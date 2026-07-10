@@ -1,0 +1,16 @@
+[package]
+name = "camera-toolbox-cli"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camera-toolbox-adapters.workspace = true
+camera-toolbox-app.workspace = true
+camera-toolbox-core.workspace = true
+clap.workspace = true
+
+[lints]
+workspace = true

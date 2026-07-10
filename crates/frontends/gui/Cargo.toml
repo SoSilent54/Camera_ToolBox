@@ -1,0 +1,15 @@
+[package]
+name = "camera-toolbox-gui"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+camera-toolbox-app.workspace = true
+eframe.workspace = true
+egui_plot.workspace = true
+
+[lints]
+workspace = true
