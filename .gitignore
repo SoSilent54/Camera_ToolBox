@@ -1,1 +1,13 @@
-target/
+# Rust build artifacts
+/target/
+
+# Local-only RAW captures, replay files, and settings
+/local_data/
+.env
+.env.*
+!.env.example
+
+# Local diagnostics and operating-system metadata
+*.log
+.DS_Store
+Thumbs.db
