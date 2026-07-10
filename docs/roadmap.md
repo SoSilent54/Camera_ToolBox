@@ -10,26 +10,27 @@
 
 ## P0：只读闭环
 
-目标：先把采集、拉取、解码、分析、展示和 journal 串通，不做自动曝光和寄存器写入。
+目标：先把本地 RAW 加载、解码、分析和 GUI 灰度显示串通；sensor 取图、SSH/SFTP、寄存器读写、自动曝光暂不做。
 
 验收：
 
-- 能从 CLI 触发一次只读流程。
-- 采集/传输/分析失败有结构化错误。
-- RAW spec 不匹配时拒绝分析。
+- CLI 能打开本地已解包 `u16le` RAW，并按显式 width/height/stride/bit depth 分析 ROI。
+- RAW spec 不匹配时拒绝分析，包括字节数不符、bit depth 越界、像素值超出当前 bit depth。
 - 同一 RAW 的统计结果可重复。
-- GUI 原型能显示真实最大尺寸样本图、hover 像素值、ROI 和直方图。
+- GUI 原型能用参数打开本地 RAW，显示灰度 preview、ROI 框和 hover 像素值。
+- RAW10/12 packed、Bayer debayer、复杂 JSON manifest 显式 deferred，不在 P0 基础显示范围内。
 
-## P1：受控手动曝光
+## P1：受控手动操作
 
-目标：在软件内受控读写曝光相关寄存器，但仍由人决定参数。
+目标：在软件内支持人工触发的单步操作，包括重新采集、加载历史 artifact、调整 ROI、读取诊断寄存器、规划曝光寄存器写入；曝光参数仍由人决定，默认不自动闭环。
 
 验收：
 
+- CLI/TUI/GUI 的手动动作都映射到同一套 app command/event/state，不绕过 workflow 直接调用 adapter。
 - sensor profile 声明允许寄存器、位宽、范围、group hold 策略。
-- 越界写入被拒绝。
+- 越界写入被拒绝，写入默认 dry-run，真实 apply 需要显式确认。
 - 写后 readback 和 journal 完整记录。
-- 设备状态不确定时禁止继续自动写入。
+- 设备状态不确定时禁止继续写入或进入自动闭环。
 
 ## P2：半自动曝光闭环
 

@@ -4,9 +4,10 @@ pub mod ports;
 pub mod workflow;
 
 pub use ports::{
-    ArtifactError, ArtifactStore, CaptureBackend, ExposureControl, ReadableCaptureBackend,
-    RegisterRead, RegisterWrite, SensorIdentity,
+    ArtifactError, ArtifactStore, CaptureBackend, ExposureControl, RawFrameLoadError,
+    RawFrameLoader, ReadableCaptureBackend, RegisterRead, RegisterWrite, SensorIdentity,
 };
 pub use workflow::{
-    AnalysisReport, AppError, CaptureAndAnalyzeRequest, CommandEnvelope, Workflow, WorkflowEvent,
+    AnalysisReport, AppError, CaptureAndAnalyzeRequest, CommandEnvelope, LocalRawAnalyzeReport,
+    LocalRawAnalyzeRequest, Workflow, WorkflowEvent,
 };

@@ -1,12 +1,16 @@
 //! P0 workflow 编排。
 
+use std::path::PathBuf;
+
 use camera_toolbox_core::{
-    AnalysisError, Roi, RoiStats, analyze_roi,
+    AnalysisError, RawEncoding, RawFrame, RawSpec, Roi, RoiStats, analyze_roi,
     sensor::{CaptureArtifact, CaptureRequest, SensorError},
 };
 use thiserror::Error;
 
-use crate::ports::{ArtifactError, ArtifactStore, CaptureBackend};
+use crate::ports::{
+    ArtifactError, ArtifactStore, CaptureBackend, RawFrameLoadError, RawFrameLoader,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureAndAnalyzeRequest {
@@ -15,13 +19,30 @@ pub struct CaptureAndAnalyzeRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalRawAnalyzeRequest {
+    pub path: PathBuf,
+    pub spec: RawSpec,
+    pub encoding: RawEncoding,
+    pub roi: Roi,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommandEnvelope {
     CaptureAndAnalyze(CaptureAndAnalyzeRequest),
+    LocalRawAnalyze(LocalRawAnalyzeRequest),
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AnalysisReport {
     pub artifact: CaptureArtifact,
+    pub roi: Roi,
+    pub stats: RoiStats,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LocalRawAnalyzeReport {
+    pub path: PathBuf,
+    pub frame: RawFrame,
     pub roi: Roi,
     pub stats: RoiStats,
 }
@@ -55,6 +76,23 @@ impl Workflow {
             stats,
         })
     }
+
+    pub fn load_raw_and_analyze<L>(
+        loader: &L,
+        request: LocalRawAnalyzeRequest,
+    ) -> Result<LocalRawAnalyzeReport, AppError>
+    where
+        L: RawFrameLoader + ?Sized,
+    {
+        let frame = loader.load_raw_frame(&request.path, request.spec, request.encoding)?;
+        let stats = analyze_roi(&frame, request.roi)?;
+        Ok(LocalRawAnalyzeReport {
+            path: request.path,
+            frame,
+            roi: request.roi,
+            stats,
+        })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -65,4 +103,6 @@ pub enum AppError {
     Analysis(#[from] AnalysisError),
     #[error(transparent)]
     Artifact(#[from] ArtifactError),
+    #[error(transparent)]
+    RawLoad(#[from] RawFrameLoadError),
 }

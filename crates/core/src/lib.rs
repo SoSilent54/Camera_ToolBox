@@ -7,4 +7,4 @@ pub mod raw;
 pub mod sensor;
 
 pub use analysis::{AnalysisError, Roi, RoiStats, analyze_roi};
-pub use raw::{BayerPattern, RawFrame, RawFrameError, RawSpec};
+pub use raw::{BayerPattern, RawEncoding, RawFrame, RawFrameError, RawSpec};

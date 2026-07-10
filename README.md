@@ -9,8 +9,7 @@ Rust-only ISP 标定工具箱。当前路线已锁定为：
 
 ## 当前阶段
 
-本仓库先落基础工程骨架，不实现设备侧真实副作用：
-
+本仓库先落基础工程骨架和本地 RAW 最小闭环，不实现 sensor 取图、SSH/SFTP、寄存器读写等设备侧真实副作用。
 ```text
 Camera Toolbox
 ├── crates/
@@ -35,6 +34,26 @@ cargo fmt --all -- --check
 cargo check --workspace
 cargo test --workspace
 ```
+
+本地 RAW smoke：
+
+```bash
+cargo run -p camera-toolbox-cli -- analyze-raw \
+  --raw <frame.raw> --width <w> --height <h> --bit-depth <n> \
+  --encoding u16le --roi 0,0,<w>,<h>
+```
+
+GUI 本地 RAW 预览：
+
+```bash
+cargo run -p camera-toolbox-gui
+```
+
+在菜单中选择 `File -> Open Raw...`，再在设置窗口填写 width、height、bit depth、stride 和 Bayer。当前只支持 unpacked `u16` little-endian。
+
+当前只支持已解包 `u16le` RAW。RAW10/12 packed、debayer 和复杂 manifest 后续再加。
+
+本地 RAW 路径也走 `app::Workflow::load_raw_and_analyze` 与 `RawFrameLoader` port；CLI/GUI 不直接解码或统计 RAW。
 
 ## 设计原则
 

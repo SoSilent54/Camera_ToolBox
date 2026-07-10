@@ -37,15 +37,14 @@ Rust workspace 不能形成 crate 循环，因此禁止 `app -> adapters -> app`
 ## P0 只读闭环调用流
 
 ```text
-CLI/TUI/GUI ──► CommandEnvelope (CaptureAndAnalyze)
+CLI/TUI/GUI ──► CommandEnvelope / LocalRawAnalyzeRequest
    │
    ▼
-Workflow
-   │    ├ capture adapter 调外部采集程序
-   │    ├ transfer adapter 拉取 RAW/manifest
-   │    ├ artifact store 校验 hash 并落库
-   │    ├ core raw 按 RawSpec 解包/校验
-   │    └ core analysis 计算 ROI/直方图/统计
+Workflow::load_raw_and_analyze
+   │    ├ RawFrameLoader port 调用 LocalRawLoader adapter
+   │    ├ core raw 按显式 `RawSpec` 校验字节数、stride、bit depth 和像素范围
+   │    ├ core analysis 计算 ROI 统计
+   │    └ GUI preview 使用 report.frame，只显示 `width x height` 有效区域，stride padding 不参与显示
    ▼
 WorkflowEvent stream
    │
@@ -53,6 +52,30 @@ WorkflowEvent stream
    ├── TUI 显示进度和日志
    └── GUI 更新图像、ROI 和曲线
 ```
+
+## 手动操作与 workflow 的关系
+
+半自动 workflow 不是唯一入口。所有人工按钮、表单和命令行动作也必须建模为 `CommandEnvelope`，由同一个 app controller/workflow 执行并产出 `WorkflowEvent`，前端不得绕过 app 层直接调用 adapter。
+
+```text
+Atomic Manual Commands                 Macro Workflows
+├── ManualCapture                       ├── CaptureAndAnalyze
+├── LoadRaw                             ├── ManualExposureStep
+├── LoadArtifact                        └── AutoExposureConverge
+├── SetActiveRoi
+├── AnalyzeRoi
+├── ReadRegister
+├── PlanRegisterWrite
+├── ApplyRegisterWrite
+└── SetExposure
+       │
+       ▼
+app controller / workflow  (统一状态机、权限校验、journal、错误语义)
+```
+
+手动操作是一等公民的可审计原子命令；半自动 workflow 是这些原子命令的受控编排，而不是另一套隐藏入口。这样 GUI/TUI/CLI 可以支持人工调试、单步验证和脚本批处理，同时不把采集、寄存器访问、曝光状态机散落到三个前端。
+
+P0 允许的手动命令只包含只读动作，例如 `ManualCapture`、`LoadRaw`、`LoadArtifact`、`SetActiveRoi`、`AnalyzeRoi`。P1 才允许 `ReadRegister`、`PlanRegisterWrite`、`ApplyRegisterWrite`、`SetExposure` 等设备状态相关命令，且写入必须经过 profile allowlist、dry-run/确认、写后 readback 和 journal。
 
 ## 关键对象
 
@@ -70,6 +93,7 @@ WorkflowEvent stream
 | `RegisterWrite` | `app` port | 受控寄存器写能力，P1/P2 才组合进 workflow。 |
 | `ExposureControl` | `app` port | P2 语义曝光控制占位能力；当前骨架不提供默认寄存器规划实现。 |
 | 具体 sensor 实现 | `adapters` | 按 sensor 型号选择性实现上述小能力 trait，隐藏寄存器表和外部采集命令差异。 |
+| `RawFrameLoader` | `app` port / `adapters` impl | 本地或后续远程 RAW 帧加载端口；frontends 不直接调用具体 loader，只经 workflow 使用。 |
 | `ArtifactStore` | `app` port / `adapters` impl | artifact 持久化、hash 校验和索引能力端口。 |
 
 P0 workflow 的类型约束只能要求 `CaptureBackend` 和 `ArtifactStore`，不能要求 `RegisterWrite`。P1/P2 的手动曝光和自动曝光 workflow 再显式组合 `RegisterRead + RegisterWrite` 或 `ExposureControl`。这样只读流程在类型层面拿不到写寄存器能力。
