@@ -103,21 +103,13 @@ impl RawFrame {
             return Err(RawFrameError::ByteCountMismatch { expected, actual });
         }
 
-        let max_code_value = spec.max_code_value();
         let mut pixels = Vec::with_capacity(spec.pixel_count());
         match encoding {
-            RawEncoding::U16Le => {
-                for chunk in bytes.chunks_exact(2) {
-                    let value = u16::from_le_bytes([chunk[0], chunk[1]]);
-                    if value > max_code_value {
-                        return Err(RawFrameError::PixelValueOutOfRange {
-                            value,
-                            max: max_code_value,
-                        });
-                    }
-                    pixels.push(value);
-                }
-            }
+            RawEncoding::U16Le => pixels.extend(
+                bytes
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]])),
+            ),
         }
         Self::new(spec, pixels)
     }
@@ -134,8 +126,6 @@ pub enum RawFrameError {
     PixelCountMismatch { expected: usize, actual: usize },
     #[error("raw byte count mismatch: expected {expected}, got {actual}")]
     ByteCountMismatch { expected: usize, actual: usize },
-    #[error("raw pixel value {value} exceeds max code {max}")]
-    PixelValueOutOfRange { value: u16, max: u16 },
     #[error("raw dimensions must be non-zero: width={width}, height={height}")]
     InvalidDimensions { width: u32, height: u32 },
     #[error("raw stride must be >= width: width={width}, stride_pixels={stride_pixels}")]
@@ -180,16 +170,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_values_above_bit_depth() {
+    fn preserves_values_above_declared_bit_depth() {
         let bytes = [0, 0, 0, 4, 0, 0, 0, 0];
-        let err = RawFrame::from_bytes(test_spec(), RawEncoding::U16Le, &bytes).unwrap_err();
+        let frame = RawFrame::from_bytes(test_spec(), RawEncoding::U16Le, &bytes).unwrap();
 
-        assert_eq!(
-            err,
-            RawFrameError::PixelValueOutOfRange {
-                value: 1024,
-                max: 1023,
-            }
-        );
+        assert_eq!(frame.pixels(), &[0, 1024, 0, 0]);
     }
 }

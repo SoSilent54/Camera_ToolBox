@@ -22,12 +22,26 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RawDiagnostics {
+    out_of_range_pixels: u64,
+    observed_max: u16,
+    first_out_of_range: Option<CursorPixel>,
+}
+
+impl RawDiagnostics {
+    fn has_out_of_range(self) -> bool {
+        self.out_of_range_pixels != 0
+    }
+}
+
 struct LoadedRaw {
     path: PathBuf,
     frame: RawFrame,
     roi: Roi,
     stats: RoiStats,
     texture: TextureHandle,
+    diagnostics: RawDiagnostics,
 }
 
 #[derive(Default)]
@@ -177,6 +191,16 @@ impl CameraToolboxApp {
                     loaded.stats.saturated_pixels,
                     loaded.stats.total_pixels
                 ));
+                if loaded.diagnostics.has_out_of_range() {
+                    ui.separator();
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        format!(
+                            "out-of-range={} observed-max={}",
+                            loaded.diagnostics.out_of_range_pixels, loaded.diagnostics.observed_max
+                        ),
+                    );
+                }
             } else {
                 ui.label("Ready");
                 ui.separator();
@@ -242,6 +266,7 @@ impl CameraToolboxApp {
             egui::Color32::WHITE,
         );
         draw_roi_overlay(&painter, image_rect, &loaded.frame, loaded.roi);
+        draw_raw_warning_overlay(&painter, viewer_rect, loaded);
 
         self.viewer.cursor = response
             .hover_pos()
@@ -384,19 +409,28 @@ impl CameraToolboxApp {
         let request = self.raw_dialog.to_request()?;
         let loader = LocalRawLoader;
         let report = Workflow::load_raw_and_analyze(&loader, request)?;
-        let image = grayscale_preview(&report.frame);
+        let (image, diagnostics) = preview_with_diagnostics(&report.frame);
         let texture = ctx.load_texture(
             format!("local-raw-preview:{}", report.path.display()),
             image,
             TextureOptions::NEAREST,
         );
-        self.status_message = format!("Loaded {}", report.path.display());
+        self.status_message = if diagnostics.has_out_of_range() {
+            format!(
+                "Loaded {} with {} out-of-range pixels; original values preserved",
+                report.path.display(),
+                diagnostics.out_of_range_pixels
+            )
+        } else {
+            format!("Loaded {}", report.path.display())
+        };
         self.loaded = Some(LoadedRaw {
             path: report.path,
             frame: report.frame,
             roi: report.roi,
             stats: report.stats,
             texture,
+            diagnostics,
         });
         self.viewer = ImageViewerState {
             fit_on_next_frame: true,
@@ -406,7 +440,7 @@ impl CameraToolboxApp {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CursorPixel {
     x: u32,
     y: u32,
@@ -639,22 +673,69 @@ fn parse_u8_field(name: &str, value: &str) -> Result<u8> {
     Ok(parsed)
 }
 
-fn grayscale_preview(frame: &RawFrame) -> ColorImage {
+fn preview_with_diagnostics(frame: &RawFrame) -> (ColorImage, RawDiagnostics) {
     let width = frame.spec.width as usize;
     let height = frame.spec.height as usize;
     let stride = frame.spec.stride_pixels as usize;
-    let max_code = u32::from(frame.spec.max_code_value()).max(1);
+    let max_code = frame.spec.max_code_value();
     let pixels = frame.pixels();
-    let mut gray = Vec::with_capacity(width * height);
+    let mut preview = Vec::with_capacity(width * height);
+    let mut diagnostics = RawDiagnostics::default();
 
     for y in 0..height {
         let row_start = y * stride;
         for x in 0..width {
-            let value = u32::from(pixels[row_start + x]);
-            gray.push(((value * 255) / max_code) as u8);
+            let value = pixels[row_start + x];
+            diagnostics.observed_max = diagnostics.observed_max.max(value);
+            if value > max_code {
+                diagnostics.out_of_range_pixels += 1;
+                diagnostics.first_out_of_range.get_or_insert(CursorPixel {
+                    x: x as u32,
+                    y: y as u32,
+                    value,
+                });
+                preview.push(egui::Color32::MAGENTA);
+            } else {
+                let gray = ((u32::from(value) * 255) / u32::from(max_code)) as u8;
+                preview.push(egui::Color32::from_gray(gray));
+            }
         }
     }
-    ColorImage::from_gray([width, height], &gray)
+
+    (ColorImage::new([width, height], preview), diagnostics)
+}
+
+fn draw_raw_warning_overlay(painter: &egui::Painter, viewer_rect: egui::Rect, loaded: &LoadedRaw) {
+    let diagnostics = loaded.diagnostics;
+    let Some(first) = diagnostics.first_out_of_range else {
+        return;
+    };
+    let text = format!(
+        "RAW RANGE WARNING: {} pixels exceed {}-bit max {} (observed max {}; first x={} y={} raw={}). Magenta pixels preserve original values.",
+        diagnostics.out_of_range_pixels,
+        loaded.frame.spec.bit_depth,
+        loaded.frame.spec.max_code_value(),
+        diagnostics.observed_max,
+        first.x,
+        first.y,
+        first.value
+    );
+    let banner = egui::Rect::from_min_size(
+        viewer_rect.min + egui::vec2(12.0, 12.0),
+        egui::vec2((viewer_rect.width() - 24.0).max(1.0), 32.0),
+    );
+    painter.rect_filled(
+        banner,
+        4.0,
+        egui::Color32::from_rgba_premultiplied(80, 45, 0, 235),
+    );
+    painter.text(
+        banner.left_center() + egui::vec2(8.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        text,
+        egui::FontId::proportional(13.0),
+        egui::Color32::YELLOW,
+    );
 }
 
 fn hover_pixel(image_rect: egui::Rect, pos: egui::Pos2, frame: &RawFrame) -> Option<CursorPixel> {
@@ -785,13 +866,46 @@ mod tests {
 
     #[test]
     fn grayscale_preview_ignores_stride_padding() {
-        let image = grayscale_preview(&padded_frame());
+        let (image, diagnostics) = preview_with_diagnostics(&padded_frame());
 
         assert_eq!(image.size, [2, 2]);
         assert_eq!(image.pixels[0], egui::Color32::from_gray(0));
         assert_eq!(image.pixels[1], egui::Color32::from_gray(255));
         assert_eq!(image.pixels[2], egui::Color32::from_gray(127));
         assert_eq!(image.pixels[3], egui::Color32::from_gray(63));
+        assert_eq!(diagnostics.out_of_range_pixels, 0);
+        assert_eq!(diagnostics.observed_max, 1023);
+        assert_eq!(diagnostics.first_out_of_range, None);
+    }
+
+    #[test]
+    fn preview_marks_and_reports_out_of_range_pixels_without_changing_raw_values() {
+        let frame = RawFrame::new(
+            RawSpec {
+                width: 2,
+                height: 1,
+                bit_depth: 10,
+                stride_pixels: 2,
+                bayer: BayerPattern::Rggb,
+            },
+            vec![1024, 42],
+        )
+        .unwrap();
+
+        let (image, diagnostics) = preview_with_diagnostics(&frame);
+
+        assert_eq!(frame.pixels(), &[1024, 42]);
+        assert_eq!(image.pixels[0], egui::Color32::MAGENTA);
+        assert_eq!(diagnostics.out_of_range_pixels, 1);
+        assert_eq!(diagnostics.observed_max, 1024);
+        assert_eq!(
+            diagnostics.first_out_of_range,
+            Some(CursorPixel {
+                x: 0,
+                y: 0,
+                value: 1024
+            })
+        );
     }
 
     #[test]
