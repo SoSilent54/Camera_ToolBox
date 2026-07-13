@@ -1,6 +1,7 @@
 mod app;
 mod color_controls;
 mod color_worker;
+mod notification;
 mod raw_dialog;
 mod viewer;
 
@@ -13,16 +14,27 @@ use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 const NOTO_SANS_CJK: &[u8] = include_bytes!("../assets/fonts/NotoSansCJK-Regular.ttc");
 
 fn main() -> Result<()> {
+    let _logging = camera_toolbox_logging::init();
+    tracing::debug!(operation = "gui_start", "starting GUI frontend");
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
         "Camera Toolbox",
         native_options,
         Box::new(|creation_context| {
             install_cjk_fonts(&creation_context.egui_ctx);
-            Ok(Box::new(CameraToolboxApp::new(&creation_context.egui_ctx)?))
+            CameraToolboxApp::new(&creation_context.egui_ctx)
+                .map(|app| Box::new(app) as Box<dyn eframe::App>)
+                .map_err(|error| {
+                    tracing::error!(operation = "create_gui_app", error = %error, "GUI initialization failed");
+                    error.into()
+                })
         }),
     )
-    .map_err(|err| anyhow!(err.to_string()))?;
+    .map_err(|error| {
+        tracing::error!(operation = "run_gui", error = %error, "GUI frontend stopped with error");
+        anyhow!(error.to_string())
+    })?;
+    tracing::debug!(operation = "gui_exit", "GUI frontend exited");
     Ok(())
 }
 

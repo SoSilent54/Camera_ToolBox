@@ -10,7 +10,9 @@ anyhow.workspace = true
 camera-toolbox-adapters.workspace = true
 camera-toolbox-app.workspace = true
 camera-toolbox-core.workspace = true
+camera-toolbox-logging.workspace = true
 clap.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

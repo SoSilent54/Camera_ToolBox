@@ -9,6 +9,7 @@ use eframe::egui;
 use crate::{
     color_controls::{DisplayMode, render_color_controls},
     color_worker::{ColorRenderRequest, ColorRenderWorker},
+    notification::{NotificationCenter, NotificationKey, NotificationScope, UiNotification},
     raw_dialog::RawOpenDialogState,
     viewer::{
         HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, bayer_label,
@@ -24,7 +25,9 @@ pub(crate) struct CameraToolboxApp {
     color_panel_expanded: bool,
     hover_view: HoverViewSettings,
     color_worker: ColorRenderWorker,
+    notifications: NotificationCenter,
     next_generation: u64,
+    next_load_attempt: u64,
 }
 
 impl CameraToolboxApp {
@@ -37,7 +40,9 @@ impl CameraToolboxApp {
             color_panel_expanded: true,
             hover_view: HoverViewSettings::default(),
             color_worker: ColorRenderWorker::new(context)?,
+            notifications: NotificationCenter::default(),
             next_generation: 1,
+            next_load_attempt: 1,
         })
     }
 }
@@ -54,15 +59,19 @@ impl eframe::App for CameraToolboxApp {
             self.render_status_bar(ui);
         });
         self.render_color_panel(ui);
-        egui::CentralPanel::default().show(ui, |ui| {
-            render_viewer(
-                ui,
-                self.loaded.as_ref(),
-                &mut self.viewer,
-                self.display_mode,
-                self.hover_view,
-            );
-        });
+        let viewer_rect = egui::CentralPanel::default()
+            .show(ui, |ui| {
+                render_viewer(
+                    ui,
+                    self.loaded.as_ref(),
+                    &mut self.viewer,
+                    self.display_mode,
+                    self.hover_view,
+                )
+            })
+            .inner;
+        self.notifications
+            .render(&context, viewer_rect, context.input(|input| input.time));
         self.render_raw_open_dialog(&context);
     }
 }
@@ -79,6 +88,17 @@ impl CameraToolboxApp {
             ui.menu_button("Help", |ui| {
                 ui.label("Camera Toolbox");
                 ui.label("Local Bayer RAW color viewer");
+                ui.separator();
+                ui.label("Log directory");
+                if let Some(directory) = camera_toolbox_logging::logging_directory() {
+                    let path = directory.display().to_string();
+                    ui.monospace(&path);
+                    if ui.button("Copy log path").clicked() {
+                        ui.ctx().copy_text(path);
+                    }
+                } else {
+                    ui.label("Unavailable on this platform");
+                }
             });
         });
         if request_color {
@@ -95,6 +115,10 @@ impl CameraToolboxApp {
             .add_enabled(self.loaded.is_some(), egui::Button::new("Close Image"))
             .clicked()
         {
+            if let Some(loaded) = &self.loaded {
+                self.notifications
+                    .clear_scope(NotificationScope::ImageGeneration(loaded.generation));
+            }
             self.color_worker.cancel();
             self.loaded = None;
             self.viewer = ImageViewerState::default();
@@ -348,10 +372,29 @@ impl CameraToolboxApp {
         let Some(request) = self.raw_dialog.show(context) else {
             return;
         };
-        match self.load_raw(context, request) {
+        let attempt = self.next_load_attempt;
+        self.next_load_attempt = self.next_load_attempt.saturating_add(1);
+        if attempt > 1 {
+            self.notifications
+                .clear_scope(NotificationScope::LoadAttempt(attempt - 1));
+        }
+        let path = request.path.clone();
+        match self.load_raw(context, attempt, request) {
             Ok(()) => self.raw_dialog.close(context),
             Err(error) => {
                 let message = error.to_string();
+                tracing::error!(
+                    operation = "load_raw",
+                    attempt,
+                    path = %path.display(),
+                    error = %format_args!("{error:#}"),
+                    "RAW loading failed"
+                );
+                self.notifications.push_once(UiNotification::error(
+                    NotificationKey::RawLoadFailed { attempt },
+                    "RAW load failed",
+                    &message,
+                ));
                 self.raw_dialog.set_error(message);
             }
         }
@@ -360,14 +403,56 @@ impl CameraToolboxApp {
     fn load_raw(
         &mut self,
         context: &egui::Context,
+        attempt: u64,
         request: LocalRawAnalyzeRequest,
     ) -> anyhow::Result<()> {
+        tracing::debug!(operation = "load_raw", attempt, path = %request.path.display(), "starting RAW load");
         let raw_loader = LocalRawLoader;
         let report = Workflow::load_raw_and_analyze(&raw_loader, request)?;
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let loaded = LoadedRaw::from_report(context, report, generation);
+        let notification = loaded.diagnostics.first_out_of_range().map(|first| {
+            UiNotification::raw_range(
+                generation,
+                loaded.frame.spec.bit_depth,
+                loaded.frame.spec.max_code_value(),
+                loaded.diagnostics.out_of_range_pixels,
+                loaded.diagnostics.observed_max,
+                (first.x, first.y, first.value),
+                context.input(|input| input.time),
+            )
+        });
+        tracing::debug!(
+            operation = "load_raw",
+            attempt,
+            generation,
+            path = %loaded.path.display(),
+            width = loaded.frame.spec.width,
+            height = loaded.frame.spec.height,
+            bit_depth = loaded.frame.spec.bit_depth,
+            "RAW loaded"
+        );
+        if loaded.diagnostics.has_out_of_range() {
+            tracing::warn!(
+                attempt,
+                operation = "load_raw",
+                generation,
+                path = %loaded.path.display(),
+                bit_depth = loaded.frame.spec.bit_depth,
+                out_of_range_pixels = loaded.diagnostics.out_of_range_pixels,
+                observed_max = loaded.diagnostics.observed_max,
+                "RAW samples exceed declared bit-depth range"
+            );
+        }
+        if let Some(previous) = &self.loaded {
+            self.notifications
+                .clear_scope(NotificationScope::ImageGeneration(previous.generation));
+        }
         self.loaded = Some(loaded);
+        if let Some(notification) = notification {
+            self.notifications.push_once(notification);
+        }
         self.viewer = ImageViewerState::default();
         self.display_mode = DisplayMode::Color;
         self.request_current_color();
@@ -388,6 +473,13 @@ impl CameraToolboxApp {
                 .params
                 .validate(loaded.frame.spec.max_code_value())
             {
+                tracing::warn!(
+                    operation = "validate_color_params",
+                    generation = loaded.generation,
+                    revision,
+                    error = %error,
+                    "color parameter validation rejected"
+                );
                 loaded.color_edit.mark_error(error.to_string());
                 return;
             }
@@ -400,6 +492,12 @@ impl CameraToolboxApp {
             loaded.color_edit.mark_submitted();
             request
         };
+        tracing::debug!(
+            operation = "submit_color_render",
+            generation = request.frame_generation,
+            revision = request.revision,
+            "submitted color render"
+        );
         self.color_worker.submit(request);
     }
 
@@ -408,6 +506,12 @@ impl CameraToolboxApp {
             return;
         };
         let Some(loaded) = self.loaded.as_mut() else {
+            tracing::debug!(
+                operation = "poll_color_result",
+                generation = result.frame_generation,
+                revision = result.revision,
+                "dropped color result because image is closed"
+            );
             return;
         };
         if !color_result_matches(
@@ -416,6 +520,12 @@ impl CameraToolboxApp {
             result.frame_generation,
             result.revision,
         ) {
+            tracing::debug!(
+                operation = "poll_color_result",
+                generation = result.frame_generation,
+                revision = result.revision,
+                "dropped stale color result"
+            );
             return;
         }
         match result.rendered {
@@ -428,9 +538,30 @@ impl CameraToolboxApp {
                     rendered.diagnostics,
                 );
                 loaded.color_edit.render_error = None;
+                tracing::debug!(
+                    operation = "install_color_render",
+                    generation = loaded.generation,
+                    revision = result.revision,
+                    "installed color render"
+                );
             }
             Err(error) => {
                 loaded.color_edit.mark_error(error.clone());
+                tracing::error!(
+                    operation = "render_color",
+                    generation = loaded.generation,
+                    revision = result.revision,
+                    error = %error,
+                    "accepted color render failed"
+                );
+                self.notifications.push_once(UiNotification::error(
+                    NotificationKey::ColorRenderFailed {
+                        generation: loaded.generation,
+                        revision: result.revision,
+                    },
+                    "Color preview failed",
+                    error,
+                ));
             }
         }
     }

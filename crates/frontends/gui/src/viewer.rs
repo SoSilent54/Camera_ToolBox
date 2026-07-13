@@ -75,6 +75,10 @@ impl RawDiagnostics {
     pub(crate) const fn has_out_of_range(self) -> bool {
         self.out_of_range_pixels != 0
     }
+
+    pub(crate) const fn first_out_of_range(self) -> Option<CursorPixel> {
+        self.first_out_of_range
+    }
 }
 
 pub(crate) struct InstalledColorPreview {
@@ -260,7 +264,7 @@ pub(crate) fn render_viewer(
     viewer: &mut ImageViewerState,
     display_mode: DisplayMode,
     hover_settings: HoverViewSettings,
-) {
+) -> egui::Rect {
     let available = ui.available_size().max(egui::vec2(1.0, 1.0));
     let (viewer_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
     let painter = ui.painter_at(viewer_rect);
@@ -275,7 +279,7 @@ pub(crate) fn render_viewer(
             egui::Color32::GRAY,
         );
         viewer.cursor = None;
-        return;
+        return viewer_rect;
     };
 
     if viewer.fit_on_next_frame {
@@ -311,7 +315,6 @@ pub(crate) fn render_viewer(
         egui::Color32::WHITE,
     );
     draw_roi_overlay(&painter, image_rect, &loaded.frame, loaded.roi);
-    draw_raw_warning_overlay(&painter, viewer_rect, loaded);
     draw_minimap(&painter, viewer_rect, image_rect, loaded, active_texture_id);
 
     let hover_position = response.hover_pos();
@@ -322,6 +325,7 @@ pub(crate) fn render_viewer(
     {
         render_hover_view(ui.ctx(), position, cursor, loaded, hover_settings);
     }
+    viewer_rect
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -685,39 +689,6 @@ fn preview_with_diagnostics(frame: &RawFrame) -> (ColorImage, RawDiagnostics) {
     }
 
     (ColorImage::new([width, height], preview), diagnostics)
-}
-
-fn draw_raw_warning_overlay(painter: &egui::Painter, viewer_rect: egui::Rect, loaded: &LoadedRaw) {
-    let diagnostics = loaded.diagnostics;
-    let Some(first) = diagnostics.first_out_of_range else {
-        return;
-    };
-    let text = format!(
-        "RAW RANGE WARNING: {} pixels exceed {}-bit max {} (observed max {}; first x={} y={} raw={}). Magenta pixels preserve original values.",
-        diagnostics.out_of_range_pixels,
-        loaded.frame.spec.bit_depth,
-        loaded.frame.spec.max_code_value(),
-        diagnostics.observed_max,
-        first.x,
-        first.y,
-        first.value
-    );
-    let banner = egui::Rect::from_min_size(
-        viewer_rect.min + egui::vec2(12.0, 12.0),
-        egui::vec2((viewer_rect.width() - 24.0).max(1.0), 32.0),
-    );
-    painter.rect_filled(
-        banner,
-        4.0,
-        egui::Color32::from_rgba_premultiplied(80, 45, 0, 235),
-    );
-    painter.text(
-        banner.left_center() + egui::vec2(8.0, 0.0),
-        egui::Align2::LEFT_CENTER,
-        text,
-        egui::FontId::proportional(13.0),
-        egui::Color32::YELLOW,
-    );
 }
 
 fn hover_pixel(

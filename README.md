@@ -70,6 +70,7 @@ cargo run --release -p camera-toolbox-gui
 
 加载成功后默认显示 `Color`，右侧 `Color Processing` 面板默认展开，可从标题栏 chevron 收起为窄 rail 并随时重新展开。面板可实时调整 Bayer、R/Gr/Gb/B black level、通道 gain 与 Gamma；Gamma 默认开启并取 2.2，GUI 可在 0.1–5.0 范围调整，关闭时线性 RGB 直接量化。关闭后重新开启会恢复上次设置。默认链接四通道 black 和 Gr/Gb gain。显示链路固定为 black subtraction → `(max_code-black)` 归一化 → CFA gain → bilinear demosaic → clamp → 可选 Gamma → RGB8。`View` 菜单可切换 `Raw Mono`、`Color`。
 `Tools -> Hover View` 默认开启，可关闭；开启后可选择 3×3、5×5（默认）或 7×7 RAW 邻域。鼠标进入图像即显示固定大小、跟随指针的非交互检查窗：邻域始终读取 RAW preview（Color 主视图下也不读取插值彩色纹理），中心格带十字与边框，图像边缘越界格留空。信息区显示坐标、CFA 通道、RAW 值、最后一次已安装彩色参数得到的 RGBf/RGB8、颜色色块和 ROI 统计；超 bit-depth 样本保留洋红诊断色。底部状态栏只保留文件规格、显示模式、缩放和异常摘要。
+RAW 超 bit-depth 时，顶部会出现可关闭的 Warning，并在 8 秒后自动消失；其消失不会清除状态栏 `RAW range`、MAGENTA 像素或 Hover View 诊断。加载和渲染失败显示可关闭但不自动消失的 Error，同时保留对话框/面板中的就地错误。GUI、CLI、TUI 统一写入 console 和按日滚动的 JSONL 文件，最多保留 7 个匹配文件；可用 `RUST_LOG` 临时调整等级。日志目录由平台 `ProjectDirs` 解析；典型位置为 Linux `${XDG_STATE_HOME:-~/.local/state}/cameratoolbox/logs`、macOS `~/Library/Application Support/org.camera-toolbox.Camera-Toolbox/logs`、Windows `%LOCALAPPDATA%\camera-toolbox\Camera Toolbox\data\logs`，应以 GUI `Help -> Log directory` 显示并可复制的实际路径为准。CLI 的业务结果仍写 stdout，日志不混入该输出。
 
 当前只支持紧密排列、已解包的 `u16le` Bayer RAW。彩色预览不包含自动 black level/AWB、CCM、LSC、降噪或 edge-aware demosaic，因此属于 sensor RGB 查验，不代表标定后的准确 sRGB。带行 padding、RAW10/12 packed 和复杂 manifest 后续再加。
 

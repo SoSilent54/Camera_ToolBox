@@ -115,11 +115,22 @@ impl FromStr for RoiArg {
 }
 
 fn main() -> Result<()> {
+    let _logging = camera_toolbox_logging::init();
     let cli = Cli::parse();
-    match cli.command {
-        Command::Smoke => run_smoke()?,
-        Command::AnalyzeRaw(args) => analyze_raw(args)?,
+    let command = match &cli.command {
+        Command::Smoke => "smoke",
+        Command::AnalyzeRaw(_) => "analyze_raw",
+    };
+    tracing::debug!(operation = "cli_start", command, "starting CLI command");
+    let result = match cli.command {
+        Command::Smoke => run_smoke(),
+        Command::AnalyzeRaw(args) => analyze_raw(args),
+    };
+    if let Err(error) = result {
+        tracing::error!(operation = "cli_command", command, error = %format_args!("{error:#}"), "CLI command failed");
+        return Err(error);
     }
+    tracing::debug!(operation = "cli_command", command, "CLI command completed");
     Ok(())
 }
 

@@ -8,8 +8,10 @@ publish.workspace = true
 [dependencies]
 anyhow.workspace = true
 camera-toolbox-app.workspace = true
+camera-toolbox-logging.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+tracing.workspace = true
 
 [lints]
 workspace = true

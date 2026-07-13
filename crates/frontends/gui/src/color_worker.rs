@@ -54,6 +54,12 @@ struct WorkerShared {
 
 impl WorkerShared {
     fn submit(&self, request: ColorRenderRequest) {
+        tracing::debug!(
+            operation = "queue_color_render",
+            generation = request.frame_generation,
+            revision = request.revision,
+            "queued color render"
+        );
         let ticket = self.desired_ticket.fetch_add(1, Ordering::AcqRel) + 1;
         lock(&self.request).pending = Some(TicketedRequest { ticket, request });
         self.request_ready.notify_one();
@@ -93,6 +99,10 @@ impl ColorRenderWorker {
     }
 
     pub(crate) fn cancel(&self) {
+        tracing::debug!(
+            operation = "cancel_color_render",
+            "cancelled pending color render"
+        );
         self.shared.desired_ticket.fetch_add(1, Ordering::AcqRel);
         lock(&self.shared.request).pending = None;
         lock(&self.shared.ready).take();
@@ -119,6 +129,13 @@ impl Drop for ColorRenderWorker {
 fn run_worker(shared: &WorkerShared, context: &egui::Context) {
     while let Some(ticketed) = wait_for_request(shared) {
         if !shared.is_current(ticketed.ticket) {
+            tracing::debug!(
+                operation = "run_color_worker",
+                ticket = ticketed.ticket,
+                generation = ticketed.request.frame_generation,
+                revision = ticketed.request.revision,
+                "dropped stale color request before rendering"
+            );
             continue;
         }
         let result = render_request(shared, ticketed);
@@ -152,11 +169,27 @@ fn render_request(shared: &WorkerShared, ticketed: TicketedRequest) -> Option<Co
         !shared.is_current(ticket)
     });
     if !shared.is_current(ticket) {
+        tracing::debug!(
+            operation = "render_color",
+            ticket,
+            generation = request.frame_generation,
+            revision = request.revision,
+            "discarded cancelled color render"
+        );
         return None;
     }
     let rendered = match rendered {
         Ok(rendered) => Ok(rendered),
-        Err(ColorRenderError::Cancelled) => return None,
+        Err(ColorRenderError::Cancelled) => {
+            tracing::debug!(
+                operation = "render_color",
+                ticket,
+                generation = request.frame_generation,
+                revision = request.revision,
+                "color render returned cancelled"
+            );
+            return None;
+        }
         Err(error) => Err(error.to_string()),
     };
     Some(ColorRenderResult {

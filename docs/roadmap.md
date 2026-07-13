@@ -16,6 +16,7 @@
 
 - CLI 能打开本地紧密排列的已解包 `u16le` RAW，并按显式 width/height/bit depth 分析 ROI。
 - RAW spec 的字节数或 bit depth 非法时拒绝分析；像素超过当前 bit depth 时保留原值，GUI 通过 Mono 洋红、Color clamp 与 diagnostics 明确告警。
+- GUI 的数据质量 Warning 支持手动关闭和 8s 自动消失，但 `RawDiagnostics`、状态栏摘要、MAGENTA 与 Hover View 诊断持续有效；GUI/CLI/TUI 对动作结果输出统一 DEBUG/WARN/ERROR JSONL 审计日志，CLI stdout 保持业务结果。
 - 同一 RAW 的统计结果可重复。
 - GUI 能用参数打开本地 RAW，切换 Raw Mono/Color，显示 ROI；`Tools -> Hover View` 提供即时、固定大小、可选 3×3/5×5/7×7 的 RAW 邻域检查，显示原始值、CFA、已安装彩色纹理对应的 RGB 和 ROI 统计。
 - 彩色预览支持四种 Bayer、R/Gr/Gb/B black/gain、bilinear demosaic，以及默认 2.2、可在 GUI 调节并可关闭的 Gamma 显示；自动 BLC/AWB、CCM、LSC、edge-aware demosaic 显式 deferred。
