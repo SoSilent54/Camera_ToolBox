@@ -4,7 +4,11 @@
 
 pub mod analysis;
 pub mod raw;
+pub mod raw_probe;
 pub mod sensor;
 
 pub use analysis::{AnalysisError, Roi, RoiStats, analyze_roi};
 pub use raw::{BayerPattern, RawEncoding, RawFrame, RawFrameError, RawSpec};
+pub use raw_probe::{
+    RawContainer, RawEndian, RawProbeCandidate, RawProbeInput, RawProbeReport, probe_raw_candidates,
+};

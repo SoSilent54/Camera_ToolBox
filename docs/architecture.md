@@ -42,9 +42,9 @@ CLI/TUI/GUI ──► CommandEnvelope / LocalRawAnalyzeRequest
    ▼
 Workflow::load_raw_and_analyze
    │    ├ RawFrameLoader port 调用 LocalRawLoader adapter
-   │    ├ core raw 按显式 `RawSpec` 校验字节数、stride、bit depth 和像素范围
+   │    ├ core raw 按显式 `RawSpec` 校验紧密布局字节数、bit depth 和像素范围
    │    ├ core analysis 计算 ROI 统计
-   │    └ GUI preview 使用 report.frame，只显示 `width x height` 有效区域，stride padding 不参与显示
+   │    └ GUI preview 使用 report.frame 显示 `width x height` 完整有效区域
    ▼
 WorkflowEvent stream
    │
@@ -81,7 +81,7 @@ P0 允许的手动命令只包含只读动作，例如 `ManualCapture`、`LoadRa
 
 | 对象 | 所属 crate | 职责 |
 |---|---|---|
-| `RawSpec` | `core` | 描述 RAW 分辨率、bit depth、stride、packing、CFA。 |
+| `RawSpec` | `core` | 描述紧密排列 RAW 的分辨率、bit depth、packing 和 CFA。 |
 | `RawFrame` | `core` | 持有已解包的 RAW 像素和对应规格。 |
 | `Roi` | `core` | 使用图像坐标定义统计区域。 |
 | `RoiStats` | `core` | ROI 内 min/max/mean/saturation 等定量结果。 |

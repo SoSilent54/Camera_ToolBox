@@ -1,9 +1,10 @@
 //! P0 workflow 编排。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use camera_toolbox_core::{
-    AnalysisError, RawEncoding, RawFrame, RawSpec, Roi, RoiStats, analyze_roi,
+    AnalysisError, RawEncoding, RawFrame, RawProbeReport, RawSpec, Roi, RoiStats, analyze_roi,
+    probe_raw_candidates,
     sensor::{CaptureArtifact, CaptureRequest, SensorError},
 };
 use thiserror::Error;
@@ -77,6 +78,24 @@ impl Workflow {
         })
     }
 
+    /// 检查无头 RAW 并返回必须由用户确认的参数候选。
+    ///
+    /// # Errors
+    ///
+    /// 文件检查端口读取失败时返回错误。
+    pub fn inspect_raw_parameters<L>(loader: &L, path: &Path) -> Result<RawProbeReport, AppError>
+    where
+        L: RawFrameLoader + ?Sized,
+    {
+        let input = loader.inspect_raw(path)?;
+        Ok(probe_raw_candidates(&input))
+    }
+
+    /// 按用户确认的 RAW 参数加载完整帧并分析指定 ROI。
+    ///
+    /// # Errors
+    ///
+    /// 文件加载失败、RAW 参数无效或 ROI 超出图像范围时返回错误。
     pub fn load_raw_and_analyze<L>(
         loader: &L,
         request: LocalRawAnalyzeRequest,

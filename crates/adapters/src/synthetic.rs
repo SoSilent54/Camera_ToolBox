@@ -103,7 +103,6 @@ const fn synthetic_raw_spec() -> RawSpec {
         width: 2,
         height: 2,
         bit_depth: 10,
-        stride_pixels: 2,
         bayer: BayerPattern::Rggb,
     }
 }

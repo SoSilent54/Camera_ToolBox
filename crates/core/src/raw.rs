@@ -16,7 +16,6 @@ pub struct RawSpec {
     pub width: u32,
     pub height: u32,
     pub bit_depth: u8,
-    pub stride_pixels: u32,
     pub bayer: BayerPattern,
 }
 
@@ -36,17 +35,16 @@ impl RawEncoding {
 }
 
 impl RawSpec {
+    /// 校验分辨率与有效位深。
+    ///
+    /// # Errors
+    ///
+    /// 分辨率为零或有效位深不在 `1..=16` 时返回错误。
     pub fn validate(&self) -> Result<(), RawFrameError> {
         if self.width == 0 || self.height == 0 {
             return Err(RawFrameError::InvalidDimensions {
                 width: self.width,
                 height: self.height,
-            });
-        }
-        if self.stride_pixels < self.width {
-            return Err(RawFrameError::InvalidStride {
-                width: self.width,
-                stride_pixels: self.stride_pixels,
             });
         }
         if !(1..=16).contains(&self.bit_depth) {
@@ -57,9 +55,15 @@ impl RawSpec {
         Ok(())
     }
 
-    #[must_use]
-    pub const fn pixel_count(&self) -> usize {
-        (self.stride_pixels as usize) * (self.height as usize)
+    /// 计算紧密排列的像素数量。
+    ///
+    /// # Errors
+    ///
+    /// `width * height` 超出当前平台地址空间时返回错误。
+    pub fn pixel_count(&self) -> Result<usize, RawFrameError> {
+        (self.width as usize)
+            .checked_mul(self.height as usize)
+            .ok_or(RawFrameError::SizeOverflow)
     }
 
     #[must_use]
@@ -67,7 +71,7 @@ impl RawSpec {
         if self.bit_depth >= 16 {
             u16::MAX
         } else {
-            ((1u32 << self.bit_depth) - 1) as u16
+            (1u16 << self.bit_depth) - 1
         }
     }
 }
@@ -79,10 +83,14 @@ pub struct RawFrame {
 }
 
 impl RawFrame {
-    /// 创建已解包 RAW 帧；长度必须等于 `stride_pixels * height`。
+    /// 创建紧密排列的已解包 RAW 帧；长度必须等于 `width * height`。
+    ///
+    /// # Errors
+    ///
+    /// RAW 规格无效、尺寸溢出或像素数量不匹配时返回错误。
     pub fn new(spec: RawSpec, pixels: Vec<u16>) -> Result<Self, RawFrameError> {
         spec.validate()?;
-        let expected = spec.pixel_count();
+        let expected = spec.pixel_count()?;
         let actual = pixels.len();
         if actual != expected {
             return Err(RawFrameError::PixelCountMismatch { expected, actual });
@@ -91,19 +99,26 @@ impl RawFrame {
     }
 
     /// 从本地 RAW 字节创建帧；当前只支持已解包 `u16le` 存储。
+    ///
+    /// # Errors
+    ///
+    /// RAW 规格无效、尺寸溢出或字节数量不匹配时返回错误。
     pub fn from_bytes(
         spec: RawSpec,
         encoding: RawEncoding,
         bytes: &[u8],
     ) -> Result<Self, RawFrameError> {
         spec.validate()?;
-        let expected = spec.pixel_count() * encoding.bytes_per_pixel();
+        let pixel_count = spec.pixel_count()?;
+        let expected = pixel_count
+            .checked_mul(encoding.bytes_per_pixel())
+            .ok_or(RawFrameError::SizeOverflow)?;
         let actual = bytes.len();
         if actual != expected {
             return Err(RawFrameError::ByteCountMismatch { expected, actual });
         }
 
-        let mut pixels = Vec::with_capacity(spec.pixel_count());
+        let mut pixels = Vec::with_capacity(pixel_count);
         match encoding {
             RawEncoding::U16Le => pixels.extend(
                 bytes
@@ -128,8 +143,8 @@ pub enum RawFrameError {
     ByteCountMismatch { expected: usize, actual: usize },
     #[error("raw dimensions must be non-zero: width={width}, height={height}")]
     InvalidDimensions { width: u32, height: u32 },
-    #[error("raw stride must be >= width: width={width}, stride_pixels={stride_pixels}")]
-    InvalidStride { width: u32, stride_pixels: u32 },
+    #[error("raw dimensions overflow host address space")]
+    SizeOverflow,
     #[error("raw bit depth must be in 1..=16, got {bit_depth}")]
     InvalidBitDepth { bit_depth: u8 },
 }
@@ -143,7 +158,6 @@ mod tests {
             width: 2,
             height: 2,
             bit_depth: 10,
-            stride_pixels: 2,
             bayer: BayerPattern::Rggb,
         }
     }

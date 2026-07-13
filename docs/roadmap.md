@@ -14,7 +14,7 @@
 
 验收：
 
-- CLI 能打开本地已解包 `u16le` RAW，并按显式 width/height/stride/bit depth 分析 ROI。
+- CLI 能打开本地紧密排列的已解包 `u16le` RAW，并按显式 width/height/bit depth 分析 ROI。
 - RAW spec 不匹配时拒绝分析，包括字节数不符、bit depth 越界、像素值超出当前 bit depth。
 - 同一 RAW 的统计结果可重复。
 - GUI 原型能用参数打开本地 RAW，显示灰度 preview、ROI 框和 hover 像素值。

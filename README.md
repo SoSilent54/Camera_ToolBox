@@ -31,9 +31,11 @@ Camera Toolbox
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace
-cargo test --workspace
+cargo check --workspace --all-targets --release --locked
+cargo test --workspace --release --locked
 ```
+
+项目将 `profile.dev` 配置为 release 等价代码生成，因此普通 `cargo build` / `cargo run` 也会启用优化并关闭 debug assertions；Cargo 仍会把这类普通命令的产物放在 `target/debug`。下列运行示例显式使用 `--release`，正式产物位于 `target/release`。
 
 ## CI 与发布
 
@@ -53,7 +55,7 @@ cargo test --workspace
 本地 RAW smoke：
 
 ```bash
-cargo run -p camera-toolbox-cli -- analyze-raw \
+cargo run --release -p camera-toolbox-cli -- analyze-raw \
   --raw <frame.raw> --width <w> --height <h> --bit-depth <n> \
   --encoding u16le --roi 0,0,<w>,<h>
 ```
@@ -61,12 +63,12 @@ cargo run -p camera-toolbox-cli -- analyze-raw \
 GUI 本地 RAW 预览：
 
 ```bash
-cargo run -p camera-toolbox-gui
+cargo run --release -p camera-toolbox-gui
 ```
 
-在菜单中选择 `File -> Open Raw...`，再在设置窗口填写 width、height、bit depth、stride 和 Bayer。当前只支持 unpacked `u16` little-endian。
+在菜单中选择 `File -> Open Raw...`，可手工填写或通过 `Select` 选择文件路径。软件会基于文件名、文件长度和有限像素样本生成 Preset，并自动应用评分最高的可加载候选；切换其他 Preset 会立即回填参数，手工修改 width、height、有效 bit depth、uint16 容器或端序后显示为 `Custom`。候选不是可靠识别，Bayer 仍须人工确认。
 
-当前只支持已解包 `u16le` RAW。RAW10/12 packed、debayer 和复杂 manifest 后续再加。
+当前只支持紧密排列、已解包的 `u16le` RAW。带行 padding 的 RAW、RAW10/12 packed、debayer 和复杂 manifest 后续再加。
 
 本地 RAW 路径也走 `app::Workflow::load_raw_and_analyze` 与 `RawFrameLoader` port；CLI/GUI 不直接解码或统计 RAW。
 

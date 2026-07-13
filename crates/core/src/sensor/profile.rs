@@ -103,7 +103,6 @@ impl SensorProfile {
                     width: 2,
                     height: 2,
                     bit_depth: 10,
-                    stride_pixels: 2,
                     bayer: BayerPattern::Rggb,
                 },
                 is_wdr: false,

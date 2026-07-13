@@ -27,7 +27,7 @@ struct AnalyzeRawArgs {
     /// Local RAW file path.
     #[arg(long)]
     raw: PathBuf,
-    /// Active image width, excluding stride padding.
+    /// Active image width.
     #[arg(long)]
     width: u32,
     /// Active image height.
@@ -36,9 +36,6 @@ struct AnalyzeRawArgs {
     /// Valid sample bit depth.
     #[arg(long)]
     bit_depth: u8,
-    /// Decoded row stride in pixels; defaults to width.
-    #[arg(long)]
-    stride_pixels: Option<u32>,
     /// Bayer metadata. Display is grayscale in this phase.
     #[arg(long, value_enum, default_value = "rggb")]
     bayer: BayerArg,
@@ -163,7 +160,6 @@ fn analyze_raw(args: AnalyzeRawArgs) -> Result<()> {
         width: args.width,
         height: args.height,
         bit_depth: args.bit_depth,
-        stride_pixels: args.stride_pixels.unwrap_or(args.width),
         bayer: args.bayer.into(),
     };
     let roi = args.roi.map(Into::into).unwrap_or(Roi {
@@ -184,11 +180,10 @@ fn analyze_raw(args: AnalyzeRawArgs) -> Result<()> {
     )?;
 
     println!(
-        "raw={} width={} height={} stride_pixels={} bit_depth={} roi={},{},{},{} min={} max={} mean={:.2} saturated={}/{}",
+        "raw={} width={} height={} bit_depth={} roi={},{},{},{} min={} max={} mean={:.2} saturated={}/{}",
         report.path.display(),
         report.frame.spec.width,
         report.frame.spec.height,
-        report.frame.spec.stride_pixels,
         report.frame.spec.bit_depth,
         report.roi.x,
         report.roi.y,

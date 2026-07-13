@@ -52,7 +52,7 @@ pub fn analyze_roi(frame: &RawFrame, roi: Roi) -> Result<RoiStats, AnalysisError
     let roi = roi
         .clamped_to(frame.spec.width, frame.spec.height)
         .ok_or(AnalysisError::EmptyRoi)?;
-    let stride = frame.spec.stride_pixels as usize;
+    let width = frame.spec.width as usize;
     let saturation_code = frame.spec.max_code_value();
     let pixels = frame.pixels();
 
@@ -63,7 +63,7 @@ pub fn analyze_roi(frame: &RawFrame, roi: Roi) -> Result<RoiStats, AnalysisError
     let mut total_pixels: u64 = 0;
 
     for row in roi.y..roi.y + roi.height {
-        let row_start = row as usize * stride;
+        let row_start = row as usize * width;
         for col in roi.x..roi.x + roi.width {
             let value = pixels[row_start + col as usize];
             min = min.min(value);
@@ -100,7 +100,6 @@ mod tests {
             width: 2,
             height: 2,
             bit_depth: 10,
-            stride_pixels: 2,
             bayer: BayerPattern::Rggb,
         };
         let frame = RawFrame::new(spec, vec![0, 1023, 10, 20]).unwrap();
