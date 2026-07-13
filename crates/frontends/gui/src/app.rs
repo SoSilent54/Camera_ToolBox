@@ -19,7 +19,7 @@ pub(crate) struct CameraToolboxApp {
     raw_dialog: RawOpenDialogState,
     status_message: String,
     display_mode: DisplayMode,
-    show_color_controls: bool,
+    color_panel_expanded: bool,
     color_worker: ColorRenderWorker,
     next_generation: u64,
 }
@@ -32,7 +32,7 @@ impl CameraToolboxApp {
             raw_dialog: RawOpenDialogState::default(),
             status_message: String::new(),
             display_mode: DisplayMode::Color,
-            show_color_controls: true,
+            color_panel_expanded: true,
             color_worker: ColorRenderWorker::new(context)?,
             next_generation: 1,
         })
@@ -137,9 +137,6 @@ impl CameraToolboxApp {
             request_color = true;
             ui.close();
         }
-        ui.add_enabled_ui(self.loaded.is_some(), |ui| {
-            ui.checkbox(&mut self.show_color_controls, "Show Color Controls");
-        });
         ui.separator();
         self.render_view_navigation(ui);
         request_color
@@ -188,16 +185,43 @@ impl CameraToolboxApp {
     }
 
     fn render_color_panel(&mut self, ui: &mut egui::Ui) {
-        if !self.show_color_controls || self.loaded.is_none() {
+        if self.loaded.is_none() {
             return;
         }
+        if !self.color_panel_expanded {
+            let mut expand = false;
+            egui::Panel::right("color_processing_rail")
+                .resizable(false)
+                .min_size(32.0)
+                .max_size(32.0)
+                .show(ui, |ui| {
+                    let response =
+                        ui.add_sized(egui::vec2(28.0, 28.0), egui::Button::new("‹").frame(false));
+                    expand = response.clicked();
+                    response.on_hover_text("Expand Color Processing");
+                });
+            if expand {
+                self.color_panel_expanded = true;
+            }
+            return;
+        }
+
         let mut should_submit = false;
+        let mut collapse = false;
         egui::Panel::right("color_processing")
             .resizable(true)
             .default_size(280.0)
             .min_size(240.0)
             .max_size(420.0)
             .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("Color Processing");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let response = ui.button("›");
+                        collapse = response.clicked();
+                        response.on_hover_text("Collapse Color Processing");
+                    });
+                });
                 let loaded = self.loaded.as_mut().expect("checked above");
                 let source_spec = loaded.frame.spec.clone();
                 let installed_revision = loaded.installed_revision();
@@ -211,6 +235,9 @@ impl CameraToolboxApp {
                 should_submit = response.params_changed
                     || (response.mode_changed && self.display_mode == DisplayMode::Color);
             });
+        if collapse {
+            self.color_panel_expanded = false;
+        }
         if should_submit {
             self.request_current_color();
         }
@@ -302,7 +329,7 @@ impl CameraToolboxApp {
             let _ = write!(
                 text,
                 " cfa={site:?} rgb8={},{},{}",
-                color.srgb.r, color.srgb.g, color.srgb.b
+                color.rgb8.r, color.rgb8.g, color.rgb8.b
             );
         }
         ui.label(text);

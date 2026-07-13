@@ -9,8 +9,8 @@ use std::{
 };
 
 use camera_toolbox_core::{
-    ColorPipelineParams, ColorRenderDiagnostics, ColorRenderError, PreparedBayer, RawFrame,
-    linear_rgb_to_srgb8,
+    ColorPipelineParams, ColorRenderDiagnostics, ColorRenderError, DisplayTransform, PreparedBayer,
+    RawFrame,
 };
 use eframe::egui::{self, ColorImage};
 
@@ -176,6 +176,7 @@ where
     F: FnMut() -> bool,
 {
     let prepared = PreparedBayer::new_with_cancel(frame, params, &mut is_cancelled)?;
+    let display_transform = DisplayTransform::new(params.display_gamma)?;
     let width = prepared.width() as usize;
     let height = prepared.height() as usize;
     let pixel_count = width
@@ -191,9 +192,9 @@ where
         let row_start = y as usize * width;
         for x in 0..prepared.width() {
             let (linear, missing) = prepared.linear_rgb_at(x, y)?;
-            let (srgb, clipped) = linear_rgb_to_srgb8(linear);
+            let (rgb8, clipped) = display_transform.encode(linear);
             diagnostics.record_pixel(missing, clipped);
-            pixels[row_start + x as usize] = egui::Color32::from_rgb(srgb.r, srgb.g, srgb.b);
+            pixels[row_start + x as usize] = egui::Color32::from_rgb(rgb8.r, rgb8.g, rgb8.b);
         }
     }
 
@@ -278,6 +279,20 @@ mod tests {
         assert_eq!(rendered.image.size, [2, 2]);
         assert_eq!(rendered.diagnostics.prepare.out_of_range_samples, 0);
         assert_eq!(rendered.diagnostics.missing_neighbor_channels, 0);
+    }
+
+    #[test]
+    fn rendering_uses_request_display_gamma() {
+        let gamma_request = request(1);
+        let gamma =
+            render_color_image(&gamma_request.frame, &gamma_request.params, || false).unwrap();
+
+        let mut linear_request = request(2);
+        linear_request.params.display_gamma = None;
+        let linear =
+            render_color_image(&linear_request.frame, &linear_request.params, || false).unwrap();
+
+        assert_ne!(gamma.image.pixels, linear.image.pixels);
     }
 
     #[test]

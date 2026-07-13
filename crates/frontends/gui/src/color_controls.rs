@@ -1,6 +1,8 @@
 //! 彩色预览参数状态与右侧控制面板。
 
-use camera_toolbox_core::{BayerPattern, CfaQuad, ColorPipelineParams, RawSpec};
+use camera_toolbox_core::{
+    BayerPattern, CfaQuad, ColorPipelineParams, DEFAULT_DISPLAY_GAMMA, RawSpec,
+};
 use eframe::egui;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,7 +25,6 @@ pub(crate) struct ColorEditState {
     pub(crate) params: ColorPipelineParams,
     pub(crate) link_black: bool,
     pub(crate) link_green: bool,
-    pub(crate) advanced_black: bool,
     pub(crate) revision: u64,
     pub(crate) submitted_revision: Option<u64>,
     pub(crate) render_error: Option<String>,
@@ -35,18 +36,10 @@ impl ColorEditState {
             params: ColorPipelineParams::for_spec(spec),
             link_black: true,
             link_green: true,
-            advanced_black: false,
             revision: 1,
             submitted_revision: None,
             render_error: None,
         }
-    }
-
-    pub(crate) fn reset(&mut self, spec: &RawSpec) {
-        self.params = ColorPipelineParams::for_spec(spec);
-        self.link_black = true;
-        self.link_green = true;
-        self.advanced_black = false;
     }
 
     pub(crate) fn touch(&mut self) {
@@ -70,6 +63,10 @@ impl ColorEditState {
     fn link_green_to_gr(&mut self) {
         self.params.gain.gb = self.params.gain.gr;
     }
+
+    fn set_gamma_enabled(&mut self, enabled: bool) {
+        self.params.display_gamma = enabled.then_some(DEFAULT_DISPLAY_GAMMA);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -85,20 +82,20 @@ pub(crate) fn render_color_controls(
     display_mode: &mut DisplayMode,
     installed_revision: Option<u64>,
 ) -> ColorControlsResponse {
-    ui.heading("Color Processing");
     let mut response = render_display_and_bayer(ui, state, display_mode);
+    response.params_changed |= render_display_gamma(ui, state);
     response.params_changed |= render_black_levels(ui, state, source_spec.max_code_value());
     response.params_changed |= render_channel_gains(ui, state);
 
     ui.separator();
     ui.label("Demosaic: Bilinear");
-    ui.label("Transfer: sRGB");
+    ui.label(if state.params.display_gamma.is_some() {
+        "Transfer: Gamma 2.2"
+    } else {
+        "Transfer: Linear"
+    });
     ui.small("输出为 sensor RGB 预览，不包含 CCM、LSC 或自动 AWB。");
     ui.separator();
-    if ui.button("Reset").clicked() {
-        state.reset(source_spec);
-        response.params_changed = true;
-    }
     render_status(ui, state, *display_mode, installed_revision);
 
     if response.params_changed {
@@ -143,49 +140,50 @@ fn render_display_and_bayer(
     response
 }
 
+fn render_display_gamma(ui: &mut egui::Ui, state: &mut ColorEditState) -> bool {
+    ui.separator();
+    let mut enabled = state.params.display_gamma.is_some();
+    if !ui
+        .checkbox(&mut enabled, "Gamma correction (2.2)")
+        .changed()
+    {
+        return false;
+    }
+    state.set_gamma_enabled(enabled);
+    true
+}
+
 fn render_black_levels(ui: &mut egui::Ui, state: &mut ColorEditState, max_code: u16) -> bool {
     ui.separator();
     ui.label("Black level (RAW code)");
     let max_black = max_code.saturating_sub(1);
     let mut changed = false;
+    let link_changed = ui
+        .checkbox(&mut state.link_black, "Link R / Gr / Gb / B")
+        .changed();
+    if link_changed && state.link_black {
+        state.link_black_to_r();
+        changed = true;
+    }
+
     if state.link_black {
         if drag_u16(ui, "All", &mut state.params.black_level.r, max_black) {
             state.link_black_to_r();
             changed = true;
         }
     } else {
-        ui.small("Per-CFA values are active; expand Advanced to edit.");
-    }
-
-    let was_open = state.advanced_black;
-    let advanced = egui::CollapsingHeader::new("Advanced")
-        .id_salt("advanced_black_levels")
-        .open(Some(was_open))
-        .show(ui, |ui| {
-            let link_changed = ui
-                .checkbox(&mut state.link_black, "Link R / Gr / Gb / B")
-                .changed();
-            if link_changed && state.link_black {
-                state.link_black_to_r();
-                changed = true;
-            }
-            if !state.link_black {
-                egui::Grid::new("color_black_grid")
-                    .num_columns(2)
-                    .show(ui, |ui| {
-                        changed |= drag_u16(ui, "R", &mut state.params.black_level.r, max_black);
-                        ui.end_row();
-                        changed |= drag_u16(ui, "Gr", &mut state.params.black_level.gr, max_black);
-                        ui.end_row();
-                        changed |= drag_u16(ui, "Gb", &mut state.params.black_level.gb, max_black);
-                        ui.end_row();
-                        changed |= drag_u16(ui, "B", &mut state.params.black_level.b, max_black);
-                        ui.end_row();
-                    });
-            }
-        });
-    if advanced.header_response.clicked() {
-        state.advanced_black = !was_open;
+        egui::Grid::new("color_black_grid")
+            .num_columns(2)
+            .show(ui, |ui| {
+                changed |= drag_u16(ui, "R", &mut state.params.black_level.r, max_black);
+                ui.end_row();
+                changed |= drag_u16(ui, "Gr", &mut state.params.black_level.gr, max_black);
+                ui.end_row();
+                changed |= drag_u16(ui, "Gb", &mut state.params.black_level.gb, max_black);
+                ui.end_row();
+                changed |= drag_u16(ui, "B", &mut state.params.black_level.b, max_black);
+                ui.end_row();
+            });
     }
     changed
 }
@@ -286,22 +284,14 @@ mod tests {
     }
 
     #[test]
-    fn reset_restores_source_bayer_and_neutral_values() {
-        let spec = spec();
-        let mut state = ColorEditState::new(&spec);
-        state.params.bayer = BayerPattern::Rggb;
-        state.params.black_level = CfaQuad::splat(64);
-        state.params.gain.r = 2.0;
-        state.advanced_black = true;
-        let previous_revision = state.revision;
+    fn gamma_switch_uses_default_exponent() {
+        let mut state = ColorEditState::new(&spec());
+        assert_eq!(state.params.display_gamma, Some(DEFAULT_DISPLAY_GAMMA));
 
-        state.reset(&spec);
-
-        assert_eq!(state.params, ColorPipelineParams::for_spec(&spec));
-        assert!(state.link_black);
-        assert!(state.link_green);
-        assert!(!state.advanced_black);
-        assert_eq!(state.revision, previous_revision);
+        state.set_gamma_enabled(false);
+        assert_eq!(state.params.display_gamma, None);
+        state.set_gamma_enabled(true);
+        assert_eq!(state.params.display_gamma, Some(DEFAULT_DISPLAY_GAMMA));
     }
 
     #[test]

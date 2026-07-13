@@ -11,8 +11,8 @@ pub mod sensor;
 pub use analysis::{AnalysisError, Roi, RoiStats, analyze_roi};
 pub use color::{
     BayerPrepareDiagnostics, CfaQuad, CfaSite, ColorPipelineParams, ColorPixel,
-    ColorRenderDiagnostics, ColorRenderError, LinearRgb, PreparedBayer, Srgb8, linear_rgb_to_srgb8,
-    render_pixel_at,
+    ColorRenderDiagnostics, ColorRenderError, DEFAULT_DISPLAY_GAMMA, DisplayTransform, LinearRgb,
+    PreparedBayer, Rgb8, render_pixel_at,
 };
 pub use raw::{BayerPattern, RawEncoding, RawFrame, RawFrameError, RawSpec};
 pub use raw_probe::{

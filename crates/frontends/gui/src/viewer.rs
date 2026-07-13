@@ -278,7 +278,7 @@ pub(crate) fn render_viewer(
                 let _ = write!(
                     text,
                     " cfa={site:?} rgb8={},{},{}",
-                    color.srgb.r, color.srgb.g, color.srgb.b
+                    color.rgb8.r, color.rgb8.g, color.rgb8.b
                 );
             }
         }

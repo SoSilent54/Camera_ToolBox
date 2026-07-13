@@ -9,6 +9,8 @@ const CROSS: [(i32, i32); 4] = [(-1, 0), (1, 0), (0, -1), (0, 1)];
 const DIAGONAL: [(i32, i32); 4] = [(-1, -1), (1, -1), (-1, 1), (1, 1)];
 const HORIZONTAL: [(i32, i32); 2] = [(-1, 0), (1, 0)];
 const VERTICAL: [(i32, i32); 2] = [(0, -1), (0, 1)];
+/// 默认显示 Gamma；用于将线性 RGB 编码为预览纹理的主观亮度。
+pub const DEFAULT_DISPLAY_GAMMA: f32 = 2.2;
 
 /// Bayer 2×2 单元中的四个物理位点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +58,8 @@ pub struct ColorPipelineParams {
     pub bayer: BayerPattern,
     pub black_level: CfaQuad<u16>,
     pub gain: CfaQuad<f32>,
+    /// `Some` 时将 clamp 后线性 RGB 做 `c^(1/gamma)`；`None` 直接线性量化。
+    pub display_gamma: Option<f32>,
 }
 
 impl ColorPipelineParams {
@@ -65,15 +69,16 @@ impl ColorPipelineParams {
             bayer: spec.bayer,
             black_level: CfaQuad::splat(0),
             gain: CfaQuad::splat(1.0),
+            display_gamma: Some(DEFAULT_DISPLAY_GAMMA),
         }
     }
 
-    /// 校验 black level 与通道增益。
+    /// 校验 black level、通道增益和显示 Gamma。
     ///
     /// # Errors
     ///
-    /// 最大码值为零、black level 不小于最大码值，或 gain 非有限值/超出
-    /// `[0, 16]` 时返回错误。
+    /// 最大码值为零、black level 不小于最大码值、gain 非有限值/超出
+    /// `[0, 16]`，或启用的 Gamma 非有限/非正时返回错误。
     pub fn validate(self, max_code: u16) -> Result<(), ColorRenderError> {
         if max_code == 0 {
             return Err(ColorRenderError::InvalidMaxCode);
@@ -92,6 +97,7 @@ impl ColorPipelineParams {
                 return Err(ColorRenderError::InvalidGain { site, value: gain });
             }
         }
+        DisplayTransform::new(self.display_gamma)?;
         Ok(())
     }
 }
@@ -104,12 +110,45 @@ pub struct LinearRgb {
     pub b: f32,
 }
 
-/// 可直接写入 8-bit GUI 纹理的 sRGB。
+/// 可直接写入 8-bit GUI 纹理的显示 RGB。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Srgb8 {
+pub struct Rgb8 {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+}
+/// 由已校验 Gamma 构造的显示变换；保证编码阶段不会接收无效指数。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayTransform {
+    display_gamma: Option<f32>,
+}
+
+impl DisplayTransform {
+    /// 构造显示变换。
+    ///
+    /// # Errors
+    ///
+    /// 启用的 Gamma 非有限或非正时返回错误。
+    pub fn new(display_gamma: Option<f32>) -> Result<Self, ColorRenderError> {
+        if let Some(gamma) = display_gamma
+            && (!gamma.is_finite() || gamma <= 0.0)
+        {
+            return Err(ColorRenderError::InvalidDisplayGamma { value: gamma });
+        }
+        Ok(Self { display_gamma })
+    }
+
+    /// 将线性 RGB clamp 后按此变换量化为 RGB8。
+    #[must_use]
+    pub fn encode(self, linear: LinearRgb) -> (Rgb8, u8) {
+        let (r, r_clipped) = encode_display_channel(linear.r, self.display_gamma);
+        let (g, g_clipped) = encode_display_channel(linear.g, self.display_gamma);
+        let (b, b_clipped) = encode_display_channel(linear.b, self.display_gamma);
+        (
+            Rgb8 { r, g, b },
+            u8::from(r_clipped) + u8::from(g_clipped) + u8::from(b_clipped),
+        )
+    }
 }
 
 /// black/gain 预处理阶段的输入诊断。
@@ -151,7 +190,7 @@ impl ColorRenderDiagnostics {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ColorPixel {
     pub linear: LinearRgb,
-    pub srgb: Srgb8,
+    pub rgb8: Rgb8,
     pub missing_neighbor_channels: u8,
     pub display_clipped_channels: u8,
 }
@@ -170,6 +209,8 @@ pub enum ColorRenderError {
     },
     #[error("gain for {site:?} must be finite and in 0..=16, got {value}")]
     InvalidGain { site: CfaSite, value: f32 },
+    #[error("display gamma must be finite and positive, got {value}")]
+    InvalidDisplayGamma { value: f32 },
     #[error("pixel ({x}, {y}) is outside {width}x{height}")]
     PixelOutOfBounds {
         x: u32,
@@ -332,25 +373,14 @@ pub fn render_pixel_at(
             correct_sample(raw, max_code, site, params).0
         },
     );
-    let (srgb, display_clipped_channels) = linear_rgb_to_srgb8(linear);
+    let display_transform = DisplayTransform::new(params.display_gamma)?;
+    let (rgb8, display_clipped_channels) = display_transform.encode(linear);
     Ok(ColorPixel {
         linear,
-        srgb,
+        rgb8,
         missing_neighbor_channels,
         display_clipped_channels,
     })
-}
-
-/// 将线性 RGB clamp 后按标准 sRGB OETF 编码为 8-bit。
-#[must_use]
-pub fn linear_rgb_to_srgb8(linear: LinearRgb) -> (Srgb8, u8) {
-    let (r, r_clipped) = encode_srgb_channel(linear.r);
-    let (g, g_clipped) = encode_srgb_channel(linear.g);
-    let (b, b_clipped) = encode_srgb_channel(linear.b);
-    (
-        Srgb8 { r, g, b },
-        u8::from(r_clipped) + u8::from(g_clipped) + u8::from(b_clipped),
-    )
 }
 
 fn validate_frame(frame: &RawFrame) -> Result<(usize, u16), ColorRenderError> {
@@ -504,9 +534,9 @@ where
     )
 }
 
-// `encoded` 已由 OETF 严格限制在 `[0, 1]`，量化后一定落在 `u8` 范围内。
+// `encoded` 已由 clamp 与可选 Gamma 严格限制在 `[0, 1]`，量化后一定落在 `u8` 范围内。
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-fn encode_srgb_channel(value: f32) -> (u8, bool) {
+fn encode_display_channel(value: f32, display_gamma: Option<f32>) -> (u8, bool) {
     let clipped = !value.is_finite() || !(0.0..=1.0).contains(&value);
     let bounded = if value.is_nan() || value == f32::NEG_INFINITY {
         0.0
@@ -515,11 +545,7 @@ fn encode_srgb_channel(value: f32) -> (u8, bool) {
     } else {
         value.clamp(0.0, 1.0)
     };
-    let encoded = if bounded <= 0.003_130_8 {
-        12.92 * bounded
-    } else {
-        1.055 * bounded.powf(1.0 / 2.4) - 0.055
-    };
+    let encoded = display_gamma.map_or(bounded, |gamma| bounded.powf(1.0 / gamma));
     ((encoded * 255.0).round() as u8, clipped)
 }
 
@@ -610,6 +636,15 @@ mod tests {
                 })
             ));
         }
+        params.gain.gb = 1.0;
+        assert_eq!(params.display_gamma, Some(DEFAULT_DISPLAY_GAMMA));
+        for invalid in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            params.display_gamma = Some(invalid);
+            assert!(matches!(
+                params.validate(1023),
+                Err(ColorRenderError::InvalidDisplayGamma { .. })
+            ));
+        }
     }
 
     #[test]
@@ -624,6 +659,7 @@ mod tests {
                 gb: 30,
                 b: 40,
             },
+            display_gamma: Some(DEFAULT_DISPLAY_GAMMA),
             gain: CfaQuad {
                 r: 1.0,
                 gr: 2.0,
@@ -771,29 +807,38 @@ mod tests {
     }
 
     #[test]
-    fn encodes_linear_rgb_with_srgb_transfer_and_clipping() {
-        let (encoded, clipped) = linear_rgb_to_srgb8(LinearRgb {
+    fn encodes_linear_rgb_with_optional_gamma_and_clipping() {
+        let gamma = DisplayTransform::new(Some(DEFAULT_DISPLAY_GAMMA)).unwrap();
+        let (encoded, clipped) = gamma.encode(LinearRgb {
             r: 0.0,
-            g: 0.003_130_8,
+            g: 0.25,
             b: 1.0,
         });
         assert_eq!(
             encoded,
-            Srgb8 {
+            Rgb8 {
                 r: 0,
-                g: 10,
+                g: 136,
                 b: 255
             }
         );
         assert_eq!(clipped, 0);
 
-        let (encoded, clipped) = linear_rgb_to_srgb8(LinearRgb {
+        let linear = DisplayTransform::new(None).unwrap();
+        let (encoded, clipped) = linear.encode(LinearRgb {
             r: -0.1,
-            g: f32::NAN,
+            g: 0.25,
             b: f32::INFINITY,
         });
-        assert_eq!(encoded, Srgb8 { r: 0, g: 0, b: 255 });
-        assert_eq!(clipped, 3);
+        assert_eq!(
+            encoded,
+            Rgb8 {
+                r: 0,
+                g: 64,
+                b: 255
+            }
+        );
+        assert_eq!(clipped, 2);
     }
 
     #[test]
@@ -807,11 +852,13 @@ mod tests {
         let params = ColorPipelineParams::for_spec(&raw.spec);
         let prepared = PreparedBayer::new(&raw, &params).unwrap();
         let (linear, missing) = prepared.linear_rgb_at(1, 1).unwrap();
-        let (srgb, clipped) = linear_rgb_to_srgb8(linear);
+        let (rgb8, clipped) = DisplayTransform::new(params.display_gamma)
+            .unwrap()
+            .encode(linear);
         let direct = render_pixel_at(&raw, &params, 1, 1).unwrap();
 
         assert_eq!(direct.linear, linear);
-        assert_eq!(direct.srgb, srgb);
+        assert_eq!(direct.rgb8, rgb8);
         assert_eq!(direct.missing_neighbor_channels, missing);
         assert_eq!(direct.display_clipped_channels, clipped);
     }
