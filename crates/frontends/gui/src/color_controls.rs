@@ -5,6 +5,9 @@ use camera_toolbox_core::{
 };
 use eframe::egui;
 
+const MIN_DISPLAY_GAMMA: f32 = 0.1;
+const MAX_DISPLAY_GAMMA: f32 = 5.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
     RawMono,
@@ -23,6 +26,7 @@ impl DisplayMode {
 #[derive(Debug, Clone)]
 pub(crate) struct ColorEditState {
     pub(crate) params: ColorPipelineParams,
+    gamma_value: f32,
     pub(crate) link_black: bool,
     pub(crate) link_green: bool,
     pub(crate) revision: u64,
@@ -32,8 +36,11 @@ pub(crate) struct ColorEditState {
 
 impl ColorEditState {
     pub(crate) fn new(spec: &RawSpec) -> Self {
+        let params = ColorPipelineParams::for_spec(spec);
+        let gamma_value = params.display_gamma.unwrap_or(DEFAULT_DISPLAY_GAMMA);
         Self {
-            params: ColorPipelineParams::for_spec(spec),
+            params,
+            gamma_value,
             link_black: true,
             link_green: true,
             revision: 1,
@@ -65,7 +72,14 @@ impl ColorEditState {
     }
 
     fn set_gamma_enabled(&mut self, enabled: bool) {
-        self.params.display_gamma = enabled.then_some(DEFAULT_DISPLAY_GAMMA);
+        self.params.display_gamma = enabled.then_some(self.gamma_value);
+    }
+
+    fn set_gamma_value(&mut self, value: f32) {
+        self.gamma_value = value.clamp(MIN_DISPLAY_GAMMA, MAX_DISPLAY_GAMMA);
+        if self.params.display_gamma.is_some() {
+            self.params.display_gamma = Some(self.gamma_value);
+        }
     }
 }
 
@@ -87,15 +101,6 @@ pub(crate) fn render_color_controls(
     response.params_changed |= render_black_levels(ui, state, source_spec.max_code_value());
     response.params_changed |= render_channel_gains(ui, state);
 
-    ui.separator();
-    ui.label("Demosaic: Bilinear");
-    ui.label(if state.params.display_gamma.is_some() {
-        "Transfer: Gamma 2.2"
-    } else {
-        "Transfer: Linear"
-    });
-    ui.small("输出为 sensor RGB 预览，不包含 CCM、LSC 或自动 AWB。");
-    ui.separator();
     render_status(ui, state, *display_mode, installed_revision);
 
     if response.params_changed {
@@ -142,15 +147,33 @@ fn render_display_and_bayer(
 
 fn render_display_gamma(ui: &mut egui::Ui, state: &mut ColorEditState) -> bool {
     ui.separator();
+    let mut changed = false;
     let mut enabled = state.params.display_gamma.is_some();
-    if !ui
-        .checkbox(&mut enabled, "Gamma correction (2.2)")
-        .changed()
-    {
-        return false;
+    if ui.checkbox(&mut enabled, "Gamma correction").changed() {
+        state.set_gamma_enabled(enabled);
+        changed = true;
     }
-    state.set_gamma_enabled(enabled);
-    true
+
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.horizontal(|ui| {
+            ui.label("Gamma");
+            let mut gamma_value = state.gamma_value;
+            if ui
+                .add(
+                    egui::DragValue::new(&mut gamma_value)
+                        .range(MIN_DISPLAY_GAMMA..=MAX_DISPLAY_GAMMA)
+                        .speed(0.05)
+                        .fixed_decimals(2)
+                        .update_while_editing(false),
+                )
+                .changed()
+            {
+                state.set_gamma_value(gamma_value);
+                changed = true;
+            }
+        });
+    });
+    changed
 }
 
 fn render_black_levels(ui: &mut egui::Ui, state: &mut ColorEditState, max_code: u16) -> bool {
@@ -233,8 +256,6 @@ fn render_status(
             ui.spinner();
             ui.label("Rendering color preview…");
         });
-    } else if installed_revision == Some(state.revision) {
-        ui.small(format!("Rendered revision {}", state.revision));
     }
 }
 
@@ -283,15 +304,32 @@ mod tests {
         }
     }
 
-    #[test]
-    fn gamma_switch_uses_default_exponent() {
-        let mut state = ColorEditState::new(&spec());
-        assert_eq!(state.params.display_gamma, Some(DEFAULT_DISPLAY_GAMMA));
+    fn assert_gamma(actual: Option<f32>, expected: f32) {
+        let actual = actual.expect("Gamma should be enabled");
+        assert!((actual - expected).abs() < f32::EPSILON);
+    }
 
+    #[test]
+    fn gamma_switch_restores_last_custom_exponent() {
+        let mut state = ColorEditState::new(&spec());
+        assert_gamma(Some(state.gamma_value), DEFAULT_DISPLAY_GAMMA);
+        assert_gamma(state.params.display_gamma, DEFAULT_DISPLAY_GAMMA);
+
+        state.set_gamma_value(1.8);
+        assert_gamma(state.params.display_gamma, 1.8);
         state.set_gamma_enabled(false);
         assert_eq!(state.params.display_gamma, None);
         state.set_gamma_enabled(true);
-        assert_eq!(state.params.display_gamma, Some(DEFAULT_DISPLAY_GAMMA));
+        assert_gamma(state.params.display_gamma, 1.8);
+    }
+
+    #[test]
+    fn gamma_control_value_is_clamped_to_ui_range() {
+        let mut state = ColorEditState::new(&spec());
+        state.set_gamma_value(0.0);
+        assert_gamma(state.params.display_gamma, MIN_DISPLAY_GAMMA);
+        state.set_gamma_value(10.0);
+        assert_gamma(state.params.display_gamma, MAX_DISPLAY_GAMMA);
     }
 
     #[test]

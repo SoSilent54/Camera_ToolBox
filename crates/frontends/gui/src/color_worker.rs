@@ -282,17 +282,24 @@ mod tests {
     }
 
     #[test]
-    fn rendering_uses_request_display_gamma() {
-        let gamma_request = request(1);
-        let gamma =
-            render_color_image(&gamma_request.frame, &gamma_request.params, || false).unwrap();
+    fn rendering_uses_request_display_gamma_modes() {
+        let default_request = request(1);
+        let default =
+            render_color_image(&default_request.frame, &default_request.params, || false).unwrap();
 
-        let mut linear_request = request(2);
+        let mut custom_request = request(2);
+        custom_request.params.display_gamma = Some(1.4);
+        let custom =
+            render_color_image(&custom_request.frame, &custom_request.params, || false).unwrap();
+
+        let mut linear_request = request(3);
         linear_request.params.display_gamma = None;
         let linear =
             render_color_image(&linear_request.frame, &linear_request.params, || false).unwrap();
 
-        assert_ne!(gamma.image.pixels, linear.image.pixels);
+        assert_ne!(custom.image.pixels, default.image.pixels);
+        assert_ne!(custom.image.pixels, linear.image.pixels);
+        assert_ne!(default.image.pixels, linear.image.pixels);
     }
 
     #[test]

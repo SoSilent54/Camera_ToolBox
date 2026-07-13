@@ -18,7 +18,7 @@
 - RAW spec 的字节数或 bit depth 非法时拒绝分析；像素超过当前 bit depth 时保留原值，GUI 通过 Mono 洋红、Color clamp 与 diagnostics 明确告警。
 - 同一 RAW 的统计结果可重复。
 - GUI 能用参数打开本地 RAW，切换 Raw Mono/Color，显示 ROI、hover 原始值及当前已安装彩色纹理对应的 RGB。
-- 彩色预览支持四种 Bayer、R/Gr/Gb/B black/gain、bilinear demosaic 和默认开启且可关闭的 Gamma 2.2 显示；自动 BLC/AWB、CCM、LSC、edge-aware demosaic 显式 deferred。
+- 彩色预览支持四种 Bayer、R/Gr/Gb/B black/gain、bilinear demosaic，以及默认 2.2、可在 GUI 调节并可关闭的 Gamma 显示；自动 BLC/AWB、CCM、LSC、edge-aware demosaic 显式 deferred。
 
 ## P1：受控手动操作
 

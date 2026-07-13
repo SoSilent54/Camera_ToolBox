@@ -645,6 +645,8 @@ mod tests {
                 Err(ColorRenderError::InvalidDisplayGamma { .. })
             ));
         }
+        params.display_gamma = Some(10.0);
+        assert!(params.validate(1023).is_ok());
     }
 
     #[test]
@@ -823,6 +825,22 @@ mod tests {
             }
         );
         assert_eq!(clipped, 0);
+
+        let custom_gamma = DisplayTransform::new(Some(4.0)).unwrap();
+        let (custom_encoded, custom_clipped) = custom_gamma.encode(LinearRgb {
+            r: 0.0,
+            g: 0.25,
+            b: 1.0,
+        });
+        assert_eq!(
+            custom_encoded,
+            Rgb8 {
+                r: 0,
+                g: 180,
+                b: 255
+            }
+        );
+        assert_eq!(custom_clipped, 0);
 
         let linear = DisplayTransform::new(None).unwrap();
         let (encoded, clipped) = linear.encode(LinearRgb {

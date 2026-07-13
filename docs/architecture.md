@@ -44,7 +44,7 @@ Workflow::load_raw_and_analyze
    │    ├ RawFrameLoader port 调用 LocalRawLoader adapter
    │    ├ core raw 按显式 `RawSpec` 校验紧密布局字节数、bit depth 和像素范围
    │    ├ core analysis 计算 ROI 统计
-   │    └ GUI 保留不可变 report.frame；core 执行 BLC/gain/bilinear/可选 Gamma 2.2 纯计算，后台 worker latest-wins 重建彩色纹理
+   │    └ GUI 保留不可变 report.frame；core 执行 BLC/gain/bilinear/可选可调 Gamma 纯计算，后台 worker latest-wins 重建彩色纹理
    ▼
 WorkflowEvent stream
    │
@@ -83,7 +83,7 @@ P0 允许的手动命令只包含只读动作，例如 `ManualCapture`、`LoadRa
 |---|---|---|
 | `RawSpec` | `core` | 描述紧密排列 RAW 的分辨率、bit depth、packing 和 CFA。 |
 | `RawFrame` | `core` | 持有已解包的 RAW 像素和对应规格。 |
-| `ColorPipelineParams` / `PreparedBayer` | `core` | 校验四 CFA 通道 black/gain 与可选正 Gamma，并生成可双线性去马赛克的线性 Bayer 派生数据；不修改 `RawFrame`。 |
+| `ColorPipelineParams` / `PreparedBayer` | `core` | 校验四 CFA 通道 black/gain 与可选 finite 正 Gamma，并生成可双线性去马赛克的线性 Bayer 派生数据；不修改 `RawFrame`。GUI 将 Gamma 操作范围限制为 0.1–5.0，但不收窄 core API。 |
 | `Roi` | `core` | 使用图像坐标定义统计区域。 |
 | `RoiStats` | `core` | ROI 内 min/max/mean/saturation 等定量结果。 |
 | `CommandEnvelope` | `app` | UI/CLI 提交给 workflow 的统一命令封装。 |
