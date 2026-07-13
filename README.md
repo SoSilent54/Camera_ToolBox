@@ -38,6 +38,7 @@ cargo test --workspace
 ## CI 与发布
 
 - 每个分支 push 会在 Ubuntu 22 上执行格式检查、全 workspace target 编译、测试和 Clippy。当前 Clippy 仅报告既有 warning，不以 `-D warnings` 使 CI 失败。
+- 也可在 GitHub `Actions -> CI -> Run workflow` 中手动执行同一套 CI 检查。
 - 推送任意 Git tag 会创建或更新同名 GitHub Release，并发布以下归档：
   - `camera-toolbox-macos-aarch64.tar.gz`
   - `camera-toolbox-windows-x86_64.zip`
@@ -45,6 +46,7 @@ cargo test --workspace
   - `camera-toolbox-linux-x86_64-ubuntu22.tar.gz`
   - `camera-toolbox-linux-aarch64-ubuntu20.tar.gz`
   - `camera-toolbox-linux-aarch64-ubuntu22.tar.gz`
+- 也可在 GitHub `Actions -> Release -> Run workflow` 中选择待构建的分支或 ref，并填写必填 `tag`；Release 会使用该 tag，并以本次运行的提交 SHA 为目标。
 - Ubuntu 20/22 Linux 归档分别在官方 `ubuntu:20.04` / `ubuntu:22.04` 容器中构建；x86_64 与 aarch64 各自使用匹配架构的 GitHub-hosted Linux runner，不依赖已不在当前 runner 标签列表中的 `ubuntu-20.04` hosted runner。
 
 
