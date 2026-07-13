@@ -1,4 +1,6 @@
 mod app;
+mod color_controls;
+mod color_worker;
 mod raw_dialog;
 mod viewer;
 
@@ -17,7 +19,7 @@ fn main() -> Result<()> {
         native_options,
         Box::new(|creation_context| {
             install_cjk_fonts(&creation_context.egui_ctx);
-            Ok(Box::<CameraToolboxApp>::default())
+            Ok(Box::new(CameraToolboxApp::new(&creation_context.egui_ctx)?))
         }),
     )
     .map_err(|err| anyhow!(err.to_string()))?;

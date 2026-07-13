@@ -1,8 +1,15 @@
 //! RAW Viewer 显示、缩放、hover 与 minimap。
 
+use std::{fmt::Write as _, sync::Arc};
+
 use camera_toolbox_app::LocalRawAnalyzeReport;
-use camera_toolbox_core::{BayerPattern, RawFrame, Roi, RoiStats};
-use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use camera_toolbox_core::{
+    BayerPattern, ColorPipelineParams, ColorPixel, ColorRenderDiagnostics, RawFrame, Roi, RoiStats,
+    render_pixel_at,
+};
+use eframe::egui::{self, ColorImage, TextureHandle, TextureId, TextureOptions};
+
+use crate::color_controls::{ColorEditState, DisplayMode};
 
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 64.0;
@@ -22,31 +29,101 @@ impl RawDiagnostics {
     }
 }
 
+pub(crate) struct InstalledColorPreview {
+    texture: TextureHandle,
+    pub(crate) rendered_params: ColorPipelineParams,
+    pub(crate) rendered_revision: u64,
+    pub(crate) diagnostics: ColorRenderDiagnostics,
+}
+
 pub(crate) struct LoadedRaw {
+    pub(crate) generation: u64,
     pub(crate) path: std::path::PathBuf,
-    pub(crate) frame: RawFrame,
+    pub(crate) frame: Arc<RawFrame>,
     pub(crate) roi: Roi,
     pub(crate) stats: RoiStats,
-    texture: TextureHandle,
+    raw_texture: TextureHandle,
+    pub(crate) installed_color: Option<InstalledColorPreview>,
+    pub(crate) color_edit: ColorEditState,
     pub(crate) diagnostics: RawDiagnostics,
 }
 
 impl LoadedRaw {
-    pub(crate) fn from_report(context: &egui::Context, report: LocalRawAnalyzeReport) -> Self {
+    pub(crate) fn from_report(
+        context: &egui::Context,
+        report: LocalRawAnalyzeReport,
+        generation: u64,
+    ) -> Self {
         let (image, diagnostics) = preview_with_diagnostics(&report.frame);
-        let texture = context.load_texture(
-            format!("local-raw-preview:{}", report.path.display()),
+        let raw_texture = context.load_texture(
+            format!("local-raw-preview:{generation}:{}", report.path.display()),
             image,
             raw_texture_options(),
         );
+        let color_edit = ColorEditState::new(&report.frame.spec);
         Self {
+            generation,
             path: report.path,
-            frame: report.frame,
+            frame: Arc::new(report.frame),
             roi: report.roi,
             stats: report.stats,
-            texture,
+            raw_texture,
+            installed_color: None,
+            color_edit,
             diagnostics,
         }
+    }
+
+    pub(crate) fn install_color(
+        &mut self,
+        context: &egui::Context,
+        revision: u64,
+        params: ColorPipelineParams,
+        image: ColorImage,
+        diagnostics: ColorRenderDiagnostics,
+    ) {
+        let texture = if let Some(mut installed) = self.installed_color.take() {
+            installed.texture.set(image, raw_texture_options());
+            installed.texture
+        } else {
+            context.load_texture(
+                format!("local-raw-color:{}", self.generation),
+                image,
+                raw_texture_options(),
+            )
+        };
+        self.installed_color = Some(InstalledColorPreview {
+            texture,
+            rendered_params: params,
+            rendered_revision: revision,
+            diagnostics,
+        });
+    }
+
+    pub(crate) fn installed_revision(&self) -> Option<u64> {
+        self.installed_color
+            .as_ref()
+            .map(|preview| preview.rendered_revision)
+    }
+
+    fn active_texture_id(&self, display_mode: DisplayMode) -> TextureId {
+        if display_mode == DisplayMode::Color
+            && let Some(preview) = &self.installed_color
+        {
+            return preview.texture.id();
+        }
+        self.raw_texture.id()
+    }
+
+    pub(crate) fn rendered_pixel(
+        &self,
+        display_mode: DisplayMode,
+        cursor: CursorPixel,
+    ) -> Option<ColorPixel> {
+        let preview = (display_mode == DisplayMode::Color)
+            .then_some(self.installed_color.as_ref())
+            .flatten()?;
+        render_pixel_at(&self.frame, &preview.rendered_params, cursor.x, cursor.y).ok()
     }
 }
 
@@ -63,6 +140,7 @@ pub(crate) struct ImageViewerState {
     pan: egui::Vec2,
     pub(crate) fit_on_next_frame: bool,
     pub(crate) cursor: Option<CursorPixel>,
+    last_image_rect: Option<egui::Rect>,
 }
 
 impl Default for ImageViewerState {
@@ -72,6 +150,7 @@ impl Default for ImageViewerState {
             pan: egui::Vec2::ZERO,
             fit_on_next_frame: true,
             cursor: None,
+            last_image_rect: None,
         }
     }
 }
@@ -113,12 +192,23 @@ impl ImageViewerState {
             egui::vec2(image_width * self.zoom, image_height * self.zoom),
         )
     }
+
+    pub(crate) fn refresh_cursor(&mut self, context: &egui::Context, loaded: Option<&LoadedRaw>) {
+        let pointer = context.input(|input| input.pointer.hover_pos());
+        self.cursor = match (pointer, self.last_image_rect, loaded) {
+            (Some(position), Some(image_rect), Some(loaded)) => {
+                hover_pixel(image_rect, position, &loaded.frame)
+            }
+            _ => None,
+        };
+    }
 }
 
 pub(crate) fn render_viewer(
     ui: &mut egui::Ui,
     loaded: Option<&LoadedRaw>,
     viewer: &mut ImageViewerState,
+    display_mode: DisplayMode,
 ) {
     let available = ui.available_size().max(egui::vec2(1.0, 1.0));
     let (viewer_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
@@ -134,6 +224,7 @@ pub(crate) fn render_viewer(
             egui::Color32::GRAY,
         );
         viewer.cursor = None;
+        viewer.last_image_rect = None;
         return;
     };
 
@@ -162,12 +253,14 @@ pub(crate) fn render_viewer(
         loaded.frame.spec.width as f32,
         loaded.frame.spec.height as f32,
     );
+    let active_texture_id = loaded.active_texture_id(display_mode);
     painter.image(
-        loaded.texture.id(),
+        active_texture_id,
         image_rect,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
     );
+    viewer.last_image_rect = Some(image_rect);
     draw_roi_overlay(&painter, image_rect, &loaded.frame, loaded.roi);
     draw_raw_warning_overlay(&painter, viewer_rect, loaded);
 
@@ -175,13 +268,24 @@ pub(crate) fn render_viewer(
         .hover_pos()
         .and_then(|position| hover_pixel(image_rect, position, &loaded.frame));
     if let Some(cursor) = viewer.cursor {
-        response.on_hover_text(format!(
-            "x={} y={} raw={}",
-            cursor.x, cursor.y, cursor.value
-        ));
+        let mut text = format!("x={} y={} raw={}", cursor.x, cursor.y, cursor.value);
+        if let Some(color) = loaded.rendered_pixel(display_mode, cursor) {
+            let site = loaded
+                .installed_color
+                .as_ref()
+                .map(|preview| preview.rendered_params.bayer.site_at(cursor.x, cursor.y));
+            if let Some(site) = site {
+                let _ = write!(
+                    text,
+                    " cfa={site:?} rgb8={},{},{}",
+                    color.srgb.r, color.srgb.g, color.srgb.b
+                );
+            }
+        }
+        response.on_hover_text(text);
     }
 
-    draw_minimap(&painter, viewer_rect, image_rect, loaded);
+    draw_minimap(&painter, viewer_rect, image_rect, loaded, active_texture_id);
 }
 
 /// 缩小时使用 mipmap 抑制混叠，放大时保持单像素边界。
@@ -309,6 +413,7 @@ fn draw_minimap(
     viewer_rect: egui::Rect,
     image_rect: egui::Rect,
     loaded: &LoadedRaw,
+    texture_id: TextureId,
 ) {
     let image_width = loaded.frame.spec.width as f32;
     let image_height = loaded.frame.spec.height as f32;
@@ -334,7 +439,7 @@ fn draw_minimap(
         egui::Color32::from_black_alpha(180),
     );
     painter.image(
-        loaded.texture.id(),
+        texture_id,
         minimap_rect,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,

@@ -10,15 +10,15 @@
 
 ## P0：只读闭环
 
-目标：先把本地 RAW 加载、解码、分析和 GUI 灰度显示串通；sensor 取图、SSH/SFTP、寄存器读写、自动曝光暂不做。
+目标：先把本地 RAW 加载、解码、分析和 GUI 灰度/基础彩色显示串通；sensor 取图、SSH/SFTP、寄存器读写、自动曝光暂不做。
 
 验收：
 
 - CLI 能打开本地紧密排列的已解包 `u16le` RAW，并按显式 width/height/bit depth 分析 ROI。
-- RAW spec 不匹配时拒绝分析，包括字节数不符、bit depth 越界、像素值超出当前 bit depth。
+- RAW spec 的字节数或 bit depth 非法时拒绝分析；像素超过当前 bit depth 时保留原值，GUI 通过 Mono 洋红、Color clamp 与 diagnostics 明确告警。
 - 同一 RAW 的统计结果可重复。
-- GUI 原型能用参数打开本地 RAW，显示灰度 preview、ROI 框和 hover 像素值。
-- RAW10/12 packed、Bayer debayer、复杂 JSON manifest 显式 deferred，不在 P0 基础显示范围内。
+- GUI 能用参数打开本地 RAW，切换 Raw Mono/Color，显示 ROI、hover 原始值及当前已安装彩色纹理对应的 RGB。
+- 彩色预览支持四种 Bayer、R/Gr/Gb/B black/gain、bilinear demosaic 和 sRGB 显示；自动 BLC/AWB、CCM、LSC、edge-aware demosaic 显式 deferred。
 
 ## P1：受控手动操作
 

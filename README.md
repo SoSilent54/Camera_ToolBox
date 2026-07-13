@@ -68,7 +68,9 @@ cargo run --release -p camera-toolbox-gui
 
 在菜单中选择 `File -> Open Raw...`，可手工填写或通过 `Select` 选择文件路径。软件会基于文件名、文件长度和有限像素样本生成 Preset，并自动应用评分最高的可加载候选；切换其他 Preset 会立即回填参数，手工修改 width、height、有效 bit depth、uint16 容器或端序后显示为 `Custom`。候选不是可靠识别，Bayer 仍须人工确认。
 
-当前只支持紧密排列、已解包的 `u16le` RAW。带行 padding 的 RAW、RAW10/12 packed、debayer 和复杂 manifest 后续再加。
+加载成功后默认显示 `Color`，右侧 `Color Processing` 面板可实时调整 Bayer、R/Gr/Gb/B black level 与通道 gain；默认链接四通道 black 和 Gr/Gb gain。显示链路固定为 black subtraction → `(max_code-black)` 归一化 → CFA gain → bilinear demosaic → linear-to-sRGB。`View` 菜单可切换 `Raw Mono`、`Color`，并显示/隐藏参数面板。
+
+当前只支持紧密排列、已解包的 `u16le` Bayer RAW。彩色预览不包含自动 black level/AWB、CCM、LSC、降噪或 edge-aware demosaic，因此属于 sensor RGB 查验，不代表标定后的准确 sRGB。带行 padding、RAW10/12 packed 和复杂 manifest 后续再加。
 
 本地 RAW 路径也走 `app::Workflow::load_raw_and_analyze` 与 `RawFrameLoader` port；CLI/GUI 不直接解码或统计 RAW。
 
