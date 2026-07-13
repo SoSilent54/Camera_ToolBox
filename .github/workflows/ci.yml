@@ -1,0 +1,51 @@
+name: CI
+
+"on":
+  push:
+    branches:
+      - "**"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Rust quality checks
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            pkg-config \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev
+
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check all workspace targets
+        run: cargo check --workspace --all-targets --locked
+
+      - name: Run workspace tests
+        run: cargo test --workspace --locked
+
+      - name: Report Clippy diagnostics
+        run: cargo clippy --workspace --all-targets --locked
