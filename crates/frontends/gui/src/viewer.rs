@@ -912,6 +912,14 @@ mod tests {
             egui::pos2(116.0, 116.0)
         );
         assert_eq!(
+            hover_view_position(egui::pos2(790.0, 100.0), viewport),
+            egui::pos2(326.0, 116.0)
+        );
+        assert_eq!(
+            hover_view_position(egui::pos2(100.0, 590.0), viewport),
+            egui::pos2(116.0, 390.0)
+        );
+        assert_eq!(
             hover_view_position(egui::pos2(790.0, 590.0), viewport),
             egui::pos2(326.0, 390.0)
         );
