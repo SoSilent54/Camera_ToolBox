@@ -1,6 +1,6 @@
 //! GUI 顶层状态与界面编排。
 
-use std::{fmt::Write as _, sync::Arc};
+use std::sync::Arc;
 
 use camera_toolbox_adapters::LocalRawLoader;
 use camera_toolbox_app::{LocalRawAnalyzeRequest, Workflow};
@@ -10,16 +10,19 @@ use crate::{
     color_controls::{DisplayMode, render_color_controls},
     color_worker::{ColorRenderRequest, ColorRenderWorker},
     raw_dialog::RawOpenDialogState,
-    viewer::{ImageViewerState, LoadedRaw, bayer_label, render_viewer},
+    viewer::{
+        HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, bayer_label,
+        render_viewer,
+    },
 };
 
 pub(crate) struct CameraToolboxApp {
     loaded: Option<LoadedRaw>,
     viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
-    status_message: String,
     display_mode: DisplayMode,
     color_panel_expanded: bool,
+    hover_view: HoverViewSettings,
     color_worker: ColorRenderWorker,
     next_generation: u64,
 }
@@ -30,9 +33,9 @@ impl CameraToolboxApp {
             loaded: None,
             viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
-            status_message: String::new(),
             display_mode: DisplayMode::Color,
             color_panel_expanded: true,
+            hover_view: HoverViewSettings::default(),
             color_worker: ColorRenderWorker::new(context)?,
             next_generation: 1,
         })
@@ -43,7 +46,6 @@ impl eframe::App for CameraToolboxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.poll_color_result(&context);
-        self.viewer.refresh_cursor(&context, self.loaded.as_ref());
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             self.render_menu_bar(ui);
@@ -58,6 +60,7 @@ impl eframe::App for CameraToolboxApp {
                 self.loaded.as_ref(),
                 &mut self.viewer,
                 self.display_mode,
+                self.hover_view,
             );
         });
         self.render_raw_open_dialog(&context);
@@ -72,10 +75,7 @@ impl CameraToolboxApp {
             ui.menu_button("View", |ui| {
                 request_color |= self.render_view_menu(ui);
             });
-            ui.menu_button("Tools", |ui| {
-                ui.add_enabled(false, egui::Button::new("ROI Stats"));
-                ui.add_enabled(false, egui::Button::new("Histogram"));
-            });
+            ui.menu_button("Tools", |ui| self.render_tools_menu(ui));
             ui.menu_button("Help", |ui| {
                 ui.label("Camera Toolbox");
                 ui.label("Local Bayer RAW color viewer");
@@ -89,7 +89,6 @@ impl CameraToolboxApp {
     fn render_file_menu(&mut self, ui: &mut egui::Ui) {
         if ui.button("Open Raw...").clicked() {
             self.raw_dialog.open(ui.ctx());
-            self.set_status("Configure RAW parameters");
             ui.close();
         }
         if ui
@@ -99,7 +98,6 @@ impl CameraToolboxApp {
             self.color_worker.cancel();
             self.loaded = None;
             self.viewer = ImageViewerState::default();
-            self.set_status("Closed image");
             ui.close();
         }
         ui.separator();
@@ -140,6 +138,31 @@ impl CameraToolboxApp {
         ui.separator();
         self.render_view_navigation(ui);
         request_color
+    }
+
+    fn render_tools_menu(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.hover_view.enabled, "Hover View");
+        if self.hover_view.enabled {
+            ui.menu_button("Hover View Settings", |ui| {
+                ui.label("Neighborhood");
+                ui.separator();
+                for neighborhood in HoverNeighborhood::ALL {
+                    if ui
+                        .selectable_value(
+                            &mut self.hover_view.neighborhood,
+                            neighborhood,
+                            neighborhood.label(),
+                        )
+                        .clicked()
+                    {
+                        ui.close();
+                    }
+                }
+            });
+        }
+        ui.separator();
+        ui.add_enabled(false, egui::Button::new("ROI Stats"));
+        ui.add_enabled(false, egui::Button::new("Histogram"));
     }
 
     fn render_view_navigation(&mut self, ui: &mut egui::Ui) {
@@ -244,18 +267,12 @@ impl CameraToolboxApp {
     }
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if let Some(loaded) = &self.loaded {
-                self.render_loaded_status(ui, loaded);
-            } else {
+        ui.horizontal(|ui| {
+            let Some(loaded) = &self.loaded else {
                 ui.label("Ready");
-                ui.separator();
-                ui.label("No image loaded");
-            }
-            if !self.status_message.is_empty() {
-                ui.separator();
-                ui.label(&self.status_message);
-            }
+                return;
+            };
+            self.render_loaded_status(ui, loaded);
         });
     }
 
@@ -265,77 +282,40 @@ impl CameraToolboxApp {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("<raw>");
-        let displayed_bayer = if self.display_mode == DisplayMode::Color {
-            loaded
-                .installed_color
-                .as_ref()
-                .map_or(loaded.frame.spec.bayer, |preview| {
-                    preview.rendered_params.bayer
-                })
-        } else {
-            loaded.frame.spec.bayer
-        };
-        ui.label(file_name);
-        ui.separator();
-        ui.label(format!(
-            "{}x{} bit={} {} u16le",
-            loaded.frame.spec.width,
-            loaded.frame.spec.height,
-            loaded.frame.spec.bit_depth,
-            bayer_label(displayed_bayer)
-        ));
-        ui.separator();
-        ui.label(self.display_mode.label());
-        ui.separator();
-        ui.label(format!("zoom={:.0}%", self.viewer.zoom * 100.0));
-        ui.separator();
-        self.render_cursor_status(ui, loaded);
-        ui.separator();
-        ui.label(format!(
-            "roi={},{},{},{} min={} max={} mean={:.2} sat={}/{}",
-            loaded.roi.x,
-            loaded.roi.y,
-            loaded.roi.width,
-            loaded.roi.height,
-            loaded.stats.min,
-            loaded.stats.max,
-            loaded.stats.mean,
-            loaded.stats.saturated_pixels,
-            loaded.stats.total_pixels
-        ));
+        let displayed_bayer = loaded.displayed_bayer(self.display_mode);
+
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(format!("{:.0}%", self.viewer.zoom * 100.0));
+            ui.separator();
+            ui.label(self.display_mode.label());
+            self.render_diagnostic_badges(ui, loaded);
+            ui.separator();
+            ui.allocate_ui_with_layout(
+                ui.available_size(),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.add(egui::Label::new(file_name).truncate());
+                    ui.separator();
+                    ui.label(format!(
+                        "{}×{} · {}-bit · {}",
+                        loaded.frame.spec.width,
+                        loaded.frame.spec.height,
+                        loaded.frame.spec.bit_depth,
+                        bayer_label(displayed_bayer).to_uppercase()
+                    ));
+                },
+            );
+        });
+    }
+
+    fn render_diagnostic_badges(&self, ui: &mut egui::Ui, loaded: &LoadedRaw) {
         if loaded.diagnostics.has_out_of_range() {
             ui.separator();
             ui.colored_label(
                 egui::Color32::YELLOW,
-                format!(
-                    "out-of-range={} observed-max={}",
-                    loaded.diagnostics.out_of_range_pixels, loaded.diagnostics.observed_max
-                ),
+                format!("RAW range: {}", loaded.diagnostics.out_of_range_pixels),
             );
         }
-        self.render_color_diagnostics(ui, loaded);
-    }
-
-    fn render_cursor_status(&self, ui: &mut egui::Ui, loaded: &LoadedRaw) {
-        let Some(cursor) = self.viewer.cursor else {
-            ui.label("x=- y=- raw=-");
-            return;
-        };
-        let mut text = format!("x={} y={} raw={}", cursor.x, cursor.y, cursor.value);
-        if let Some(color) = loaded.rendered_pixel(self.display_mode, cursor)
-            && let Some(preview) = &loaded.installed_color
-        {
-            let site = preview.rendered_params.bayer.site_at(cursor.x, cursor.y);
-            let _ = write!(
-                text,
-                " cfa={site:?} rgb8={},{},{}",
-                color.rgb8.r, color.rgb8.g, color.rgb8.b
-            );
-        }
-        ui.label(text);
-    }
-
-    fn render_color_diagnostics(&self, ui: &mut egui::Ui, loaded: &LoadedRaw) {
         if self.display_mode != DisplayMode::Color {
             return;
         }
@@ -347,7 +327,7 @@ impl CameraToolboxApp {
             ui.colored_label(
                 egui::Color32::YELLOW,
                 format!(
-                    "color-clipped-channels={}",
+                    "RGB clipped: {}",
                     preview.diagnostics.display_clipped_channels
                 ),
             );
@@ -357,7 +337,7 @@ impl CameraToolboxApp {
             ui.colored_label(
                 egui::Color32::YELLOW,
                 format!(
-                    "missing-color-neighbors={}",
+                    "Demosaic edge: {}",
                     preview.diagnostics.missing_neighbor_channels
                 ),
             );
@@ -372,15 +352,9 @@ impl CameraToolboxApp {
             Ok(()) => self.raw_dialog.close(context),
             Err(error) => {
                 let message = error.to_string();
-                self.status_message = format!("Open RAW failed: {message}");
                 self.raw_dialog.set_error(message);
             }
         }
-    }
-
-    fn set_status(&mut self, message: &str) {
-        self.status_message.clear();
-        self.status_message.push_str(message);
     }
 
     fn load_raw(
@@ -393,15 +367,6 @@ impl CameraToolboxApp {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let loaded = LoadedRaw::from_report(context, report, generation);
-        self.status_message = if loaded.diagnostics.has_out_of_range() {
-            format!(
-                "Loaded {} with {} out-of-range pixels; original values preserved",
-                loaded.path.display(),
-                loaded.diagnostics.out_of_range_pixels
-            )
-        } else {
-            format!("Loaded {}", loaded.path.display())
-        };
         self.loaded = Some(loaded);
         self.viewer = ImageViewerState::default();
         self.display_mode = DisplayMode::Color;
@@ -463,12 +428,9 @@ impl CameraToolboxApp {
                     rendered.diagnostics,
                 );
                 loaded.color_edit.render_error = None;
-                self.status_message =
-                    format!("Rendered color preview revision {}", result.revision);
             }
             Err(error) => {
                 loaded.color_edit.mark_error(error.clone());
-                self.status_message = format!("Color preview failed: {error}");
             }
         }
     }
