@@ -43,10 +43,10 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Check all workspace targets
-        run: cargo check --workspace --all-targets --locked
+        run: cargo check --workspace --all-targets --release --locked
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --release --locked
 
       - name: Report Clippy diagnostics
-        run: cargo clippy --workspace --all-targets --locked
+        run: cargo clippy --workspace --all-targets --release --locked

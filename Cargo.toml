@@ -31,6 +31,15 @@ camera-toolbox-core = { path = "crates/core" }
 camera-toolbox-app = { path = "crates/app" }
 camera-toolbox-adapters = { path = "crates/adapters" }
 
+# Cargo 不支持项目级默认 profile；让普通 build/run 采用 release 等价代码生成。
+[profile.dev]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+codegen-units = 16
+
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
