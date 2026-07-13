@@ -1,13 +1,14 @@
-# Rust build artifacts
+# Generated and local-only artifacts
 /target/
+/.ai_doc/
 
-# Local-only RAW captures, replay files, and settings
+# Local project data and settings
 /local_data/
-.env
-.env.*
-!.env.example
+/.env
+/.env.*
+!/.env.example
 
-# Local diagnostics and operating-system metadata
+# Local diagnostics and OS metadata
 *.log
 .DS_Store
 Thumbs.db
