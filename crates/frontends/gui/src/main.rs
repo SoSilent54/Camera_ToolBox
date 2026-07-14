@@ -1,6 +1,9 @@
+mod analysis_panel;
+mod analysis_worker;
 mod app;
 mod color_controls;
 mod color_worker;
+mod histogram_link;
 mod notification;
 mod raw_dialog;
 mod viewer;

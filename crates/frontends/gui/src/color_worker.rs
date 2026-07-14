@@ -22,7 +22,7 @@ pub(crate) struct ColorRenderRequest {
 }
 
 pub(crate) struct RenderedColorImage {
-    pub(crate) image: ColorImage,
+    pub(crate) image: Arc<ColorImage>,
     pub(crate) diagnostics: ColorRenderDiagnostics,
 }
 
@@ -232,7 +232,7 @@ where
     }
 
     Ok(RenderedColorImage {
-        image: ColorImage::new([width, height], pixels),
+        image: Arc::new(ColorImage::new([width, height], pixels)),
         diagnostics,
     })
 }

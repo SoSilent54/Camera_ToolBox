@@ -4,16 +4,23 @@ use std::sync::Arc;
 
 use camera_toolbox_adapters::LocalRawLoader;
 use camera_toolbox_app::{LocalRawAnalyzeRequest, Workflow};
+use camera_toolbox_core::Roi;
 use eframe::egui;
 
 use crate::{
+    analysis_panel::{AnalysisPanelState, DesiredAnalysis, render_analysis_panel},
+    analysis_worker::{AnalysisDomain, AnalysisKey, AnalysisRequest, AnalysisWorker},
     color_controls::{DisplayMode, render_color_controls},
     color_worker::{ColorRenderRequest, ColorRenderWorker},
+    histogram_link::{
+        HistogramBinSelection, HistogramPixelSample, ImageHistogramHover, SpatialHighlight,
+        SpatialHighlightRequest, SpatialHighlightWorker, display_histogram_sample,
+    },
     notification::{NotificationCenter, NotificationKey, NotificationScope, UiNotification},
     raw_dialog::RawOpenDialogState,
     viewer::{
-        HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, bayer_label,
-        render_viewer,
+        HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, ViewerAction,
+        bayer_label, render_viewer,
     },
 };
 
@@ -25,6 +32,12 @@ pub(crate) struct CameraToolboxApp {
     color_panel_expanded: bool,
     hover_view: HoverViewSettings,
     color_worker: ColorRenderWorker,
+    analysis_worker: AnalysisWorker,
+    spatial_worker: SpatialHighlightWorker,
+    spatial_requested: Option<HistogramBinSelection>,
+    spatial_highlight: Option<SpatialHighlight>,
+    analysis_panel: AnalysisPanelState,
+    analysis_pending_active: Option<(u64, Roi)>,
     notifications: NotificationCenter,
     next_generation: u64,
     next_load_attempt: u64,
@@ -40,6 +53,12 @@ impl CameraToolboxApp {
             color_panel_expanded: true,
             hover_view: HoverViewSettings::default(),
             color_worker: ColorRenderWorker::new(context)?,
+            analysis_worker: AnalysisWorker::new(context)?,
+            spatial_worker: SpatialHighlightWorker::new(context)?,
+            spatial_requested: None,
+            spatial_highlight: None,
+            analysis_panel: AnalysisPanelState::default(),
+            analysis_pending_active: None,
             notifications: NotificationCenter::default(),
             next_generation: 1,
             next_load_attempt: 1,
@@ -51,6 +70,13 @@ impl eframe::App for CameraToolboxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
         self.poll_color_result(&context);
+        self.poll_analysis_result();
+        self.poll_spatial_highlight_result();
+        // 先使 Display chart 与刚安装的纹理 revision 对齐，再绘制面板。
+        self.ensure_analysis();
+        if let Some(loaded) = &self.loaded {
+            self.viewer.refresh_cursor(&context, &loaded.frame);
+        }
 
         egui::Panel::top("menu_bar").show(ui, |ui| {
             self.render_menu_bar(ui);
@@ -58,8 +84,9 @@ impl eframe::App for CameraToolboxApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             self.render_status_bar(ui);
         });
+        self.render_analysis_panel_ui(ui);
         self.render_color_panel(ui);
-        let viewer_rect = egui::CentralPanel::default()
+        let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
                 render_viewer(
                     ui,
@@ -67,12 +94,18 @@ impl eframe::App for CameraToolboxApp {
                     &mut self.viewer,
                     self.display_mode,
                     self.hover_view,
+                    self.spatial_highlight.as_ref(),
                 )
             })
             .inner;
+        let viewer_rect = viewer_output.rect;
+        if let Some(action) = viewer_output.action {
+            self.handle_viewer_action(action);
+        }
         self.notifications
             .render(&context, viewer_rect, context.input(|input| input.time));
         self.render_raw_open_dialog(&context);
+        self.ensure_analysis();
     }
 }
 
@@ -118,8 +151,13 @@ impl CameraToolboxApp {
             if let Some(loaded) = &self.loaded {
                 self.notifications
                     .clear_scope(NotificationScope::ImageGeneration(loaded.generation));
+                self.analysis_panel.clear_generation(loaded.generation);
             }
             self.color_worker.cancel();
+            self.analysis_worker.cancel();
+            self.clear_spatial_highlight();
+            self.analysis_pending_active = None;
+            self.analysis_panel.clear();
             self.loaded = None;
             self.viewer = ImageViewerState::default();
             ui.close();
@@ -184,9 +222,15 @@ impl CameraToolboxApp {
                 }
             });
         }
-        ui.separator();
-        ui.add_enabled(false, egui::Button::new("ROI Stats"));
-        ui.add_enabled(false, egui::Button::new("Histogram"));
+        let analysis_enabled = self.loaded.is_some();
+        ui.add_enabled_ui(analysis_enabled, |ui| {
+            ui.checkbox(&mut self.analysis_panel.expanded, "Analysis Panel");
+            if ui.button("Reset ROI to Full Frame").clicked() {
+                self.reset_roi_to_full_frame();
+                ui.close();
+            }
+            ui.weak("Right-drag image to select ROI");
+        });
     }
 
     fn render_view_navigation(&mut self, ui: &mut egui::Ui) {
@@ -269,24 +313,299 @@ impl CameraToolboxApp {
                         response.on_hover_text("Collapse Color Processing");
                     });
                 });
-                let loaded = self.loaded.as_mut().expect("checked above");
-                let source_spec = loaded.frame.spec.clone();
-                let installed_revision = loaded.installed_revision();
-                let response = render_color_controls(
-                    ui,
-                    &mut loaded.color_edit,
-                    &source_spec,
-                    &mut self.display_mode,
-                    installed_revision,
-                );
-                should_submit = response.params_changed
-                    || (response.mode_changed && self.display_mode == DisplayMode::Color);
+                egui::ScrollArea::vertical()
+                    .id_salt("color_processing_controls")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        let loaded = self.loaded.as_mut().expect("checked above");
+                        let source_spec = loaded.frame.spec.clone();
+                        let installed_revision = loaded.installed_revision();
+                        let response = render_color_controls(
+                            ui,
+                            &mut loaded.color_edit,
+                            &source_spec,
+                            &mut self.display_mode,
+                            installed_revision,
+                        );
+                        should_submit = response.params_changed
+                            || (response.mode_changed && self.display_mode == DisplayMode::Color);
+                    });
             });
         if collapse {
             self.color_panel_expanded = false;
         }
         if should_submit {
             self.request_current_color();
+        }
+    }
+
+    fn render_analysis_panel_ui(&mut self, ui: &mut egui::Ui) {
+        if self.loaded.is_none() {
+            return;
+        }
+        let image_hover = self.image_histogram_hover();
+        let expanded = self.analysis_panel.expanded;
+        let default_size = self.analysis_panel.panel_height();
+        let min_size = self.analysis_panel.min_height();
+        let max_size = if expanded {
+            (ui.available_height() * 0.45).max(min_size)
+        } else {
+            min_size
+        };
+        let response = egui::Panel::bottom("analysis_panel")
+            .resizable(expanded)
+            .default_size(default_size)
+            .min_size(min_size)
+            .max_size(max_size)
+            .show(ui, |ui| {
+                render_analysis_panel(ui, &mut self.analysis_panel, image_hover)
+            })
+            .inner;
+        if response.selection_changed {
+            self.analysis_pending_active = None;
+        }
+        self.update_spatial_highlight(
+            response.hovered_bin,
+            response.selection_changed || response.view_interacting,
+        );
+    }
+
+    fn update_spatial_highlight(
+        &mut self,
+        selection: Option<HistogramBinSelection>,
+        suppress: bool,
+    ) {
+        let Some(selection) = selection.filter(|_| !suppress) else {
+            self.clear_spatial_highlight();
+            return;
+        };
+        if self.spatial_requested == Some(selection) {
+            return;
+        }
+        let Some(loaded) = self.loaded.as_ref() else {
+            self.clear_spatial_highlight();
+            return;
+        };
+        if self.analysis_panel.current_key() != Some(selection.key)
+            || loaded.generation != selection.key.generation
+        {
+            self.clear_spatial_highlight();
+            return;
+        }
+        let display_image = match selection.key.domain {
+            AnalysisDomain::RawBayer => None,
+            AnalysisDomain::DisplayRgb => {
+                let Some(preview) = loaded.installed_color.as_ref() else {
+                    self.clear_spatial_highlight();
+                    return;
+                };
+                if Some(preview.rendered_revision) != selection.key.source_revision {
+                    self.clear_spatial_highlight();
+                    return;
+                }
+                Some(Arc::clone(&preview.image))
+            }
+        };
+        self.spatial_highlight = None;
+        self.spatial_requested = Some(selection);
+        self.spatial_worker.submit(SpatialHighlightRequest {
+            selection,
+            frame: Arc::clone(&loaded.frame),
+            display_image,
+        });
+    }
+
+    fn clear_spatial_highlight(&mut self) {
+        if self.spatial_requested.is_none() && self.spatial_highlight.is_none() {
+            return;
+        }
+        self.spatial_worker.cancel();
+        self.spatial_requested = None;
+        self.spatial_highlight = None;
+    }
+
+    fn poll_spatial_highlight_result(&mut self) {
+        let Some(result) = self.spatial_worker.take_ready() else {
+            return;
+        };
+        if self.spatial_requested != Some(result.selection)
+            || self.analysis_panel.current_key() != Some(result.selection.key)
+        {
+            return;
+        }
+        match result.result {
+            Ok(payload) => {
+                self.spatial_highlight = Some(SpatialHighlight {
+                    selection: result.selection,
+                    mask: payload.mask,
+                    overlay_image: payload.overlay_image,
+                });
+            }
+            Err(error) => {
+                tracing::warn!(
+                    operation = "build_histogram_spatial_highlight",
+                    generation = result.selection.key.generation,
+                    error = %error,
+                    "spatial highlight failed"
+                );
+                self.spatial_requested = None;
+                self.spatial_highlight = None;
+            }
+        }
+    }
+
+    fn image_histogram_hover(&self) -> Option<ImageHistogramHover> {
+        let key = self.analysis_panel.current_key()?;
+        let loaded = self.loaded.as_ref()?;
+        let cursor = self.viewer.cursor?;
+        if loaded.generation != key.generation || !key.roi.contains(cursor.x, cursor.y) {
+            return None;
+        }
+        let row_width = usize::try_from(loaded.frame.spec.width).ok()?;
+        let x = usize::try_from(cursor.x).ok()?;
+        let y = usize::try_from(cursor.y).ok()?;
+        let index = y.checked_mul(row_width)?.checked_add(x)?;
+        let sample = match key.domain {
+            AnalysisDomain::RawBayer => HistogramPixelSample::Raw {
+                site: loaded.frame.spec.bayer.site_at(cursor.x, cursor.y),
+                value: *loaded.frame.pixels().get(index)?,
+            },
+            AnalysisDomain::DisplayRgb => {
+                let preview = loaded.installed_color.as_ref()?;
+                if Some(preview.rendered_revision) != key.source_revision {
+                    return None;
+                }
+                HistogramPixelSample::Display(display_histogram_sample(
+                    *preview.image.pixels.get(index)?,
+                ))
+            }
+        };
+        Some(ImageHistogramHover {
+            key,
+            x: cursor.x,
+            y: cursor.y,
+            sample,
+        })
+    }
+
+    fn handle_viewer_action(&mut self, action: ViewerAction) {
+        match action {
+            ViewerAction::CommitRoi(roi) => self.commit_roi(roi),
+            ViewerAction::ResetRoi => self.reset_roi_to_full_frame(),
+        }
+    }
+
+    fn reset_roi_to_full_frame(&mut self) {
+        let Some(loaded) = &self.loaded else {
+            return;
+        };
+        self.commit_roi(Roi {
+            x: 0,
+            y: 0,
+            width: loaded.frame.spec.width,
+            height: loaded.frame.spec.height,
+        });
+    }
+
+    fn commit_roi(&mut self, roi: Roi) {
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        let Some(roi) = roi.clamped_to(loaded.frame.spec.width, loaded.frame.spec.height) else {
+            return;
+        };
+        if loaded.roi == roi {
+            return;
+        }
+        tracing::debug!(
+            operation = "commit_roi",
+            generation = loaded.generation,
+            roi_x = roi.x,
+            roi_y = roi.y,
+            roi_width = roi.width,
+            roi_height = roi.height,
+            "committed viewer ROI"
+        );
+        loaded.roi = roi;
+        loaded.stats = None;
+        self.analysis_pending_active = None;
+    }
+
+    fn ensure_analysis(&mut self) {
+        let Some(loaded) = self.loaded.as_ref() else {
+            return;
+        };
+        let chart_roi = self.analysis_panel.scope.resolve(
+            loaded.roi,
+            loaded.frame.spec.width,
+            loaded.frame.spec.height,
+        );
+        let (source_revision, display_image) = match self.analysis_panel.domain {
+            AnalysisDomain::RawBayer => (None, None),
+            AnalysisDomain::DisplayRgb => {
+                let Some(preview) = &loaded.installed_color else {
+                    self.analysis_panel.wait_for_source();
+                    return;
+                };
+                (
+                    Some(preview.rendered_revision),
+                    Some(Arc::clone(&preview.image)),
+                )
+            }
+        };
+        let key = AnalysisKey {
+            generation: loaded.generation,
+            source_revision,
+            roi: chart_roi,
+            domain: self.analysis_panel.domain,
+        };
+        let desired = self.analysis_panel.set_desired(key);
+        let chart_ready = self.analysis_panel.has_current(key);
+        let stats_ready = loaded.stats.is_some();
+        let stats_pending = self.analysis_pending_active == Some((loaded.generation, loaded.roi));
+        if desired != DesiredAnalysis::Submit && (stats_ready || stats_pending) {
+            return;
+        }
+        let compute_chart = !chart_ready;
+        self.analysis_worker.submit(AnalysisRequest {
+            key,
+            active_roi: loaded.roi,
+            compute_chart,
+            frame: Arc::clone(&loaded.frame),
+            display_image,
+        });
+        self.analysis_pending_active = Some((loaded.generation, loaded.roi));
+    }
+
+    fn poll_analysis_result(&mut self) {
+        let Some(result) = self.analysis_worker.take_ready() else {
+            return;
+        };
+        let key = result.key;
+        let accepted = self.analysis_panel.accept_result(result);
+        let Some((active_roi, stats)) = accepted else {
+            tracing::debug!(
+                operation = "poll_histogram_analysis",
+                generation = key.generation,
+                revision = ?key.source_revision,
+                domain = key.domain.label(),
+                "dropped stale or failed histogram analysis"
+            );
+            return;
+        };
+        let Some(loaded) = self.loaded.as_mut() else {
+            return;
+        };
+        if loaded.generation == key.generation && loaded.roi == active_roi {
+            loaded.stats = Some(stats);
+            self.analysis_pending_active = None;
+            tracing::debug!(
+                operation = "install_histogram_analysis",
+                generation = key.generation,
+                revision = ?key.source_revision,
+                domain = key.domain.label(),
+                "installed histogram analysis"
+            );
         }
     }
 
@@ -313,6 +632,8 @@ impl CameraToolboxApp {
             ui.separator();
             ui.label(self.display_mode.label());
             self.render_diagnostic_badges(ui, loaded);
+            ui.separator();
+            ui.label(format!("ROI: {}×{}", loaded.roi.width, loaded.roi.height));
             ui.separator();
             ui.allocate_ui_with_layout(
                 ui.available_size(),
@@ -448,8 +769,13 @@ impl CameraToolboxApp {
         if let Some(previous) = &self.loaded {
             self.notifications
                 .clear_scope(NotificationScope::ImageGeneration(previous.generation));
+            self.analysis_panel.clear_generation(previous.generation);
+            self.analysis_worker.cancel();
+            self.clear_spatial_highlight();
+            self.analysis_pending_active = None;
         }
         self.loaded = Some(loaded);
+        self.analysis_panel.open_for_first_image();
         if let Some(notification) = notification {
             self.notifications.push_once(notification);
         }
@@ -578,7 +904,146 @@ const fn color_result_matches(
 
 #[cfg(test)]
 mod tests {
-    use super::color_result_matches;
+    use std::path::PathBuf;
+
+    use camera_toolbox_app::LocalRawAnalyzeReport;
+    use camera_toolbox_core::{BayerPattern, RawFrame, RawSpec, Roi, analyze_roi};
+    use eframe::egui::{self, accesskit::Role};
+
+    use super::{CameraToolboxApp, LoadedRaw, color_result_matches};
+
+    const TEST_VIEWPORT: egui::Vec2 = egui::vec2(640.0, 360.0);
+
+    /// `AccessKit` 使用 `f64` 屏幕坐标；测试 viewport 有界，可安全转换为 `egui` 的 `f32` 坐标。
+    #[allow(clippy::cast_possible_truncation)]
+    fn accesskit_rect_center(rect: egui::accesskit::Rect) -> egui::Pos2 {
+        egui::pos2(
+            ((rect.x0 + rect.x1) * 0.5) as f32,
+            ((rect.y0 + rect.y1) * 0.5) as f32,
+        )
+    }
+
+    fn run_app_frame(
+        context: &egui::Context,
+        app: &mut CameraToolboxApp,
+        frame: &mut eframe::Frame,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, TEST_VIEWPORT)),
+            ..Default::default()
+        };
+        input.events = events;
+        context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
+    }
+
+    fn app_with_loaded_raw(context: &egui::Context) -> CameraToolboxApp {
+        let spec = RawSpec {
+            width: 2,
+            height: 2,
+            bit_depth: 10,
+            bayer: BayerPattern::Rggb,
+        };
+        let frame = RawFrame::new(spec, vec![64, 128, 256, 512]).unwrap();
+        let roi = Roi {
+            x: 0,
+            y: 0,
+            width: frame.spec.width,
+            height: frame.spec.height,
+        };
+        let report = LocalRawAnalyzeReport {
+            path: PathBuf::from("fixture.raw"),
+            stats: analyze_roi(&frame, roi).unwrap(),
+            frame,
+            roi,
+        };
+        let mut app = CameraToolboxApp::new(context).unwrap();
+        app.loaded = Some(LoadedRaw::from_report(context, report, 1));
+        app.analysis_panel.open_for_first_image();
+        app
+    }
+
+    #[test]
+    fn color_panel_bottom_gain_remains_reachable_in_short_viewport() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut app = app_with_loaded_raw(&context);
+        let mut frame = eframe::Frame::_new_kittest();
+        let panel_position = egui::pos2(500.0, 100.0);
+
+        run_app_frame(&context, &mut app, &mut frame, Vec::new());
+        run_app_frame(
+            &context,
+            &mut app,
+            &mut frame,
+            vec![egui::Event::PointerMoved(panel_position)],
+        );
+        run_app_frame(
+            &context,
+            &mut app,
+            &mut frame,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -1_000.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+        let target = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree is enabled")
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| {
+                (node.role() == Role::SpinButton)
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .filter(|bounds| bounds.x0 >= 360.0 && bounds.y0 >= 0.0 && bounds.y1 <= 200.0)
+            .max_by(|left, right| left.y1.total_cmp(&right.y1))
+            .expect("scrolled Channel gain control is visible");
+        let start = accesskit_rect_center(target);
+        let end = start + egui::vec2(20.0, 0.0);
+        let before = app.loaded.as_ref().unwrap().color_edit.params.gain.b;
+
+        run_app_frame(
+            &context,
+            &mut app,
+            &mut frame,
+            vec![
+                egui::Event::PointerMoved(start),
+                egui::Event::PointerButton {
+                    pos: start,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        run_app_frame(
+            &context,
+            &mut app,
+            &mut frame,
+            vec![egui::Event::PointerMoved(end)],
+        );
+        run_app_frame(
+            &context,
+            &mut app,
+            &mut frame,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        let loaded = app.loaded.as_ref().unwrap();
+        assert!((loaded.color_edit.params.gain.b - before).abs() > f32::EPSILON);
+        assert!(loaded.color_edit.revision > 0);
+    }
 
     #[test]
     fn color_result_requires_matching_generation_and_revision() {

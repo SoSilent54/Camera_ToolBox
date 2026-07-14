@@ -8,7 +8,10 @@ pub mod raw;
 pub mod raw_probe;
 pub mod sensor;
 
-pub use analysis::{AnalysisError, Roi, RoiStats, analyze_roi};
+pub use analysis::{
+    AnalysisError, HistogramSeries, RawBayerHistogram, RawRoiAnalysis, Roi, RoiStats,
+    analyze_raw_roi, analyze_raw_roi_with_cancel, analyze_roi, analyze_roi_with_cancel,
+};
 pub use color::{
     BayerPrepareDiagnostics, CfaQuad, CfaSite, ColorPipelineParams, ColorPixel,
     ColorRenderDiagnostics, ColorRenderError, DEFAULT_DISPLAY_GAMMA, DisplayTransform, LinearRgb,
