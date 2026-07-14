@@ -1,67 +1,72 @@
-//! GUI 顶层状态与界面编排。
+//! GUI 顶层编排；文档状态由 workspace 模块独立持有。
 
-use std::sync::Arc;
+use std::{
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use camera_toolbox_adapters::LocalRawLoader;
-use camera_toolbox_app::{LocalRawAnalyzeRequest, Workflow};
-use camera_toolbox_core::Roi;
+use camera_toolbox_app::{LocalRawAnalyzeReport, LocalRawAnalyzeRequest, Workflow};
+use camera_toolbox_core::{
+    MediaFormat, OwnedMediaPayload, PackedRawSpec, Roi, analyze_roi, decode_le_continuous_raw,
+};
 use eframe::egui;
 
 use crate::{
-    analysis_panel::{AnalysisPanelState, DesiredAnalysis, render_analysis_panel},
-    analysis_worker::{AnalysisDomain, AnalysisKey, AnalysisRequest, AnalysisWorker},
+    analysis_panel::{DesiredAnalysis, render_analysis_panel},
+    analysis_worker::{
+        AnalysisDomain, AnalysisKey, AnalysisRequest, AnalysisResult, AnalysisWorker,
+    },
     color_controls::{DisplayMode, render_color_controls},
-    color_worker::{ColorRenderRequest, ColorRenderWorker},
+    color_worker::{ColorRenderRequest, ColorRenderResult, ColorRenderWorker},
     histogram_link::{
         HistogramBinSelection, HistogramPixelSample, ImageHistogramHover, SpatialHighlight,
-        SpatialHighlightRequest, SpatialHighlightWorker, display_histogram_sample,
+        SpatialHighlightRequest, SpatialHighlightResult, SpatialHighlightWorker,
+        display_histogram_sample,
     },
     notification::{NotificationCenter, NotificationKey, NotificationScope, UiNotification},
+    platform_ui::{LiveRuntime, PlatformEffect, PlatformUiAction, StreamPanelAction},
     raw_dialog::RawOpenDialogState,
     viewer::{
         HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, ViewerAction,
-        bayer_label, render_viewer,
+        ViewerOutput, bayer_label, render_viewer,
+    },
+    workspace::{
+        DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, TabBarAction,
+        WorkspaceState, render_tab_bar,
     },
 };
+const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(crate) struct CameraToolboxApp {
-    loaded: Option<LoadedRaw>,
-    viewer: ImageViewerState,
+    workspace: WorkspaceState,
+    empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
-    display_mode: DisplayMode,
-    color_panel_expanded: bool,
-    hover_view: HoverViewSettings,
     color_worker: ColorRenderWorker,
     analysis_worker: AnalysisWorker,
     spatial_worker: SpatialHighlightWorker,
-    spatial_requested: Option<HistogramBinSelection>,
-    spatial_highlight: Option<SpatialHighlight>,
-    analysis_panel: AnalysisPanelState,
-    analysis_pending_active: Option<(u64, Roi)>,
     notifications: NotificationCenter,
     next_generation: u64,
+    live_runtime: LiveRuntime,
     next_load_attempt: u64,
+    pending_ephemeral_close: Option<DocumentId>,
 }
 
 impl CameraToolboxApp {
     pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
         Ok(Self {
-            loaded: None,
-            viewer: ImageViewerState::default(),
+            workspace: WorkspaceState::default(),
+            empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
-            display_mode: DisplayMode::Color,
-            color_panel_expanded: true,
-            hover_view: HoverViewSettings::default(),
             color_worker: ColorRenderWorker::new(context)?,
             analysis_worker: AnalysisWorker::new(context)?,
             spatial_worker: SpatialHighlightWorker::new(context)?,
-            spatial_requested: None,
-            spatial_highlight: None,
-            analysis_panel: AnalysisPanelState::default(),
-            analysis_pending_active: None,
             notifications: NotificationCenter::default(),
+            live_runtime: LiveRuntime::new().map_err(std::io::Error::other)?,
             next_generation: 1,
             next_load_attempt: 1,
+            pending_ephemeral_close: None,
         })
     }
 }
@@ -72,40 +77,134 @@ impl eframe::App for CameraToolboxApp {
         self.poll_color_result(&context);
         self.poll_analysis_result();
         self.poll_spatial_highlight_result();
-        // 先使 Display chart 与刚安装的纹理 revision 对齐，再绘制面板。
+        self.poll_stream_events();
+        for effect in self.live_runtime.poll_platform_events() {
+            self.handle_platform_effect(&context, effect);
+        }
+        self.advance_live_close_deadlines();
+        if let Some(document) = self.workspace.active_live_mut() {
+            document.install_latest_texture(&context);
+        }
+        self.ensure_active_resources(&context);
+        if let Some(document) = self.workspace.active_asset_mut() {
+            document.ensure_texture(&context);
+        }
         self.ensure_analysis();
-        if let Some(loaded) = &self.loaded {
-            self.viewer.refresh_cursor(&context, &loaded.frame);
+        if let Some(document) = self.workspace.active_mut() {
+            document
+                .viewer
+                .refresh_cursor(&context, &document.loaded.frame);
         }
 
-        egui::Panel::top("menu_bar").show(ui, |ui| {
-            self.render_menu_bar(ui);
+        egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
+        let tab_action = egui::Panel::top("document_tabs")
+            .resizable(false)
+            .show(ui, |ui| render_tab_bar(ui, &self.workspace))
+            .inner;
+        if let Some(action) = tab_action {
+            self.handle_tab_action(&context, action);
+        }
+        let live_running = self.workspace.live_documents().iter().any(|document| {
+            matches!(
+                document.lifecycle,
+                LiveDocumentLifecycle::Open
+                    | LiveDocumentLifecycle::CloseRequested
+                    | LiveDocumentLifecycle::Closing { .. }
+            )
         });
-        egui::Panel::bottom("status_bar").show(ui, |ui| {
-            self.render_status_bar(ui);
-        });
+        let platform_action = if self.live_runtime.panel.expanded {
+            let mut collapse = false;
+            let action = egui::Panel::left("platform_operation_panel")
+                .resizable(true)
+                .default_size(260.0)
+                .min_size(220.0)
+                .max_size(380.0)
+                .show(ui, |ui| {
+                    if ui
+                        .button("‹")
+                        .on_hover_text("Collapse platform controls")
+                        .clicked()
+                    {
+                        collapse = true;
+                    }
+                    self.live_runtime.render_panel(ui, live_running)
+                })
+                .inner;
+            if collapse {
+                self.live_runtime.panel.expanded = false;
+            }
+            action
+        } else {
+            let expand = egui::Panel::left("platform_operation_panel_rail")
+                .resizable(false)
+                .min_size(32.0)
+                .max_size(32.0)
+                .show(ui, |ui| {
+                    ui.button("›")
+                        .on_hover_text("Expand CV610 Stream")
+                        .clicked()
+                })
+                .inner;
+            if expand {
+                self.live_runtime.panel.expanded = true;
+            }
+            None
+        };
+        if let Some(action) = platform_action {
+            self.handle_platform_ui_action(&context, action);
+        }
+        egui::Panel::bottom("status_bar").show(ui, |ui| self.render_status_bar(ui));
         self.render_analysis_panel_ui(ui);
         self.render_color_panel(ui);
+
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
-                render_viewer(
-                    ui,
-                    self.loaded.as_ref(),
-                    &mut self.viewer,
-                    self.display_mode,
-                    self.hover_view,
-                    self.spatial_highlight.as_ref(),
-                )
+                if let Some(document) = self.workspace.active_live_mut() {
+                    let rect = Self::render_live_viewer(ui, document, &self.live_runtime);
+                    ViewerOutput { rect, action: None }
+                } else if let Some(document) = self.workspace.active_asset_mut() {
+                    let rect = Self::render_asset_viewer(ui, document);
+                    ViewerOutput { rect, action: None }
+                } else if let Some(document) = self.workspace.active_mut() {
+                    render_viewer(
+                        ui,
+                        Some(&document.loaded),
+                        &mut document.viewer,
+                        document.display_mode,
+                        document.hover_view,
+                        document.spatial_highlight.as_ref(),
+                    )
+                } else {
+                    render_viewer(
+                        ui,
+                        None,
+                        &mut self.empty_viewer,
+                        DisplayMode::RawMono,
+                        HoverViewSettings::default(),
+                        None,
+                    )
+                }
             })
             .inner;
-        let viewer_rect = viewer_output.rect;
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
         }
-        self.notifications
-            .render(&context, viewer_rect, context.input(|input| input.time));
+        self.notifications.render(
+            &context,
+            viewer_output.rect,
+            context.input(|input| input.time),
+        );
         self.render_raw_open_dialog(&context);
+        self.live_runtime.show_device_manager(&context);
+        self.render_pending_ephemeral_close(&context);
         self.ensure_analysis();
+        self.workspace.enforce_derived_budget();
+        self.workspace.release_inactive_live_textures();
+        if !self.workspace.live_documents().is_empty() {
+            context.request_repaint_after(Duration::from_millis(33));
+        } else {
+            context.request_repaint_after(Duration::from_millis(100));
+        }
     }
 }
 
@@ -133,6 +232,10 @@ impl CameraToolboxApp {
                     ui.label("Unavailable on this platform");
                 }
             });
+            ui.separator();
+            egui::ScrollArea::horizontal()
+                .id_salt("target_toolbar_scroll")
+                .show(ui, |ui| self.live_runtime.render_target_toolbar(ui));
         });
         if request_color {
             self.request_current_color();
@@ -145,21 +248,29 @@ impl CameraToolboxApp {
             ui.close();
         }
         if ui
-            .add_enabled(self.loaded.is_some(), egui::Button::new("Close Image"))
+            .add_enabled(
+                self.workspace.active_asset().is_some()
+                    || self
+                        .workspace
+                        .active()
+                        .is_some_and(|document| document.source_asset.is_some()),
+                egui::Button::new("Save/Export Captured Source..."),
+            )
             .clicked()
         {
-            if let Some(loaded) = &self.loaded {
-                self.notifications
-                    .clear_scope(NotificationScope::ImageGeneration(loaded.generation));
-                self.analysis_panel.clear_generation(loaded.generation);
+            self.save_active_ephemeral_source();
+            ui.close();
+        }
+        if ui
+            .add_enabled(
+                self.workspace.active_id().is_some(),
+                egui::Button::new("Close Image"),
+            )
+            .clicked()
+        {
+            if let Some(id) = self.workspace.active_id() {
+                self.close_document(ui.ctx(), id);
             }
-            self.color_worker.cancel();
-            self.analysis_worker.cancel();
-            self.clear_spatial_highlight();
-            self.analysis_pending_active = None;
-            self.analysis_panel.clear();
-            self.loaded = None;
-            self.viewer = ImageViewerState::default();
             ui.close();
         }
         ui.separator();
@@ -169,49 +280,52 @@ impl CameraToolboxApp {
     }
 
     fn render_view_menu(&mut self, ui: &mut egui::Ui) -> bool {
+        let Some(document) = self.workspace.active_mut() else {
+            ui.add_enabled(false, egui::Button::new(DisplayMode::RawMono.label()));
+            ui.add_enabled(false, egui::Button::new(DisplayMode::Color.label()));
+            return false;
+        };
         let mut request_color = false;
         if ui
-            .add_enabled(
-                self.loaded.is_some(),
-                egui::Button::selectable(
-                    self.display_mode == DisplayMode::RawMono,
-                    DisplayMode::RawMono.label(),
-                ),
-            )
+            .add(egui::Button::selectable(
+                document.display_mode == DisplayMode::RawMono,
+                DisplayMode::RawMono.label(),
+            ))
             .clicked()
         {
-            self.display_mode = DisplayMode::RawMono;
+            document.display_mode = DisplayMode::RawMono;
             ui.close();
         }
         if ui
-            .add_enabled(
-                self.loaded.is_some(),
-                egui::Button::selectable(
-                    self.display_mode == DisplayMode::Color,
-                    DisplayMode::Color.label(),
-                ),
-            )
+            .add(egui::Button::selectable(
+                document.display_mode == DisplayMode::Color,
+                DisplayMode::Color.label(),
+            ))
             .clicked()
         {
-            self.display_mode = DisplayMode::Color;
+            document.display_mode = DisplayMode::Color;
             request_color = true;
             ui.close();
         }
         ui.separator();
-        self.render_view_navigation(ui);
+        Self::render_view_navigation(ui, document);
         request_color
     }
 
     fn render_tools_menu(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(&mut self.hover_view.enabled, "Hover View");
-        if self.hover_view.enabled {
+        let Some(document) = self.workspace.active_mut() else {
+            ui.add_enabled(false, egui::Checkbox::new(&mut false, "Hover View"));
+            return;
+        };
+        ui.checkbox(&mut document.hover_view.enabled, "Hover View");
+        if document.hover_view.enabled {
             ui.menu_button("Hover View Settings", |ui| {
                 ui.label("Neighborhood");
                 ui.separator();
                 for neighborhood in HoverNeighborhood::ALL {
                     if ui
                         .selectable_value(
-                            &mut self.hover_view.neighborhood,
+                            &mut document.hover_view.neighborhood,
                             neighborhood,
                             neighborhood.label(),
                         )
@@ -222,64 +336,57 @@ impl CameraToolboxApp {
                 }
             });
         }
-        let analysis_enabled = self.loaded.is_some();
-        ui.add_enabled_ui(analysis_enabled, |ui| {
-            ui.checkbox(&mut self.analysis_panel.expanded, "Analysis Panel");
-            if ui.button("Reset ROI to Full Frame").clicked() {
-                self.reset_roi_to_full_frame();
-                ui.close();
-            }
-            ui.weak("Right-drag image to select ROI");
-        });
+        ui.checkbox(&mut document.analysis_panel.expanded, "Analysis Panel");
+        if ui.button("Reset ROI to Full Frame").clicked() {
+            let width = document.loaded.frame.spec.width;
+            let height = document.loaded.frame.spec.height;
+            Self::commit_roi_for_document(
+                document,
+                Roi {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+            );
+            ui.close();
+        }
+        ui.weak("Right-drag image to select ROI");
     }
 
-    fn render_view_navigation(&mut self, ui: &mut egui::Ui) {
-        if ui
-            .add_enabled(self.loaded.is_some(), egui::Button::new("Fit to Window"))
-            .clicked()
-        {
-            self.viewer.fit_on_next_frame = true;
+    fn render_view_navigation(ui: &mut egui::Ui, document: &mut crate::workspace::RawDocument) {
+        if ui.button("Fit to Window").clicked() {
+            document.viewer.fit_on_next_frame = true;
             ui.close();
         }
-        if ui
-            .add_enabled(
-                self.loaded.is_some(),
-                egui::Button::new("Actual Size / 100%"),
-            )
-            .clicked()
-        {
-            self.viewer.zoom = 1.0;
-            self.viewer.fit_on_next_frame = false;
+        if ui.button("Actual Size / 100%").clicked() {
+            document.viewer.zoom = 1.0;
+            document.viewer.fit_on_next_frame = false;
             ui.close();
         }
-        if ui
-            .add_enabled(self.loaded.is_some(), egui::Button::new("Zoom In"))
-            .clicked()
-        {
-            self.viewer.zoom_by(1.25, None, egui::Rect::NOTHING);
+        if ui.button("Zoom In").clicked() {
+            document.viewer.zoom_by(1.25, None, egui::Rect::NOTHING);
             ui.close();
         }
-        if ui
-            .add_enabled(self.loaded.is_some(), egui::Button::new("Zoom Out"))
-            .clicked()
-        {
-            self.viewer.zoom_by(0.8, None, egui::Rect::NOTHING);
+        if ui.button("Zoom Out").clicked() {
+            document.viewer.zoom_by(0.8, None, egui::Rect::NOTHING);
             ui.close();
         }
-        if ui
-            .add_enabled(self.loaded.is_some(), egui::Button::new("Reset View"))
-            .clicked()
-        {
-            self.viewer = ImageViewerState::default();
+        if ui.button("Reset View").clicked() {
+            document.viewer = ImageViewerState::default();
             ui.close();
         }
     }
 
     fn render_color_panel(&mut self, ui: &mut egui::Ui) {
-        if self.loaded.is_none() {
+        let Some(expanded) = self
+            .workspace
+            .active()
+            .map(|document| document.color_panel_expanded)
+        else {
             return;
-        }
-        if !self.color_panel_expanded {
+        };
+        if !expanded {
             let mut expand = false;
             egui::Panel::right("color_processing_rail")
                 .resizable(false)
@@ -291,14 +398,15 @@ impl CameraToolboxApp {
                     expand = response.clicked();
                     response.on_hover_text("Expand Color Processing");
                 });
-            if expand {
-                self.color_panel_expanded = true;
+            if expand && let Some(document) = self.workspace.active_mut() {
+                document.color_panel_expanded = true;
             }
             return;
         }
 
         let mut should_submit = false;
         let mut collapse = false;
+        let workspace = &mut self.workspace;
         egui::Panel::right("color_processing")
             .resizable(true)
             .default_size(280.0)
@@ -317,22 +425,23 @@ impl CameraToolboxApp {
                     .id_salt("color_processing_controls")
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        let loaded = self.loaded.as_mut().expect("checked above");
-                        let source_spec = loaded.frame.spec.clone();
-                        let installed_revision = loaded.installed_revision();
+                        let document = workspace.active_mut().expect("active document exists");
+                        let source_spec = document.loaded.frame.spec.clone();
+                        let installed_revision = document.loaded.installed_revision();
                         let response = render_color_controls(
                             ui,
-                            &mut loaded.color_edit,
+                            &mut document.loaded.color_edit,
                             &source_spec,
-                            &mut self.display_mode,
+                            &mut document.display_mode,
                             installed_revision,
                         );
                         should_submit = response.params_changed
-                            || (response.mode_changed && self.display_mode == DisplayMode::Color);
+                            || (response.mode_changed
+                                && document.display_mode == DisplayMode::Color);
                     });
             });
-        if collapse {
-            self.color_panel_expanded = false;
+        if collapse && let Some(document) = self.workspace.active_mut() {
+            document.color_panel_expanded = false;
         }
         if should_submit {
             self.request_current_color();
@@ -340,13 +449,13 @@ impl CameraToolboxApp {
     }
 
     fn render_analysis_panel_ui(&mut self, ui: &mut egui::Ui) {
-        if self.loaded.is_none() {
+        let Some(document) = self.workspace.active() else {
             return;
-        }
+        };
         let image_hover = self.image_histogram_hover();
-        let expanded = self.analysis_panel.expanded;
-        let default_size = self.analysis_panel.panel_height();
-        let min_size = self.analysis_panel.min_height();
+        let expanded = document.analysis_panel.expanded;
+        let default_size = document.analysis_panel.panel_height();
+        let min_size = document.analysis_panel.min_height();
         let max_size = if expanded {
             (ui.available_height() * 0.45).max(min_size)
         } else {
@@ -358,11 +467,14 @@ impl CameraToolboxApp {
             .min_size(min_size)
             .max_size(max_size)
             .show(ui, |ui| {
-                render_analysis_panel(ui, &mut self.analysis_panel, image_hover)
+                let document = self.workspace.active_mut().expect("active document exists");
+                render_analysis_panel(ui, &mut document.analysis_panel, image_hover)
             })
             .inner;
-        if response.selection_changed {
-            self.analysis_pending_active = None;
+        if response.selection_changed
+            && let Some(document) = self.workspace.active_mut()
+        {
+            document.analysis_pending_active = None;
         }
         self.update_spatial_highlight(
             response.hovered_bin,
@@ -376,102 +488,131 @@ impl CameraToolboxApp {
         suppress: bool,
     ) {
         let Some(selection) = selection.filter(|_| !suppress) else {
-            self.clear_spatial_highlight();
+            self.clear_active_spatial_highlight();
             return;
         };
-        if self.spatial_requested == Some(selection) {
-            return;
-        }
-        let Some(loaded) = self.loaded.as_ref() else {
-            self.clear_spatial_highlight();
-            return;
-        };
-        if self.analysis_panel.current_key() != Some(selection.key)
-            || loaded.generation != selection.key.generation
-        {
-            self.clear_spatial_highlight();
-            return;
-        }
-        let display_image = match selection.key.domain {
-            AnalysisDomain::RawBayer => None,
-            AnalysisDomain::DisplayRgb => {
-                let Some(preview) = loaded.installed_color.as_ref() else {
-                    self.clear_spatial_highlight();
-                    return;
-                };
-                if Some(preview.rendered_revision) != selection.key.source_revision {
-                    self.clear_spatial_highlight();
-                    return;
+        let request = {
+            let Some(document) = self.workspace.active_mut() else {
+                return;
+            };
+            if document.spatial_requested == Some(selection) {
+                return;
+            }
+            if document.analysis_panel.current_key() != Some(selection.key)
+                || document.id != selection.key.document_id
+                || document.loaded.generation != selection.key.generation
+            {
+                document.spatial_requested = None;
+                document.spatial_highlight = None;
+                document.viewer.evict_derived_resources();
+                return;
+            }
+            let display_image = match selection.key.domain {
+                AnalysisDomain::RawBayer => None,
+                AnalysisDomain::DisplayRgb => {
+                    let Some(preview) = document.loaded.installed_color.as_ref() else {
+                        document.spatial_requested = None;
+                        document.spatial_highlight = None;
+                        return;
+                    };
+                    if Some(preview.rendered_revision) != selection.key.source_revision {
+                        document.spatial_requested = None;
+                        document.spatial_highlight = None;
+                        return;
+                    }
+                    Some(Arc::clone(&preview.image))
                 }
-                Some(Arc::clone(&preview.image))
+            };
+            document.spatial_highlight = None;
+            document.viewer.evict_derived_resources();
+            document.spatial_requested = Some(selection);
+            SpatialHighlightRequest {
+                selection,
+                frame: Arc::clone(&document.loaded.frame),
+                display_image,
             }
         };
-        self.spatial_highlight = None;
-        self.spatial_requested = Some(selection);
-        self.spatial_worker.submit(SpatialHighlightRequest {
-            selection,
-            frame: Arc::clone(&loaded.frame),
-            display_image,
-        });
+        self.workspace
+            .supersede_spatial_submissions_except(request.selection.key.document_id);
+        self.spatial_worker.submit(request);
     }
 
-    fn clear_spatial_highlight(&mut self) {
-        if self.spatial_requested.is_none() && self.spatial_highlight.is_none() {
+    fn clear_active_spatial_highlight(&mut self) {
+        let Some(document) = self.workspace.active_mut() else {
+            return;
+        };
+        if document.spatial_requested.is_none() && document.spatial_highlight.is_none() {
             return;
         }
-        self.spatial_worker.cancel();
-        self.spatial_requested = None;
-        self.spatial_highlight = None;
+        document.spatial_requested = None;
+        document.spatial_highlight = None;
+        document.viewer.evict_derived_resources();
     }
 
     fn poll_spatial_highlight_result(&mut self) {
         let Some(result) = self.spatial_worker.take_ready() else {
             return;
         };
-        if self.spatial_requested != Some(result.selection)
-            || self.analysis_panel.current_key() != Some(result.selection.key)
+        self.install_spatial_highlight_result(result);
+    }
+
+    fn install_spatial_highlight_result(&mut self, result: SpatialHighlightResult) {
+        let identity = DocumentIdentity {
+            document_id: result.selection.key.document_id,
+            generation: result.selection.key.generation,
+        };
+        let Some(document) = self.workspace.matching_document_mut(identity) else {
+            return;
+        };
+        if document.spatial_requested != Some(result.selection)
+            || document.analysis_panel.current_key() != Some(result.selection.key)
         {
             return;
         }
         match result.result {
             Ok(payload) => {
-                self.spatial_highlight = Some(SpatialHighlight {
+                document.spatial_highlight = Some(SpatialHighlight {
                     selection: result.selection,
                     mask: payload.mask,
                     overlay_image: payload.overlay_image,
                 });
+                document.mark_derived_loaded();
             }
             Err(error) => {
                 tracing::warn!(
                     operation = "build_histogram_spatial_highlight",
+                    document_id = %document.id,
                     generation = result.selection.key.generation,
                     error = %error,
                     "spatial highlight failed"
                 );
-                self.spatial_requested = None;
-                self.spatial_highlight = None;
+                document.spatial_requested = None;
+                document.spatial_highlight = None;
             }
         }
     }
 
     fn image_histogram_hover(&self) -> Option<ImageHistogramHover> {
-        let key = self.analysis_panel.current_key()?;
-        let loaded = self.loaded.as_ref()?;
-        let cursor = self.viewer.cursor?;
-        if loaded.generation != key.generation || !key.roi.contains(cursor.x, cursor.y) {
+        let document = self.workspace.active()?;
+        let key = document.analysis_panel.current_key()?;
+        let cursor = document.viewer.cursor?;
+        if document.id != key.document_id
+            || document.loaded.generation != key.generation
+            || !key.roi.contains(cursor.x, cursor.y)
+        {
             return None;
         }
-        let row_width = usize::try_from(loaded.frame.spec.width).ok()?;
+        let row_width = usize::try_from(document.loaded.frame.spec.width).ok()?;
         let x = usize::try_from(cursor.x).ok()?;
         let y = usize::try_from(cursor.y).ok()?;
         let index = y.checked_mul(row_width)?.checked_add(x)?;
         let sample = match key.domain {
             AnalysisDomain::RawBayer => HistogramPixelSample::Raw {
-                site: loaded.frame.spec.bayer.site_at(cursor.x, cursor.y),
-                value: *loaded.frame.pixels().get(index)?,
+                site: document.loaded.frame.spec.bayer.site_at(cursor.x, cursor.y),
+                value: *document.loaded.frame.pixels().get(index)?,
             },
             AnalysisDomain::DisplayRgb => {
-                let preview = loaded.installed_color.as_ref()?;
+                let preview = document.loaded.installed_color.as_ref()?;
                 if Some(preview.rendered_revision) != key.source_revision {
                     return None;
                 }
@@ -489,103 +630,132 @@ impl CameraToolboxApp {
     }
 
     fn handle_viewer_action(&mut self, action: ViewerAction) {
+        let Some(document) = self.workspace.active_mut() else {
+            return;
+        };
         match action {
-            ViewerAction::CommitRoi(roi) => self.commit_roi(roi),
-            ViewerAction::ResetRoi => self.reset_roi_to_full_frame(),
+            ViewerAction::CommitRoi(roi) => Self::commit_roi_for_document(document, roi),
+            ViewerAction::ResetRoi => {
+                let spec = &document.loaded.frame.spec;
+                Self::commit_roi_for_document(
+                    document,
+                    Roi {
+                        x: 0,
+                        y: 0,
+                        width: spec.width,
+                        height: spec.height,
+                    },
+                );
+            }
         }
     }
 
-    fn reset_roi_to_full_frame(&mut self) {
-        let Some(loaded) = &self.loaded else {
+    fn commit_roi_for_document(document: &mut crate::workspace::RawDocument, roi: Roi) {
+        let Some(roi) = roi.clamped_to(
+            document.loaded.frame.spec.width,
+            document.loaded.frame.spec.height,
+        ) else {
             return;
         };
-        self.commit_roi(Roi {
-            x: 0,
-            y: 0,
-            width: loaded.frame.spec.width,
-            height: loaded.frame.spec.height,
-        });
-    }
-
-    fn commit_roi(&mut self, roi: Roi) {
-        let Some(loaded) = self.loaded.as_mut() else {
-            return;
-        };
-        let Some(roi) = roi.clamped_to(loaded.frame.spec.width, loaded.frame.spec.height) else {
-            return;
-        };
-        if loaded.roi == roi {
+        if document.loaded.roi == roi {
             return;
         }
         tracing::debug!(
             operation = "commit_roi",
-            generation = loaded.generation,
+            document_id = %document.id,
+            generation = document.loaded.generation,
             roi_x = roi.x,
             roi_y = roi.y,
             roi_width = roi.width,
             roi_height = roi.height,
             "committed viewer ROI"
         );
-        loaded.roi = roi;
-        loaded.stats = None;
-        self.analysis_pending_active = None;
+        document.loaded.roi = roi;
+        document.loaded.stats = None;
+        document.analysis_pending_active = None;
     }
 
     fn ensure_analysis(&mut self) {
-        let Some(loaded) = self.loaded.as_ref() else {
-            return;
-        };
-        let chart_roi = self.analysis_panel.scope.resolve(
-            loaded.roi,
-            loaded.frame.spec.width,
-            loaded.frame.spec.height,
-        );
-        let (source_revision, display_image) = match self.analysis_panel.domain {
-            AnalysisDomain::RawBayer => (None, None),
-            AnalysisDomain::DisplayRgb => {
-                let Some(preview) = &loaded.installed_color else {
-                    self.analysis_panel.wait_for_source();
-                    return;
-                };
-                (
-                    Some(preview.rendered_revision),
-                    Some(Arc::clone(&preview.image)),
-                )
+        let request = {
+            let Some(document) = self.workspace.active_mut() else {
+                return;
+            };
+            let loaded = &document.loaded;
+            let chart_roi = document.analysis_panel.scope.resolve(
+                loaded.roi,
+                loaded.frame.spec.width,
+                loaded.frame.spec.height,
+            );
+            let (source_revision, display_image) = match document.analysis_panel.domain {
+                AnalysisDomain::RawBayer => (None, None),
+                AnalysisDomain::DisplayRgb => {
+                    let Some(preview) = &loaded.installed_color else {
+                        document.analysis_panel.wait_for_source();
+                        return;
+                    };
+                    (
+                        Some(preview.rendered_revision),
+                        Some(Arc::clone(&preview.image)),
+                    )
+                }
+            };
+            let key = AnalysisKey {
+                document_id: document.id,
+                generation: loaded.generation,
+                source_revision,
+                roi: chart_roi,
+                domain: document.analysis_panel.domain,
+            };
+            let desired = document.analysis_panel.set_desired(key);
+            let chart_ready = document.analysis_panel.has_current(key);
+            let stats_ready = loaded.stats.is_some();
+            let stats_pending =
+                document.analysis_pending_active == Some((loaded.generation, loaded.roi));
+            if desired != DesiredAnalysis::Submit && (stats_ready || stats_pending) {
+                return;
+            }
+            let compute_chart = !chart_ready;
+            document.analysis_pending_active = Some((loaded.generation, loaded.roi));
+            AnalysisRequest {
+                key,
+                active_roi: loaded.roi,
+                compute_chart,
+                frame: Arc::clone(&loaded.frame),
+                display_image,
             }
         };
-        let key = AnalysisKey {
-            generation: loaded.generation,
-            source_revision,
-            roi: chart_roi,
-            domain: self.analysis_panel.domain,
-        };
-        let desired = self.analysis_panel.set_desired(key);
-        let chart_ready = self.analysis_panel.has_current(key);
-        let stats_ready = loaded.stats.is_some();
-        let stats_pending = self.analysis_pending_active == Some((loaded.generation, loaded.roi));
-        if desired != DesiredAnalysis::Submit && (stats_ready || stats_pending) {
-            return;
-        }
-        let compute_chart = !chart_ready;
-        self.analysis_worker.submit(AnalysisRequest {
-            key,
-            active_roi: loaded.roi,
-            compute_chart,
-            frame: Arc::clone(&loaded.frame),
-            display_image,
-        });
-        self.analysis_pending_active = Some((loaded.generation, loaded.roi));
+        self.workspace
+            .supersede_analysis_submissions_except(request.key.document_id);
+        self.analysis_worker.submit(request);
     }
 
     fn poll_analysis_result(&mut self) {
         let Some(result) = self.analysis_worker.take_ready() else {
             return;
         };
+        self.install_analysis_result(result);
+    }
+
+    fn install_analysis_result(&mut self, result: AnalysisResult) {
         let key = result.key;
-        let accepted = self.analysis_panel.accept_result(result);
+        let identity = DocumentIdentity {
+            document_id: key.document_id,
+            generation: key.generation,
+        };
+        let Some(document) = self.workspace.matching_document_mut(identity) else {
+            tracing::debug!(
+                operation = "poll_histogram_analysis",
+                document_id = %key.document_id,
+                generation = key.generation,
+                "dropped analysis result for closed or replaced document"
+            );
+            return;
+        };
+        let accepted = document.analysis_panel.accept_result(result);
         let Some((active_roi, stats)) = accepted else {
             tracing::debug!(
                 operation = "poll_histogram_analysis",
+                document_id = %key.document_id,
                 generation = key.generation,
                 revision = ?key.source_revision,
                 domain = key.domain.label(),
@@ -593,14 +763,13 @@ impl CameraToolboxApp {
             );
             return;
         };
-        let Some(loaded) = self.loaded.as_mut() else {
-            return;
-        };
-        if loaded.generation == key.generation && loaded.roi == active_roi {
-            loaded.stats = Some(stats);
-            self.analysis_pending_active = None;
+        if document.loaded.roi == active_roi {
+            document.loaded.stats = Some(stats);
+            document.analysis_pending_active = None;
+            document.mark_derived_loaded();
             tracing::debug!(
                 operation = "install_histogram_analysis",
+                document_id = %key.document_id,
                 generation = key.generation,
                 revision = ?key.source_revision,
                 domain = key.domain.label(),
@@ -611,49 +780,68 @@ impl CameraToolboxApp {
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            let Some(loaded) = &self.loaded else {
+            if let Some(document) = self.workspace.active_live() {
+                let media = document.media.as_ref().map_or_else(
+                    || "Negotiating".to_owned(),
+                    |media| {
+                        format!(
+                            "{:?} {}×{} PT {} SSRC {:08x} {} fps",
+                            media.codec,
+                            media.width,
+                            media.height,
+                            media.payload_type,
+                            media.ssrc,
+                            media.frame_rate
+                        )
+                    },
+                );
+                ui.label(&document.title);
+                ui.separator();
+                ui.label(media);
+                ui.separator();
+                ui.label(format!(
+                    "RTP gaps {} · preview dropped {} · resync {}",
+                    document.metrics.rtp_gaps,
+                    document.metrics.preview_dropped,
+                    document.metrics.decoder_resyncs
+                ));
+                return;
+            }
+            let Some(document) = self.workspace.active() else {
                 ui.label("Ready");
                 return;
             };
-            self.render_loaded_status(ui, loaded);
+            let loaded = &document.loaded;
+            let displayed_bayer = loaded.displayed_bayer(document.display_mode);
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.label(format!("{:.0}%", document.viewer.zoom * 100.0));
+                ui.separator();
+                ui.label(document.display_mode.label());
+                Self::render_diagnostic_badges(ui, document);
+                ui.separator();
+                ui.label(format!("ROI: {}×{}", loaded.roi.width, loaded.roi.height));
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    ui.available_size(),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(egui::Label::new(&document.title).truncate());
+                        ui.separator();
+                        ui.label(format!(
+                            "{}×{} · {}-bit · {}",
+                            loaded.frame.spec.width,
+                            loaded.frame.spec.height,
+                            loaded.frame.spec.bit_depth,
+                            bayer_label(displayed_bayer).to_uppercase()
+                        ));
+                    },
+                );
+            });
         });
     }
 
-    fn render_loaded_status(&self, ui: &mut egui::Ui, loaded: &LoadedRaw) {
-        let file_name = loaded
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("<raw>");
-        let displayed_bayer = loaded.displayed_bayer(self.display_mode);
-
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(format!("{:.0}%", self.viewer.zoom * 100.0));
-            ui.separator();
-            ui.label(self.display_mode.label());
-            self.render_diagnostic_badges(ui, loaded);
-            ui.separator();
-            ui.label(format!("ROI: {}×{}", loaded.roi.width, loaded.roi.height));
-            ui.separator();
-            ui.allocate_ui_with_layout(
-                ui.available_size(),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.add(egui::Label::new(file_name).truncate());
-                    ui.separator();
-                    ui.label(format!(
-                        "{}×{} · {}-bit · {}",
-                        loaded.frame.spec.width,
-                        loaded.frame.spec.height,
-                        loaded.frame.spec.bit_depth,
-                        bayer_label(displayed_bayer).to_uppercase()
-                    ));
-                },
-            );
-        });
-    }
-
-    fn render_diagnostic_badges(&self, ui: &mut egui::Ui, loaded: &LoadedRaw) {
+    fn render_diagnostic_badges(ui: &mut egui::Ui, document: &crate::workspace::RawDocument) {
+        let loaded = &document.loaded;
         if loaded.diagnostics.has_out_of_range() {
             ui.separator();
             ui.colored_label(
@@ -661,7 +849,7 @@ impl CameraToolboxApp {
                 format!("RAW range: {}", loaded.diagnostics.out_of_range_pixels),
             );
         }
-        if self.display_mode != DisplayMode::Color {
+        if document.display_mode != DisplayMode::Color {
             return;
         }
         let Some(preview) = &loaded.installed_color else {
@@ -766,30 +954,27 @@ impl CameraToolboxApp {
                 "RAW samples exceed declared bit-depth range"
             );
         }
-        if let Some(previous) = &self.loaded {
-            self.notifications
-                .clear_scope(NotificationScope::ImageGeneration(previous.generation));
-            self.analysis_panel.clear_generation(previous.generation);
-            self.analysis_worker.cancel();
-            self.clear_spatial_highlight();
-            self.analysis_pending_active = None;
-        }
-        self.loaded = Some(loaded);
-        self.analysis_panel.open_for_first_image();
+        let document_id = self.workspace.open_local_raw(loaded);
         if let Some(notification) = notification {
             self.notifications.push_once(notification);
         }
-        self.viewer = ImageViewerState::default();
-        self.display_mode = DisplayMode::Color;
+        tracing::debug!(
+            operation = "open_document",
+            document_id = %document_id,
+            generation,
+            "opened local RAW in new tab"
+        );
         self.request_current_color();
+        self.workspace.enforce_derived_budget();
         Ok(())
     }
 
     fn request_current_color(&mut self) {
         let request = {
-            let Some(loaded) = self.loaded.as_mut() else {
+            let Some(document) = self.workspace.active_mut() else {
                 return;
             };
+            let loaded = &mut document.loaded;
             let revision = loaded.color_edit.revision;
             if loaded.color_edit.submitted_revision == Some(revision) {
                 return;
@@ -801,6 +986,7 @@ impl CameraToolboxApp {
             {
                 tracing::warn!(
                     operation = "validate_color_params",
+                    document_id = %document.id,
                     generation = loaded.generation,
                     revision,
                     error = %error,
@@ -810,6 +996,7 @@ impl CameraToolboxApp {
                 return;
             }
             let request = ColorRenderRequest {
+                document_id: document.id,
                 frame_generation: loaded.generation,
                 revision,
                 frame: Arc::clone(&loaded.frame),
@@ -820,10 +1007,13 @@ impl CameraToolboxApp {
         };
         tracing::debug!(
             operation = "submit_color_render",
+            document_id = %request.document_id,
             generation = request.frame_generation,
             revision = request.revision,
             "submitted color render"
         );
+        self.workspace
+            .supersede_color_submissions_except(request.document_id);
         self.color_worker.submit(request);
     }
 
@@ -831,23 +1021,28 @@ impl CameraToolboxApp {
         let Some(result) = self.color_worker.take_ready() else {
             return;
         };
-        let Some(loaded) = self.loaded.as_mut() else {
+        self.install_color_result(context, result);
+    }
+
+    fn install_color_result(&mut self, context: &egui::Context, result: ColorRenderResult) {
+        let identity = DocumentIdentity {
+            document_id: result.document_id,
+            generation: result.frame_generation,
+        };
+        let Some(document) = self.workspace.matching_document_mut(identity) else {
             tracing::debug!(
                 operation = "poll_color_result",
+                document_id = %result.document_id,
                 generation = result.frame_generation,
                 revision = result.revision,
-                "dropped color result because image is closed"
+                "dropped color result for closed or replaced document"
             );
             return;
         };
-        if !color_result_matches(
-            loaded.generation,
-            loaded.color_edit.revision,
-            result.frame_generation,
-            result.revision,
-        ) {
+        if document.loaded.color_edit.revision != result.revision {
             tracing::debug!(
                 operation = "poll_color_result",
+                document_id = %result.document_id,
                 generation = result.frame_generation,
                 revision = result.revision,
                 "dropped stale color result"
@@ -856,33 +1051,37 @@ impl CameraToolboxApp {
         }
         match result.rendered {
             Ok(rendered) => {
-                loaded.install_color(
+                document.loaded.install_color(
                     context,
                     result.revision,
                     result.params,
                     rendered.image,
                     rendered.diagnostics,
                 );
-                loaded.color_edit.render_error = None;
+                document.loaded.color_edit.render_error = None;
+                document.mark_derived_loaded();
                 tracing::debug!(
                     operation = "install_color_render",
-                    generation = loaded.generation,
+                    document_id = %document.id,
+                    generation = document.loaded.generation,
                     revision = result.revision,
                     "installed color render"
                 );
             }
             Err(error) => {
-                loaded.color_edit.mark_error(error.clone());
+                document.loaded.color_edit.mark_error(error.clone());
                 tracing::error!(
                     operation = "render_color",
-                    generation = loaded.generation,
+                    document_id = %document.id,
+                    generation = document.loaded.generation,
                     revision = result.revision,
                     error = %error,
                     "accepted color render failed"
                 );
+
                 self.notifications.push_once(UiNotification::error(
                     NotificationKey::ColorRenderFailed {
-                        generation: loaded.generation,
+                        generation: document.loaded.generation,
                         revision: result.revision,
                     },
                     "Color preview failed",
@@ -891,164 +1090,555 @@ impl CameraToolboxApp {
             }
         }
     }
-}
 
-const fn color_result_matches(
-    loaded_generation: u64,
-    desired_revision: u64,
-    result_generation: u64,
-    result_revision: u64,
-) -> bool {
-    loaded_generation == result_generation && desired_revision == result_revision
-}
-
-#[cfg(test)]
-mod tests {
-    use std::path::PathBuf;
-
-    use camera_toolbox_app::LocalRawAnalyzeReport;
-    use camera_toolbox_core::{BayerPattern, RawFrame, RawSpec, Roi, analyze_roi};
-    use eframe::egui::{self, accesskit::Role};
-
-    use super::{CameraToolboxApp, LoadedRaw, color_result_matches};
-
-    const TEST_VIEWPORT: egui::Vec2 = egui::vec2(640.0, 360.0);
-
-    /// `AccessKit` 使用 `f64` 屏幕坐标；测试 viewport 有界，可安全转换为 `egui` 的 `f32` 坐标。
-    #[allow(clippy::cast_possible_truncation)]
-    fn accesskit_rect_center(rect: egui::accesskit::Rect) -> egui::Pos2 {
-        egui::pos2(
-            ((rect.x0 + rect.x1) * 0.5) as f32,
-            ((rect.y0 + rect.y1) * 0.5) as f32,
-        )
+    fn ensure_active_resources(&mut self, context: &egui::Context) {
+        let should_request_color = if let Some(document) = self.workspace.active_mut() {
+            document.loaded.ensure_raw_texture(context);
+            document.display_mode == DisplayMode::Color
+                && document.loaded.installed_revision() != Some(document.loaded.color_edit.revision)
+                && document.loaded.color_edit.submitted_revision
+                    != Some(document.loaded.color_edit.revision)
+        } else {
+            false
+        };
+        if should_request_color {
+            self.request_current_color();
+        }
     }
 
-    fn run_app_frame(
+    fn handle_platform_ui_action(&mut self, context: &egui::Context, action: PlatformUiAction) {
+        match action {
+            PlatformUiAction::OpenRaw => self.raw_dialog.open(context),
+            PlatformUiAction::Stream(action) => self.handle_stream_panel_action(action),
+        }
+    }
+
+    fn handle_platform_effect(&mut self, context: &egui::Context, effect: PlatformEffect) {
+        let PlatformEffect::OpenAsset {
+            asset,
+            snapshot,
+            foreground,
+            spec,
+        } = effect;
+        let result = match asset.metadata.format {
+            MediaFormat::RawPacked { bit_depth } => self
+                .open_packed_raw_asset(context, asset, snapshot, spec.bayer, bit_depth, foreground),
+            MediaFormat::Jpeg | MediaFormat::Yuv420Sp { .. } => self
+                .workspace
+                .open_asset(asset, snapshot, foreground)
+                .map(|_| ()),
+            ref format => Err(format!(
+                "captured media format {format:?} cannot be opened as an image"
+            )),
+        };
+        if let Err(error) = result {
+            self.live_runtime.panel.last_error = Some(error);
+        }
+    }
+
+    fn open_packed_raw_asset(
+        &mut self,
         context: &egui::Context,
-        app: &mut CameraToolboxApp,
-        frame: &mut eframe::Frame,
-        events: Vec<egui::Event>,
-    ) -> egui::FullOutput {
-        let mut input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, TEST_VIEWPORT)),
-            ..Default::default()
+        asset: Arc<camera_toolbox_core::EphemeralAsset>,
+        snapshot: Arc<camera_toolbox_app::TargetResolutionSnapshot>,
+        bayer: camera_toolbox_core::BayerPattern,
+        bit_depth: u8,
+        foreground: bool,
+    ) -> Result<(), String> {
+        let attribute = |name: &str| -> Result<usize, String> {
+            asset
+                .metadata
+                .attributes
+                .get(name)
+                .ok_or_else(|| format!("captured RAW metadata is missing {name}"))?
+                .parse::<usize>()
+                .map_err(|error| format!("captured RAW metadata {name} is invalid: {error}"))
         };
-        input.events = events;
-        context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
-    }
-
-    fn app_with_loaded_raw(context: &egui::Context) -> CameraToolboxApp {
-        let spec = RawSpec {
-            width: 2,
-            height: 2,
-            bit_depth: 10,
-            bayer: BayerPattern::Rggb,
+        let width = u32::try_from(attribute("width")?)
+            .map_err(|_| "captured RAW width does not fit u32".to_owned())?;
+        let height = u32::try_from(attribute("height")?)
+            .map_err(|_| "captured RAW height does not fit u32".to_owned())?;
+        let stride = attribute("stride")?;
+        let bytes = match &asset.source {
+            OwnedMediaPayload::Bytes(bytes) => bytes.as_ref(),
+            OwnedMediaPayload::Planes(_) => {
+                return Err("packed RAW source must be one contiguous payload".to_owned());
+            }
         };
-        let frame = RawFrame::new(spec, vec![64, 128, 256, 512]).unwrap();
+        let frame = decode_le_continuous_raw(
+            PackedRawSpec {
+                width,
+                height,
+                stride,
+                bit_depth,
+            },
+            bayer,
+            bytes,
+        )
+        .map_err(|error| error.to_string())?;
         let roi = Roi {
             x: 0,
             y: 0,
-            width: frame.spec.width,
-            height: frame.spec.height,
+            width,
+            height,
         };
-        let report = LocalRawAnalyzeReport {
-            path: PathBuf::from("fixture.raw"),
-            stats: analyze_roi(&frame, roi).unwrap(),
-            frame,
-            roi,
+        let stats = analyze_roi(&frame, roi).map_err(|error| error.to_string())?;
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let loaded = LoadedRaw::from_report(
+            context,
+            LocalRawAnalyzeReport {
+                path: std::path::PathBuf::from(&asset.metadata.source_name),
+                frame,
+                roi,
+                stats,
+            },
+            generation,
+        );
+        self.workspace
+            .open_captured_raw(loaded, asset, snapshot, foreground);
+        Ok(())
+    }
+    fn save_active_ephemeral_source(&mut self) -> bool {
+        let asset = self
+            .workspace
+            .active_asset()
+            .map(|document| Arc::clone(&document.asset))
+            .or_else(|| {
+                self.workspace
+                    .active()
+                    .and_then(|document| document.source_asset.as_ref().map(Arc::clone))
+            });
+        let Some(asset) = asset else { return false };
+        let extension = asset_extension(&asset.metadata.format);
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Captured source", &[extension])
+            .set_file_name(format!("{}.{}", asset.metadata.source_name, extension))
+            .save_file()
+        else {
+            return false;
         };
-        let mut app = CameraToolboxApp::new(context).unwrap();
-        app.loaded = Some(LoadedRaw::from_report(context, report, 1));
-        app.analysis_panel.open_for_first_image();
-        app
+        match save_asset_source(&path, &asset) {
+            Ok(()) => {
+                if let Some(document) = self.workspace.active_asset_mut() {
+                    document.saved = true;
+                }
+                if let Some(document) = self.workspace.active_mut() {
+                    document.unsaved = false;
+                }
+                true
+            }
+            Err(error) => {
+                self.live_runtime.panel.last_error = Some(error);
+                false
+            }
+        }
     }
 
-    #[test]
-    fn color_panel_bottom_gain_remains_reachable_in_short_viewport() {
-        let context = egui::Context::default();
-        context.enable_accesskit();
-        let mut app = app_with_loaded_raw(&context);
-        let mut frame = eframe::Frame::_new_kittest();
-        let panel_position = egui::pos2(500.0, 100.0);
+    fn render_pending_ephemeral_close(&mut self, context: &egui::Context) {
+        let Some(id) = self.pending_ephemeral_close else {
+            return;
+        };
+        let mut cancel = false;
+        let mut save = false;
+        let mut discard = false;
+        egui::Window::new("Unsaved captured source")
+            .collapsible(false)
+            .resizable(false)
+            .show(context, |ui| {
+                ui.label("Save writes the source from memory to the chosen destination.");
+                ui.horizontal(|ui| {
+                    cancel = ui.button("Cancel").clicked();
+                    save = ui.button("Save...").clicked();
+                    discard = ui.button("Discard tab").clicked();
+                });
+            });
+        if cancel {
+            self.pending_ephemeral_close = None;
+        } else if save {
+            self.workspace.activate(id);
+            if self.save_active_ephemeral_source() {
+                self.pending_ephemeral_close = None;
+                self.close_document(context, id);
+            }
+        } else if discard {
+            if let Some(document) = self.workspace.asset_mut(id) {
+                document.saved = true;
+            }
+            if let Some(document) = self.workspace.document_mut(id) {
+                document.unsaved = false;
+            }
+            self.pending_ephemeral_close = None;
+            self.close_document(context, id);
+        }
+    }
 
-        run_app_frame(&context, &mut app, &mut frame, Vec::new());
-        run_app_frame(
-            &context,
-            &mut app,
-            &mut frame,
-            vec![egui::Event::PointerMoved(panel_position)],
-        );
-        run_app_frame(
-            &context,
-            &mut app,
-            &mut frame,
-            vec![egui::Event::MouseWheel {
-                unit: egui::MouseWheelUnit::Point,
-                delta: egui::vec2(0.0, -1_000.0),
-                phase: egui::TouchPhase::Move,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
-        let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
-        let target = output
-            .platform_output
-            .accesskit_update
-            .expect("accessibility tree is enabled")
-            .nodes
-            .into_iter()
-            .filter_map(|(_, node)| {
-                (node.role() == Role::SpinButton)
-                    .then(|| node.bounds())
-                    .flatten()
+    fn render_asset_viewer(
+        ui: &mut egui::Ui,
+        document: &mut crate::workspace::AssetDocument,
+    ) -> egui::Rect {
+        let rect = ui.max_rect();
+        ui.heading(&document.title);
+        ui.horizontal_wrapped(|ui| {
+            ui.label(format!("Format: {:?}", document.asset.metadata.format));
+            ui.label(format!(
+                "Source bytes: {}",
+                document.asset.byte_len().unwrap_or(0)
+            ));
+            ui.label(format!("Integrity: {:?}", document.asset.integrity));
+        });
+        ui.collapsing("Source metadata", |ui| {
+            for (key, value) in &document.asset.metadata.attributes {
+                ui.label(format!("{key}: {value}"));
+            }
+            ui.monospace(format!("target={}", document.resolution.aggregate_hash));
+        });
+        ui.separator();
+        if let Some(texture) = document.texture() {
+            let available = ui.available_size();
+            let source = texture.size_vec2();
+            let scale = (available.x / source.x)
+                .min(available.y / source.y)
+                .min(1.0)
+                .max(0.01);
+            ui.centered_and_justified(|ui| {
+                ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
+            });
+        } else {
+            ui.centered_and_justified(|ui| ui.spinner());
+        }
+        rect
+    }
+
+    fn handle_stream_panel_action(&mut self, action: StreamPanelAction) {
+        match action {
+            StreamPanelAction::Start => match self.live_runtime.start() {
+                Ok((session_id, latest_frame)) => {
+                    self.workspace.open_live(session_id, latest_frame);
+                    self.live_runtime.panel.last_error = None;
+                }
+                Err(error) => self.live_runtime.panel.last_error = Some(error),
+            },
+            StreamPanelAction::RequestStop => {
+                let id = self
+                    .workspace
+                    .active_live()
+                    .map(|document| document.id)
+                    .or_else(|| {
+                        self.workspace
+                            .live_documents()
+                            .first()
+                            .map(|document| document.id)
+                    });
+                if let Some(id) = id
+                    && let Some(document) = self.workspace.live_mut(id)
+                    && matches!(document.lifecycle, LiveDocumentLifecycle::Open)
+                {
+                    document.lifecycle = LiveDocumentLifecycle::CloseRequested;
+                    self.workspace.activate(id);
+                }
+            }
+        }
+    }
+
+    fn poll_stream_events(&mut self) {
+        loop {
+            let event = match self.live_runtime.try_recv() {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(error) => {
+                    self.live_runtime.panel.last_error = Some(error);
+                    break;
+                }
+            };
+            if let Some(document) = self.workspace.live_by_session_mut(&event.session_id) {
+                document.apply_event(event.event);
+            }
+        }
+    }
+
+    fn advance_live_close_deadlines(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<_> = self
+            .workspace
+            .live_documents()
+            .iter()
+            .filter_map(|document| match document.lifecycle {
+                LiveDocumentLifecycle::Closing { stop_deadline } if now >= stop_deadline => {
+                    Some((document.id, document.session_id.clone()))
+                }
+                _ => None,
             })
-            .filter(|bounds| bounds.x0 >= 360.0 && bounds.y0 >= 0.0 && bounds.y1 <= 200.0)
-            .max_by(|left, right| left.y1.total_cmp(&right.y1))
-            .expect("scrolled Channel gain control is visible");
-        let start = accesskit_rect_center(target);
-        let end = start + egui::vec2(20.0, 0.0);
-        let before = app.loaded.as_ref().unwrap().color_edit.params.gain.b;
-
-        run_app_frame(
-            &context,
-            &mut app,
-            &mut frame,
-            vec![
-                egui::Event::PointerMoved(start),
-                egui::Event::PointerButton {
-                    pos: start,
-                    button: egui::PointerButton::Primary,
-                    pressed: true,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-        );
-        run_app_frame(
-            &context,
-            &mut app,
-            &mut frame,
-            vec![egui::Event::PointerMoved(end)],
-        );
-        run_app_frame(
-            &context,
-            &mut app,
-            &mut frame,
-            vec![egui::Event::PointerButton {
-                pos: end,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            }],
-        );
-
-        let loaded = app.loaded.as_ref().unwrap();
-        assert!((loaded.color_edit.params.gain.b - before).abs() > f32::EPSILON);
-        assert!(loaded.color_edit.revision > 0);
+            .collect();
+        for (id, session_id) in expired {
+            if self.live_runtime.force_cleanup(&session_id)
+                && let Some(document) = self.workspace.live_mut(id)
+            {
+                document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
+                    terminal: camera_toolbox_app::StreamTerminal::Forced {
+                        remote_state_unknown: true,
+                    },
+                };
+            }
+        }
     }
 
-    #[test]
-    fn color_result_requires_matching_generation_and_revision() {
-        assert!(color_result_matches(4, 7, 4, 7));
-        assert!(!color_result_matches(4, 7, 3, 7));
-        assert!(!color_result_matches(4, 7, 4, 6));
+    fn render_live_viewer(
+        ui: &mut egui::Ui,
+        document: &mut LiveDocument,
+        runtime: &LiveRuntime,
+    ) -> egui::Rect {
+        let rect = ui.max_rect();
+        ui.horizontal(|ui| {
+            ui.heading(&document.title);
+            if ui.button("Snapshot...").clicked()
+                && let Some(frame) = document.latest_frame.latest()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("PNG image", &["png"])
+                    .save_file()
+            {
+                document.last_snapshot = Some(match write_live_snapshot(&path, &frame) {
+                    Ok(()) => format!("Saved {}", path.display()),
+                    Err(error) => format!("Snapshot failed: {error}"),
+                });
+            }
+        });
+        if let Some(message) = document.last_snapshot.as_deref() {
+            ui.label(message);
+        }
+        match &document.lifecycle {
+            LiveDocumentLifecycle::CloseRequested => {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    ui.label(
+                        "Close this live session? The only stop action is closing its TCP socket.",
+                    );
+                    ui.horizontal(|ui| {
+                        if ui.button("Cancel").clicked() {
+                            document.lifecycle = LiveDocumentLifecycle::Open;
+                        }
+                        if ui.button("Close Stream").clicked() {
+                            if runtime.request_close(&document.session_id) {
+                                document.lifecycle = LiveDocumentLifecycle::Closing {
+                                    stop_deadline: Instant::now() + LIVE_STOP_TIMEOUT,
+                                };
+                            } else {
+                                document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
+                                    terminal: camera_toolbox_app::StreamTerminal::Forced {
+                                        remote_state_unknown: true,
+                                    },
+                                };
+                            }
+                        }
+                    });
+                });
+            }
+            LiveDocumentLifecycle::Closing { .. } => {
+                ui.colored_label(egui::Color32::YELLOW, "Closing asynchronously...");
+            }
+            LiveDocumentLifecycle::ForcedCleanup { terminal }
+            | LiveDocumentLifecycle::Terminal { terminal } => {
+                ui.colored_label(egui::Color32::LIGHT_RED, format!("Stopped: {terminal:?}"));
+            }
+            LiveDocumentLifecycle::Open => {}
+        }
+        if let Some(reason) = document.decoder_unavailable.as_deref() {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                format!("Decoder unavailable; record-only mode: {reason}"),
+            );
+        }
+        ui.separator();
+        egui::Grid::new(format!("live_metrics_{}", document.id))
+            .num_columns(4)
+            .show(ui, |ui| {
+                ui.label(format!("Network {} B", document.metrics.network_bytes));
+                ui.label(format!("RTP {}", document.metrics.rtp_packets));
+                ui.label(format!("Gaps {}", document.metrics.rtp_gaps));
+                ui.label(format!("Dropped {}", document.metrics.preview_dropped));
+                ui.end_row();
+                ui.label(format!("Decoded {}", document.metrics.decoded_frames));
+                ui.label(format!("Presented {}", document.presented_frames));
+                ui.label(format!("Resync {}", document.metrics.decoder_resyncs));
+                ui.label(format!("Record {} B", document.metrics.record_bytes));
+                ui.end_row();
+                ui.label(format!(
+                    "Preview Q {}",
+                    document.metrics.preview_queue_depth
+                ));
+                ui.label(format!(
+                    "Decoder Q {}",
+                    document.metrics.decoder_queue_depth
+                ));
+                ui.label(format!(
+                    "Record Q {} B",
+                    document.metrics.recorder_queue_bytes
+                ));
+                ui.label("source_rtp_pts=None");
+                ui.end_row();
+            });
+        ui.separator();
+        if let Some(texture) = document.texture() {
+            let available = ui.available_size();
+            let source = texture.size_vec2();
+            let scale = (available.x / source.x)
+                .min(available.y / source.y)
+                .min(1.0)
+                .max(0.01);
+            ui.centered_and_justified(|ui| {
+                ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
+            });
+        } else {
+            ui.centered_and_justified(|ui| {
+                ui.spinner();
+                ui.label("Waiting for decoded frame");
+            });
+        }
+        rect
+    }
+
+    fn handle_tab_action(&mut self, context: &egui::Context, action: TabBarAction) {
+        match action {
+            TabBarAction::Activate(id) => {
+                if self.workspace.activate(id) {
+                    self.ensure_active_resources(context);
+                }
+            }
+            TabBarAction::Close(id) => self.close_document(context, id),
+        }
+    }
+
+    fn close_document(&mut self, context: &egui::Context, id: DocumentId) {
+        if self
+            .workspace
+            .asset(id)
+            .is_some_and(|document| !document.saved)
+            || self
+                .workspace
+                .document(id)
+                .is_some_and(|document| document.unsaved && document.source_asset.is_some())
+        {
+            self.pending_ephemeral_close = Some(id);
+            self.workspace.activate(id);
+            return;
+        }
+        if self.workspace.asset(id).is_some() {
+            self.workspace.remove_asset(id);
+            return;
+        }
+        if let Some(document) = self.workspace.live_mut(id) {
+            let (remove, activate_confirmation) = match document.lifecycle {
+                LiveDocumentLifecycle::Open => {
+                    document.lifecycle = LiveDocumentLifecycle::CloseRequested;
+                    (false, true)
+                }
+                LiveDocumentLifecycle::Terminal { .. }
+                | LiveDocumentLifecycle::ForcedCleanup { .. } => (true, false),
+                LiveDocumentLifecycle::CloseRequested | LiveDocumentLifecycle::Closing { .. } => {
+                    (false, false)
+                }
+            };
+            if remove {
+                self.workspace.remove_live(id);
+            } else if activate_confirmation {
+                self.workspace.activate(id);
+            }
+            return;
+        }
+        let Some(document) = self.workspace.close(id) else {
+            return;
+        };
+        self.notifications
+            .clear_scope(NotificationScope::ImageGeneration(
+                document.loaded.generation,
+            ));
+        tracing::debug!(
+            operation = "close_document",
+            document_id = %document.id,
+            generation = document.loaded.generation,
+            "closed RAW document"
+        );
+        self.ensure_active_resources(context);
+        self.workspace.enforce_derived_budget();
     }
 }
+fn asset_extension(format: &MediaFormat) -> &'static str {
+    match format {
+        MediaFormat::RawPacked { .. } | MediaFormat::RawU16Le { .. } => "raw",
+        MediaFormat::Jpeg => "jpg",
+        MediaFormat::Yuv420Sp { .. } => "nv21",
+        MediaFormat::H264AnnexB => "h264",
+        MediaFormat::H265AnnexB => "h265",
+        MediaFormat::Binary => "bin",
+    }
+}
+fn save_asset_source(
+    path: &Path,
+    asset: &camera_toolbox_core::EphemeralAsset,
+) -> Result<(), String> {
+    save_asset_source_with(path, asset, |file, asset| {
+        use std::io::Write;
+
+        match &asset.source {
+            OwnedMediaPayload::Bytes(bytes) => file.write_all(bytes)?,
+            OwnedMediaPayload::Planes(planes) => {
+                for plane in planes {
+                    file.write_all(&plane.bytes)?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+fn save_asset_source_with<F>(
+    path: &Path,
+    asset: &camera_toolbox_core::EphemeralAsset,
+    write_payload: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut std::fs::File, &camera_toolbox_core::EphemeralAsset) -> std::io::Result<()>,
+{
+    use std::io::Write;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "destination already exists and was preserved; choose a new path: {}",
+                    path.display()
+                )
+            } else {
+                error.to_string()
+            }
+        })?;
+    let result = write_payload(&mut file, asset)
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(path);
+        return Err(format!("export incomplete: {error}"));
+    }
+    Ok(())
+}
+
+fn write_live_snapshot(
+    path: &Path,
+    frame: &camera_toolbox_app::DecodedVideoFrame,
+) -> Result<(), String> {
+    let file = std::fs::File::create(path).map_err(|error| error.to_string())?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), frame.width, frame.height);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder.write_header().map_err(|error| error.to_string())?;
+    writer
+        .write_image_data(&frame.rgba)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
+#[path = "app_tests.rs"]
+mod tests;

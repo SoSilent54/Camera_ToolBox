@@ -14,7 +14,7 @@ use camera_toolbox_core::{
 };
 use eframe::egui::{self, ColorImage};
 
-use crate::histogram_link::display_histogram_sample;
+use crate::{histogram_link::display_histogram_sample, workspace::DocumentId};
 
 const DISPLAY_BIN_COUNT: usize = 256;
 const DEFAULT_CACHE_CAPACITY: usize = 8;
@@ -36,6 +36,7 @@ impl AnalysisDomain {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct AnalysisKey {
+    pub(crate) document_id: DocumentId,
     pub(crate) generation: u64,
     pub(crate) source_revision: Option<u64>,
     pub(crate) roi: Roi,
@@ -93,6 +94,37 @@ pub(crate) struct DisplayRoiAnalysis {
 pub(crate) enum AnalysisData {
     Raw(RawRoiAnalysis),
     Display(DisplayRoiAnalysis),
+}
+
+impl AnalysisData {
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        match self {
+            Self::Raw(analysis) => {
+                let histogram = &analysis.histogram;
+                [
+                    histogram.channels.r.bins().len(),
+                    histogram.channels.gr.bins().len(),
+                    histogram.channels.gb.bins().len(),
+                    histogram.channels.b.bins().len(),
+                    histogram.all.bins().len(),
+                ]
+                .into_iter()
+                .fold(std::mem::size_of_val(analysis), |total, bins| {
+                    total.saturating_add(bins.saturating_mul(std::mem::size_of::<u64>()))
+                })
+            }
+            Self::Display(analysis) => [
+                analysis.histogram.r.bins.len(),
+                analysis.histogram.g.bins.len(),
+                analysis.histogram.b.bins.len(),
+                analysis.histogram.luma.bins.len(),
+            ]
+            .into_iter()
+            .fold(std::mem::size_of_val(analysis), |total, bins| {
+                total.saturating_add(bins.saturating_mul(std::mem::size_of::<u64>()))
+            }),
+        }
+    }
 }
 
 pub(crate) struct AnalysisPayload {
@@ -179,13 +211,6 @@ impl AnalysisWorker {
 
     pub(crate) fn submit(&self, request: AnalysisRequest) {
         self.shared.submit(request);
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.shared.desired_ticket.fetch_add(1, Ordering::AcqRel);
-        lock(&self.shared.request).pending = None;
-        lock(&self.shared.ready).take();
-        self.shared.request_ready.notify_all();
     }
 
     pub(crate) fn take_ready(&self) -> Option<AnalysisResult> {
@@ -424,12 +449,19 @@ impl AnalysisCache {
         value
     }
 
+    #[cfg(test)]
     pub(crate) fn clear_generation(&mut self, generation: u64) {
         self.entries.retain(|(key, _)| key.generation != generation);
     }
 
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
+    }
+
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        self.entries.iter().fold(0usize, |total, (_, data)| {
+            total.saturating_add(data.estimated_bytes())
+        })
     }
 
     #[cfg(test)]
@@ -466,6 +498,7 @@ mod tests {
 
     fn key(generation: u64, revision: Option<u64>, domain: AnalysisDomain) -> AnalysisKey {
         AnalysisKey {
+            document_id: DocumentId::from_raw(generation),
             generation,
             source_revision: revision,
             roi: Roi {

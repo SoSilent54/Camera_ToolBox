@@ -14,7 +14,10 @@ use camera_toolbox_core::{
 };
 use eframe::egui::{self, ColorImage};
 
+use crate::workspace::DocumentId;
+
 pub(crate) struct ColorRenderRequest {
+    pub(crate) document_id: DocumentId,
     pub(crate) frame_generation: u64,
     pub(crate) revision: u64,
     pub(crate) frame: Arc<RawFrame>,
@@ -27,6 +30,7 @@ pub(crate) struct RenderedColorImage {
 }
 
 pub(crate) struct ColorRenderResult {
+    pub(crate) document_id: DocumentId,
     pub(crate) frame_generation: u64,
     pub(crate) revision: u64,
     pub(crate) params: ColorPipelineParams,
@@ -96,17 +100,6 @@ impl ColorRenderWorker {
 
     pub(crate) fn submit(&self, request: ColorRenderRequest) {
         self.shared.submit(request);
-    }
-
-    pub(crate) fn cancel(&self) {
-        tracing::debug!(
-            operation = "cancel_color_render",
-            "cancelled pending color render"
-        );
-        self.shared.desired_ticket.fetch_add(1, Ordering::AcqRel);
-        lock(&self.shared.request).pending = None;
-        lock(&self.shared.ready).take();
-        self.shared.request_ready.notify_all();
     }
 
     pub(crate) fn take_ready(&self) -> Option<ColorRenderResult> {
@@ -193,6 +186,7 @@ fn render_request(shared: &WorkerShared, ticketed: TicketedRequest) -> Option<Co
         Err(error) => Err(error.to_string()),
     };
     Some(ColorRenderResult {
+        document_id: request.document_id,
         frame_generation: request.frame_generation,
         revision: request.revision,
         params: request.params,
@@ -251,6 +245,7 @@ mod tests {
 
     fn request(revision: u64) -> ColorRenderRequest {
         ColorRenderRequest {
+            document_id: DocumentId::from_raw(1),
             frame_generation: 7,
             revision,
             frame: Arc::new(
@@ -293,6 +288,7 @@ mod tests {
         let shared = WorkerShared::default();
         for revision in [1, 2] {
             lock(&shared.ready).replace(ColorRenderResult {
+                document_id: DocumentId::from_raw(1),
                 frame_generation: 7,
                 revision,
                 params: request(revision).params,

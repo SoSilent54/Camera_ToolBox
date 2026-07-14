@@ -10,7 +10,7 @@
 
 ## P0：只读闭环
 
-目标：先把本地 RAW 加载、解码、分析和 GUI 灰度/基础彩色显示串通；sensor 取图、SSH/SFTP、寄存器读写、自动曝光暂不做。
+目标：打通本地 RAW 与受控远端只读采集；当前已实现 CV610 direct TCP、SSH-managed、内存资产和多文档 GUI，寄存器读写与自动曝光仍不进入本阶段。
 
 验收：
 
@@ -20,6 +20,10 @@
 - 同一 RAW 的统计结果可重复。
 - GUI 能用参数打开本地 RAW，切换 Raw Mono/Color，显示 ROI；`Tools -> Hover View` 提供即时、固定大小、可选 3×3/5×5/7×7 的 RAW 邻域检查，显示原始值、CFA、已安装彩色纹理对应的 RGB 和 ROI 统计。
 - 彩色预览支持四种 Bayer、R/Gr/Gb/B black/gain、bilinear demosaic，以及默认 2.2、可在 GUI 调节并可关闭的 Gamma 显示；自动 BLC/AWB、CCM、LSC、edge-aware demosaic 显式 deferred。
+- CV610 PQTools Dump 支持 RAW10/RAW12/JPEG/NV21；PQStream 支持有界 H.264/H.265 transport、H.265 preview 与显式 recording，协议 fixture 和 fake server 已验证。
+- SSH-managed 使用严格 host key、credential reference、typed allowlist recipe、普通 SSH exec/SFTP 和可选 watcher helper；远端载荷先进入有界内存，不产生 capture 临时文件。
+- GUI 使用 Platform/Sensor 独立选择和多文档 Tab；未绑定 Sensor 时 platform-only 能力仍可用，同一 Platform 切换 Sensor 不重连既有 runtime。
+- CV610、SSH 与 RDK X5 真实设备端到端验收仍是明确未完成项，不将 fixture 结果提升为实机能力。
 
 ## P1：受控手动操作
 

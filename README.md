@@ -9,13 +9,14 @@ Rust-only ISP 标定工具箱。当前路线已锁定为：
 
 ## 当前阶段
 
-本仓库先落基础工程骨架和本地 RAW 最小闭环，不实现 sensor 取图、SSH/SFTP、寄存器读写等设备侧真实副作用。
+当前已完成本地 RAW、多文档工作区，以及 CV610/SSH-managed 只读采集链路。寄存器读写、自动曝光闭环和真实设备验收仍未开放。
+
 ```text
 Camera Toolbox
 ├── crates/
-│   ├── core/           # 领域模型、RAW 描述、ROI 统计、journal 基础类型
-│   ├── app/            # 命令/事件/工作流编排边界
-│   ├── adapters/       # 外部进程、SSH、文件、寄存器等适配端口
+│   ├── core/           # RAW/媒体/临时资产、ROI 统计与 sensor 描述
+│   ├── app/            # Platform/Profile/能力矩阵、命令事件与内存预算
+│   ├── adapters/       # CV610 PQTools/PQStream、SSH/SFTP、本地文件
 │   └── frontends/
 │       ├── cli/        # headless 自动化入口
 │       ├── tui/        # 运维/日志/批处理副界面
@@ -72,9 +73,58 @@ cargo run --release -p camera-toolbox-gui
 `Tools -> Hover View` 默认开启，可关闭；开启后可选择 3×3、5×5（默认）或 7×7 RAW 邻域。鼠标进入图像即显示固定大小、跟随指针的非交互检查窗：邻域始终读取 RAW preview（Color 主视图下也不读取插值彩色纹理），中心格带十字与边框，图像边缘越界格留空。信息区显示坐标、CFA 通道、RAW 值、最后一次已安装彩色参数得到的 RGBf/RGB8、颜色色块和 ROI 统计；超 bit-depth 样本保留洋红诊断色。底部状态栏只保留文件规格、显示模式、缩放和异常摘要。
 RAW 超 bit-depth 时，顶部会出现可关闭的 Warning，并在 8 秒后自动消失；其消失不会清除状态栏 `RAW range`、MAGENTA 像素或 Hover View 诊断。加载和渲染失败显示可关闭但不自动消失的 Error，同时保留对话框/面板中的就地错误。GUI、CLI、TUI 统一写入 console 和按日滚动的 JSONL 文件，最多保留 7 个匹配文件；可用 `RUST_LOG` 临时调整等级。日志目录由平台 `ProjectDirs` 解析；典型位置为 Linux `${XDG_STATE_HOME:-~/.local/state}/cameratoolbox/logs`、macOS `~/Library/Application Support/org.camera-toolbox.Camera-Toolbox/logs`、Windows `%LOCALAPPDATA%\camera-toolbox\Camera Toolbox\data\logs`，应以 GUI `Help -> Log directory` 显示并可复制的实际路径为准。CLI 的业务结果仍写 stdout，日志不混入该输出。
 
-当前只支持紧密排列、已解包的 `u16le` Bayer RAW。彩色预览不包含自动 black level/AWB、CCM、LSC、降噪或 edge-aware demosaic，因此属于 sensor RGB 查验，不代表标定后的准确 sRGB。带行 padding、RAW10/12 packed 和复杂 manifest 后续再加。
+本地文件入口目前只支持紧密排列、已解包的 `u16le` Bayer RAW。CV610 Dump 另外支持协议内的 packed RAW10/RAW12、JPEG 和 NV21，并在内存中完成长度、checksum、stride 和格式校验；这不代表本地文件对话框已经支持这些 packed 格式。彩色预览不包含自动 black level/AWB、CCM、LSC、降噪或 edge-aware demosaic，因此属于 sensor RGB 查验，不代表标定后的准确 sRGB。
 
 本地 RAW 路径也走 `app::Workflow::load_raw_and_analyze` 与 `RawFrameLoader` port；CLI/GUI 不直接解码或统计 RAW。
+
+## 平台采集与配置
+
+GUI 顶部依次选择 Platform Profile 和 `Sensor: Unbound` 或已配置的 Sensor/Mode。当前 Dump、Stream、SSH Command/File 都是 platform-only 能力，因此没有 Sensor 配置时仍可使用；Sensor×Platform cell 目前只用于收窄格式或补充 Bayer、方向等证据，尚不产生寄存器权限。
+
+选择 `Device Manager...` 可新建、校验、保存、导入或导出 tagged profile：
+
+- `Local`：只显示本地 RAW 打开入口。
+- `Hisilicon CV610`：一个 host 由 Dump/Stream 共享，默认端口分别为 `4321`/`80`。
+- `SSH-managed`：保存 host、port、username、严格固定的 OpenSSH host public key、credential reference、typed recipe id、远端根目录与 glob；不会保存密码或私钥内容。
+
+配置文件为 versioned JSON `platform-profiles.json`，目录由 `ProjectDirs::from("io", "sosilent", "camera-toolbox")` 解析。首次启动只创建 `Local files`；网络目标必须显式配置。导入时拒绝未知 schema、未知字段、重复 ID 和无效跨引用。编辑配置不会改变已提交 job；job 持有提交时的 Platform/Sensor/matrix snapshot hashes。
+
+### CV610
+
+- Dump 使用一次一连接的 PQTools TCP 4321；当前 profile host 必须是数值 IPv4/IPv6 地址。`Auto` 和 `DirectOnly` 都只发送已验证的直接请求；只有显式注入的 `ValidatedRecipe` 才会执行额外初始化。
+- Stream 使用独立 PQStream TCP 80 会话，支持有界 RTP/H.264/H.265 解析、H.265 live preview、显式 recording 和异步关闭。FFmpeg 不可用时仍可接收/显式录制，但不会伪装为可预览。
+- Dump/SSH fetch 先成为有上限的内存 `EphemeralAsset`，不会创建 `.part`、wire dump 或 manifest 临时文件。默认单次上限 256 MiB、全局未保存 source 上限 1 GiB；超限明确失败，不回退磁盘。
+- `Save/Export` 只写用户选择的新目标并拒绝覆盖既有文件；写入失败会尽力删除该不完整目标，不创建隐藏 staging 文件。
+
+### SSH-managed
+
+普通 SSH `exec` 是默认命令路径。程序和 argv 布局只能来自部署时注册的 typed allowlist recipe，参数经过类型、范围、choice 或远端根目录校验，并逐 argv 做 POSIX shell-safe 编码；UI 不接受任意 shell command。可选 `CTARGV1 subsystem` 仅用于已经部署对应 helper 的目标。`Event subsystem` 也是可选优化，留空时使用限定目录/glob 的稳定性 polling。
+
+Credential reference 支持：
+
+- `key-file:/absolute/path`：操作时读取 OpenSSH private key；Unix 下要求权限不宽于 `0600`，文件最大 1 MiB。
+- `session:<id>`：在 Device Manager 中输入，仅保存在当前进程内，重启后必须重新输入。
+
+生产 SSH capture recipe 从以下完整环境变量组加载；全部缺失表示没有部署 recipe，只有部分字段则启动时明确报错：
+
+```bash
+CAMERA_TOOLBOX_SSH_RECIPE_ID=rdk-x5-vin-raw
+CAMERA_TOOLBOX_SSH_RECIPE_PROGRAM=/absolute/path/to/capture-program
+CAMERA_TOOLBOX_SSH_RECIPE_OUTPUT_ROOT=/absolute/remote/root
+CAMERA_TOOLBOX_SSH_RECIPE_FORMATS=raw12,nv21
+CAMERA_TOOLBOX_SSH_RECIPE_OUTPUT_DIR_FLAG=--output-dir
+CAMERA_TOOLBOX_SSH_RECIPE_FORMAT_FLAG=--format
+CAMERA_TOOLBOX_SSH_RECIPE_ONCE_FLAG=--once
+CAMERA_TOOLBOX_SSH_RECIPE_PATH_STDOUT=true
+```
+
+该程序成功时必须在 stdout 返回一个 UTF-8 artifact path line；返回路径仍会经过远端根目录、稳定性、大小、hash 与内存预算校验。被动 watcher 默认只更新 Assets，不抢占当前 Tab。
+
+### 验收限制
+
+- Rust protocol fixtures、本地 TCP fake server、SSH state machine 和 GUI smoke 已通过；当前尚未连接真实 CV610 或 SSH 设备完成端到端验收。
+- CV610 cold boot 初始化、Dump `0xEE` 错误、RAW metadata Bayer enum、YUV 其他 enum/range/matrix、真实 H.264、Dump+Stream 并发和自动重连仍保持 Unknown。
+- RDK X5 仅提供未完成的 SSH-managed 模板，不代表已部署或已验收；host key、recipe、远端路径和采集格式必须来自实际设备证据。
 
 ## 设计原则
 

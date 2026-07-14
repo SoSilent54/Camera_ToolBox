@@ -140,6 +140,11 @@ impl ImageViewerState {
         });
     }
 
+    /// 释放可重建 overlay texture，不改变 zoom/pan/ROI 交互状态。
+    pub(crate) fn evict_derived_resources(&mut self) {
+        self.spatial_overlay = None;
+    }
+
     fn sync_spatial_overlay(
         &mut self,
         context: &egui::Context,

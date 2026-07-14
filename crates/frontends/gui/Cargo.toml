@@ -14,6 +14,9 @@ camera-toolbox-logging.workspace = true
 eframe.workspace = true
 egui_plot.workspace = true
 rfd.workspace = true
+png.workspace = true
+image.workspace = true
+secrecy.workspace = true
 tracing.workspace = true
 
 [lints]

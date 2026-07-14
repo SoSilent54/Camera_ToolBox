@@ -144,6 +144,12 @@ impl SpatialMask {
     }
 }
 
+impl SpatialMask {
+    fn estimated_bytes(&self) -> usize {
+        self.bits.len().saturating_mul(std::mem::size_of::<u64>())
+    }
+}
+
 fn spatial_mask_image_with_cancel<F>(
     mask: &SpatialMask,
     highlight_color: egui::Color32,
@@ -232,6 +238,19 @@ pub(crate) struct SpatialHighlight {
     pub(crate) overlay_image: Option<Arc<egui::ColorImage>>,
 }
 
+impl SpatialHighlight {
+    pub(crate) fn estimated_bytes(&self) -> usize {
+        let overlay_bytes = self.overlay_image.as_ref().map_or(0, |image| {
+            // CPU ColorImage 与 Viewer 上传后的 GPU texture 各保守计一份 RGBA。
+            image
+                .pixels
+                .len()
+                .saturating_mul(std::mem::size_of::<egui::Color32>().saturating_mul(2))
+        });
+        self.mask.estimated_bytes().saturating_add(overlay_bytes)
+    }
+}
+
 pub(crate) struct SpatialHighlightRequest {
     pub(crate) selection: HistogramBinSelection,
     pub(crate) frame: Arc<RawFrame>,
@@ -298,13 +317,6 @@ impl SpatialHighlightWorker {
         lock(&self.shared.request).pending = Some(TicketedRequest { ticket, request });
         lock(&self.shared.ready).take();
         self.shared.request_ready.notify_one();
-    }
-
-    pub(crate) fn cancel(&self) {
-        self.shared.desired_ticket.fetch_add(1, Ordering::AcqRel);
-        lock(&self.shared.request).pending = None;
-        lock(&self.shared.ready).take();
-        self.shared.request_ready.notify_all();
     }
 
     pub(crate) fn take_ready(&self) -> Option<SpatialHighlightResult> {
@@ -485,6 +497,7 @@ mod tests {
     ) -> HistogramBinSelection {
         HistogramBinSelection {
             key: AnalysisKey {
+                document_id: crate::workspace::DocumentId::from_raw(1),
                 generation: 1,
                 source_revision: (domain == AnalysisDomain::DisplayRgb).then_some(3),
                 roi,

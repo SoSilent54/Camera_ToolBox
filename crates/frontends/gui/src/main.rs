@@ -5,8 +5,10 @@ mod color_controls;
 mod color_worker;
 mod histogram_link;
 mod notification;
+mod platform_ui;
 mod raw_dialog;
 mod viewer;
+mod workspace;
 
 use std::sync::Arc;
 

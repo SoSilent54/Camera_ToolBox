@@ -44,7 +44,7 @@ pub(crate) struct LoadedRaw {
     pub(crate) frame: Arc<RawFrame>,
     pub(crate) roi: Roi,
     pub(crate) stats: Option<RoiStats>,
-    raw_texture: TextureHandle,
+    raw_texture: Option<TextureHandle>,
     pub(crate) installed_color: Option<InstalledColorPreview>,
     pub(crate) color_edit: ColorEditState,
     pub(crate) diagnostics: RawDiagnostics,
@@ -69,7 +69,7 @@ impl LoadedRaw {
             frame: Arc::new(report.frame),
             roi: report.roi,
             stats: Some(report.stats),
-            raw_texture,
+            raw_texture: Some(raw_texture),
             installed_color: None,
             color_edit,
             diagnostics,
@@ -111,13 +111,60 @@ impl LoadedRaw {
             .map(|preview| preview.rendered_revision)
     }
 
+    /// RAW GPU texture、Color CPU image 与 Color GPU texture 的保守驻留估算。
+    pub(crate) fn derived_resource_bytes(&self) -> usize {
+        let pixel_count = self.frame.pixels().len();
+        let raw_texture_bytes = self.raw_texture.as_ref().map_or(0, |_| {
+            pixel_count.saturating_mul(std::mem::size_of::<egui::Color32>())
+        });
+        let color_bytes = self.installed_color.as_ref().map_or(0, |preview| {
+            preview
+                .image
+                .pixels
+                .len()
+                .saturating_mul(std::mem::size_of::<egui::Color32>().saturating_mul(2))
+        });
+        raw_texture_bytes.saturating_add(color_bytes)
+    }
+
+    pub(crate) const fn has_raw_texture(&self) -> bool {
+        self.raw_texture.is_some()
+    }
+
+    /// GPU texture 必须在 egui 线程恢复；权威 RawFrame 始终保持不变。
+    pub(crate) fn ensure_raw_texture(&mut self, context: &egui::Context) {
+        if self.raw_texture.is_some() {
+            return;
+        }
+        let (image, _) = preview_with_diagnostics(&self.frame);
+        self.raw_texture = Some(context.load_texture(
+            format!(
+                "local-raw-preview:{}:{}",
+                self.generation,
+                self.path.display()
+            ),
+            image,
+            raw_texture_options(),
+        ));
+    }
+
+    /// 所有预览均可由权威 RAW 与参数重建；清除 submitted 允许再次调度同一 revision。
+    pub(crate) fn evict_preview_resources(&mut self) {
+        self.raw_texture = None;
+        self.installed_color = None;
+        self.color_edit.submitted_revision = None;
+    }
+
     pub(super) fn active_texture_id(&self, display_mode: DisplayMode) -> TextureId {
         if display_mode == DisplayMode::Color
             && let Some(preview) = &self.installed_color
         {
             return preview.texture.id();
         }
-        self.raw_texture.id()
+        self.raw_texture
+            .as_ref()
+            .expect("active document raw texture is resident")
+            .id()
     }
 
     pub(crate) fn displayed_bayer(&self, display_mode: DisplayMode) -> BayerPattern {
@@ -137,7 +184,10 @@ impl LoadedRaw {
     }
 
     pub(super) fn raw_texture_id(&self) -> TextureId {
-        self.raw_texture.id()
+        self.raw_texture
+            .as_ref()
+            .expect("active document raw texture is resident")
+            .id()
     }
 
     pub(super) fn rendered_pixel(&self, cursor: CursorPixel) -> Option<ColorPixel> {

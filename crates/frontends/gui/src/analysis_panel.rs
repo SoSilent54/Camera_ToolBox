@@ -221,25 +221,45 @@ impl AnalysisPanelState {
         self.current = None;
     }
 
-    pub(crate) fn clear_generation(&mut self, generation: u64) {
-        self.cache.clear_generation(generation);
-        if self
-            .desired_key
-            .is_some_and(|key| key.generation == generation)
-        {
-            self.desired_key = None;
-            self.pending_key = None;
-            self.error = None;
-            self.current = None;
-        }
+    /// 全局 latest-wins worker 被其他文档占用后，保留 desired/UI 状态并允许切回时重提。
+    pub(crate) fn mark_submission_superseded(&mut self) {
+        self.pending_key = None;
     }
 
-    pub(crate) fn clear(&mut self) {
+    #[cfg(test)]
+    pub(crate) const fn pending_key(&self) -> Option<AnalysisKey> {
+        self.pending_key
+    }
+
+    pub(crate) fn derived_resource_bytes(&self) -> usize {
+        let plot_bytes = self.current.as_ref().map_or(0, |current| {
+            current.plot.series.iter().fold(0usize, |total, series| {
+                total
+                    .saturating_add(
+                        series
+                            .count_points
+                            .len()
+                            .saturating_mul(std::mem::size_of::<PlotPoint>()),
+                    )
+                    .saturating_add(
+                        series
+                            .normalized_points
+                            .len()
+                            .saturating_mul(std::mem::size_of::<PlotPoint>()),
+                    )
+            })
+        });
+        self.cache.estimated_bytes().saturating_add(plot_bytes)
+    }
+
+    /// 保留展开、domain、scope、可见 series 等 UI 选择，只清理可重建分析结果。
+    pub(crate) fn evict_derived(&mut self) {
         self.desired_key = None;
         self.pending_key = None;
         self.error = None;
         self.current = None;
         self.cache.clear();
+        self.reset_view_requested = false;
     }
 
     pub(crate) fn has_current(&self, key: AnalysisKey) -> bool {
@@ -985,6 +1005,7 @@ mod tests {
         };
         let analysis = analyze_raw_roi(&frame, roi).unwrap();
         let key = AnalysisKey {
+            document_id: crate::workspace::DocumentId::from_raw(7),
             generation: 7,
             source_revision: None,
             roi,
@@ -1045,6 +1066,7 @@ mod tests {
         let analysis = analyze_raw_roi(&frame, roi).unwrap();
         let current = CurrentAnalysis {
             key: AnalysisKey {
+                document_id: crate::workspace::DocumentId::from_raw(1),
                 generation: 1,
                 source_revision: None,
                 roi,
