@@ -492,6 +492,7 @@ dependencies = [
  "camera-toolbox-app",
  "camera-toolbox-core",
  "camera-toolbox-logging",
+ "camera-toolbox-tui",
  "clap",
  "tracing",
 ]
@@ -538,8 +539,11 @@ name = "camera-toolbox-tui"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "camera-toolbox-adapters",
  "camera-toolbox-app",
+ "camera-toolbox-core",
  "camera-toolbox-logging",
+ "clap",
  "crossterm",
  "ratatui",
  "tracing",

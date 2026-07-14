@@ -14,5 +14,8 @@ camera-toolbox-logging.workspace = true
 clap.workspace = true
 tracing.workspace = true
 
+[dev-dependencies]
+camera-toolbox-tui = { path = "../tui" }
+
 [lints]
 workspace = true

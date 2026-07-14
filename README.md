@@ -120,6 +120,50 @@ CAMERA_TOOLBOX_SSH_RECIPE_PATH_STDOUT=true
 
 该程序成功时必须在 stdout 返回一个 UTF-8 artifact path line；返回路径仍会经过远端根目录、稳定性、大小、hash 与内存预算校验。被动 watcher 默认只更新 Assets，不抢占当前 Tab。
 
+### CLI 与 TUI
+
+CLI、TUI、GUI 使用同一 `ProfileStore → PlatformRegistry → CapabilityResolver → TargetResolutionSnapshot → PlatformController` 路径。CLI 业务结果为确定性 JSON stdout，typed terminal failure 返回非零状态；日志仍写 stderr/JSONL。
+
+```bash
+# 列出或校验 versioned profile store
+cargo run --release -p camera-toolbox-cli -- profile list
+cargo run --release -p camera-toolbox-cli -- profile validate
+
+# 无网络副作用地 bind/resolve 一个 Platform/Sensor 组合
+cargo run --release -p camera-toolbox-cli -- \
+  platform probe --platform <platform-id>
+
+# CV610 still Dump；--output 可省略，此时只保留有界内存资产
+cargo run --release -p camera-toolbox-cli -- \
+  cv610 dump --platform <platform-id> --kind raw12 --output <new-file.raw>
+
+# 有限时长 Stream recording；目标必须显式给出且不得已存在
+cargo run --release -p camera-toolbox-cli -- \
+  stream-record --platform <platform-id> --duration 10 \
+  --quota-bytes 536870912 --annexb-output <new-file.h265> \
+  --timestamp-output <new-file.jsonl>
+
+# 执行 profile 的 typed SSH capture recipe，或显式 fetch 一个远端文件
+cargo run --release -p camera-toolbox-cli -- \
+  ssh capture --platform <platform-id> --format raw12
+cargo run --release -p camera-toolbox-cli -- \
+  ssh fetch --platform <platform-id> --remote-path </remote/file> \
+  --format raw12-packed --output <new-file.raw>
+```
+
+`--sensor-id` 与 `--mode-id` 必须成对出现；都不提供时使用 `Sensor: Unbound`。所有平台命令均支持 `--profile-store <path>` 覆盖默认项目配置文件。
+
+交互式 TUI 显示 Platform/Sensor 选择、resolved capabilities/evidence、Jobs、Assets 和 typed event log：
+
+```bash
+cargo run --release -p camera-toolbox-tui
+
+# CI、远程支持或无 TTY 环境：只解析配置并输出确定性状态，不连接设备
+cargo run --release -p camera-toolbox-tui -- --snapshot
+```
+
+TUI 的 Stream、SSH capture/fetch/watch 只有在命令行显式提供有限时长、quota、目标路径或格式后才启用；按 `--help` 查看对应参数。退出会请求关闭活动 session/job，并通过 RAII 恢复 terminal。
+
 ### 验收限制
 
 - Rust protocol fixtures、本地 TCP fake server、SSH state machine 和 GUI smoke 已通过；当前尚未连接真实 CV610 或 SSH 设备完成端到端验收。

@@ -23,6 +23,7 @@
 - CV610 PQTools Dump 支持 RAW10/RAW12/JPEG/NV21；PQStream 支持有界 H.264/H.265 transport、H.265 preview 与显式 recording，协议 fixture 和 fake server 已验证。
 - SSH-managed 使用严格 host key、credential reference、typed allowlist recipe、普通 SSH exec/SFTP 和可选 watcher helper；远端载荷先进入有界内存，不产生 capture 临时文件。
 - GUI 使用 Platform/Sensor 独立选择和多文档 Tab；未绑定 Sensor 时 platform-only 能力仍可用，同一 Platform 切换 Sensor 不重连既有 runtime。
+- CLI 已提供 versioned profile list/validate、Platform/Sensor probe、CV610 Dump/有限录制和 SSH typed capture/fetch；TUI 已提供相同 resolver/controller/event 路径上的 Platform/Sensor/capability/job/asset 控制台与无 TTY snapshot。跨前端契约测试用同一 profile fixture 校验 `Unbound` 与 resolved capability/evidence 一致。
 - CV610、SSH 与 RDK X5 真实设备端到端验收仍是明确未完成项，不将 fixture 结果提升为实机能力。
 
 ## P1：受控手动操作
