@@ -19,7 +19,7 @@ Camera Toolbox
 │   └── frontends/
 │       ├── cli/        # 内部无头命令 library，不生成 bin
 │       └── gui/        # 唯一 camera-toolbox bin；GUI + argv 分流
-├── build.sh            # local / cv610 / ssh 单平台构建入口
+├── build.sh            # 当前原生系统的全 provider 统一构建入口
 ├── docs/
 │   ├── architecture.md # 架构边界与调用流
 │   └── roadmap.md      # P0 起步路线与验收
@@ -30,28 +30,27 @@ Camera Toolbox
 
 ```bash
 cargo fmt --all -- --check
-./build.sh local debug
-./build.sh cv610 debug
-./build.sh ssh debug
+./build.sh debug
 ```
 
-`build.sh` 必须显式选择 `local`、`cv610` 或 `ssh`，并通过 `--no-default-features` 只启用对应 provider。产物分别进入 `target/<platform>/debug/camera-toolbox`；第二参数可传 `release`。项目的 `profile.dev` 仍使用优化代码生成，但 Cargo 目录名保持 `debug`。
+`build.sh` 不选择 Local/CV610/SSH 功能平台；每次都统一编译这三个 provider。可选参数为 `debug`（默认）或 `release`，产物使用标准 Cargo 路径 `target/<profile>/camera-toolbox`。脚本只为当前原生系统构建，不把 OS 名伪装成跨平台参数；Windows、macOS、Linux 的编译由对应 GitHub Actions runner 承担。
 
 ## CI 与发布
 
-- 每个分支 push 会分别运行 common 检查以及 `local`、`cv610`、`ssh` 三个互相隔离的 feature job；单个 job 不同时启用多个远端 provider。Clippy 仅报告 warning，不以 `-D warnings` 阻断。
+- 每个分支 push 会在 Linux x86_64、macOS aarch64、Windows x86_64 runner 上分别编译同一个全 provider 产品；完整测试与 Clippy 在 Linux job 执行，macOS/Windows 至少验证原生 release 编译。Clippy 仅报告 warning，不以 `-D warnings` 阻断。
 - 也可在 GitHub `Actions -> CI -> Run workflow` 中手动执行同一套检查。
-- 推送任意 Git tag 会为每个功能平台分别构建单一 `camera-toolbox` 可执行文件。归档命名为 `camera-toolbox-<platform>-<environment>`，其中：
-  - `<platform>`：`local`、`cv610`、`ssh`；
-  - `<environment>`：`macos-aarch64`、`windows-x86_64`、`linux-{x86_64|aarch64}-ubuntu{20|22}`。
+- 推送任意 Git tag 会生成 6 个归档；每个归档都只有一个同时包含全部 provider 的 `camera-toolbox` 可执行文件：
+  - `camera-toolbox-macos-aarch64`
+  - `camera-toolbox-windows-x86_64`
+  - `camera-toolbox-linux-{x86_64|aarch64}-ubuntu{20|22}`
 - 也可在 GitHub `Actions -> Release -> Run workflow` 中填写 tag。Ubuntu 20/22 使用对应官方容器；x86_64 与 aarch64 使用匹配架构 runner。
 
 
 本地 RAW 无头分析：
 
 ```bash
-./build.sh local release
-target/local/release/camera-toolbox analyze-raw \
+./build.sh release
+target/release/camera-toolbox analyze-raw \
   --raw <frame.raw> --width <w> --height <h> --bit-depth <n> \
   --encoding u16le --roi 0,0,<w>,<h>
 ```
@@ -59,7 +58,7 @@ target/local/release/camera-toolbox analyze-raw \
 GUI 本地 RAW 预览：
 
 ```bash
-target/local/release/camera-toolbox
+target/release/camera-toolbox
 ```
 
 在菜单中选择 `File -> Open Raw...`，可手工填写或通过 `Select` 选择文件路径。软件会基于文件名、文件长度和有限像素样本生成 Preset，并自动应用评分最高的可加载候选；切换其他 Preset 会立即回填参数，手工修改 width、height、有效 bit depth、uint16 容器或端序后显示为 `Custom`。候选不是可靠识别，Bayer 仍须人工确认。
@@ -135,31 +134,28 @@ CAMERA_TOOLBOX_SSH_RECIPE_PATH_STDOUT=true
 `camera-toolbox` 的 GUI 与无头命令使用同一 `ProfileStore → PlatformRegistry → CapabilityResolver → TargetResolutionSnapshot → PlatformController` 路径。只要存在命令行子命令，程序就直接执行 CLI library 并退出，不初始化 eframe；业务结果为确定性 JSON stdout，typed terminal failure 返回非零状态。
 
 ```bash
-# Local build：profile 管理与无网络 probe
-./build.sh local release
-target/local/release/camera-toolbox profile list
-target/local/release/camera-toolbox profile validate
-target/local/release/camera-toolbox platform probe --platform <platform-id>
+# 一次构建同时提供 Local、CV610 与 SSH-managed 命令
+./build.sh release
 
-# CV610 build：still Dump / 有限时长 Stream recording
-./build.sh cv610 release
-target/cv610/release/camera-toolbox \
+target/release/camera-toolbox profile list
+target/release/camera-toolbox profile validate
+target/release/camera-toolbox platform probe --platform <platform-id>
+
+target/release/camera-toolbox \
   cv610 dump --platform <platform-id> --kind raw12 --output <new-file.raw>
-target/cv610/release/camera-toolbox \
+target/release/camera-toolbox \
   stream-record --platform <platform-id> --duration 10 \
   --quota-bytes 536870912 --annexb-output <new-file.h265> \
   --timestamp-output <new-file.jsonl>
 
-# SSH build：typed capture recipe / 显式远程文件 fetch
-./build.sh ssh release
-target/ssh/release/camera-toolbox \
+target/release/camera-toolbox \
   ssh capture --platform <platform-id> --format raw12
-target/ssh/release/camera-toolbox \
+target/release/camera-toolbox \
   ssh fetch --platform <platform-id> --remote-path </remote/file> \
   --format raw12-packed --output <new-file.raw>
 ```
 
-`--sensor-id` 与 `--mode-id` 必须成对出现；都不提供时使用 `Sensor: Unbound`。所有平台命令均支持 `--profile-store <path>` 覆盖默认项目配置文件。某个单平台构建仍可读取含其他平台 variant 的 profile store，但 bind 未编译 provider 时会明确返回 `platform provider is not compiled or registered`。
+`--sensor-id` 与 `--mode-id` 必须成对出现；都不提供时使用 `Sensor: Unbound`。所有平台命令均支持 `--profile-store <path>` 覆盖默认项目配置文件。Local、CV610、SSH provider 在正常产品构建中始终同时可用；叶子 Cargo feature 只保留给实现隔离与定向测试，不构成发布产品变体。
 
 
 ### 验收限制

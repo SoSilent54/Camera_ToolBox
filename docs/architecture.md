@@ -32,6 +32,20 @@ core        (RAW 描述、ROI、统计、journal 类型、领域校验)
 
 Rust workspace 不能形成 crate 循环，因此禁止 `app -> adapters -> app` 的双向依赖。运行时调用关系是 workflow 调用 trait object；编译期依赖关系是 adapters 实现 app 中定义的 trait。
 
+## 构建与 Provider 边界
+
+正常产品构建始终同时包含 Local、CV610 与 SSH-managed provider；它们不是三个发行变体。`platform-local`、`platform-cv610`、`platform-ssh` 叶子 feature 只用于隔离模块、可选重依赖和定向测试，`platform-all` 是产品默认与生产构建入口。
+
+```text
+Windows x86_64 runner ─┐
+macOS aarch64 runner ──┼──► camera-toolbox (Local + CV610 + SSH)
+Linux native runners ──┘
+   ├── x86_64 / Ubuntu 20、22
+   └── aarch64 / Ubuntu 20、22
+```
+
+OS/架构差异由 Rust `cfg(target_*)`、原生依赖和对应 Actions runner 处理。`build.sh` 只构建当前主机，不接受虚假的 OS 跨编译参数；未配置 Rust target、linker 与目标系统依赖时不得宣称可以跨平台构建。
+
 ## 当前只读调用流
 
 ```text

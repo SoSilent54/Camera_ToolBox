@@ -1066,6 +1066,7 @@ impl Drop for LiveRuntime {
     }
 }
 
+#[cfg(any(not(feature = "platform-cv610"), not(feature = "platform-ssh")))]
 fn render_platform_not_compiled(ui: &mut egui::Ui, platform: &str) {
     ui.heading(format!("{platform} profile"));
     ui.colored_label(

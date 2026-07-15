@@ -7,7 +7,8 @@ publish.workspace = true
 autobins = false
 
 [features]
-default = ["platform-local"]
+default = ["platform-all"]
+platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
 platform-local = ["camera-toolbox-adapters/platform-local"]
 platform-cv610 = ["camera-toolbox-adapters/platform-cv610"]
 platform-ssh = ["camera-toolbox-adapters/platform-ssh"]

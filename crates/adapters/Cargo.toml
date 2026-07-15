@@ -6,7 +6,8 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = []
+default = ["platform-all"]
+platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
 platform-local = []
 platform-cv610 = ["dep:sha2", "dep:socket2"]
 platform-ssh = [

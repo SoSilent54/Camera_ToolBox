@@ -5,7 +5,7 @@
 - 语言：Rust only。
 - 唯一产品二进制：`camera-toolbox`；无参数启动 `egui/eframe` GUI，有子命令进入无头自动化分支。
 - 内部 CLI library：复用 app workflow，且 argv 分流发生在 eframe 初始化前。
-- 平台构建：`platform-local`、`platform-cv610`、`platform-ssh` Cargo feature 单选，避免链接未使用的远端栈。
+- 产品构建：默认同时编译 Local、CV610、SSH-managed；叶子 Cargo feature 仅作为 provider 实现与重依赖隔离边界。发布按 Windows/macOS/Linux 原生 OS/架构 runner 拆分，不按功能 provider 拆分。
 - 依赖管理：workspace `[workspace.dependencies]` 统一锁定 GUI 版本族，避免多套 `egui` 类型。
 
 ## P0：只读闭环

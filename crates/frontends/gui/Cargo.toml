@@ -11,7 +11,8 @@ name = "camera-toolbox"
 path = "src/main.rs"
 
 [features]
-default = ["platform-local"]
+default = ["platform-all"]
+platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
 platform-local = [
     "camera-toolbox-adapters/platform-local",
     "camera-toolbox-cli/platform-local",

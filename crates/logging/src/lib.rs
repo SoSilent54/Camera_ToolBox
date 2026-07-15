@@ -7,7 +7,7 @@ use tracing_subscriber::{EnvFilter, Layer, layer::SubscriberExt, util::Subscribe
 
 const LOG_FILE_PREFIX: &str = "camera-toolbox.jsonl";
 const LOG_RETENTION_FILES: usize = 7;
-const FILE_DEFAULT_FILTER: &str = "warn,camera_toolbox_core=debug,camera_toolbox_app=debug,camera_toolbox_adapters=debug,camera_toolbox_logging=debug,camera_toolbox_gui=debug,camera_toolbox_cli=debug,camera_toolbox_tui=debug";
+const FILE_DEFAULT_FILTER: &str = "warn,camera_toolbox_core=debug,camera_toolbox_app=debug,camera_toolbox_adapters=debug,camera_toolbox_logging=debug,camera_toolbox=debug,camera_toolbox_cli=debug";
 
 /// 保持异步日志 writer 存活；丢弃时会刷新已排队的日志。
 pub struct LoggingGuard {

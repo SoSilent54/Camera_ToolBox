@@ -3,12 +3,11 @@ set -euo pipefail
 
 usage() {
     cat <<'EOF'
-Usage: ./build.sh <platform> [profile]
+Usage: ./build.sh [profile]
 
-Platforms:
-  local    Local RAW workflow only
-  cv610    Local RAW plus Hisilicon CV610 provider
-  ssh      Local RAW plus SSH-managed provider
+Builds one camera-toolbox executable for the current native host with Local,
+CV610, and SSH-managed providers enabled together. OS/architecture builds are
+split by native GitHub Actions runners rather than by this script.
 
 Profiles:
   debug    Cargo dev profile (default)
@@ -21,24 +20,12 @@ if [[ ${1:-} == "-h" || ${1:-} == "--help" ]]; then
     exit 0
 fi
 
-if (( $# < 1 || $# > 2 )); then
+if (( $# > 1 )); then
     usage >&2
     exit 2
 fi
 
-platform=$1
-profile=${2:-debug}
-
-case "$platform" in
-    local|cv610|ssh)
-        feature="platform-${platform}"
-        ;;
-    *)
-        printf 'error: unsupported platform %q\n' "$platform" >&2
-        usage >&2
-        exit 2
-        ;;
-esac
+profile=${1:-debug}
 
 case "$profile" in
     debug)
@@ -55,16 +42,16 @@ case "$profile" in
 esac
 
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-target_dir="${project_root}/target/${platform}"
+target_dir=${CARGO_TARGET_DIR:-"${project_root}/target"}
 
-printf 'Building camera-toolbox: platform=%s profile=%s target_dir=%s\n' \
-    "$platform" "$profile" "$target_dir"
+printf 'Building camera-toolbox: providers=all profile=%s target_dir=%s\n' \
+    "$profile" "$target_dir"
 
 CARGO_TARGET_DIR="$target_dir" cargo build \
     --manifest-path "${project_root}/Cargo.toml" \
     --package camera-toolbox \
     --bin camera-toolbox \
     --no-default-features \
-    --features "$feature" \
+    --features platform-all \
     --locked \
     "${profile_args[@]}"

@@ -492,6 +492,7 @@ fn available_variants() -> Vec<(DraftVariant, &'static str)> {
     variants
 }
 
+#[cfg(any(not(feature = "platform-cv610"), not(feature = "platform-ssh")))]
 fn render_not_compiled(ui: &mut egui::Ui, platform: &str) {
     ui.heading(format!("{platform} profile"));
     ui.colored_label(egui::Color32::YELLOW, "Platform not compiled in this build. The profile is read-only here and can still be imported or exported.");

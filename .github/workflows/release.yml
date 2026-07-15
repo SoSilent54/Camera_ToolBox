@@ -19,16 +19,12 @@ env:
 
 jobs:
   build-native:
-    name: Build ${{ matrix.platform }} ${{ matrix.environment }}
+    name: Build ${{ matrix.environment }}
     runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - local
-          - cv610
-          - ssh
         environment:
           - macos-aarch64
           - windows-x86_64
@@ -43,20 +39,19 @@ jobs:
         uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Build selected release
+      - name: Build unified release
         shell: bash
-        run: ./build.sh "${{ matrix.platform }}" release
+        run: ./build.sh release
 
       - name: Package Unix release
         if: runner.os != 'Windows'
         shell: bash
         env:
-          PLATFORM: ${{ matrix.platform }}
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          bundle="camera-toolbox-${PLATFORM}-${ENVIRONMENT}"
+          bundle="camera-toolbox-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
-          install -m 755 "target/${PLATFORM}/release/camera-toolbox" "dist/${bundle}/"
+          install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
 
@@ -64,24 +59,23 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          PLATFORM: ${{ matrix.platform }}
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          $bundle = "camera-toolbox-$env:PLATFORM-$env:ENVIRONMENT"
+          $bundle = "camera-toolbox-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
-          Copy-Item "target/$env:PLATFORM/release/camera-toolbox.exe" "dist/$bundle/"
+          Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
           Copy-Item README.md "dist/$bundle/"
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$bundle.zip" -Force
 
       - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}-${{ matrix.environment }}
-          path: dist/camera-toolbox-${{ matrix.platform }}-${{ matrix.environment }}.*
+          name: release-${{ matrix.environment }}
+          path: dist/camera-toolbox-${{ matrix.environment }}.*
           if-no-files-found: error
 
   build-linux:
-    name: Build ${{ matrix.platform }} ${{ matrix.environment }}
+    name: Build ${{ matrix.environment }}
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:${{ matrix.ubuntu_version }}
@@ -89,10 +83,6 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - local
-          - cv610
-          - ssh
         environment:
           - linux-x86_64-ubuntu20
           - linux-x86_64-ubuntu22
@@ -133,23 +123,22 @@ jobs:
         uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Build selected release
-        run: ./build.sh "${{ matrix.platform }}" release
+      - name: Build unified release
+        run: ./build.sh release
       - name: Package Linux release
         env:
-          PLATFORM: ${{ matrix.platform }}
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          bundle="camera-toolbox-${PLATFORM}-${ENVIRONMENT}"
+          bundle="camera-toolbox-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
-          install -m 755 "target/${PLATFORM}/release/camera-toolbox" "dist/${bundle}/"
+          install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
       - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.platform }}-${{ matrix.environment }}
-          path: dist/camera-toolbox-${{ matrix.platform }}-${{ matrix.environment }}.tar.gz
+          name: release-${{ matrix.environment }}
+          path: dist/camera-toolbox-${{ matrix.environment }}.tar.gz
           if-no-files-found: error
 
   publish:
@@ -170,14 +159,12 @@ jobs:
           merge-multiple: true
       - name: Verify release archives
         run: |
-          for platform in local cv610 ssh; do
-            test -f "dist/camera-toolbox-${platform}-macos-aarch64.tar.gz"
-            test -f "dist/camera-toolbox-${platform}-windows-x86_64.zip"
-            test -f "dist/camera-toolbox-${platform}-linux-x86_64-ubuntu20.tar.gz"
-            test -f "dist/camera-toolbox-${platform}-linux-x86_64-ubuntu22.tar.gz"
-            test -f "dist/camera-toolbox-${platform}-linux-aarch64-ubuntu20.tar.gz"
-            test -f "dist/camera-toolbox-${platform}-linux-aarch64-ubuntu22.tar.gz"
-          done
+          test -f "dist/camera-toolbox-macos-aarch64.tar.gz"
+          test -f "dist/camera-toolbox-windows-x86_64.zip"
+          test -f "dist/camera-toolbox-linux-x86_64-ubuntu20.tar.gz"
+          test -f "dist/camera-toolbox-linux-x86_64-ubuntu22.tar.gz"
+          test -f "dist/camera-toolbox-linux-aarch64-ubuntu20.tar.gz"
+          test -f "dist/camera-toolbox-linux-aarch64-ubuntu22.tar.gz"
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:

@@ -44,21 +44,25 @@ jobs:
       - name: Report common Clippy diagnostics
         run: cargo clippy --release --locked --all-targets -p camera-toolbox-core -p camera-toolbox-app -p camera-toolbox-logging
 
-  platform:
-    name: Platform ${{ matrix.platform }}
-    runs-on: ubuntu-22.04
+  product:
+    name: Unified product ${{ matrix.environment }}
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        platform:
-          - local
-          - cv610
-          - ssh
+        include:
+          - environment: linux-x86_64
+            runner: ubuntu-22.04
+          - environment: macos-aarch64
+            runner: macos-14
+          - environment: windows-x86_64
+            runner: windows-latest
 
     steps:
       - name: Check out source
         uses: actions/checkout@v4
       - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -78,29 +82,34 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - name: Build selected platform
-        run: ./build.sh "${{ matrix.platform }}" release
-      - name: Test selected adapter implementation
+      - name: Build unified product
+        shell: bash
+        run: ./build.sh release
+      - name: Test all adapter implementations together
+        if: runner.os == 'Linux'
         run: >-
           cargo test --release --locked
           -p camera-toolbox-adapters
           --no-default-features
-          --features "platform-${{ matrix.platform }}"
-      - name: Test internal CLI branch
+          --features platform-all
+      - name: Test internal CLI branch with all providers
+        if: runner.os == 'Linux'
         run: >-
           cargo test --release --locked
           -p camera-toolbox-cli --lib
           --no-default-features
-          --features "platform-${{ matrix.platform }}"
+          --features platform-all
       - name: Test unified binary target
+        if: runner.os == 'Linux'
         run: >-
           cargo test --release --locked
           -p camera-toolbox --all-targets
           --no-default-features
-          --features "platform-${{ matrix.platform }}"
-      - name: Report selected-platform Clippy diagnostics
+          --features platform-all
+      - name: Report unified-product Clippy diagnostics
+        if: runner.os == 'Linux'
         run: >-
           cargo clippy --release --locked
           -p camera-toolbox --all-targets
           --no-default-features
-          --features "platform-${{ matrix.platform }}"
+          --features platform-all
