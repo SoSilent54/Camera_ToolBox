@@ -294,7 +294,7 @@ fn run_connection_test(
             host: config.host,
             port: config.port,
             username: config.username,
-            expected_host_key: config.expected_host_key,
+            expected_host_key: Some(config.expected_host_key),
             command_subsystem: config.command_subsystem,
             remote_event_subsystem: config.remote_event_subsystem,
         },

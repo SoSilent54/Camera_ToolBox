@@ -49,7 +49,8 @@ pub struct SshConnectionTarget {
     pub host: String,
     pub port: u16,
     pub username: String,
-    pub expected_host_key: String,
+    /// `None` 明确表示接受服务端提供的任意主机密钥。
+    pub expected_host_key: Option<String>,
     pub command_subsystem: Option<String>,
     pub remote_event_subsystem: Option<String>,
 }
@@ -222,7 +223,7 @@ pub trait SshTransportSession: Send {
 pub struct RusshTransportFactory;
 
 struct HostKeyVerifier {
-    expected: russh::keys::ssh_key::PublicKey,
+    expected: Option<russh::keys::ssh_key::PublicKey>,
 }
 
 impl client::Handler for HostKeyVerifier {
@@ -232,7 +233,10 @@ impl client::Handler for HostKeyVerifier {
         &mut self,
         server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(server_public_key == &self.expected)
+        Ok(self
+            .expected
+            .as_ref()
+            .is_none_or(|expected| server_public_key == expected))
     }
 }
 
@@ -301,7 +305,11 @@ impl SshTransportFactory for RusshTransportFactory {
         if control.cancellation.is_cancelled() {
             return Err(SshTransportError::Cancelled);
         }
-        let expected = russh::keys::ssh_key::PublicKey::from_openssh(&target.expected_host_key)
+        let expected = target
+            .expected_host_key
+            .as_deref()
+            .map(russh::keys::ssh_key::PublicKey::from_openssh)
+            .transpose()
             .map_err(|error| {
                 SshTransportError::HelperProtocol(format!("invalid expected host key: {error}"))
             })?;
@@ -1311,6 +1319,59 @@ mod tests {
             self.requests.borrow_mut().push(RecordedRequest::Eof);
             Ok(())
         }
+    }
+
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
+
+    #[test]
+    fn absent_host_key_pin_accepts_any_server_key() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let key_a = russh::keys::ssh_key::PublicKey::from_openssh(KEY_A).unwrap();
+        let key_b = russh::keys::ssh_key::PublicKey::from_openssh(KEY_B).unwrap();
+        let mut verifier = HostKeyVerifier { expected: None };
+
+        runtime.block_on(async {
+            assert!(
+                client::Handler::check_server_key(&mut verifier, &key_a)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                client::Handler::check_server_key(&mut verifier, &key_b)
+                    .await
+                    .unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn configured_host_key_pin_remains_strict() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let key_a = russh::keys::ssh_key::PublicKey::from_openssh(KEY_A).unwrap();
+        let key_b = russh::keys::ssh_key::PublicKey::from_openssh(KEY_B).unwrap();
+        let mut verifier = HostKeyVerifier {
+            expected: Some(key_a.clone()),
+        };
+
+        runtime.block_on(async {
+            assert!(
+                client::Handler::check_server_key(&mut verifier, &key_a)
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !client::Handler::check_server_key(&mut verifier, &key_b)
+                    .await
+                    .unwrap()
+            );
+        });
     }
 
     #[test]

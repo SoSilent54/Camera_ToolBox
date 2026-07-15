@@ -84,7 +84,7 @@ impl SshManagedPlatformProvider {
                     host: config.host.clone(),
                     port: config.port,
                     username: config.username.clone(),
-                    expected_host_key: config.expected_host_key.clone(),
+                    expected_host_key: Some(config.expected_host_key.clone()),
                     command_subsystem: config.command_subsystem.clone(),
                     remote_event_subsystem: config.remote_event_subsystem.clone(),
                 },
@@ -105,7 +105,7 @@ impl SshManagedPlatformProvider {
             host: config.host.clone(),
             port: config.port,
             username: config.username.clone(),
-            expected_host_key: config.expected_host_key.clone(),
+            expected_host_key: Some(config.expected_host_key.clone()),
             command_subsystem: config.command_subsystem.clone(),
             remote_event_subsystem: config.remote_event_subsystem.clone(),
         };

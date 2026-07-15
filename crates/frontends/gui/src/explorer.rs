@@ -11,14 +11,18 @@ use std::{
     thread,
     time::Duration,
 };
+#[cfg(feature = "platform-ssh")]
+use std::{
+    panic::{AssertUnwindSafe, catch_unwind},
+    time::Instant,
+};
 
 use camera_toolbox_adapters::filesystem::LocalFileSystem;
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::{
     filesystem::SftpFileSystem,
     platforms::ssh_managed::{
-        CredentialResolver, HostKeyAssessment, HostKeyManager, HostKeyTarget,
-        RusshTransportFactory, ServerHostKey, SshConnectionTarget, SshCredential,
+        CredentialResolver, RusshTransportFactory, SshConnectionTarget, SshCredential,
         SshTransportFactory,
     },
 };
@@ -34,6 +38,9 @@ use camera_toolbox_app::{
 use eframe::egui;
 #[cfg(feature = "platform-ssh")]
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
+
+#[cfg(feature = "platform-ssh")]
+const REMOTE_CONNECT_WATCHDOG: Duration = Duration::from_secs(30);
 
 pub(crate) enum ExplorerAction {
     AddLocalMount(PathBuf),
@@ -95,7 +102,7 @@ impl RemoteConnectionDraft {
         }
     }
 
-    fn connect_request(&self, generation: u64) -> Result<RemoteConnectRequest, String> {
+    fn connect_request(&self) -> Result<RemoteConnectRequest, String> {
         let host = self.host.trim();
         if host.is_empty() || host.contains(char::is_whitespace) || host.contains(['/', '\\', '\0'])
         {
@@ -121,7 +128,6 @@ impl RemoteConnectionDraft {
             .clone()
             .unwrap_or_else(|| format!("credential-{}", id.as_str()));
         Ok(RemoteConnectRequest {
-            generation,
             id,
             slot_id,
             host: host.to_owned(),
@@ -134,7 +140,6 @@ impl RemoteConnectionDraft {
 
 #[cfg(feature = "platform-ssh")]
 struct RemoteConnectRequest {
-    generation: u64,
     id: RemoteConnectionId,
     slot_id: String,
     host: String,
@@ -150,39 +155,19 @@ struct RemoteConnectResult {
 }
 
 #[cfg(feature = "platform-ssh")]
-trait RemoteHostIdentityVerifier: Send + Sync {
-    fn verified_key(&self, host: &str, port: u16) -> Result<ServerHostKey, String>;
-}
-
-#[cfg(feature = "platform-ssh")]
-struct ProductionRemoteHostIdentityVerifier;
-
-#[cfg(feature = "platform-ssh")]
-impl RemoteHostIdentityVerifier for ProductionRemoteHostIdentityVerifier {
-    fn verified_key(&self, host: &str, port: u16) -> Result<ServerHostKey, String> {
-        let target =
-            HostKeyTarget::new(host.to_owned(), port).map_err(|error| error.to_string())?;
-        let manager = HostKeyManager::production().map_err(|error| error.to_string())?;
-        let assessment = manager
-            .scan_and_assess(&target, Duration::from_secs(5))
-            .map_err(|error| error.to_string())?;
-        resolve_host_key_assessment(assessment, |key| {
-            manager
-                .trust(&target, key)
-                .map(|_| ())
-                .map_err(|error| error.to_string())
-        })
-    }
+struct ActiveRemoteConnect {
+    generation: u64,
+    started_at: Instant,
+    cancellation: DumpCancellation,
+    receiver: Receiver<RemoteConnectResult>,
 }
 
 #[cfg(feature = "platform-ssh")]
 fn run_remote_connect(
     request: RemoteConnectRequest,
     transport: &dyn SshTransportFactory,
-    identity: &dyn RemoteHostIdentityVerifier,
+    cancellation: DumpCancellation,
 ) -> Result<RemoteConnectionCommit, String> {
-    let server_key = identity.verified_key(&request.host, request.port)?;
-
     let password_for_transport = SecretString::from(request.password.expose_secret());
     let password_for_session = SecretString::from(request.password.expose_secret());
     let control = RemoteOperationControl::new(
@@ -191,14 +176,14 @@ fn run_remote_connect(
             idle: Duration::from_secs(10),
             overall: Duration::from_secs(20),
         },
-        DumpCancellation::default(),
+        cancellation,
     )
     .map_err(|error| error.to_string())?;
     let connection_target = SshConnectionTarget {
         host: request.host.clone(),
         port: request.port,
         username: request.username.clone(),
-        expected_host_key: server_key.openssh().to_owned(),
+        expected_host_key: None,
         command_subsystem: None,
         remote_event_subsystem: None,
     };
@@ -219,7 +204,7 @@ fn run_remote_connect(
         host: request.host,
         port: request.port,
         username: request.username,
-        expected_host_key: server_key.openssh().to_owned(),
+        expected_host_key: None,
         authentication: RemoteAuthentication::Password {
             slot_id: request.slot_id,
         },
@@ -232,21 +217,15 @@ fn run_remote_connect(
 }
 
 #[cfg(feature = "platform-ssh")]
-fn resolve_host_key_assessment(
-    assessment: HostKeyAssessment,
-    trust_unknown: impl FnOnce(&ServerHostKey) -> Result<(), String>,
-) -> Result<ServerHostKey, String> {
-    match assessment {
-        HostKeyAssessment::Trusted(key) => Ok(key),
-        HostKeyAssessment::Unknown(key) => {
-            trust_unknown(&key)?;
-            Ok(key)
-        }
-        HostKeyAssessment::Changed(_) => Err(
-            "SSH server identity changed. Connection was blocked to protect your credentials."
-                .to_owned(),
-        ),
-    }
+fn run_remote_connect_guarded(
+    request: RemoteConnectRequest,
+    transport: &dyn SshTransportFactory,
+    cancellation: DumpCancellation,
+) -> Result<RemoteConnectionCommit, String> {
+    catch_unwind(AssertUnwindSafe(|| {
+        run_remote_connect(request, transport, cancellation)
+    }))
+    .unwrap_or_else(|_| Err("Remote connection worker crashed unexpectedly".to_owned()))
 }
 
 pub(crate) struct MountBinding {
@@ -321,7 +300,7 @@ impl MountView {
             host: connection.host.clone(),
             port: connection.port,
             username: connection.username.clone(),
-            expected_host_key: connection.expected_host_key.clone(),
+            expected_host_key: None,
             command_subsystem: None,
             remote_event_subsystem: None,
         };
@@ -409,13 +388,9 @@ pub(crate) struct ExplorerState {
     #[cfg(feature = "platform-ssh")]
     remote_draft: RemoteConnectionDraft,
     #[cfg(feature = "platform-ssh")]
-    remote_connect_sender: Sender<RemoteConnectResult>,
-    #[cfg(feature = "platform-ssh")]
-    remote_connect_receiver: Receiver<RemoteConnectResult>,
-    #[cfg(feature = "platform-ssh")]
     next_remote_connect_generation: u64,
     #[cfg(feature = "platform-ssh")]
-    remote_connect_in_flight: bool,
+    active_remote_connect: Option<ActiveRemoteConnect>,
 }
 
 impl ExplorerState {
@@ -455,7 +430,6 @@ impl ExplorerState {
         let mut mounts = Vec::new();
         let mut errors = Vec::new();
         let transport: Arc<dyn SshTransportFactory> = transport;
-        let (remote_connect_sender, remote_connect_receiver) = mpsc::channel();
         for mount in settings.mounts() {
             let view = match mount {
                 MountedSourceConfig::Local { source_id, root } => {
@@ -505,10 +479,8 @@ impl ExplorerState {
             remote_editor_error: None,
             remote_status: None,
             remote_draft,
-            remote_connect_sender,
-            remote_connect_receiver,
             next_remote_connect_generation: 1,
-            remote_connect_in_flight: false,
+            active_remote_connect: None,
         }
     }
 
@@ -603,7 +575,7 @@ impl ExplorerState {
             "Connected to {}@{}:{}",
             connection.username, connection.host, connection.port
         ));
-        self.remote_connect_in_flight = false;
+        self.cancel_remote_connect();
         self.remote_draft = RemoteConnectionDraft::from_config(&connection);
         let connections = self.connections.clone();
         let credentials = Arc::clone(&self.credentials);
@@ -668,73 +640,112 @@ impl ExplorerState {
     }
 
     #[cfg(feature = "platform-ssh")]
+    fn remote_connect_in_flight(&self) -> bool {
+        self.active_remote_connect.is_some()
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn cancel_remote_connect(&mut self) {
+        if let Some(active) = self.active_remote_connect.take() {
+            active.cancellation.cancel();
+        }
+    }
+
+    #[cfg(feature = "platform-ssh")]
     fn start_remote_connect(&mut self, context: &egui::Context) {
-        if self.remote_connect_in_flight {
+        if self.remote_connect_in_flight() {
             return;
         }
         let generation = self.next_remote_connect_generation;
         self.next_remote_connect_generation = self.next_remote_connect_generation.saturating_add(1);
-        let request = match self.remote_draft.connect_request(generation) {
+        let request = match self.remote_draft.connect_request() {
             Ok(request) => request,
             Err(error) => {
                 self.remote_editor_error = Some(error);
                 return;
             }
         };
+        let cancellation = DumpCancellation::default();
+        let worker_cancellation = cancellation.clone();
+        let (sender, receiver) = mpsc::channel();
         self.remote_editor_error = None;
         self.global_error = None;
-        self.remote_status = Some("Connecting and verifying the remote device…".to_owned());
-        self.remote_connect_in_flight = true;
-        let sender = self.remote_connect_sender.clone();
+        self.remote_status = Some("Connecting to the remote device…".to_owned());
+        self.active_remote_connect = Some(ActiveRemoteConnect {
+            generation,
+            started_at: Instant::now(),
+            cancellation,
+            receiver,
+        });
+        context.request_repaint_after(REMOTE_CONNECT_WATCHDOG);
         let transport = Arc::clone(&self.transport);
         let context = context.clone();
         thread::spawn(move || {
-            let generation = request.generation;
-            let identity = ProductionRemoteHostIdentityVerifier;
-            let result = run_remote_connect(request, transport.as_ref(), &identity);
+            let result =
+                run_remote_connect_guarded(request, transport.as_ref(), worker_cancellation);
             let _ = sender.send(RemoteConnectResult { generation, result });
             context.request_repaint();
         });
     }
 
     #[cfg(feature = "platform-ssh")]
-    fn poll_remote_connect_result(&mut self) -> Option<ExplorerAction> {
-        let mut action = None;
-        loop {
-            let result = match self.remote_connect_receiver.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.remote_connect_in_flight = false;
-                    self.remote_status = None;
-                    self.remote_editor_error =
-                        Some("Remote connection worker is unavailable".to_owned());
-                    break;
+    fn poll_remote_connect_result(&mut self, context: &egui::Context) -> Option<ExplorerAction> {
+        let outcome = {
+            let active = self.active_remote_connect.as_ref()?;
+            let elapsed = active.started_at.elapsed();
+            match active.receiver.try_recv() {
+                Ok(result) => Some(Ok(result)),
+                Err(TryRecvError::Empty) if elapsed >= REMOTE_CONNECT_WATCHDOG => {
+                    Some(Err(format!(
+                        "Remote connection timed out after {} seconds",
+                        REMOTE_CONNECT_WATCHDOG.as_secs()
+                    )))
                 }
-            };
-            if result.generation.saturating_add(1) != self.next_remote_connect_generation {
-                continue;
+                Err(TryRecvError::Empty) => {
+                    context.request_repaint_after(REMOTE_CONNECT_WATCHDOG.saturating_sub(elapsed));
+                    None
+                }
+                Err(TryRecvError::Disconnected) => Some(Err(
+                    "Remote connection worker stopped unexpectedly".to_owned(),
+                )),
             }
-            self.remote_connect_in_flight = false;
-            match result.result {
+        }?;
+        let active = self
+            .active_remote_connect
+            .take()
+            .expect("active connection exists while polling its result");
+        match outcome {
+            Ok(result) if result.generation == active.generation => match result.result {
                 Ok(commit) => {
-                    self.remote_status =
-                        Some("Remote device verified. Saving connection…".to_owned());
-                    action = Some(ExplorerAction::SaveRemoteConnection(commit));
+                    self.remote_status = Some("Remote device connected. Saving…".to_owned());
+                    Some(ExplorerAction::SaveRemoteConnection(commit))
                 }
                 Err(error) => {
                     self.remote_status = None;
                     self.remote_editor_error = Some(error);
+                    None
                 }
+            },
+            Ok(_) => {
+                active.cancellation.cancel();
+                self.remote_status = None;
+                self.remote_editor_error =
+                    Some("Ignored an out-of-date remote connection result".to_owned());
+                None
+            }
+            Err(error) => {
+                active.cancellation.cancel();
+                self.remote_status = None;
+                self.remote_editor_error = Some(error);
+                None
             }
         }
-        action
     }
 
     #[cfg(feature = "platform-ssh")]
     pub(crate) fn set_remote_connection_error(&mut self, error: impl Into<String>) {
         let error = error.into();
-        self.remote_connect_in_flight = false;
+        self.cancel_remote_connect();
         self.remote_status = None;
         self.remote_editor_open = true;
         self.remote_editor_error = Some(error.clone());
@@ -786,7 +797,7 @@ impl ExplorerState {
         self.poll();
         let mut action = None;
         #[cfg(feature = "platform-ssh")]
-        if let Some(remote_action) = self.poll_remote_connect_result() {
+        if let Some(remote_action) = self.poll_remote_connect_result(context) {
             action = Some(remote_action);
         }
 
@@ -971,7 +982,7 @@ impl ExplorerState {
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(
-                    !self.remote_connect_in_flight,
+                    !self.remote_connect_in_flight(),
                     egui::Button::new("New Remote"),
                 )
                 .clicked()
@@ -980,7 +991,7 @@ impl ExplorerState {
             }
             if ui
                 .add_enabled(
-                    !self.remote_connect_in_flight && self.selected_connection.is_some(),
+                    !self.remote_connect_in_flight() && self.selected_connection.is_some(),
                     egui::Button::new("Edit Selected"),
                 )
                 .clicked()
@@ -990,7 +1001,7 @@ impl ExplorerState {
         });
         if let Some(status) = &self.remote_status {
             ui.horizontal(|ui| {
-                if self.remote_connect_in_flight {
+                if self.remote_connect_in_flight() {
                     ui.spinner();
                 }
                 ui.small(status);
@@ -1011,18 +1022,18 @@ impl ExplorerState {
                 } else {
                     "Connect to Remote"
                 });
-                if ui
-                    .add_enabled(!self.remote_connect_in_flight, egui::Button::new("Cancel"))
-                    .clicked()
-                {
+                if ui.button("Cancel").clicked() {
+                    self.cancel_remote_connect();
+                    self.remote_status = None;
                     self.remote_editor_open = false;
                     self.remote_editor_error = None;
+                    self.remote_draft = RemoteConnectionDraft::new();
                 }
             });
             if let Some(error) = &self.remote_editor_error {
                 ui.colored_label(egui::Color32::RED, error);
             }
-            ui.add_enabled_ui(!self.remote_connect_in_flight, |ui| {
+            ui.add_enabled_ui(!self.remote_connect_in_flight(), |ui| {
                 ui.label("Host");
                 ui.add(
                     egui::TextEdit::singleline(&mut self.remote_draft.host)
@@ -1044,10 +1055,10 @@ impl ExplorerState {
                         .desired_width(ui.available_width()),
                 );
             });
-            ui.small("The app verifies and pins the server identity automatically. A changed identity is blocked.");
+            ui.small("Host identity is not verified or saved. Use this only on a trusted network.");
             if ui
                 .add_enabled(
-                    !self.remote_connect_in_flight,
+                    !self.remote_connect_in_flight(),
                     egui::Button::new("Connect"),
                 )
                 .clicked()
@@ -1290,27 +1301,14 @@ fn sftp_source_id_for_mount(
 
 #[cfg(all(test, feature = "platform-ssh"))]
 mod tests {
-    use std::{cell::Cell, sync::Arc};
+    use std::sync::Arc;
 
     use camera_toolbox_adapters::platforms::ssh_managed::{
-        MemorySshTransport, ProductionCredentialResolver,
+        MemorySshTransport, ProductionCredentialResolver, SshTransportError, SshTransportSession,
     };
     use eframe::egui::accesskit::Role;
 
     use super::*;
-
-    const HOST_KEY: &str =
-        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
-
-    struct FixedIdentityVerifier {
-        key: ServerHostKey,
-    }
-
-    impl RemoteHostIdentityVerifier for FixedIdentityVerifier {
-        fn verified_key(&self, _host: &str, _port: u16) -> Result<ServerHostKey, String> {
-            Ok(self.key.clone())
-        }
-    }
 
     fn remote_draft(host: &str, username: &str, password: &str) -> RemoteConnectionDraft {
         let mut draft = RemoteConnectionDraft::new();
@@ -1407,7 +1405,7 @@ mod tests {
             host: "camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            expected_host_key: HOST_KEY.to_owned(),
+            expected_host_key: None,
             authentication: RemoteAuthentication::Password {
                 slot_id: "saved-slot".to_owned(),
             },
@@ -1415,20 +1413,18 @@ mod tests {
     }
 
     #[test]
-    fn remote_connect_verifies_identity_authenticates_and_probes_sftp() {
-        let key = ServerHostKey::from_openssh(HOST_KEY).unwrap();
-        let identity = FixedIdentityVerifier { key: key.clone() };
-        let transport = MemorySshTransport::new(key.openssh());
+    fn remote_connect_uses_password_without_saving_host_key() {
+        let transport = MemorySshTransport::new("unverified-server-key");
         let request = remote_draft("camera.local", "root", "process-only-password")
-            .connect_request(11)
+            .connect_request()
             .unwrap();
 
-        let commit = run_remote_connect(request, &transport, &identity).unwrap();
+        let commit = run_remote_connect(request, &transport, DumpCancellation::default()).unwrap();
 
         assert_eq!(commit.config.host, "camera.local");
         assert_eq!(commit.config.port, 22);
         assert_eq!(commit.config.username, "root");
-        assert_eq!(commit.config.expected_host_key, HOST_KEY);
+        assert_eq!(commit.config.expected_host_key, None);
         assert!(matches!(
             commit.config.authentication,
             RemoteAuthentication::Password { .. }
@@ -1540,9 +1536,7 @@ mod tests {
     #[test]
     fn connect_request_trims_endpoint_and_keeps_password_secret() {
         let draft = remote_draft("  camera.local  ", " root ", "test-password");
-        let request = draft.connect_request(7).unwrap();
-
-        assert_eq!(request.generation, 7);
+        let request = draft.connect_request().unwrap();
         assert_eq!(request.host, "camera.local");
         assert_eq!(request.username, "root");
         assert_eq!(request.port, 22);
@@ -1564,7 +1558,7 @@ mod tests {
             host: "old-camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            expected_host_key: HOST_KEY.to_owned(),
+            expected_host_key: Some("legacy-pinned-key".to_owned()),
             authentication: RemoteAuthentication::Password {
                 slot_id: "existing-slot".to_owned(),
             },
@@ -1573,7 +1567,7 @@ mod tests {
         draft.host = "new-camera.local".to_owned();
         *draft.password.expose_secret_mut() = "replacement".to_owned();
 
-        let request = draft.connect_request(1).unwrap();
+        let request = draft.connect_request().unwrap();
 
         assert_eq!(request.id, original_id);
         assert_eq!(request.slot_id, "existing-slot");
@@ -1591,43 +1585,106 @@ mod tests {
         ] {
             assert!(
                 remote_draft(host, username, password)
-                    .connect_request(1)
+                    .connect_request()
                     .is_err(),
                 "unexpected valid login: host={host:?}, username={username:?}"
             );
         }
     }
 
-    #[test]
-    fn changed_host_identity_blocks_before_trust() {
-        let key = ServerHostKey::from_openssh(HOST_KEY).unwrap();
-        let trust_called = Cell::new(false);
+    struct PanickingTransport;
 
-        let error = resolve_host_key_assessment(HostKeyAssessment::Changed(key), |_| {
-            trust_called.set(true);
-            Ok(())
-        })
-        .unwrap_err();
-
-        assert!(!trust_called.get());
-        assert!(error.contains("identity changed"));
-        assert!(error.contains("blocked"));
+    impl SshTransportFactory for PanickingTransport {
+        fn connect(
+            &self,
+            _target: &SshConnectionTarget,
+            _credential: SshCredential,
+            _control: &RemoteOperationControl,
+        ) -> Result<Box<dyn SshTransportSession>, SshTransportError> {
+            panic!("simulated transport panic");
+        }
     }
 
     #[test]
-    fn unknown_host_identity_is_trusted_once_before_use() {
-        let key = ServerHostKey::from_openssh(HOST_KEY).unwrap();
-        let trust_called = Cell::new(false);
-
-        let verified =
-            resolve_host_key_assessment(HostKeyAssessment::Unknown(key.clone()), |observed| {
-                assert_eq!(observed, &key);
-                trust_called.set(true);
-                Ok(())
-            })
+    fn worker_panic_is_reported_as_connection_error() {
+        let request = remote_draft("camera.local", "root", "secret")
+            .connect_request()
             .unwrap();
 
-        assert!(trust_called.get());
-        assert_eq!(verified, key);
+        let result =
+            run_remote_connect_guarded(request, &PanickingTransport, DumpCancellation::default());
+        let Err(error) = result else {
+            panic!("panicking transport must return an error");
+        };
+
+        assert!(error.contains("crashed unexpectedly"));
+    }
+
+    #[test]
+    fn disconnected_worker_clears_connecting_state() {
+        let mut explorer = explorer_state(&ConnectionSettings::default());
+        let context = egui::Context::default();
+        let (sender, receiver) = mpsc::channel::<RemoteConnectResult>();
+        explorer.active_remote_connect = Some(ActiveRemoteConnect {
+            generation: 1,
+            started_at: Instant::now(),
+            cancellation: DumpCancellation::default(),
+            receiver,
+        });
+        drop(sender);
+
+        assert!(explorer.poll_remote_connect_result(&context).is_none());
+        assert!(!explorer.remote_connect_in_flight());
+        assert_eq!(
+            explorer.remote_editor_error.as_deref(),
+            Some("Remote connection worker stopped unexpectedly")
+        );
+    }
+
+    #[test]
+    fn watchdog_cancels_connection_that_exceeds_deadline() {
+        let mut explorer = explorer_state(&ConnectionSettings::default());
+        let context = egui::Context::default();
+        let (_sender, receiver) = mpsc::channel::<RemoteConnectResult>();
+        let cancellation = DumpCancellation::default();
+        explorer.active_remote_connect = Some(ActiveRemoteConnect {
+            generation: 1,
+            started_at: Instant::now()
+                .checked_sub(REMOTE_CONNECT_WATCHDOG + Duration::from_secs(1))
+                .unwrap(),
+            cancellation: cancellation.clone(),
+            receiver,
+        });
+
+        assert!(explorer.poll_remote_connect_result(&context).is_none());
+        assert!(!explorer.remote_connect_in_flight());
+        assert!(cancellation.is_cancelled());
+        assert!(
+            explorer
+                .remote_editor_error
+                .as_deref()
+                .is_some_and(|error| error.contains("timed out"))
+        );
+    }
+
+    #[test]
+    fn cancel_button_stops_in_flight_connection() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut explorer = explorer_state(&ConnectionSettings::default());
+        explorer.remote_editor_open = true;
+        let (_sender, receiver) = mpsc::channel::<RemoteConnectResult>();
+        let cancellation = DumpCancellation::default();
+        explorer.active_remote_connect = Some(ActiveRemoteConnect {
+            generation: 1,
+            started_at: Instant::now(),
+            cancellation: cancellation.clone(),
+            receiver,
+        });
+
+        assert!(click_button(&context, &mut explorer, "Cancel").is_none());
+        assert!(cancellation.is_cancelled());
+        assert!(!explorer.remote_connect_in_flight());
+        assert!(!explorer.remote_editor_open);
     }
 }

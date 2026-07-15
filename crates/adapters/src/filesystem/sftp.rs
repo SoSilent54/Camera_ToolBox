@@ -595,7 +595,7 @@ mod tests {
                 host: "camera.test".to_owned(),
                 port: 22,
                 username: "root".to_owned(),
-                expected_host_key: expected_key.to_owned(),
+                expected_host_key: Some(expected_key.to_owned()),
                 command_subsystem: None,
                 remote_event_subsystem: None,
             },

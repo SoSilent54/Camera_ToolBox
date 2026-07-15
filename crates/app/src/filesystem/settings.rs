@@ -63,15 +63,16 @@ pub struct RemoteConnectionConfig {
     pub host: String,
     pub port: u16,
     pub username: String,
-    /// OpenSSH 公钥文本；每次连接都严格匹配。
-    pub expected_host_key: String,
+    /// 仅用于读取旧版配置；导入时清空，且永不重新序列化。
+    #[serde(default, skip_serializing)]
+    pub expected_host_key: Option<String>,
     pub authentication: RemoteAuthentication,
 }
 
 impl RemoteConnectionConfig {
     /// # Errors
     ///
-    /// 端点、用户名、host key pin 或认证配置无效时返回错误。
+    /// 端点、用户名或认证配置无效时返回错误。
     pub fn validate(&self) -> Result<(), WorkspaceSettingsError> {
         if self.display_name.trim().is_empty() {
             return Err(WorkspaceSettingsError::InvalidDisplayName);
@@ -87,9 +88,6 @@ impl RemoteConnectionConfig {
         }
         if self.username.trim().is_empty() || self.username.contains('\0') {
             return Err(WorkspaceSettingsError::InvalidUsername);
-        }
-        if self.expected_host_key.trim().is_empty() || self.expected_host_key.contains('\0') {
-            return Err(WorkspaceSettingsError::MissingHostKeyPin);
         }
         match &self.authentication {
             RemoteAuthentication::Password { slot_id }
@@ -137,8 +135,9 @@ impl ConnectionSettings {
     /// 配置无效或标识冲突时返回错误。
     pub fn insert(
         &mut self,
-        connection: RemoteConnectionConfig,
+        mut connection: RemoteConnectionConfig,
     ) -> Result<(), WorkspaceSettingsError> {
+        connection.expected_host_key = None;
         connection.validate()?;
         if self.connections.contains_key(&connection.id) {
             return Err(WorkspaceSettingsError::DuplicateConnection(
@@ -151,8 +150,9 @@ impl ConnectionSettings {
 
     pub fn upsert(
         &mut self,
-        connection: RemoteConnectionConfig,
+        mut connection: RemoteConnectionConfig,
     ) -> Result<(), WorkspaceSettingsError> {
+        connection.expected_host_key = None;
         connection.validate()?;
         self.connections.insert(connection.id.clone(), connection);
         Ok(())
@@ -334,8 +334,8 @@ pub struct LegacyWorkspaceImport {
 }
 
 impl LegacyWorkspaceImport {
-    /// 仅迁移 SSH 端点、安全 pin、认证偏好、artifact 根和旧自动打开开关。
-    /// 命令、capture recipe、helper 与密码均不会进入新模型。
+    /// 仅迁移 SSH 端点、认证偏好、artifact 根和旧自动打开开关。
+    /// 命令、capture recipe、helper、主机密钥与密码均不会进入新模型。
     pub fn from_profile_store(store: &ProfileStore) -> Result<Self, WorkspaceSettingsError> {
         let mut import = Self::default();
         for profile in store.platforms() {
@@ -361,7 +361,7 @@ impl LegacyWorkspaceImport {
                 host: config.host.clone(),
                 port: config.port,
                 username: config.username.clone(),
-                expected_host_key: config.expected_host_key.clone(),
+                expected_host_key: None,
                 authentication,
             })?;
             let source_id = FileSourceId::new(format!("sftp-{}", profile.id.as_str()))?;
@@ -453,8 +453,6 @@ pub enum WorkspaceSettingsError {
     InvalidPort,
     #[error("SSH username must not be empty")]
     InvalidUsername,
-    #[error("expected SSH host key pin is required")]
-    MissingHostKeyPin,
     #[error("private key path must not be empty")]
     InvalidPrivateKeyPath,
     #[error("password slot id must be non-empty and contain no path syntax")]
@@ -528,7 +526,7 @@ mod tests {
                 host: "camera.lan".to_owned(),
                 port: 22,
                 username: "root".to_owned(),
-                expected_host_key: "ssh-ed25519 AAAA".to_owned(),
+                expected_host_key: None,
                 authentication: RemoteAuthentication::Password {
                     slot_id: "camera".to_owned(),
                 },
@@ -537,6 +535,31 @@ mod tests {
         let json = String::from_utf8(settings.export_json().unwrap()).unwrap();
         assert!(!json.contains("credential_ref"));
         assert!(!json.contains("session:"));
+        assert!(!json.contains("expected_host_key"));
+    }
+
+    #[test]
+    fn legacy_connection_host_key_is_discarded_on_import() {
+        let json = br#"{
+            "schema_version": 1,
+            "connections": [{
+                "id": "camera",
+                "display_name": "Camera",
+                "host": "camera.lan",
+                "port": 22,
+                "username": "root",
+                "expected_host_key": "stale-host-key",
+                "authentication": {"kind": "password", "slot_id": "camera"}
+            }]
+        }"#;
+
+        let settings = ConnectionSettings::import_json(json).unwrap();
+        let id = RemoteConnectionId::new("camera").unwrap();
+        assert_eq!(settings.get(&id).unwrap().expected_host_key, None);
+
+        let exported = String::from_utf8(settings.export_json().unwrap()).unwrap();
+        assert!(!exported.contains("expected_host_key"));
+        assert!(!exported.contains("stale-host-key"));
     }
 
     #[test]

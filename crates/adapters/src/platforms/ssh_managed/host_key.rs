@@ -171,10 +171,9 @@ impl ServerHostKeyProbe for RusshServerHostKeyProbe {
             ..Default::default()
         });
         let address = (target.host(), target.port());
-        let result = runtime.block_on(tokio::time::timeout(
-            timeout,
-            client::connect(config, address, handler),
-        ));
+        let result = runtime.block_on(async {
+            tokio::time::timeout(timeout, client::connect(config, address, handler)).await
+        });
         if result.is_err() {
             return Err(HostKeyError::ProbeTimedOut);
         }
@@ -428,6 +427,12 @@ mod tests {
     const HASHED_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILIG2T/B0l0gaqj3puu510tu9N1OkQ4znY3LYuEm5zCF";
     const ECDSA_KEY: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBN76zuqnjypL54/w4763l7q1Sn3IBYHptJ5wcYfEWkzeNTvpexr05Z18m2yPT2SWRd1JJ8Aj5TYidG9MdSS5J78=";
+
+    #[test]
+    fn production_probe_creates_timeout_inside_runtime() {
+        let target = HostKeyTarget::new("127.0.0.1", 1).unwrap();
+        let _ = RusshServerHostKeyProbe.probe(&target, Duration::from_millis(50));
+    }
 
     #[test]
     fn known_hosts_matching_covers_plain_hashed_comma_and_nondefault_port() {

@@ -167,7 +167,9 @@ impl SshTransportFactory for MemorySshTransport {
         if control.deadline_expired() {
             return Err(SshTransportError::TimedOut);
         }
-        if target.expected_host_key != self.lock().actual_host_key {
+        if let Some(expected) = &target.expected_host_key
+            && expected != &self.lock().actual_host_key
+        {
             return Err(SshTransportError::HostKeyMismatch);
         }
         Ok(Box::new(MemorySshSession {
