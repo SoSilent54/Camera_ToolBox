@@ -497,6 +497,22 @@ fn map_transport_error(error: SshTransportError) -> CommandServiceError {
         SshTransportError::TimedOut => CommandServiceError::DeadlineExceeded,
         SshTransportError::Transport(reason) => CommandServiceError::Transport(reason),
         SshTransportError::HelperProtocol(reason) => CommandServiceError::HelperProtocol(reason),
+        SshTransportError::NotFound(reason)
+        | SshTransportError::PermissionDenied(reason)
+        | SshTransportError::Disconnected(reason)
+        | SshTransportError::AlreadyExists(reason)
+        | SshTransportError::ChangedDuringRead(reason) => CommandServiceError::Transport(reason),
+        SshTransportError::ReadLimitExceeded { requested, limit } => {
+            CommandServiceError::Transport(format!(
+                "remote read exceeds bound: {requested} > {limit}"
+            ))
+        }
+        SshTransportError::InvalidContinuation => {
+            CommandServiceError::HelperProtocol("invalid remote directory continuation".to_owned())
+        }
+        SshTransportError::Unsupported => {
+            CommandServiceError::HelperProtocol("remote operation is unsupported".to_owned())
+        }
     }
 }
 

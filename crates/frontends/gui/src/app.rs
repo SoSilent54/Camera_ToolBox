@@ -1,25 +1,27 @@
 //! GUI 顶层编排；文档状态由 workspace 模块独立持有。
 
 use std::{
-    path::Path,
-    sync::Arc,
+    collections::{BTreeMap, VecDeque},
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, Sender, TryRecvError},
+    },
+    thread,
     time::{Duration, Instant},
 };
 
-use camera_toolbox_adapters::LocalRawLoader;
-use camera_toolbox_app::{LocalRawAnalyzeReport, LocalRawAnalyzeRequest, Workflow};
-use camera_toolbox_core::{
-    MediaFormat, OwnedMediaPayload, PackedRawSpec, Roi, analyze_roi, decode_le_continuous_raw,
-};
-use eframe::egui;
-
+#[cfg(feature = "platform-ssh")]
+use crate::explorer::RemoteConnectionCommit;
 use crate::{
     analysis_panel::{DesiredAnalysis, render_analysis_panel},
     analysis_worker::{
         AnalysisDomain, AnalysisKey, AnalysisRequest, AnalysisResult, AnalysisWorker,
     },
+    auto_open::{AutoOpenCandidate, AutoOpenCoordinator},
     color_controls::{DisplayMode, render_color_controls},
     color_worker::{ColorRenderRequest, ColorRenderResult, ColorRenderWorker},
+    explorer::{ExplorerAction, ExplorerState},
     histogram_link::{
         HistogramBinSelection, HistogramPixelSample, ImageHistogramHover, SpatialHighlight,
         SpatialHighlightRequest, SpatialHighlightResult, SpatialHighlightWorker,
@@ -27,7 +29,8 @@ use crate::{
     },
     notification::{NotificationCenter, NotificationKey, NotificationScope, UiNotification},
     platform_ui::{LiveRuntime, PlatformEffect, PlatformUiAction, StreamPanelAction},
-    raw_dialog::RawOpenDialogState,
+    raw_dialog::{RawOpenDialogState, local_file_source},
+    raw_inspector::render_raw_inspector,
     viewer::{
         HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, ViewerAction,
         ViewerOutput, bayer_label, render_viewer,
@@ -37,12 +40,83 @@ use crate::{
         WorkspaceState, render_tab_bar,
     },
 };
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_adapters::platforms::ssh_managed::RusshTransportFactory;
+use camera_toolbox_app::{
+    AutoOpenActivation, FileRef, FileSystem, FsCancellation, FsControl, LocalRawAnalyzeReport,
+    LocalRawAnalyzeRequest, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline,
+    RawSourceHandle, SourceCache, WorkspaceSettings, WorkspaceSettingsError,
+    workspace_settings_path,
+};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::{
+    ConnectionSettings, WorkspaceSettingsError as FileWorkspaceSettingsError,
+    connection_settings_path,
+};
+use camera_toolbox_core::{
+    MediaFormat, OwnedMediaPayload, PackedRawSpec, Roi, analyze_roi, decode_le_continuous_raw,
+};
+use eframe::egui;
 const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+const AUTO_OPEN_QUEUE_LIMIT: usize = 16;
+const AUTO_OPEN_BACKGROUND_TAB_LIMIT: usize = 8;
+
+struct OpenedRawDocument {
+    report: LocalRawAnalyzeReport,
+    source: RawSourceHandle,
+    interpretation: RawInterpretation,
+}
+
+struct WorkspaceFileOpenRequest {
+    display_path: PathBuf,
+    file_system: Arc<dyn FileSystem>,
+    reference: FileRef,
+}
+
+struct RawOpenJobResult {
+    attempt: u64,
+    path: PathBuf,
+    result: Result<OpenedRawDocument, String>,
+}
+
+struct ActiveRawOpenJob {
+    attempt: u64,
+    cancellation: FsCancellation,
+}
+
+struct PendingAutoOpenRequest {
+    candidate: AutoOpenCandidate,
+    request: WorkspaceFileOpenRequest,
+}
+
+struct AutoOpenJobResult {
+    candidate: AutoOpenCandidate,
+    path: PathBuf,
+    result: Result<OpenedRawDocument, String>,
+}
+
+struct ActiveAutoOpenJob {
+    candidate: AutoOpenCandidate,
+    cancellation: FsCancellation,
+}
+
+struct ReinterpretJobResult {
+    document_id: DocumentId,
+    decode_generation: u64,
+    result: Result<OpenedRawDocument, String>,
+}
 
 pub(crate) struct CameraToolboxApp {
     workspace: WorkspaceState,
+    #[cfg(feature = "platform-ssh")]
+    connection_settings: ConnectionSettings,
+    workspace_settings: WorkspaceSettings,
+    auto_open: AutoOpenCoordinator,
+    explorer: ExplorerState,
+    explorer_panel_expanded: bool,
     empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
+    raw_pipeline: RawOpenPipeline,
     color_worker: ColorRenderWorker,
     analysis_worker: AnalysisWorker,
     spatial_worker: SpatialHighlightWorker,
@@ -51,22 +125,70 @@ pub(crate) struct CameraToolboxApp {
     live_runtime: LiveRuntime,
     next_load_attempt: u64,
     pending_ephemeral_close: Option<DocumentId>,
+    raw_open_sender: Sender<RawOpenJobResult>,
+    raw_open_receiver: Receiver<RawOpenJobResult>,
+    active_raw_open: Option<ActiveRawOpenJob>,
+    pending_auto_open: VecDeque<PendingAutoOpenRequest>,
+    auto_open_sender: Sender<AutoOpenJobResult>,
+    auto_open_receiver: Receiver<AutoOpenJobResult>,
+    active_auto_open: Option<ActiveAutoOpenJob>,
+    auto_open_documents: BTreeMap<String, DocumentId>,
+    auto_open_background_tabs: VecDeque<DocumentId>,
+    reinterpret_sender: Sender<ReinterpretJobResult>,
+    reinterpret_receiver: Receiver<ReinterpretJobResult>,
 }
 
 impl CameraToolboxApp {
     pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
+        let cache = SourceCache::new(source_cache_directory(), 2 * 1024 * 1024 * 1024, 64)
+            .map_err(std::io::Error::other)?;
+        let workspace_settings = load_workspace_settings();
+        #[cfg(feature = "platform-ssh")]
+        let connection_settings = load_connection_settings();
+        let (raw_open_sender, raw_open_receiver) = mpsc::channel();
+        let (reinterpret_sender, reinterpret_receiver) = mpsc::channel();
+        let (auto_open_sender, auto_open_receiver) = mpsc::channel();
+        let live_runtime = LiveRuntime::new().map_err(std::io::Error::other)?;
+        #[cfg(feature = "platform-ssh")]
+        let explorer = ExplorerState::from_settings(
+            &workspace_settings,
+            &connection_settings,
+            live_runtime.ssh_resolver(),
+            Arc::new(RusshTransportFactory),
+        );
+        #[cfg(not(feature = "platform-ssh"))]
+        let explorer = ExplorerState::from_settings(&workspace_settings);
+        let auto_open = AutoOpenCoordinator::from_settings(&workspace_settings, &explorer);
         Ok(Self {
             workspace: WorkspaceState::default(),
+            workspace_settings,
+            #[cfg(feature = "platform-ssh")]
+            connection_settings,
+            explorer,
+            auto_open,
+            explorer_panel_expanded: false,
             empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
+            raw_pipeline: RawOpenPipeline::new(cache, Vec::new(), 256 * 1024 * 1024),
             color_worker: ColorRenderWorker::new(context)?,
             analysis_worker: AnalysisWorker::new(context)?,
             spatial_worker: SpatialHighlightWorker::new(context)?,
             notifications: NotificationCenter::default(),
-            live_runtime: LiveRuntime::new().map_err(std::io::Error::other)?,
             next_generation: 1,
+            live_runtime,
             next_load_attempt: 1,
             pending_ephemeral_close: None,
+            raw_open_sender,
+            raw_open_receiver,
+            active_raw_open: None,
+            pending_auto_open: VecDeque::new(),
+            auto_open_sender,
+            auto_open_receiver,
+            active_auto_open: None,
+            auto_open_documents: BTreeMap::new(),
+            auto_open_background_tabs: VecDeque::new(),
+            reinterpret_sender,
+            reinterpret_receiver,
         })
     }
 }
@@ -77,6 +199,11 @@ impl eframe::App for CameraToolboxApp {
         self.poll_color_result(&context);
         self.poll_analysis_result();
         self.poll_spatial_highlight_result();
+        self.poll_raw_open_result(&context);
+        self.poll_auto_open_result(&context);
+        self.enqueue_auto_open_candidates();
+        self.dispatch_auto_open(&context);
+        self.poll_reinterpret_result(&context);
         self.poll_stream_events();
         for effect in self.live_runtime.poll_platform_events() {
             self.handle_platform_effect(&context, effect);
@@ -95,6 +222,7 @@ impl eframe::App for CameraToolboxApp {
                 .viewer
                 .refresh_cursor(&context, &document.loaded.frame);
         }
+        self.explorer.ensure_default_local_mount(&context);
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
         let tab_action = egui::Panel::top("document_tabs")
@@ -104,54 +232,45 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = tab_action {
             self.handle_tab_action(&context, action);
         }
-        let live_running = self.workspace.live_documents().iter().any(|document| {
-            matches!(
-                document.lifecycle,
-                LiveDocumentLifecycle::Open
-                    | LiveDocumentLifecycle::CloseRequested
-                    | LiveDocumentLifecycle::Closing { .. }
-            )
-        });
-        let platform_action = if self.live_runtime.panel.expanded {
+        let explorer_action = if self.explorer_panel_expanded {
             let mut collapse = false;
-            let action = egui::Panel::left("platform_operation_panel")
+            let action = egui::Panel::left("workspace_explorer_panel")
                 .resizable(true)
-                .default_size(260.0)
+                .default_size(280.0)
                 .min_size(220.0)
-                .max_size(380.0)
                 .show(ui, |ui| {
-                    if ui
-                        .button("‹")
-                        .on_hover_text("Collapse platform controls")
-                        .clicked()
-                    {
-                        collapse = true;
-                    }
-                    self.live_runtime.render_panel(ui, live_running)
+                    ui.horizontal(|ui| {
+                        ui.heading("Workspace");
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.button("‹").on_hover_text("Collapse Workspace").clicked() {
+                                collapse = true;
+                            }
+                        });
+                    });
+                    ui.separator();
+                    self.explorer.render(&context, ui)
                 })
                 .inner;
             if collapse {
-                self.live_runtime.panel.expanded = false;
+                self.explorer_panel_expanded = false;
             }
             action
         } else {
-            let expand = egui::Panel::left("platform_operation_panel_rail")
+            let expand = egui::Panel::left("workspace_explorer_panel_rail")
                 .resizable(false)
                 .min_size(32.0)
                 .max_size(32.0)
                 .show(ui, |ui| {
-                    ui.button("›")
-                        .on_hover_text("Expand CV610 Stream")
-                        .clicked()
+                    ui.button("›").on_hover_text("Expand Workspace").clicked()
                 })
                 .inner;
             if expand {
-                self.live_runtime.panel.expanded = true;
+                self.explorer_panel_expanded = true;
             }
             None
         };
-        if let Some(action) = platform_action {
-            self.handle_platform_ui_action(&context, action);
+        if let Some(action) = explorer_action {
+            self.handle_explorer_action(&context, action);
         }
         egui::Panel::bottom("status_bar").show(ui, |ui| self.render_status_bar(ui));
         self.render_analysis_panel_ui(ui);
@@ -195,7 +314,6 @@ impl eframe::App for CameraToolboxApp {
             context.input(|input| input.time),
         );
         self.render_raw_open_dialog(&context);
-        self.live_runtime.show_device_manager(&context);
         self.render_pending_ephemeral_close(&context);
         self.ensure_analysis();
         self.workspace.enforce_derived_budget();
@@ -232,10 +350,6 @@ impl CameraToolboxApp {
                     ui.label("Unavailable on this platform");
                 }
             });
-            ui.separator();
-            egui::ScrollArea::horizontal()
-                .id_salt("target_toolbar_scroll")
-                .show(ui, |ui| self.live_runtime.render_target_toolbar(ui));
         });
         if request_color {
             self.request_current_color();
@@ -406,6 +520,7 @@ impl CameraToolboxApp {
 
         let mut should_submit = false;
         let mut collapse = false;
+        let mut reinterpret_request = None;
         let workspace = &mut self.workspace;
         egui::Panel::right("color_processing")
             .resizable(true)
@@ -435,11 +550,55 @@ impl CameraToolboxApp {
                             &mut document.display_mode,
                             installed_revision,
                         );
+                        let inspector = render_raw_inspector(
+                            ui,
+                            &mut document.raw_inspector,
+                            document.raw_source.is_some(),
+                        );
+                        if inspector.apply_requested {
+                            let decode_generation = document.decode_generation.saturating_add(1);
+                            let bayer = document.loaded.color_edit.params.bayer;
+                            match document.raw_inspector.decode_params(bayer) {
+                                Ok(params) => {
+                                    let Some(source) = document.raw_source.clone() else {
+                                        document.raw_inspector.mark_error(
+                                            None,
+                                            "当前文档没有可复用的 RAW source".to_owned(),
+                                        );
+                                        return;
+                                    };
+                                    document.decode_generation = decode_generation;
+                                    document.raw_inspector.mark_submitted(decode_generation);
+                                    reinterpret_request = Some((
+                                        document.id,
+                                        decode_generation,
+                                        source,
+                                        params,
+                                        document.loaded.roi,
+                                        document.loaded.path.clone(),
+                                    ));
+                                }
+                                Err(error) => document.raw_inspector.mark_error(None, error),
+                            }
+                        }
                         should_submit = response.params_changed
                             || (response.mode_changed
                                 && document.display_mode == DisplayMode::Color);
                     });
             });
+        if let Some((document_id, decode_generation, source, params, roi, path)) =
+            reinterpret_request
+        {
+            self.start_reinterpret(
+                ui.ctx(),
+                document_id,
+                decode_generation,
+                source,
+                params,
+                roi,
+                path,
+            );
+        }
         if collapse && let Some(document) = self.workspace.active_mut() {
             document.color_panel_expanded = false;
         }
@@ -877,50 +1036,403 @@ impl CameraToolboxApp {
         }
     }
 
-    fn render_raw_open_dialog(&mut self, context: &egui::Context) {
-        let Some(request) = self.raw_dialog.show(context) else {
+    fn handle_explorer_action(&mut self, context: &egui::Context, action: ExplorerAction) {
+        match action {
+            ExplorerAction::AddLocalMount(root) => {
+                let config = match self.explorer.add_local_mount(root.clone(), context) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::error!(
+                            operation = "explorer_add_local_mount",
+                            root = %root.display(),
+                            error = %error,
+                            "failed to mount local directory"
+                        );
+                        self.explorer
+                            .set_global_error(format!("Mount folder failed: {error}"));
+                        return;
+                    }
+                };
+                if self
+                    .workspace_settings
+                    .mounts()
+                    .any(|existing| existing.source_id() == config.source_id())
+                {
+                    self.reload_auto_open();
+                    return;
+                }
+                let mut updated = self.workspace_settings.clone();
+                if let Err(error) = updated
+                    .insert_mount(config)
+                    .and_then(|_| save_workspace_settings(&updated))
+                {
+                    tracing::error!(
+                        operation = "explorer_persist_local_mount",
+                        root = %root.display(),
+                        error = %error,
+                        "failed to persist workspace mount"
+                    );
+                    self.explorer
+                        .set_global_error(format!("Persist mount failed: {error}"));
+                    return;
+                }
+                self.workspace_settings = updated;
+                self.reload_auto_open();
+            }
+            #[cfg(feature = "platform-ssh")]
+            ExplorerAction::SaveRemoteConnection(RemoteConnectionCommit {
+                config,
+                session_password,
+            }) => {
+                if let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
+                    &config.authentication
+                    && let Some(password) = session_password
+                    && let Err(error) = self
+                        .live_runtime
+                        .ssh_credential_resolver()
+                        .register_session_password(slot_id, password)
+                {
+                    tracing::error!(
+                        operation = "explorer_register_remote_password",
+                        connection_id = config.id.as_str(),
+                        slot_id,
+                        error = %error,
+                        "failed to register remote session password"
+                    );
+                    self.explorer.set_remote_connection_error(format!(
+                        "Register remote password failed: {error}"
+                    ));
+                    return;
+                }
+                let mut updated = self.connection_settings.clone();
+                if let Err(error) = updated
+                    .upsert(config.clone())
+                    .and_then(|_| save_connection_settings(&updated))
+                {
+                    tracing::error!(
+                        operation = "explorer_save_remote_connection",
+                        connection_id = config.id.as_str(),
+                        host = %config.host,
+                        port = config.port,
+                        error = %error,
+                        "failed to persist remote connection"
+                    );
+                    self.explorer.set_remote_connection_error(format!(
+                        "Save remote connection failed: {error}"
+                    ));
+                    return;
+                }
+                self.connection_settings = updated;
+                if let Err(error) = self.explorer.finish_remote_connection_save(config, context) {
+                    tracing::error!(
+                        operation = "explorer_refresh_remote_connection",
+                        error = %error,
+                        "saved remote connection but Explorer refresh failed"
+                    );
+                    self.explorer.set_global_error(format!(
+                        "Remote connection saved, but Explorer refresh failed: {error}"
+                    ));
+                    return;
+                }
+                self.reload_auto_open();
+            }
+            #[cfg(feature = "platform-ssh")]
+            ExplorerAction::AddSftpMount {
+                connection_id,
+                remote_root,
+            } => {
+                let config = match self.explorer.add_sftp_mount(
+                    connection_id.clone(),
+                    remote_root.clone(),
+                    context,
+                ) {
+                    Ok(config) => config,
+                    Err(error) => {
+                        tracing::error!(
+                            operation = "explorer_add_sftp_mount",
+                            connection_id = connection_id.as_str(),
+                            remote_root,
+                            error = %error,
+                            "failed to mount remote directory"
+                        );
+                        self.explorer
+                            .set_global_error(format!("Mount remote failed: {error}"));
+                        return;
+                    }
+                };
+                if self
+                    .workspace_settings
+                    .mounts()
+                    .any(|existing| existing.source_id() == config.source_id())
+                {
+                    self.reload_auto_open();
+                    return;
+                }
+                let mut updated = self.workspace_settings.clone();
+                if let Err(error) = updated
+                    .insert_mount(config)
+                    .and_then(|_| save_workspace_settings(&updated))
+                {
+                    tracing::error!(
+                        operation = "explorer_persist_sftp_mount",
+                        connection_id = connection_id.as_str(),
+                        remote_root,
+                        error = %error,
+                        "failed to persist remote mount"
+                    );
+                    self.explorer
+                        .set_global_error(format!("Persist remote mount failed: {error}"));
+                    return;
+                }
+                self.workspace_settings = updated;
+                self.reload_auto_open();
+            }
+            ExplorerAction::OpenAuto {
+                display_path,
+                file_system,
+                reference,
+            } => {
+                let attempt = self.begin_raw_open_attempt();
+                self.start_load_workspace_file(
+                    context,
+                    attempt,
+                    WorkspaceFileOpenRequest {
+                        display_path,
+                        file_system,
+                        reference,
+                    },
+                );
+            }
+        }
+    }
+
+    fn reload_auto_open(&mut self) {
+        self.auto_open =
+            AutoOpenCoordinator::from_settings(&self.workspace_settings, &self.explorer);
+    }
+
+    fn cancel_active_auto_open(&mut self) {
+        if let Some(active) = self.active_auto_open.take() {
+            active.cancellation.cancel();
+        }
+    }
+
+    fn enqueue_auto_open_candidates(&mut self) {
+        for candidate in self.auto_open.poll() {
+            let Some(ExplorerAction::OpenAuto {
+                display_path,
+                file_system,
+                reference,
+            }) = self.explorer.open_action_for(&candidate.reference)
+            else {
+                tracing::warn!(
+                    operation = "auto_open_enqueue",
+                    rule_id = candidate.rule_id.as_str(),
+                    source_id = %candidate.reference.source_id,
+                    path = %candidate.reference.path.as_str(),
+                    "auto-open source is no longer mounted; dropping candidate"
+                );
+                continue;
+            };
+            if self.pending_auto_open.len() >= AUTO_OPEN_QUEUE_LIMIT {
+                self.pending_auto_open.pop_front();
+            }
+            self.pending_auto_open.push_back(PendingAutoOpenRequest {
+                candidate,
+                request: WorkspaceFileOpenRequest {
+                    display_path,
+                    file_system,
+                    reference,
+                },
+            });
+        }
+    }
+
+    fn dispatch_auto_open(&mut self, context: &egui::Context) {
+        if self.active_raw_open.is_some() || self.active_auto_open.is_some() {
+            return;
+        }
+        let Some(pending) = self.pending_auto_open.pop_front() else {
             return;
         };
+        let cancellation = FsCancellation::default();
+        self.active_auto_open = Some(ActiveAutoOpenJob {
+            candidate: pending.candidate.clone(),
+            cancellation: cancellation.clone(),
+        });
+        let pipeline = self.raw_pipeline.clone();
+        let sender = self.auto_open_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let path = pending.request.display_path.clone();
+            let result = decode_workspace_file_request(&pipeline, pending.request, cancellation)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(AutoOpenJobResult {
+                candidate: pending.candidate,
+                path,
+                result,
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn begin_raw_open_attempt(&mut self) -> u64 {
         let attempt = self.next_load_attempt;
         self.next_load_attempt = self.next_load_attempt.saturating_add(1);
         if attempt > 1 {
             self.notifications
                 .clear_scope(NotificationScope::LoadAttempt(attempt - 1));
         }
-        let path = request.path.clone();
-        match self.load_raw(context, attempt, request) {
-            Ok(()) => self.raw_dialog.close(context),
-            Err(error) => {
-                let message = error.to_string();
-                tracing::error!(
-                    operation = "load_raw",
-                    attempt,
-                    path = %path.display(),
-                    error = %format_args!("{error:#}"),
-                    "RAW loading failed"
-                );
-                self.notifications.push_once(UiNotification::error(
-                    NotificationKey::RawLoadFailed { attempt },
-                    "RAW load failed",
-                    &message,
-                ));
-                self.raw_dialog.set_error(message);
-            }
-        }
+        attempt
     }
 
-    fn load_raw(
+    fn render_raw_open_dialog(&mut self, context: &egui::Context) {
+        let Some(request) = self.raw_dialog.show(context, &self.raw_pipeline) else {
+            return;
+        };
+        let attempt = self.begin_raw_open_attempt();
+        self.start_load_raw(context, attempt, request);
+        self.raw_dialog.close(context);
+    }
+
+    fn start_load_raw(
         &mut self,
         context: &egui::Context,
         attempt: u64,
         request: LocalRawAnalyzeRequest,
-    ) -> anyhow::Result<()> {
-        tracing::debug!(operation = "load_raw", attempt, path = %request.path.display(), "starting RAW load");
-        let raw_loader = LocalRawLoader;
-        let report = Workflow::load_raw_and_analyze(&raw_loader, request)?;
+    ) {
+        if let Some(active) = self.active_raw_open.take() {
+            active.cancellation.cancel();
+        }
+        self.cancel_active_auto_open();
+        let cancellation = FsCancellation::default();
+        self.active_raw_open = Some(ActiveRawOpenJob {
+            attempt,
+            cancellation: cancellation.clone(),
+        });
+        let pipeline = self.raw_pipeline.clone();
+        let sender = self.raw_open_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let path = request.path.clone();
+            let result = decode_raw_request(&pipeline, request, cancellation)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(RawOpenJobResult {
+                attempt,
+                path,
+                result,
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn start_load_workspace_file(
+        &mut self,
+        context: &egui::Context,
+        attempt: u64,
+        request: WorkspaceFileOpenRequest,
+    ) {
+        if let Some(active) = self.active_raw_open.take() {
+            active.cancellation.cancel();
+        }
+        let cancellation = FsCancellation::default();
+        self.cancel_active_auto_open();
+        self.active_raw_open = Some(ActiveRawOpenJob {
+            attempt,
+            cancellation: cancellation.clone(),
+        });
+        let pipeline = self.raw_pipeline.clone();
+        let sender = self.raw_open_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let path = request.display_path.clone();
+            let result = decode_workspace_file_request(&pipeline, request, cancellation)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(RawOpenJobResult {
+                attempt,
+                path,
+                result,
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn poll_raw_open_result(&mut self, context: &egui::Context) {
+        loop {
+            let result = match self.raw_open_receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            if !self
+                .active_raw_open
+                .as_ref()
+                .is_some_and(|active| active.attempt == result.attempt)
+            {
+                continue;
+            }
+            self.active_raw_open = None;
+            match result.result {
+                Ok(completed) => self.install_opened_raw(context, result.attempt, completed),
+                Err(message) => {
+                    tracing::error!(
+                        operation = "load_raw",
+                        attempt = result.attempt,
+                        path = %result.path.display(),
+                        error = %message,
+                        "RAW loading failed"
+                    );
+                    self.notifications.push_once(UiNotification::error(
+                        NotificationKey::RawLoadFailed {
+                            attempt: result.attempt,
+                        },
+                        "RAW load failed",
+                        &message,
+                    ));
+                    self.raw_dialog.set_error(message);
+                }
+            }
+        }
+    }
+
+    fn poll_auto_open_result(&mut self, context: &egui::Context) {
+        loop {
+            let result = match self.auto_open_receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            let Some(active) = self.active_auto_open.as_ref() else {
+                continue;
+            };
+            if active.candidate.rule_id != result.candidate.rule_id
+                || active.candidate.reference != result.candidate.reference
+            {
+                continue;
+            }
+            self.active_auto_open = None;
+            match result.result {
+                Ok(completed) => self.install_auto_opened_raw(context, result.candidate, completed),
+                Err(message) => {
+                    tracing::error!(
+                        operation = "auto_open_raw",
+                        rule_id = result.candidate.rule_id.as_str(),
+                        path = %result.path.display(),
+                        error = %message,
+                        "auto-open RAW loading failed"
+                    );
+                }
+            }
+        }
+    }
+
+    fn install_opened_raw(
+        &mut self,
+        context: &egui::Context,
+        attempt: u64,
+        completed: OpenedRawDocument,
+    ) {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
-        let loaded = LoadedRaw::from_report(context, report, generation);
+        let loaded = LoadedRaw::from_report(context, completed.report, generation);
         let notification = loaded.diagnostics.first_out_of_range().map(|first| {
             UiNotification::raw_range(
                 generation,
@@ -954,7 +1466,13 @@ impl CameraToolboxApp {
                 "RAW samples exceed declared bit-depth range"
             );
         }
-        let document_id = self.workspace.open_local_raw(loaded);
+        let document_id = self.workspace.open_file_raw(
+            loaded,
+            completed.source,
+            completed.interpretation,
+            generation,
+            true,
+        );
         if let Some(notification) = notification {
             self.notifications.push_once(notification);
         }
@@ -966,7 +1484,233 @@ impl CameraToolboxApp {
         );
         self.request_current_color();
         self.workspace.enforce_derived_budget();
-        Ok(())
+    }
+
+    fn install_auto_opened_raw(
+        &mut self,
+        context: &egui::Context,
+        candidate: AutoOpenCandidate,
+        completed: OpenedRawDocument,
+    ) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let loaded = LoadedRaw::from_report(context, completed.report, generation);
+        let notification = loaded.diagnostics.first_out_of_range().map(|first| {
+            UiNotification::raw_range(
+                generation,
+                loaded.frame.spec.bit_depth,
+                loaded.frame.spec.max_code_value(),
+                loaded.diagnostics.out_of_range_pixels,
+                loaded.diagnostics.observed_max,
+                (first.x, first.y, first.value),
+                context.input(|input| input.time),
+            )
+        });
+        tracing::debug!(
+            operation = "auto_open_raw",
+            rule_id = candidate.rule_id.as_str(),
+            generation,
+            path = %loaded.path.display(),
+            width = loaded.frame.spec.width,
+            height = loaded.frame.spec.height,
+            bit_depth = loaded.frame.spec.bit_depth,
+            "auto-open RAW loaded"
+        );
+        if loaded.diagnostics.has_out_of_range() {
+            tracing::warn!(
+                operation = "auto_open_raw",
+                rule_id = candidate.rule_id.as_str(),
+                generation,
+                path = %loaded.path.display(),
+                bit_depth = loaded.frame.spec.bit_depth,
+                out_of_range_pixels = loaded.diagnostics.out_of_range_pixels,
+                observed_max = loaded.diagnostics.observed_max,
+                "auto-open RAW samples exceed declared bit-depth range"
+            );
+        }
+        if candidate.activation == AutoOpenActivation::FollowLatest {
+            let existing_id = self
+                .auto_open_documents
+                .get(candidate.rule_id.as_str())
+                .copied();
+            if let Some(document_id) = existing_id {
+                let previous_generation = self
+                    .workspace
+                    .document(document_id)
+                    .map(|document| document.loaded.generation);
+                if let Some(previous_generation) = previous_generation {
+                    let was_active = self.workspace.active_id() == Some(document_id);
+                    let replaced = self.workspace.replace_file_raw(
+                        document_id,
+                        loaded,
+                        completed.source,
+                        completed.interpretation,
+                        generation,
+                    );
+                    debug_assert!(
+                        replaced,
+                        "existing follow-latest document must still be replaceable"
+                    );
+                    self.notifications
+                        .clear_scope(NotificationScope::ImageGeneration(previous_generation));
+                    if let Some(notification) = notification {
+                        self.notifications.push_once(notification);
+                    }
+                    if was_active {
+                        self.request_current_color();
+                    }
+                    self.workspace.enforce_derived_budget();
+                    return;
+                }
+                self.auto_open_documents.remove(candidate.rule_id.as_str());
+            }
+        }
+        let document_id = self.workspace.open_file_raw(
+            loaded,
+            completed.source,
+            completed.interpretation,
+            generation,
+            false,
+        );
+        match candidate.activation {
+            AutoOpenActivation::FollowLatest => {
+                self.auto_open_documents
+                    .insert(candidate.rule_id.as_str().to_owned(), document_id);
+            }
+            AutoOpenActivation::NewBackgroundTab => {
+                self.track_auto_open_background_tab(context, document_id);
+            }
+        }
+        if let Some(notification) = notification {
+            self.notifications.push_once(notification);
+        }
+        if self.workspace.active_id() == Some(document_id) {
+            self.request_current_color();
+        }
+        self.workspace.enforce_derived_budget();
+    }
+
+    fn start_reinterpret(
+        &mut self,
+        context: &egui::Context,
+        document_id: DocumentId,
+        decode_generation: u64,
+        source: RawSourceHandle,
+        params: RawDecodeParams,
+        roi: Roi,
+        path: PathBuf,
+    ) {
+        let pipeline = self.raw_pipeline.clone();
+        let sender = self.reinterpret_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let result =
+                decode_raw_reinterpret(&pipeline, source, params, decode_generation, roi, path)
+                    .map_err(|error| error.to_string());
+            let _ = sender.send(ReinterpretJobResult {
+                document_id,
+                decode_generation,
+                result,
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn poll_reinterpret_result(&mut self, context: &egui::Context) {
+        loop {
+            let result = match self.reinterpret_receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            match result.result {
+                Ok(completed) => self.install_reinterpreted_raw(
+                    context,
+                    result.document_id,
+                    result.decode_generation,
+                    completed,
+                ),
+                Err(message) => {
+                    if let Some(document) = self.workspace.document_mut(result.document_id) {
+                        document
+                            .raw_inspector
+                            .mark_error(Some(result.decode_generation), message);
+                    }
+                }
+            }
+        }
+    }
+
+    fn install_reinterpreted_raw(
+        &mut self,
+        context: &egui::Context,
+        document_id: DocumentId,
+        decode_generation: u64,
+        completed: OpenedRawDocument,
+    ) {
+        let Some(previous_generation) = self.workspace.document(document_id).and_then(|document| {
+            (document.decode_generation == decode_generation).then_some(document.loaded.generation)
+        }) else {
+            return;
+        };
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let loaded = LoadedRaw::from_report(context, completed.report, generation);
+        let notification = loaded.diagnostics.first_out_of_range().map(|first| {
+            UiNotification::raw_range(
+                generation,
+                loaded.frame.spec.bit_depth,
+                loaded.frame.spec.max_code_value(),
+                loaded.diagnostics.out_of_range_pixels,
+                loaded.diagnostics.observed_max,
+                (first.x, first.y, first.value),
+                context.input(|input| input.time),
+            )
+        });
+        tracing::debug!(
+            operation = "reinterpret_raw",
+            document_id = %document_id,
+            generation,
+            decode_generation,
+            path = %loaded.path.display(),
+            width = loaded.frame.spec.width,
+            height = loaded.frame.spec.height,
+            bit_depth = loaded.frame.spec.bit_depth,
+            "installed reinterpreted RAW"
+        );
+        if loaded.diagnostics.has_out_of_range() {
+            tracing::warn!(
+                operation = "reinterpret_raw",
+                document_id = %document_id,
+                generation,
+                decode_generation,
+                path = %loaded.path.display(),
+                bit_depth = loaded.frame.spec.bit_depth,
+                out_of_range_pixels = loaded.diagnostics.out_of_range_pixels,
+                observed_max = loaded.diagnostics.observed_max,
+                "RAW samples exceed declared bit-depth range"
+            );
+        }
+        let Some(document) = self.workspace.document_mut(document_id) else {
+            return;
+        };
+        if document.decode_generation != decode_generation {
+            return;
+        }
+        document.install_reinterpreted(
+            loaded,
+            completed.source,
+            completed.interpretation,
+            decode_generation,
+        );
+        self.notifications
+            .clear_scope(NotificationScope::ImageGeneration(previous_generation));
+        if let Some(notification) = notification {
+            self.notifications.push_once(notification);
+        }
+        if self.workspace.active_id() == Some(document_id) {
+            self.request_current_color();
+        }
+        self.workspace.enforce_derived_budget();
     }
 
     fn request_current_color(&mut self) {
@@ -1461,6 +2205,7 @@ impl CameraToolboxApp {
                 ui.label(format!("Resync {}", document.metrics.decoder_resyncs));
                 ui.label(format!("Record {} B", document.metrics.record_bytes));
                 ui.end_row();
+
                 ui.label(format!(
                     "Preview Q {}",
                     document.metrics.preview_queue_depth
@@ -1496,6 +2241,29 @@ impl CameraToolboxApp {
         rect
     }
 
+    fn forget_auto_open_document(&mut self, id: DocumentId) {
+        self.auto_open_background_tabs
+            .retain(|existing| *existing != id);
+        self.auto_open_documents
+            .retain(|_, existing| *existing != id);
+    }
+
+    fn track_auto_open_background_tab(&mut self, context: &egui::Context, id: DocumentId) {
+        self.auto_open_background_tabs
+            .retain(|existing| *existing != id);
+        self.auto_open_background_tabs.push_back(id);
+        while self.auto_open_background_tabs.len() > AUTO_OPEN_BACKGROUND_TAB_LIMIT {
+            let Some(oldest) = self.auto_open_background_tabs.pop_front() else {
+                break;
+            };
+            if self.workspace.active_id() == Some(oldest) {
+                self.auto_open_background_tabs.push_back(oldest);
+                break;
+            }
+            self.close_document(context, oldest);
+        }
+    }
+
     fn handle_tab_action(&mut self, context: &egui::Context, action: TabBarAction) {
         match action {
             TabBarAction::Activate(id) => {
@@ -1521,6 +2289,7 @@ impl CameraToolboxApp {
             self.workspace.activate(id);
             return;
         }
+        self.forget_auto_open_document(id);
         if self.workspace.asset(id).is_some() {
             self.workspace.remove_asset(id);
             return;
@@ -1561,6 +2330,198 @@ impl CameraToolboxApp {
         self.workspace.enforce_derived_budget();
     }
 }
+
+fn decode_raw_request(
+    pipeline: &RawOpenPipeline,
+    request: LocalRawAnalyzeRequest,
+    cancellation: FsCancellation,
+) -> anyhow::Result<OpenedRawDocument> {
+    tracing::debug!(
+        operation = "load_raw",
+        path = %request.path.display(),
+        "starting RAW load"
+    );
+    let (file_system, reference) = local_file_source(&request.path)?;
+    let mut control = FsControl::with_timeout(Duration::from_secs(30));
+    control.cancellation = cancellation;
+    let result = pipeline.begin(
+        &file_system,
+        &reference,
+        RawOpenMode::WithOptions(RawDecodeParams {
+            spec: request.spec.clone(),
+            encoding: request.encoding,
+        }),
+        &control,
+    )?;
+    let roi = request
+        .roi
+        .clamped_to(result.frame.spec.width, result.frame.spec.height)
+        .unwrap_or(Roi {
+            x: 0,
+            y: 0,
+            width: result.frame.spec.width,
+            height: result.frame.spec.height,
+        });
+    let stats = analyze_roi(&result.frame, roi)?;
+    Ok(OpenedRawDocument {
+        report: LocalRawAnalyzeReport {
+            path: request.path,
+            frame: result.frame,
+            roi,
+            stats,
+        },
+
+        source: result.source,
+        interpretation: result.interpretation,
+    })
+}
+
+fn decode_workspace_file_request(
+    pipeline: &RawOpenPipeline,
+    request: WorkspaceFileOpenRequest,
+    cancellation: FsCancellation,
+) -> anyhow::Result<OpenedRawDocument> {
+    tracing::debug!(
+        operation = "load_raw",
+        path = %request.display_path.display(),
+        source_id = %request.reference.source_id,
+        "starting workspace RAW auto-open"
+    );
+    let mut control = FsControl::with_timeout(Duration::from_secs(30));
+    control.cancellation = cancellation;
+    let result = pipeline.begin(
+        &*request.file_system,
+        &request.reference,
+        RawOpenMode::Auto,
+        &control,
+    )?;
+    let roi = Roi {
+        x: 0,
+        y: 0,
+        width: result.frame.spec.width,
+        height: result.frame.spec.height,
+    };
+    let stats = analyze_roi(&result.frame, roi)?;
+    Ok(OpenedRawDocument {
+        report: LocalRawAnalyzeReport {
+            path: request.display_path,
+            frame: result.frame,
+            roi,
+            stats,
+        },
+        source: result.source,
+        interpretation: result.interpretation,
+    })
+}
+
+fn load_workspace_settings() -> WorkspaceSettings {
+    let path = match workspace_settings_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(
+                operation = "load_workspace_settings_path",
+                error = %error,
+                "failed to resolve workspace settings path"
+            );
+            return WorkspaceSettings::default();
+        }
+    };
+    match WorkspaceSettings::load_from_path(&path) {
+        Ok(settings) => settings,
+        Err(WorkspaceSettingsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            WorkspaceSettings::default()
+        }
+        Err(error) => {
+            tracing::error!(
+                operation = "load_workspace_settings",
+                path = %path.display(),
+                error = %error,
+                "failed to load workspace settings; using defaults"
+            );
+            WorkspaceSettings::default()
+        }
+    }
+}
+
+fn save_workspace_settings(settings: &WorkspaceSettings) -> Result<(), WorkspaceSettingsError> {
+    let path = workspace_settings_path()?;
+    settings.save_to_path(&path)
+}
+
+#[cfg(feature = "platform-ssh")]
+fn load_connection_settings() -> ConnectionSettings {
+    let path = match connection_settings_path() {
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!(
+                operation = "load_connection_settings_path",
+                error = %error,
+                "failed to resolve connection settings path"
+            );
+            return ConnectionSettings::default();
+        }
+    };
+    match ConnectionSettings::load_from_path(&path) {
+        Ok(settings) => settings,
+        Err(FileWorkspaceSettingsError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            ConnectionSettings::default()
+        }
+        Err(error) => {
+            tracing::error!(
+                operation = "load_connection_settings",
+                path = %path.display(),
+                error = %error,
+                "failed to load connection settings; using defaults"
+            );
+            ConnectionSettings::default()
+        }
+    }
+}
+
+#[cfg(feature = "platform-ssh")]
+fn save_connection_settings(settings: &ConnectionSettings) -> Result<(), WorkspaceSettingsError> {
+    let path = connection_settings_path()?;
+    settings.save_to_path(&path)
+}
+
+fn decode_raw_reinterpret(
+    pipeline: &RawOpenPipeline,
+    source: RawSourceHandle,
+    params: RawDecodeParams,
+    decode_generation: u64,
+    roi: Roi,
+    path: PathBuf,
+) -> anyhow::Result<OpenedRawDocument> {
+    tracing::debug!(
+        operation = "reinterpret_raw",
+        decode_generation,
+        path = %path.display(),
+        "starting RAW reinterpret"
+    );
+    let control = FsControl::with_timeout(Duration::from_secs(30));
+    let result = pipeline.reinterpret(source, params, decode_generation, &control)?;
+    let roi = roi
+        .clamped_to(result.frame.spec.width, result.frame.spec.height)
+        .unwrap_or(Roi {
+            x: 0,
+            y: 0,
+            width: result.frame.spec.width,
+            height: result.frame.spec.height,
+        });
+    let stats = analyze_roi(&result.frame, roi)?;
+    Ok(OpenedRawDocument {
+        report: LocalRawAnalyzeReport {
+            path,
+            frame: result.frame,
+            roi,
+            stats,
+        },
+        source: result.source,
+        interpretation: result.interpretation,
+    })
+}
 fn asset_extension(format: &MediaFormat) -> &'static str {
     match format {
         MediaFormat::RawPacked { .. } | MediaFormat::RawU16Le { .. } => "raw",
@@ -1588,6 +2549,16 @@ fn save_asset_source(
         }
         Ok(())
     })
+}
+
+fn source_cache_directory() -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    std::env::temp_dir().join(format!(
+        "camera-toolbox-source-cache-{}-{nonce}",
+        std::process::id()
+    ))
 }
 
 fn save_asset_source_with<F>(

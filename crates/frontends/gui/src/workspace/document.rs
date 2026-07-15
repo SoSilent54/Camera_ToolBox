@@ -6,9 +6,10 @@ use crate::{
     analysis_panel::AnalysisPanelState,
     color_controls::DisplayMode,
     histogram_link::{HistogramBinSelection, SpatialHighlight},
+    raw_inspector::RawInspectorState,
     viewer::{HoverViewSettings, ImageViewerState, LoadedRaw},
 };
-use camera_toolbox_app::TargetResolutionSnapshot;
+use camera_toolbox_app::{RawInterpretation, RawSourceHandle, TargetResolutionSnapshot};
 use camera_toolbox_core::EphemeralAsset;
 
 use super::DocumentId;
@@ -48,6 +49,10 @@ pub(crate) struct RawDocument {
     pub(crate) unsaved: bool,
     pub(crate) source_asset: Option<Arc<EphemeralAsset>>,
     pub(crate) resolution: Option<Arc<TargetResolutionSnapshot>>,
+    pub(crate) raw_source: Option<RawSourceHandle>,
+    pub(crate) interpretation: Option<RawInterpretation>,
+    pub(crate) decode_generation: u64,
+    pub(crate) raw_inspector: RawInspectorState,
     derived_evicted: bool,
 }
 
@@ -56,6 +61,7 @@ impl RawDocument {
         let title = document_title(&loaded.path);
         let mut analysis_panel = AnalysisPanelState::default();
         analysis_panel.open_for_first_image();
+        let raw_inspector = RawInspectorState::new(&loaded.frame.spec);
         Self {
             id,
             title,
@@ -72,8 +78,66 @@ impl RawDocument {
             unsaved: false,
             source_asset: None,
             resolution: None,
+            raw_source: None,
+            interpretation: None,
+            decode_generation: 0,
+            raw_inspector,
             derived_evicted: false,
         }
+    }
+
+    pub(crate) fn attach_file_source(
+        &mut self,
+        source: RawSourceHandle,
+        interpretation: RawInterpretation,
+        generation: u64,
+    ) {
+        self.raw_source = Some(source);
+        self.interpretation = Some(interpretation.clone());
+        self.decode_generation = generation;
+        self.raw_inspector
+            .sync_from_spec(&interpretation.params.spec);
+    }
+
+    pub(crate) fn replace_file_source(
+        &mut self,
+        loaded: LoadedRaw,
+        source: RawSourceHandle,
+        interpretation: RawInterpretation,
+        generation: u64,
+    ) {
+        self.title = document_title(&loaded.path);
+        self.unsaved = false;
+        self.source_asset = None;
+        self.resolution = None;
+        self.install_reinterpreted(loaded, source, interpretation, generation);
+    }
+
+    pub(crate) fn install_reinterpreted(
+        &mut self,
+        loaded: LoadedRaw,
+        source: RawSourceHandle,
+        interpretation: RawInterpretation,
+        decode_generation: u64,
+    ) {
+        let dimensions_changed = self.loaded.frame.spec.width != loaded.frame.spec.width
+            || self.loaded.frame.spec.height != loaded.frame.spec.height;
+        if dimensions_changed {
+            self.viewer = ImageViewerState::default();
+        } else {
+            self.viewer.evict_derived_resources();
+        }
+        self.loaded = loaded;
+        self.raw_source = Some(source);
+        self.interpretation = Some(interpretation.clone());
+        self.decode_generation = decode_generation;
+        self.raw_inspector
+            .sync_from_spec(&interpretation.params.spec);
+        self.analysis_panel.evict_derived();
+        self.analysis_pending_active = None;
+        self.spatial_requested = None;
+        self.spatial_highlight = None;
+        self.derived_evicted = false;
     }
 
     pub(crate) fn attach_ephemeral_source(

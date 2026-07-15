@@ -1,6 +1,7 @@
 //! SSH/SFTP transport abstraction 与 production russh 实现。
 
 use std::{
+    collections::{BTreeMap, VecDeque},
     io,
     sync::Arc,
     time::{Duration, UNIX_EPOCH},
@@ -24,6 +25,9 @@ const READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_EVENT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_CANDIDATES: usize = 4096;
 const MAX_DIRECTORY_METADATA_BYTES: usize = 1024 * 1024;
+const MAX_ACTIVE_DIRECTORY_CURSORS: usize = 16;
+const MAX_DIRECTORY_PAGE_ENTRIES: usize = 1024;
+const DIRECTORY_CURSOR_TTL: Duration = Duration::from_secs(30);
 
 /// resolver 返回 operation-owned secret；profile 永远只持有引用字符串。
 #[derive(Clone)]
@@ -59,11 +63,26 @@ pub struct TransportCommandOutput {
     pub stderr_truncated: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransportDirEntry {
     pub path: String,
     pub size: u64,
     pub modified_seconds: u64,
+    pub kind: TransportFileKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransportListPage {
+    pub entries: Vec<TransportDirEntry>,
+    pub continuation: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -76,6 +95,22 @@ pub enum SshTransportError {
     Cancelled,
     #[error("operation timed out")]
     TimedOut,
+    #[error("remote path not found: {0}")]
+    NotFound(String),
+    #[error("remote permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("remote file source disconnected: {0}")]
+    Disconnected(String),
+    #[error("remote destination already exists: {0}")]
+    AlreadyExists(String),
+    #[error("remote read exceeds bound: requested {requested}, limit {limit}")]
+    ReadLimitExceeded { requested: u64, limit: u64 },
+    #[error("remote source changed during read: {0}")]
+    ChangedDuringRead(String),
+    #[error("invalid or expired remote directory continuation")]
+    InvalidContinuation,
+    #[error("remote operation is unsupported")]
+    Unsupported,
     #[error("transport failure: {0}")]
     Transport(String),
     #[error("helper protocol failure: {0}")]
@@ -120,6 +155,20 @@ pub trait SshTransportSession: Send {
         control: &RemoteOperationControl,
     ) -> Result<Vec<TransportDirEntry>, SshTransportError>;
 
+    fn read_dir_page(
+        &mut self,
+        root: &str,
+        continuation: Option<&str>,
+        limit: usize,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportListPage, SshTransportError>;
+
+    fn metadata(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportDirEntry, SshTransportError>;
+
     fn event_paths(
         &mut self,
         root: &str,
@@ -134,6 +183,39 @@ pub trait SshTransportSession: Send {
         control: &RemoteOperationControl,
         consume: &mut dyn FnMut(&[u8]) -> Result<(), SshTransportError>,
     ) -> Result<u64, SshTransportError>;
+
+    fn mkdir(
+        &mut self,
+        _path: &str,
+        _control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        Err(SshTransportError::Unsupported)
+    }
+
+    fn rename(
+        &mut self,
+        _source: &str,
+        _destination: &str,
+        _control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        Err(SshTransportError::Unsupported)
+    }
+
+    fn remove_file(
+        &mut self,
+        _path: &str,
+        _control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        Err(SshTransportError::Unsupported)
+    }
+
+    fn remove_dir(
+        &mut self,
+        _path: &str,
+        _control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        Err(SshTransportError::Unsupported)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -160,6 +242,53 @@ struct RusshTransportSession {
     command_subsystem: Option<String>,
     remote_event_subsystem: Option<String>,
     cancellation: CancellationToken,
+    next_directory_cursor_id: u64,
+    directory_cursors: BTreeMap<String, TransportDirectoryCursor>,
+    directory_cursor_order: VecDeque<String>,
+}
+
+struct TransportDirectoryCursor {
+    root: String,
+    raw: RawSftpSession,
+    handle: String,
+    pending: VecDeque<TransportDirEntry>,
+    last_used: TokioInstant,
+}
+
+impl RusshTransportSession {
+    fn close_directory_cursor(&self, cursor: TransportDirectoryCursor) {
+        self.runtime.block_on(async {
+            let _ =
+                tokio::time::timeout(Duration::from_secs(1), cursor.raw.close(cursor.handle)).await;
+        });
+    }
+
+    fn prune_directory_cursors(&mut self) {
+        let now = TokioInstant::now();
+        let expired: Vec<_> = self
+            .directory_cursors
+            .iter()
+            .filter(|(_, cursor)| now.duration_since(cursor.last_used) >= DIRECTORY_CURSOR_TTL)
+            .map(|(token, _)| token.clone())
+            .collect();
+        for token in expired {
+            self.directory_cursor_order
+                .retain(|candidate| candidate != &token);
+            if let Some(cursor) = self.directory_cursors.remove(&token) {
+                self.close_directory_cursor(cursor);
+            }
+        }
+    }
+}
+
+impl Drop for RusshTransportSession {
+    fn drop(&mut self) {
+        let cursors = std::mem::take(&mut self.directory_cursors);
+        self.directory_cursor_order.clear();
+        for cursor in cursors.into_values() {
+            self.close_directory_cursor(cursor);
+        }
+    }
 }
 
 impl SshTransportFactory for RusshTransportFactory {
@@ -231,6 +360,9 @@ impl SshTransportFactory for RusshTransportFactory {
             command_subsystem: target.command_subsystem.clone(),
             remote_event_subsystem: target.remote_event_subsystem.clone(),
             cancellation,
+            next_directory_cursor_id: 0,
+            directory_cursors: BTreeMap::new(),
+            directory_cursor_order: VecDeque::new(),
         }))
     }
 }
@@ -373,78 +505,141 @@ impl SshTransportSession for RusshTransportSession {
         })
     }
 
+    fn metadata(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportDirEntry, SshTransportError> {
+        let cancellation = self.cancellation.clone();
+        let overall = control.remaining_overall();
+        let idle = control.timeouts.idle;
+        let deadline = TokioInstant::now() + overall;
+        let path = path.to_owned();
+        self.runtime.block_on(async {
+            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
+            let metadata = cancellable_sftp_until(
+                &cancellation,
+                deadline,
+                idle,
+                sftp.symlink_metadata(path.clone()),
+            )
+            .await?;
+            Ok(TransportDirEntry {
+                path,
+                size: metadata.len(),
+                modified_seconds: modified_seconds(&metadata),
+                kind: transport_file_kind(&metadata),
+            })
+        })
+    }
+
     fn read_dir(
         &mut self,
         root: &str,
         control: &RemoteOperationControl,
     ) -> Result<Vec<TransportDirEntry>, SshTransportError> {
+        let mut entries = Vec::new();
+        let mut continuation = None;
+        loop {
+            let page = self.read_dir_page(
+                root,
+                continuation.as_deref(),
+                MAX_DIRECTORY_PAGE_ENTRIES,
+                control,
+            )?;
+            entries.extend(page.entries);
+            if entries.len() > MAX_DIRECTORY_CANDIDATES {
+                return Err(SshTransportError::HelperProtocol(
+                    "directory candidate count exceeds legacy hard limit".to_owned(),
+                ));
+            }
+            let Some(next) = page.continuation else {
+                return Ok(entries);
+            };
+            continuation = Some(next);
+        }
+    }
+
+    fn read_dir_page(
+        &mut self,
+        root: &str,
+        continuation: Option<&str>,
+        limit: usize,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportListPage, SshTransportError> {
+        self.prune_directory_cursors();
+        let limit = limit.clamp(1, MAX_DIRECTORY_PAGE_ENTRIES);
         let cancellation = self.cancellation.clone();
-        let overall = control.remaining_overall();
+        let deadline = TokioInstant::now() + control.remaining_overall();
         let idle = control.timeouts.idle;
-        let deadline = TokioInstant::now() + overall;
-        let root = root.to_owned();
-        self.runtime.block_on(async {
-            let raw = open_raw_sftp(&self.session, &cancellation, deadline, idle).await?;
-            let handle =
-                cancellable_until(&cancellation, deadline, idle, raw.opendir(root.clone()))
-                    .await?
-                    .handle;
-            let mut entries = Vec::new();
-            let mut metadata_bytes = 0_usize;
-            loop {
-                let page = cancellable_until(&cancellation, deadline, idle, async {
-                    match raw.readdir(handle.clone()).await {
-                        Ok(page) => Ok(Some(page)),
-                        Err(SftpError::Status(status)) if status.status_code == StatusCode::Eof => {
-                            Ok(None)
-                        }
-                        Err(error) => Err(error),
-                    }
+        let mut cursor = if let Some(token) = continuation {
+            let cursor = self
+                .directory_cursors
+                .remove(token)
+                .ok_or(SshTransportError::InvalidContinuation)?;
+            self.directory_cursor_order
+                .retain(|candidate| candidate != token);
+            if cursor.root != root {
+                self.close_directory_cursor(cursor);
+                return Err(SshTransportError::InvalidContinuation);
+            }
+            cursor
+        } else {
+            let root = root.to_owned();
+            self.runtime.block_on(async {
+                let raw = open_raw_sftp(&self.session, &cancellation, deadline, idle).await?;
+                let handle = cancellable_sftp_until(
+                    &cancellation,
+                    deadline,
+                    idle,
+                    raw.opendir(root.clone()),
+                )
+                .await?
+                .handle;
+                Ok::<_, SshTransportError>(TransportDirectoryCursor {
+                    root,
+                    raw,
+                    handle,
+                    pending: VecDeque::new(),
+                    last_used: TokioInstant::now(),
                 })
-                .await?;
-                let Some(page) = page else {
+            })?
+        };
+        let page_result = self.runtime.block_on(read_directory_cursor_page(
+            &mut cursor,
+            limit,
+            &cancellation,
+            deadline,
+            idle,
+        ));
+        let (entries, exhausted) = match page_result {
+            Ok(page) => page,
+            Err(error) => {
+                self.close_directory_cursor(cursor);
+                return Err(error);
+            }
+        };
+        let continuation = if exhausted {
+            None
+        } else {
+            while self.directory_cursors.len() >= MAX_ACTIVE_DIRECTORY_CURSORS {
+                let Some(oldest) = self.directory_cursor_order.pop_front() else {
                     break;
                 };
-                for file in page.files {
-                    if matches!(file.filename.as_str(), "." | "..") {
-                        continue;
-                    }
-                    metadata_bytes = metadata_bytes
-                        .checked_add(file.filename.len())
-                        .and_then(|bytes| bytes.checked_add(file.longname.len()))
-                        .and_then(|bytes| {
-                            bytes.checked_add(file.attrs.user.as_ref().map_or(0, String::len))
-                        })
-                        .and_then(|bytes| {
-                            bytes.checked_add(file.attrs.group.as_ref().map_or(0, String::len))
-                        })
-                        .and_then(|bytes| bytes.checked_add(64))
-                        .ok_or_else(|| {
-                            SshTransportError::HelperProtocol(
-                                "directory metadata accounting overflow".to_owned(),
-                            )
-                        })?;
-                    if entries.len() == MAX_DIRECTORY_CANDIDATES
-                        || metadata_bytes > MAX_DIRECTORY_METADATA_BYTES
-                    {
-                        return Err(SshTransportError::HelperProtocol(
-                            "directory candidate metadata exceeds hard limit".to_owned(),
-                        ));
-                    }
-                    let path = if root.ends_with('/') {
-                        format!("{root}{}", file.filename)
-                    } else {
-                        format!("{root}/{}", file.filename)
-                    };
-                    entries.push(TransportDirEntry {
-                        path,
-                        size: file.attrs.len(),
-                        modified_seconds: modified_seconds(&file.attrs),
-                    });
+                if let Some(cursor) = self.directory_cursors.remove(&oldest) {
+                    self.close_directory_cursor(cursor);
                 }
             }
-            cancellable_until(&cancellation, deadline, idle, raw.close(handle)).await?;
-            Ok(entries)
+            let token = format!("remote-dir-{}", self.next_directory_cursor_id);
+            self.next_directory_cursor_id = self.next_directory_cursor_id.wrapping_add(1);
+            self.directory_cursor_order.push_back(token.clone());
+            cursor.last_used = TokioInstant::now();
+            self.directory_cursors.insert(token.clone(), cursor);
+            Some(token)
+        };
+        Ok(TransportListPage {
+            entries,
+            continuation,
         })
     }
 
@@ -551,6 +746,174 @@ impl SshTransportSession for RusshTransportSession {
             Ok(total)
         })
     }
+
+    fn mkdir(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        let cancellation = self.cancellation.clone();
+        let deadline = TokioInstant::now() + control.remaining_overall();
+        let idle = control.timeouts.idle;
+        let path = path.to_owned();
+        self.runtime.block_on(async {
+            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
+            cancellable_sftp_until(&cancellation, deadline, idle, sftp.create_dir(path)).await
+        })
+    }
+
+    fn rename(
+        &mut self,
+        source: &str,
+        destination: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        let cancellation = self.cancellation.clone();
+        let deadline = TokioInstant::now() + control.remaining_overall();
+        let idle = control.timeouts.idle;
+        let source = source.to_owned();
+        let destination = destination.to_owned();
+        self.runtime.block_on(async {
+            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
+            cancellable_sftp_until(
+                &cancellation,
+                deadline,
+                idle,
+                sftp.rename(source, destination),
+            )
+            .await
+        })
+    }
+
+    fn remove_file(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        let cancellation = self.cancellation.clone();
+        let deadline = TokioInstant::now() + control.remaining_overall();
+        let idle = control.timeouts.idle;
+        let path = path.to_owned();
+        self.runtime.block_on(async {
+            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
+            cancellable_sftp_until(&cancellation, deadline, idle, sftp.remove_file(path)).await
+        })
+    }
+
+    fn remove_dir(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        let cancellation = self.cancellation.clone();
+        let deadline = TokioInstant::now() + control.remaining_overall();
+        let idle = control.timeouts.idle;
+        let path = path.to_owned();
+        self.runtime.block_on(async {
+            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
+            cancellable_sftp_until(&cancellation, deadline, idle, sftp.remove_dir(path)).await
+        })
+    }
+}
+
+async fn read_directory_cursor_page(
+    cursor: &mut TransportDirectoryCursor,
+    limit: usize,
+    cancellation: &CancellationToken,
+    deadline: TokioInstant,
+    idle: Duration,
+) -> Result<(Vec<TransportDirEntry>, bool), SshTransportError> {
+    let mut entries = Vec::with_capacity(limit);
+    loop {
+        while entries.len() < limit {
+            let Some(entry) = cursor.pending.pop_front() else {
+                break;
+            };
+            entries.push(entry);
+        }
+        if entries.len() == limit {
+            return Ok((entries, false));
+        }
+        let Some(page) =
+            next_sftp_directory_response(&cursor.raw, &cursor.handle, cancellation, deadline, idle)
+                .await?
+        else {
+            cancellable_sftp_until(
+                cancellation,
+                deadline,
+                idle,
+                cursor.raw.close(cursor.handle.clone()),
+            )
+            .await?;
+            return Ok((entries, true));
+        };
+        if page.files.len() > MAX_DIRECTORY_CANDIDATES {
+            return Err(SshTransportError::HelperProtocol(
+                "single SFTP directory response exceeds hard entry limit".to_owned(),
+            ));
+        }
+        let mut metadata_bytes = 0_usize;
+        for file in page.files {
+            if matches!(file.filename.as_str(), "." | "..") {
+                continue;
+            }
+            metadata_bytes = metadata_bytes
+                .checked_add(file.filename.len())
+                .and_then(|bytes| bytes.checked_add(file.longname.len()))
+                .and_then(|bytes| {
+                    bytes.checked_add(file.attrs.user.as_ref().map_or(0, String::len))
+                })
+                .and_then(|bytes| {
+                    bytes.checked_add(file.attrs.group.as_ref().map_or(0, String::len))
+                })
+                .and_then(|bytes| bytes.checked_add(64))
+                .ok_or_else(|| {
+                    SshTransportError::HelperProtocol(
+                        "directory metadata accounting overflow".to_owned(),
+                    )
+                })?;
+            if metadata_bytes > MAX_DIRECTORY_METADATA_BYTES {
+                return Err(SshTransportError::HelperProtocol(
+                    "single SFTP directory response exceeds metadata limit".to_owned(),
+                ));
+            }
+            let path = if cursor.root.ends_with('/') {
+                format!("{}{}", cursor.root, file.filename)
+            } else {
+                format!("{}/{}", cursor.root, file.filename)
+            };
+            cursor.pending.push_back(TransportDirEntry {
+                path,
+                size: file.attrs.len(),
+                modified_seconds: modified_seconds(&file.attrs),
+                kind: transport_file_kind(&file.attrs),
+            });
+        }
+    }
+}
+
+async fn next_sftp_directory_response(
+    raw: &RawSftpSession,
+    handle: &str,
+    cancellation: &CancellationToken,
+    deadline: TokioInstant,
+    idle: Duration,
+) -> Result<Option<russh_sftp::protocol::Name>, SshTransportError> {
+    let timeout = deadline
+        .saturating_duration_since(TokioInstant::now())
+        .min(idle);
+    if timeout.is_zero() {
+        return Err(SshTransportError::TimedOut);
+    }
+    tokio::select! {
+        () = cancellation.cancelled() => Err(SshTransportError::Cancelled),
+        result = tokio::time::timeout(timeout, raw.readdir(handle.to_owned())) => match result {
+            Ok(Ok(page)) => Ok(Some(page)),
+            Ok(Err(SftpError::Status(status))) if status.status_code == StatusCode::Eof => Ok(None),
+            Ok(Err(error)) => Err(map_sftp_error(error)),
+            Err(_) => Err(SshTransportError::TimedOut),
+        }
+    }
 }
 
 async fn open_raw_sftp(
@@ -620,6 +983,66 @@ where
             Ok(Err(error)) => Err(SshTransportError::Transport(error.to_string())),
             Err(_) => Err(SshTransportError::TimedOut),
         }
+    }
+}
+
+async fn cancellable_sftp_until<F, T>(
+    cancellation: &CancellationToken,
+    deadline: TokioInstant,
+    idle: Duration,
+    future: F,
+) -> Result<T, SshTransportError>
+where
+    F: Future<Output = Result<T, SftpError>>,
+{
+    let timeout = deadline
+        .saturating_duration_since(TokioInstant::now())
+        .min(idle);
+    if timeout.is_zero() {
+        return Err(SshTransportError::TimedOut);
+    }
+    tokio::select! {
+        () = cancellation.cancelled() => Err(SshTransportError::Cancelled),
+        result = tokio::time::timeout(timeout, future) => match result {
+            Ok(Ok(value)) => Ok(value),
+            Ok(Err(error)) => Err(map_sftp_error(error)),
+            Err(_) => Err(SshTransportError::TimedOut),
+        }
+    }
+}
+
+fn map_sftp_error(error: SftpError) -> SshTransportError {
+    match error {
+        SftpError::Status(status) => match status.status_code {
+            StatusCode::NoSuchFile => SshTransportError::NotFound(status.error_message),
+            StatusCode::PermissionDenied => {
+                SshTransportError::PermissionDenied(status.error_message)
+            }
+            StatusCode::NoConnection | StatusCode::ConnectionLost => {
+                SshTransportError::Disconnected(status.error_message)
+            }
+            StatusCode::OpUnsupported => SshTransportError::Unsupported,
+            _ => SshTransportError::Transport(format!(
+                "{}: {}",
+                status.status_code, status.error_message
+            )),
+        },
+        SftpError::Timeout => SshTransportError::TimedOut,
+        SftpError::IO(message) => SshTransportError::Disconnected(message),
+        other => SshTransportError::Transport(other.to_string()),
+    }
+}
+
+fn transport_file_kind(metadata: &russh_sftp::client::fs::Metadata) -> TransportFileKind {
+    let file_type = metadata.file_type();
+    if file_type.is_file() {
+        TransportFileKind::File
+    } else if file_type.is_dir() {
+        TransportFileKind::Directory
+    } else if file_type.is_symlink() {
+        TransportFileKind::Symlink
+    } else {
+        TransportFileKind::Other
     }
 }
 

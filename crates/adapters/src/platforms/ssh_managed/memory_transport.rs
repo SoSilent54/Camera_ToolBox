@@ -11,7 +11,8 @@ use secrecy::SecretString;
 
 use super::connection::{
     CredentialResolver, SshConnectionTarget, SshCredential, SshTransportError, SshTransportFactory,
-    SshTransportSession, TransportCommandOutput, TransportDirEntry,
+    SshTransportSession, TransportCommandOutput, TransportDirEntry, TransportFileKind,
+    TransportListPage,
 };
 
 #[derive(Debug, Clone)]
@@ -25,6 +26,7 @@ struct MemoryTransportState {
     actual_host_key: String,
     credentials: BTreeSet<String>,
     files: BTreeMap<String, MemoryRemoteFile>,
+    directories: BTreeSet<String>,
     canonical_paths: BTreeMap<String, String>,
     event_paths: Vec<String>,
     event_error: Option<SshTransportError>,
@@ -49,6 +51,7 @@ impl MemorySshTransport {
                 actual_host_key: actual_host_key.into(),
                 credentials: BTreeSet::new(),
                 files: BTreeMap::new(),
+                directories: BTreeSet::from(["/".to_owned()]),
                 canonical_paths: BTreeMap::new(),
                 event_paths: Vec::new(),
                 event_error: None,
@@ -73,7 +76,23 @@ impl MemorySshTransport {
     }
 
     pub fn insert_file(&self, path: impl Into<String>, file: MemoryRemoteFile) {
-        self.lock().files.insert(path.into(), file);
+        let path = path.into();
+        let mut state = self.lock();
+        insert_parent_directories(&mut state.directories, &path);
+        state.files.insert(path, file);
+    }
+
+    pub fn insert_directory(&self, path: impl Into<String>) {
+        let path = trim_memory_path(path.into());
+        let mut state = self.lock();
+        insert_parent_directories(&mut state.directories, &path);
+        state.directories.insert(path);
+    }
+
+    #[must_use]
+    pub fn contains_path(&self, path: &str) -> bool {
+        let state = self.lock();
+        state.files.contains_key(path) || state.directories.contains(path)
     }
 
     pub fn set_canonical_path(&self, path: impl Into<String>, canonical: impl Into<String>) {
@@ -199,12 +218,15 @@ impl SshTransportSession for MemorySshSession {
         control: &RemoteOperationControl,
     ) -> Result<String, SshTransportError> {
         check_control(control)?;
-        Ok(self
-            .lock()
-            .canonical_paths
-            .get(path)
-            .cloned()
-            .unwrap_or_else(|| path.to_owned()))
+        let state = self.lock();
+        if let Some(canonical) = state.canonical_paths.get(path) {
+            return Ok(canonical.clone());
+        }
+        if state.files.contains_key(path) || state.directories.contains(path) {
+            Ok(trim_memory_path(path.to_owned()))
+        } else {
+            Err(SshTransportError::NotFound(path.to_owned()))
+        }
     }
 
     fn stat(
@@ -230,6 +252,34 @@ impl SshTransportSession for MemorySshSession {
         }
     }
 
+    fn metadata(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportDirEntry, SshTransportError> {
+        check_control(control)?;
+        let state = self.lock();
+        if state.directories.contains(path) {
+            return Ok(TransportDirEntry {
+                path: path.to_owned(),
+                size: 0,
+                modified_seconds: 0,
+                kind: TransportFileKind::Directory,
+            });
+        }
+        let stat = state
+            .files
+            .get(path)
+            .and_then(|file| file.stats.front())
+            .ok_or_else(|| SshTransportError::NotFound(path.to_owned()))?;
+        Ok(TransportDirEntry {
+            path: path.to_owned(),
+            size: stat.size,
+            modified_seconds: stat.modified_seconds,
+            kind: TransportFileKind::File,
+        })
+    }
+
     fn read_dir(
         &mut self,
         root: &str,
@@ -237,18 +287,78 @@ impl SshTransportSession for MemorySshSession {
     ) -> Result<Vec<TransportDirEntry>, SshTransportError> {
         check_control(control)?;
         let state = self.lock();
-        Ok(state
-            .files
-            .iter()
-            .filter(|(path, _)| path.starts_with(root))
-            .filter_map(|(path, file)| {
-                file.stats.front().map(|stat| TransportDirEntry {
+        if !state.directories.contains(root) {
+            return Err(SshTransportError::NotFound(root.to_owned()));
+        }
+        let prefix = if root == "/" {
+            "/".to_owned()
+        } else {
+            format!("{root}/")
+        };
+        let mut entries = Vec::new();
+        for directory in &state.directories {
+            let Some(relative) = directory.strip_prefix(&prefix) else {
+                continue;
+            };
+            if relative.is_empty() || relative.contains('/') {
+                continue;
+            }
+            entries.push(TransportDirEntry {
+                path: directory.clone(),
+                size: 0,
+                modified_seconds: 0,
+                kind: TransportFileKind::Directory,
+            });
+        }
+        for (path, file) in &state.files {
+            let Some(relative) = path.strip_prefix(&prefix) else {
+                continue;
+            };
+            if relative.is_empty() || relative.contains('/') {
+                continue;
+            }
+            if let Some(stat) = file.stats.front() {
+                entries.push(TransportDirEntry {
                     path: path.clone(),
                     size: stat.size,
                     modified_seconds: stat.modified_seconds,
-                })
-            })
-            .collect())
+                    kind: TransportFileKind::File,
+                });
+            }
+        }
+        Ok(entries)
+    }
+
+    fn read_dir_page(
+        &mut self,
+        root: &str,
+        continuation: Option<&str>,
+        limit: usize,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportListPage, SshTransportError> {
+        let offset = if let Some(token) = continuation {
+            let (token_root, offset) = token
+                .rsplit_once('|')
+                .ok_or(SshTransportError::InvalidContinuation)?;
+            if token_root != root {
+                return Err(SshTransportError::InvalidContinuation);
+            }
+            offset
+                .parse::<usize>()
+                .map_err(|_| SshTransportError::InvalidContinuation)?
+        } else {
+            0
+        };
+        let entries = self.read_dir(root, control)?;
+        let limit = limit.clamp(1, 1024);
+        let end = offset.saturating_add(limit).min(entries.len());
+        if offset > entries.len() {
+            return Err(SshTransportError::InvalidContinuation);
+        }
+        Ok(TransportListPage {
+            entries: entries[offset..end].to_vec(),
+            continuation: (end < entries.len()).then(|| format!("{root}|{end}")),
+        })
     }
 
     fn event_paths(
@@ -303,6 +413,140 @@ impl SshTransportSession for MemorySshSession {
         }
         u64::try_from(total)
             .map_err(|_| SshTransportError::Transport("memory read length overflow".to_owned()))
+    }
+
+    fn mkdir(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        check_control(control)?;
+        let mut state = self.lock();
+        if state.files.contains_key(path) || state.directories.contains(path) {
+            return Err(SshTransportError::AlreadyExists(path.to_owned()));
+        }
+        let parent = memory_parent(path);
+        if !state.directories.contains(parent) {
+            return Err(SshTransportError::NotFound(parent.to_owned()));
+        }
+        state.directories.insert(path.to_owned());
+        Ok(())
+    }
+
+    fn rename(
+        &mut self,
+        source: &str,
+        destination: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        check_control(control)?;
+        let mut state = self.lock();
+        if state.files.contains_key(destination) || state.directories.contains(destination) {
+            return Err(SshTransportError::AlreadyExists(destination.to_owned()));
+        }
+        if let Some(mut file) = state.files.remove(source) {
+            for stat in &mut file.stats {
+                stat.path = destination.to_owned();
+            }
+            state.files.insert(destination.to_owned(), file);
+            return Ok(());
+        }
+        if !state.directories.contains(source) {
+            return Err(SshTransportError::NotFound(source.to_owned()));
+        }
+        let source_prefix = format!("{source}/");
+        let directories: Vec<_> = state
+            .directories
+            .iter()
+            .filter(|path| *path == source || path.starts_with(&source_prefix))
+            .cloned()
+            .collect();
+        let files: Vec<_> = state
+            .files
+            .keys()
+            .filter(|path| path.starts_with(&source_prefix))
+            .cloned()
+            .collect();
+        for path in directories {
+            state.directories.remove(&path);
+            state
+                .directories
+                .insert(path.replacen(source, destination, 1));
+        }
+        for path in files {
+            let mut file = state.files.remove(&path).expect("listed file exists");
+            let renamed = path.replacen(source, destination, 1);
+            for stat in &mut file.stats {
+                stat.path = renamed.clone();
+            }
+            state.files.insert(renamed, file);
+        }
+        Ok(())
+    }
+
+    fn remove_file(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        check_control(control)?;
+        self.lock()
+            .files
+            .remove(path)
+            .map(|_| ())
+            .ok_or_else(|| SshTransportError::NotFound(path.to_owned()))
+    }
+
+    fn remove_dir(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+    ) -> Result<(), SshTransportError> {
+        check_control(control)?;
+        let mut state = self.lock();
+        let prefix = format!("{path}/");
+        if state.files.keys().any(|child| child.starts_with(&prefix))
+            || state
+                .directories
+                .iter()
+                .any(|child| child != path && child.starts_with(&prefix))
+        {
+            return Err(SshTransportError::Transport(
+                "remote directory is not empty".to_owned(),
+            ));
+        }
+        if state.directories.remove(path) {
+            Ok(())
+        } else {
+            Err(SshTransportError::NotFound(path.to_owned()))
+        }
+    }
+}
+
+fn trim_memory_path(mut path: String) -> String {
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    path
+}
+
+fn memory_parent(path: &str) -> &str {
+    path.rsplit_once('/').map_or(
+        "/",
+        |(parent, _)| {
+            if parent.is_empty() { "/" } else { parent }
+        },
+    )
+}
+
+fn insert_parent_directories(directories: &mut BTreeSet<String>, path: &str) {
+    let mut current = memory_parent(path);
+    loop {
+        directories.insert(current.to_owned());
+        if current == "/" {
+            break;
+        }
+        current = memory_parent(current);
     }
 }
 

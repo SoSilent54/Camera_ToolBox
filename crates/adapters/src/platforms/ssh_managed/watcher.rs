@@ -129,6 +129,25 @@ pub(crate) fn map_transport(error: SshTransportError, stage: RemoteStage) -> Rem
         SshTransportError::TimedOut => RemoteServiceError::DeadlineExceeded { stage },
         SshTransportError::Transport(reason) => RemoteServiceError::Transport { stage, reason },
         SshTransportError::HelperProtocol(reason) => RemoteServiceError::HelperProtocol(reason),
+        SshTransportError::NotFound(reason)
+        | SshTransportError::PermissionDenied(reason)
+        | SshTransportError::Disconnected(reason)
+        | SshTransportError::AlreadyExists(reason)
+        | SshTransportError::ChangedDuringRead(reason) => {
+            RemoteServiceError::Transport { stage, reason }
+        }
+        SshTransportError::ReadLimitExceeded { requested, limit } => {
+            RemoteServiceError::Transport {
+                stage,
+                reason: format!("remote read exceeds bound: {requested} > {limit}"),
+            }
+        }
+        SshTransportError::InvalidContinuation => {
+            RemoteServiceError::HelperProtocol("invalid remote directory continuation".to_owned())
+        }
+        SshTransportError::Unsupported => {
+            RemoteServiceError::HelperProtocol("remote operation is unsupported".to_owned())
+        }
     }
 }
 

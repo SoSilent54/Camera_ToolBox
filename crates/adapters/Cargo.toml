@@ -24,6 +24,7 @@ platform-ssh = [
 camera-toolbox-app.workspace = true
 camera-toolbox-core.workspace = true
 directories = { workspace = true, optional = true }
+notify.workspace = true
 sha2 = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 thiserror.workspace = true

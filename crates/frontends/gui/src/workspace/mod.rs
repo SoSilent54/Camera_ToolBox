@@ -83,6 +83,41 @@ impl WorkspaceState {
         id
     }
 
+    pub(crate) fn open_file_raw(
+        &mut self,
+        loaded: LoadedRaw,
+        source: camera_toolbox_app::RawSourceHandle,
+        interpretation: camera_toolbox_app::RawInterpretation,
+        generation: u64,
+        foreground: bool,
+    ) -> DocumentId {
+        let id = DocumentId(self.next_document_id);
+        self.next_document_id = self.next_document_id.saturating_add(1);
+        self.access_clock = self.access_clock.saturating_add(1);
+        let mut document = RawDocument::new(id, loaded, self.access_clock);
+        document.attach_file_source(source, interpretation, generation);
+        self.documents.push(document);
+        if foreground || self.active.is_none() {
+            self.active = Some(id);
+        }
+        id
+    }
+
+    pub(crate) fn replace_file_raw(
+        &mut self,
+        id: DocumentId,
+        loaded: LoadedRaw,
+        source: camera_toolbox_app::RawSourceHandle,
+        interpretation: camera_toolbox_app::RawInterpretation,
+        generation: u64,
+    ) -> bool {
+        let Some(document) = self.document_mut(id) else {
+            return false;
+        };
+        document.replace_file_source(loaded, source, interpretation, generation);
+        true
+    }
+
     pub(crate) fn open_live(
         &mut self,
         session_id: camera_toolbox_app::StreamSessionId,

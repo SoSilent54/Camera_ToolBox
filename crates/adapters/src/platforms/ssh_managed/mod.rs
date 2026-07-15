@@ -15,7 +15,7 @@ pub use command::{
 pub use connection::{
     CredentialResolver, RusshTransportFactory, SshConnectionTarget, SshCredential,
     SshTransportError, SshTransportFactory, SshTransportSession, TransportCommandOutput,
-    TransportDirEntry,
+    TransportDirEntry, TransportFileKind, TransportListPage,
 };
 pub use credential::{
     PrivateKeyDiscoveryError, ProductionCredentialResolver, discover_private_key_files,

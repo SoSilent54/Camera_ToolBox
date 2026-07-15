@@ -1,5 +1,6 @@
 //! Camera Toolbox starter adapters.
 
+pub mod filesystem;
 pub mod local_raw;
 #[cfg(feature = "platform-cv610")]
 pub mod media;

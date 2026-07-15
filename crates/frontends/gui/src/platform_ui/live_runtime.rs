@@ -222,6 +222,16 @@ impl LiveRuntime {
         Ok(runtime)
     }
 
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn ssh_credential_resolver(&self) -> Arc<ProductionCredentialResolver> {
+        Arc::clone(&self.credential_resolver)
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn ssh_resolver(&self) -> Arc<dyn CredentialResolver> {
+        self.credential_resolver.clone()
+    }
+
     pub(crate) fn render_target_toolbar(&mut self, ui: &mut egui::Ui) {
         let profiles: Vec<_> = self
             .profiles

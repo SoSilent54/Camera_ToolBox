@@ -1,10 +1,20 @@
 //! Open RAW 参数窗口与候选确认交互。
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::hash_map::DefaultHasher,
+    hash::{Hash, Hasher},
+    path::{Path, PathBuf},
+    sync::mpsc::{self, Receiver, Sender, TryRecvError},
+    thread,
+    time::Duration,
+};
 
 use anyhow::{Result, anyhow};
-use camera_toolbox_adapters::LocalRawLoader;
-use camera_toolbox_app::{LocalRawAnalyzeRequest, Workflow};
+use camera_toolbox_adapters::filesystem::LocalFileSystem;
+use camera_toolbox_app::{
+    FileRef, FileSourceId, FsCancellation, FsControl, LocalRawAnalyzeRequest, RawOpenPipeline,
+    SourcePath,
+};
 use camera_toolbox_core::{
     BayerPattern, RawContainer, RawEncoding, RawEndian, RawProbeCandidate, RawProbeReport, RawSpec,
     Roi,
@@ -22,6 +32,16 @@ enum ProbeState {
     Failed(String),
 }
 
+struct ProbeResult {
+    request_id: u64,
+    result: std::result::Result<RawProbeReport, String>,
+}
+
+struct ActiveProbe {
+    request_id: u64,
+    cancellation: FsCancellation,
+}
+
 pub(crate) struct RawOpenDialogState {
     visible: bool,
     path: String,
@@ -34,10 +54,15 @@ pub(crate) struct RawOpenDialogState {
     probe_state: ProbeState,
     selected_preset: Option<usize>,
     error: Option<String>,
+    probe_sender: Sender<ProbeResult>,
+    probe_receiver: Receiver<ProbeResult>,
+    active_probe: Option<ActiveProbe>,
+    next_probe_request: u64,
 }
 
 impl Default for RawOpenDialogState {
     fn default() -> Self {
+        let (probe_sender, probe_receiver) = mpsc::channel();
         Self {
             visible: false,
             path: String::new(),
@@ -50,12 +75,17 @@ impl Default for RawOpenDialogState {
             probe_state: ProbeState::Idle,
             selected_preset: None,
             error: None,
+            probe_sender,
+            probe_receiver,
+            active_probe: None,
+            next_probe_request: 1,
         }
     }
 }
 
 impl RawOpenDialogState {
     pub(crate) fn open(&mut self, context: &egui::Context) {
+        self.cancel_probe();
         *self = Self {
             visible: true,
             ..Self::default()
@@ -63,6 +93,7 @@ impl RawOpenDialogState {
         context.send_viewport_cmd_to(raw_open_viewport_id(), egui::ViewportCommand::CancelClose);
     }
     pub(crate) fn close(&mut self, context: &egui::Context) {
+        self.cancel_probe();
         self.visible = false;
         context.send_viewport_cmd_to(raw_open_viewport_id(), egui::ViewportCommand::Close);
     }
@@ -72,10 +103,15 @@ impl RawOpenDialogState {
         self.visible = true;
     }
 
-    pub(crate) fn show(&mut self, context: &egui::Context) -> Option<LocalRawAnalyzeRequest> {
+    pub(crate) fn show(
+        &mut self,
+        context: &egui::Context,
+        pipeline: &RawOpenPipeline,
+    ) -> Option<LocalRawAnalyzeRequest> {
         if !self.visible {
             return None;
         }
+        self.poll_probe_results();
 
         let viewport_id = raw_open_viewport_id();
         let builder = egui::ViewportBuilder::default()
@@ -106,7 +142,7 @@ impl RawOpenDialogState {
             return None;
         }
         if should_probe {
-            self.run_probe();
+            self.start_probe(pipeline, context);
         }
         if !should_open {
             return None;
@@ -314,24 +350,73 @@ impl RawOpenDialogState {
         }
     }
 
-    fn run_probe(&mut self) {
-        let path = self.path.trim();
+    fn start_probe(&mut self, pipeline: &RawOpenPipeline, context: &egui::Context) {
+        let path = self.path.trim().to_owned();
         if path.is_empty() {
             self.probe_state = ProbeState::Idle;
             return;
         }
 
+        self.cancel_probe();
+        let request_id = self.next_probe_request;
+        self.next_probe_request = self.next_probe_request.saturating_add(1);
+        let cancellation = FsCancellation::default();
+        self.active_probe = Some(ActiveProbe {
+            request_id,
+            cancellation: cancellation.clone(),
+        });
         self.probe_state = ProbeState::Running;
         self.error = None;
-        let loader = LocalRawLoader;
-        match Workflow::inspect_raw_parameters(&loader, Path::new(path)) {
-            Ok(report) => self.apply_probe_report(report),
-            Err(error) => {
-                self.selected_preset = None;
-                let message = format!("检查 RAW 失败：{error}");
-                self.probe_state = ProbeState::Failed(message.clone());
-                self.error = Some(message);
+        let path = PathBuf::from(path);
+        let pipeline = pipeline.clone();
+        let sender = self.probe_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let result = local_file_source(&path).and_then(|(file_system, reference)| {
+                let mut control = FsControl::with_timeout(Duration::from_secs(30));
+                control.cancellation = cancellation;
+                pipeline
+                    .inspect(&file_system, &reference, &control)
+                    .map(|session| session.report)
+                    .map_err(anyhow::Error::from)
+            });
+            let _ = sender.send(ProbeResult {
+                request_id,
+                result: result.map_err(|error: anyhow::Error| error.to_string()),
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn poll_probe_results(&mut self) {
+        loop {
+            match self.probe_receiver.try_recv() {
+                Ok(result)
+                    if self
+                        .active_probe
+                        .as_ref()
+                        .is_some_and(|active| active.request_id == result.request_id) =>
+                {
+                    self.active_probe = None;
+                    match result.result {
+                        Ok(report) => self.apply_probe_report(report),
+                        Err(error) => {
+                            self.selected_preset = None;
+                            let message = format!("检查 RAW 失败：{error}");
+                            self.probe_state = ProbeState::Failed(message.clone());
+                            self.error = Some(message);
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             }
+        }
+    }
+
+    fn cancel_probe(&mut self) {
+        if let Some(active) = self.active_probe.take() {
+            active.cancellation.cancel();
         }
     }
 
@@ -363,6 +448,7 @@ impl RawOpenDialogState {
     }
 
     fn invalidate_probe(&mut self) {
+        self.cancel_probe();
         let had_applied_preset = self.selected_preset.is_some();
         self.probe_state = ProbeState::Idle;
         self.selected_preset = None;
@@ -422,6 +508,24 @@ impl RawOpenDialogState {
             },
         })
     }
+}
+
+pub(crate) fn local_file_source(path: &Path) -> Result<(LocalFileSystem, FileRef)> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| anyhow!("RAW path must end in a UTF-8 file name"))?;
+    let root = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let canonical_root = std::fs::canonicalize(root)?;
+    let mut hasher = DefaultHasher::new();
+    canonical_root.hash(&mut hasher);
+    let source_id = FileSourceId::new(format!("local-{:016x}", hasher.finish()))?;
+    let file_system = LocalFileSystem::new(source_id.clone(), canonical_root)?;
+    let reference = FileRef::new(source_id, SourcePath::new(file_name)?);
+    Ok((file_system, reference))
 }
 
 fn raw_open_viewport_id() -> egui::ViewportId {
@@ -620,26 +724,17 @@ mod tests {
     }
 
     #[test]
-    fn failed_probe_after_path_change_drops_stale_preset_values() {
+    fn path_change_invalidates_applied_probe_values() {
         let mut dialog = RawOpenDialogState::default();
         dialog.apply_probe_report(RawProbeReport {
             file_len: 640 * 480 * 2,
             candidates: vec![candidate()],
             diagnostics: Vec::new(),
         });
-        let missing = std::env::temp_dir().join(format!(
-            "camera-toolbox-missing-preset-{}-{}.raw",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
 
-        dialog.set_path(&missing);
-        dialog.run_probe();
+        dialog.set_path(Path::new("missing.raw"));
 
-        assert!(matches!(dialog.probe_state, ProbeState::Failed(_)));
+        assert!(matches!(dialog.probe_state, ProbeState::Idle));
         assert_eq!(dialog.selected_preset, None);
         assert!(dialog.width.is_empty());
         assert!(dialog.height.is_empty());

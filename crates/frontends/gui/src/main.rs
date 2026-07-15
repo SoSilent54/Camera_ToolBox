@@ -1,12 +1,15 @@
 mod analysis_panel;
 mod analysis_worker;
 mod app;
+mod auto_open;
 mod color_controls;
 mod color_worker;
+mod explorer;
 mod histogram_link;
 mod notification;
 mod platform_ui;
 mod raw_dialog;
+mod raw_inspector;
 mod viewer;
 mod workspace;
 

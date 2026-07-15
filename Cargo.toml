@@ -32,6 +32,7 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 png = "0.17"
 image = { version = "0.25", default-features = false, features = ["jpeg"] }
+notify = "8.2"
 russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "2.3"
 secrecy = "0.10"
