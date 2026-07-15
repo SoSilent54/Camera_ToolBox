@@ -5,18 +5,32 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+platform-local = []
+platform-cv610 = ["dep:sha2", "dep:socket2"]
+platform-ssh = [
+    "dep:directories",
+    "dep:russh",
+    "dep:russh-sftp",
+    "dep:secrecy",
+    "dep:sha2",
+    "dep:tokio",
+    "dep:tokio-util",
+]
+
 [dependencies]
 camera-toolbox-app.workspace = true
 camera-toolbox-core.workspace = true
-directories.workspace = true
-sha2.workspace = true
-socket2.workspace = true
+directories = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+socket2 = { workspace = true, optional = true }
 thiserror.workspace = true
-russh.workspace = true
-russh-sftp.workspace = true
-secrecy.workspace = true
-tokio.workspace = true
-tokio-util.workspace = true
+russh = { workspace = true, optional = true }
+russh-sftp = { workspace = true, optional = true }
+secrecy = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }

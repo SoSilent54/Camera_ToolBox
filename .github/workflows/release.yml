@@ -19,66 +19,69 @@ env:
 
 jobs:
   build-native:
-    name: Build ${{ matrix.asset_suffix }}
+    name: Build ${{ matrix.platform }} ${{ matrix.environment }}
     runs-on: ${{ matrix.runner }}
 
     strategy:
       fail-fast: false
       matrix:
+        platform:
+          - local
+          - cv610
+          - ssh
+        environment:
+          - macos-aarch64
+          - windows-x86_64
         include:
-          - runner: macos-14
-            asset_suffix: macos-aarch64
-          - runner: windows-latest
-            asset_suffix: windows-x86_64
+          - environment: macos-aarch64
+            runner: macos-14
+          - environment: windows-x86_64
+            runner: windows-latest
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
-
+        uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release binaries
-        run: cargo build --workspace --release --locked
+      - name: Build selected release
+        shell: bash
+        run: ./build.sh "${{ matrix.platform }}" release
 
       - name: Package Unix release
         if: runner.os != 'Windows'
+        shell: bash
         env:
-          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          PLATFORM: ${{ matrix.platform }}
+          ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          bundle="camera-toolbox-${ASSET_SUFFIX}"
-          archive="${bundle}.tar.gz"
+          bundle="camera-toolbox-${PLATFORM}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
-          install -m 755 target/release/camera-toolbox-cli "dist/${bundle}/"
-          install -m 755 target/release/camera-toolbox-tui "dist/${bundle}/"
-          install -m 755 target/release/camera-toolbox-gui "dist/${bundle}/"
+          install -m 755 "target/${PLATFORM}/release/camera-toolbox" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
-          tar -C dist -czf "dist/${archive}" "${bundle}"
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
 
       - name: Package Windows release
         if: runner.os == 'Windows'
         shell: pwsh
         env:
-          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          PLATFORM: ${{ matrix.platform }}
+          ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          $bundle = "camera-toolbox-$env:ASSET_SUFFIX"
-          $archive = "$bundle.zip"
+          $bundle = "camera-toolbox-$env:PLATFORM-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
-          Copy-Item target/release/camera-toolbox-cli.exe "dist/$bundle/"
-          Copy-Item target/release/camera-toolbox-tui.exe "dist/$bundle/"
-          Copy-Item target/release/camera-toolbox-gui.exe "dist/$bundle/"
+          Copy-Item "target/$env:PLATFORM/release/camera-toolbox.exe" "dist/$bundle/"
           Copy-Item README.md "dist/$bundle/"
-          Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$archive" -Force
+          Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$bundle.zip" -Force
 
       - name: Upload release archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.asset_suffix }}
-          path: dist/camera-toolbox-${{ matrix.asset_suffix }}.*
+          name: release-${{ matrix.platform }}-${{ matrix.environment }}
+          path: dist/camera-toolbox-${{ matrix.platform }}-${{ matrix.environment }}.*
           if-no-files-found: error
 
   build-linux:
-    name: Build ${{ matrix.asset_suffix }}
+    name: Build ${{ matrix.platform }} ${{ matrix.environment }}
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:${{ matrix.ubuntu_version }}
@@ -86,19 +89,28 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        platform:
+          - local
+          - cv610
+          - ssh
+        environment:
+          - linux-x86_64-ubuntu20
+          - linux-x86_64-ubuntu22
+          - linux-aarch64-ubuntu20
+          - linux-aarch64-ubuntu22
         include:
-          - runner: ubuntu-22.04
+          - environment: linux-x86_64-ubuntu20
+            runner: ubuntu-22.04
             ubuntu_version: "20.04"
-            asset_suffix: linux-x86_64-ubuntu20
-          - runner: ubuntu-22.04
+          - environment: linux-x86_64-ubuntu22
+            runner: ubuntu-22.04
             ubuntu_version: "22.04"
-            asset_suffix: linux-x86_64-ubuntu22
-          - runner: ubuntu-22.04-arm
+          - environment: linux-aarch64-ubuntu20
+            runner: ubuntu-22.04-arm
             ubuntu_version: "20.04"
-            asset_suffix: linux-aarch64-ubuntu20
-          - runner: ubuntu-22.04-arm
+          - environment: linux-aarch64-ubuntu22
+            runner: ubuntu-22.04-arm
             ubuntu_version: "22.04"
-            asset_suffix: linux-aarch64-ubuntu22
 
     steps:
       - name: Install Linux build dependencies
@@ -117,34 +129,27 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libxkbcommon-dev
-
       - name: Check out source
-        uses: actions/checkout@v7
-
+        uses: actions/checkout@v4
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release binaries
-        run: cargo build --workspace --release --locked
-
+      - name: Build selected release
+        run: ./build.sh "${{ matrix.platform }}" release
       - name: Package Linux release
         env:
-          ASSET_SUFFIX: ${{ matrix.asset_suffix }}
+          PLATFORM: ${{ matrix.platform }}
+          ENVIRONMENT: ${{ matrix.environment }}
         run: |
-          bundle="camera-toolbox-${ASSET_SUFFIX}"
-          archive="${bundle}.tar.gz"
+          bundle="camera-toolbox-${PLATFORM}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
-          install -m 755 target/release/camera-toolbox-cli "dist/${bundle}/"
-          install -m 755 target/release/camera-toolbox-tui "dist/${bundle}/"
-          install -m 755 target/release/camera-toolbox-gui "dist/${bundle}/"
+          install -m 755 "target/${PLATFORM}/release/camera-toolbox" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
-          tar -C dist -czf "dist/${archive}" "${bundle}"
-
+          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
       - name: Upload release archive
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
-          name: release-${{ matrix.asset_suffix }}
-          path: dist/camera-toolbox-${{ matrix.asset_suffix }}.tar.gz
+          name: release-${{ matrix.platform }}-${{ matrix.environment }}
+          path: dist/camera-toolbox-${{ matrix.platform }}-${{ matrix.environment }}.tar.gz
           if-no-files-found: error
 
   publish:
@@ -158,21 +163,21 @@ jobs:
 
     steps:
       - name: Download release archives
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           pattern: release-*
           path: dist
           merge-multiple: true
-
       - name: Verify release archives
         run: |
-          test -f dist/camera-toolbox-macos-aarch64.tar.gz
-          test -f dist/camera-toolbox-windows-x86_64.zip
-          test -f dist/camera-toolbox-linux-x86_64-ubuntu20.tar.gz
-          test -f dist/camera-toolbox-linux-x86_64-ubuntu22.tar.gz
-          test -f dist/camera-toolbox-linux-aarch64-ubuntu20.tar.gz
-          test -f dist/camera-toolbox-linux-aarch64-ubuntu22.tar.gz
-
+          for platform in local cv610 ssh; do
+            test -f "dist/camera-toolbox-${platform}-macos-aarch64.tar.gz"
+            test -f "dist/camera-toolbox-${platform}-windows-x86_64.zip"
+            test -f "dist/camera-toolbox-${platform}-linux-x86_64-ubuntu20.tar.gz"
+            test -f "dist/camera-toolbox-${platform}-linux-x86_64-ubuntu22.tar.gz"
+            test -f "dist/camera-toolbox-${platform}-linux-aarch64-ubuntu20.tar.gz"
+            test -f "dist/camera-toolbox-${platform}-linux-aarch64-ubuntu22.tar.gz"
+          done
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -181,9 +186,5 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/camera-toolbox-macos-aarch64.tar.gz
-            dist/camera-toolbox-windows-x86_64.zip
-            dist/camera-toolbox-linux-x86_64-ubuntu20.tar.gz
-            dist/camera-toolbox-linux-x86_64-ubuntu22.tar.gz
-            dist/camera-toolbox-linux-aarch64-ubuntu20.tar.gz
-            dist/camera-toolbox-linux-aarch64-ubuntu22.tar.gz
+            dist/camera-toolbox-*.tar.gz
+            dist/camera-toolbox-*.zip

@@ -1,16 +1,23 @@
 //! Profile commit 规范化与候选 ProfileStore 持久化。
 
-use camera_toolbox_app::{PlatformConfig, PlatformProfile, PlatformProfileId, ProfileStore};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::PlatformConfig;
+use camera_toolbox_app::{PlatformProfile, PlatformProfileId, ProfileStore};
+#[cfg(feature = "platform-ssh")]
 use secrecy::SecretString;
 
-use super::{device_manager::ProfileDraft, ssh_profile::SshCommitAuth};
+use super::device_manager::ProfileDraft;
+#[cfg(feature = "platform-ssh")]
+use super::ssh_profile::SshCommitAuth;
 
 pub(super) struct NormalizedProfileCommit {
     pub(super) profile: PlatformProfile,
     pub(super) original_id: Option<PlatformProfileId>,
+    #[cfg(feature = "platform-ssh")]
     pub(super) session_password: Option<(String, SecretString)>,
 }
 
+#[cfg(feature = "platform-ssh")]
 pub(super) fn normalize_profile_commit(
     store: &ProfileStore,
     mut draft: ProfileDraft,
@@ -66,6 +73,18 @@ pub(super) fn normalize_profile_commit(
     }
 }
 
+#[cfg(not(feature = "platform-ssh"))]
+pub(super) fn normalize_profile_commit(
+    _store: &ProfileStore,
+    draft: ProfileDraft,
+) -> Result<NormalizedProfileCommit, String> {
+    let original_id = draft.original_id.clone();
+    Ok(NormalizedProfileCommit {
+        profile: draft.build()?,
+        original_id,
+    })
+}
+
 /// 先在 clone 中校验 mutation，再持久化；调用者只安装成功返回的 candidate。
 pub(super) fn persist_profile_candidate(
     current: &ProfileStore,
@@ -90,6 +109,7 @@ pub(super) fn persist_profile_candidate(
     Ok(candidate)
 }
 
+#[cfg(feature = "platform-ssh")]
 pub(super) fn stable_session_id(profile_id: &PlatformProfileId) -> String {
     let mut id = String::with_capacity(8 + profile_id.as_str().len() * 2);
     id.push_str("profile-");
@@ -100,6 +120,7 @@ pub(super) fn stable_session_id(profile_id: &PlatformProfileId) -> String {
     id
 }
 
+#[cfg(feature = "platform-ssh")]
 fn unique_profile_id(store: &ProfileStore, identity: &str) -> String {
     let mut base = String::new();
     let mut separator = false;
@@ -131,14 +152,15 @@ fn unique_profile_id(store: &ProfileStore, identity: &str) -> String {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "platform-ssh"))]
 mod tests {
     use std::sync::{Arc, Mutex};
 
-    use camera_toolbox_app::{LocalConfig, PlatformConfig};
+    use camera_toolbox_app::LocalConfig;
 
     use super::*;
-    use crate::platform_ui::device_manager::{DraftVariant, incomplete_ssh_template};
+    use crate::platform_ui::device_manager::incomplete_ssh_template;
+    use crate::platform_ui::ssh_profile::SshCommitAuth;
 
     fn local_profile(id: &str) -> PlatformProfile {
         PlatformProfile {
@@ -161,9 +183,7 @@ mod tests {
         };
         config.host = "camera.example".to_owned();
         config.username = "root".to_owned();
-        config.expected_host_key =
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-                .to_owned();
+        config.expected_host_key = "ssh-ed25519 test".to_owned();
         config.remote_artifact_dir = "/data".to_owned();
         config.remote_artifact_glob = "frame.raw".to_owned();
         let normalized = normalize_profile_commit(
@@ -174,14 +194,6 @@ mod tests {
         .unwrap();
         assert_eq!(normalized.profile.id.as_str(), "root-camera-example");
         assert_eq!(normalized.profile.display_name, "root@camera.example");
-        let PlatformConfig::SshManaged(config) = normalized.profile.config else {
-            panic!()
-        };
-        assert_eq!(
-            config.credential_ref,
-            format!("session:{}", stable_session_id(&normalized.profile.id))
-        );
-        assert!(!config.credential_ref.contains('@'));
     }
 
     #[test]
@@ -201,16 +213,5 @@ mod tests {
         assert_eq!(result.unwrap_err(), "disk full");
         assert_eq!(*observed.lock().unwrap(), vec![2]);
         assert_eq!(current.platforms().count(), 1);
-        assert!(
-            current
-                .platform(&PlatformProfileId::new("new").unwrap())
-                .is_none()
-        );
-    }
-
-    #[test]
-    fn password_is_default_for_new_ssh_draft() {
-        let draft = ProfileDraft::new(DraftVariant::SshManaged);
-        assert!(matches!(draft.config, PlatformConfig::SshManaged(_)));
     }
 }

@@ -1,42 +1,54 @@
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
-    sync::Arc,
+    path::Path,
     thread,
     time::{Duration, Instant},
 };
+use std::{path::PathBuf, sync::Arc};
 
 use crate::json::{Value, json};
 use anyhow::{Context, Result, anyhow, bail};
-use camera_toolbox_adapters::{
-    PlatformRegistry,
-    platforms::{
-        hisilicon_cv610::HisiliconCv610Provider,
-        ssh_managed::{
-            CredentialResolver, ProductionCredentialResolver, SshManagedPlatformProvider,
-            production_recipe_registry_from_env,
-        },
-    },
+use camera_toolbox_adapters::PlatformRegistry;
+#[cfg(feature = "platform-cv610")]
+use camera_toolbox_adapters::platforms::hisilicon_cv610::HisiliconCv610Provider;
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_adapters::platforms::ssh_managed::{
+    CredentialResolver, ProductionCredentialResolver, SshManagedPlatformProvider,
+    production_recipe_registry_from_env,
 };
 use camera_toolbox_app::{
-    CapabilityKind, CapabilityVariant, CaptureStore, CaptureStoreLimits, CommandParameter,
-    CommandResult, CommandTerminal, DumpJobEvent, DumpJobState, DumpTimeouts, EvidenceMaturity,
-    OperationId, PlatformConfig, PlatformController, PlatformKind, PlatformProfile,
-    PlatformProfileId, ProfileStore, RecordingBranch, RecordingState, RemoteDiscoverySource,
-    RemoteFileRequest, RemoteJobEvent, RemoteJobFailure, RemoteJobState, RemoteTimeouts,
-    ResolvedTargetBindings, SensorId, SensorModeKey, SensorSelection, SnapshotHash, StreamMetrics,
-    StreamOpenRequest, StreamRecordingRequest, StreamServiceEvent, StreamSessionEvent,
-    StreamSessionId, StreamTerminal, StreamTimeouts, TargetResolutionSnapshot, TypedCommandRequest,
+    CapabilityKind, CapabilityVariant, EvidenceMaturity, PlatformConfig, PlatformKind,
+    PlatformProfile, PlatformProfileId, ProfileStore, SensorId, SensorModeKey, SensorSelection,
+    SnapshotHash, TargetResolutionSnapshot,
+};
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
+use camera_toolbox_app::{CaptureStore, CaptureStoreLimits, OperationId, PlatformController};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::{
+    CommandParameter, CommandResult, CommandTerminal, RemoteDiscoverySource, RemoteFileRequest,
+    RemoteJobEvent, RemoteJobFailure, RemoteJobState, RemoteTimeouts, TypedCommandRequest,
+};
+#[cfg(feature = "platform-cv610")]
+use camera_toolbox_app::{
+    DumpJobEvent, DumpJobState, DumpTimeouts, RecordingBranch, RecordingState,
+    ResolvedTargetBindings, StreamMetrics, StreamOpenRequest, StreamRecordingRequest,
+    StreamServiceEvent, StreamSessionEvent, StreamSessionId, StreamTerminal, StreamTimeouts,
     VerifiedDumpKind, VerifiedDumpRequest,
 };
-use camera_toolbox_core::{AssetId, ChromaOrder, MediaFormat, OwnedMediaPayload};
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
+use camera_toolbox_core::{AssetId, OwnedMediaPayload};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_core::{ChromaOrder, MediaFormat};
 
-use crate::cli::{
-    Cv610Command, Cv610DumpArgs, DumpKindArg, MediaFormatArg, PlatformCommand, ProfileCommand,
-    ProfileStoreArgs, SshCaptureArgs, SshCommand, SshFetchArgs, StreamRecordArgs, TargetArgs,
-};
+#[cfg(feature = "platform-cv610")]
+use crate::cli::{Cv610Command, Cv610DumpArgs, DumpKindArg, StreamRecordArgs};
+#[cfg(feature = "platform-ssh")]
+use crate::cli::{MediaFormatArg, SshCaptureArgs, SshCommand, SshFetchArgs};
+use crate::cli::{PlatformCommand, ProfileCommand, ProfileStoreArgs, TargetArgs};
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 pub(crate) fn run_profile(command: ProfileCommand) -> Result<()> {
@@ -54,16 +66,19 @@ pub(crate) fn run_platform(command: PlatformCommand) -> Result<()> {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 pub(crate) fn run_cv610(command: Cv610Command) -> Result<()> {
     match command {
         Cv610Command::Dump(args) => emit_result("cv610_dump", || cv610_dump(&args)),
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 pub(crate) fn run_stream_record(args: &StreamRecordArgs) -> Result<()> {
     emit_result("stream_record", || stream_record(args))
 }
 
+#[cfg(feature = "platform-ssh")]
 pub(crate) fn run_ssh(command: SshCommand) -> Result<()> {
     match command {
         SshCommand::Capture(args) => emit_result("ssh_capture", || ssh_capture(args)),
@@ -187,24 +202,24 @@ fn resolve_target(args: &TargetArgs) -> Result<ResolvedTarget> {
         .ok_or_else(|| anyhow!("platform profile not found: {platform_id}"))?;
     let selection = target_selection(args)?;
 
-    let credential_resolver = Arc::new(ProductionCredentialResolver::new());
-    if let PlatformConfig::SshManaged(config) = &profile.config
-        && config.credential_ref.starts_with("session:")
-    {
-        bail!(
-            "session credential {} is not registered in this non-interactive CLI process; use key-file:/absolute/path or run the operation from Device Manager after entering the session secret",
-            config.credential_ref
+    let mut registry = PlatformRegistry::default();
+    #[cfg(feature = "platform-cv610")]
+    registry.register_cv610(HisiliconCv610Provider::default());
+    #[cfg(feature = "platform-ssh")]
+    if let PlatformConfig::SshManaged(config) = &profile.config {
+        if config.credential_ref.starts_with("session:") {
+            bail!(
+                "session credential {} is not registered in this non-interactive CLI process; use key-file:/absolute/path or run the operation from Device Manager after entering the session secret",
+                config.credential_ref
+            );
+        }
+        let resolver: Arc<dyn CredentialResolver> = Arc::new(ProductionCredentialResolver::new());
+        let recipes = Arc::new(
+            production_recipe_registry_from_env()
+                .context("invalid production SSH recipe environment")?,
         );
+        registry.register_ssh(SshManagedPlatformProvider::production(resolver, recipes));
     }
-    let recipes = Arc::new(
-        production_recipe_registry_from_env()
-            .context("invalid production SSH recipe environment")?,
-    );
-    let resolver: Arc<dyn CredentialResolver> = credential_resolver;
-    let registry = PlatformRegistry::new(
-        HisiliconCv610Provider::default(),
-        SshManagedPlatformProvider::production(resolver, recipes),
-    );
     let bindings = registry
         .bind(&profile)
         .with_context(|| format!("failed to bind platform profile {platform_id}"))?;
@@ -278,6 +293,7 @@ fn probe_json(profile: &PlatformProfile, snapshot: &TargetResolutionSnapshot) ->
     })
 }
 
+#[cfg(feature = "platform-cv610")]
 fn cv610_dump(args: &Cv610DumpArgs) -> Result<CommandReport> {
     let target = resolve_target(&args.target)?;
     if !matches!(target.profile.config, PlatformConfig::HisiliconCv610(_)) {
@@ -304,6 +320,7 @@ fn cv610_dump(args: &Cv610DumpArgs) -> Result<CommandReport> {
     )
 }
 
+#[cfg(feature = "platform-cv610")]
 fn wait_dump(
     controller: &PlatformController,
     store: &CaptureStore,
@@ -332,6 +349,7 @@ fn wait_dump(
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn dump_terminal_report(
     store: &CaptureStore,
     snapshot: &TargetResolutionSnapshot,
@@ -373,6 +391,7 @@ fn dump_terminal_report(
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn stream_record(args: &StreamRecordArgs) -> Result<CommandReport> {
     if args.transport_output.is_none() && args.annexb_output.is_none() {
         bail!(
@@ -428,6 +447,7 @@ fn stream_record(args: &StreamRecordArgs) -> Result<CommandReport> {
     )
 }
 
+#[cfg(feature = "platform-cv610")]
 fn wait_stream(
     controller: &PlatformController,
     snapshot: &TargetResolutionSnapshot,
@@ -486,6 +506,7 @@ fn wait_stream(
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 #[derive(Default)]
 struct StreamReportState {
     negotiated: Option<Value>,
@@ -494,6 +515,7 @@ struct StreamReportState {
     recording_failure: Option<String>,
 }
 
+#[cfg(feature = "platform-cv610")]
 impl StreamReportState {
     fn accept(
         &mut self,
@@ -573,6 +595,7 @@ impl StreamReportState {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 fn ssh_capture(args: SshCaptureArgs) -> Result<CommandReport> {
     let target = resolve_target(&args.target)?;
     let PlatformConfig::SshManaged(config) = &target.profile.config else {
@@ -601,6 +624,7 @@ fn ssh_capture(args: SshCaptureArgs) -> Result<CommandReport> {
     )
 }
 
+#[cfg(feature = "platform-ssh")]
 fn ssh_fetch(args: SshFetchArgs) -> Result<CommandReport> {
     let target = resolve_target(&args.target)?;
     if !matches!(target.profile.config, PlatformConfig::SshManaged(_)) {
@@ -634,6 +658,7 @@ fn ssh_fetch(args: SshFetchArgs) -> Result<CommandReport> {
     )
 }
 
+#[cfg(feature = "platform-ssh")]
 fn wait_remote(
     controller: &PlatformController,
     persistence: Option<(&CaptureStore, Option<DirectOutput>)>,
@@ -664,6 +689,7 @@ fn wait_remote(
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 fn remote_terminal_report(
     persistence: Option<(&CaptureStore, Option<DirectOutput>)>,
     snapshot: &TargetResolutionSnapshot,
@@ -711,6 +737,7 @@ fn remote_terminal_report(
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 fn command_result_report(base: Value, result: CommandResult) -> CommandReport {
     let CommandResult {
         terminal: command_terminal,
@@ -760,6 +787,7 @@ fn command_result_report(base: Value, result: CommandResult) -> CommandReport {
     )
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 fn controller_for(
     snapshot: &TargetResolutionSnapshot,
 ) -> Result<(CaptureStore, PlatformController)> {
@@ -783,6 +811,7 @@ fn controller_for(
     Ok((store, controller))
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 fn persist_asset(
     store: &CaptureStore,
     asset_id: &AssetId,
@@ -804,12 +833,14 @@ fn persist_asset(
     })))
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 struct DirectOutput {
     path: PathBuf,
     file: Option<fs::File>,
     committed: bool,
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 impl DirectOutput {
     fn reserve(path: Option<&Path>) -> io::Result<Option<Self>> {
         let Some(path) = path else {
@@ -851,6 +882,7 @@ impl DirectOutput {
     }
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 impl Drop for DirectOutput {
     fn drop(&mut self) {
         drop(self.file.take());
@@ -860,11 +892,13 @@ impl Drop for DirectOutput {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 struct OutputReservation {
     paths: Vec<PathBuf>,
     committed: bool,
 }
 
+#[cfg(feature = "platform-cv610")]
 impl OutputReservation {
     fn reserve(paths: &[&Path]) -> io::Result<Self> {
         let mut reservation = Self {
@@ -883,6 +917,7 @@ impl OutputReservation {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 impl Drop for OutputReservation {
     fn drop(&mut self) {
         if !self.committed {
@@ -893,6 +928,7 @@ impl Drop for OutputReservation {
     }
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 fn job_base(
     command: &'static str,
     operation_id: &str,
@@ -909,6 +945,7 @@ fn job_base(
     })
 }
 
+#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
 fn merge_json(base: Value, fields: Value) -> Value {
     let Value::Object(mut base) = base else {
         unreachable!("job base is an object");
@@ -987,6 +1024,7 @@ fn platform_kind_name(kind: PlatformKind) -> &'static str {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn dump_kind_name(kind: VerifiedDumpKind) -> &'static str {
     match kind {
         VerifiedDumpKind::Raw10 => "raw10",
@@ -996,6 +1034,7 @@ fn dump_kind_name(kind: VerifiedDumpKind) -> &'static str {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn stream_terminal(
     terminal: &StreamTerminal,
     close_requested: bool,
@@ -1019,6 +1058,7 @@ fn stream_terminal(
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn recording_json(branch: RecordingBranch, state: &RecordingState) -> Value {
     let branch = match branch {
         RecordingBranch::TransportEvidence => "transport_evidence",
@@ -1043,6 +1083,7 @@ fn recording_json(branch: RecordingBranch, state: &RecordingState) -> Value {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn metrics_json(metrics: &StreamMetrics) -> Value {
     json!({
         "decoded_frames": metrics.decoded_frames,
@@ -1061,6 +1102,7 @@ fn metrics_json(metrics: &StreamMetrics) -> Value {
     })
 }
 
+#[cfg(feature = "platform-ssh")]
 fn remote_failure_string(failure: &RemoteJobFailure) -> String {
     match failure {
         RemoteJobFailure::Command(error) => error.to_string(),
@@ -1068,6 +1110,7 @@ fn remote_failure_string(failure: &RemoteJobFailure) -> String {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 fn discovery_source_name(source: RemoteDiscoverySource) -> &'static str {
     match source {
         RemoteDiscoverySource::CommandResultPath => "command_result_path",
@@ -1077,6 +1120,7 @@ fn discovery_source_name(source: RemoteDiscoverySource) -> &'static str {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 impl From<DumpKindArg> for VerifiedDumpKind {
     fn from(value: DumpKindArg) -> Self {
         match value {
@@ -1088,6 +1132,7 @@ impl From<DumpKindArg> for VerifiedDumpKind {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 impl From<MediaFormatArg> for MediaFormat {
     fn from(value: MediaFormatArg) -> Self {
         match value {
@@ -1111,14 +1156,16 @@ impl From<MediaFormatArg> for MediaFormat {
 
 #[cfg(test)]
 mod tests {
-    use camera_toolbox_adapters::platforms::ssh_managed::CommandRecipeRegistry;
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
     use std::{collections::BTreeMap, time::SystemTime};
 
-    use camera_toolbox_app::{
-        Cv610Config, Cv610DumpConfig, Cv610StreamConfig, DumpServiceError, LocalConfig,
-        PlatformConfig, PlatformProfile, SensorSelection,
-    };
-    use camera_toolbox_core::{CaptureMetadata, EphemeralAsset, IntegrityState};
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
+    use camera_toolbox_app::LocalConfig;
+    use camera_toolbox_app::SensorSelection;
+    #[cfg(feature = "platform-cv610")]
+    use camera_toolbox_app::{Cv610Config, Cv610DumpConfig, Cv610StreamConfig, DumpServiceError};
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
+    use camera_toolbox_core::{CaptureMetadata, EphemeralAsset, IntegrityState, MediaFormat};
 
     use super::*;
 
@@ -1131,6 +1178,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "platform-cv610")]
     fn cv610_profile() -> PlatformProfile {
         PlatformProfile {
             id: PlatformProfileId::new("cv610").unwrap(),
@@ -1143,12 +1191,13 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
     fn unique_directory() -> PathBuf {
         let suffix = SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        std::env::temp_dir().join(format!("camera-toolbox-cli-{suffix}"))
+        std::env::temp_dir().join(format!("camera-toolbox-command-{suffix}"))
     }
 
     #[test]
@@ -1165,19 +1214,14 @@ mod tests {
         assert!(target_selection(&target_args(None, Some("4k30"))).is_err());
     }
 
+    #[cfg(feature = "platform-cv610")]
     #[test]
     fn unbound_resolution_keeps_platform_only_cv610_capabilities_and_json_shape() {
         let profile = cv610_profile();
         let mut store = ProfileStore::new();
         store.insert_platform(profile.clone()).unwrap();
-        let resolver: Arc<dyn CredentialResolver> = Arc::new(ProductionCredentialResolver::new());
-        let registry = PlatformRegistry::new(
-            HisiliconCv610Provider::default(),
-            SshManagedPlatformProvider::production(
-                resolver,
-                Arc::new(CommandRecipeRegistry::default()),
-            ),
-        );
+        let mut registry = PlatformRegistry::default();
+        registry.register_cv610(HisiliconCv610Provider::default());
         let bindings = registry.bind(&profile).unwrap();
         let snapshot = store
             .resolve_target(SensorSelection::Unbound, &bindings)
@@ -1198,6 +1242,7 @@ mod tests {
         assert_eq!(output["aggregate_hash"].as_str().unwrap().len(), 64);
     }
 
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
     #[test]
     fn direct_output_refuses_existing_target_without_temp_files() {
         let directory = unique_directory();
@@ -1219,6 +1264,7 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(feature = "platform-cv610")]
     #[test]
     fn stream_reservation_cleans_only_this_invocations_setup_files() {
         let directory = unique_directory();
@@ -1237,19 +1283,14 @@ mod tests {
         fs::remove_dir_all(directory).unwrap();
     }
 
+    #[cfg(feature = "platform-cv610")]
     #[test]
-    fn typed_terminal_failures_map_to_nonzero_reports() {
+    fn cv610_terminal_failures_map_to_nonzero_reports() {
         let profile = cv610_profile();
         let mut store = ProfileStore::new();
         store.insert_platform(profile.clone()).unwrap();
-        let resolver: Arc<dyn CredentialResolver> = Arc::new(ProductionCredentialResolver::new());
-        let registry = PlatformRegistry::new(
-            HisiliconCv610Provider::default(),
-            SshManagedPlatformProvider::production(
-                resolver,
-                Arc::new(CommandRecipeRegistry::default()),
-            ),
-        );
+        let mut registry = PlatformRegistry::default();
+        registry.register_cv610(HisiliconCv610Provider::default());
         let bindings = registry.bind(&profile).unwrap();
         let snapshot = store
             .resolve_target(SensorSelection::Unbound, &bindings)
@@ -1273,7 +1314,11 @@ mod tests {
             false,
         );
         assert!(failure.is_some());
+    }
 
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn ssh_terminal_failures_map_to_nonzero_reports() {
         let command = command_result_report(
             json!({}),
             CommandResult {
@@ -1288,6 +1333,7 @@ mod tests {
         assert!(command.terminal_failure.is_some());
     }
 
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
     #[test]
     fn test_asset_fixture_is_valid_for_direct_writer() {
         let asset = EphemeralAsset::new(

@@ -10,13 +10,13 @@ permissions:
   contents: read
 
 jobs:
-  quality:
-    name: Rust quality checks
+  common:
+    name: Common Rust checks
     runs-on: ubuntu-22.04
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v7
+        uses: actions/checkout@v4
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
@@ -33,20 +33,74 @@ jobs:
             libwayland-dev \
             libx11-dev \
             libxkbcommon-dev
-
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Test platform-independent crates
+        run: cargo test --release --locked -p camera-toolbox-core -p camera-toolbox-app -p camera-toolbox-logging
+      - name: Report common Clippy diagnostics
+        run: cargo clippy --release --locked --all-targets -p camera-toolbox-core -p camera-toolbox-app -p camera-toolbox-logging
 
-      - name: Check all workspace targets
-        run: cargo check --workspace --all-targets --release --locked
+  platform:
+    name: Platform ${{ matrix.platform }}
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - local
+          - cv610
+          - ssh
 
-      - name: Run workspace tests
-        run: cargo test --workspace --release --locked
-
-      - name: Report Clippy diagnostics
-        run: cargo clippy --workspace --all-targets --release --locked
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            pkg-config \
+            libasound2-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libgtk-3-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Build selected platform
+        run: ./build.sh "${{ matrix.platform }}" release
+      - name: Test selected adapter implementation
+        run: >-
+          cargo test --release --locked
+          -p camera-toolbox-adapters
+          --no-default-features
+          --features "platform-${{ matrix.platform }}"
+      - name: Test internal CLI branch
+        run: >-
+          cargo test --release --locked
+          -p camera-toolbox-cli --lib
+          --no-default-features
+          --features "platform-${{ matrix.platform }}"
+      - name: Test unified binary target
+        run: >-
+          cargo test --release --locked
+          -p camera-toolbox --all-targets
+          --no-default-features
+          --features "platform-${{ matrix.platform }}"
+      - name: Report selected-platform Clippy diagnostics
+        run: >-
+          cargo clippy --release --locked
+          -p camera-toolbox --all-targets
+          --no-default-features
+          --features "platform-${{ matrix.platform }}"

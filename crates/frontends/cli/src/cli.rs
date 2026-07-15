@@ -1,6 +1,10 @@
-use std::{num::NonZeroU64, path::PathBuf};
+#[cfg(feature = "platform-cv610")]
+use std::num::NonZeroU64;
+use std::path::PathBuf;
 
-use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
+#[cfg(feature = "platform-cv610")]
+use clap::ArgGroup;
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "camera-toolbox")]
@@ -33,13 +37,16 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: PlatformCommand,
     },
+    #[cfg(feature = "platform-cv610")]
     /// Run a CV610 production operation.
     Cv610 {
         #[command(subcommand)]
         command: Cv610Command,
     },
+    #[cfg(feature = "platform-cv610")]
     /// Record a CV610 stream for an explicit finite duration.
     StreamRecord(StreamRecordArgs),
+    #[cfg(feature = "platform-ssh")]
     /// Run an SSH-managed production operation.
     Ssh {
         #[command(subcommand)]
@@ -54,8 +61,11 @@ impl Command {
             Self::AnalyzeRaw(_) => "analyze_raw",
             Self::Profile { command } => command.name(),
             Self::Platform { command } => command.name(),
+            #[cfg(feature = "platform-cv610")]
             Self::Cv610 { command } => command.name(),
+            #[cfg(feature = "platform-cv610")]
             Self::StreamRecord(_) => "stream_record",
+            #[cfg(feature = "platform-ssh")]
             Self::Ssh { command } => command.name(),
         }
     }
@@ -92,12 +102,14 @@ impl PlatformCommand {
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 #[derive(Debug, Subcommand)]
 pub enum Cv610Command {
     /// Submit one verified still Dump job.
     Dump(Cv610DumpArgs),
 }
 
+#[cfg(feature = "platform-cv610")]
 impl Cv610Command {
     const fn name(&self) -> &'static str {
         match self {
@@ -106,6 +118,7 @@ impl Cv610Command {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 #[derive(Debug, Subcommand)]
 pub enum SshCommand {
     /// Run the profile's allowlisted one-shot capture recipe.
@@ -113,6 +126,7 @@ pub enum SshCommand {
     /// Fetch one explicit remote artifact into bounded memory.
     Fetch(SshFetchArgs),
 }
+#[cfg(feature = "platform-ssh")]
 
 impl SshCommand {
     const fn name(&self) -> &'static str {
@@ -146,6 +160,7 @@ pub struct TargetArgs {
     pub mode_id: Option<String>,
 }
 
+#[cfg(feature = "platform-cv610")]
 #[derive(Debug, Clone, Args)]
 pub struct Cv610DumpArgs {
     #[command(flatten)]
@@ -158,6 +173,7 @@ pub struct Cv610DumpArgs {
     pub output: Option<PathBuf>,
 }
 
+#[cfg(feature = "platform-cv610")]
 #[derive(Debug, Clone, Args)]
 #[command(group(
     ArgGroup::new("recording_output")
@@ -185,6 +201,7 @@ pub struct StreamRecordArgs {
     pub timestamp_output: Option<PathBuf>,
 }
 
+#[cfg(feature = "platform-ssh")]
 #[derive(Debug, Clone, Args)]
 pub struct SshCaptureArgs {
     #[command(flatten)]
@@ -194,6 +211,7 @@ pub struct SshCaptureArgs {
     pub format: String,
 }
 
+#[cfg(feature = "platform-ssh")]
 #[derive(Debug, Clone, Args)]
 pub struct SshFetchArgs {
     #[command(flatten)]
@@ -237,6 +255,7 @@ pub struct AnalyzeRawArgs {
     pub roi: Option<crate::RoiArg>,
 }
 
+#[cfg(feature = "platform-cv610")]
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum DumpKindArg {
     Raw10,
@@ -245,6 +264,7 @@ pub enum DumpKindArg {
     Nv21,
 }
 
+#[cfg(feature = "platform-ssh")]
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum MediaFormatArg {
     Raw10Packed,
@@ -306,22 +326,49 @@ mod tests {
             .command,
             Command::AnalyzeRaw(_)
         ));
-        let parsed = Cli::try_parse_from([
-            "camera-toolbox",
-            "cv610",
-            "dump",
-            "--platform",
-            "lab",
-            "--kind",
-            "raw12",
-        ])
-        .unwrap();
         assert!(matches!(
-            parsed.command,
-            Command::Cv610 {
-                command: Cv610Command::Dump(_)
-            }
+            Cli::try_parse_from(["camera-toolbox", "platform", "probe", "--platform", "lab"])
+                .unwrap()
+                .command,
+            Command::Platform { .. }
         ));
+        #[cfg(feature = "platform-cv610")]
+        {
+            let parsed = Cli::try_parse_from([
+                "camera-toolbox",
+                "cv610",
+                "dump",
+                "--platform",
+                "lab",
+                "--kind",
+                "raw12",
+            ])
+            .unwrap();
+            assert!(matches!(
+                parsed.command,
+                Command::Cv610 {
+                    command: Cv610Command::Dump(_)
+                }
+            ));
+        }
+        #[cfg(feature = "platform-ssh")]
+        {
+            let parsed = Cli::try_parse_from([
+                "camera-toolbox",
+                "ssh",
+                "capture",
+                "--platform",
+                "lab",
+                "--format",
+                "raw12",
+            ])
+            .unwrap();
+            assert!(matches!(parsed.command, Command::Ssh { .. }));
+        }
+        #[cfg(not(feature = "platform-cv610"))]
+        assert!(Cli::try_parse_from(["camera-toolbox", "cv610", "dump"]).is_err());
+        #[cfg(not(feature = "platform-ssh"))]
+        assert!(Cli::try_parse_from(["camera-toolbox", "ssh", "capture"]).is_err());
     }
 
     #[test]
@@ -338,33 +385,36 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(
-            Cli::try_parse_from([
-                "camera-toolbox",
-                "stream-record",
-                "--platform",
-                "lab",
-                "--duration",
-                "0",
-                "--quota-bytes",
-                "1",
-                "--transport-output",
-                "record.bin"
-            ])
-            .is_err()
-        );
-        assert!(
-            Cli::try_parse_from([
-                "camera-toolbox",
-                "stream-record",
-                "--platform",
-                "lab",
-                "--duration",
-                "1",
-                "--quota-bytes",
-                "1"
-            ])
-            .is_err()
-        );
+        #[cfg(feature = "platform-cv610")]
+        {
+            assert!(
+                Cli::try_parse_from([
+                    "camera-toolbox",
+                    "stream-record",
+                    "--platform",
+                    "lab",
+                    "--duration",
+                    "0",
+                    "--quota-bytes",
+                    "1",
+                    "--transport-output",
+                    "record.bin"
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "camera-toolbox",
+                    "stream-record",
+                    "--platform",
+                    "lab",
+                    "--duration",
+                    "1",
+                    "--quota-bytes",
+                    "1"
+                ])
+                .is_err()
+            );
+        }
     }
 }

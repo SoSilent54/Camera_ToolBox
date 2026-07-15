@@ -1,3 +1,5 @@
+#![cfg(feature = "platform-cv610")]
+
 use std::{
     net::TcpListener,
     path::PathBuf,
@@ -27,7 +29,7 @@ fn unique_directory() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time after epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("camera-toolbox-cli-exit-{suffix}"))
+    std::env::temp_dir().join(format!("camera-toolbox-exit-{suffix}"))
 }
 
 #[test]
@@ -73,7 +75,7 @@ fn typed_dump_terminal_failure_reaches_a_failing_process_exit_status() {
         .expect("insert profile");
     store.save_to_path(&store_path).expect("save fixture store");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_camera-toolbox-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_camera-toolbox"));
     command.args([
         "cv610",
         "dump",

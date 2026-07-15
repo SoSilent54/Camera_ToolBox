@@ -7,9 +7,9 @@ use camera_toolbox_core::{
 };
 use eframe::egui::{self, accesskit::Role};
 
-use super::{
-    CameraToolboxApp, LIVE_STOP_TIMEOUT, LoadedRaw, save_asset_source, save_asset_source_with,
-};
+#[cfg(all(target_os = "linux", feature = "platform-cv610"))]
+use super::LIVE_STOP_TIMEOUT;
+use super::{CameraToolboxApp, LoadedRaw, save_asset_source, save_asset_source_with};
 use crate::{
     analysis_panel::DesiredAnalysis,
     analysis_worker::{AnalysisData, AnalysisDomain, AnalysisKey, AnalysisPayload, AnalysisResult},
@@ -689,7 +689,7 @@ fn closing_inactive_live_tab_activates_its_confirmation() {
     ));
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", feature = "platform-cv610"))]
 #[test]
 fn ignored_eof_sidecar_stays_closing_until_gui_deadline_then_is_forced() {
     use std::{
@@ -762,7 +762,7 @@ fn ignored_eof_sidecar_stays_closing_until_gui_deadline_then_is_forced() {
     });
 
     let root = std::env::temp_dir().join(format!(
-        "camera-toolbox-gui-stream-eof-test-{}",
+        "camera-toolbox-stream-eof-test-{}",
         std::process::id()
     ));
     fs::create_dir_all(&root).unwrap();

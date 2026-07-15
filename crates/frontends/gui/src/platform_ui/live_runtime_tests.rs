@@ -13,6 +13,7 @@ use camera_toolbox_core::{
 };
 
 use super::{AssetOpenSpec, JobContext, LiveRuntime, OpenIntent, PlatformEffect};
+#[cfg(feature = "platform-ssh")]
 use crate::platform_ui::device_manager::incomplete_ssh_template;
 
 fn local_profile(id: &str) -> PlatformProfile {
@@ -23,6 +24,7 @@ fn local_profile(id: &str) -> PlatformProfile {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 fn ssh_profile(id: &str, glob: &str) -> PlatformProfile {
     let mut config = incomplete_ssh_template();
     config.host = "camera.example".to_owned();
@@ -109,6 +111,7 @@ fn platform_and_sensor_selectors_are_independent_and_unbound_remains_usable() {
     );
 }
 
+#[cfg(feature = "platform-ssh")]
 #[test]
 fn profile_selection_seeds_literal_remote_path_but_preserves_wildcard_user_path() {
     let mut runtime = LiveRuntime::new().unwrap();

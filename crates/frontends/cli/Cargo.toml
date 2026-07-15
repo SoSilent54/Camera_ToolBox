@@ -4,6 +4,13 @@ edition.workspace = true
 version.workspace = true
 license.workspace = true
 publish.workspace = true
+autobins = false
+
+[features]
+default = ["platform-local"]
+platform-local = ["camera-toolbox-adapters/platform-local"]
+platform-cv610 = ["camera-toolbox-adapters/platform-cv610"]
+platform-ssh = ["camera-toolbox-adapters/platform-ssh"]
 
 [dependencies]
 anyhow.workspace = true
@@ -14,8 +21,6 @@ camera-toolbox-logging.workspace = true
 clap.workspace = true
 tracing.workspace = true
 
-[dev-dependencies]
-camera-toolbox-tui = { path = "../tui" }
 
 [lints]
 workspace = true

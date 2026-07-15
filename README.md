@@ -2,9 +2,8 @@
 
 Rust-only ISP 标定工具箱。当前路线已锁定为：
 
-- 主前端：`egui/eframe` GUI，用于图像查看、ROI、曲线和人工标定交互。
-- 副前端：`ratatui/crossterm` TUI，用于 SSH/远程运维、日志、批处理和无桌面环境降级。
-- 自动化入口：CLI，用于 P0 只读闭环、批处理和后续 CI/回放。
+- 唯一产品入口：`camera-toolbox`。无命令行子命令时启动 `egui/eframe` GUI；提供子命令时直接执行无头自动化分支，不初始化 X11/Wayland。
+- 内部 CLI library 仅承载 agent、CI、批处理和回放逻辑，不再生成第二个可执行文件。
 - 核心：UI 无关 Rust workspace，采集、RAW、分析、journal、寄存器访问都通过清晰端口隔离。
 
 ## 当前阶段
@@ -18,45 +17,41 @@ Camera Toolbox
 │   ├── app/            # Platform/Profile/能力矩阵、命令事件与内存预算
 │   ├── adapters/       # CV610 PQTools/PQStream、SSH/SFTP、本地文件
 │   └── frontends/
-│       ├── cli/        # headless 自动化入口
-│       ├── tui/        # 运维/日志/批处理副界面
-│       └── gui/        # egui 主界面
+│       ├── cli/        # 内部无头命令 library，不生成 bin
+│       └── gui/        # 唯一 camera-toolbox bin；GUI + argv 分流
+├── build.sh            # local / cv610 / ssh 单平台构建入口
 ├── docs/
-│   ├── architecture.md              # 架构边界与调用流
-│   ├── roadmap.md                   # P0 起步路线与验收
-│   └── rust-for-cpp-sensor-design.md # C++ 工程师视角的 Rust trait/profile 设计
-└── Cargo.toml                       # workspace 统一依赖版本
+│   ├── architecture.md # 架构边界与调用流
+│   └── roadmap.md      # P0 起步路线与验收
+└── Cargo.toml          # workspace 统一依赖版本
 ```
 
 ## 快速验证
 
 ```bash
 cargo fmt --all -- --check
-cargo check --workspace --all-targets --release --locked
-cargo test --workspace --release --locked
+./build.sh local debug
+./build.sh cv610 debug
+./build.sh ssh debug
 ```
 
-项目将 `profile.dev` 配置为 release 等价代码生成，因此普通 `cargo build` / `cargo run` 也会启用优化并关闭 debug assertions；Cargo 仍会把这类普通命令的产物放在 `target/debug`。下列运行示例显式使用 `--release`，正式产物位于 `target/release`。
+`build.sh` 必须显式选择 `local`、`cv610` 或 `ssh`，并通过 `--no-default-features` 只启用对应 provider。产物分别进入 `target/<platform>/debug/camera-toolbox`；第二参数可传 `release`。项目的 `profile.dev` 仍使用优化代码生成，但 Cargo 目录名保持 `debug`。
 
 ## CI 与发布
 
-- 每个分支 push 会在 Ubuntu 22 上执行格式检查、全 workspace target 编译、测试和 Clippy。当前 Clippy 仅报告既有 warning，不以 `-D warnings` 使 CI 失败。
-- 也可在 GitHub `Actions -> CI -> Run workflow` 中手动执行同一套 CI 检查。
-- 推送任意 Git tag 会创建或更新同名 GitHub Release，并发布以下归档：
-  - `camera-toolbox-macos-aarch64.tar.gz`
-  - `camera-toolbox-windows-x86_64.zip`
-  - `camera-toolbox-linux-x86_64-ubuntu20.tar.gz`
-  - `camera-toolbox-linux-x86_64-ubuntu22.tar.gz`
-  - `camera-toolbox-linux-aarch64-ubuntu20.tar.gz`
-  - `camera-toolbox-linux-aarch64-ubuntu22.tar.gz`
-- 也可在 GitHub `Actions -> Release -> Run workflow` 中选择待构建的分支或 ref，并填写必填 `tag`；Release 会使用该 tag，并以本次运行的提交 SHA 为目标。
-- Ubuntu 20/22 Linux 归档分别在官方 `ubuntu:20.04` / `ubuntu:22.04` 容器中构建；x86_64 与 aarch64 各自使用匹配架构的 GitHub-hosted Linux runner，不依赖已不在当前 runner 标签列表中的 `ubuntu-20.04` hosted runner。
+- 每个分支 push 会分别运行 common 检查以及 `local`、`cv610`、`ssh` 三个互相隔离的 feature job；单个 job 不同时启用多个远端 provider。Clippy 仅报告 warning，不以 `-D warnings` 阻断。
+- 也可在 GitHub `Actions -> CI -> Run workflow` 中手动执行同一套检查。
+- 推送任意 Git tag 会为每个功能平台分别构建单一 `camera-toolbox` 可执行文件。归档命名为 `camera-toolbox-<platform>-<environment>`，其中：
+  - `<platform>`：`local`、`cv610`、`ssh`；
+  - `<environment>`：`macos-aarch64`、`windows-x86_64`、`linux-{x86_64|aarch64}-ubuntu{20|22}`。
+- 也可在 GitHub `Actions -> Release -> Run workflow` 中填写 tag。Ubuntu 20/22 使用对应官方容器；x86_64 与 aarch64 使用匹配架构 runner。
 
 
-本地 RAW smoke：
+本地 RAW 无头分析：
 
 ```bash
-cargo run --release -p camera-toolbox-cli -- analyze-raw \
+./build.sh local release
+target/local/release/camera-toolbox analyze-raw \
   --raw <frame.raw> --width <w> --height <h> --bit-depth <n> \
   --encoding u16le --roi 0,0,<w>,<h>
 ```
@@ -64,14 +59,14 @@ cargo run --release -p camera-toolbox-cli -- analyze-raw \
 GUI 本地 RAW 预览：
 
 ```bash
-cargo run --release -p camera-toolbox-gui
+target/local/release/camera-toolbox
 ```
 
 在菜单中选择 `File -> Open Raw...`，可手工填写或通过 `Select` 选择文件路径。软件会基于文件名、文件长度和有限像素样本生成 Preset，并自动应用评分最高的可加载候选；切换其他 Preset 会立即回填参数，手工修改 width、height、有效 bit depth、uint16 容器或端序后显示为 `Custom`。候选不是可靠识别，Bayer 仍须人工确认。
 
 加载成功后默认显示 `Color`，右侧 `Color Processing` 面板默认展开，可从标题栏 chevron 收起为窄 rail 并随时重新展开。面板可实时调整 Bayer、R/Gr/Gb/B black level、通道 gain 与 Gamma；Gamma 默认开启并取 2.2，GUI 可在 0.1–5.0 范围调整，关闭时线性 RGB 直接量化。关闭后重新开启会恢复上次设置。默认链接四通道 black 和 Gr/Gb gain。显示链路固定为 black subtraction → `(max_code-black)` 归一化 → CFA gain → bilinear demosaic → clamp → 可选 Gamma → RGB8。`View` 菜单可切换 `Raw Mono`、`Color`。
 `Tools -> Hover View` 默认开启，可关闭；开启后可选择 3×3、5×5（默认）或 7×7 RAW 邻域。鼠标进入图像即显示固定大小、跟随指针的非交互检查窗：邻域始终读取 RAW preview（Color 主视图下也不读取插值彩色纹理），中心格带十字与边框，图像边缘越界格留空。信息区显示坐标、CFA 通道、RAW 值、最后一次已安装彩色参数得到的 RGBf/RGB8、颜色色块和 ROI 统计；超 bit-depth 样本保留洋红诊断色。底部状态栏只保留文件规格、显示模式、缩放和异常摘要。
-RAW 超 bit-depth 时，顶部会出现可关闭的 Warning，并在 8 秒后自动消失；其消失不会清除状态栏 `RAW range`、MAGENTA 像素或 Hover View 诊断。加载和渲染失败显示可关闭但不自动消失的 Error，同时保留对话框/面板中的就地错误。GUI、CLI、TUI 统一写入 console 和按日滚动的 JSONL 文件，最多保留 7 个匹配文件；可用 `RUST_LOG` 临时调整等级。日志目录由平台 `ProjectDirs` 解析；典型位置为 Linux `${XDG_STATE_HOME:-~/.local/state}/cameratoolbox/logs`、macOS `~/Library/Application Support/org.camera-toolbox.Camera-Toolbox/logs`、Windows `%LOCALAPPDATA%\camera-toolbox\Camera Toolbox\data\logs`，应以 GUI `Help -> Log directory` 显示并可复制的实际路径为准。CLI 的业务结果仍写 stdout，日志不混入该输出。
+RAW 超 bit-depth 时，顶部会出现可关闭的 Warning，并在 8 秒后自动消失；其消失不会清除状态栏 `RAW range`、MAGENTA 像素或 Hover View 诊断。加载和渲染失败显示可关闭但不自动消失的 Error，同时保留对话框/面板中的就地错误。GUI 与无头 CLI 分支统一写入 console 和按日滚动的 JSONL 文件，最多保留 7 个匹配文件；可用 `RUST_LOG` 临时调整等级。日志目录由平台 `ProjectDirs` 解析；典型位置为 Linux `${XDG_STATE_HOME:-~/.local/state}/cameratoolbox/logs`、macOS `~/Library/Application Support/org.camera-toolbox.Camera-Toolbox/logs`、Windows `%LOCALAPPDATA%\camera-toolbox\Camera Toolbox\data\logs`，应以 GUI `Help -> Log directory` 显示并可复制的实际路径为准。无头命令的业务结果仍写 stdout，日志不混入该输出。
 
 本地文件入口目前只支持紧密排列、已解包的 `u16le` Bayer RAW。CV610 Dump 另外支持协议内的 packed RAW10/RAW12、JPEG 和 NV21，并在内存中完成长度、checksum、stride 和格式校验；这不代表本地文件对话框已经支持这些 packed 格式。彩色预览不包含自动 black level/AWB、CCM、LSC、降噪或 edge-aware demosaic，因此属于 sensor RGB 查验，不代表标定后的准确 sRGB。
 
@@ -135,49 +130,37 @@ CAMERA_TOOLBOX_SSH_RECIPE_PATH_STDOUT=true
 
 该程序成功时必须在 stdout 返回一个 UTF-8 artifact path line；返回路径仍会经过远端根目录、稳定性、大小、hash 与内存预算校验。被动 watcher 默认只更新 Assets，不抢占当前 Tab。
 
-### CLI 与 TUI
+### 统一二进制的无头命令分支
 
-CLI、TUI、GUI 使用同一 `ProfileStore → PlatformRegistry → CapabilityResolver → TargetResolutionSnapshot → PlatformController` 路径。CLI 业务结果为确定性 JSON stdout，typed terminal failure 返回非零状态；日志仍写 stderr/JSONL。
+`camera-toolbox` 的 GUI 与无头命令使用同一 `ProfileStore → PlatformRegistry → CapabilityResolver → TargetResolutionSnapshot → PlatformController` 路径。只要存在命令行子命令，程序就直接执行 CLI library 并退出，不初始化 eframe；业务结果为确定性 JSON stdout，typed terminal failure 返回非零状态。
 
 ```bash
-# 列出或校验 versioned profile store
-cargo run --release -p camera-toolbox-cli -- profile list
-cargo run --release -p camera-toolbox-cli -- profile validate
+# Local build：profile 管理与无网络 probe
+./build.sh local release
+target/local/release/camera-toolbox profile list
+target/local/release/camera-toolbox profile validate
+target/local/release/camera-toolbox platform probe --platform <platform-id>
 
-# 无网络副作用地 bind/resolve 一个 Platform/Sensor 组合
-cargo run --release -p camera-toolbox-cli -- \
-  platform probe --platform <platform-id>
-
-# CV610 still Dump；--output 可省略，此时只保留有界内存资产
-cargo run --release -p camera-toolbox-cli -- \
+# CV610 build：still Dump / 有限时长 Stream recording
+./build.sh cv610 release
+target/cv610/release/camera-toolbox \
   cv610 dump --platform <platform-id> --kind raw12 --output <new-file.raw>
-
-# 有限时长 Stream recording；目标必须显式给出且不得已存在
-cargo run --release -p camera-toolbox-cli -- \
+target/cv610/release/camera-toolbox \
   stream-record --platform <platform-id> --duration 10 \
   --quota-bytes 536870912 --annexb-output <new-file.h265> \
   --timestamp-output <new-file.jsonl>
 
-# 执行 profile 的 typed SSH capture recipe，或显式 fetch 一个远端文件
-cargo run --release -p camera-toolbox-cli -- \
+# SSH build：typed capture recipe / 显式远程文件 fetch
+./build.sh ssh release
+target/ssh/release/camera-toolbox \
   ssh capture --platform <platform-id> --format raw12
-cargo run --release -p camera-toolbox-cli -- \
+target/ssh/release/camera-toolbox \
   ssh fetch --platform <platform-id> --remote-path </remote/file> \
   --format raw12-packed --output <new-file.raw>
 ```
 
-`--sensor-id` 与 `--mode-id` 必须成对出现；都不提供时使用 `Sensor: Unbound`。所有平台命令均支持 `--profile-store <path>` 覆盖默认项目配置文件。
+`--sensor-id` 与 `--mode-id` 必须成对出现；都不提供时使用 `Sensor: Unbound`。所有平台命令均支持 `--profile-store <path>` 覆盖默认项目配置文件。某个单平台构建仍可读取含其他平台 variant 的 profile store，但 bind 未编译 provider 时会明确返回 `platform provider is not compiled or registered`。
 
-交互式 TUI 显示 Platform/Sensor 选择、resolved capabilities/evidence、Jobs、Assets 和 typed event log：
-
-```bash
-cargo run --release -p camera-toolbox-tui
-
-# CI、远程支持或无 TTY 环境：只解析配置并输出确定性状态，不连接设备
-cargo run --release -p camera-toolbox-tui -- --snapshot
-```
-
-TUI 的 Stream、SSH capture/fetch/watch 只有在命令行显式提供有限时长、quota、目标路径或格式后才启用；按 `--help` 查看对应参数。退出会请求关闭活动 session/job，并通过 RAII 恢复 terminal。
 
 ### 验收限制
 
@@ -187,7 +170,7 @@ TUI 的 Stream、SSH capture/fetch/watch 只有在命令行显式提供有限时
 
 ## 设计原则
 
-- GUI/TUI/CLI 不直接执行 SSH、采集程序或 `i2ctransfer`。
+- GUI 与无头命令分支不直接执行 SSH、采集程序或 `i2ctransfer`。
 - 所有外部副作用通过 adapter 端口进入 app workflow。
 - RAW 定量分析基于原始 buffer，不基于 tone-mapped preview。
 - artifact、配置、分析结果和设备回执后续都要进入可审计 journal。

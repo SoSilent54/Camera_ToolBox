@@ -1,32 +1,45 @@
 //! GUI 平台运行时：静态 profile 选择、typed binding/resolution、后台 jobs 与 event 路由。
 
-use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, sync::Arc};
+#[cfg(feature = "platform-ssh")]
+use std::{path::Path, time::Duration};
 
-use camera_toolbox_adapters::{
-    PlatformRegistry,
-    platforms::{
-        hisilicon_cv610::HisiliconCv610Provider,
-        ssh_managed::{
-            CommandRecipeRegistry, CredentialResolver, ProductionCredentialResolver,
-            SshManagedPlatformProvider, production_recipe_registry_from_env,
-        },
-    },
+use camera_toolbox_adapters::PlatformRegistry;
+#[cfg(feature = "platform-cv610")]
+use camera_toolbox_adapters::platforms::hisilicon_cv610::HisiliconCv610Provider;
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_adapters::platforms::ssh_managed::{
+    CommandRecipeRegistry, CredentialResolver, ProductionCredentialResolver,
+    SshManagedPlatformProvider, production_recipe_registry_from_env,
 };
+#[cfg(feature = "platform-cv610")]
+use camera_toolbox_app::ResolvedTargetBindings;
 use camera_toolbox_app::{
-    CaptureStore, CaptureStoreLimits, CommandParameter, CommandTerminal, DumpJobState,
-    DumpTimeouts, LatestDecodedFrameSlot, OperationId, PlatformBindings, PlatformConfig,
-    PlatformController, PlatformProfileId, ProfileStore, RemoteDiscoveryRequest, RemoteFileRequest,
-    RemoteJobState, RemoteOpenDisposition, RemoteTimeouts, RemoteWatchEvent, RemoteWatchRequest,
-    ResolvedTargetBindings, SensorSelection, StreamSessionEvent, StreamSessionId, StreamTimeouts,
-    TargetResolutionSnapshot, TypedCommandRequest, VerifiedDumpKind, VerifiedDumpRequest,
+    CaptureStore, CaptureStoreLimits, LatestDecodedFrameSlot, OperationId, PlatformBindings,
+    PlatformConfig, PlatformController, PlatformProfileId, ProfileStore, SensorSelection,
+    StreamSessionEvent, StreamSessionId, TargetResolutionSnapshot,
+};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::{
+    CommandParameter, CommandTerminal, RemoteDiscoveryRequest, RemoteFileRequest, RemoteJobState,
+    RemoteOpenDisposition, RemoteTimeouts, RemoteWatchEvent, RemoteWatchRequest,
+    TypedCommandRequest,
+};
+#[cfg(feature = "platform-cv610")]
+use camera_toolbox_app::{
+    DumpJobState, DumpTimeouts, StreamTimeouts, VerifiedDumpKind, VerifiedDumpRequest,
 };
 use camera_toolbox_core::{AssetId, BayerPattern, EphemeralAsset, MediaFormat};
 use eframe::egui;
 
+#[cfg(feature = "platform-cv610")]
+use super::render_stream_panel;
 use super::{
     DeviceManagerAction, DeviceManagerState, StreamPanelAction, StreamPanelState,
     profile_commit::{normalize_profile_commit, persist_profile_candidate},
-    render_stream_panel,
+};
+#[cfg(feature = "platform-ssh")]
+use super::{
     ssh_profile::{combine_remote_file, is_literal_remote_glob},
     ssh_runtime::{
         SshRuntimeAction, decorate_remote_asset, remote_format_name, remote_state_label,
@@ -69,26 +82,40 @@ struct JobContext {
 
 #[derive(Debug, Clone)]
 pub(super) struct CapturePanelState {
+    #[cfg(feature = "platform-cv610")]
     pub(super) dump_kind: VerifiedDumpKind,
     pub(super) manual_bayer: BayerPattern,
+    #[cfg(feature = "platform-ssh")]
     pub(super) remote_path: String,
+    #[cfg(feature = "platform-ssh")]
     pub(super) remote_format: MediaFormat,
+    #[cfg(feature = "platform-ssh")]
     pub(super) remote_width: u32,
+    #[cfg(feature = "platform-ssh")]
     pub(super) remote_height: u32,
+    #[cfg(feature = "platform-ssh")]
     pub(super) remote_stride: usize,
+    #[cfg(feature = "platform-ssh")]
     pub(super) watcher_operation: Option<OperationId>,
 }
 
 impl Default for CapturePanelState {
     fn default() -> Self {
         Self {
+            #[cfg(feature = "platform-cv610")]
             dump_kind: VerifiedDumpKind::Raw12,
             manual_bayer: BayerPattern::Rggb,
+            #[cfg(feature = "platform-ssh")]
             remote_path: String::new(),
+            #[cfg(feature = "platform-ssh")]
             remote_format: MediaFormat::Jpeg,
+            #[cfg(feature = "platform-ssh")]
             remote_width: 1920,
+            #[cfg(feature = "platform-ssh")]
             remote_height: 1080,
+            #[cfg(feature = "platform-ssh")]
             remote_stride: 0,
+            #[cfg(feature = "platform-ssh")]
             watcher_operation: None,
         }
     }
@@ -98,7 +125,9 @@ pub(crate) struct LiveRuntime {
     controller: PlatformController,
     capture_store: CaptureStore,
     registry: PlatformRegistry,
+    #[cfg(feature = "platform-ssh")]
     credential_resolver: Arc<ProductionCredentialResolver>,
+    #[cfg(feature = "platform-ssh")]
     recipes: Arc<CommandRecipeRegistry>,
     pub(crate) profiles: ProfileStore,
     selected_profile: Option<PlatformProfileId>,
@@ -122,15 +151,23 @@ impl LiveRuntime {
         let limits = CaptureStoreLimits::new(256 * 1024 * 1024, 1024 * 1024 * 1024)
             .map_err(|error| error.to_string())?;
         let capture_store = CaptureStore::new(limits);
+        #[cfg(feature = "platform-ssh")]
         let credential_resolver = Arc::new(ProductionCredentialResolver::new());
+        #[cfg(feature = "platform-ssh")]
         let resolver: Arc<dyn CredentialResolver> = credential_resolver.clone();
-        let recipe_registry = production_recipe_registry_from_env()
-            .map_err(|error| format!("invalid production SSH recipe configuration: {error}"))?;
-        let recipes = Arc::new(recipe_registry);
-        let registry = PlatformRegistry::new(
-            HisiliconCv610Provider::default(),
-            SshManagedPlatformProvider::production(resolver, Arc::clone(&recipes)),
-        );
+        #[cfg(feature = "platform-ssh")]
+        let recipes =
+            Arc::new(production_recipe_registry_from_env().map_err(|error| {
+                format!("invalid production SSH recipe configuration: {error}")
+            })?);
+        let mut registry = PlatformRegistry::new();
+        #[cfg(feature = "platform-cv610")]
+        registry.register_cv610(HisiliconCv610Provider::default());
+        #[cfg(feature = "platform-ssh")]
+        registry.register_ssh(SshManagedPlatformProvider::production(
+            resolver,
+            Arc::clone(&recipes),
+        ));
         let path = ProfileStore::project_file_path().map_err(|error| error.to_string())?;
         let (profiles, startup_message) = if path.exists() {
             match ProfileStore::load_from_path(&path) {
@@ -159,7 +196,9 @@ impl LiveRuntime {
             controller: PlatformController::new(capture_store.clone()),
             capture_store,
             registry,
+            #[cfg(feature = "platform-ssh")]
             credential_resolver,
+            #[cfg(feature = "platform-ssh")]
             recipes,
             profiles,
             selected_profile: None,
@@ -237,21 +276,26 @@ impl LiveRuntime {
                 .and_then(|id| self.profiles.platform(id))
                 .cloned()
             {
-                let readiness = match &profile.config {
-                    PlatformConfig::SshManaged(config)
-                        if config.credential_ref.starts_with("session:") =>
-                    {
-                        self.credential_resolver.has_session(&config.credential_ref)
+                #[cfg(feature = "platform-ssh")]
+                {
+                    let readiness = match &profile.config {
+                        PlatformConfig::SshManaged(config)
+                            if config.credential_ref.starts_with("session:") =>
+                        {
+                            self.credential_resolver.has_session(&config.credential_ref)
+                        }
+                        _ => Ok(true),
+                    };
+                    self.device_manager
+                        .edit(&profile, readiness.as_ref().copied().unwrap_or(false));
+                    if let Err(error) = readiness {
+                        self.device_manager.message = Some(format!(
+                            "Password registry status is unavailable: {error}; re-enter the password"
+                        ));
                     }
-                    _ => Ok(true),
-                };
-                self.device_manager
-                    .edit(&profile, readiness.as_ref().copied().unwrap_or(false));
-                if let Err(error) = readiness {
-                    self.device_manager.message = Some(format!(
-                        "Password registry status is unavailable: {error}; re-enter the password"
-                    ));
                 }
+                #[cfg(not(feature = "platform-ssh"))]
+                self.device_manager.edit(&profile, false);
             } else {
                 self.device_manager.open = true;
             }
@@ -292,19 +336,26 @@ impl LiveRuntime {
                 }
             }
             PlatformConfig::HisiliconCv610(config) => {
-                ui.heading("CV610 Capture");
-                ui.label(format!(
-                    "{} — Dump {} / Stream {}",
-                    config.host, config.dump.port, config.stream.port
-                ));
-                self.render_dump_controls(ui);
-                ui.separator();
-                if let Some(stream_action) = render_stream_panel(ui, &mut self.panel, live_running)
+                #[cfg(feature = "platform-cv610")]
                 {
-                    action = Some(PlatformUiAction::Stream(stream_action));
+                    ui.heading("CV610 Capture");
+                    ui.label(format!(
+                        "{} — Dump {} / Stream {}",
+                        config.host, config.dump.port, config.stream.port
+                    ));
+                    self.render_dump_controls(ui);
+                    ui.separator();
+                    if let Some(stream_action) =
+                        render_stream_panel(ui, &mut self.panel, live_running)
+                    {
+                        action = Some(PlatformUiAction::Stream(stream_action));
+                    }
                 }
+                #[cfg(not(feature = "platform-cv610"))]
+                render_platform_not_compiled(ui, "CV610");
             }
             PlatformConfig::SshManaged(config) => {
+                #[cfg(feature = "platform-ssh")]
                 if let Some(ssh_action) = render_ssh_controls(
                     ui,
                     &config,
@@ -322,6 +373,8 @@ impl LiveRuntime {
                         }
                     }
                 }
+                #[cfg(not(feature = "platform-ssh"))]
+                render_platform_not_compiled(ui, "SSH-managed");
             }
         }
         ui.separator();
@@ -345,7 +398,12 @@ impl LiveRuntime {
         action: DeviceManagerAction,
     ) -> Result<String, String> {
         match action {
-            DeviceManagerAction::Commit { draft, ssh_auth } => {
+            DeviceManagerAction::Commit {
+                draft,
+                #[cfg(feature = "platform-ssh")]
+                ssh_auth,
+            } => {
+                #[cfg(feature = "platform-ssh")]
                 let old_reference = draft
                     .original_id
                     .as_ref()
@@ -354,7 +412,10 @@ impl LiveRuntime {
                         PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
                         _ => None,
                     });
+                #[cfg(feature = "platform-ssh")]
                 let normalized = normalize_profile_commit(&self.profiles, draft, ssh_auth)?;
+                #[cfg(not(feature = "platform-ssh"))]
+                let normalized = normalize_profile_commit(&self.profiles, draft)?;
                 let profile = normalized.profile;
                 let original_id = normalized.original_id;
                 let candidate = persist_profile_candidate(
@@ -363,56 +424,64 @@ impl LiveRuntime {
                     original_id.as_ref(),
                     |candidate| candidate.save_project().map_err(|error| error.to_string()),
                 )?;
-                let new_reference = match &profile.config {
-                    PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
-                    _ => None,
-                };
-
-                // candidate 已持久化；从这里开始的错误必须明确报告 partial state。
                 self.profiles = candidate;
-                if old_reference.as_deref().is_some_and(|reference| {
-                    reference.starts_with("session:") && Some(reference) != new_reference.as_deref()
-                }) && let Some(reference) = old_reference.as_deref()
+                #[cfg(feature = "platform-ssh")]
                 {
-                    let _ = self.credential_resolver.remove_session(reference);
-                }
-
-                let registration = normalized.session_password.map(|(session_id, password)| {
-                    self.credential_resolver
-                        .register_session_password(&session_id, password)
-                });
-                let registration_error = registration.and_then(Result::err);
-                let readiness = match new_reference.as_deref() {
-                    Some(reference) if reference.starts_with("session:") => {
-                        self.credential_resolver.has_session(reference)
+                    let new_reference = match &profile.config {
+                        PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
+                        _ => None,
+                    };
+                    if old_reference.as_deref().is_some_and(|reference| {
+                        reference.starts_with("session:")
+                            && Some(reference) != new_reference.as_deref()
+                    }) && let Some(reference) = old_reference.as_deref()
+                    {
+                        let _ = self.credential_resolver.remove_session(reference);
                     }
-                    _ => Ok(true),
-                };
-                self.select_platform(profile.id.clone());
-                self.device_manager
-                    .mark_saved(&profile, readiness.as_ref().copied().unwrap_or(false));
-                if let Some(error) = registration_error {
-                    return Err(format!(
-                        "profile {} was persisted and installed, but process-only password registration failed: {error}; remote operations remain unavailable until the password is re-entered",
+                    let registration = normalized.session_password.map(|(session_id, password)| {
+                        self.credential_resolver
+                            .register_session_password(&session_id, password)
+                    });
+                    let registration_error = registration.and_then(Result::err);
+                    let readiness = match new_reference.as_deref() {
+                        Some(reference) if reference.starts_with("session:") => {
+                            self.credential_resolver.has_session(reference)
+                        }
+                        _ => Ok(true),
+                    };
+                    self.select_platform(profile.id.clone());
+                    self.device_manager
+                        .mark_saved(&profile, readiness.as_ref().copied().unwrap_or(false));
+                    if let Some(error) = registration_error {
+                        return Err(format!(
+                            "profile {} was persisted and installed, but process-only password registration failed: {error}; remote operations remain unavailable until the password is re-entered",
+                            profile.id
+                        ));
+                    }
+                    let password_registered = readiness.map_err(|error| format!(
+                        "profile {} was persisted and installed, but password registry status is unavailable: {error}",
                         profile.id
-                    ));
+                    ))?;
+                    let password_note = if password_registered {
+                        ""
+                    } else {
+                        "; password is not registered in this process"
+                    };
+                    return Ok(format!("Saved profile {}{password_note}", profile.id));
                 }
-                let password_registered = readiness.map_err(|error| format!(
-                    "profile {} was persisted and installed, but password registry status is unavailable: {error}",
-                    profile.id
-                ))?;
-                let password_note = if password_registered {
-                    ""
-                } else {
-                    "; password is not registered in this process"
-                };
-                Ok(format!("Saved profile {}{password_note}", profile.id))
+                #[cfg(not(feature = "platform-ssh"))]
+                {
+                    self.select_platform(profile.id.clone());
+                    self.device_manager.mark_saved(&profile, false);
+                    Ok(format!("Saved profile {}", profile.id))
+                }
             }
             DeviceManagerAction::ValidationError(error) => Err(error),
             DeviceManagerAction::Delete(id) => {
                 if self.profiles.platforms().count() <= 1 {
                     return Err("at least one platform profile must remain".to_owned());
                 }
+                #[cfg(feature = "platform-ssh")]
                 let old_reference = self
                     .profiles
                     .platform(&id)
@@ -428,6 +497,7 @@ impl LiveRuntime {
                     .save_project()
                     .map_err(|error| error.to_string())?;
                 self.profiles = candidate;
+                #[cfg(feature = "platform-ssh")]
                 if let Some(reference) = old_reference.as_deref()
                     && reference.starts_with("session:")
                 {
@@ -479,6 +549,7 @@ impl LiveRuntime {
             self.binding_error = Some(format!("platform profile {id} no longer exists"));
             return;
         };
+        #[cfg(feature = "platform-ssh")]
         if let PlatformConfig::SshManaged(config) = &profile.config
             && is_literal_remote_glob(&config.remote_artifact_glob)
         {
@@ -492,18 +563,19 @@ impl LiveRuntime {
                 self.resolve_selected();
             }
             Err(error) => {
-                self.binding_error = Some(match &profile.config {
-                    PlatformConfig::SshManaged(config)
-                        if !config.capture_recipe.is_empty()
-                            && !self.recipes.contains(&config.capture_recipe) =>
-                    {
-                        format!(
-                            "SSH typed recipe '{}' is unavailable. Configure the complete CAMERA_TOOLBOX_SSH_RECIPE_* environment group with a verified absolute program, typed flags, allowed formats, remote root and path-on-stdout contract; no command was sent.",
-                            config.capture_recipe
-                        )
-                    }
-                    _ => error.to_string(),
-                });
+                #[cfg(feature = "platform-ssh")]
+                {
+                    self.binding_error = Some(binding_error_message(
+                        &profile.config,
+                        &error.to_string(),
+                        &self.recipes,
+                    ));
+                }
+                #[cfg(not(feature = "platform-ssh"))]
+                {
+                    self.binding_error =
+                        Some(binding_error_message(&profile.config, &error.to_string()));
+                }
             }
         }
     }
@@ -533,6 +605,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(feature = "platform-cv610")]
     fn render_dump_controls(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             for (kind, label) in [
@@ -605,6 +678,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(feature = "platform-cv610")]
     fn submit_dump(&mut self, intent: OpenIntent) {
         let Some(snapshot) = self.snapshot.clone() else {
             return;
@@ -647,6 +721,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(feature = "platform-ssh")]
     fn submit_remote_command(&mut self, config: &camera_toolbox_app::SshManagedConfig) {
         let Some(snapshot) = self.snapshot.clone() else {
             return;
@@ -694,6 +769,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(feature = "platform-ssh")]
     fn submit_remote_fetch(&mut self) {
         let Some(snapshot) = self.snapshot.clone() else {
             return;
@@ -732,6 +808,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(feature = "platform-ssh")]
     fn submit_watch(&mut self) {
         let Some(snapshot) = self.snapshot.clone() else {
             return;
@@ -768,6 +845,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(feature = "platform-ssh")]
     fn remote_job_context(&self, snapshot: Arc<TargetResolutionSnapshot>) -> JobContext {
         JobContext {
             snapshot,
@@ -781,6 +859,7 @@ impl LiveRuntime {
 
     pub(crate) fn poll_platform_events(&mut self) -> Vec<PlatformEffect> {
         let mut effects = Vec::new();
+        #[cfg(feature = "platform-cv610")]
         while let Ok(Some(event)) = self.controller.try_recv() {
             self.jobs
                 .insert(event.operation_id.clone(), format!("{:?}", event.state));
@@ -790,6 +869,7 @@ impl LiveRuntime {
                 self.submissions.remove(&event.operation_id);
             }
         }
+        #[cfg(feature = "platform-ssh")]
         while let Ok(Some(event)) = self.controller.try_recv_remote() {
             self.jobs
                 .insert(event.operation_id.clone(), remote_state_label(&event.state));
@@ -869,10 +949,18 @@ impl LiveRuntime {
             .insert(asset_id.clone(), Arc::clone(&context.snapshot));
         if matches!(context.intent, OpenIntent::Foreground) {
             effects.push(PlatformEffect::OpenAsset {
-                asset: if decorate_remote {
-                    decorate_remote_asset(asset, &self.capture_panel)
-                } else {
-                    asset
+                asset: {
+                    #[cfg(feature = "platform-ssh")]
+                    if decorate_remote {
+                        decorate_remote_asset(asset, &self.capture_panel)
+                    } else {
+                        asset
+                    }
+                    #[cfg(not(feature = "platform-ssh"))]
+                    {
+                        let _ = decorate_remote;
+                        asset
+                    }
                 },
                 snapshot: context.snapshot,
                 foreground: true,
@@ -881,6 +969,7 @@ impl LiveRuntime {
         }
     }
 
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
     fn selected_bayer(&self) -> BayerPattern {
         if let SensorSelection::Mode(key) = &self.sensor_selection
             && let Some(sensor) = self.profiles.sensor(&key.sensor_id)
@@ -891,6 +980,7 @@ impl LiveRuntime {
         self.capture_panel.manual_bayer
     }
 
+    #[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
     fn next_asset_id(&mut self, prefix: &str) -> Result<AssetId, String> {
         let sequence = self.next_asset;
         self.next_asset = self.next_asset.saturating_add(1);
@@ -900,35 +990,40 @@ impl LiveRuntime {
     pub(crate) fn start(
         &mut self,
     ) -> Result<(StreamSessionId, Arc<LatestDecodedFrameSlot>), String> {
-        let snapshot = self.snapshot.clone().ok_or_else(|| {
-            self.binding_error
-                .clone()
-                .unwrap_or_else(|| "no resolved target".to_owned())
-        })?;
-        let profile = self
-            .selected_profile
-            .as_ref()
-            .and_then(|id| self.profiles.platform(id))
-            .ok_or_else(|| "selected profile no longer exists".to_owned())?;
-        let PlatformConfig::HisiliconCv610(config) = &profile.config else {
-            return Err("selected platform does not provide CV610 Stream".to_owned());
-        };
-        let request = self
-            .panel
-            .request(config.stream.channel, &config.stream.media)?;
-        let session_id = self
-            .controller
-            .submit_stream(snapshot, request, StreamTimeouts::default())
-            .map_err(|error| error.to_string())?;
-        let latest = self
-            .controller
-            .latest_stream_frame(&session_id)
-            .ok_or_else(|| "stream controller did not retain latest-frame slot".to_owned())?;
-        self.panel.last_error = None;
-        Ok((session_id, latest))
+        #[cfg(feature = "platform-cv610")]
+        {
+            let snapshot = self.snapshot.clone().ok_or_else(|| {
+                self.binding_error
+                    .clone()
+                    .unwrap_or_else(|| "no resolved target".to_owned())
+            })?;
+            let profile = self
+                .selected_profile
+                .as_ref()
+                .and_then(|id| self.profiles.platform(id))
+                .ok_or_else(|| "selected profile no longer exists".to_owned())?;
+            let PlatformConfig::HisiliconCv610(config) = &profile.config else {
+                return Err("selected platform does not provide CV610 Stream".to_owned());
+            };
+            let request = self
+                .panel
+                .request(config.stream.channel, &config.stream.media)?;
+            let session_id = self
+                .controller
+                .submit_stream(snapshot, request, StreamTimeouts::default())
+                .map_err(|error| error.to_string())?;
+            let latest = self
+                .controller
+                .latest_stream_frame(&session_id)
+                .ok_or_else(|| "stream controller did not retain latest-frame slot".to_owned())?;
+            self.panel.last_error = None;
+            return Ok((session_id, latest));
+        }
+        #[cfg(not(feature = "platform-cv610"))]
+        Err("CV610 platform is not compiled in this build".to_owned())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "platform-cv610"))]
     pub(crate) fn start_resolved_for_test(
         &self,
         snapshot: Arc<TargetResolutionSnapshot>,
@@ -971,6 +1066,38 @@ impl Drop for LiveRuntime {
     }
 }
 
+fn render_platform_not_compiled(ui: &mut egui::Ui, platform: &str) {
+    ui.heading(format!("{platform} profile"));
+    ui.colored_label(
+        egui::Color32::YELLOW,
+        "Platform not compiled in this build. The profile remains available for display, import, and export.",
+    );
+}
+
+#[cfg(feature = "platform-ssh")]
+fn binding_error_message(
+    config: &PlatformConfig,
+    fallback: &str,
+    recipes: &CommandRecipeRegistry,
+) -> String {
+    match config {
+        PlatformConfig::SshManaged(config)
+            if !config.capture_recipe.is_empty() && !recipes.contains(&config.capture_recipe) =>
+        {
+            format!(
+                "SSH typed recipe '{}' is unavailable. Configure the complete CAMERA_TOOLBOX_SSH_RECIPE_* environment group with a verified absolute program, typed flags, allowed formats, remote root and path-on-stdout contract; no command was sent.",
+                config.capture_recipe
+            )
+        }
+        _ => fallback.to_owned(),
+    }
+}
+
+#[cfg(not(feature = "platform-ssh"))]
+fn binding_error_message(_config: &PlatformConfig, fallback: &str) -> String {
+    fallback.to_owned()
+}
+
 fn sensor_selection_label(selection: &SensorSelection) -> String {
     match selection {
         SensorSelection::Unbound => "Sensor: Unbound".to_owned(),
@@ -995,6 +1122,7 @@ fn render_capability_chips(ui: &mut egui::Ui, snapshot: &TargetResolutionSnapsho
     }
 }
 
+#[cfg(feature = "platform-cv610")]
 fn dump_media_format(kind: VerifiedDumpKind) -> MediaFormat {
     match kind {
         VerifiedDumpKind::Raw10 => MediaFormat::RawPacked { bit_depth: 10 },

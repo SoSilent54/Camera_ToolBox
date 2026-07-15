@@ -2,18 +2,22 @@
 
 use std::path::PathBuf;
 
-use camera_toolbox_app::{
-    Cv610Config, Cv610DumpConfig, Cv610StreamConfig, LocalConfig, PlatformConfig, PlatformProfile,
-    PlatformProfileId, SshManagedConfig,
-};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::SshManagedConfig;
+#[cfg(feature = "platform-cv610")]
+use camera_toolbox_app::{Cv610Config, Cv610DumpConfig, Cv610StreamConfig};
+use camera_toolbox_app::{LocalConfig, PlatformConfig, PlatformProfile, PlatformProfileId};
 use eframe::egui;
 
+#[cfg(feature = "platform-ssh")]
 use super::ssh_profile::{SshCommitAuth, SshEditorState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DraftVariant {
     Local,
+    #[cfg(feature = "platform-cv610")]
     Cv610,
+    #[cfg(feature = "platform-ssh")]
     SshManaged,
 }
 
@@ -47,26 +51,47 @@ impl ProfileDraft {
         }
     }
 
-    pub(crate) const fn variant(&self) -> DraftVariant {
+    pub(crate) const fn variant(&self) -> Option<DraftVariant> {
         match self.config {
-            PlatformConfig::Local(_) => DraftVariant::Local,
-            PlatformConfig::HisiliconCv610(_) => DraftVariant::Cv610,
-            PlatformConfig::SshManaged(_) => DraftVariant::SshManaged,
+            PlatformConfig::Local(_) => Some(DraftVariant::Local),
+            PlatformConfig::HisiliconCv610(_) => {
+                #[cfg(feature = "platform-cv610")]
+                {
+                    Some(DraftVariant::Cv610)
+                }
+                #[cfg(not(feature = "platform-cv610"))]
+                {
+                    None
+                }
+            }
+            PlatformConfig::SshManaged(_) => {
+                #[cfg(feature = "platform-ssh")]
+                {
+                    Some(DraftVariant::SshManaged)
+                }
+                #[cfg(not(feature = "platform-ssh"))]
+                {
+                    None
+                }
+            }
         }
     }
 
     pub(crate) fn switch_variant(&mut self, variant: DraftVariant) {
         self.config = match variant {
             DraftVariant::Local => PlatformConfig::Local(LocalConfig::default()),
+            #[cfg(feature = "platform-cv610")]
             DraftVariant::Cv610 => PlatformConfig::HisiliconCv610(Cv610Config {
                 host: String::new(),
                 dump: Cv610DumpConfig::default(),
                 stream: Cv610StreamConfig::default(),
             }),
+            #[cfg(feature = "platform-ssh")]
             DraftVariant::SshManaged => PlatformConfig::SshManaged(incomplete_ssh_template()),
         };
     }
 
+    #[cfg(feature = "platform-ssh")]
     pub(crate) fn rdk_x5_unknown() -> Self {
         let mut draft = Self::new(DraftVariant::SshManaged);
         draft.display_name = "RDK X5 (SSH template, Unknown)".to_owned();
@@ -84,6 +109,7 @@ impl ProfileDraft {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 pub(super) fn incomplete_ssh_template() -> SshManagedConfig {
     SshManagedConfig {
         host: String::new(),
@@ -108,6 +134,7 @@ pub(super) fn incomplete_ssh_template() -> SshManagedConfig {
 pub(crate) enum DeviceManagerAction {
     Commit {
         draft: ProfileDraft,
+        #[cfg(feature = "platform-ssh")]
         ssh_auth: Option<SshCommitAuth>,
     },
     ValidationError(String),
@@ -120,6 +147,7 @@ pub(crate) struct DeviceManagerState {
     pub(crate) open: bool,
     pub(crate) draft: Option<ProfileDraft>,
     pub(crate) message: Option<String>,
+    #[cfg(feature = "platform-ssh")]
     ssh: SshEditorState,
 }
 
@@ -129,6 +157,7 @@ impl Default for DeviceManagerState {
             open: false,
             draft: None,
             message: None,
+            #[cfg(feature = "platform-ssh")]
             ssh: SshEditorState::new(),
         }
     }
@@ -136,27 +165,41 @@ impl Default for DeviceManagerState {
 
 impl DeviceManagerState {
     pub(crate) fn edit(&mut self, profile: &PlatformProfile, password_registered: bool) {
-        self.ssh.clear_sensitive();
-        self.ssh = SshEditorState::from_profile(profile, password_registered);
+        #[cfg(feature = "platform-ssh")]
+        {
+            self.ssh.clear_sensitive();
+            self.ssh = SshEditorState::from_profile(profile, password_registered);
+        }
+        #[cfg(not(feature = "platform-ssh"))]
+        let _ = password_registered;
         self.draft = Some(ProfileDraft::from_profile(profile));
         self.open = true;
         self.message = None;
     }
 
     pub(crate) fn mark_saved(&mut self, profile: &PlatformProfile, password_registered: bool) {
-        self.ssh.clear_sensitive();
-        self.ssh = SshEditorState::from_profile(profile, password_registered);
+        #[cfg(feature = "platform-ssh")]
+        {
+            self.ssh.clear_sensitive();
+            self.ssh = SshEditorState::from_profile(profile, password_registered);
+        }
+        #[cfg(not(feature = "platform-ssh"))]
+        let _ = password_registered;
         self.draft = Some(ProfileDraft::from_profile(profile));
     }
 
     pub(crate) fn mark_deleted(&mut self) {
-        self.ssh.clear_sensitive();
-        self.ssh = SshEditorState::new();
+        #[cfg(feature = "platform-ssh")]
+        {
+            self.ssh.clear_sensitive();
+            self.ssh = SshEditorState::new();
+        }
         self.draft = None;
     }
 
     fn close(&mut self) {
         self.open = false;
+        #[cfg(feature = "platform-ssh")]
         self.ssh.clear_sensitive();
         self.draft = None;
     }
@@ -165,6 +208,7 @@ impl DeviceManagerState {
         if !self.open {
             return Vec::new();
         }
+        #[cfg(feature = "platform-ssh")]
         if let Some(ProfileDraft {
             config: PlatformConfig::SshManaged(config),
             ..
@@ -198,7 +242,10 @@ impl DeviceManagerState {
                         return;
                     };
                     egui::ScrollArea::vertical().show(ui, |ui| {
+                        #[cfg(feature = "platform-ssh")]
                         render_draft(ui, draft, &mut self.ssh, &mut actions);
+                        #[cfg(not(feature = "platform-ssh"))]
+                        render_draft(ui, draft, &mut actions);
                     });
                 });
             },
@@ -209,20 +256,29 @@ impl DeviceManagerState {
     fn render_toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<DeviceManagerAction>) {
         ui.horizontal(|ui| {
             if ui.button("New Local").clicked() {
-                self.ssh.clear_sensitive();
-                self.ssh = SshEditorState::new();
+                #[cfg(feature = "platform-ssh")]
+                {
+                    self.ssh.clear_sensitive();
+                    self.ssh = SshEditorState::new();
+                }
                 self.draft = Some(ProfileDraft::new(DraftVariant::Local));
             }
+            #[cfg(feature = "platform-cv610")]
             if ui.button("New CV610").clicked() {
-                self.ssh.clear_sensitive();
-                self.ssh = SshEditorState::new();
+                #[cfg(feature = "platform-ssh")]
+                {
+                    self.ssh.clear_sensitive();
+                    self.ssh = SshEditorState::new();
+                }
                 self.draft = Some(ProfileDraft::new(DraftVariant::Cv610));
             }
+            #[cfg(feature = "platform-ssh")]
             if ui.button("New SSH-managed").clicked() {
                 self.ssh.clear_sensitive();
                 self.ssh = SshEditorState::new();
                 self.draft = Some(ProfileDraft::new(DraftVariant::SshManaged));
             }
+            #[cfg(feature = "platform-ssh")]
             if ui.button("RDK X5 template (Unknown)").clicked() {
                 self.ssh.clear_sensitive();
                 self.ssh = SshEditorState::rdk_template();
@@ -249,7 +305,27 @@ impl DeviceManagerState {
     }
 }
 
+#[cfg(feature = "platform-ssh")]
 fn render_draft(
+    ui: &mut egui::Ui,
+    draft: &mut ProfileDraft,
+    ssh: &mut SshEditorState,
+    actions: &mut Vec<DeviceManagerAction>,
+) {
+    render_draft_body(ui, draft, ssh, actions);
+}
+
+#[cfg(not(feature = "platform-ssh"))]
+fn render_draft(
+    ui: &mut egui::Ui,
+    draft: &mut ProfileDraft,
+    actions: &mut Vec<DeviceManagerAction>,
+) {
+    render_draft_body(ui, draft, actions);
+}
+
+#[cfg(feature = "platform-ssh")]
+fn render_draft_body(
     ui: &mut egui::Ui,
     draft: &mut ProfileDraft,
     ssh: &mut SshEditorState,
@@ -259,82 +335,169 @@ fn render_draft(
     ui.horizontal(|ui| {
         ui.label("Variant");
         let current = draft.variant();
-        for (variant, label) in [
-            (DraftVariant::Local, "Local"),
-            (DraftVariant::Cv610, "Hisilicon CV610"),
-            (DraftVariant::SshManaged, "SSH-managed"),
-        ] {
-            if ui.selectable_label(current == variant, label).clicked() && current != variant {
+        for (variant, label) in available_variants() {
+            if ui
+                .selectable_label(current == Some(variant), label)
+                .clicked()
+                && current != Some(variant)
+            {
                 ssh.reset_for_variant();
                 draft.switch_variant(variant);
             }
         }
     });
-    ui.collapsing("Profile details", |ui| {
-        ui.weak("For a new SSH profile, blanks are generated from username@host when saved.");
-        egui::Grid::new("profile_common_fields")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("Profile ID");
-                ui.add_enabled(
-                    draft.original_id.is_none(),
-                    egui::TextEdit::singleline(&mut draft.id),
-                );
-                ui.end_row();
-                ui.label("Display name");
-                ui.text_edit_singleline(&mut draft.display_name);
-                ui.end_row();
-            });
-    });
+    if draft.variant().is_none() {
+        ui.colored_label(egui::Color32::YELLOW, "This imported platform is not compiled into this build. Its schema remains available for display, import, and export.");
+    }
+    render_profile_details(ui, draft);
     ui.separator();
     match &mut draft.config {
         PlatformConfig::Local(_) => {
             ui.label("Local profile has no network or credential fields.");
         }
+        #[cfg(feature = "platform-cv610")]
         PlatformConfig::HisiliconCv610(config) => render_cv610(ui, config),
+        #[cfg(not(feature = "platform-cv610"))]
+        PlatformConfig::HisiliconCv610(_) => render_not_compiled(ui, "CV610"),
         PlatformConfig::SshManaged(config) => ssh.render(ui, config),
     }
+    let editable = draft.variant().is_some();
+    render_draft_actions(ui, draft, actions, editable, |mut candidate, actions| {
+        let is_new = candidate.original_id.is_none();
+        let ssh_auth = match &mut candidate.config {
+            PlatformConfig::SshManaged(config) => match ssh.prepare_commit(config, is_new) {
+                Ok(auth) => Some(auth),
+                Err(error) => {
+                    actions.push(DeviceManagerAction::ValidationError(error));
+                    return;
+                }
+            },
+            _ => None,
+        };
+        actions.push(DeviceManagerAction::Commit {
+            draft: candidate,
+            ssh_auth,
+        });
+    });
+}
+
+#[cfg(not(feature = "platform-ssh"))]
+fn render_draft_body(
+    ui: &mut egui::Ui,
+    draft: &mut ProfileDraft,
+    actions: &mut Vec<DeviceManagerAction>,
+) {
+    render_draft_common(ui, draft, actions, |ui, draft| match &mut draft.config {
+        PlatformConfig::Local(_) => {
+            ui.label("Local profile has no network or credential fields.");
+        }
+        #[cfg(feature = "platform-cv610")]
+        PlatformConfig::HisiliconCv610(config) => render_cv610(ui, config),
+        #[cfg(not(feature = "platform-cv610"))]
+        PlatformConfig::HisiliconCv610(_) => render_not_compiled(ui, "CV610"),
+        PlatformConfig::SshManaged(_) => render_not_compiled(ui, "SSH-managed"),
+    });
+}
+
+#[cfg(not(feature = "platform-ssh"))]
+fn render_draft_common(
+    ui: &mut egui::Ui,
+    draft: &mut ProfileDraft,
+    actions: &mut Vec<DeviceManagerAction>,
+    render_config: impl FnOnce(&mut egui::Ui, &mut ProfileDraft),
+) {
+    ui.heading("Profile draft");
+    ui.horizontal(|ui| {
+        ui.label("Variant");
+        let current = draft.variant();
+        for (variant, label) in available_variants() {
+            if ui
+                .selectable_label(current == Some(variant), label)
+                .clicked()
+                && current != Some(variant)
+            {
+                draft.switch_variant(variant);
+            }
+        }
+    });
+    if draft.variant().is_none() {
+        ui.colored_label(egui::Color32::YELLOW, "This imported platform is not compiled into this build. Its schema remains available for display, import, and export.");
+    }
+    render_profile_details(ui, draft);
+    ui.separator();
+    render_config(ui, draft);
+    let editable = draft.variant().is_some();
+    render_draft_actions(ui, draft, actions, editable, |candidate, actions| {
+        actions.push(DeviceManagerAction::Commit { draft: candidate });
+    });
+}
+
+fn render_profile_details(ui: &mut egui::Ui, draft: &mut ProfileDraft) {
+    let editable = draft.variant().is_some();
+    ui.collapsing("Profile details", |ui| {
+        egui::Grid::new("profile_common_fields")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Profile ID");
+                ui.add_enabled(
+                    editable && draft.original_id.is_none(),
+                    egui::TextEdit::singleline(&mut draft.id),
+                );
+                ui.end_row();
+                ui.label("Display name");
+                ui.add_enabled(
+                    editable,
+                    egui::TextEdit::singleline(&mut draft.display_name),
+                );
+                ui.end_row();
+            });
+    });
+}
+
+fn render_draft_actions(
+    ui: &mut egui::Ui,
+    draft: &mut ProfileDraft,
+    actions: &mut Vec<DeviceManagerAction>,
+    editable: bool,
+    mut save: impl FnMut(ProfileDraft, &mut Vec<DeviceManagerAction>),
+) {
     ui.separator();
     ui.horizontal(|ui| {
-        if ui.button("Validate and Save").clicked() {
-            let mut candidate = draft.clone();
-            let auth = match &mut candidate.config {
-                PlatformConfig::SshManaged(config) => {
-                    match ssh.prepare_commit(config, candidate.original_id.is_none()) {
-                        Ok(auth) => Some(auth),
-                        Err(error) => {
-                            actions.push(DeviceManagerAction::ValidationError(error));
-                            return;
-                        }
-                    }
-                }
-                _ => None,
-            };
-            actions.push(DeviceManagerAction::Commit {
-                draft: candidate,
-                ssh_auth: auth,
-            });
+        if ui
+            .add_enabled(editable, egui::Button::new("Validate and Save"))
+            .clicked()
+        {
+            save(draft.clone(), actions);
         }
         if let Some(id) = draft.original_id.clone()
             && ui.button("Delete profile").clicked()
         {
-            ssh.clear_sensitive();
             actions.push(DeviceManagerAction::Delete(id));
         }
         if ui.button("Discard draft").clicked() {
-            discard_draft(draft, ssh);
+            draft.original_id = None;
+            draft.id.clear();
+            draft.display_name.clear();
+            draft.switch_variant(DraftVariant::Local);
         }
     });
 }
-fn discard_draft(draft: &mut ProfileDraft, ssh: &mut SshEditorState) {
-    ssh.clear_sensitive();
-    *ssh = SshEditorState::new();
-    draft.original_id = None;
-    draft.id.clear();
-    draft.display_name.clear();
-    draft.switch_variant(DraftVariant::Local);
+
+fn available_variants() -> Vec<(DraftVariant, &'static str)> {
+    let mut variants = vec![(DraftVariant::Local, "Local")];
+    #[cfg(feature = "platform-cv610")]
+    variants.push((DraftVariant::Cv610, "Hisilicon CV610"));
+    #[cfg(feature = "platform-ssh")]
+    variants.push((DraftVariant::SshManaged, "SSH-managed"));
+    variants
 }
 
+fn render_not_compiled(ui: &mut egui::Ui, platform: &str) {
+    ui.heading(format!("{platform} profile"));
+    ui.colored_label(egui::Color32::YELLOW, "Platform not compiled in this build. The profile is read-only here and can still be imported or exported.");
+}
+
+#[cfg(feature = "platform-cv610")]
 fn render_cv610(ui: &mut egui::Ui, config: &mut Cv610Config) {
     ui.heading("CV610 direct TCP");
     ui.label("One host is shared by Dump and Stream; transports retain separate ports/lifecycles.");
@@ -361,78 +524,4 @@ fn render_cv610(ui: &mut egui::Ui, config: &mut Cv610Config) {
             ui.text_edit_singleline(&mut config.stream.media);
             ui.end_row();
         });
-}
-
-#[cfg(test)]
-mod tests {
-    use camera_toolbox_app::ProfileStore;
-
-    use super::*;
-
-    #[test]
-    fn switching_variant_discards_cross_platform_fields() {
-        let mut draft = ProfileDraft::new(DraftVariant::Cv610);
-        let PlatformConfig::HisiliconCv610(config) = &mut draft.config else {
-            panic!()
-        };
-        config.host = "10.0.0.1".to_owned();
-        draft.switch_variant(DraftVariant::SshManaged);
-        let PlatformConfig::SshManaged(config) = &draft.config else {
-            panic!()
-        };
-        assert!(config.host.is_empty());
-        assert!(config.capture_recipe.is_empty());
-        assert!(config.command_subsystem.is_none());
-        draft.switch_variant(DraftVariant::Local);
-        assert!(matches!(draft.config, PlatformConfig::Local(_)));
-    }
-
-    #[test]
-    fn rdk_template_is_incomplete_and_cannot_claim_acceptance() {
-        let draft = ProfileDraft::rdk_x5_unknown();
-        assert!(draft.display_name.contains("Unknown"));
-        assert!(draft.build().is_err());
-    }
-
-    #[test]
-    fn draft_clone_debug_and_profile_json_never_contain_password() {
-        let mut draft = ProfileDraft::new(DraftVariant::SshManaged);
-        draft.id = "camera".to_owned();
-        draft.display_name = "camera".to_owned();
-        let PlatformConfig::SshManaged(config) = &mut draft.config else {
-            panic!()
-        };
-        config.host = "camera.example".to_owned();
-        config.username = "root".to_owned();
-        config.expected_host_key =
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-                .to_owned();
-        config.credential_ref = "session:camera".to_owned();
-        config.remote_artifact_dir = "/data".to_owned();
-        config.remote_artifact_glob = "frame.raw".to_owned();
-        let mut manager = DeviceManagerState::default();
-        manager.ssh.set_password_for_test("super-secret");
-        assert!(!manager.ssh.password_is_empty());
-        manager.draft = Some(draft.clone());
-        let debug = format!("{:?}", manager.draft.as_ref().unwrap().clone());
-        assert!(!debug.contains("super-secret"));
-        let profile = manager.draft.as_ref().unwrap().build().unwrap();
-        let mut store = ProfileStore::new();
-        store.insert_platform(profile).unwrap();
-        let json = String::from_utf8(store.export_json().unwrap()).unwrap();
-        assert!(!json.contains("super-secret"));
-        assert!(json.contains("session:camera"));
-
-        let mut discard = manager.draft.take().unwrap();
-        discard_draft(&mut discard, &mut manager.ssh);
-        assert!(manager.ssh.password_is_empty());
-        manager.ssh.set_password_for_test("super-secret");
-        manager.ssh.reset_for_variant();
-        assert!(manager.ssh.password_is_empty());
-        manager.ssh.set_password_for_test("super-secret");
-        manager.draft = Some(draft);
-        manager.close();
-        assert!(manager.ssh.password_is_empty());
-        assert!(manager.draft.is_none());
-    }
 }

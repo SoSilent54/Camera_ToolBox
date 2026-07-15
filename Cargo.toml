@@ -5,7 +5,6 @@ members = [
     "crates/adapters",
     "crates/logging",
     "crates/frontends/cli",
-    "crates/frontends/tui",
     "crates/frontends/gui",
 ]
 resolver = "3"
@@ -19,10 +18,8 @@ publish = false
 [workspace.dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-crossterm = "0.29"
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui_plot = "0.36"
-ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 rfd = "0.17"
 serde = { version = "1.0", features = ["derive"] }
 sha2 = "0.10"
@@ -43,8 +40,8 @@ tokio-util = { version = "0.7", features = ["rt"] }
 
 camera-toolbox-core = { path = "crates/core" }
 camera-toolbox-app = { path = "crates/app" }
-camera-toolbox-adapters = { path = "crates/adapters" }
 camera-toolbox-logging = { path = "crates/logging" }
+camera-toolbox-adapters = { path = "crates/adapters", default-features = false }
 
 # Cargo 不支持项目级默认 profile；让普通 build/run 采用 release 等价代码生成。
 [profile.dev]

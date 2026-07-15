@@ -24,8 +24,11 @@ pub fn run(cli: Cli) -> Result<()> {
         Command::AnalyzeRaw(args) => analyze_raw(args),
         Command::Profile { command } => platform::run_profile(command),
         Command::Platform { command } => platform::run_platform(command),
+        #[cfg(feature = "platform-cv610")]
         Command::Cv610 { command } => platform::run_cv610(command),
+        #[cfg(feature = "platform-cv610")]
         Command::StreamRecord(args) => platform::run_stream_record(&args),
+        #[cfg(feature = "platform-ssh")]
         Command::Ssh { command } => platform::run_ssh(command),
     }
 }

@@ -161,7 +161,7 @@ fn discovered_key_selection_validates_real_file_without_raw_reference() {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let directory = std::env::temp_dir().join(format!("camera-toolbox-gui-key-{suffix}"));
+    let directory = std::env::temp_dir().join(format!("camera-toolbox-key-{suffix}"));
     fs::create_dir_all(&directory).unwrap();
     let key = directory.join("id_ed25519");
     fs::write(

@@ -14,12 +14,33 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use app::CameraToolboxApp;
+use camera_toolbox_cli::{Cli, run};
+use clap::Parser;
 use eframe::egui::{self, FontData, FontDefinitions, FontFamily};
 
 const NOTO_SANS_CJK: &[u8] = include_bytes!("../assets/fonts/NotoSansCJK-Regular.ttc");
 
 fn main() -> Result<()> {
     let _logging = camera_toolbox_logging::init();
+    if std::env::args_os().nth(1).is_some() {
+        return run_cli();
+    }
+    run_gui()
+}
+
+fn run_cli() -> Result<()> {
+    let cli = Cli::parse();
+    let command = cli.command_name();
+    tracing::debug!(operation = "cli_start", command, "starting CLI command");
+    if let Err(error) = run(cli) {
+        tracing::error!(operation = "cli_command", command, error = %format_args!("{error:#}"), "CLI command failed");
+        return Err(error);
+    }
+    tracing::debug!(operation = "cli_command", command, "CLI command completed");
+    Ok(())
+}
+
+fn run_gui() -> Result<()> {
     tracing::debug!(operation = "gui_start", "starting GUI frontend");
     let native_options = eframe::NativeOptions::default();
     eframe::run_native(
