@@ -45,13 +45,7 @@ use camera_toolbox_adapters::platforms::ssh_managed::RusshTransportFactory;
 use camera_toolbox_app::{
     AutoOpenActivation, FileRef, FileSystem, FsCancellation, FsControl, LocalRawAnalyzeReport,
     LocalRawAnalyzeRequest, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline,
-    RawSourceHandle, SourceCache, WorkspaceSettings, WorkspaceSettingsError,
-    workspace_settings_path,
-};
-#[cfg(feature = "platform-ssh")]
-use camera_toolbox_app::{
-    ConnectionSettings, WorkspaceSettingsError as FileWorkspaceSettingsError,
-    connection_settings_path,
+    RawSourceHandle, SourceCache, SourceReadProgress, WorkspaceSettings,
 };
 use camera_toolbox_core::{
     MediaFormat, OwnedMediaPayload, PackedRawSpec, Roi, analyze_roi, decode_le_continuous_raw,
@@ -60,6 +54,9 @@ use eframe::egui;
 const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTO_OPEN_QUEUE_LIMIT: usize = 16;
 const AUTO_OPEN_BACKGROUND_TAB_LIMIT: usize = 8;
+const RAW_SOURCE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
+const RAW_SOURCE_CACHE_ENTRIES: usize = 16;
+const RAW_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
 struct OpenedRawDocument {
     report: LocalRawAnalyzeReport,
@@ -71,6 +68,15 @@ struct WorkspaceFileOpenRequest {
     display_path: PathBuf,
     file_system: Arc<dyn FileSystem>,
     reference: FileRef,
+    remote: bool,
+}
+
+enum RawOpenJobEvent {
+    Progress {
+        attempt: u64,
+        progress: SourceReadProgress,
+    },
+    Finished(Box<RawOpenJobResult>),
 }
 
 struct RawOpenJobResult {
@@ -81,6 +87,9 @@ struct RawOpenJobResult {
 
 struct ActiveRawOpenJob {
     attempt: u64,
+    path: PathBuf,
+    remote: bool,
+    progress: Option<SourceReadProgress>,
     cancellation: FsCancellation,
 }
 
@@ -108,9 +117,6 @@ struct ReinterpretJobResult {
 
 pub(crate) struct CameraToolboxApp {
     workspace: WorkspaceState,
-    #[cfg(feature = "platform-ssh")]
-    connection_settings: ConnectionSettings,
-    workspace_settings: WorkspaceSettings,
     auto_open: AutoOpenCoordinator,
     explorer: ExplorerState,
     explorer_panel_expanded: bool,
@@ -125,8 +131,8 @@ pub(crate) struct CameraToolboxApp {
     live_runtime: LiveRuntime,
     next_load_attempt: u64,
     pending_ephemeral_close: Option<DocumentId>,
-    raw_open_sender: Sender<RawOpenJobResult>,
-    raw_open_receiver: Receiver<RawOpenJobResult>,
+    raw_open_sender: Sender<RawOpenJobEvent>,
+    raw_open_receiver: Receiver<RawOpenJobEvent>,
     active_raw_open: Option<ActiveRawOpenJob>,
     pending_auto_open: VecDeque<PendingAutoOpenRequest>,
     auto_open_sender: Sender<AutoOpenJobResult>,
@@ -140,30 +146,21 @@ pub(crate) struct CameraToolboxApp {
 
 impl CameraToolboxApp {
     pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
-        let cache = SourceCache::new(source_cache_directory(), 2 * 1024 * 1024 * 1024, 64)
+        let cache = SourceCache::new(RAW_SOURCE_CACHE_BYTES, RAW_SOURCE_CACHE_ENTRIES)
             .map_err(std::io::Error::other)?;
-        let workspace_settings = load_workspace_settings();
-        #[cfg(feature = "platform-ssh")]
-        let connection_settings = load_connection_settings();
+        let workspace_settings = WorkspaceSettings::default();
         let (raw_open_sender, raw_open_receiver) = mpsc::channel();
         let (reinterpret_sender, reinterpret_receiver) = mpsc::channel();
         let (auto_open_sender, auto_open_receiver) = mpsc::channel();
         let live_runtime = LiveRuntime::new().map_err(std::io::Error::other)?;
         #[cfg(feature = "platform-ssh")]
-        let explorer = ExplorerState::from_settings(
-            &workspace_settings,
-            &connection_settings,
-            live_runtime.ssh_resolver(),
-            Arc::new(RusshTransportFactory),
-        );
+        let explorer =
+            ExplorerState::new(live_runtime.ssh_resolver(), Arc::new(RusshTransportFactory));
         #[cfg(not(feature = "platform-ssh"))]
-        let explorer = ExplorerState::from_settings(&workspace_settings);
+        let explorer = ExplorerState::new();
         let auto_open = AutoOpenCoordinator::from_settings(&workspace_settings, &explorer);
         Ok(Self {
             workspace: WorkspaceState::default(),
-            workspace_settings,
-            #[cfg(feature = "platform-ssh")]
-            connection_settings,
             explorer,
             auto_open,
             explorer_panel_expanded: false,
@@ -222,7 +219,6 @@ impl eframe::App for CameraToolboxApp {
                 .viewer
                 .refresh_cursor(&context, &document.loaded.frame);
         }
-        self.explorer.ensure_default_local_mount(&context);
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
         let tab_action = egui::Panel::top("document_tabs")
@@ -939,6 +935,40 @@ impl CameraToolboxApp {
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if let Some(active) = self.active_raw_open.as_ref().filter(|active| active.remote) {
+                let name = active
+                    .path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("remote RAW");
+                ui.spinner();
+                match active.progress {
+                    Some(progress) => {
+                        let percent = if progress.total_bytes == 0 {
+                            100
+                        } else {
+                            ((u128::from(progress.bytes_read) * 100
+                                + u128::from(progress.total_bytes) / 2)
+                                / u128::from(progress.total_bytes))
+                            .min(100)
+                        };
+                        let mib = u128::from(1024_u64 * 1024);
+                        let read_tenths = (u128::from(progress.bytes_read) * 10 + mib / 2) / mib;
+                        let total_tenths = (u128::from(progress.total_bytes) * 10 + mib / 2) / mib;
+                        ui.label(format!(
+                            "Transferring {name} · {}.{:01}/{}.{:01} MiB · {percent}%",
+                            read_tenths / 10,
+                            read_tenths % 10,
+                            total_tenths / 10,
+                            total_tenths % 10
+                        ));
+                    }
+                    None => {
+                        ui.label(format!("Preparing remote transfer · {name}"));
+                    }
+                }
+                return;
+            }
             if let Some(document) = self.workspace.active_live() {
                 let media = document.media.as_ref().map_or_else(
                     || "Negotiating".to_owned(),
@@ -1038,59 +1068,24 @@ impl CameraToolboxApp {
 
     fn handle_explorer_action(&mut self, context: &egui::Context, action: ExplorerAction) {
         match action {
-            ExplorerAction::AddLocalMount(root) => {
-                let config = match self.explorer.add_local_mount(root.clone(), context) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        tracing::error!(
-                            operation = "explorer_add_local_mount",
-                            root = %root.display(),
-                            error = %error,
-                            "failed to mount local directory"
-                        );
-                        self.explorer
-                            .set_global_error(format!("Mount folder failed: {error}"));
-                        return;
-                    }
-                };
-                if self
-                    .workspace_settings
-                    .mounts()
-                    .any(|existing| existing.source_id() == config.source_id())
-                {
-                    self.reload_auto_open();
-                    return;
-                }
-                let mut updated = self.workspace_settings.clone();
-                if let Err(error) = updated
-                    .insert_mount(config)
-                    .and_then(|_| save_workspace_settings(&updated))
-                {
-                    tracing::error!(
-                        operation = "explorer_persist_local_mount",
-                        root = %root.display(),
-                        error = %error,
-                        "failed to persist workspace mount"
-                    );
-                    self.explorer
-                        .set_global_error(format!("Persist mount failed: {error}"));
-                    return;
-                }
-                self.workspace_settings = updated;
-                self.reload_auto_open();
-            }
             #[cfg(feature = "platform-ssh")]
-            ExplorerAction::SaveRemoteConnection(RemoteConnectionCommit {
+            ExplorerAction::ActivateSftp(RemoteConnectionCommit {
                 config,
                 session_password,
+                remote_root,
             }) => {
-                if let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
+                let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
                     &config.authentication
-                    && let Some(password) = session_password
-                    && let Err(error) = self
-                        .live_runtime
-                        .ssh_credential_resolver()
-                        .register_session_password(slot_id, password)
+                else {
+                    self.explorer.set_remote_connection_error(
+                        "Explorer SFTP requires process-only password authentication",
+                    );
+                    return;
+                };
+                if let Err(error) = self
+                    .live_runtime
+                    .ssh_credential_resolver()
+                    .register_session_password(slot_id, session_password)
                 {
                     tracing::error!(
                         operation = "explorer_register_remote_password",
@@ -1104,93 +1099,25 @@ impl CameraToolboxApp {
                     ));
                     return;
                 }
-                let mut updated = self.connection_settings.clone();
-                if let Err(error) = updated
-                    .upsert(config.clone())
-                    .and_then(|_| save_connection_settings(&updated))
+                if let Err(error) =
+                    self.explorer
+                        .finish_sftp_connection(config, remote_root, context)
                 {
                     tracing::error!(
-                        operation = "explorer_save_remote_connection",
-                        connection_id = config.id.as_str(),
-                        host = %config.host,
-                        port = config.port,
+                        operation = "explorer_activate_sftp",
                         error = %error,
-                        "failed to persist remote connection"
+                        "failed to activate ephemeral SFTP workspace"
                     );
                     self.explorer.set_remote_connection_error(format!(
-                        "Save remote connection failed: {error}"
+                        "Open SFTP workspace failed: {error}"
                     ));
-                    return;
                 }
-                self.connection_settings = updated;
-                if let Err(error) = self.explorer.finish_remote_connection_save(config, context) {
-                    tracing::error!(
-                        operation = "explorer_refresh_remote_connection",
-                        error = %error,
-                        "saved remote connection but Explorer refresh failed"
-                    );
-                    self.explorer.set_global_error(format!(
-                        "Remote connection saved, but Explorer refresh failed: {error}"
-                    ));
-                    return;
-                }
-                self.reload_auto_open();
-            }
-            #[cfg(feature = "platform-ssh")]
-            ExplorerAction::AddSftpMount {
-                connection_id,
-                remote_root,
-            } => {
-                let config = match self.explorer.add_sftp_mount(
-                    connection_id.clone(),
-                    remote_root.clone(),
-                    context,
-                ) {
-                    Ok(config) => config,
-                    Err(error) => {
-                        tracing::error!(
-                            operation = "explorer_add_sftp_mount",
-                            connection_id = connection_id.as_str(),
-                            remote_root,
-                            error = %error,
-                            "failed to mount remote directory"
-                        );
-                        self.explorer
-                            .set_global_error(format!("Mount remote failed: {error}"));
-                        return;
-                    }
-                };
-                if self
-                    .workspace_settings
-                    .mounts()
-                    .any(|existing| existing.source_id() == config.source_id())
-                {
-                    self.reload_auto_open();
-                    return;
-                }
-                let mut updated = self.workspace_settings.clone();
-                if let Err(error) = updated
-                    .insert_mount(config)
-                    .and_then(|_| save_workspace_settings(&updated))
-                {
-                    tracing::error!(
-                        operation = "explorer_persist_sftp_mount",
-                        connection_id = connection_id.as_str(),
-                        remote_root,
-                        error = %error,
-                        "failed to persist remote mount"
-                    );
-                    self.explorer
-                        .set_global_error(format!("Persist remote mount failed: {error}"));
-                    return;
-                }
-                self.workspace_settings = updated;
-                self.reload_auto_open();
             }
             ExplorerAction::OpenAuto {
                 display_path,
                 file_system,
                 reference,
+                remote,
             } => {
                 let attempt = self.begin_raw_open_attempt();
                 self.start_load_workspace_file(
@@ -1200,15 +1127,11 @@ impl CameraToolboxApp {
                         display_path,
                         file_system,
                         reference,
+                        remote,
                     },
                 );
             }
         }
-    }
-
-    fn reload_auto_open(&mut self) {
-        self.auto_open =
-            AutoOpenCoordinator::from_settings(&self.workspace_settings, &self.explorer);
     }
 
     fn cancel_active_auto_open(&mut self) {
@@ -1223,6 +1146,7 @@ impl CameraToolboxApp {
                 display_path,
                 file_system,
                 reference,
+                remote,
             }) = self.explorer.open_action_for(&candidate.reference)
             else {
                 tracing::warn!(
@@ -1243,6 +1167,7 @@ impl CameraToolboxApp {
                     display_path,
                     file_system,
                     reference,
+                    remote,
                 },
             });
         }
@@ -1265,8 +1190,14 @@ impl CameraToolboxApp {
         let context = context.clone();
         thread::spawn(move || {
             let path = pending.request.display_path.clone();
-            let result = decode_workspace_file_request(&pipeline, pending.request, cancellation)
-                .map_err(|error| error.to_string());
+            let mut ignore_progress = |_| {};
+            let result = decode_workspace_file_request(
+                &pipeline,
+                pending.request,
+                cancellation,
+                &mut ignore_progress,
+            )
+            .map_err(|error| error.to_string());
             let _ = sender.send(AutoOpenJobResult {
                 candidate: pending.candidate,
                 path,
@@ -1306,22 +1237,25 @@ impl CameraToolboxApp {
         }
         self.cancel_active_auto_open();
         let cancellation = FsCancellation::default();
+        let path = request.path.clone();
         self.active_raw_open = Some(ActiveRawOpenJob {
             attempt,
+            path: path.clone(),
+            remote: false,
+            progress: None,
             cancellation: cancellation.clone(),
         });
         let pipeline = self.raw_pipeline.clone();
         let sender = self.raw_open_sender.clone();
         let context = context.clone();
         thread::spawn(move || {
-            let path = request.path.clone();
             let result = decode_raw_request(&pipeline, request, cancellation)
                 .map_err(|error| error.to_string());
-            let _ = sender.send(RawOpenJobResult {
+            let _ = sender.send(RawOpenJobEvent::Finished(Box::new(RawOpenJobResult {
                 attempt,
                 path,
                 result,
-            });
+            })));
             context.request_repaint();
         });
     }
@@ -1337,58 +1271,97 @@ impl CameraToolboxApp {
         }
         let cancellation = FsCancellation::default();
         self.cancel_active_auto_open();
+        let path = request.display_path.clone();
+        let remote = request.remote;
         self.active_raw_open = Some(ActiveRawOpenJob {
             attempt,
+            path: path.clone(),
+            remote,
+            progress: None,
             cancellation: cancellation.clone(),
         });
         let pipeline = self.raw_pipeline.clone();
         let sender = self.raw_open_sender.clone();
         let context = context.clone();
         thread::spawn(move || {
-            let path = request.display_path.clone();
-            let result = decode_workspace_file_request(&pipeline, request, cancellation)
-                .map_err(|error| error.to_string());
-            let _ = sender.send(RawOpenJobResult {
+            let mut last_repaint = Instant::now()
+                .checked_sub(RAW_PROGRESS_REPAINT_INTERVAL)
+                .unwrap_or_else(Instant::now);
+            let mut report_progress = |progress: SourceReadProgress| {
+                let final_update = progress.bytes_read == progress.total_bytes;
+                if progress.bytes_read == 0
+                    || final_update
+                    || last_repaint.elapsed() >= RAW_PROGRESS_REPAINT_INTERVAL
+                {
+                    let _ = sender.send(RawOpenJobEvent::Progress { attempt, progress });
+                    last_repaint = Instant::now();
+                    context.request_repaint();
+                }
+            };
+            let result = decode_workspace_file_request(
+                &pipeline,
+                request,
+                cancellation,
+                &mut report_progress,
+            )
+            .map_err(|error| error.to_string());
+            let _ = sender.send(RawOpenJobEvent::Finished(Box::new(RawOpenJobResult {
                 attempt,
                 path,
                 result,
-            });
+            })));
             context.request_repaint();
         });
     }
 
     fn poll_raw_open_result(&mut self, context: &egui::Context) {
         loop {
-            let result = match self.raw_open_receiver.try_recv() {
-                Ok(result) => result,
+            let event = match self.raw_open_receiver.try_recv() {
+                Ok(event) => event,
                 Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
             };
-            if !self
-                .active_raw_open
-                .as_ref()
-                .is_some_and(|active| active.attempt == result.attempt)
-            {
-                continue;
-            }
-            self.active_raw_open = None;
-            match result.result {
-                Ok(completed) => self.install_opened_raw(context, result.attempt, completed),
-                Err(message) => {
-                    tracing::error!(
-                        operation = "load_raw",
-                        attempt = result.attempt,
-                        path = %result.path.display(),
-                        error = %message,
-                        "RAW loading failed"
-                    );
-                    self.notifications.push_once(UiNotification::error(
-                        NotificationKey::RawLoadFailed {
-                            attempt: result.attempt,
-                        },
-                        "RAW load failed",
-                        &message,
-                    ));
-                    self.raw_dialog.set_error(message);
+            match event {
+                RawOpenJobEvent::Progress { attempt, progress } => {
+                    if let Some(active) = self
+                        .active_raw_open
+                        .as_mut()
+                        .filter(|active| active.attempt == attempt && active.remote)
+                    {
+                        active.progress = Some(progress);
+                    }
+                }
+                RawOpenJobEvent::Finished(result) => {
+                    let result = *result;
+                    if !self
+                        .active_raw_open
+                        .as_ref()
+                        .is_some_and(|active| active.attempt == result.attempt)
+                    {
+                        continue;
+                    }
+                    self.active_raw_open = None;
+                    match result.result {
+                        Ok(completed) => {
+                            self.install_opened_raw(context, result.attempt, completed);
+                        }
+                        Err(message) => {
+                            tracing::error!(
+                                operation = "load_raw",
+                                attempt = result.attempt,
+                                path = %result.path.display(),
+                                error = %message,
+                                "RAW loading failed"
+                            );
+                            self.notifications.push_once(UiNotification::error(
+                                NotificationKey::RawLoadFailed {
+                                    attempt: result.attempt,
+                                },
+                                "RAW load failed",
+                                &message,
+                            ));
+                            self.raw_dialog.set_error(message);
+                        }
+                    }
                 }
             }
         }
@@ -2380,6 +2353,7 @@ fn decode_workspace_file_request(
     pipeline: &RawOpenPipeline,
     request: WorkspaceFileOpenRequest,
     cancellation: FsCancellation,
+    progress: &mut dyn FnMut(SourceReadProgress),
 ) -> anyhow::Result<OpenedRawDocument> {
     tracing::debug!(
         operation = "load_raw",
@@ -2389,11 +2363,12 @@ fn decode_workspace_file_request(
     );
     let mut control = FsControl::with_timeout(Duration::from_secs(30));
     control.cancellation = cancellation;
-    let result = pipeline.begin(
+    let result = pipeline.begin_with_progress(
         &*request.file_system,
         &request.reference,
         RawOpenMode::Auto,
         &control,
+        progress,
     )?;
     let roi = Roi {
         x: 0,
@@ -2412,78 +2387,6 @@ fn decode_workspace_file_request(
         source: result.source,
         interpretation: result.interpretation,
     })
-}
-
-fn load_workspace_settings() -> WorkspaceSettings {
-    let path = match workspace_settings_path() {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::error!(
-                operation = "load_workspace_settings_path",
-                error = %error,
-                "failed to resolve workspace settings path"
-            );
-            return WorkspaceSettings::default();
-        }
-    };
-    match WorkspaceSettings::load_from_path(&path) {
-        Ok(settings) => settings,
-        Err(WorkspaceSettingsError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-            WorkspaceSettings::default()
-        }
-        Err(error) => {
-            tracing::error!(
-                operation = "load_workspace_settings",
-                path = %path.display(),
-                error = %error,
-                "failed to load workspace settings; using defaults"
-            );
-            WorkspaceSettings::default()
-        }
-    }
-}
-
-fn save_workspace_settings(settings: &WorkspaceSettings) -> Result<(), WorkspaceSettingsError> {
-    let path = workspace_settings_path()?;
-    settings.save_to_path(&path)
-}
-
-#[cfg(feature = "platform-ssh")]
-fn load_connection_settings() -> ConnectionSettings {
-    let path = match connection_settings_path() {
-        Ok(path) => path,
-        Err(error) => {
-            tracing::error!(
-                operation = "load_connection_settings_path",
-                error = %error,
-                "failed to resolve connection settings path"
-            );
-            return ConnectionSettings::default();
-        }
-    };
-    match ConnectionSettings::load_from_path(&path) {
-        Ok(settings) => settings,
-        Err(FileWorkspaceSettingsError::Io(error))
-            if error.kind() == std::io::ErrorKind::NotFound =>
-        {
-            ConnectionSettings::default()
-        }
-        Err(error) => {
-            tracing::error!(
-                operation = "load_connection_settings",
-                path = %path.display(),
-                error = %error,
-                "failed to load connection settings; using defaults"
-            );
-            ConnectionSettings::default()
-        }
-    }
-}
-
-#[cfg(feature = "platform-ssh")]
-fn save_connection_settings(settings: &ConnectionSettings) -> Result<(), WorkspaceSettingsError> {
-    let path = connection_settings_path()?;
-    settings.save_to_path(&path)
 }
 
 fn decode_raw_reinterpret(
@@ -2549,16 +2452,6 @@ fn save_asset_source(
         }
         Ok(())
     })
-}
-
-fn source_cache_directory() -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_nanos());
-    std::env::temp_dir().join(format!(
-        "camera-toolbox-source-cache-{}-{nonce}",
-        std::process::id()
-    ))
 }
 
 fn save_asset_source_with<F>(

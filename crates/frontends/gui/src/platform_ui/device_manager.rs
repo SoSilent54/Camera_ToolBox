@@ -21,7 +21,7 @@ pub(crate) enum DraftVariant {
     SshManaged,
 }
 
-/// Clone/Debug draft 只含可持久化配置，绝不持有 password。
+/// Clone/Debug draft 只含非敏感配置，绝不持有 password。
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileDraft {
     pub(crate) original_id: Option<PlatformProfileId>,
@@ -177,7 +177,7 @@ impl DeviceManagerState {
         self.message = None;
     }
 
-    pub(crate) fn mark_saved(&mut self, profile: &PlatformProfile, password_registered: bool) {
+    pub(crate) fn mark_applied(&mut self, profile: &PlatformProfile, password_registered: bool) {
         #[cfg(feature = "platform-ssh")]
         {
             self.ssh.clear_sensitive();
@@ -459,15 +459,15 @@ fn render_draft_actions(
     draft: &mut ProfileDraft,
     actions: &mut Vec<DeviceManagerAction>,
     editable: bool,
-    mut save: impl FnMut(ProfileDraft, &mut Vec<DeviceManagerAction>),
+    mut apply: impl FnMut(ProfileDraft, &mut Vec<DeviceManagerAction>),
 ) {
     ui.separator();
     ui.horizontal(|ui| {
         if ui
-            .add_enabled(editable, egui::Button::new("Validate and Save"))
+            .add_enabled(editable, egui::Button::new("Validate and Apply"))
             .clicked()
         {
-            save(draft.clone(), actions);
+            apply(draft.clone(), actions);
         }
         if let Some(id) = draft.original_id.clone()
             && ui.button("Delete profile").clicked()

@@ -36,7 +36,7 @@ use eframe::egui;
 use super::render_stream_panel;
 use super::{
     DeviceManagerAction, DeviceManagerState, StreamPanelAction, StreamPanelState,
-    profile_commit::{normalize_profile_commit, persist_profile_candidate},
+    profile_commit::{apply_profile_candidate, normalize_profile_commit},
 };
 #[cfg(feature = "platform-ssh")]
 use super::{
@@ -168,26 +168,8 @@ impl LiveRuntime {
             resolver,
             Arc::clone(&recipes),
         ));
-        let path = ProfileStore::project_file_path().map_err(|error| error.to_string())?;
-        let (profiles, startup_message) = if path.exists() {
-            match ProfileStore::load_from_path(&path) {
-                Ok(store) => (store, None),
-                Err(error) => (
-                    ProfileStore::with_builtin_local().map_err(|error| error.to_string())?,
-                    Some(format!(
-                        "Profile store could not be loaded from {}: {error}",
-                        path.display()
-                    )),
-                ),
-            }
-        } else {
-            let store = ProfileStore::with_builtin_local().map_err(|error| error.to_string())?;
-            let message = store
-                .save_project()
-                .err()
-                .map(|error| format!("Initial profile store could not be saved: {error}"));
-            (store, message)
-        };
+        let profiles = ProfileStore::with_builtin_local().map_err(|error| error.to_string())?;
+        let startup_message = None;
         let selected = profiles
             .platforms()
             .next()
@@ -428,12 +410,8 @@ impl LiveRuntime {
                 let normalized = normalize_profile_commit(&self.profiles, draft)?;
                 let profile = normalized.profile;
                 let original_id = normalized.original_id;
-                let candidate = persist_profile_candidate(
-                    &self.profiles,
-                    profile.clone(),
-                    original_id.as_ref(),
-                    |candidate| candidate.save_project().map_err(|error| error.to_string()),
-                )?;
+                let candidate =
+                    apply_profile_candidate(&self.profiles, profile.clone(), original_id.as_ref())?;
                 self.profiles = candidate;
                 #[cfg(feature = "platform-ssh")]
                 {
@@ -461,15 +439,15 @@ impl LiveRuntime {
                     };
                     self.select_platform(profile.id.clone());
                     self.device_manager
-                        .mark_saved(&profile, readiness.as_ref().copied().unwrap_or(false));
+                        .mark_applied(&profile, readiness.as_ref().copied().unwrap_or(false));
                     if let Some(error) = registration_error {
                         return Err(format!(
-                            "profile {} was persisted and installed, but process-only password registration failed: {error}; remote operations remain unavailable until the password is re-entered",
+                            "profile {} was applied for this session, but process-only password registration failed: {error}; remote operations remain unavailable until the password is re-entered",
                             profile.id
                         ));
                     }
                     let password_registered = readiness.map_err(|error| format!(
-                        "profile {} was persisted and installed, but password registry status is unavailable: {error}",
+                        "profile {} is active for this session, but password registry status is unavailable: {error}",
                         profile.id
                     ))?;
                     let password_note = if password_registered {
@@ -477,13 +455,13 @@ impl LiveRuntime {
                     } else {
                         "; password is not registered in this process"
                     };
-                    return Ok(format!("Saved profile {}{password_note}", profile.id));
+                    return Ok(format!("Applied profile {}{password_note}", profile.id));
                 }
                 #[cfg(not(feature = "platform-ssh"))]
                 {
                     self.select_platform(profile.id.clone());
-                    self.device_manager.mark_saved(&profile, false);
-                    Ok(format!("Saved profile {}", profile.id))
+                    self.device_manager.mark_applied(&profile, false);
+                    Ok(format!("Applied profile {}", profile.id))
                 }
             }
             DeviceManagerAction::ValidationError(error) => Err(error),
@@ -502,9 +480,6 @@ impl LiveRuntime {
                 let mut candidate = self.profiles.clone();
                 candidate
                     .remove_platform(&id)
-                    .map_err(|error| error.to_string())?;
-                candidate
-                    .save_project()
                     .map_err(|error| error.to_string())?;
                 self.profiles = candidate;
                 #[cfg(feature = "platform-ssh")]
@@ -533,13 +508,12 @@ impl LiveRuntime {
                     .platforms()
                     .next()
                     .map(|profile| profile.id.clone());
-                imported.save_project().map_err(|error| error.to_string())?;
                 self.profiles = imported;
                 self.device_manager.mark_deleted();
                 if let Some(next) = next {
                     self.select_platform(next);
                 }
-                Ok(format!("Imported {}", path.display()))
+                Ok(format!("Imported {} for this session", path.display()))
             }
             DeviceManagerAction::Export(path) => {
                 self.profiles

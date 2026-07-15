@@ -64,6 +64,16 @@ fn sensor() -> SensorDescriptor {
 }
 
 #[test]
+fn startup_profiles_are_session_local_defaults() {
+    let runtime = LiveRuntime::new().unwrap();
+    let profiles = runtime.profiles.platforms().collect::<Vec<_>>();
+
+    assert_eq!(profiles.len(), 1);
+    assert_eq!(profiles[0].id.as_str(), "local");
+    assert!(runtime.startup_message.is_none());
+}
+
+#[test]
 fn platform_and_sensor_selectors_are_independent_and_unbound_remains_usable() {
     let mut runtime = LiveRuntime::new().unwrap();
     runtime.profiles = camera_toolbox_app::ProfileStore::new();

@@ -1,10 +1,5 @@
 //! 统一 RAW acquire → probe → rank → decode 流水线。
 
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom},
-};
-
 use camera_toolbox_core::{
     RawFrame, RawFrameError, RawProbeInput, RawProbeReport, probe_raw_candidates,
 };
@@ -14,7 +9,7 @@ use crate::{FileRef, FileSystem, FsControl};
 
 use super::{
     RawDecodeParams, RawDecodePreset, RawInterpretation, RawPresetError, RawSourceHandle,
-    SourceCache, SourceCacheError, explicit, select_automatic,
+    SourceCache, SourceCacheError, SourceReadProgress, explicit, select_automatic,
 };
 
 const PROBE_WINDOW_BYTES: u64 = 64 * 1024;
@@ -87,6 +82,33 @@ impl RawOpenPipeline {
             recommended,
         })
     }
+    /// 获取不可变源并向调用方报告传输进度。
+    ///
+    /// # Errors
+    ///
+    /// 源获取、缓存或 probe 分段读取失败时返回错误。
+    pub fn inspect_with_progress(
+        &self,
+        file_system: &dyn FileSystem,
+        reference: &FileRef,
+        control: &FsControl,
+        progress: &mut dyn FnMut(SourceReadProgress),
+    ) -> Result<RawOpenSession, RawOpenError> {
+        let source = self.cache.acquire_with_progress(
+            file_system,
+            reference,
+            self.max_source_bytes,
+            control,
+            progress,
+        )?;
+        let report = inspect_cached_source(&source)?;
+        let recommended = select_automatic(reference, &report, &self.presets).ok();
+        Ok(RawOpenSession {
+            source,
+            report,
+            recommended,
+        })
+    }
 
     /// 所有入口共用的同步执行入口；调用方负责在线程池中调度并携带 generation。
     ///
@@ -101,6 +123,22 @@ impl RawOpenPipeline {
         control: &FsControl,
     ) -> Result<RawOpenResult, RawOpenError> {
         let session = self.inspect(file_system, reference, control)?;
+        self.decode(session, mode, control)
+    }
+    /// 与 `begin` 相同，但在源获取阶段报告传输进度。
+    ///
+    /// # Errors
+    ///
+    /// 无自动候选、显式参数无效、源获取或完整解码失败时返回错误。
+    pub fn begin_with_progress(
+        &self,
+        file_system: &dyn FileSystem,
+        reference: &FileRef,
+        mode: RawOpenMode,
+        control: &FsControl,
+        progress: &mut dyn FnMut(SourceReadProgress),
+    ) -> Result<RawOpenResult, RawOpenError> {
+        let session = self.inspect_with_progress(file_system, reference, control, progress)?;
         self.decode(session, mode, control)
     }
 
@@ -127,7 +165,7 @@ impl RawOpenPipeline {
             RawOpenMode::WithOptions(params) => (explicit(params), None),
             RawOpenMode::Reinterpret { generation, params } => (explicit(params), Some(generation)),
         };
-        self.decode_cached_source(
+        Self::decode_cached_source(
             session.source,
             session.report,
             interpretation,
@@ -149,11 +187,10 @@ impl RawOpenPipeline {
         control: &FsControl,
     ) -> Result<RawOpenResult, RawOpenError> {
         let report = inspect_cached_source(&source)?;
-        self.decode_cached_source(source, report, explicit(params), Some(generation), control)
+        Self::decode_cached_source(source, report, explicit(params), Some(generation), control)
     }
 
     fn decode_cached_source(
-        &self,
         source: RawSourceHandle,
         report: RawProbeReport,
         interpretation: RawInterpretation,
@@ -161,22 +198,10 @@ impl RawOpenPipeline {
         control: &FsControl,
     ) -> Result<RawOpenResult, RawOpenError> {
         control.checkpoint()?;
-        let mut file = File::open(source.cached_path())?;
-        let mut bytes = Vec::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            control.checkpoint()?;
-            let count = file.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            bytes.extend_from_slice(&buffer[..count]);
-        }
-        control.checkpoint()?;
         let frame = RawFrame::from_bytes(
             interpretation.params.spec.clone(),
             interpretation.params.encoding,
-            &bytes,
+            source.bytes(),
         )?;
         Ok(RawOpenResult {
             source,
@@ -204,16 +229,18 @@ fn inspect_cached_source(source: &RawSourceHandle) -> Result<RawProbeReport, Raw
     offsets.sort_unstable();
     offsets.dedup();
 
-    let mut file = File::open(source.cached_path())?;
+    let bytes = source.bytes();
     let mut samples = Vec::with_capacity(offsets.len());
     for offset in offsets {
         let readable = (file_len - offset).min(window_len) & !1;
         let sample_len =
             usize::try_from(readable).map_err(|_| RawOpenError::ProbeWindowTooLarge(readable))?;
-        let mut sample = vec![0; sample_len];
-        file.seek(SeekFrom::Start(offset))?;
-        file.read_exact(&mut sample)?;
-        samples.push(sample);
+        let start =
+            usize::try_from(offset).map_err(|_| RawOpenError::ProbeWindowTooLarge(offset))?;
+        let end = start
+            .checked_add(sample_len)
+            .ok_or(RawOpenError::ProbeWindowTooLarge(readable))?;
+        samples.push(bytes[start..end].to_vec());
     }
     Ok(probe_raw_candidates(&RawProbeInput {
         file_name: source.reference().path.file_name().map(str::to_owned),

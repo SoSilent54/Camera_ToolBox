@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
-use camera_toolbox_app::LocalRawAnalyzeReport;
+use camera_toolbox_app::{FsCancellation, LocalRawAnalyzeReport, SourceReadProgress};
 use camera_toolbox_core::{
     AssetId, BayerPattern, CaptureMetadata, ChromaOrder, EphemeralAsset, IntegrityState,
     MediaFormat, OwnedMediaPayload, RawFrame, RawSpec, Roi, RoiStats, analyze_raw_roi, analyze_roi,
@@ -9,7 +9,10 @@ use eframe::egui::{self, accesskit::Role};
 
 #[cfg(all(target_os = "linux", feature = "platform-cv610"))]
 use super::LIVE_STOP_TIMEOUT;
-use super::{CameraToolboxApp, LoadedRaw, save_asset_source, save_asset_source_with};
+use super::{
+    ActiveRawOpenJob, CameraToolboxApp, LoadedRaw, RawOpenJobEvent, save_asset_source,
+    save_asset_source_with,
+};
 use crate::{
     analysis_panel::DesiredAnalysis,
     analysis_worker::{AnalysisData, AnalysisDomain, AnalysisKey, AnalysisPayload, AnalysisResult},
@@ -889,4 +892,107 @@ fn ignored_eof_sidecar_stays_closing_until_gui_deadline_then_is_forced() {
     );
     server.join().unwrap();
     let _ = fs::remove_dir_all(root);
+}
+
+#[test]
+fn gui_startup_does_not_create_implicit_configuration_files() {
+    const PROBE: &str = "CAMERA_TOOLBOX_CONFIG_PROBE";
+    const TEST_NAME: &str = "app::tests::gui_startup_does_not_create_implicit_configuration_files";
+    let root = std::env::temp_dir().join(format!(
+        "camera-toolbox-config-probe-{}",
+        std::process::id()
+    ));
+
+    if std::env::var_os(PROBE).is_some() {
+        let root = PathBuf::from(std::env::var_os("XDG_CONFIG_HOME").unwrap());
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        let mut frame = eframe::Frame::_new_kittest();
+        run_app_frame(&context, &mut app, &mut frame, Vec::new());
+        drop(app);
+        for file in [
+            "workspace-settings.json",
+            "connections.json",
+            "platform-profiles.json",
+        ] {
+            assert!(!root.join("camera-toolbox").join(file).exists());
+        }
+        return;
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("home")).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST_NAME, "--nocapture"])
+        .env(PROBE, "1")
+        .env("XDG_CONFIG_HOME", &root)
+        .env("HOME", root.join("home"))
+        .status()
+        .unwrap();
+    assert!(status.success());
+    for file in [
+        "workspace-settings.json",
+        "connections.json",
+        "platform-profiles.json",
+    ] {
+        assert!(!root.join("camera-toolbox").join(file).exists());
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn remote_raw_progress_is_generation_safe_and_visible() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.active_raw_open = Some(ActiveRawOpenJob {
+        attempt: 2,
+        path: PathBuf::from("sftp://camera/remote.raw"),
+        remote: true,
+        progress: None,
+        cancellation: FsCancellation::default(),
+    });
+
+    app.raw_open_sender
+        .send(RawOpenJobEvent::Progress {
+            attempt: 1,
+            progress: SourceReadProgress {
+                bytes_read: 90,
+                total_bytes: 100,
+            },
+        })
+        .unwrap();
+    app.poll_raw_open_result(&context);
+    assert!(app.active_raw_open.as_ref().unwrap().progress.is_none());
+
+    app.raw_open_sender
+        .send(RawOpenJobEvent::Progress {
+            attempt: 2,
+            progress: SourceReadProgress {
+                bytes_read: 50,
+                total_bytes: 100,
+            },
+        })
+        .unwrap();
+    app.poll_raw_open_result(&context);
+    assert_eq!(
+        app.active_raw_open.as_ref().unwrap().progress,
+        Some(SourceReadProgress {
+            bytes_read: 50,
+            total_bytes: 100,
+        })
+    );
+
+    let output = context.run_ui(egui::RawInput::default(), |ui| app.render_status_bar(ui));
+    let visible = output
+        .platform_output
+        .accesskit_update
+        .expect("accessibility tree is enabled")
+        .nodes
+        .into_iter()
+        .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(visible.contains("Transferring remote.raw"));
+    assert!(visible.contains("50%"));
 }

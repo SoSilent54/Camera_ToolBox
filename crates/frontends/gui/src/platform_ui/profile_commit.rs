@@ -1,4 +1,4 @@
-//! Profile commit 规范化与候选 ProfileStore 持久化。
+//! Profile commit 规范化与会话内候选 ProfileStore 更新。
 
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::PlatformConfig;
@@ -85,12 +85,11 @@ pub(super) fn normalize_profile_commit(
     })
 }
 
-/// 先在 clone 中校验 mutation，再持久化；调用者只安装成功返回的 candidate。
-pub(super) fn persist_profile_candidate(
+/// 先在 clone 中校验 mutation；调用者只安装成功返回的 candidate。
+pub(super) fn apply_profile_candidate(
     current: &ProfileStore,
     profile: PlatformProfile,
     original_id: Option<&PlatformProfileId>,
-    persist: impl FnOnce(&ProfileStore) -> Result<(), String>,
 ) -> Result<ProfileStore, String> {
     let mut candidate = current.clone();
     if let Some(original_id) = original_id {
@@ -105,7 +104,6 @@ pub(super) fn persist_profile_candidate(
             .insert_platform(profile)
             .map_err(|error| error.to_string())?;
     }
-    persist(&candidate)?;
     Ok(candidate)
 }
 
@@ -154,8 +152,6 @@ fn unique_profile_id(store: &ProfileStore, identity: &str) -> String {
 
 #[cfg(all(test, feature = "platform-ssh"))]
 mod tests {
-    use std::sync::{Arc, Mutex};
-
     use camera_toolbox_app::LocalConfig;
 
     use super::*;
@@ -197,21 +193,21 @@ mod tests {
     }
 
     #[test]
-    fn candidate_is_persisted_before_install_and_failure_leaves_current_unchanged() {
+    fn candidate_is_applied_atomically_in_memory() {
         let mut current = ProfileStore::new();
         current.insert_platform(local_profile("old")).unwrap();
-        let observed = Arc::new(Mutex::new(Vec::new()));
-        let observed_in_persist = Arc::clone(&observed);
-        let result =
-            persist_profile_candidate(&current, local_profile("new"), None, move |candidate| {
-                observed_in_persist
-                    .lock()
-                    .unwrap()
-                    .push(candidate.platforms().count());
-                Err("disk full".to_owned())
-            });
-        assert_eq!(result.unwrap_err(), "disk full");
-        assert_eq!(*observed.lock().unwrap(), vec![2]);
+
+        let candidate = apply_profile_candidate(&current, local_profile("new"), None).unwrap();
+
+        assert_eq!(candidate.platforms().count(), 2);
         assert_eq!(current.platforms().count(), 1);
+
+        assert!(apply_profile_candidate(&current, local_profile("old"), None).is_err());
+        assert_eq!(current.platforms().count(), 1);
+        assert!(
+            current
+                .platform(&PlatformProfileId::new("new").unwrap())
+                .is_none()
+        );
     }
 }
