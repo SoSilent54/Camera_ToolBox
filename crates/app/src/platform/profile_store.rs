@@ -478,6 +478,47 @@ mod tests {
     }
 
     #[test]
+    fn schema_v1_round_trips_ssh_profile_without_command_recipe() {
+        let json = br#"{
+          "schema_version": 1,
+          "platforms": [{
+            "id": "ssh-files",
+            "display_name": "SSH Files",
+            "provider": "ssh-managed",
+            "host": "2001:db8::10",
+            "port": 2222,
+            "username": "camera",
+            "expected_host_key": "ssh-ed25519 AAAA",
+            "credential_ref": "session:camera",
+            "command_subsystem": null,
+            "capture_recipe": "",
+            "remote_artifact_dir": "/data/captures",
+            "remote_artifact_glob": "*.raw",
+            "remote_event_subsystem": null,
+            "passive_watch_auto_open": false,
+            "stable_samples": 2,
+            "stability_interval_ms": 500,
+            "max_fetch_bytes": 1024,
+            "command_output_bytes": 1024
+          }],
+          "sensors": [],
+          "capability_bindings": []
+        }"#;
+        let store = ProfileStore::import_json(json).unwrap();
+        let exported = store.export_json().unwrap();
+        let reloaded = ProfileStore::import_json(&exported).unwrap();
+        let profile = reloaded
+            .platform(&PlatformProfileId::new("ssh-files").unwrap())
+            .unwrap();
+        let PlatformConfig::SshManaged(config) = &profile.config else {
+            panic!("expected SSH-managed profile")
+        };
+        assert!(config.capture_recipe.is_empty());
+        assert!(config.command_subsystem.is_none());
+        assert_eq!(PROFILE_STORE_SCHEMA_VERSION, 1);
+    }
+
+    #[test]
     fn plaintext_credential_is_rejected_before_persistence() {
         let profile = PlatformProfile {
             id: PlatformProfileId::new("ssh").unwrap(),

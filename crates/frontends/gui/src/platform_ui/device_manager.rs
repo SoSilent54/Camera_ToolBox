@@ -8,6 +8,8 @@ use camera_toolbox_app::{
 };
 use eframe::egui;
 
+use super::ssh_profile::{SshCommitAuth, SshEditorState};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DraftVariant {
     Local,
@@ -15,25 +17,22 @@ pub(crate) enum DraftVariant {
     SshManaged,
 }
 
+/// Clone/Debug draft 只含可持久化配置，绝不持有 password。
 #[derive(Debug, Clone)]
 pub(crate) struct ProfileDraft {
     pub(crate) original_id: Option<PlatformProfileId>,
     pub(crate) id: String,
     pub(crate) display_name: String,
     pub(crate) config: PlatformConfig,
-    pub(crate) session_secret: String,
-    pub(crate) session_id: String,
 }
 
 impl ProfileDraft {
-    fn new(variant: DraftVariant) -> Self {
+    pub(super) fn new(variant: DraftVariant) -> Self {
         let mut draft = Self {
             original_id: None,
             id: String::new(),
             display_name: String::new(),
             config: PlatformConfig::Local(LocalConfig::default()),
-            session_secret: String::new(),
-            session_id: String::new(),
         };
         draft.switch_variant(variant);
         draft
@@ -45,8 +44,6 @@ impl ProfileDraft {
             id: profile.id.as_str().to_owned(),
             display_name: profile.display_name.clone(),
             config: profile.config.clone(),
-            session_secret: String::new(),
-            session_id: profile.id.as_str().to_owned(),
         }
     }
 
@@ -68,7 +65,6 @@ impl ProfileDraft {
             }),
             DraftVariant::SshManaged => PlatformConfig::SshManaged(incomplete_ssh_template()),
         };
-        self.session_secret.clear();
     }
 
     pub(crate) fn rdk_x5_unknown() -> Self {
@@ -88,7 +84,7 @@ impl ProfileDraft {
     }
 }
 
-fn incomplete_ssh_template() -> SshManagedConfig {
+pub(super) fn incomplete_ssh_template() -> SshManagedConfig {
     SshManagedConfig {
         host: String::new(),
         port: 22,
@@ -108,31 +104,73 @@ fn incomplete_ssh_template() -> SshManagedConfig {
     }
 }
 
+/// Secret-bearing action intentionally has no Clone/Debug implementation.
 pub(crate) enum DeviceManagerAction {
-    Commit(ProfileDraft),
+    Commit {
+        draft: ProfileDraft,
+        ssh_auth: Option<SshCommitAuth>,
+    },
+    ValidationError(String),
     Delete(PlatformProfileId),
     Import(PathBuf),
     Export(PathBuf),
-    RegisterSessionSecret { id: String, secret: String },
 }
 
-#[derive(Default)]
 pub(crate) struct DeviceManagerState {
     pub(crate) open: bool,
     pub(crate) draft: Option<ProfileDraft>,
     pub(crate) message: Option<String>,
+    ssh: SshEditorState,
+}
+
+impl Default for DeviceManagerState {
+    fn default() -> Self {
+        Self {
+            open: false,
+            draft: None,
+            message: None,
+            ssh: SshEditorState::new(),
+        }
+    }
 }
 
 impl DeviceManagerState {
-    pub(crate) fn edit(&mut self, profile: &PlatformProfile) {
+    pub(crate) fn edit(&mut self, profile: &PlatformProfile, password_registered: bool) {
+        self.ssh.clear_sensitive();
+        self.ssh = SshEditorState::from_profile(profile, password_registered);
         self.draft = Some(ProfileDraft::from_profile(profile));
         self.open = true;
         self.message = None;
     }
 
+    pub(crate) fn mark_saved(&mut self, profile: &PlatformProfile, password_registered: bool) {
+        self.ssh.clear_sensitive();
+        self.ssh = SshEditorState::from_profile(profile, password_registered);
+        self.draft = Some(ProfileDraft::from_profile(profile));
+    }
+
+    pub(crate) fn mark_deleted(&mut self) {
+        self.ssh.clear_sensitive();
+        self.ssh = SshEditorState::new();
+        self.draft = None;
+    }
+
+    fn close(&mut self) {
+        self.open = false;
+        self.ssh.clear_sensitive();
+        self.draft = None;
+    }
+
     pub(crate) fn show(&mut self, context: &egui::Context) -> Vec<DeviceManagerAction> {
         if !self.open {
             return Vec::new();
+        }
+        if let Some(ProfileDraft {
+            config: PlatformConfig::SshManaged(config),
+            ..
+        }) = self.draft.as_mut()
+        {
+            self.ssh.poll(config, true);
         }
         let mut actions = Vec::new();
         let viewport_id = egui::ViewportId::from_hash_of("camera-toolbox-device-manager");
@@ -144,40 +182,11 @@ impl DeviceManagerState {
                 .with_min_inner_size([560.0, 460.0]),
             |context, _class| {
                 if context.input(|input| input.viewport().close_requested()) {
-                    self.open = false;
+                    self.close();
+                    return;
                 }
                 egui::CentralPanel::default().show(context, |ui| {
-                    ui.horizontal(|ui| {
-                        if ui.button("New Local").clicked() {
-                            self.draft = Some(ProfileDraft::new(DraftVariant::Local));
-                        }
-                        if ui.button("New CV610").clicked() {
-                            self.draft = Some(ProfileDraft::new(DraftVariant::Cv610));
-                        }
-                        if ui.button("New SSH-managed").clicked() {
-                            self.draft = Some(ProfileDraft::new(DraftVariant::SshManaged));
-                        }
-                        if ui.button("RDK X5 template (Unknown)").clicked() {
-                            self.draft = Some(ProfileDraft::rdk_x5_unknown());
-                        }
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("Import profiles...").clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Camera Toolbox profiles", &["json"])
-                                .pick_file()
-                        {
-                            actions.push(DeviceManagerAction::Import(path));
-                        }
-                        if ui.button("Export profiles...").clicked()
-                            && let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Camera Toolbox profiles", &["json"])
-                                .set_file_name("platform-profiles.json")
-                                .save_file()
-                        {
-                            actions.push(DeviceManagerAction::Export(path));
-                        }
-                    });
+                    self.render_toolbar(ui, &mut actions);
                     ui.separator();
                     if let Some(message) = self.message.as_deref() {
                         ui.label(message);
@@ -189,31 +198,64 @@ impl DeviceManagerState {
                         return;
                     };
                     egui::ScrollArea::vertical().show(ui, |ui| {
-                        render_draft(ui, draft, &mut actions);
+                        render_draft(ui, draft, &mut self.ssh, &mut actions);
                     });
                 });
             },
         );
         actions
     }
+
+    fn render_toolbar(&mut self, ui: &mut egui::Ui, actions: &mut Vec<DeviceManagerAction>) {
+        ui.horizontal(|ui| {
+            if ui.button("New Local").clicked() {
+                self.ssh.clear_sensitive();
+                self.ssh = SshEditorState::new();
+                self.draft = Some(ProfileDraft::new(DraftVariant::Local));
+            }
+            if ui.button("New CV610").clicked() {
+                self.ssh.clear_sensitive();
+                self.ssh = SshEditorState::new();
+                self.draft = Some(ProfileDraft::new(DraftVariant::Cv610));
+            }
+            if ui.button("New SSH-managed").clicked() {
+                self.ssh.clear_sensitive();
+                self.ssh = SshEditorState::new();
+                self.draft = Some(ProfileDraft::new(DraftVariant::SshManaged));
+            }
+            if ui.button("RDK X5 template (Unknown)").clicked() {
+                self.ssh.clear_sensitive();
+                self.ssh = SshEditorState::rdk_template();
+                self.draft = Some(ProfileDraft::rdk_x5_unknown());
+            }
+        });
+        ui.horizontal(|ui| {
+            if ui.button("Import profiles...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Camera Toolbox profiles", &["json"])
+                    .pick_file()
+            {
+                actions.push(DeviceManagerAction::Import(path));
+            }
+            if ui.button("Export profiles...").clicked()
+                && let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Camera Toolbox profiles", &["json"])
+                    .set_file_name("platform-profiles.json")
+                    .save_file()
+            {
+                actions.push(DeviceManagerAction::Export(path));
+            }
+        });
+    }
 }
 
 fn render_draft(
     ui: &mut egui::Ui,
     draft: &mut ProfileDraft,
+    ssh: &mut SshEditorState,
     actions: &mut Vec<DeviceManagerAction>,
 ) {
     ui.heading("Profile draft");
-    egui::Grid::new("profile_common_fields")
-        .num_columns(2)
-        .show(ui, |ui| {
-            ui.label("Profile ID");
-            ui.text_edit_singleline(&mut draft.id);
-            ui.end_row();
-            ui.label("Display name");
-            ui.text_edit_singleline(&mut draft.display_name);
-            ui.end_row();
-        });
     ui.horizontal(|ui| {
         ui.label("Variant");
         let current = draft.variant();
@@ -223,39 +265,74 @@ fn render_draft(
             (DraftVariant::SshManaged, "SSH-managed"),
         ] {
             if ui.selectable_label(current == variant, label).clicked() && current != variant {
+                ssh.reset_for_variant();
                 draft.switch_variant(variant);
             }
         }
     });
+    ui.collapsing("Profile details", |ui| {
+        ui.weak("For a new SSH profile, blanks are generated from username@host when saved.");
+        egui::Grid::new("profile_common_fields")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label("Profile ID");
+                ui.add_enabled(
+                    draft.original_id.is_none(),
+                    egui::TextEdit::singleline(&mut draft.id),
+                );
+                ui.end_row();
+                ui.label("Display name");
+                ui.text_edit_singleline(&mut draft.display_name);
+                ui.end_row();
+            });
+    });
     ui.separator();
-    let session_id = &mut draft.session_id;
-    let session_secret = &mut draft.session_secret;
     match &mut draft.config {
         PlatformConfig::Local(_) => {
             ui.label("Local profile has no network or credential fields.");
         }
         PlatformConfig::HisiliconCv610(config) => render_cv610(ui, config),
-        PlatformConfig::SshManaged(config) => {
-            render_ssh(ui, config, session_id, session_secret, actions);
-        }
+        PlatformConfig::SshManaged(config) => ssh.render(ui, config),
     }
     ui.separator();
     ui.horizontal(|ui| {
         if ui.button("Validate and Save").clicked() {
-            actions.push(DeviceManagerAction::Commit(draft.clone()));
+            let mut candidate = draft.clone();
+            let auth = match &mut candidate.config {
+                PlatformConfig::SshManaged(config) => {
+                    match ssh.prepare_commit(config, candidate.original_id.is_none()) {
+                        Ok(auth) => Some(auth),
+                        Err(error) => {
+                            actions.push(DeviceManagerAction::ValidationError(error));
+                            return;
+                        }
+                    }
+                }
+                _ => None,
+            };
+            actions.push(DeviceManagerAction::Commit {
+                draft: candidate,
+                ssh_auth: auth,
+            });
         }
         if let Some(id) = draft.original_id.clone()
             && ui.button("Delete profile").clicked()
         {
+            ssh.clear_sensitive();
             actions.push(DeviceManagerAction::Delete(id));
         }
         if ui.button("Discard draft").clicked() {
-            draft.original_id = None;
-            draft.id.clear();
-            draft.display_name.clear();
-            draft.switch_variant(DraftVariant::Local);
+            discard_draft(draft, ssh);
         }
     });
+}
+fn discard_draft(draft: &mut ProfileDraft, ssh: &mut SshEditorState) {
+    ssh.clear_sensitive();
+    *ssh = SshEditorState::new();
+    draft.original_id = None;
+    draft.id.clear();
+    draft.display_name.clear();
+    draft.switch_variant(DraftVariant::Local);
 }
 
 fn render_cv610(ui: &mut egui::Ui, config: &mut Cv610Config) {
@@ -286,91 +363,10 @@ fn render_cv610(ui: &mut egui::Ui, config: &mut Cv610Config) {
         });
 }
 
-fn render_ssh(
-    ui: &mut egui::Ui,
-    config: &mut SshManagedConfig,
-    session_id: &mut String,
-    session_secret: &mut String,
-    actions: &mut Vec<DeviceManagerAction>,
-) {
-    ui.heading("SSH-managed");
-    ui.colored_label(
-        egui::Color32::YELLOW,
-        "RDK X5 acceptance is Unknown. Blank template fields must be filled from your deployment evidence.",
-    );
-    egui::Grid::new("ssh_profile_fields")
-        .num_columns(2)
-        .show(ui, |ui| {
-            text_row(ui, "Host", &mut config.host);
-            ui.label("SSH port");
-            ui.add(egui::DragValue::new(&mut config.port).range(1..=u16::MAX));
-            ui.end_row();
-            text_row(ui, "Username", &mut config.username);
-            text_row(ui, "Pinned host public key", &mut config.expected_host_key);
-            text_row(ui, "Credential reference", &mut config.credential_ref);
-            let mut command_subsystem = config.command_subsystem.clone().unwrap_or_default();
-            text_row(ui, "CTARGV1 subsystem (optional)", &mut command_subsystem);
-            config.command_subsystem = (!command_subsystem.is_empty()).then_some(command_subsystem);
-            ui.label("");
-            ui.weak("Blank: standard SSH exec; no remote argv helper required");
-            ui.end_row();
-            text_row(ui, "Capture recipe ID", &mut config.capture_recipe);
-            text_row(ui, "Remote artifact root", &mut config.remote_artifact_dir);
-            text_row(
-                ui,
-                "Artifact basename glob",
-                &mut config.remote_artifact_glob,
-            );
-            let mut event = config.remote_event_subsystem.clone().unwrap_or_default();
-            text_row(ui, "Event subsystem (optional)", &mut event);
-            config.remote_event_subsystem = (!event.is_empty()).then_some(event);
-            ui.label("");
-            ui.weak("Blank: directory polling fallback");
-            ui.end_row();
-            ui.label("Passive watcher");
-            ui.checkbox(
-                &mut config.passive_watch_auto_open,
-                "Auto-open stable watched files in background",
-            );
-            ui.end_row();
-            ui.label("");
-            ui.weak("Unchecked: Assets only; never open a tab");
-            ui.end_row();
-            ui.label("Stable samples");
-            ui.add(egui::DragValue::new(&mut config.stable_samples).range(2..=10));
-            ui.end_row();
-            ui.label("Stability interval ms");
-            ui.add(egui::DragValue::new(&mut config.stability_interval_ms).range(100..=5000));
-            ui.end_row();
-            ui.label("Fetch hard limit bytes");
-            ui.add(egui::DragValue::new(&mut config.max_fetch_bytes).range(1..=1_073_741_824_u64));
-            ui.end_row();
-        });
-    ui.group(|ui| {
-        ui.label("Register session-only password (never saved)");
-        ui.horizontal(|ui| {
-            ui.label("Session ID");
-            ui.text_edit_singleline(session_id);
-            ui.label("Secret");
-            ui.add(egui::TextEdit::singleline(session_secret).password(true));
-            if ui.button("Register for this session").clicked() {
-                actions.push(DeviceManagerAction::RegisterSessionSecret {
-                    id: session_id.clone(),
-                    secret: std::mem::take(session_secret),
-                });
-            }
-        });
-    });
-}
-
-fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
-    ui.label(label);
-    ui.text_edit_singleline(value);
-    ui.end_row();
-}
-
 #[cfg(test)]
 mod tests {
+    use camera_toolbox_app::ProfileStore;
+
     use super::*;
 
     #[test]
@@ -396,5 +392,47 @@ mod tests {
         let draft = ProfileDraft::rdk_x5_unknown();
         assert!(draft.display_name.contains("Unknown"));
         assert!(draft.build().is_err());
+    }
+
+    #[test]
+    fn draft_clone_debug_and_profile_json_never_contain_password() {
+        let mut draft = ProfileDraft::new(DraftVariant::SshManaged);
+        draft.id = "camera".to_owned();
+        draft.display_name = "camera".to_owned();
+        let PlatformConfig::SshManaged(config) = &mut draft.config else {
+            panic!()
+        };
+        config.host = "camera.example".to_owned();
+        config.username = "root".to_owned();
+        config.expected_host_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
+                .to_owned();
+        config.credential_ref = "session:camera".to_owned();
+        config.remote_artifact_dir = "/data".to_owned();
+        config.remote_artifact_glob = "frame.raw".to_owned();
+        let mut manager = DeviceManagerState::default();
+        manager.ssh.set_password_for_test("super-secret");
+        assert!(!manager.ssh.password_is_empty());
+        manager.draft = Some(draft.clone());
+        let debug = format!("{:?}", manager.draft.as_ref().unwrap().clone());
+        assert!(!debug.contains("super-secret"));
+        let profile = manager.draft.as_ref().unwrap().build().unwrap();
+        let mut store = ProfileStore::new();
+        store.insert_platform(profile).unwrap();
+        let json = String::from_utf8(store.export_json().unwrap()).unwrap();
+        assert!(!json.contains("super-secret"));
+        assert!(json.contains("session:camera"));
+
+        let mut discard = manager.draft.take().unwrap();
+        discard_draft(&mut discard, &mut manager.ssh);
+        assert!(manager.ssh.password_is_empty());
+        manager.ssh.set_password_for_test("super-secret");
+        manager.ssh.reset_for_variant();
+        assert!(manager.ssh.password_is_empty());
+        manager.ssh.set_password_for_test("super-secret");
+        manager.draft = Some(draft);
+        manager.close();
+        assert!(manager.ssh.password_is_empty());
+        assert!(manager.draft.is_none());
     }
 }

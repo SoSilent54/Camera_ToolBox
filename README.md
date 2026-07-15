@@ -85,7 +85,7 @@ GUI 顶部依次选择 Platform Profile 和 `Sensor: Unbound` 或已配置的 Se
 
 - `Local`：只显示本地 RAW 打开入口。
 - `Hisilicon CV610`：一个 host 由 Dump/Stream 共享，默认端口分别为 `4321`/`80`。
-- `SSH-managed`：保存 host、port、username、严格固定的 OpenSSH host public key、credential reference、typed recipe id、远端根目录与 glob；不会保存密码或私钥内容。
+- `SSH-managed`：普通用户只需填写 host/IP、username、当前进程密码和一个绝对远程文件路径；server host key 由无认证 Verify 流程检查，Capture recipe、watcher 和限制放在折叠的 Advanced 区域。
 
 配置文件为 versioned JSON `platform-profiles.json`，目录由 `ProjectDirs::from("io", "sosilent", "camera-toolbox")` 解析。首次启动只创建 `Local files`；网络目标必须显式配置。导入时拒绝未知 schema、未知字段、重复 ID 和无效跨引用。编辑配置不会改变已提交 job；job 持有提交时的 Platform/Sensor/matrix snapshot hashes。
 
@@ -98,12 +98,26 @@ GUI 顶部依次选择 Platform Profile 和 `Sensor: Unbound` 或已配置的 Se
 
 ### SSH-managed
 
-普通 SSH `exec` 是默认命令路径。程序和 argv 布局只能来自部署时注册的 typed allowlist recipe，参数经过类型、范围、choice 或远端根目录校验，并逐 argv 做 POSIX shell-safe 编码；UI 不接受任意 shell command。可选 `CTARGV1 subsystem` 仅用于已经部署对应 helper 的目标。`Event subsystem` 也是可选优化，留空时使用限定目录/glob 的稳定性 polling。
+#### GUI 快速配置
 
-Credential reference 支持：
+1. 选择 `Device Manager...` → `New SSH-managed`。
+2. 填写 `Host / IP`、SSH port（默认 `22`）、`Username`。
+3. `Client authentication` 默认选择 `Password`；密码只进入当前进程内存，永不写入 profile、日志或导出文件。重启后再次编辑该 profile、输入密码并保存即可重新注册。
+4. 在 `Remote file` 粘贴一个绝对文件路径，例如 `/userdata/capture/frame.raw`。GUI 自动保存为受限 root `/userdata/capture` 与 literal basename `frame.raw`，选中 profile 时直接回填 `Fetch and Open` 路径。
+5. 点击 `Verify server identity`。该操作只做 SSH handshake，不发送用户名或密码：
+   - server key 与 OpenSSH `~/.ssh/known_hosts` 或原 profile pin 精确一致：自动显示 `Trusted`；
+   - 主机没有记录：显示算法和 SHA-256 fingerprint；必须通过设备控制台或管理员核对，勾选 `I verified this fingerprint out of band` 后才能显式信任；
+   - 主机已有不同 key：显示 `Server key changed` 并阻止连接，不提供一键替换。
+6. 点击 `Validate and Save`。新 profile 的 ID/display name 留空时由 `username@host` 稳定生成。
 
-- `key-file:/absolute/path`：操作时读取 OpenSSH private key；Unix 下要求权限不宽于 `0600`，文件最大 1 MiB。
-- `session:<id>`：在 Device Manager 中输入，仅保存在当前进程内，重启后必须重新输入。
+`SSH private key file` 是第二、可选的**客户端登录方式**，不是 server host key。GUI 自动发现 `~/.ssh` 中权限安全的 OpenSSH 私钥，也可通过文件选择器指定；profile 只保存 `key-file:/absolute/path`，不会保存私钥内容。密码与私钥不会互相 fallback，每次操作只使用当前选中的一种认证方式。
+
+默认 profile 是 Fetch/Watch-only：`capture_recipe` 为空时仍正常绑定 SFTP `RemoteFile`，`Fetch and Open` 与 Watch 不受影响；`Remote Capture` 明确禁用。只有部署了远端采集程序时，才在 `Advanced` 中启用 Capture automation，并配置 typed recipe。普通 SSH `exec` 仍是默认命令路径；程序和 argv 布局只能来自部署时注册的 typed allowlist recipe，UI 不接受任意 shell command。可选 `CTARGV1 subsystem` 和 `Event subsystem` 只用于已部署的 helper；Event 留空时使用限定目录/glob 的稳定性 polling。
+
+底层 profile 仍只保存 credential reference：
+
+- `session:<id>`：GUI 密码登录自动生成，只存在于当前进程；
+- `key-file:/absolute/path`：操作时读取经过权限、大小与 OpenSSH 格式检查的客户端私钥。
 
 生产 SSH capture recipe 从以下完整环境变量组加载；全部缺失表示没有部署 recipe，只有部分字段则启动时明确报错：
 

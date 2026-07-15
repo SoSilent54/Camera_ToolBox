@@ -5,11 +5,12 @@ use std::{
 };
 
 use camera_toolbox_app::{
-    CapabilityVariant, CaptureStore, CaptureStoreLimits, CommandServiceError, CommandTerminal,
-    DumpCancellation, OperationId, PlatformConfig, PlatformProfile, PlatformProfileId,
-    RemoteDiscoveryRequest, RemoteDiscoverySource, RemoteFileRequest, RemoteOpenDisposition,
-    RemoteOperationControl, RemoteServiceError, RemoteTimeouts, RemoteWatchEvent,
-    RemoteWatchRequest, SshManagedConfig, TypedCommandRequest,
+    CapabilityKind, CapabilityResolutionKey, CapabilityVariant, CaptureStore, CaptureStoreLimits,
+    CommandServiceError, CommandTerminal, DefaultCapabilityResolver, DumpCancellation, OperationId,
+    PlatformBindings, PlatformConfig, PlatformProfile, PlatformProfileId, RemoteDiscoveryRequest,
+    RemoteDiscoverySource, RemoteFileRequest, RemoteOpenDisposition, RemoteOperationControl,
+    RemoteServiceError, RemoteTimeouts, RemoteWatchEvent, RemoteWatchRequest,
+    ResolvedTargetBindings, SensorSelection, SshManagedConfig, TypedCommandRequest,
 };
 use camera_toolbox_core::{AssetId, MediaFormat, OwnedMediaPayload};
 use sha2::{Digest, Sha256};
@@ -120,6 +121,94 @@ fn strict_host_key_mismatch_fails_before_command_dispatch() {
         .unwrap_err();
     assert_eq!(error, CommandServiceError::HostKeyMismatch);
     assert!(memory.captured_argv().is_empty());
+}
+
+#[test]
+fn empty_recipe_binds_and_resolves_only_remote_file_then_fetches_in_memory() {
+    let path = format!("{ROOT}/sparse.raw");
+    let bytes = b"sparse-remote-file".to_vec();
+    let memory = MemorySshTransport::new(HOST_KEY);
+    memory.insert_file(
+        &path,
+        MemoryRemoteFile {
+            bytes: bytes.clone(),
+            stats: VecDeque::from([stat(&path, bytes.len() as u64, 1, true)]),
+        },
+    );
+    let mut sparse_profile = profile(false, None);
+    let PlatformConfig::SshManaged(config) = &mut sparse_profile.config else {
+        panic!()
+    };
+    config.capture_recipe.clear();
+    memory.allow_credential(CREDENTIAL_REF);
+    let resolver: Arc<dyn CredentialResolver> = Arc::new(memory.clone());
+    let transport: Arc<dyn SshTransportFactory> = Arc::new(memory.clone());
+    let sparse_provider = SshManagedPlatformProvider::new(
+        resolver,
+        transport,
+        Arc::new(CommandRecipeRegistry::new()),
+    );
+    let bindings = sparse_provider.bind(&sparse_profile).unwrap();
+    assert!(bindings.command.is_none());
+    assert!(bindings.remote_file.is_some());
+
+    let resolved = DefaultCapabilityResolver
+        .resolve(
+            &CapabilityResolutionKey {
+                platform_id: sparse_profile.id.clone(),
+                sensor: SensorSelection::Unbound,
+            },
+            &PlatformBindings::SshManaged(Arc::new(bindings.clone())),
+            None,
+            None,
+        )
+        .unwrap();
+    assert!(
+        resolved
+            .bindings
+            .capability(CapabilityKind::Command)
+            .is_none()
+    );
+    assert!(
+        resolved
+            .bindings
+            .capability(CapabilityKind::RemoteFile)
+            .is_some()
+    );
+    let ResolvedTargetBindings::SshManaged(resolved_bindings) = resolved.bindings.as_ref() else {
+        panic!("expected SSH-managed bindings")
+    };
+    let result = resolved_bindings
+        .remote_file
+        .as_ref()
+        .unwrap()
+        .service
+        .fetch(
+            OperationId::new("sparse-fetch").unwrap(),
+            request(&path, None),
+            control(DumpCancellation::default()),
+            &store(64, 64),
+        )
+        .unwrap();
+    let OwnedMediaPayload::Bytes(published) = &result.asset.source else {
+        panic!("expected byte payload")
+    };
+    assert_eq!(published.as_ref(), bytes.as_slice());
+}
+
+#[test]
+fn nonempty_unknown_recipe_is_a_typed_bind_error() {
+    let memory = MemorySshTransport::new(HOST_KEY);
+    let mut unknown = profile(false, None);
+    let PlatformConfig::SshManaged(config) = &mut unknown.config else {
+        panic!()
+    };
+    config.capture_recipe = "missing".to_owned();
+    assert!(matches!(
+        provider(&memory).bind(&unknown),
+        Err(super::SshManagedProviderError::CaptureRecipeNotRegistered(recipe))
+            if recipe == "missing"
+    ));
 }
 
 #[test]

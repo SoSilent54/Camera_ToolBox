@@ -49,7 +49,7 @@ CapabilityResolver ──► Arc<TargetResolutionSnapshot>
 PlatformController
         ├── Local Raw Loader
         ├── CV610 Dump/Stream
-        └── SSH Command/SFTP/Watcher
+        └── SSH RemoteFile/Watcher + optional Command
         │
         ▼
 bounded CaptureStore ──► EphemeralAsset ──► Workspace Tab
@@ -120,6 +120,9 @@ app controller / workflow  (统一状态机、权限校验、journal、错误语
 | Live close deadline | GUI/controller | 5 s | 异步关闭宽限；超时 kill sidecar 并记录 Forced。 |
 | SSH stable samples / interval | SSH profile | 2 / 500 ms | 无 producer marker 时的 size+mtime 稳定判断。 |
 | Passive watcher auto-open | SSH profile | false | 默认只进入 Assets，不抢 active Tab。 |
+| SSH authentication | GUI/session | Password | Password 仅驻留当前进程；客户端私钥文件是显式选择的第二方式，不做自动 fallback。 |
+| SSH host-key scan timeout | GUI onboarding | 5 s | 无认证 handshake 的总时限；egui 线程只轮询异步结果。 |
+| SSH capture recipe | SSH profile | disabled / empty | 空 recipe 只绑定 RemoteFile，Fetch/Watch 不依赖远端采集程序。 |
 | Sensor selection | Capability resolver | Unbound | 当前 platform-only 能力无需 Sensor 即可使用。 |
 
 ## 安全边界
@@ -130,7 +133,7 @@ app controller / workflow  (统一状态机、权限校验、journal、错误语
 - SSH 断线、采集失败、hash mismatch、RAW spec mismatch 都必须进入明确错误状态。
 - CV610/SSH 网络 source 必须先进入有界内存；capture/watch 禁止 `.part`、wire/manifest 临时文件和 disk spill。显式导出只允许新目标，拒绝覆盖已有文件。
 - SSH command 只接受部署 allowlist recipe 与 typed 参数。普通 SSH exec 对每个 argv 做 POSIX shell-safe 编码；可选 CTARGV1/event subsystem 必须显式配置和探测。
-- SSH 必须严格比对 profile 中的 OpenSSH host public key；profile 只保存 `key-file:` 或 `session:` credential reference。
+- SSH 实际操作始终严格比对 profile 中的 OpenSSH server host public key。GUI onboarding 通过无认证 handshake 获取候选 key：与 `known_hosts`/既有 pin 精确一致才自动信任；未知 key 必须显示 SHA-256 fingerprint 并由用户显式确认；已有记录不匹配时硬失败。profile 只保存 `session:` 或 `key-file:` credential reference，密码仅驻留进程，客户端私钥内容按 operation 读取。
 - GUI Hover View 的 RAW 邻域直接采样 raw preview texture；正常样本为灰度，超 bit-depth 样本使用洋红诊断色，图像外邻域格明确留空，绝不通过边界 clamp 伪造样本。
 - Hover View 偏好由 app 级状态持有，不随加载、关闭或 Reset View 重置；其 foreground `Area` 必须不可交互，不能拦截 viewer 的 hover、缩放或拖拽。
 - 彩色纹理、rendered params、revision 与 diagnostics 必须同批安装；Hover View 的 RGB/CFA 只按已安装参数计算，pending 参数不得提前影响显示读数，首次渲染错误必须显示 unavailable 而不是 rendering。

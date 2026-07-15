@@ -303,12 +303,15 @@ impl SshManagedConfig {
         }
         if let Some(subsystem) = &self.command_subsystem {
             validate_subsystem(subsystem)?;
+            if self.capture_recipe.is_empty() {
+                return Err(ProfileError::CommandSubsystemWithoutRecipe);
+            }
         }
         if let Some(subsystem) = &self.remote_event_subsystem {
             validate_subsystem(subsystem)?;
         }
-        if self.capture_recipe.trim().is_empty() {
-            return Err(ProfileError::EmptyCaptureRecipe);
+        if !self.capture_recipe.is_empty() && self.capture_recipe.trim().is_empty() {
+            return Err(ProfileError::InvalidCaptureRecipe);
         }
         if !self.remote_artifact_dir.starts_with('/')
             || self.remote_artifact_dir.contains('\0')
@@ -351,12 +354,30 @@ fn validate_subsystem(subsystem: &str) -> Result<(), ProfileError> {
     Ok(())
 }
 
-fn validate_host(host: &str) -> Result<(), ProfileError> {
-    if host.trim().is_empty() {
-        Err(ProfileError::EmptyHost)
-    } else {
-        Ok(())
+/// 校验可安全传给 socket 解析与 russh known_hosts API 的裸 host。
+///
+/// IPv6 使用未加方括号的形式；非默认端口的 known_hosts 标记由 russh 生成。
+///
+/// # Errors
+///
+/// host 为空、含首尾空白、ASCII 空白/控制字符或 known_hosts 分隔符时返回错误。
+pub fn validate_ssh_host(host: &str) -> Result<(), ProfileError> {
+    if host.is_empty() {
+        return Err(ProfileError::EmptyHost);
     }
+    if host.trim() != host
+        || host
+            .bytes()
+            .any(|byte| byte.is_ascii_whitespace() || byte.is_ascii_control())
+        || host.contains([',', '[', ']', '|', '#'])
+    {
+        return Err(ProfileError::UnsafeHost);
+    }
+    Ok(())
+}
+
+fn validate_host(host: &str) -> Result<(), ProfileError> {
+    validate_ssh_host(host)
 }
 
 fn validate_port(port: u16, service: &'static str) -> Result<(), ProfileError> {
@@ -558,8 +579,12 @@ pub enum ProfileError {
     EmptyCredentialReference,
     #[error("SSH subsystem must contain only ASCII letters, digits, '-', '_' or '.'")]
     InvalidSshSubsystem,
-    #[error("capture recipe must not be empty")]
-    EmptyCaptureRecipe,
+    #[error("an SSH command subsystem requires a non-empty capture recipe")]
+    CommandSubsystemWithoutRecipe,
+    #[error("capture recipe must be empty or contain non-whitespace characters")]
+    InvalidCaptureRecipe,
+    #[error("platform host contains whitespace, control characters or known_hosts delimiters")]
+    UnsafeHost,
     #[error("remote artifact directory must be an absolute normalized path")]
     InvalidRemoteArtifactDirectory,
     #[error("remote artifact glob must be a non-empty basename pattern")]
@@ -604,5 +629,59 @@ mod tests {
         assert_eq!(config.host, "10.21.12.102");
         assert_eq!(config.dump.port, 4321);
         assert!(profile.snapshot_hash().is_ok());
+    }
+
+    fn ssh_config(host: &str) -> SshManagedConfig {
+        SshManagedConfig {
+            host: host.to_owned(),
+            port: 22,
+            username: "camera".to_owned(),
+            expected_host_key: "ssh-ed25519 AAAA".to_owned(),
+            credential_ref: "session:camera".to_owned(),
+            command_subsystem: None,
+            capture_recipe: String::new(),
+            remote_artifact_dir: "/data".to_owned(),
+            remote_artifact_glob: "*.raw".to_owned(),
+            remote_event_subsystem: None,
+            passive_watch_auto_open: false,
+            stable_samples: 2,
+            stability_interval_ms: 500,
+            max_fetch_bytes: 1024,
+            command_output_bytes: 1024,
+        }
+    }
+
+    #[test]
+    fn empty_recipe_is_valid_only_without_command_subsystem() {
+        assert!(ssh_config("camera.local").validate().is_ok());
+        let mut inconsistent = ssh_config("camera.local");
+        inconsistent.command_subsystem = Some("camera-toolbox-argv-v1".to_owned());
+        assert!(matches!(
+            inconsistent.validate(),
+            Err(ProfileError::CommandSubsystemWithoutRecipe)
+        ));
+    }
+
+    #[test]
+    fn ssh_host_rejects_known_hosts_injection_and_accepts_normal_addresses() {
+        for host in ["camera.local", "192.0.2.10", "2001:db8::10", "::1"] {
+            assert!(validate_ssh_host(host).is_ok(), "rejected {host:?}");
+        }
+        for host in [
+            " camera.local",
+            "camera.local ",
+            "camera\t.local",
+            "camera\nattacker",
+            "camera\0attacker",
+            "camera,attacker",
+            "[2001:db8::10]",
+            "|1|salt|hash",
+            "camera#comment",
+        ] {
+            assert!(
+                matches!(validate_ssh_host(host), Err(ProfileError::UnsafeHost)),
+                "accepted {host:?}"
+            );
+        }
     }
 }

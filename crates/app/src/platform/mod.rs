@@ -38,7 +38,7 @@ pub use profile::{
     CapabilityResolutionKey, Cv610Config, Cv610DumpConfig, Cv610StreamConfig,
     DumpInitializationPolicy, LocalConfig, PlatformConfig, PlatformProfile, PlatformProfileId,
     ProfileError, SensorCatalog, SensorDescriptor, SensorId, SensorModeKey, SensorModeSnapshot,
-    SensorSelection, SshManagedConfig,
+    SensorSelection, SshManagedConfig, validate_ssh_host,
 };
 pub use profile_store::{PROFILE_STORE_SCHEMA_VERSION, ProfileStore, ProfileStoreError};
 pub use remote::{

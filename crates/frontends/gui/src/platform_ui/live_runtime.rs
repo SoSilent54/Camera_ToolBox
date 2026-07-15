@@ -22,11 +22,16 @@ use camera_toolbox_app::{
 };
 use camera_toolbox_core::{AssetId, BayerPattern, EphemeralAsset, MediaFormat};
 use eframe::egui;
-use secrecy::SecretString;
 
 use super::{
     DeviceManagerAction, DeviceManagerState, StreamPanelAction, StreamPanelState,
+    profile_commit::{normalize_profile_commit, persist_profile_candidate},
     render_stream_panel,
+    ssh_profile::{combine_remote_file, is_literal_remote_glob},
+    ssh_runtime::{
+        SshRuntimeAction, decorate_remote_asset, remote_format_name, remote_state_label,
+        render_ssh_controls,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -63,15 +68,15 @@ struct JobContext {
 }
 
 #[derive(Debug, Clone)]
-struct CapturePanelState {
-    dump_kind: VerifiedDumpKind,
-    manual_bayer: BayerPattern,
-    remote_path: String,
-    remote_format: MediaFormat,
-    remote_width: u32,
-    remote_height: u32,
-    remote_stride: usize,
-    watcher_operation: Option<OperationId>,
+pub(super) struct CapturePanelState {
+    pub(super) dump_kind: VerifiedDumpKind,
+    pub(super) manual_bayer: BayerPattern,
+    pub(super) remote_path: String,
+    pub(super) remote_format: MediaFormat,
+    pub(super) remote_width: u32,
+    pub(super) remote_height: u32,
+    pub(super) remote_stride: usize,
+    pub(super) watcher_operation: Option<OperationId>,
 }
 
 impl Default for CapturePanelState {
@@ -230,8 +235,23 @@ impl LiveRuntime {
                 .selected_profile
                 .as_ref()
                 .and_then(|id| self.profiles.platform(id))
+                .cloned()
             {
-                self.device_manager.edit(profile);
+                let readiness = match &profile.config {
+                    PlatformConfig::SshManaged(config)
+                        if config.credential_ref.starts_with("session:") =>
+                    {
+                        self.credential_resolver.has_session(&config.credential_ref)
+                    }
+                    _ => Ok(true),
+                };
+                self.device_manager
+                    .edit(&profile, readiness.as_ref().copied().unwrap_or(false));
+                if let Err(error) = readiness {
+                    self.device_manager.message = Some(format!(
+                        "Password registry status is unavailable: {error}; re-enter the password"
+                    ));
+                }
             } else {
                 self.device_manager.open = true;
             }
@@ -285,7 +305,23 @@ impl LiveRuntime {
                 }
             }
             PlatformConfig::SshManaged(config) => {
-                self.render_ssh_controls(ui, &config);
+                if let Some(ssh_action) = render_ssh_controls(
+                    ui,
+                    &config,
+                    &mut self.capture_panel,
+                    self.snapshot.as_deref(),
+                ) {
+                    match ssh_action {
+                        SshRuntimeAction::Capture => self.submit_remote_command(&config),
+                        SshRuntimeAction::Fetch => self.submit_remote_fetch(),
+                        SshRuntimeAction::StartWatch => self.submit_watch(),
+                        SshRuntimeAction::StopWatch(operation) => {
+                            if self.controller.cancel(&operation) {
+                                self.capture_panel.watcher_operation = None;
+                            }
+                        }
+                    }
+                }
             }
         }
         ui.separator();
@@ -309,41 +345,95 @@ impl LiveRuntime {
         action: DeviceManagerAction,
     ) -> Result<String, String> {
         match action {
-            DeviceManagerAction::Commit(draft) => {
-                let profile = draft.build()?;
-                if let Some(original) = &draft.original_id {
-                    if *original != profile.id {
-                        return Err(
-                            "profile ID is immutable while editing; duplicate it instead"
-                                .to_owned(),
-                        );
+            DeviceManagerAction::Commit { draft, ssh_auth } => {
+                let old_reference = draft
+                    .original_id
+                    .as_ref()
+                    .and_then(|id| self.profiles.platform(id))
+                    .and_then(|profile| match &profile.config {
+                        PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
+                        _ => None,
+                    });
+                let normalized = normalize_profile_commit(&self.profiles, draft, ssh_auth)?;
+                let profile = normalized.profile;
+                let original_id = normalized.original_id;
+                let candidate = persist_profile_candidate(
+                    &self.profiles,
+                    profile.clone(),
+                    original_id.as_ref(),
+                    |candidate| candidate.save_project().map_err(|error| error.to_string()),
+                )?;
+                let new_reference = match &profile.config {
+                    PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
+                    _ => None,
+                };
+
+                // candidate 已持久化；从这里开始的错误必须明确报告 partial state。
+                self.profiles = candidate;
+                if old_reference.as_deref().is_some_and(|reference| {
+                    reference.starts_with("session:") && Some(reference) != new_reference.as_deref()
+                }) && let Some(reference) = old_reference.as_deref()
+                {
+                    let _ = self.credential_resolver.remove_session(reference);
+                }
+
+                let registration = normalized.session_password.map(|(session_id, password)| {
+                    self.credential_resolver
+                        .register_session_password(&session_id, password)
+                });
+                let registration_error = registration.and_then(Result::err);
+                let readiness = match new_reference.as_deref() {
+                    Some(reference) if reference.starts_with("session:") => {
+                        self.credential_resolver.has_session(reference)
                     }
-                    self.profiles
-                        .replace_platform(profile.clone())
-                        .map_err(|error| error.to_string())?;
+                    _ => Ok(true),
+                };
+                self.select_platform(profile.id.clone());
+                self.device_manager
+                    .mark_saved(&profile, readiness.as_ref().copied().unwrap_or(false));
+                if let Some(error) = registration_error {
+                    return Err(format!(
+                        "profile {} was persisted and installed, but process-only password registration failed: {error}; remote operations remain unavailable until the password is re-entered",
+                        profile.id
+                    ));
+                }
+                let password_registered = readiness.map_err(|error| format!(
+                    "profile {} was persisted and installed, but password registry status is unavailable: {error}",
+                    profile.id
+                ))?;
+                let password_note = if password_registered {
+                    ""
                 } else {
-                    self.profiles
-                        .insert_platform(profile.clone())
-                        .map_err(|error| error.to_string())?;
-                }
-                self.profiles
-                    .save_project()
-                    .map_err(|error| error.to_string())?;
-                if self.selected_profile.as_ref() == Some(&profile.id) {
-                    self.select_platform(profile.id.clone());
-                }
-                Ok(format!("Saved profile {}", profile.id))
+                    "; password is not registered in this process"
+                };
+                Ok(format!("Saved profile {}{password_note}", profile.id))
             }
+            DeviceManagerAction::ValidationError(error) => Err(error),
             DeviceManagerAction::Delete(id) => {
                 if self.profiles.platforms().count() <= 1 {
                     return Err("at least one platform profile must remain".to_owned());
                 }
-                self.profiles
+                let old_reference = self
+                    .profiles
+                    .platform(&id)
+                    .and_then(|profile| match &profile.config {
+                        PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
+                        _ => None,
+                    });
+                let mut candidate = self.profiles.clone();
+                candidate
                     .remove_platform(&id)
                     .map_err(|error| error.to_string())?;
-                self.profiles
+                candidate
                     .save_project()
                     .map_err(|error| error.to_string())?;
+                self.profiles = candidate;
+                if let Some(reference) = old_reference.as_deref()
+                    && reference.starts_with("session:")
+                {
+                    let _ = self.credential_resolver.remove_session(reference);
+                }
+                self.device_manager.mark_deleted();
                 if self.selected_profile.as_ref() == Some(&id) {
                     let next = self
                         .profiles
@@ -363,10 +453,9 @@ impl LiveRuntime {
                     .platforms()
                     .next()
                     .map(|profile| profile.id.clone());
+                imported.save_project().map_err(|error| error.to_string())?;
                 self.profiles = imported;
-                self.profiles
-                    .save_project()
-                    .map_err(|error| error.to_string())?;
+                self.device_manager.mark_deleted();
                 if let Some(next) = next {
                     self.select_platform(next);
                 }
@@ -377,20 +466,6 @@ impl LiveRuntime {
                     .save_to_path(&path)
                     .map_err(|error| error.to_string())?;
                 Ok(format!("Exported {}", path.display()))
-            }
-            DeviceManagerAction::RegisterSessionSecret { id, secret } => {
-                if secret.is_empty() {
-                    return Err("session secret must not be empty".to_owned());
-                }
-                let reference = self
-                    .credential_resolver
-                    .register_session_password(&id, SecretString::from(secret))?;
-                if let Some(draft) = self.device_manager.draft.as_mut()
-                    && let PlatformConfig::SshManaged(config) = &mut draft.config
-                {
-                    config.credential_ref = reference.clone();
-                }
-                Ok(format!("Registered {reference} for this process only"))
             }
         }
     }
@@ -404,6 +479,12 @@ impl LiveRuntime {
             self.binding_error = Some(format!("platform profile {id} no longer exists"));
             return;
         };
+        if let PlatformConfig::SshManaged(config) = &profile.config
+            && is_literal_remote_glob(&config.remote_artifact_glob)
+        {
+            self.capture_panel.remote_path =
+                combine_remote_file(&config.remote_artifact_dir, &config.remote_artifact_glob);
+        }
         self.bind_count = self.bind_count.saturating_add(1);
         match self.registry.bind(profile) {
             Ok(candidate) => {
@@ -413,7 +494,8 @@ impl LiveRuntime {
             Err(error) => {
                 self.binding_error = Some(match &profile.config {
                     PlatformConfig::SshManaged(config)
-                        if !self.recipes.contains(&config.capture_recipe) =>
+                        if !config.capture_recipe.is_empty()
+                            && !self.recipes.contains(&config.capture_recipe) =>
                     {
                         format!(
                             "SSH typed recipe '{}' is unavailable. Configure the complete CAMERA_TOOLBOX_SSH_RECIPE_* environment group with a verified absolute program, typed flags, allowed formats, remote root and path-on-stdout contract; no command was sent.",
@@ -498,101 +580,6 @@ impl LiveRuntime {
                 self.submit_dump(OpenIntent::Foreground);
             }
         });
-    }
-
-    fn render_ssh_controls(
-        &mut self,
-        ui: &mut egui::Ui,
-        config: &camera_toolbox_app::SshManagedConfig,
-    ) {
-        ui.heading("SSH-managed");
-        ui.label(format!(
-            "{}@{}:{}",
-            config.username, config.host, config.port
-        ));
-        ui.label(format!("Remote root: {}", config.remote_artifact_dir));
-        ui.label(format!("Typed recipe: {}", config.capture_recipe));
-        ui.label(match config.command_subsystem.as_deref() {
-            Some(subsystem) => format!("Command transport: CTARGV1 subsystem '{subsystem}'"),
-            None => "Command transport: standard SSH exec (no argv helper)".to_owned(),
-        });
-        ui.label(match config.remote_event_subsystem.as_deref() {
-            Some(subsystem) => format!("Discovery: event subsystem '{subsystem}'"),
-            None => "Discovery: directory polling fallback".to_owned(),
-        });
-        if !self.recipes.contains(&config.capture_recipe) {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                "Typed capture recipe unavailable; capture is disabled instead of reporting fake success.",
-            );
-        }
-        let enabled = self.snapshot.is_some();
-        if ui
-            .add_enabled(enabled, egui::Button::new("Remote Capture"))
-            .clicked()
-        {
-            self.submit_remote_command(config);
-        }
-        ui.separator();
-        ui.heading("Remote Files");
-        ui.text_edit_singleline(&mut self.capture_panel.remote_path);
-        remote_format_selector(ui, &mut self.capture_panel.remote_format);
-        self.render_remote_geometry(ui);
-        if ui
-            .add_enabled(
-                enabled && !self.capture_panel.remote_path.is_empty(),
-                egui::Button::new("Fetch and Open"),
-            )
-            .clicked()
-        {
-            self.submit_remote_fetch();
-        }
-        ui.separator();
-        ui.heading("Watch");
-        ui.label(if config.passive_watch_auto_open {
-            "Stable watched assets open only in background."
-        } else {
-            "Stable watched assets are collected but never auto-opened."
-        });
-        if let Some(operation) = self.capture_panel.watcher_operation.clone() {
-            if ui.button("Stop Watch").clicked() && self.controller.cancel(&operation) {
-                self.capture_panel.watcher_operation = None;
-            }
-        } else if ui
-            .add_enabled(enabled, egui::Button::new("Start Watch"))
-            .clicked()
-        {
-            self.submit_watch();
-        }
-    }
-
-    fn render_remote_geometry(&mut self, ui: &mut egui::Ui) {
-        if !matches!(
-            self.capture_panel.remote_format,
-            MediaFormat::RawPacked { .. } | MediaFormat::Yuv420Sp { .. }
-        ) {
-            return;
-        }
-        egui::Grid::new("remote_media_geometry")
-            .num_columns(2)
-            .show(ui, |ui| {
-                ui.label("Width");
-                ui.add(
-                    egui::DragValue::new(&mut self.capture_panel.remote_width).range(1..=u32::MAX),
-                );
-                ui.end_row();
-                ui.label("Height");
-                ui.add(
-                    egui::DragValue::new(&mut self.capture_panel.remote_height).range(1..=u32::MAX),
-                );
-                ui.end_row();
-                ui.label("Stride bytes");
-                ui.add(
-                    egui::DragValue::new(&mut self.capture_panel.remote_stride)
-                        .range(1..=usize::MAX),
-                );
-                ui.end_row();
-            });
     }
 
     fn render_jobs_assets(&self, ui: &mut egui::Ui) {
@@ -1019,250 +1006,6 @@ fn dump_media_format(kind: VerifiedDumpKind) -> MediaFormat {
     }
 }
 
-fn remote_format_selector(ui: &mut egui::Ui, format: &mut MediaFormat) {
-    egui::ComboBox::from_id_salt("remote_media_format")
-        .selected_text(remote_format_name(format))
-        .show_ui(ui, |ui| {
-            ui.selectable_value(format, MediaFormat::Jpeg, "JPEG");
-            ui.selectable_value(format, MediaFormat::RawPacked { bit_depth: 10 }, "RAW10");
-            ui.selectable_value(format, MediaFormat::RawPacked { bit_depth: 12 }, "RAW12");
-            ui.selectable_value(
-                format,
-                MediaFormat::Yuv420Sp {
-                    chroma_order: camera_toolbox_core::ChromaOrder::Vu,
-                },
-                "NV21",
-            );
-        });
-}
-
-fn remote_format_name(format: &MediaFormat) -> &'static str {
-    match format {
-        MediaFormat::Jpeg => "jpeg",
-        MediaFormat::RawPacked { bit_depth: 10 } => "raw10",
-        MediaFormat::RawPacked { bit_depth: 12 } => "raw12",
-        MediaFormat::Yuv420Sp {
-            chroma_order: camera_toolbox_core::ChromaOrder::Vu,
-        } => "nv21",
-        _ => "binary",
-    }
-}
-
-fn decorate_remote_asset(
-    asset: Arc<EphemeralAsset>,
-    panel: &CapturePanelState,
-) -> Arc<EphemeralAsset> {
-    if matches!(asset.metadata.format, MediaFormat::Jpeg) {
-        return asset;
-    }
-    let mut owned = (*asset).clone();
-    owned
-        .metadata
-        .attributes
-        .insert("width".to_owned(), panel.remote_width.to_string());
-    owned
-        .metadata
-        .attributes
-        .insert("height".to_owned(), panel.remote_height.to_string());
-    match owned.metadata.format {
-        MediaFormat::RawPacked { .. } => {
-            owned
-                .metadata
-                .attributes
-                .insert("stride".to_owned(), panel.remote_stride.to_string());
-        }
-        MediaFormat::Yuv420Sp { .. } => {
-            owned
-                .metadata
-                .attributes
-                .insert("y_stride".to_owned(), panel.remote_stride.to_string());
-            owned
-                .metadata
-                .attributes
-                .insert("chroma_stride".to_owned(), panel.remote_stride.to_string());
-        }
-        _ => {}
-    }
-    Arc::new(owned)
-}
-
-fn remote_state_label(state: &RemoteJobState) -> String {
-    match state {
-        RemoteJobState::Queued => "Queued".to_owned(),
-        RemoteJobState::Running(stage) => format!("Running: {stage:?}"),
-        RemoteJobState::CommandCompleted(result) => format!("Command: {:?}", result.terminal),
-        RemoteJobState::AssetReady { asset_id, .. } => format!("Asset ready: {asset_id}"),
-        RemoteJobState::Watch(RemoteWatchEvent::AssetReady { result, open }) => {
-            format!("Watched asset: {} ({open:?})", result.asset.id)
-        }
-        RemoteJobState::Watch(RemoteWatchEvent::CandidateFailed { path, error }) => {
-            format!("Watch candidate {path}: {error}")
-        }
-        RemoteJobState::Watch(RemoteWatchEvent::Terminal(terminal)) => {
-            format!("Watch stopped: {terminal:?}")
-        }
-        RemoteJobState::Failed(error) => format!("Failed: {error:?}"),
-    }
-}
-
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use camera_toolbox_app::{
-        CapabilityKind, LocalConfig, OperationId, PlatformConfig, PlatformProfile,
-        PlatformProfileId, SensorDescriptor, SensorId, SensorModeKey, SensorSelection,
-    };
-    use camera_toolbox_core::{
-        AssetId, BayerPattern, CaptureMetadata, EphemeralAsset, IntegrityState, MediaFormat,
-        OwnedMediaPayload, RawSpec,
-        sensor::{SensorMode, SensorProfile},
-    };
-
-    use super::{AssetOpenSpec, JobContext, LiveRuntime, OpenIntent, PlatformEffect};
-
-    fn local_profile(id: &str) -> PlatformProfile {
-        PlatformProfile {
-            id: PlatformProfileId::new(id).unwrap(),
-            display_name: id.to_owned(),
-            config: PlatformConfig::Local(LocalConfig::default()),
-        }
-    }
-
-    fn sensor() -> SensorDescriptor {
-        SensorDescriptor {
-            id: SensorId::new("sensor-a").unwrap(),
-            display_name: "Sensor A".to_owned(),
-            profile: SensorProfile {
-                model: "sensor-a".to_owned(),
-                modes: vec![SensorMode {
-                    id: "mode-a".to_owned(),
-                    raw: RawSpec {
-                        width: 4,
-                        height: 2,
-                        bit_depth: 12,
-                        bayer: BayerPattern::Rggb,
-                    },
-                    is_wdr: false,
-                }],
-                registers: Vec::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn platform_and_sensor_selectors_are_independent_and_unbound_remains_usable() {
-        let mut runtime = LiveRuntime::new().unwrap();
-        runtime.profiles = camera_toolbox_app::ProfileStore::new();
-        runtime
-            .profiles
-            .insert_platform(local_profile("local-a"))
-            .unwrap();
-        runtime
-            .profiles
-            .insert_platform(local_profile("local-b"))
-            .unwrap();
-        runtime.profiles.insert_sensor(sensor()).unwrap();
-
-        runtime.select_platform(PlatformProfileId::new("local-a").unwrap());
-        let unbound = runtime.snapshot.as_ref().unwrap();
-        assert_eq!(runtime.sensor_selection, SensorSelection::Unbound);
-        assert!(
-            unbound
-                .bindings
-                .capability(CapabilityKind::LocalOpen)
-                .is_some()
-        );
-
-        let selection = SensorSelection::Mode(SensorModeKey {
-            sensor_id: SensorId::new("sensor-a").unwrap(),
-            mode_id: "mode-a".to_owned(),
-        });
-        runtime.select_sensor(selection.clone());
-        let first_hash = runtime.snapshot.as_ref().unwrap().aggregate_hash;
-        runtime.select_platform(PlatformProfileId::new("local-b").unwrap());
-
-        assert_eq!(runtime.sensor_selection, selection);
-        assert_ne!(
-            runtime.snapshot.as_ref().unwrap().aggregate_hash,
-            first_hash
-        );
-        assert!(
-            runtime
-                .snapshot
-                .as_ref()
-                .unwrap()
-                .bindings
-                .capability(CapabilityKind::LocalOpen)
-                .is_some()
-        );
-    }
-    #[test]
-    fn background_asset_is_retained_without_opening_while_foreground_emits_open_effect() {
-        let mut runtime = LiveRuntime::new().unwrap();
-        runtime.profiles = camera_toolbox_app::ProfileStore::new();
-        runtime
-            .profiles
-            .insert_platform(local_profile("local-a"))
-            .unwrap();
-        runtime.select_platform(PlatformProfileId::new("local-a").unwrap());
-        let snapshot = runtime.snapshot.clone().unwrap();
-
-        for (suffix, intent, expected_effects) in [
-            ("background", OpenIntent::None, 0),
-            ("foreground", OpenIntent::Foreground, 1),
-        ] {
-            let operation = OperationId::new(format!("operation-{suffix}")).unwrap();
-            let asset_id = AssetId::new(format!("asset-{suffix}")).unwrap();
-            let bytes = Arc::<[u8]>::from(&b"abc"[..]);
-            let reservation = runtime
-                .capture_store
-                .reserve(operation.clone(), bytes.len())
-                .unwrap();
-            runtime
-                .capture_store
-                .publish_validated(
-                    reservation,
-                    EphemeralAsset::new(
-                        asset_id.clone(),
-                        OwnedMediaPayload::from_bytes(bytes),
-                        CaptureMetadata {
-                            format: MediaFormat::Binary,
-                            source_name: suffix.to_owned(),
-                            attributes: Default::default(),
-                        },
-                        IntegrityState::Verified {
-                            algorithm: "test".to_owned(),
-                            digest: suffix.to_owned(),
-                        },
-                    ),
-                )
-                .unwrap();
-            runtime.submissions.insert(
-                operation.clone(),
-                JobContext {
-                    snapshot: Arc::clone(&snapshot),
-                    intent,
-                    format: MediaFormat::Binary,
-                    spec: AssetOpenSpec {
-                        bayer: BayerPattern::Rggb,
-                    },
-                },
-            );
-
-            let mut effects = Vec::new();
-            runtime.finish_asset_operation(&operation, &asset_id, false, &mut effects);
-            assert_eq!(effects.len(), expected_effects);
-            assert!(runtime.assets.contains_key(&asset_id));
-            if expected_effects == 1 {
-                assert!(matches!(
-                    effects[0],
-                    PlatformEffect::OpenAsset {
-                        foreground: true,
-                        ..
-                    }
-                ));
-            }
-        }
-    }
-}
+#[path = "live_runtime_tests.rs"]
+mod tests;

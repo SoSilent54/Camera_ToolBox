@@ -63,17 +63,44 @@ impl SshManagedPlatformProvider {
         let PlatformConfig::SshManaged(config) = &profile.config else {
             return Err(SshManagedProviderError::WrongProfileVariant);
         };
-        if !self.recipes.contains(&config.capture_recipe) {
-            return Err(SshManagedProviderError::CaptureRecipeNotRegistered(
-                config.capture_recipe.clone(),
-            ));
-        }
-        let command_output_bytes = usize::try_from(config.command_output_bytes).map_err(|_| {
-            SshManagedProviderError::LimitUnsupported {
-                name: "command_output_bytes",
-                value: config.command_output_bytes,
+        let command = if config.capture_recipe.is_empty() {
+            None
+        } else {
+            if !self.recipes.contains(&config.capture_recipe) {
+                return Err(SshManagedProviderError::CaptureRecipeNotRegistered(
+                    config.capture_recipe.clone(),
+                ));
             }
-        })?;
+            let command_output_bytes =
+                usize::try_from(config.command_output_bytes).map_err(|_| {
+                    SshManagedProviderError::LimitUnsupported {
+                        name: "command_output_bytes",
+                        value: config.command_output_bytes,
+                    }
+                })?;
+            let command_service = SshCommandService::new(
+                format!("ssh-managed:{}:command", profile.id.as_str()),
+                SshConnectionTarget {
+                    host: config.host.clone(),
+                    port: config.port,
+                    username: config.username.clone(),
+                    expected_host_key: config.expected_host_key.clone(),
+                    command_subsystem: config.command_subsystem.clone(),
+                    remote_event_subsystem: config.remote_event_subsystem.clone(),
+                },
+                config.credential_ref.clone(),
+                config.capture_recipe.clone(),
+                Arc::clone(&self.resolver),
+                Arc::clone(&self.transport),
+                Arc::clone(&self.recipes),
+                command_output_bytes,
+            );
+            let descriptor = Arc::new(command_descriptor(config, platform_snapshot_hash));
+            Some(PlatformCapabilityHandle {
+                service: Arc::new(command_service) as Arc<dyn CommandService>,
+                descriptor,
+            })
+        };
         let target = SshConnectionTarget {
             host: config.host.clone(),
             port: config.port,
@@ -82,16 +109,6 @@ impl SshManagedPlatformProvider {
             command_subsystem: config.command_subsystem.clone(),
             remote_event_subsystem: config.remote_event_subsystem.clone(),
         };
-        let command_service = SshCommandService::new(
-            format!("ssh-managed:{}:command", profile.id.as_str()),
-            target.clone(),
-            config.credential_ref.clone(),
-            config.capture_recipe.clone(),
-            Arc::clone(&self.resolver),
-            Arc::clone(&self.transport),
-            Arc::clone(&self.recipes),
-            command_output_bytes,
-        );
         let remote_file_service = SshRemoteFileService::new(
             format!("ssh-managed:{}:remote-file", profile.id.as_str()),
             target,
@@ -105,30 +122,6 @@ impl SshManagedPlatformProvider {
             config.passive_watch_auto_open,
             config.max_fetch_bytes,
         );
-        let command_descriptor = Arc::new(PlatformCapabilityDescriptor {
-            capability: CapabilityKind::Command,
-            requirement: CapabilityRequirement::PlatformOnly,
-            provider: PlatformKind::SshManaged,
-            driver: if config.command_subsystem.is_some() {
-                "russh-ctargv1-subsystem-v1".to_owned()
-            } else {
-                "russh-standard-exec-posix-argv-v1".to_owned()
-            },
-            evidence: EvidenceMaturity::ProtocolVerified,
-            minimum_sensor_evidence: EvidenceMaturity::Unknown,
-            initialization: InitializationState::NotRequired,
-            concurrency: ConcurrencyPolicy::Independent,
-            hard_limits: CapabilityLimits {
-                max_payload_bytes: Some(config.command_output_bytes),
-                max_concurrent_operations: Some(1),
-            },
-            supported_variants: BTreeSet::from([if config.command_subsystem.is_some() {
-                CapabilityVariant::ArgvSubsystemCommand
-            } else {
-                CapabilityVariant::StandardExecCommand
-            }]),
-            platform_snapshot_hash,
-        });
         let remote_descriptor = Arc::new(PlatformCapabilityDescriptor {
             capability: CapabilityKind::RemoteFile,
             requirement: CapabilityRequirement::PlatformOnly,
@@ -148,10 +141,7 @@ impl SshManagedPlatformProvider {
             ]),
             platform_snapshot_hash,
         });
-        let command: PlatformCapabilityHandle<dyn CommandService> = PlatformCapabilityHandle {
-            service: Arc::new(command_service),
-            descriptor: command_descriptor,
-        };
+        let command: Option<PlatformCapabilityHandle<dyn CommandService>> = command;
         let remote_file: PlatformCapabilityHandle<dyn RemoteFileService> =
             PlatformCapabilityHandle {
                 service: Arc::new(remote_file_service),
@@ -161,9 +151,39 @@ impl SshManagedPlatformProvider {
             profile.id.clone(),
             platform_snapshot_hash,
             Some(remote_file),
-            Some(command),
+            command,
         )
         .map_err(Into::into)
+    }
+}
+
+fn command_descriptor(
+    config: &camera_toolbox_app::SshManagedConfig,
+    platform_snapshot_hash: camera_toolbox_app::SnapshotHash,
+) -> PlatformCapabilityDescriptor {
+    PlatformCapabilityDescriptor {
+        capability: CapabilityKind::Command,
+        requirement: CapabilityRequirement::PlatformOnly,
+        provider: PlatformKind::SshManaged,
+        driver: if config.command_subsystem.is_some() {
+            "russh-ctargv1-subsystem-v1".to_owned()
+        } else {
+            "russh-standard-exec-posix-argv-v1".to_owned()
+        },
+        evidence: EvidenceMaturity::ProtocolVerified,
+        minimum_sensor_evidence: EvidenceMaturity::Unknown,
+        initialization: InitializationState::NotRequired,
+        concurrency: ConcurrencyPolicy::Independent,
+        hard_limits: CapabilityLimits {
+            max_payload_bytes: Some(config.command_output_bytes),
+            max_concurrent_operations: Some(1),
+        },
+        supported_variants: BTreeSet::from([if config.command_subsystem.is_some() {
+            CapabilityVariant::ArgvSubsystemCommand
+        } else {
+            CapabilityVariant::StandardExecCommand
+        }]),
+        platform_snapshot_hash,
     }
 }
 
