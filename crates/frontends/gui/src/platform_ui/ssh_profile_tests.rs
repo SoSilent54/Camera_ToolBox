@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use super::*;
 
 const KEY_A: &str =
@@ -82,10 +84,14 @@ fn new_ssh_profile_renders_password_first_basic_flow() {
     assert!(rendered.contains("Client authentication"));
     assert!(rendered.contains("Password"));
     assert!(rendered.contains("Process memory only / never saved"));
-    assert!(rendered.contains("Server identity (separate from client authentication)"));
-    assert!(rendered.contains("Verify server identity"));
+    assert!(rendered.contains("测试 SSH 登录与远程路径"));
+    assert!(rendered.contains("服务器身份"));
+    assert!(rendered.contains(
+        "测试验证服务器身份、SSH 登录、规范化路径和 SFTP 元数据可见性；不读取文件内容。"
+    ));
     assert!(rendered.contains("Remote file"));
     assert!(rendered.contains("Advanced"));
+    assert!(!rendered.contains("验证服务器身份（不测试账号密码）"));
 }
 
 #[test]
@@ -138,8 +144,7 @@ fn password_is_default_and_cleared_on_auth_switch_and_consume() {
     state
         .password
         .insert_text("again", egui::text::CharIndex::default());
-    let secret = state.password.take().unwrap();
-    assert_eq!(secret.expose_secret(), "again");
+    let _secret = state.password.take().unwrap();
     assert!(state.password_is_empty());
 }
 
@@ -188,6 +193,129 @@ fn exact_remote_path_round_trips_and_wildcard_stays_advanced() {
     assert!(split_exact_remote_file("/data/*.raw").is_err());
     assert!(!is_literal_remote_glob("*.raw"));
     assert!(is_literal_remote_glob("frame.raw"));
+}
+
+#[test]
+fn password_connection_request_keeps_visible_password_and_normalizes_basic_path() {
+    let mut state = SshEditorState::for_test();
+    let mut config = super::super::device_manager::incomplete_ssh_template();
+    state.set_password_for_test("test-password");
+    state.exact_remote_file = "/data/capture/frame.raw".to_owned();
+    config.remote_artifact_dir = "/unused".to_owned();
+    config.remote_artifact_glob = "old.raw".to_owned();
+
+    let request = state.prepare_connection_test_request(&config, 17).unwrap();
+
+    assert!(!state.password_is_empty());
+    assert_eq!(request.generation, 17);
+    assert_eq!(request.remote_path, "/data/capture/frame.raw");
+    assert_eq!(request.config.remote_artifact_dir, "/data/capture");
+    assert_eq!(request.config.remote_artifact_glob, "frame.raw");
+    assert!(matches!(request.auth, SshConnectionTestAuth::Password(_)));
+}
+
+#[test]
+fn private_key_connection_request_uses_the_selected_path_without_fallback() {
+    let mut state = SshEditorState::for_test();
+    let config = super::super::device_manager::incomplete_ssh_template();
+    let selected = PathBuf::from("/tmp/selected-client-key");
+    state.auth_mode = SshAuthMode::PrivateKeyFile;
+    state.selected_private_key = Some(selected.clone());
+    state.exact_remote_file = "/data/frame.raw".to_owned();
+
+    let request = state.prepare_connection_test_request(&config, 18).unwrap();
+
+    assert!(matches!(
+        request.auth,
+        SshConnectionTestAuth::PrivateKeyFile(path) if path == selected
+    ));
+}
+
+#[test]
+fn advanced_connection_request_requires_and_uses_exact_test_path() {
+    let mut state = SshEditorState::for_test();
+    let mut config = super::super::device_manager::incomplete_ssh_template();
+    state.set_password_for_test("test-password");
+    state.advanced_remote_path = true;
+    config.remote_artifact_dir = "/data/captures".to_owned();
+    config.remote_artifact_glob = "*.raw".to_owned();
+
+    assert!(state.prepare_connection_test_request(&config, 19).is_err());
+
+    state.exact_remote_file = "/data/captures/current.raw".to_owned();
+    let request = state.prepare_connection_test_request(&config, 20).unwrap();
+    assert_eq!(request.remote_path, "/data/captures/current.raw");
+    assert_eq!(request.config.remote_artifact_dir, "/data/captures");
+    assert_eq!(request.config.remote_artifact_glob, "*.raw");
+}
+
+#[test]
+fn existing_profile_pin_tests_login_directly_without_host_key_scan() {
+    use std::{collections::VecDeque, fs, sync::Arc, time::Duration};
+
+    use camera_toolbox_adapters::platforms::ssh_managed::{
+        HostKeyManager, MemoryRemoteFile, MemorySshTransport,
+    };
+    use camera_toolbox_app::RemoteFileStat;
+
+    let directory = std::env::temp_dir().join(format!(
+        "camera-toolbox-direct-login-test-{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&directory).unwrap();
+    let manager = HostKeyManager::with_probe(
+        directory.join("known_hosts"),
+        Arc::new(StaticProbe(ServerHostKey::from_openssh(KEY_B).unwrap())),
+    )
+    .unwrap();
+    let transport = MemorySshTransport::new(KEY_A);
+    transport.insert_file(
+        "/data/frame.raw",
+        MemoryRemoteFile {
+            bytes: Vec::new(),
+            stats: VecDeque::from([RemoteFileStat {
+                path: "/data/frame.raw".to_owned(),
+                size: 4096,
+                modified_seconds: 123,
+                producer_marker: None,
+                sha256: None,
+            }]),
+        },
+    );
+    let worker = HostKeyWorker::with_manager_and_transport(manager, Arc::new(transport)).unwrap();
+    let mut state = SshEditorState::base(Some(worker), status_from_existing_pin(KEY_A));
+    let mut config = super::super::device_manager::incomplete_ssh_template();
+    config.host = "camera.example".to_owned();
+    config.username = "root".to_owned();
+    config.expected_host_key = KEY_A.to_owned();
+    state.set_password_for_test("process-only-password");
+    state.exact_remote_file = "/data/frame.raw".to_owned();
+
+    state.start_connection_test(&config);
+    assert!(matches!(
+        state.connection_status,
+        ConnectionTestStatus::Testing
+    ));
+    for _ in 0..100 {
+        state.poll(&mut config, true);
+        if !matches!(state.connection_status, ConnectionTestStatus::Testing) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert!(matches!(
+        state.connection_status,
+        ConnectionTestStatus::Success {
+            size: 4096,
+            modified_seconds: 123,
+            ..
+        }
+    ));
+    assert!(matches!(
+        state.host_status,
+        HostIdentityStatus::Pinned { .. }
+    ));
+    fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]

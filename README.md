@@ -85,7 +85,7 @@ GUI 顶部依次选择 Platform Profile 和 `Sensor: Unbound` 或已配置的 Se
 
 - `Local`：只显示本地 RAW 打开入口。
 - `Hisilicon CV610`：一个 host 由 Dump/Stream 共享，默认端口分别为 `4321`/`80`。
-- `SSH-managed`：普通用户只需填写 host/IP、username、当前进程密码和一个绝对远程文件路径；server host key 由无认证 Verify 流程检查，Capture recipe、watcher 和限制放在折叠的 Advanced 区域。
+- `SSH-managed`：普通用户只需填写 host/IP、username、当前进程密码和一个绝对远程文件路径；`测试 SSH 登录与远程路径` 会按当前密码或私钥执行严格 pin 登录与 SFTP metadata 检查，Capture recipe、watcher 和限制放在折叠的 Advanced 区域。
 
 配置文件为 versioned JSON `platform-profiles.json`，目录由 `ProjectDirs::from("io", "sosilent", "camera-toolbox")` 解析。首次启动只创建 `Local files`；网络目标必须显式配置。导入时拒绝未知 schema、未知字段、重复 ID 和无效跨引用。编辑配置不会改变已提交 job；job 持有提交时的 Platform/Sensor/matrix snapshot hashes。
 
@@ -104,10 +104,11 @@ GUI 顶部依次选择 Platform Profile 和 `Sensor: Unbound` 或已配置的 Se
 2. 填写 `Host / IP`、SSH port（默认 `22`）、`Username`。
 3. `Client authentication` 默认选择 `Password`；密码只进入当前进程内存，永不写入 profile、日志或导出文件。重启后再次编辑该 profile、输入密码并保存即可重新注册。
 4. 在 `Remote file` 粘贴一个绝对文件路径，例如 `/userdata/capture/frame.raw`。GUI 自动保存为受限 root `/userdata/capture` 与 literal basename `frame.raw`，选中 profile 时直接回填 `Fetch and Open` 路径。
-5. 点击 `Verify server identity`。该操作只做 SSH handshake，不发送用户名或密码：
-   - server key 与 OpenSSH `~/.ssh/known_hosts` 或原 profile pin 精确一致：自动显示 `Trusted`；
-   - 主机没有记录：显示算法和 SHA-256 fingerprint；必须通过设备控制台或管理员核对，勾选 `I verified this fingerprint out of band` 后才能显式信任；
-   - 主机已有不同 key：显示 `Server key changed` 并阻止连接，不提供一键替换。
+5. 点击 `测试 SSH 登录与远程路径`：
+   - 已保存 profile 含 server host-key pin 时，直接使用该 pin 和当前选择的 Password/SSH private key 登录；russh 握手仍会严格拒绝不匹配的服务器 key；
+   - 新 profile 尚无 pin 时，先在不发送账号密码的情况下读取 server key；已知 key 自动继续，未知 key 显示 fingerprint，核对并点击 `信任并测试` 后继续登录，发生 key 变化则硬阻断；
+   - 登录成功后规范化远程路径并执行 SFTP `stat`，显示路径、大小和 mtime。它验证 metadata 可见性，不读取或下载文件内容；
+   - 测试只使用当前表单选择的认证方式，不会在密码与私钥之间 fallback，也不要求先保存 profile。
 6. 点击 `Validate and Save`。新 profile 的 ID/display name 留空时由 `username@host` 稳定生成。
 
 `SSH private key file` 是第二、可选的**客户端登录方式**，不是 server host key。GUI 自动发现 `~/.ssh` 中权限安全的 OpenSSH 私钥，也可通过文件选择器指定；profile 只保存 `key-file:/absolute/path`，不会保存私钥内容。密码与私钥不会互相 fallback，每次操作只使用当前选中的一种认证方式。

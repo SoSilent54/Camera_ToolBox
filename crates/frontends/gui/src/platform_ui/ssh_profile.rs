@@ -1,16 +1,23 @@
 //! SSH profile draft editor：密码优先认证、远端文件与 server identity。
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use camera_toolbox_adapters::platforms::ssh_managed::{
     HostKeyAssessment, HostKeyTarget, ServerHostKey, discover_private_key_files,
-    discover_private_key_files_in,
 };
 use camera_toolbox_app::{PlatformConfig, PlatformProfile, PlatformProfileId, SshManagedConfig};
 use eframe::egui::{self, TextBuffer};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString, zeroize::Zeroize};
 
-use super::host_key_worker::{HostKeyWorker, HostKeyWorkerResult};
+#[path = "ssh_profile_path.rs"]
+mod remote_path;
+pub(super) use remote_path::{combine_remote_file, is_literal_remote_glob};
+use remote_path::{split_exact_remote_file, validate_client_private_key};
+
+use super::host_key_worker::{
+    HostKeyWorker, HostKeyWorkerResult, SshConnectionTestAuth, SshConnectionTestRequest,
+    SshConnectionTestResult,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum SshAuthMode {
@@ -48,6 +55,11 @@ impl SecretInput {
     fn take(&mut self) -> Option<SecretString> {
         let value = std::mem::take(self.value.expose_secret_mut());
         (!value.is_empty()).then(|| SecretString::from(value))
+    }
+
+    /// 为连接测试复制一次 secret，保留界面输入，直到用户显式清除或提交保存。
+    fn clone_secret(&self) -> Option<SecretString> {
+        (!self.is_empty()).then(|| SecretString::from(self.value.expose_secret().clone()))
     }
 }
 
@@ -97,6 +109,18 @@ enum HostIdentityStatus {
     Error(String),
 }
 
+enum ConnectionTestStatus {
+    Idle,
+    WaitingIdentity,
+    Testing,
+    Success {
+        path: String,
+        size: u64,
+        modified_seconds: u64,
+    },
+    Error(String),
+}
+
 pub(super) struct SshEditorState {
     auth_mode: SshAuthMode,
     password_required: bool,
@@ -111,6 +135,9 @@ pub(super) struct SshEditorState {
     host_generation: u64,
     host_status: HostIdentityStatus,
     host_worker: Option<HostKeyWorker>,
+    connection_generation: u64,
+    connection_status: ConnectionTestStatus,
+    pending_connection_test: Option<SshConnectionTestRequest>,
 }
 
 impl Default for SshEditorState {
@@ -152,6 +179,9 @@ impl SshEditorState {
             host_generation: 1,
             host_status,
             host_worker,
+            connection_generation: 1,
+            connection_status: ConnectionTestStatus::Idle,
+            pending_connection_test: None,
         }
     }
 
@@ -193,6 +223,7 @@ impl SshEditorState {
     pub(super) fn clear_sensitive(&mut self) {
         self.password.clear();
         self.host_generation = self.host_generation.wrapping_add(1);
+        self.invalidate_connection_test();
     }
 
     pub(super) fn reset_for_variant(&mut self) {
@@ -202,10 +233,21 @@ impl SshEditorState {
 
     pub(super) fn poll(&mut self, config: &mut SshManagedConfig, dialog_open: bool) {
         loop {
-            let result = self.host_worker.as_mut().and_then(HostKeyWorker::try_recv);
-            let Some(result) = result else { break };
+            let host_result = self.host_worker.as_mut().and_then(HostKeyWorker::try_recv);
+            let connection_result = self
+                .host_worker
+                .as_mut()
+                .and_then(HostKeyWorker::try_recv_connection_test);
+            if host_result.is_none() && connection_result.is_none() {
+                break;
+            }
             if dialog_open {
-                self.apply_worker_result(config, result);
+                if let Some(result) = host_result {
+                    self.apply_worker_result(config, result);
+                }
+                if let Some(result) = connection_result {
+                    self.apply_connection_test_result(config, result);
+                }
             }
         }
     }
@@ -220,6 +262,7 @@ impl SshEditorState {
         }
 
         let original_endpoint = (config.host.clone(), config.port);
+        let original_username = config.username.clone();
         egui::Grid::new("ssh_basic_fields")
             .num_columns(2)
             .show(ui, |ui| {
@@ -233,13 +276,23 @@ impl SshEditorState {
             config.expected_host_key.clear();
             self.host_generation = self.host_generation.wrapping_add(1);
             self.host_status = HostIdentityStatus::Unverified;
+            self.invalidate_connection_test();
+        } else if original_username != config.username {
+            self.invalidate_connection_test();
         }
 
-        self.render_authentication(ui);
-        self.render_server_identity(ui, config);
+        if self.render_authentication(ui) {
+            self.invalidate_connection_test();
+        }
 
         ui.separator();
         ui.label("Remote file");
+        let original_remote = (
+            self.advanced_remote_path,
+            self.exact_remote_file.clone(),
+            config.remote_artifact_dir.clone(),
+            config.remote_artifact_glob.clone(),
+        );
         ui.checkbox(
             &mut self.advanced_remote_path,
             "Advanced root / basename glob mode",
@@ -250,7 +303,9 @@ impl SshEditorState {
                 .show(ui, |ui| {
                     text_row(ui, "Remote root", &mut config.remote_artifact_dir);
                     text_row(ui, "Basename glob", &mut config.remote_artifact_glob);
+                    text_row(ui, "测试文件（精确路径）", &mut self.exact_remote_file);
                 });
+            ui.weak("测试文件只用于登录与 SFTP 元数据检查；保存仍保留 root / basename glob。");
         } else {
             ui.add(
                 egui::TextEdit::singleline(&mut self.exact_remote_file)
@@ -258,14 +313,49 @@ impl SshEditorState {
             );
             ui.weak("Exact absolute remote file; saved as parent root plus literal basename.");
         }
+        if original_remote
+            != (
+                self.advanced_remote_path,
+                self.exact_remote_file.clone(),
+                config.remote_artifact_dir.clone(),
+                config.remote_artifact_glob.clone(),
+            )
+        {
+            self.invalidate_connection_test();
+        }
+
+        let test_in_progress = self
+            .host_worker
+            .as_ref()
+            .is_some_and(HostKeyWorker::is_in_flight)
+            || matches!(
+                self.connection_status,
+                ConnectionTestStatus::WaitingIdentity | ConnectionTestStatus::Testing
+            )
+            || matches!(
+                self.host_status,
+                HostIdentityStatus::Scanning | HostIdentityStatus::Trusting
+            );
+        if ui
+            .add_enabled(
+                !test_in_progress,
+                egui::Button::new("测试 SSH 登录与远程路径").fill(ui.visuals().selection.bg_fill),
+            )
+            .clicked()
+        {
+            self.start_connection_test(config);
+        }
+        self.render_connection_status(ui);
+        self.render_server_identity(ui, config);
 
         ui.collapsing("Advanced", |ui| self.render_advanced(ui, config));
     }
 
-    fn render_authentication(&mut self, ui: &mut egui::Ui) {
+    fn render_authentication(&mut self, ui: &mut egui::Ui) -> bool {
         ui.separator();
         ui.label("Client authentication");
         let previous = self.auth_mode;
+        let previous_key = self.selected_private_key.clone();
         egui::ComboBox::from_id_salt("ssh_auth_mode")
             .selected_text(match self.auth_mode {
                 SshAuthMode::Password => "Password",
@@ -281,9 +371,12 @@ impl SshEditorState {
             });
         self.apply_auth_change(previous);
 
+        let mut changed = previous != self.auth_mode;
         match self.auth_mode {
             SshAuthMode::Password => {
-                ui.add(egui::TextEdit::singleline(&mut self.password).password(true));
+                changed |= ui
+                    .add(egui::TextEdit::singleline(&mut self.password).password(true))
+                    .changed();
                 ui.weak("Process memory only / never saved");
             }
             SshAuthMode::PrivateKeyFile => {
@@ -317,9 +410,12 @@ impl SshEditorState {
                 if let Some(message) = self.key_discovery_message.as_deref() {
                     ui.weak(message);
                 }
+                changed |= previous_key != self.selected_private_key;
             }
         }
+        changed
     }
+
     fn apply_auth_change(&mut self, previous: SshAuthMode) {
         if previous == self.auth_mode {
             return;
@@ -333,26 +429,62 @@ impl SshEditorState {
         }
     }
 
+    fn render_connection_status(&self, ui: &mut egui::Ui) {
+        match &self.connection_status {
+            ConnectionTestStatus::Idle => {
+                if self
+                    .host_worker
+                    .as_ref()
+                    .is_some_and(HostKeyWorker::is_in_flight)
+                {
+                    ui.spinner();
+                    ui.label("正在结束上一次 SSH 操作，请稍候...");
+                }
+            }
+            ConnectionTestStatus::WaitingIdentity => {
+                ui.spinner();
+                ui.label("正在核对 SSH 服务器身份；尚未发送登录凭据...");
+            }
+            ConnectionTestStatus::Testing => {
+                ui.spinner();
+                ui.label("正在测试 SSH 登录与远程路径的 SFTP 元数据可见性...");
+            }
+            ConnectionTestStatus::Success {
+                path,
+                size,
+                modified_seconds,
+            } => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_GREEN,
+                    format!(
+                        "SSH 登录与 SFTP 元数据可见：{path}，{size} bytes，mtime {modified_seconds}"
+                    ),
+                );
+            }
+            ConnectionTestStatus::Error(error) => {
+                ui.colored_label(egui::Color32::LIGHT_RED, error);
+            }
+        }
+        ui.weak("测试验证服务器身份、SSH 登录、规范化路径和 SFTP 元数据可见性；不读取文件内容。");
+    }
+
     fn render_server_identity(&mut self, ui: &mut egui::Ui, config: &mut SshManagedConfig) {
         ui.separator();
-        ui.label("Server identity (separate from client authentication)");
-        let mut scan = false;
+        ui.strong("服务器身份");
         let mut trust = None;
         match &mut self.host_status {
             HostIdentityStatus::Unverified => {
-                ui.colored_label(egui::Color32::YELLOW, "Server identity not verified");
-                scan = ui.button("Verify server identity").clicked();
+                ui.colored_label(egui::Color32::YELLOW, "等待测试时读取 SSH 服务器密钥");
             }
             HostIdentityStatus::Pinned {
                 algorithm,
                 fingerprint,
             } => {
-                ui.label(format!("Pinned profile key: {algorithm} {fingerprint}"));
-                scan = ui.button("Re-verify without authentication").clicked();
+                ui.label(format!("Profile 已固定：{algorithm} {fingerprint}"));
             }
             HostIdentityStatus::Scanning => {
                 ui.spinner();
-                ui.label("Scanning server key without authentication...");
+                ui.label("正在读取并核对 SSH 服务端密钥，不发送账号密码...");
             }
             HostIdentityStatus::Trusted {
                 algorithm,
@@ -360,7 +492,7 @@ impl SshEditorState {
             } => {
                 ui.colored_label(
                     egui::Color32::LIGHT_GREEN,
-                    format!("Trusted: {algorithm} {fingerprint}"),
+                    format!("服务器身份可信：{algorithm} {fingerprint}"),
                 );
             }
             HostIdentityStatus::Unknown {
@@ -369,16 +501,16 @@ impl SshEditorState {
             } => {
                 ui.colored_label(
                     egui::Color32::YELLOW,
-                    format!("Unknown: {} {}", key.algorithm(), key.fingerprint()),
+                    format!("未知服务器密钥：{} {}", key.algorithm(), key.fingerprint()),
                 );
                 ui.checkbox(
                     verified_out_of_band,
-                    "I verified this fingerprint out of band",
+                    "我已通过设备控制台或管理员核对该 fingerprint",
                 );
                 if ui
                     .add_enabled(
                         unknown_trust_allowed(*verified_out_of_band),
-                        egui::Button::new("Trust this server key"),
+                        egui::Button::new("信任并测试"),
                     )
                     .clicked()
                 {
@@ -387,7 +519,7 @@ impl SshEditorState {
             }
             HostIdentityStatus::Trusting => {
                 ui.spinner();
-                ui.label("Recording explicitly trusted server key...");
+                ui.label("正在保存已确认的服务器密钥...");
             }
             HostIdentityStatus::Changed {
                 algorithm,
@@ -395,17 +527,13 @@ impl SshEditorState {
             } => {
                 ui.colored_label(
                     egui::Color32::LIGHT_RED,
-                    format!("Server key changed: {algorithm} {fingerprint}"),
+                    format!("服务器密钥已变化：{algorithm} {fingerprint}"),
                 );
-                ui.strong("Connection is blocked; investigate known_hosts out of band.");
+                ui.strong("连接已阻止；请通过可信渠道检查 known_hosts 与设备身份。");
             }
             HostIdentityStatus::Error(error) => {
                 ui.colored_label(egui::Color32::LIGHT_RED, error);
-                scan = ui.button("Retry verification").clicked();
             }
-        }
-        if scan {
-            self.request_scan(config);
         }
         if let Some(key) = trust {
             self.request_trust(config, key);
@@ -504,6 +632,92 @@ impl SshEditorState {
         }
     }
 
+    fn prepare_connection_test_request(
+        &self,
+        config: &SshManagedConfig,
+        generation: u64,
+    ) -> Result<SshConnectionTestRequest, String> {
+        let mut config = config.clone();
+        let remote_path = if self.advanced_remote_path {
+            if config.remote_artifact_dir.is_empty() || config.remote_artifact_glob.is_empty() {
+                return Err("请先填写远程 root 与 basename glob。".to_owned());
+            }
+            split_exact_remote_file(&self.exact_remote_file)?;
+            self.exact_remote_file.clone()
+        } else {
+            let (root, basename) = split_exact_remote_file(&self.exact_remote_file)?;
+            config.remote_artifact_dir = root;
+            config.remote_artifact_glob = basename;
+            combine_remote_file(&config.remote_artifact_dir, &config.remote_artifact_glob)
+        };
+        let auth = match self.auth_mode {
+            SshAuthMode::Password => SshConnectionTestAuth::Password(
+                self.password
+                    .clone_secret()
+                    .ok_or_else(|| "请输入密码后再测试 SSH 登录。".to_owned())?,
+            ),
+            SshAuthMode::PrivateKeyFile => SshConnectionTestAuth::PrivateKeyFile(
+                self.selected_private_key
+                    .clone()
+                    .ok_or_else(|| "请选择 SSH 客户端私钥文件后再测试。".to_owned())?,
+            ),
+        };
+        Ok(SshConnectionTestRequest {
+            generation,
+            config,
+            remote_path,
+            auth,
+        })
+    }
+
+    fn start_connection_test(&mut self, config: &SshManagedConfig) {
+        self.invalidate_connection_test();
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        let generation = self.connection_generation;
+        let request = match self.prepare_connection_test_request(config, generation) {
+            Ok(request) => request,
+            Err(error) => {
+                self.connection_status = ConnectionTestStatus::Error(error);
+                return;
+            }
+        };
+        self.pending_connection_test = Some(request);
+
+        if config.expected_host_key.is_empty() {
+            self.connection_status = ConnectionTestStatus::WaitingIdentity;
+            self.request_scan(config);
+            if !matches!(self.host_status, HostIdentityStatus::Scanning) {
+                self.fail_pending_connection_test("无法开始 SSH 服务器身份验证。".to_owned());
+            }
+            return;
+        }
+
+        // 已保存 profile 直接使用固定 pin 登录；russh 握手仍会严格拒绝不匹配的服务端密钥。
+        match ServerHostKey::from_openssh(&config.expected_host_key) {
+            Ok(key) => self.submit_pending_connection_test(&key),
+            Err(error) => self.fail_pending_connection_test(format!(
+                "Profile 中的服务器密钥无效，无法测试连接：{error}"
+            )),
+        }
+    }
+
+    fn invalidate_connection_test(&mut self) {
+        self.connection_generation = self.connection_generation.wrapping_add(1);
+        self.pending_connection_test = None;
+        self.connection_status = ConnectionTestStatus::Idle;
+    }
+
+    fn fail_pending_connection_test(&mut self, error: String) {
+        if self.pending_connection_test.take().is_some()
+            || matches!(
+                self.connection_status,
+                ConnectionTestStatus::WaitingIdentity | ConnectionTestStatus::Testing
+            )
+        {
+            self.connection_status = ConnectionTestStatus::Error(error);
+        }
+    }
+
     fn request_scan(&mut self, config: &SshManagedConfig) {
         let target = match HostKeyTarget::new(config.host.clone(), config.port) {
             Ok(target) => target,
@@ -531,20 +745,31 @@ impl SshEditorState {
             Ok(target) => target,
             Err(error) => {
                 self.host_status = HostIdentityStatus::Error(error.to_string());
+                self.fail_pending_connection_test(error.to_string());
                 return;
             }
         };
         self.host_generation = self.host_generation.wrapping_add(1);
         let generation = self.host_generation;
-        match self.host_worker.as_mut() {
+        let failure = match self.host_worker.as_mut() {
             Some(worker) => match worker.request_trust(generation, target, key) {
-                Ok(()) => self.host_status = HostIdentityStatus::Trusting,
-                Err(error) => self.host_status = HostIdentityStatus::Error(error),
+                Ok(()) => {
+                    self.host_status = HostIdentityStatus::Trusting;
+                    None
+                }
+                Err(error) => {
+                    self.host_status = HostIdentityStatus::Error(error.clone());
+                    Some(error)
+                }
             },
             None => {
-                self.host_status =
-                    HostIdentityStatus::Error("host-key worker is unavailable".to_owned())
+                let error = "host-key worker is unavailable".to_owned();
+                self.host_status = HostIdentityStatus::Error(error.clone());
+                Some(error)
             }
+        };
+        if let Some(error) = failure {
+            self.fail_pending_connection_test(error);
         }
     }
 
@@ -558,38 +783,58 @@ impl SshEditorState {
                 if generation != self.host_generation || !target_matches(&target, config) {
                     return;
                 }
-                self.host_status = match result {
+                let trusted_key = match result {
                     Ok(assessment) => {
                         let key = assessment.server_key().clone();
                         if !config.expected_host_key.is_empty() {
                             if config.expected_host_key == key.openssh() {
                                 config.expected_host_key = key.openssh().to_owned();
-                                trusted_status(&key)
+                                self.host_status = trusted_status(&key);
+                                Some(key)
                             } else {
-                                HostIdentityStatus::Changed {
+                                self.host_status = HostIdentityStatus::Changed {
                                     algorithm: key.algorithm().to_owned(),
                                     fingerprint: key.fingerprint().to_owned(),
-                                }
+                                };
+                                None
                             }
                         } else {
                             match assessment {
                                 HostKeyAssessment::Trusted(key) => {
                                     config.expected_host_key = key.openssh().to_owned();
-                                    trusted_status(&key)
+                                    self.host_status = trusted_status(&key);
+                                    Some(key)
                                 }
-                                HostKeyAssessment::Unknown(key) => HostIdentityStatus::Unknown {
-                                    key,
-                                    verified_out_of_band: false,
-                                },
-                                HostKeyAssessment::Changed(key) => HostIdentityStatus::Changed {
-                                    algorithm: key.algorithm().to_owned(),
-                                    fingerprint: key.fingerprint().to_owned(),
-                                },
+                                HostKeyAssessment::Unknown(key) => {
+                                    self.host_status = HostIdentityStatus::Unknown {
+                                        key,
+                                        verified_out_of_band: false,
+                                    };
+                                    None
+                                }
+                                HostKeyAssessment::Changed(key) => {
+                                    self.host_status = HostIdentityStatus::Changed {
+                                        algorithm: key.algorithm().to_owned(),
+                                        fingerprint: key.fingerprint().to_owned(),
+                                    };
+                                    None
+                                }
                             }
                         }
                     }
-                    Err(error) => HostIdentityStatus::Error(error),
+                    Err(error) => {
+                        self.host_status = HostIdentityStatus::Error(error.clone());
+                        self.fail_pending_connection_test(error);
+                        return;
+                    }
                 };
+                if let Some(key) = trusted_key {
+                    self.submit_pending_connection_test(&key);
+                } else if matches!(self.host_status, HostIdentityStatus::Changed { .. }) {
+                    self.fail_pending_connection_test(
+                        "服务器密钥已变化，连接测试已阻止。".to_owned(),
+                    );
+                }
             }
             HostKeyWorkerResult::Trust {
                 generation,
@@ -600,15 +845,57 @@ impl SshEditorState {
                 if generation != self.host_generation || !target_matches(&target, config) {
                     return;
                 }
-                self.host_status = match result {
+                match result {
                     Ok(_) => {
                         config.expected_host_key = key.openssh().to_owned();
-                        trusted_status(&key)
+                        self.host_status = trusted_status(&key);
+                        self.submit_pending_connection_test(&key);
                     }
-                    Err(error) => HostIdentityStatus::Error(error),
-                };
+                    Err(error) => {
+                        self.host_status = HostIdentityStatus::Error(error.clone());
+                        self.fail_pending_connection_test(error);
+                    }
+                }
             }
         }
+    }
+
+    fn submit_pending_connection_test(&mut self, key: &ServerHostKey) {
+        let Some(mut request) = self.pending_connection_test.take() else {
+            return;
+        };
+        // 扫描完成后再将已核对的 pin 写入测试副本，绝不以空 pin 登录。
+        request.config.expected_host_key = key.openssh().to_owned();
+        match self.host_worker.as_mut() {
+            Some(worker) => match worker.request_connection_test(request) {
+                Ok(()) => self.connection_status = ConnectionTestStatus::Testing,
+                Err(error) => self.connection_status = ConnectionTestStatus::Error(error),
+            },
+            None => {
+                self.connection_status =
+                    ConnectionTestStatus::Error("host-key worker is unavailable".to_owned())
+            }
+        }
+    }
+
+    fn apply_connection_test_result(
+        &mut self,
+        config: &SshManagedConfig,
+        result: SshConnectionTestResult,
+    ) {
+        if result.generation != self.connection_generation
+            || !target_matches(&result.endpoint, config)
+        {
+            return;
+        }
+        self.connection_status = match result.result {
+            Ok(stat) => ConnectionTestStatus::Success {
+                path: stat.path,
+                size: stat.size,
+                modified_seconds: stat.modified_seconds,
+            },
+            Err(error) => ConnectionTestStatus::Error(error),
+        };
     }
 
     fn refresh_private_keys(&mut self) {
@@ -660,21 +947,6 @@ impl SshEditorState {
         self.password.is_empty()
     }
 }
-fn validate_client_private_key(path: &Path) -> Result<PathBuf, String> {
-    if !path.is_absolute() {
-        return Err("SSH client private key path must be absolute".to_owned());
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| "private-key file has no parent directory".to_owned())?;
-    let candidates = discover_private_key_files_in(parent).map_err(|error| error.to_string())?;
-    let canonical = std::fs::canonicalize(path)
-        .map_err(|error| format!("cannot normalize private-key path: {error}"))?;
-    candidates
-        .contains(&canonical)
-        .then_some(canonical)
-        .ok_or_else(|| "Selected file is not a valid protected OpenSSH private key".to_owned())
-}
 
 fn status_from_existing_pin(pin: &str) -> HostIdentityStatus {
     if pin.is_empty() {
@@ -704,37 +976,6 @@ fn target_matches(target: &HostKeyTarget, config: &SshManagedConfig) -> bool {
 
 fn unknown_trust_allowed(verified_out_of_band: bool) -> bool {
     verified_out_of_band
-}
-
-pub(super) fn is_literal_remote_glob(glob: &str) -> bool {
-    !glob.is_empty() && !glob.bytes().any(|byte| matches!(byte, b'*' | b'?'))
-}
-
-pub(super) fn combine_remote_file(root: &str, basename: &str) -> String {
-    if root == "/" {
-        format!("/{basename}")
-    } else {
-        format!("{}/{basename}", root.trim_end_matches('/'))
-    }
-}
-
-pub(super) fn split_exact_remote_file(path: &str) -> Result<(String, String), String> {
-    if !path.starts_with('/') || path.ends_with('/') || path.contains('\0') {
-        return Err("remote file must be an exact absolute file path".to_owned());
-    }
-    let (root, basename) = path
-        .rsplit_once('/')
-        .ok_or_else(|| "remote file must include a literal basename".to_owned())?;
-    if basename.is_empty() || basename.bytes().any(|byte| matches!(byte, b'*' | b'?')) {
-        return Err("remote file basename must be literal (no '*' or '?')".to_owned());
-    }
-    if path.split('/').any(|component| component == "..") {
-        return Err("remote file must not contain '..' path segments".to_owned());
-    }
-    Ok((
-        if root.is_empty() { "/" } else { root }.to_owned(),
-        basename.to_owned(),
-    ))
 }
 
 fn text_row(ui: &mut egui::Ui, label: &str, value: &mut String) {
