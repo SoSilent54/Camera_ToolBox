@@ -52,7 +52,7 @@ pub(crate) fn render_tab_bar(
                         });
                     });
                 }
-                for document in workspace.asset_documents() {
+                for document in workspace.image_documents() {
                     let selected = active == Some(document.id);
                     let frame = if selected {
                         egui::Frame::group(ui.style()).fill(ui.visuals().selection.bg_fill)
@@ -61,8 +61,7 @@ pub(crate) fn render_tab_bar(
                     };
                     frame.show(ui, |ui| {
                         ui.horizontal(|ui| {
-                            let status = if document.saved { "Saved" } else { "Unsaved" };
-                            let title = format!("{}  {}", document.title, status);
+                            let title = format!("{}  {}", document.title, document.status_label());
                             if ui.selectable_label(selected, title).clicked() {
                                 action = Some(TabBarAction::Activate(document.id));
                             }

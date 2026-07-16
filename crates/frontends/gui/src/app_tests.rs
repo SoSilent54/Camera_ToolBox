@@ -1,16 +1,22 @@
+use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
 use std::{path::PathBuf, sync::Arc};
 
-use camera_toolbox_app::{FsCancellation, LocalRawAnalyzeReport, SourceReadProgress};
+use camera_toolbox_app::{
+    FileRef, FileSourceId, FsCancellation, ImageOpenMode, LocalRawAnalyzeReport, RasterImageCodec,
+    SourcePath, SourceReadProgress,
+};
 use camera_toolbox_core::{
     AssetId, BayerPattern, CaptureMetadata, ChromaOrder, EphemeralAsset, IntegrityState,
-    MediaFormat, OwnedMediaPayload, RawFrame, RawSpec, Roi, RoiStats, analyze_raw_roi, analyze_roi,
+    MediaFormat, NativeImage, OwnedMediaPayload, RawFrame, RawSpec, Rgba8Frame, Roi, RoiStats,
+    Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange, analyze_raw_roi, analyze_roi,
 };
 use eframe::egui::{self, accesskit::Role};
 
 #[cfg(all(target_os = "linux", feature = "platform-cv610"))]
 use super::LIVE_STOP_TIMEOUT;
 use super::{
-    ActiveRawOpenJob, CameraToolboxApp, LoadedRaw, RawOpenJobEvent, save_asset_source,
+    ActiveRawOpenJob, CameraToolboxApp, LoadedRaw, OpenedFileDocument, RawOpenJobEvent,
+    WorkspaceFileOpenRequest, decode_workspace_image_request, save_asset_source,
     save_asset_source_with,
 };
 use crate::{
@@ -18,6 +24,7 @@ use crate::{
     analysis_worker::{AnalysisData, AnalysisDomain, AnalysisKey, AnalysisPayload, AnalysisResult},
     color_worker::ColorRenderResult,
     histogram_link::{HistogramBinSelection, HistogramSeriesId, SpatialHighlightResult},
+    image_save::{SaveFormat, SaveKey, SaveResult},
 };
 
 const TEST_VIEWPORT: egui::Vec2 = egui::vec2(640.0, 360.0);
@@ -75,6 +82,89 @@ fn app_with_loaded_raw(context: &egui::Context) -> CameraToolboxApp {
     app.workspace
         .open_local_raw(loaded_raw(context, "fixture.raw", 1));
     app
+}
+
+#[test]
+fn png_workspace_open_reaches_viewer_and_source_rgb_analysis() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "camera-toolbox-gui-png-open-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("sample.png");
+    let source_frame = Rgba8Frame::tight(
+        2,
+        2,
+        Arc::<[u8]>::from(vec![
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 128,
+        ]),
+    )
+    .unwrap();
+    let mut encoded = Vec::new();
+    ImageRasterCodec
+        .encode_png(&source_frame, &mut encoded)
+        .unwrap();
+    std::fs::write(&path, encoded).unwrap();
+
+    let source_id = FileSourceId::new("gui-png-open-test").unwrap();
+    let file_system: Arc<dyn camera_toolbox_app::FileSystem> =
+        Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
+    let reference = FileRef::new(source_id, SourcePath::new("sample.png").unwrap());
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    let mut ignore_progress = |_| {};
+    let opened = decode_workspace_image_request(
+        &app.image_pipeline,
+        WorkspaceFileOpenRequest {
+            display_path: path.clone(),
+            file_system,
+            reference,
+            remote: false,
+        },
+        ImageOpenMode::Auto,
+        FsCancellation::default(),
+        &mut ignore_progress,
+    )
+    .unwrap();
+    let OpenedFileDocument::Image(opened) = opened else {
+        panic!("PNG must route to a static image document");
+    };
+    app.install_opened_image(&context, 1, path, opened);
+
+    let document = app.workspace.active_image().unwrap();
+    assert_eq!(document.native.dimensions(), [2, 2]);
+    assert_eq!(document.analysis_panel.domain, AnalysisDomain::SourceRgb);
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while app
+        .workspace
+        .active_image()
+        .unwrap()
+        .analysis_panel
+        .current_key()
+        .is_none()
+        && std::time::Instant::now() < deadline
+    {
+        run_app_frame(&context, &mut app, &mut frame, Vec::new());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let key = app
+        .workspace
+        .active_image()
+        .unwrap()
+        .analysis_panel
+        .current_key()
+        .expect("source RGB analysis must install");
+    assert_eq!(key.domain, AnalysisDomain::SourceRgb);
+
+    drop(app);
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
@@ -655,6 +745,57 @@ fn captured_source_export_writes_only_final_target_without_overwrite_or_staging(
 }
 
 #[test]
+fn image_save_does_not_clear_captured_raw_source_prompt() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    let snapshot = app.live_runtime.snapshot_for_test().unwrap();
+    let asset = Arc::new(EphemeralAsset::new(
+        AssetId::new("captured-raw-save-state").unwrap(),
+        OwnedMediaPayload::from_bytes(Arc::<[u8]>::from(&[0, 1, 2, 3][..])),
+        CaptureMetadata {
+            format: MediaFormat::RawPacked { bit_depth: 10 },
+            source_name: "captured-raw-save-state".to_owned(),
+            attributes: std::collections::BTreeMap::new(),
+        },
+        IntegrityState::Verified {
+            algorithm: "test".to_owned(),
+            digest: "test".to_owned(),
+        },
+    ));
+    let id = app.workspace.open_captured_raw(
+        loaded_raw(&context, "captured.raw", 7),
+        asset,
+        snapshot,
+        true,
+    );
+    assert!(app.workspace.document(id).unwrap().unsaved);
+
+    app.install_save_result(SaveResult {
+        key: SaveKey {
+            document_id: id,
+            generation: 7,
+            revision: 1,
+        },
+        path: PathBuf::from("display.png"),
+        format: SaveFormat::Png,
+        result: Ok(()),
+    });
+    assert!(app.workspace.document(id).unwrap().unsaved);
+
+    app.install_save_result(SaveResult {
+        key: SaveKey {
+            document_id: id,
+            generation: 7,
+            revision: 1,
+        },
+        path: PathBuf::from("capture.raw"),
+        format: SaveFormat::RawU16Le,
+        result: Ok(()),
+    });
+    assert!(app.workspace.document(id).unwrap().unsaved);
+}
+
+#[test]
 fn unsaved_ephemeral_tab_is_retained_until_explicit_close_resolution() {
     let context = egui::Context::default();
     let mut app = CameraToolboxApp::new(&context).unwrap();
@@ -679,16 +820,40 @@ fn unsaved_ephemeral_tab_is_retained_until_explicit_close_resolution() {
             digest: "test".to_owned(),
         },
     ));
-    let id = app.workspace.open_asset(asset, snapshot, true).unwrap();
+    let spec = Yuv420SpSpec {
+        width: 2,
+        height: 2,
+        y_stride: 2,
+        chroma_stride: 2,
+        chroma_order: ChromaOrder::Vu,
+        matrix: YuvMatrix::Bt601,
+        range: YuvRange::Limited,
+    };
+    let frame = Arc::new(
+        Yuv420SpFrame::from_contiguous(spec, Arc::new(vec![16, 16, 16, 16, 128, 128])).unwrap(),
+    );
+    let display =
+        Arc::new(Rgba8Frame::tight(2, 2, Arc::<[u8]>::from(vec![0, 0, 0, 255].repeat(4))).unwrap());
+    let id = app
+        .workspace
+        .open_captured_image(
+            9,
+            asset,
+            snapshot,
+            NativeImage::Yuv420Sp(frame),
+            display,
+            true,
+        )
+        .unwrap();
 
     app.close_document(&context, id);
     assert_eq!(app.pending_ephemeral_close, Some(id));
-    assert!(app.workspace.asset(id).is_some());
+    assert!(app.workspace.image(id).is_some());
 
     app.pending_ephemeral_close = None;
-    app.workspace.asset_mut(id).unwrap().saved = true;
+    app.workspace.image_mut(id).unwrap().unsaved = false;
     app.close_document(&context, id);
-    assert!(app.workspace.asset(id).is_none());
+    assert!(app.workspace.image(id).is_none());
 }
 
 #[test]

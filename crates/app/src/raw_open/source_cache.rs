@@ -44,7 +44,7 @@ struct SourceCacheInner {
 pub struct SourceCache(Arc<SourceCacheInner>);
 
 #[derive(Clone)]
-pub struct RawSourceHandle {
+pub struct ImageSourceHandle {
     key: CacheKey,
     bytes: Arc<Vec<u8>>,
 }
@@ -61,17 +61,17 @@ impl std::fmt::Debug for SourceCache {
     }
 }
 
-impl std::fmt::Debug for RawSourceHandle {
+impl std::fmt::Debug for ImageSourceHandle {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
-            .debug_struct("RawSourceHandle")
+            .debug_struct("ImageSourceHandle")
             .field("reference", &self.key.reference)
             .field("version", &self.key.version)
             .finish_non_exhaustive()
     }
 }
 
-impl RawSourceHandle {
+impl ImageSourceHandle {
     #[must_use]
     pub fn reference(&self) -> &FileRef {
         &self.key.reference
@@ -86,6 +86,12 @@ impl RawSourceHandle {
     #[must_use]
     pub fn bytes(&self) -> &[u8] {
         self.bytes.as_slice()
+    }
+
+    /// 克隆底层 source 所有权；用于需要建立零拷贝 plane 视图的解码器。
+    #[must_use]
+    pub fn shared_bytes(&self) -> Arc<Vec<u8>> {
+        Arc::clone(&self.bytes)
     }
 }
 
@@ -118,7 +124,7 @@ impl SourceCache {
         reference: &FileRef,
         max_source_bytes: u64,
         control: &FsControl,
-    ) -> Result<RawSourceHandle, SourceCacheError> {
+    ) -> Result<ImageSourceHandle, SourceCacheError> {
         self.acquire_with_progress(
             file_system,
             reference,
@@ -140,7 +146,7 @@ impl SourceCache {
         max_source_bytes: u64,
         control: &FsControl,
         progress: &mut dyn FnMut(SourceReadProgress),
-    ) -> Result<RawSourceHandle, SourceCacheError> {
+    ) -> Result<ImageSourceHandle, SourceCacheError> {
         control.checkpoint()?;
         let entry = file_system.stat(reference, control)?;
         if entry.kind != FileKind::File {
@@ -252,7 +258,7 @@ impl SourceCache {
 }
 
 impl SourceCacheInner {
-    fn cached_handle(&self, key: &CacheKey) -> Option<RawSourceHandle> {
+    fn cached_handle(&self, key: &CacheKey) -> Option<ImageSourceHandle> {
         let mut state = self
             .state
             .lock()
@@ -261,7 +267,7 @@ impl SourceCacheInner {
         let access = state.access_clock;
         let entry = state.entries.get_mut(key)?;
         entry.last_access = access;
-        Some(RawSourceHandle {
+        Some(ImageSourceHandle {
             key: key.clone(),
             bytes: Arc::clone(&entry.bytes),
         })
@@ -301,9 +307,9 @@ impl SourceCacheInner {
         Ok(())
     }
 
-    fn publish(&self, key: CacheKey, bytes: Vec<u8>) -> RawSourceHandle {
+    fn publish(&self, key: CacheKey, bytes: Vec<u8>) -> ImageSourceHandle {
         let bytes = Arc::new(bytes);
-        let handle = RawSourceHandle {
+        let handle = ImageSourceHandle {
             key: key.clone(),
             bytes: Arc::clone(&bytes),
         };

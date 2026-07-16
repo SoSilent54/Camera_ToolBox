@@ -9,7 +9,7 @@ use crate::{
     raw_inspector::RawInspectorState,
     viewer::{HoverViewSettings, ImageViewerState, LoadedRaw},
 };
-use camera_toolbox_app::{RawInterpretation, RawSourceHandle, TargetResolutionSnapshot};
+use camera_toolbox_app::{ImageSourceHandle, RawInterpretation, TargetResolutionSnapshot};
 use camera_toolbox_core::EphemeralAsset;
 
 use super::DocumentId;
@@ -49,7 +49,7 @@ pub(crate) struct RawDocument {
     pub(crate) unsaved: bool,
     pub(crate) source_asset: Option<Arc<EphemeralAsset>>,
     pub(crate) resolution: Option<Arc<TargetResolutionSnapshot>>,
-    pub(crate) raw_source: Option<RawSourceHandle>,
+    pub(crate) raw_source: Option<ImageSourceHandle>,
     pub(crate) interpretation: Option<RawInterpretation>,
     pub(crate) decode_generation: u64,
     pub(crate) raw_inspector: RawInspectorState,
@@ -88,7 +88,7 @@ impl RawDocument {
 
     pub(crate) fn attach_file_source(
         &mut self,
-        source: RawSourceHandle,
+        source: ImageSourceHandle,
         interpretation: RawInterpretation,
         generation: u64,
     ) {
@@ -102,7 +102,7 @@ impl RawDocument {
     pub(crate) fn replace_file_source(
         &mut self,
         loaded: LoadedRaw,
-        source: RawSourceHandle,
+        source: ImageSourceHandle,
         interpretation: RawInterpretation,
         generation: u64,
     ) {
@@ -116,7 +116,7 @@ impl RawDocument {
     pub(crate) fn install_reinterpreted(
         &mut self,
         mut loaded: LoadedRaw,
-        source: RawSourceHandle,
+        source: ImageSourceHandle,
         interpretation: RawInterpretation,
         decode_generation: u64,
     ) {

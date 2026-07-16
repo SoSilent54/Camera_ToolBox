@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use camera_toolbox_core::{RawFrame, Roi};
+use camera_toolbox_core::{NativeImage, Roi};
 use eframe::egui;
 
 use crate::{
@@ -17,7 +17,7 @@ mod model;
 pub(crate) use hover::{HoverNeighborhood, HoverViewSettings};
 pub(crate) use model::{LoadedRaw, bayer_label};
 
-use hover::render_hover_view;
+use hover::{render_hover_view, render_native_hover_view};
 use interaction::{
     RoiGesture, draw_minimap, draw_roi_draft, draw_roi_overlay, hover_pixel, image_extent_f32,
     update_roi_interaction,
@@ -42,7 +42,7 @@ const MAX_ZOOM: f32 = 64.0;
 pub(crate) struct CursorPixel {
     pub(crate) x: u32,
     pub(crate) y: u32,
-    pub(crate) value: u16,
+    pub(crate) raw_value: Option<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +55,42 @@ pub(crate) enum ViewerAction {
 pub(crate) struct ViewerOutput {
     pub(crate) rect: egui::Rect,
     pub(crate) action: Option<ViewerAction>,
+}
+
+/// Viewer 只消费原生图像语义、当前显示纹理与 ROI；RAW 专属详情通过可选上下文保留。
+pub(crate) struct ViewerImage<'a> {
+    pub(crate) generation: u64,
+    pub(crate) native: NativeImage,
+    pub(crate) texture_id: egui::TextureId,
+    pub(crate) roi: Roi,
+    raw: Option<&'a LoadedRaw>,
+}
+
+impl<'a> ViewerImage<'a> {
+    pub(crate) fn raw(loaded: &'a LoadedRaw, display_mode: DisplayMode) -> Self {
+        Self {
+            generation: loaded.generation,
+            native: NativeImage::Raw(Arc::clone(&loaded.frame)),
+            texture_id: loaded.active_texture_id(display_mode),
+            roi: loaded.roi,
+            raw: Some(loaded),
+        }
+    }
+
+    pub(crate) fn native(
+        generation: u64,
+        native: NativeImage,
+        texture_id: egui::TextureId,
+        roi: Roi,
+    ) -> Self {
+        Self {
+            generation,
+            native,
+            texture_id,
+            roi,
+            raw: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -131,12 +167,12 @@ impl ImageViewerState {
     }
 
     /// 在面板布局前按上一帧稳定几何刷新 cursor，避免曲线 marker 滞后一帧。
-    pub(crate) fn refresh_cursor(&mut self, context: &egui::Context, frame: &RawFrame) {
+    pub(crate) fn refresh_cursor(&mut self, context: &egui::Context, image: &NativeImage) {
         let position = context.pointer_latest_pos();
         self.cursor = self.geometry.and_then(|geometry| {
             position
                 .filter(|position| geometry.viewer_rect.contains(*position))
-                .and_then(|position| hover_pixel(geometry.image_rect, position, frame))
+                .and_then(|position| hover_pixel(geometry.image_rect, position, image))
         });
     }
 
@@ -148,13 +184,14 @@ impl ImageViewerState {
     fn sync_spatial_overlay(
         &mut self,
         context: &egui::Context,
-        loaded: &LoadedRaw,
+        generation: u64,
+        dimensions: [u32; 2],
         highlight: Option<&SpatialHighlight>,
     ) -> Option<egui::TextureId> {
         let Some(highlight) = highlight.filter(|highlight| {
-            highlight.selection.key.generation == loaded.generation
-                && highlight.mask.width == loaded.frame.spec.width
-                && highlight.mask.height == loaded.frame.spec.height
+            highlight.selection.key.generation == generation
+                && highlight.mask.width == dimensions[0]
+                && highlight.mask.height == dimensions[1]
         }) else {
             self.spatial_overlay = None;
             return None;
@@ -186,9 +223,8 @@ impl ImageViewerState {
 
 pub(crate) fn render_viewer(
     ui: &mut egui::Ui,
-    loaded: Option<&LoadedRaw>,
+    image: Option<ViewerImage<'_>>,
     viewer: &mut ImageViewerState,
-    display_mode: DisplayMode,
     hover_settings: HoverViewSettings,
     spatial_highlight: Option<&SpatialHighlight>,
 ) -> ViewerOutput {
@@ -197,11 +233,11 @@ pub(crate) fn render_viewer(
     let painter = ui.painter_at(viewer_rect);
     painter.rect_filled(viewer_rect, 0.0, egui::Color32::from_gray(22));
 
-    let Some(loaded) = loaded else {
+    let Some(image) = image else {
         painter.text(
             viewer_rect.center(),
             egui::Align2::CENTER_CENTER,
-            "File -> Open Raw...",
+            "File -> Open...",
             egui::TextStyle::Heading.resolve(ui.style()),
             egui::Color32::GRAY,
         );
@@ -214,12 +250,13 @@ pub(crate) fn render_viewer(
             action: None,
         };
     };
+    let dimensions = image.native.dimensions();
 
     if viewer.fit_on_next_frame {
         viewer.fit_to_rect(
             viewer_rect,
-            image_extent_f32(loaded.frame.spec.width),
-            image_extent_f32(loaded.frame.spec.height),
+            image_extent_f32(dimensions[0]),
+            image_extent_f32(dimensions[1]),
         );
     }
 
@@ -237,18 +274,18 @@ pub(crate) fn render_viewer(
 
     let image_rect = viewer.image_rect(
         viewer_rect,
-        image_extent_f32(loaded.frame.spec.width),
-        image_extent_f32(loaded.frame.spec.height),
+        image_extent_f32(dimensions[0]),
+        image_extent_f32(dimensions[1]),
     );
     viewer.geometry = Some(ViewerGeometry {
         viewer_rect,
         image_rect,
     });
-    let action = update_roi_interaction(ui, &response, image_rect, viewer, &loaded.frame);
-    let active_texture_id = loaded.active_texture_id(display_mode);
-    let spatial_texture_id = viewer.sync_spatial_overlay(ui.ctx(), loaded, spatial_highlight);
+    let action = update_roi_interaction(ui, &response, image_rect, viewer, dimensions);
+    let spatial_texture_id =
+        viewer.sync_spatial_overlay(ui.ctx(), image.generation, dimensions, spatial_highlight);
     painter.image(
-        active_texture_id,
+        image.texture_id,
         image_rect,
         egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
         egui::Color32::WHITE,
@@ -264,8 +301,8 @@ pub(crate) fn render_viewer(
     draw_roi_overlay(
         &painter,
         image_rect,
-        &loaded.frame,
-        loaded.roi,
+        dimensions,
+        image.roi,
         if viewer
             .roi_gesture
             .is_some_and(|gesture| gesture.drag_started)
@@ -276,20 +313,37 @@ pub(crate) fn render_viewer(
         },
     );
     if let Some(gesture) = viewer.roi_gesture.filter(|gesture| gesture.drag_started) {
-        draw_roi_draft(&painter, image_rect, &loaded.frame, gesture);
+        draw_roi_draft(&painter, image_rect, dimensions, gesture);
     }
-    draw_minimap(&painter, viewer_rect, image_rect, loaded, active_texture_id);
+    draw_minimap(
+        &painter,
+        viewer_rect,
+        image_rect,
+        dimensions,
+        image.texture_id,
+    );
 
     let hover_position = response.hover_pos();
     viewer.cursor =
-        hover_position.and_then(|position| hover_pixel(image_rect, position, &loaded.frame));
+        hover_position.and_then(|position| hover_pixel(image_rect, position, &image.native));
     if hover_settings.enabled
         && !viewer
             .roi_gesture
             .is_some_and(|gesture| gesture.drag_started)
         && let (Some(position), Some(cursor)) = (hover_position, viewer.cursor)
     {
-        render_hover_view(ui.ctx(), position, cursor, loaded, hover_settings);
+        if let Some(loaded) = image.raw {
+            render_hover_view(ui.ctx(), position, cursor, loaded, hover_settings);
+        } else {
+            render_native_hover_view(
+                ui.ctx(),
+                position,
+                cursor,
+                &image.native,
+                image.roi,
+                hover_settings,
+            );
+        }
     }
     ViewerOutput {
         rect: viewer_rect,
@@ -331,7 +385,7 @@ mod tests {
             CursorPixel {
                 x: 0,
                 y: 0,
-                value: 0,
+                raw_value: None,
             },
             HoverNeighborhood::Five,
             4,
@@ -346,7 +400,7 @@ mod tests {
             CursorPixel {
                 x: 3,
                 y: 2,
-                value: 0,
+                raw_value: None,
             },
             HoverNeighborhood::Five,
             4,
@@ -481,7 +535,7 @@ mod tests {
             CursorPixel {
                 x: 12,
                 y: 21,
-                value: 0,
+                raw_value: None,
             }
         ));
         assert!(!roi_contains(
@@ -489,7 +543,7 @@ mod tests {
             CursorPixel {
                 x: 13,
                 y: 21,
-                value: 0,
+                raw_value: None,
             }
         ));
     }
@@ -510,7 +564,7 @@ mod tests {
             CursorPixel {
                 x: 1,
                 y: 0,
-                value: 42,
+                raw_value: Some(42),
             },
             HoverNeighborhood::Three,
             2,
@@ -556,9 +610,10 @@ mod tests {
     #[test]
     fn hover_reads_original_tightly_packed_pixel() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(20.0, 20.0));
-        let hovered = hover_pixel(rect, egui::pos2(15.0, 15.0), &test_frame()).unwrap();
+        let image = NativeImage::Raw(Arc::new(test_frame()));
+        let hovered = hover_pixel(rect, egui::pos2(15.0, 15.0), &image).unwrap();
 
-        assert_eq!((hovered.x, hovered.y, hovered.value), (1, 1, 256));
+        assert_eq!((hovered.x, hovered.y, hovered.raw_value), (1, 1, Some(256)));
     }
 
     #[test]

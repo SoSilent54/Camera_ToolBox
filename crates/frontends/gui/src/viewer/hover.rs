@@ -1,6 +1,6 @@
 //! RAW Viewer 的像素 Hover、邻域可视化与详情面板。
 
-use camera_toolbox_core::{RawFrame, Roi};
+use camera_toolbox_core::{NativeImage, NativePixelSample, RawFrame, Roi, yuv_to_rgb};
 use eframe::egui;
 
 use super::{CursorPixel, LoadedRaw};
@@ -103,6 +103,167 @@ pub(super) fn render_hover_view(
                     });
                 });
         });
+}
+
+pub(super) fn render_native_hover_view(
+    context: &egui::Context,
+    pointer: egui::Pos2,
+    cursor: CursorPixel,
+    image: &NativeImage,
+    roi: Roi,
+    settings: HoverViewSettings,
+) {
+    let position = hover_view_position(pointer, context.content_rect());
+    egui::Area::new(egui::Id::new("native_hover_view"))
+        .fixed_pos(position)
+        .order(egui::Order::Foreground)
+        .interactable(false)
+        .show(context, |ui| {
+            egui::Frame::popup(ui.style())
+                .inner_margin(8)
+                .show(ui, |ui| {
+                    ui.set_min_size(HOVER_CONTENT_SIZE);
+                    ui.set_max_size(HOVER_CONTENT_SIZE);
+                    ui.horizontal(|ui| {
+                        let (neighborhood_rect, _) =
+                            ui.allocate_exact_size(HOVER_NEIGHBORHOOD_SIZE, egui::Sense::hover());
+                        draw_native_neighborhood(
+                            ui.painter(),
+                            neighborhood_rect,
+                            image,
+                            cursor,
+                            settings.neighborhood,
+                        );
+                        ui.separator();
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(
+                                HOVER_CONTENT_SIZE.x - HOVER_NEIGHBORHOOD_SIZE.x - 16.0,
+                                HOVER_CONTENT_SIZE.y,
+                            ),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| render_native_hover_details(ui, image, roi, cursor),
+                        );
+                    });
+                });
+        });
+}
+
+fn draw_native_neighborhood(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    image: &NativeImage,
+    cursor: CursorPixel,
+    neighborhood: HoverNeighborhood,
+) {
+    painter.rect_filled(rect, 0.0, egui::Color32::from_gray(18));
+    let size = neighborhood.size();
+    let cell_size = egui::vec2(rect.width() / size as f32, rect.height() / size as f32);
+    let half = i64::from(size / 2);
+    let [width, height] = image.dimensions();
+    for grid_y in 0..size {
+        for grid_x in 0..size {
+            let x = i64::from(cursor.x) + i64::from(grid_x) - half;
+            let y = i64::from(cursor.y) + i64::from(grid_y) - half;
+            if x < 0 || y < 0 || x >= i64::from(width) || y >= i64::from(height) {
+                continue;
+            }
+            let x = u32::try_from(x).expect("checked non-negative x");
+            let y = u32::try_from(y).expect("checked non-negative y");
+            let cell = egui::Rect::from_min_size(
+                rect.min + egui::vec2(grid_x as f32 * cell_size.x, grid_y as f32 * cell_size.y),
+                cell_size,
+            );
+            if let Some(sample) = image.sample_at(x, y) {
+                painter.rect_filled(cell, 0.0, native_sample_color(image, sample));
+            }
+            painter.rect_stroke(
+                cell,
+                0.0,
+                egui::Stroke::new(0.5, egui::Color32::from_white_alpha(32)),
+                egui::StrokeKind::Inside,
+            );
+        }
+    }
+    let center = egui::Rect::from_min_size(
+        rect.min + egui::vec2(half as f32 * cell_size.x, half as f32 * cell_size.y),
+        cell_size,
+    );
+    painter.rect_stroke(
+        center,
+        0.0,
+        egui::Stroke::new(2.0, egui::Color32::YELLOW),
+        egui::StrokeKind::Inside,
+    );
+}
+
+fn native_sample_color(image: &NativeImage, sample: NativePixelSample) -> egui::Color32 {
+    match sample {
+        NativePixelSample::Raw {
+            value, max_code, ..
+        } => {
+            if value > max_code {
+                egui::Color32::MAGENTA
+            } else {
+                let gray = ((u32::from(value) * 255) / u32::from(max_code)) as u8;
+                egui::Color32::from_gray(gray)
+            }
+        }
+        NativePixelSample::Rgba { r, g, b, a } => egui::Color32::from_rgba_unmultiplied(r, g, b, a),
+        NativePixelSample::Yuv { y, u, v, .. } => {
+            let NativeImage::Yuv420Sp(frame) = image else {
+                return egui::Color32::MAGENTA;
+            };
+            let [r, g, b] = yuv_to_rgb(y, u, v, frame.spec.matrix, frame.spec.range);
+            egui::Color32::from_rgb(r, g, b)
+        }
+    }
+}
+
+fn render_native_hover_details(
+    ui: &mut egui::Ui,
+    image: &NativeImage,
+    roi: Roi,
+    cursor: CursorPixel,
+) {
+    ui.spacing_mut().item_spacing.y = 2.0;
+    hover_detail_label(ui, format!("Pos  x={} y={}", cursor.x, cursor.y));
+    match image.sample_at(cursor.x, cursor.y) {
+        Some(NativePixelSample::Rgba { r, g, b, a }) => {
+            hover_detail_label(ui, "Source RGBA8".to_owned());
+            hover_detail_label(ui, format!("R {r}  G {g}  B {b}"));
+            hover_detail_label(ui, format!("A {a}"));
+        }
+        Some(NativePixelSample::Yuv {
+            y,
+            u,
+            v,
+            chroma_x,
+            chroma_y,
+        }) => {
+            let NativeImage::Yuv420Sp(frame) = image else {
+                return;
+            };
+            hover_detail_label(ui, "Source YUV420SP 8-bit".to_owned());
+            hover_detail_label(ui, format!("Y {y}  U {u}  V {v}"));
+            hover_detail_label(ui, format!("Chroma x={chroma_x} y={chroma_y}"));
+            hover_detail_label(
+                ui,
+                format!("{:?} · {:?}", frame.spec.matrix, frame.spec.range),
+            );
+        }
+        Some(NativePixelSample::Raw { .. }) | None => {}
+    }
+    hover_detail_label(
+        ui,
+        format!(
+            "ROI {}",
+            if roi_contains(roi, cursor) {
+                "in"
+            } else {
+                "out"
+            }
+        ),
+    );
 }
 
 pub(super) fn hover_view_position(pointer: egui::Pos2, viewport: egui::Rect) -> egui::Pos2 {
@@ -281,7 +442,16 @@ fn render_hover_details(
     let max_code = loaded.frame.spec.max_code_value();
     hover_detail_label(ui, format!("Pos  x={} y={}", cursor.x, cursor.y));
     hover_detail_label(ui, format!("CFA  {site:?}"));
-    hover_detail_label(ui, format!("RAW  {}/{}", cursor.value, max_code));
+    hover_detail_label(
+        ui,
+        format!(
+            "RAW  {}/{}",
+            cursor
+                .raw_value
+                .expect("RAW hover always carries a RAW code"),
+            max_code
+        ),
+    );
 
     let rendered_pixel = loaded.rendered_pixel(cursor);
     if let Some(color) = rendered_pixel {

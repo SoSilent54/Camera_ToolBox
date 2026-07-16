@@ -7,14 +7,14 @@ use eframe::egui;
 
 use crate::viewer::LoadedRaw;
 
-mod asset_document;
 mod document;
+mod image_document;
 mod live_document;
 mod resources;
 mod tabs;
 
-pub(crate) use asset_document::AssetDocument;
 pub(crate) use document::RawDocument;
+pub(crate) use image_document::ImageDocument;
 pub(crate) use live_document::{LiveDocument, LiveDocumentLifecycle};
 pub(crate) use tabs::{TabBarAction, render_tab_bar};
 
@@ -46,8 +46,8 @@ pub(crate) struct DocumentIdentity {
 /// 当前静态 RAW 文档集合。权威 RAW source 常驻，只有可重建派生资源参与 LRU。
 pub(crate) struct WorkspaceState {
     documents: Vec<RawDocument>,
+    image_documents: Vec<ImageDocument>,
     live_documents: Vec<LiveDocument>,
-    asset_documents: Vec<AssetDocument>,
     active: Option<DocumentId>,
     next_document_id: u64,
     access_clock: u64,
@@ -64,8 +64,8 @@ impl WorkspaceState {
     pub(crate) const fn with_derived_budget(derived_budget_bytes: usize) -> Self {
         Self {
             documents: Vec::new(),
+            image_documents: Vec::new(),
             live_documents: Vec::new(),
-            asset_documents: Vec::new(),
             active: None,
             next_document_id: 1,
             access_clock: 0,
@@ -86,7 +86,7 @@ impl WorkspaceState {
     pub(crate) fn open_file_raw(
         &mut self,
         loaded: LoadedRaw,
-        source: camera_toolbox_app::RawSourceHandle,
+        source: camera_toolbox_app::ImageSourceHandle,
         interpretation: camera_toolbox_app::RawInterpretation,
         generation: u64,
         foreground: bool,
@@ -103,11 +103,30 @@ impl WorkspaceState {
         id
     }
 
+    pub(crate) fn open_image(
+        &mut self,
+        generation: u64,
+        path: std::path::PathBuf,
+        result: camera_toolbox_app::ImageOpenResult,
+        foreground: bool,
+    ) -> Result<DocumentId, String> {
+        let id = DocumentId(self.next_document_id);
+        self.next_document_id = self.next_document_id.saturating_add(1);
+        self.access_clock = self.access_clock.saturating_add(1);
+        let document =
+            ImageDocument::from_open_result(id, generation, path, result, self.access_clock)?;
+        self.image_documents.push(document);
+        if foreground || self.active.is_none() {
+            self.active = Some(id);
+        }
+        Ok(id)
+    }
+
     pub(crate) fn replace_file_raw(
         &mut self,
         id: DocumentId,
         loaded: LoadedRaw,
-        source: camera_toolbox_app::RawSourceHandle,
+        source: camera_toolbox_app::ImageSourceHandle,
         interpretation: camera_toolbox_app::RawInterpretation,
         generation: u64,
     ) -> bool {
@@ -156,10 +175,13 @@ impl WorkspaceState {
         id
     }
 
-    pub(crate) fn open_asset(
+    pub(crate) fn open_captured_image(
         &mut self,
+        generation: u64,
         asset: Arc<camera_toolbox_core::EphemeralAsset>,
         resolution: Arc<camera_toolbox_app::TargetResolutionSnapshot>,
+        native: camera_toolbox_core::NativeImage,
+        display: Arc<camera_toolbox_core::Rgba8Frame>,
         foreground: bool,
     ) -> Result<DocumentId, String> {
         if let Some(id) = self.document_for_asset(&asset.id) {
@@ -170,8 +192,17 @@ impl WorkspaceState {
         }
         let id = DocumentId(self.next_document_id);
         self.next_document_id = self.next_document_id.saturating_add(1);
-        self.asset_documents
-            .push(AssetDocument::new(id, asset, resolution)?);
+        self.access_clock = self.access_clock.saturating_add(1);
+        let document = ImageDocument::from_capture(
+            id,
+            generation,
+            asset,
+            resolution,
+            native,
+            display,
+            self.access_clock,
+        );
+        self.image_documents.push(document);
         if foreground {
             self.active = Some(id);
         }
@@ -198,12 +229,12 @@ impl WorkspaceState {
         self.live_mut(self.active?)
     }
 
-    pub(crate) fn active_asset(&self) -> Option<&AssetDocument> {
-        self.asset(self.active?)
+    pub(crate) fn active_image(&self) -> Option<&ImageDocument> {
+        self.image(self.active?)
     }
 
-    pub(crate) fn active_asset_mut(&mut self) -> Option<&mut AssetDocument> {
-        self.asset_mut(self.active?)
+    pub(crate) fn active_image_mut(&mut self) -> Option<&mut ImageDocument> {
+        self.image_mut(self.active?)
     }
 
     pub(crate) fn document(&self, id: DocumentId) -> Option<&RawDocument> {
@@ -216,6 +247,22 @@ impl WorkspaceState {
 
     pub(crate) fn documents(&self) -> &[RawDocument] {
         &self.documents
+    }
+
+    pub(crate) fn image(&self, id: DocumentId) -> Option<&ImageDocument> {
+        self.image_documents
+            .iter()
+            .find(|document| document.id == id)
+    }
+
+    pub(crate) fn image_mut(&mut self, id: DocumentId) -> Option<&mut ImageDocument> {
+        self.image_documents
+            .iter_mut()
+            .find(|document| document.id == id)
+    }
+
+    pub(crate) fn image_documents(&self) -> &[ImageDocument] {
+        &self.image_documents
     }
 
     pub(crate) fn live(&self, id: DocumentId) -> Option<&LiveDocument> {
@@ -234,22 +281,6 @@ impl WorkspaceState {
         &self.live_documents
     }
 
-    pub(crate) fn asset(&self, id: DocumentId) -> Option<&AssetDocument> {
-        self.asset_documents
-            .iter()
-            .find(|document| document.id == id)
-    }
-
-    pub(crate) fn asset_mut(&mut self, id: DocumentId) -> Option<&mut AssetDocument> {
-        self.asset_documents
-            .iter_mut()
-            .find(|document| document.id == id)
-    }
-
-    pub(crate) fn asset_documents(&self) -> &[AssetDocument] {
-        &self.asset_documents
-    }
-
     fn document_for_asset(&self, asset_id: &camera_toolbox_core::AssetId) -> Option<DocumentId> {
         self.documents
             .iter()
@@ -261,17 +292,22 @@ impl WorkspaceState {
             })
             .map(|document| document.id)
             .or_else(|| {
-                self.asset_documents
+                self.image_documents
                     .iter()
-                    .find(|document| document.asset.id == *asset_id)
+                    .find(|document| {
+                        document
+                            .source
+                            .asset()
+                            .is_some_and(|asset| asset.id == *asset_id)
+                    })
                     .map(|document| document.id)
             })
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.documents.is_empty()
+            && self.image_documents.is_empty()
             && self.live_documents.is_empty()
-            && self.asset_documents.is_empty()
     }
 
     pub(crate) fn supersede_color_submissions_except(&mut self, document_id: DocumentId) {
@@ -291,6 +327,12 @@ impl WorkspaceState {
                 document.analysis_pending_active = None;
             }
         }
+        for document in &mut self.image_documents {
+            if document.id != document_id {
+                document.analysis_panel.mark_submission_superseded();
+                document.analysis_pending_active = None;
+            }
+        }
     }
 
     pub(crate) fn supersede_spatial_submissions_except(&mut self, document_id: DocumentId) {
@@ -302,13 +344,16 @@ impl WorkspaceState {
     }
 
     pub(crate) fn activate(&mut self, id: DocumentId) -> bool {
-        if self.document(id).is_none() && self.live(id).is_none() && self.asset(id).is_none() {
+        if self.document(id).is_none() && self.image(id).is_none() && self.live(id).is_none() {
             return false;
         }
         self.access_clock = self.access_clock.saturating_add(1);
         let tick = self.access_clock;
         self.active = Some(id);
         if let Some(document) = self.document_mut(id) {
+            document.last_access = tick;
+        }
+        if let Some(document) = self.image_mut(id) {
             document.last_access = tick;
         }
         true
@@ -331,7 +376,7 @@ impl WorkspaceState {
                         .and_then(|index| self.documents.get(index))
                 })
                 .map(|document| document.id)
-                .or_else(|| self.asset_documents.first().map(|document| document.id))
+                .or_else(|| self.image_documents.first().map(|document| document.id))
                 .or_else(|| self.live_documents.first().map(|document| document.id));
             if let Some(active) = self.active {
                 self.access_clock = self.access_clock.saturating_add(1);
@@ -366,21 +411,21 @@ impl WorkspaceState {
         Some(removed)
     }
 
-    pub(crate) fn remove_asset(&mut self, id: DocumentId) -> Option<AssetDocument> {
+    pub(crate) fn remove_image(&mut self, id: DocumentId) -> Option<ImageDocument> {
         let index = self
-            .asset_documents
+            .image_documents
             .iter()
             .position(|document| document.id == id)?;
         let was_active = self.active == Some(id);
-        let removed = self.asset_documents.remove(index);
+        let removed = self.image_documents.remove(index);
         if was_active {
             self.active = self
-                .asset_documents
+                .image_documents
                 .get(index)
                 .or_else(|| {
                     index
                         .checked_sub(1)
-                        .and_then(|index| self.asset_documents.get(index))
+                        .and_then(|index| self.image_documents.get(index))
                 })
                 .map(|document| document.id)
                 .or_else(|| self.documents.last().map(|document| document.id))
@@ -416,8 +461,19 @@ impl WorkspaceState {
         (document.loaded.generation == identity.generation).then_some(document)
     }
 
+    pub(crate) fn matching_image_mut(
+        &mut self,
+        identity: DocumentIdentity,
+    ) -> Option<&mut ImageDocument> {
+        let document = self.image_mut(identity.document_id)?;
+        (document.generation == identity.generation).then_some(document)
+    }
+
     pub(crate) fn total_derived_bytes(&self) -> usize {
-        self.documents.iter().fold(0usize, |total, document| {
+        let raw = self.documents.iter().fold(0usize, |total, document| {
+            total.saturating_add(document.derived_resource_bytes())
+        });
+        self.image_documents.iter().fold(raw, |total, document| {
             total.saturating_add(document.derived_resource_bytes())
         })
     }

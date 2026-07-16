@@ -2,6 +2,7 @@
 
 pub mod asset;
 pub mod filesystem;
+pub mod image_io;
 pub mod platform;
 pub mod raw_open;
 
@@ -12,12 +13,14 @@ pub use asset::{
     AssetReservation, CaptureStore, CaptureStoreError, CaptureStoreLimits, CaptureStoreStats,
 };
 pub use filesystem::*;
+pub use image_io::*;
 pub use platform::*;
 pub use raw_open::*;
 
 pub use ports::{
-    ArtifactError, ArtifactStore, CaptureBackend, ExposureControl, RawFrameLoadError,
-    RawFrameLoader, ReadableCaptureBackend, RegisterRead, RegisterWrite, SensorIdentity,
+    ArtifactError, ArtifactStore, CaptureBackend, ExposureControl, RasterCodecError, RasterFormat,
+    RasterImageCodec, RawFrameLoadError, RawFrameLoader, ReadableCaptureBackend, RegisterRead,
+    RegisterWrite, SensorIdentity,
 };
 pub use workflow::{
     AnalysisReport, AppError, CaptureAndAnalyzeRequest, CommandEnvelope, LocalRawAnalyzeReport,

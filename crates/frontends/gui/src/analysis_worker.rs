@@ -10,9 +10,11 @@ use std::{
 };
 
 use camera_toolbox_core::{
-    RawFrame, RawRoiAnalysis, Roi, RoiStats, analyze_raw_roi_with_cancel, analyze_roi_with_cancel,
+    ChannelAnalysis8, NativeImage, RawRoiAnalysis, RgbRoiAnalysis, Rgba8Frame, Roi, RoiStats,
+    YuvRoiAnalysis, analyze_raw_roi_with_cancel, analyze_rgba8_with_cancel,
+    analyze_roi_with_cancel, analyze_yuv420sp_with_cancel,
 };
-use eframe::egui::{self, ColorImage};
+use eframe::egui;
 
 use crate::{histogram_link::display_histogram_sample, workspace::DocumentId};
 
@@ -22,6 +24,8 @@ const DEFAULT_CACHE_CAPACITY: usize = 8;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum AnalysisDomain {
     RawBayer,
+    SourceRgb,
+    SourceYuv,
     DisplayRgb,
 }
 
@@ -29,6 +33,8 @@ impl AnalysisDomain {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::RawBayer => "RAW Bayer",
+            Self::SourceRgb => "Source RGB",
+            Self::SourceYuv => "Source YUV",
             Self::DisplayRgb => "Display RGB",
         }
     }
@@ -93,6 +99,8 @@ pub(crate) struct DisplayRoiAnalysis {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum AnalysisData {
     Raw(RawRoiAnalysis),
+    Rgb(RgbRoiAnalysis),
+    Yuv(YuvRoiAnalysis),
     Display(DisplayRoiAnalysis),
 }
 
@@ -113,6 +121,10 @@ impl AnalysisData {
                     total.saturating_add(bins.saturating_mul(std::mem::size_of::<u64>()))
                 })
             }
+            Self::Rgb(_) => std::mem::size_of::<RgbRoiAnalysis>()
+                .saturating_add(4 * DISPLAY_BIN_COUNT * std::mem::size_of::<u64>()),
+            Self::Yuv(_) => std::mem::size_of::<YuvRoiAnalysis>()
+                .saturating_add(3 * DISPLAY_BIN_COUNT * std::mem::size_of::<u64>()),
             Self::Display(analysis) => [
                 analysis.histogram.r.bins.len(),
                 analysis.histogram.g.bins.len(),
@@ -137,8 +149,8 @@ pub(crate) struct AnalysisRequest {
     pub(crate) key: AnalysisKey,
     pub(crate) active_roi: Roi,
     pub(crate) compute_chart: bool,
-    pub(crate) frame: Arc<RawFrame>,
-    pub(crate) display_image: Option<Arc<ColorImage>>,
+    pub(crate) native: NativeImage,
+    pub(crate) display_frame: Option<Arc<Rgba8Frame>>,
 }
 
 pub(crate) struct AnalysisResult {
@@ -264,24 +276,9 @@ fn analyze_request(shared: &WorkerShared, ticketed: TicketedRequest) -> Option<A
     let TicketedRequest { ticket, request } = ticketed;
     let result = if request.compute_chart {
         match request.key.domain {
-            AnalysisDomain::RawBayer => {
-                analyze_raw_roi_with_cancel(&request.frame, request.key.roi, || {
-                    !shared.is_current(ticket)
-                })
-                .map_err(|error| error.to_string())
-                .and_then(|analysis| {
-                    let active_stats = if request.active_roi == request.key.roi {
-                        analysis.stats
-                    } else {
-                        analyze_active_stats(shared, ticket, &request)?
-                    };
-                    Ok(AnalysisPayload {
-                        chart: Some(AnalysisData::Raw(analysis)),
-                        active_stats,
-                        active_roi: request.active_roi,
-                    })
-                })
-            }
+            AnalysisDomain::RawBayer => analyze_raw_request(shared, ticket, &request),
+            AnalysisDomain::SourceRgb => analyze_source_rgb_request(shared, ticket, &request),
+            AnalysisDomain::SourceYuv => analyze_source_yuv_request(shared, ticket, &request),
             AnalysisDomain::DisplayRgb => analyze_display_request(shared, ticket, &request),
         }
     } else {
@@ -312,10 +309,21 @@ fn analyze_active_stats(
     ticket: u64,
     request: &AnalysisRequest,
 ) -> Result<RoiStats, String> {
-    analyze_roi_with_cancel(&request.frame, request.active_roi, || {
-        !shared.is_current(ticket)
-    })
-    .map_err(|error| error.to_string())
+    match &request.native {
+        NativeImage::Raw(frame) => {
+            analyze_roi_with_cancel(frame, request.active_roi, || !shared.is_current(ticket))
+                .map_err(|error| error.to_string())
+        }
+        NativeImage::Rgba8(frame) => {
+            analyze_display_histogram(frame, request.active_roi, || !shared.is_current(ticket))
+                .map(|analysis| display_to_roi_stats(analysis.display_stats))
+        }
+        NativeImage::Yuv420Sp(frame) => {
+            analyze_yuv420sp_with_cancel(frame, request.active_roi, || !shared.is_current(ticket))
+                .map(|analysis| channel_to_roi_stats(&analysis.y))
+                .map_err(|error| error.to_string())
+        }
+    }
 }
 
 fn analyze_display_request(
@@ -323,29 +331,23 @@ fn analyze_display_request(
     ticket: u64,
     request: &AnalysisRequest,
 ) -> Result<AnalysisPayload, String> {
-    let image = request
-        .display_image
+    let frame = request
+        .display_frame
         .as_ref()
-        .ok_or_else(|| "display RGB analysis requires an installed color preview".to_owned())?;
-    let expected_size = [
-        request.frame.spec.width as usize,
-        request.frame.spec.height as usize,
-    ];
-    if image.size != expected_size {
+        .ok_or_else(|| "display RGB analysis requires a current display frame".to_owned())?;
+    if [frame.width, frame.height] != request.native.dimensions() {
         return Err(format!(
-            "display preview size {:?} does not match RAW size {:?}",
-            image.size, expected_size
+            "display frame size {}x{} does not match native size {:?}",
+            frame.width,
+            frame.height,
+            request.native.dimensions()
         ));
     }
     let active_stats = analyze_active_stats(shared, ticket, request)?;
-    let (roi, histogram, display_stats) =
-        analyze_display_histogram(image, request.key.roi, || !shared.is_current(ticket))?;
+    let analysis =
+        analyze_display_histogram(frame, request.key.roi, || !shared.is_current(ticket))?;
     Ok(AnalysisPayload {
-        chart: Some(AnalysisData::Display(DisplayRoiAnalysis {
-            roi,
-            display_stats,
-            histogram,
-        })),
+        chart: Some(AnalysisData::Display(analysis)),
         active_stats,
         active_roi: request.active_roi,
     })
@@ -353,18 +355,15 @@ fn analyze_display_request(
 
 #[allow(clippy::cast_precision_loss)] // 均值显示为 f64；像素累计值无需保持整数逐位精度。
 fn analyze_display_histogram<F>(
-    image: &ColorImage,
+    image: &Rgba8Frame,
     roi: Roi,
     mut is_cancelled: F,
-) -> Result<(Roi, DisplayHistogram, DisplayStats), String>
+) -> Result<DisplayRoiAnalysis, String>
 where
     F: FnMut() -> bool,
 {
-    let width = u32::try_from(image.size[0]).map_err(|_| "display width exceeds u32".to_owned())?;
-    let height =
-        u32::try_from(image.size[1]).map_err(|_| "display height exceeds u32".to_owned())?;
     let roi = roi
-        .clamped_to(width, height)
+        .clamped_to(image.width, image.height)
         .ok_or_else(|| "display analysis ROI is empty".to_owned())?;
     let mut histogram = DisplayHistogram {
         r: DisplayHistogramSeries::new(),
@@ -376,35 +375,120 @@ where
     let mut luma_max = u8::MIN;
     let mut luma_sum: u128 = 0;
     let mut total_pixels: u64 = 0;
-    let row_width = width as usize;
     for y in roi.y..roi.y + roi.height {
         if is_cancelled() {
             return Err("analysis cancelled".to_owned());
         }
-        let row_start = y as usize * row_width;
         for x in roi.x..roi.x + roi.width {
-            let pixel = image.pixels[row_start + x as usize];
-            let sample = display_histogram_sample(pixel);
-            histogram.r.record(sample.r);
-            histogram.g.record(sample.g);
-            histogram.b.record(sample.b);
-            histogram.luma.record(sample.luma);
-            luma_min = luma_min.min(sample.luma);
-            luma_max = luma_max.max(sample.luma);
-            luma_sum = luma_sum.saturating_add(u128::from(sample.luma));
+            let [r, g, b, _] = image
+                .pixel(x, y)
+                .expect("clamped ROI keeps display pixel in bounds");
+            let luma = display_histogram_sample(egui::Color32::from_rgb(r, g, b)).luma;
+            histogram.r.record(r);
+            histogram.g.record(g);
+            histogram.b.record(b);
+            histogram.luma.record(luma);
+            luma_min = luma_min.min(luma);
+            luma_max = luma_max.max(luma);
+            luma_sum = luma_sum.saturating_add(u128::from(luma));
             total_pixels = total_pixels.saturating_add(1);
         }
     }
-    Ok((
+    Ok(DisplayRoiAnalysis {
         roi,
         histogram,
-        DisplayStats {
+        display_stats: DisplayStats {
             luma_min,
             luma_max,
             luma_mean: luma_sum as f64 / total_pixels as f64,
             total_pixels,
         },
-    ))
+    })
+}
+
+fn analyze_raw_request(
+    shared: &WorkerShared,
+    ticket: u64,
+    request: &AnalysisRequest,
+) -> Result<AnalysisPayload, String> {
+    let NativeImage::Raw(frame) = &request.native else {
+        return Err("RAW Bayer analysis requires a native RAW frame".to_owned());
+    };
+    analyze_raw_roi_with_cancel(frame, request.key.roi, || !shared.is_current(ticket))
+        .map_err(|error| error.to_string())
+        .and_then(|analysis| {
+            let active_stats = if request.active_roi == request.key.roi {
+                analysis.stats
+            } else {
+                analyze_active_stats(shared, ticket, request)?
+            };
+            Ok(AnalysisPayload {
+                chart: Some(AnalysisData::Raw(analysis)),
+                active_stats,
+                active_roi: request.active_roi,
+            })
+        })
+}
+
+fn analyze_source_rgb_request(
+    shared: &WorkerShared,
+    ticket: u64,
+    request: &AnalysisRequest,
+) -> Result<AnalysisPayload, String> {
+    let NativeImage::Rgba8(frame) = &request.native else {
+        return Err("source RGB analysis requires a native RGBA8 frame".to_owned());
+    };
+    let analysis = analyze_rgba8_with_cancel(frame, request.key.roi, || !shared.is_current(ticket))
+        .map_err(|error| error.to_string())?;
+    let active_stats = analyze_active_stats(shared, ticket, request)?;
+    Ok(AnalysisPayload {
+        chart: Some(AnalysisData::Rgb(analysis)),
+        active_stats,
+        active_roi: request.active_roi,
+    })
+}
+
+fn analyze_source_yuv_request(
+    shared: &WorkerShared,
+    ticket: u64,
+    request: &AnalysisRequest,
+) -> Result<AnalysisPayload, String> {
+    let NativeImage::Yuv420Sp(frame) = &request.native else {
+        return Err("source YUV analysis requires a native YUV420SP frame".to_owned());
+    };
+    let analysis =
+        analyze_yuv420sp_with_cancel(frame, request.key.roi, || !shared.is_current(ticket))
+            .map_err(|error| error.to_string())?;
+    let active_stats = if request.active_roi == request.key.roi {
+        channel_to_roi_stats(&analysis.y)
+    } else {
+        analyze_active_stats(shared, ticket, request)?
+    };
+    Ok(AnalysisPayload {
+        chart: Some(AnalysisData::Yuv(analysis)),
+        active_stats,
+        active_roi: request.active_roi,
+    })
+}
+
+fn channel_to_roi_stats(channel: &ChannelAnalysis8) -> RoiStats {
+    RoiStats {
+        min: u16::from(channel.min),
+        max: u16::from(channel.max),
+        mean: channel.mean,
+        saturated_pixels: channel.histogram[usize::from(u8::MAX)],
+        total_pixels: channel.total_samples,
+    }
+}
+
+fn display_to_roi_stats(stats: DisplayStats) -> RoiStats {
+    RoiStats {
+        min: u16::from(stats.luma_min),
+        max: u16::from(stats.luma_max),
+        mean: stats.luma_mean,
+        saturated_pixels: 0,
+        total_pixels: stats.total_pixels,
+    }
 }
 
 pub(crate) struct AnalysisCache {
@@ -479,8 +563,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camera_toolbox_core::{BayerPattern, RawSpec};
-
+    use camera_toolbox_core::{BayerPattern, RawFrame, RawSpec};
     fn frame() -> Arc<RawFrame> {
         Arc::new(
             RawFrame::new(
@@ -528,11 +611,13 @@ mod tests {
 
     #[test]
     fn display_histogram_uses_exact_rgb_and_bt709_luma_bins() {
-        let image = ColorImage::new(
-            [2, 1],
-            vec![egui::Color32::RED, egui::Color32::from_rgb(0, 255, 0)],
-        );
-        let (_, histogram, stats) = analyze_display_histogram(
+        let image = Rgba8Frame::tight(
+            2,
+            1,
+            Arc::<[u8]>::from(vec![255, 0, 0, 255, 0, 255, 0, 255]),
+        )
+        .unwrap();
+        let analysis = analyze_display_histogram(
             &image,
             Roi {
                 x: 0,
@@ -544,15 +629,15 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(histogram.r.bins()[255], 1);
-        assert_eq!(histogram.g.bins()[255], 1);
-        assert_eq!(histogram.b.bins()[0], 2);
-        assert_eq!(histogram.luma.bins()[54], 1);
-        assert_eq!(histogram.luma.bins()[182], 1);
-        assert_eq!(stats.luma_min, 54);
-        assert_eq!(stats.luma_max, 182);
-        assert!((stats.luma_mean - 118.0).abs() < f64::EPSILON);
-        assert_eq!(stats.total_pixels, 2);
+        assert_eq!(analysis.histogram.r.bins()[255], 1);
+        assert_eq!(analysis.histogram.g.bins()[255], 1);
+        assert_eq!(analysis.histogram.b.bins()[0], 2);
+        assert_eq!(analysis.histogram.luma.bins()[54], 1);
+        assert_eq!(analysis.histogram.luma.bins()[182], 1);
+        assert_eq!(analysis.display_stats.luma_min, 54);
+        assert_eq!(analysis.display_stats.luma_max, 182);
+        assert!((analysis.display_stats.luma_mean - 118.0).abs() < f64::EPSILON);
+        assert_eq!(analysis.display_stats.total_pixels, 2);
     }
 
     #[test]
@@ -584,8 +669,8 @@ mod tests {
                 key: key(generation, None, AnalysisDomain::RawBayer),
                 active_roi: key(generation, None, AnalysisDomain::RawBayer).roi,
                 compute_chart: true,
-                frame: frame(),
-                display_image: None,
+                native: NativeImage::Raw(frame()),
+                display_frame: None,
             });
         }
         let pending = lock(&shared.request).pending.take().unwrap();

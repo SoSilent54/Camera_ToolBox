@@ -25,14 +25,15 @@ pub(crate) enum NotificationKey {
     RawRange { generation: u64 },
     RawLoadFailed { attempt: u64 },
     ColorRenderFailed { generation: u64, revision: u64 },
+    SaveFailed { generation: u64, revision: u64 },
 }
 
 impl NotificationKey {
     const fn scope(&self) -> NotificationScope {
         match *self {
-            Self::RawRange { generation } | Self::ColorRenderFailed { generation, .. } => {
-                NotificationScope::ImageGeneration(generation)
-            }
+            Self::RawRange { generation }
+            | Self::ColorRenderFailed { generation, .. }
+            | Self::SaveFailed { generation, .. } => NotificationScope::ImageGeneration(generation),
             Self::RawLoadFailed { attempt } => NotificationScope::LoadAttempt(attempt),
         }
     }

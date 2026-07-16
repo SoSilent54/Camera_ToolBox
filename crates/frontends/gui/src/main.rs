@@ -6,12 +6,14 @@ mod color_controls;
 mod color_worker;
 mod explorer;
 mod histogram_link;
+mod image_save;
 mod notification;
 mod platform_ui;
 mod raw_dialog;
 mod raw_inspector;
 mod viewer;
 mod workspace;
+mod yuv_dialog;
 
 use std::sync::Arc;
 

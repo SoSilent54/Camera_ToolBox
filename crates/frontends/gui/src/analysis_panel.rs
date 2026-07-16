@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use camera_toolbox_core::{HistogramSeries, RawRoiAnalysis, Roi, RoiStats};
+use camera_toolbox_core::{
+    ChannelAnalysis8, HistogramSeries, NativeImage, RawRoiAnalysis, Roi, RoiStats,
+};
 use eframe::egui;
 use egui_plot::{HoverPosition, Line, Plot, PlotPoint, PlotPoints, PlotUi, Points, VLine};
 
@@ -107,6 +109,7 @@ pub(crate) struct AnalysisPanelState {
     pub(crate) expanded: bool,
     opened_once: bool,
     pub(crate) domain: AnalysisDomain,
+    source_domain: AnalysisDomain,
     pub(crate) scope: AnalysisScope,
     y_mode: HistogramYMode,
     raw_visible: [bool; 5],
@@ -125,6 +128,7 @@ impl Default for AnalysisPanelState {
             expanded: false,
             opened_once: false,
             domain: AnalysisDomain::RawBayer,
+            source_domain: AnalysisDomain::RawBayer,
             scope: AnalysisScope::ActiveRoi,
             y_mode: HistogramYMode::Normalized,
             raw_visible: [true, true, true, true, false],
@@ -140,6 +144,18 @@ impl Default for AnalysisPanelState {
 }
 
 impl AnalysisPanelState {
+    pub(crate) fn default_for_native(native: &NativeImage) -> Self {
+        let source_domain = match native {
+            NativeImage::Raw(_) => AnalysisDomain::RawBayer,
+            NativeImage::Rgba8(_) => AnalysisDomain::SourceRgb,
+            NativeImage::Yuv420Sp(_) => AnalysisDomain::SourceYuv,
+        };
+        Self {
+            domain: source_domain,
+            source_domain,
+            ..Self::default()
+        }
+    }
     pub(crate) fn open_for_first_image(&mut self) {
         if !self.opened_once {
             self.expanded = true;
@@ -303,12 +319,9 @@ pub(crate) fn render_analysis_panel(
         ui.strong("Analysis");
         if state.expanded {
             ui.separator();
+            let source_domain = state.source_domain;
             response.selection_changed |= ui
-                .selectable_value(
-                    &mut state.domain,
-                    AnalysisDomain::RawBayer,
-                    AnalysisDomain::RawBayer.label(),
-                )
+                .selectable_value(&mut state.domain, source_domain, source_domain.label())
                 .changed();
             response.selection_changed |= ui
                 .selectable_value(
@@ -418,6 +431,26 @@ fn render_stats(ui: &mut egui::Ui, state: &AnalysisPanelState) {
                     analysis.histogram.total_overflow_count()
                 ));
             }
+            AnalysisData::Rgb(analysis) => {
+                ui.label(format!(
+                    "R {:.2} · G {:.2} · B {:.2} · A {:.2} · Pixels {}",
+                    analysis.r.mean,
+                    analysis.g.mean,
+                    analysis.b.mean,
+                    analysis.a.mean,
+                    analysis.r.total_samples
+                ));
+            }
+            AnalysisData::Yuv(analysis) => {
+                ui.label(format!(
+                    "Y {:.2} · U {:.2} · V {:.2} · Luma {} · Chroma {}",
+                    analysis.y.mean,
+                    analysis.u.mean,
+                    analysis.v.mean,
+                    analysis.y.total_samples,
+                    analysis.u.total_samples
+                ));
+            }
             AnalysisData::Display(analysis) => {
                 ui.label(format!(
                     "Display Y′ min {} · mean {:.2} · max {} · Pixels {} · rev {}",
@@ -442,6 +475,22 @@ fn render_series_toggles(ui: &mut egui::Ui, state: &mut AnalysisPanelState) {
                 state.raw_visible[0] = true;
             }
         }
+        AnalysisDomain::SourceRgb => {
+            for (index, label) in ["R", "G", "B", "A"].into_iter().enumerate() {
+                ui.checkbox(&mut state.display_visible[index], label);
+            }
+            if !state.display_visible.iter().any(|visible| *visible) {
+                state.display_visible[0] = true;
+            }
+        }
+        AnalysisDomain::SourceYuv => {
+            for (index, label) in ["Y", "U", "V"].into_iter().enumerate() {
+                ui.checkbox(&mut state.display_visible[index], label);
+            }
+            if !state.display_visible[..3].iter().any(|visible| *visible) {
+                state.display_visible[0] = true;
+            }
+        }
         AnalysisDomain::DisplayRgb => {
             for (index, label) in ["R", "G", "B", "Y′"].into_iter().enumerate() {
                 ui.checkbox(&mut state.display_visible[index], label);
@@ -462,7 +511,8 @@ fn render_plot(
     let y_mode = state.y_mode;
     let visibility = match state.domain {
         AnalysisDomain::RawBayer => state.raw_visible.as_slice(),
-        AnalysisDomain::DisplayRgb => state.display_visible.as_slice(),
+        AnalysisDomain::SourceRgb | AnalysisDomain::DisplayRgb => state.display_visible.as_slice(),
+        AnalysisDomain::SourceYuv => &state.display_visible[..3],
     };
     let Some(current) = state.current.as_ref() else {
         return PlotInteraction::default();
@@ -608,8 +658,8 @@ fn histogram_bin_at_x(
     let bin_index = plot_bin_index(points, x)?;
     let (lower_code, upper_code) = match current.data.as_ref() {
         AnalysisData::Raw(analysis) => analysis.histogram.bin_code_range(bin_index)?,
-        AnalysisData::Display(analysis) => {
-            if bin_index >= analysis.histogram.r.bins().len() {
+        AnalysisData::Rgb(_) | AnalysisData::Yuv(_) | AnalysisData::Display(_) => {
+            if bin_index >= 256 {
                 return None;
             }
             let code = u16::try_from(bin_index).ok()?;
@@ -669,6 +719,8 @@ fn prepare_image_plot_markers(
     };
     let analysis_roi = match current.data.as_ref() {
         AnalysisData::Raw(analysis) => analysis.roi,
+        AnalysisData::Rgb(analysis) => analysis.roi,
+        AnalysisData::Yuv(analysis) => analysis.roi,
         AnalysisData::Display(analysis) => analysis.roi,
     };
     if !analysis_roi.contains(hover.x, hover.y) {
@@ -740,6 +792,25 @@ fn plot_zoom_vector(scroll: egui::Vec2, shift: bool) -> Option<egui::Vec2> {
 fn prepare_plot(data: &AnalysisData) -> PreparedPlot {
     match data {
         AnalysisData::Raw(analysis) => prepare_raw_plot(analysis),
+        AnalysisData::Rgb(analysis) => PreparedPlot {
+            series: vec![
+                prepare_channel_series("R", egui::Color32::from_rgb(244, 91, 105), &analysis.r),
+                prepare_channel_series("G", egui::Color32::from_rgb(57, 193, 108), &analysis.g),
+                prepare_channel_series("B", egui::Color32::from_rgb(77, 141, 255), &analysis.b),
+                prepare_channel_series("A", egui::Color32::from_rgb(184, 189, 199), &analysis.a),
+            ],
+            saturation_x: None,
+            x_max: 256.0,
+        },
+        AnalysisData::Yuv(analysis) => PreparedPlot {
+            series: vec![
+                prepare_channel_series("Y", egui::Color32::from_rgb(216, 220, 229), &analysis.y),
+                prepare_channel_series("U", egui::Color32::from_rgb(77, 141, 255), &analysis.u),
+                prepare_channel_series("V", egui::Color32::from_rgb(244, 91, 105), &analysis.v),
+            ],
+            saturation_x: None,
+            x_max: 256.0,
+        },
         AnalysisData::Display(analysis) => PreparedPlot {
             series: vec![
                 prepare_display_series(
@@ -827,6 +898,20 @@ fn prepare_display_series(
     prepare_series(name, color, series.bins(), series.sample_count, 1.0)
 }
 
+fn prepare_channel_series(
+    name: &'static str,
+    color: egui::Color32,
+    series: &ChannelAnalysis8,
+) -> PlotSeries {
+    prepare_series(
+        name,
+        color,
+        series.histogram.as_ref(),
+        series.total_samples,
+        1.0,
+    )
+}
+
 #[allow(clippy::cast_precision_loss)] // Plot API 使用 f64；直方图计数仅在显示时近似转换。
 fn prepare_series(
     name: &'static str,
@@ -896,6 +981,19 @@ fn histogram_count(data: &AnalysisData, name: &str, index: usize) -> Option<u64>
             "Gb" => analysis.histogram.channels.gb.bins().get(index).copied(),
             "B" => analysis.histogram.channels.b.bins().get(index).copied(),
             "All" => analysis.histogram.all.bins().get(index).copied(),
+            _ => None,
+        },
+        AnalysisData::Rgb(analysis) => match name {
+            "R" => analysis.r.histogram.get(index).copied(),
+            "G" => analysis.g.histogram.get(index).copied(),
+            "B" => analysis.b.histogram.get(index).copied(),
+            "A" => analysis.a.histogram.get(index).copied(),
+            _ => None,
+        },
+        AnalysisData::Yuv(analysis) => match name {
+            "Y" => analysis.y.histogram.get(index).copied(),
+            "U" => analysis.u.histogram.get(index).copied(),
+            "V" => analysis.v.histogram.get(index).copied(),
             _ => None,
         },
         AnalysisData::Display(analysis) => match name {

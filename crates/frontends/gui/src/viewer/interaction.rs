@@ -1,9 +1,9 @@
 //! Viewer 坐标映射、ROI 手势、ROI overlay 与 minimap。
 
-use camera_toolbox_core::{RawFrame, Roi};
+use camera_toolbox_core::{NativeImage, NativePixelSample, Roi};
 use eframe::egui::{self, TextureId};
 
-use super::{CursorPixel, ImageViewerState, LoadedRaw, ViewerAction};
+use super::{CursorPixel, ImageViewerState, ViewerAction};
 
 const MINIMAP_MAX_SIZE: egui::Vec2 = egui::vec2(180.0, 130.0);
 const MINIMAP_MARGIN: f32 = 12.0;
@@ -26,8 +26,9 @@ pub(super) fn update_roi_interaction(
     response: &egui::Response,
     image_rect: egui::Rect,
     viewer: &mut ImageViewerState,
-    frame: &RawFrame,
+    dimensions: [u32; 2],
 ) -> Option<ViewerAction> {
+    let [width, height] = dimensions;
     let (secondary_pressed, secondary_released, pointer_position, cancel) = ui.input(|input| {
         (
             input.pointer.button_pressed(egui::PointerButton::Secondary),
@@ -47,13 +48,7 @@ pub(super) fn update_roi_interaction(
     if secondary_pressed
         && response.hovered()
         && let Some(position) = pointer_position
-        && let Some(pixel) = image_pixel_from_screen(
-            image_rect,
-            position,
-            frame.spec.width,
-            frame.spec.height,
-            false,
-        )
+        && let Some(pixel) = image_pixel_from_screen(image_rect, position, width, height, false)
     {
         viewer.roi_gesture = Some(RoiGesture {
             anchor: pixel,
@@ -68,13 +63,7 @@ pub(super) fn update_roi_interaction(
         gesture.drag_started = true;
     }
     if let (Some(gesture), Some(position)) = (&mut viewer.roi_gesture, pointer_position)
-        && let Some(pixel) = image_pixel_from_screen(
-            image_rect,
-            position,
-            frame.spec.width,
-            frame.spec.height,
-            true,
-        )
+        && let Some(pixel) = image_pixel_from_screen(image_rect, position, width, height, true)
     {
         gesture.current = pixel;
     }
@@ -170,27 +159,26 @@ pub(super) const fn roi_from_inclusive_pixels(anchor: ImagePixel, current: Image
 pub(super) fn hover_pixel(
     image_rect: egui::Rect,
     position: egui::Pos2,
-    frame: &RawFrame,
+    image: &NativeImage,
 ) -> Option<CursorPixel> {
-    let pixel = image_pixel_from_screen(
-        image_rect,
-        position,
-        frame.spec.width,
-        frame.spec.height,
-        false,
-    )?;
-    let index = pixel.y as usize * frame.spec.width as usize + pixel.x as usize;
+    let [width, height] = image.dimensions();
+    let pixel = image_pixel_from_screen(image_rect, position, width, height, false)?;
+    let raw_value = match image.sample_at(pixel.x, pixel.y)? {
+        NativePixelSample::Raw { value, .. } => Some(value),
+        NativePixelSample::Rgba { .. } | NativePixelSample::Yuv { .. } => None,
+    };
     Some(CursorPixel {
         x: pixel.x,
         y: pixel.y,
-        value: frame.pixels()[index],
+        raw_value,
     })
 }
 
-fn roi_screen_rect(image_rect: egui::Rect, frame: &RawFrame, roi: Roi) -> Option<egui::Rect> {
-    let roi = roi.clamped_to(frame.spec.width, frame.spec.height)?;
-    let scale_x = image_rect.width() / image_extent_f32(frame.spec.width);
-    let scale_y = image_rect.height() / image_extent_f32(frame.spec.height);
+fn roi_screen_rect(image_rect: egui::Rect, dimensions: [u32; 2], roi: Roi) -> Option<egui::Rect> {
+    let [width, height] = dimensions;
+    let roi = roi.clamped_to(width, height)?;
+    let scale_x = image_rect.width() / image_extent_f32(width);
+    let scale_y = image_rect.height() / image_extent_f32(height);
     Some(egui::Rect::from_min_max(
         egui::pos2(
             image_rect.left() + image_extent_f32(roi.x) * scale_x,
@@ -206,11 +194,11 @@ fn roi_screen_rect(image_rect: egui::Rect, frame: &RawFrame, roi: Roi) -> Option
 pub(super) fn draw_roi_overlay(
     painter: &egui::Painter,
     image_rect: egui::Rect,
-    frame: &RawFrame,
+    dimensions: [u32; 2],
     roi: Roi,
     color: egui::Color32,
 ) {
-    let Some(rect) = roi_screen_rect(image_rect, frame, roi) else {
+    let Some(rect) = roi_screen_rect(image_rect, dimensions, roi) else {
         return;
     };
     painter.rect_stroke(
@@ -224,11 +212,11 @@ pub(super) fn draw_roi_overlay(
 pub(super) fn draw_roi_draft(
     painter: &egui::Painter,
     image_rect: egui::Rect,
-    frame: &RawFrame,
+    dimensions: [u32; 2],
     gesture: RoiGesture,
 ) {
     let roi = roi_from_inclusive_pixels(gesture.anchor, gesture.current);
-    let Some(rect) = roi_screen_rect(image_rect, frame, roi) else {
+    let Some(rect) = roi_screen_rect(image_rect, dimensions, roi) else {
         return;
     };
     painter.rect_filled(
@@ -255,11 +243,11 @@ pub(super) fn draw_minimap(
     painter: &egui::Painter,
     viewer_rect: egui::Rect,
     image_rect: egui::Rect,
-    loaded: &LoadedRaw,
+    dimensions: [u32; 2],
     texture_id: TextureId,
 ) {
-    let image_width = image_extent_f32(loaded.frame.spec.width);
-    let image_height = image_extent_f32(loaded.frame.spec.height);
+    let image_width = image_extent_f32(dimensions[0]);
+    let image_height = image_extent_f32(dimensions[1]);
     if image_width <= 0.0 || image_height <= 0.0 {
         return;
     }

@@ -433,6 +433,7 @@ where
                         .value(selection.series)
                         .is_some_and(|value| selection.matches_code(u16::from(value)))
                 }
+                AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => false,
             };
             if matches {
                 mask.bits[index / 64] |= 1u64 << (index % 64);

@@ -27,28 +27,37 @@ use crate::{
         SpatialHighlightRequest, SpatialHighlightResult, SpatialHighlightWorker,
         display_histogram_sample,
     },
+    image_save::{
+        ImageSaveWorker, SaveFormat, SaveKey, SavePayload, SaveRequest, SaveResult,
+        YuvSaveDialogState,
+    },
     notification::{NotificationCenter, NotificationKey, NotificationScope, UiNotification},
     platform_ui::{LiveRuntime, PlatformEffect, PlatformUiAction, StreamPanelAction},
     raw_dialog::{RawOpenDialogState, local_file_source},
     raw_inspector::render_raw_inspector,
     viewer::{
         HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, ViewerAction,
-        ViewerOutput, bayer_label, render_viewer,
+        ViewerImage, ViewerOutput, bayer_label, render_viewer,
     },
     workspace::{
         DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, TabBarAction,
         WorkspaceState, render_tab_bar,
     },
+    yuv_dialog::YuvOpenDialogState,
 };
+use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::RusshTransportFactory;
 use camera_toolbox_app::{
-    AutoOpenActivation, FileRef, FileSystem, FsCancellation, FsControl, LocalRawAnalyzeReport,
-    LocalRawAnalyzeRequest, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline,
-    RawSourceHandle, SourceCache, SourceReadProgress, WorkspaceSettings,
+    AutoOpenActivation, FileRef, FileSystem, FsCancellation, FsControl, ImageFileKind,
+    ImageOpenMode, ImageOpenPipeline, ImageOpenResult, ImageSourceHandle, LocalRawAnalyzeReport,
+    LocalRawAnalyzeRequest, RasterFormat, RasterImageCodec, RawDecodeParams, RawInterpretation,
+    RawOpenMode, RawOpenPipeline, SourceCache, SourceReadProgress, WorkspaceSettings,
 };
 use camera_toolbox_core::{
-    MediaFormat, OwnedMediaPayload, PackedRawSpec, Roi, analyze_roi, decode_le_continuous_raw,
+    ChromaOrder, MediaFormat, NativeImage, OwnedMediaPayload, PackedRawSpec, Rgba8Frame, Roi,
+    Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange, analyze_roi, decode_le_continuous_raw,
+    yuv420sp_to_rgba8_with_cancel,
 };
 use eframe::egui;
 const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -60,8 +69,13 @@ const RAW_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
 struct OpenedRawDocument {
     report: LocalRawAnalyzeReport,
-    source: RawSourceHandle,
+    source: ImageSourceHandle,
     interpretation: RawInterpretation,
+}
+
+enum OpenedFileDocument {
+    Raw(OpenedRawDocument),
+    Image(ImageOpenResult),
 }
 
 struct WorkspaceFileOpenRequest {
@@ -82,7 +96,7 @@ enum RawOpenJobEvent {
 struct RawOpenJobResult {
     attempt: u64,
     path: PathBuf,
-    result: Result<OpenedRawDocument, String>,
+    result: Result<OpenedFileDocument, String>,
 }
 
 struct ActiveRawOpenJob {
@@ -101,7 +115,7 @@ struct PendingAutoOpenRequest {
 struct AutoOpenJobResult {
     candidate: AutoOpenCandidate,
     path: PathBuf,
-    result: Result<OpenedRawDocument, String>,
+    result: Result<OpenedFileDocument, String>,
 }
 
 struct ActiveAutoOpenJob {
@@ -115,6 +129,12 @@ struct ReinterpretJobResult {
     result: Result<OpenedRawDocument, String>,
 }
 
+struct PendingYuvSave {
+    key: SaveKey,
+    path: PathBuf,
+    frame: Arc<Rgba8Frame>,
+}
+
 pub(crate) struct CameraToolboxApp {
     workspace: WorkspaceState,
     auto_open: AutoOpenCoordinator,
@@ -122,10 +142,14 @@ pub(crate) struct CameraToolboxApp {
     explorer_panel_expanded: bool,
     empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
+    yuv_dialog: YuvOpenDialogState,
+    yuv_save_dialog: YuvSaveDialogState,
     raw_pipeline: RawOpenPipeline,
+    image_pipeline: ImageOpenPipeline,
     color_worker: ColorRenderWorker,
     analysis_worker: AnalysisWorker,
     spatial_worker: SpatialHighlightWorker,
+    save_worker: ImageSaveWorker,
     notifications: NotificationCenter,
     next_generation: u64,
     live_runtime: LiveRuntime,
@@ -134,7 +158,9 @@ pub(crate) struct CameraToolboxApp {
     raw_open_sender: Sender<RawOpenJobEvent>,
     raw_open_receiver: Receiver<RawOpenJobEvent>,
     active_raw_open: Option<ActiveRawOpenJob>,
+    pending_yuv_open: Option<WorkspaceFileOpenRequest>,
     pending_auto_open: VecDeque<PendingAutoOpenRequest>,
+    pending_yuv_save: Option<PendingYuvSave>,
     auto_open_sender: Sender<AutoOpenJobResult>,
     auto_open_receiver: Receiver<AutoOpenJobResult>,
     active_auto_open: Option<ActiveAutoOpenJob>,
@@ -148,6 +174,14 @@ impl CameraToolboxApp {
     pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
         let cache = SourceCache::new(RAW_SOURCE_CACHE_BYTES, RAW_SOURCE_CACHE_ENTRIES)
             .map_err(std::io::Error::other)?;
+        let codec: Arc<dyn RasterImageCodec> = Arc::new(ImageRasterCodec);
+        let raw_pipeline = RawOpenPipeline::new(cache, Vec::new(), 256 * 1024 * 1024);
+        let image_pipeline = ImageOpenPipeline::new(
+            raw_pipeline.clone(),
+            Arc::clone(&codec),
+            256 * 1024 * 1024,
+            256 * 1024 * 1024,
+        );
         let workspace_settings = WorkspaceSettings::default();
         let (raw_open_sender, raw_open_receiver) = mpsc::channel();
         let (reinterpret_sender, reinterpret_receiver) = mpsc::channel();
@@ -166,10 +200,14 @@ impl CameraToolboxApp {
             explorer_panel_expanded: false,
             empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
-            raw_pipeline: RawOpenPipeline::new(cache, Vec::new(), 256 * 1024 * 1024),
+            yuv_dialog: YuvOpenDialogState::default(),
+            yuv_save_dialog: YuvSaveDialogState::default(),
+            raw_pipeline,
+            image_pipeline,
             color_worker: ColorRenderWorker::new(context)?,
             analysis_worker: AnalysisWorker::new(context)?,
             spatial_worker: SpatialHighlightWorker::new(context)?,
+            save_worker: ImageSaveWorker::new(context, codec)?,
             notifications: NotificationCenter::default(),
             next_generation: 1,
             live_runtime,
@@ -178,6 +216,8 @@ impl CameraToolboxApp {
             raw_open_sender,
             raw_open_receiver,
             active_raw_open: None,
+            pending_yuv_open: None,
+            pending_yuv_save: None,
             pending_auto_open: VecDeque::new(),
             auto_open_sender,
             auto_open_receiver,
@@ -196,6 +236,7 @@ impl eframe::App for CameraToolboxApp {
         self.poll_color_result(&context);
         self.poll_analysis_result();
         self.poll_spatial_highlight_result();
+        self.poll_save_result();
         self.poll_raw_open_result(&context);
         self.poll_auto_open_result(&context);
         self.enqueue_auto_open_candidates();
@@ -210,14 +251,23 @@ impl eframe::App for CameraToolboxApp {
             document.install_latest_texture(&context);
         }
         self.ensure_active_resources(&context);
-        if let Some(document) = self.workspace.active_asset_mut() {
-            document.ensure_texture(&context);
+        if let Some(document) = self.workspace.active_image_mut() {
+            if let Err(error) = document.ensure_texture(&context) {
+                tracing::error!(
+                    operation = "install_static_image_texture",
+                    document_id = %document.id,
+                    error = %error,
+                    "failed to install static image texture"
+                );
+            }
         }
         self.ensure_analysis();
         if let Some(document) = self.workspace.active_mut() {
-            document
-                .viewer
-                .refresh_cursor(&context, &document.loaded.frame);
+            let native = NativeImage::Raw(Arc::clone(&document.loaded.frame));
+            document.viewer.refresh_cursor(&context, &native);
+        }
+        if let Some(document) = self.workspace.active_image_mut() {
+            document.viewer.refresh_cursor(&context, &document.native);
         }
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
@@ -277,15 +327,22 @@ impl eframe::App for CameraToolboxApp {
                 if let Some(document) = self.workspace.active_live_mut() {
                     let rect = Self::render_live_viewer(ui, document, &self.live_runtime);
                     ViewerOutput { rect, action: None }
-                } else if let Some(document) = self.workspace.active_asset_mut() {
-                    let rect = Self::render_asset_viewer(ui, document);
-                    ViewerOutput { rect, action: None }
+                } else if let Some(document) = self.workspace.active_image_mut() {
+                    let image = document.display.texture_id().map(|texture_id| {
+                        ViewerImage::native(
+                            document.generation,
+                            document.native.clone(),
+                            texture_id,
+                            document.roi,
+                        )
+                    });
+                    render_viewer(ui, image, &mut document.viewer, document.hover_view, None)
                 } else if let Some(document) = self.workspace.active_mut() {
+                    let image = ViewerImage::raw(&document.loaded, document.display_mode);
                     render_viewer(
                         ui,
-                        Some(&document.loaded),
+                        Some(image),
                         &mut document.viewer,
-                        document.display_mode,
                         document.hover_view,
                         document.spatial_highlight.as_ref(),
                     )
@@ -294,7 +351,6 @@ impl eframe::App for CameraToolboxApp {
                         ui,
                         None,
                         &mut self.empty_viewer,
-                        DisplayMode::RawMono,
                         HoverViewSettings::default(),
                         None,
                     )
@@ -304,12 +360,14 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
         }
+        self.render_yuv_save_dialog(&context);
         self.notifications.render(
             &context,
             viewer_output.rect,
             context.input(|input| input.time),
         );
         self.render_raw_open_dialog(&context);
+        self.render_yuv_open_dialog(&context);
         self.render_pending_ephemeral_close(&context);
         self.ensure_analysis();
         self.workspace.enforce_derived_budget();
@@ -353,22 +411,18 @@ impl CameraToolboxApp {
     }
 
     fn render_file_menu(&mut self, ui: &mut egui::Ui) {
-        if ui.button("Open Raw...").clicked() {
+        if ui.button("Open...").clicked() {
             self.raw_dialog.open(ui.ctx());
             ui.close();
         }
         if ui
             .add_enabled(
-                self.workspace.active_asset().is_some()
-                    || self
-                        .workspace
-                        .active()
-                        .is_some_and(|document| document.source_asset.is_some()),
-                egui::Button::new("Save/Export Captured Source..."),
+                self.workspace.active().is_some() || self.workspace.active_image().is_some(),
+                egui::Button::new("Save..."),
             )
             .clicked()
         {
-            self.save_active_ephemeral_source();
+            self.start_save_active_image(ui.ctx());
             ui.close();
         }
         if ui
@@ -610,13 +664,28 @@ impl CameraToolboxApp {
     }
 
     fn render_analysis_panel_ui(&mut self, ui: &mut egui::Ui) {
-        let Some(document) = self.workspace.active() else {
+        let Some(active_id) = self.workspace.active_id() else {
             return;
         };
         let image_hover = self.image_histogram_hover();
-        let expanded = document.analysis_panel.expanded;
-        let default_size = document.analysis_panel.panel_height();
-        let min_size = document.analysis_panel.min_height();
+        let (expanded, default_size, min_size, supports_spatial) =
+            if let Some(document) = self.workspace.document(active_id) {
+                (
+                    document.analysis_panel.expanded,
+                    document.analysis_panel.panel_height(),
+                    document.analysis_panel.min_height(),
+                    true,
+                )
+            } else if let Some(document) = self.workspace.image(active_id) {
+                (
+                    document.analysis_panel.expanded,
+                    document.analysis_panel.panel_height(),
+                    document.analysis_panel.min_height(),
+                    false,
+                )
+            } else {
+                return;
+            };
         let max_size = if expanded {
             (ui.available_height() * 0.45).max(min_size)
         } else {
@@ -628,17 +697,26 @@ impl CameraToolboxApp {
             .min_size(min_size)
             .max_size(max_size)
             .show(ui, |ui| {
-                let document = self.workspace.active_mut().expect("active document exists");
-                render_analysis_panel(ui, &mut document.analysis_panel, image_hover)
+                if let Some(document) = self.workspace.document_mut(active_id) {
+                    render_analysis_panel(ui, &mut document.analysis_panel, image_hover)
+                } else {
+                    let document = self
+                        .workspace
+                        .image_mut(active_id)
+                        .expect("active analysis document exists");
+                    render_analysis_panel(ui, &mut document.analysis_panel, None)
+                }
             })
             .inner;
-        if response.selection_changed
-            && let Some(document) = self.workspace.active_mut()
-        {
-            document.analysis_pending_active = None;
+        if response.selection_changed {
+            if let Some(document) = self.workspace.document_mut(active_id) {
+                document.analysis_pending_active = None;
+            } else if let Some(document) = self.workspace.image_mut(active_id) {
+                document.analysis_pending_active = None;
+            }
         }
         self.update_spatial_highlight(
-            response.hovered_bin,
+            response.hovered_bin.filter(|_| supports_spatial),
             response.selection_changed || response.view_interacting,
         );
     }
@@ -682,6 +760,11 @@ impl CameraToolboxApp {
                         return;
                     }
                     Some(Arc::clone(&preview.image))
+                }
+                AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => {
+                    document.spatial_requested = None;
+                    document.spatial_highlight = None;
+                    return;
                 }
             };
             document.spatial_highlight = None;
@@ -781,6 +864,7 @@ impl CameraToolboxApp {
                     *preview.image.pixels.get(index)?,
                 ))
             }
+            AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => return None,
         };
         Some(ImageHistogramHover {
             key,
@@ -791,6 +875,24 @@ impl CameraToolboxApp {
     }
 
     fn handle_viewer_action(&mut self, action: ViewerAction) {
+        if let Some(document) = self.workspace.active_image_mut() {
+            match action {
+                ViewerAction::CommitRoi(roi) => Self::commit_roi_for_image(document, roi),
+                ViewerAction::ResetRoi => {
+                    let [width, height] = document.native.dimensions();
+                    Self::commit_roi_for_image(
+                        document,
+                        Roi {
+                            x: 0,
+                            y: 0,
+                            width,
+                            height,
+                        },
+                    );
+                }
+            }
+            return;
+        }
         let Some(document) = self.workspace.active_mut() else {
             return;
         };
@@ -836,58 +938,141 @@ impl CameraToolboxApp {
         document.analysis_pending_active = None;
     }
 
+    fn commit_roi_for_image(document: &mut crate::workspace::ImageDocument, roi: Roi) {
+        let [width, height] = document.native.dimensions();
+        let Some(roi) = roi.clamped_to(width, height) else {
+            return;
+        };
+        if document.roi == roi {
+            return;
+        }
+        tracing::debug!(
+            operation = "commit_roi",
+            document_id = %document.id,
+            generation = document.generation,
+            roi_x = roi.x,
+            roi_y = roi.y,
+            roi_width = roi.width,
+            roi_height = roi.height,
+            "committed static image ROI"
+        );
+        document.roi = roi;
+        document.analysis_pending_active = None;
+    }
+
     fn ensure_analysis(&mut self) {
-        let request = {
-            let Some(document) = self.workspace.active_mut() else {
-                return;
-            };
-            let loaded = &document.loaded;
-            let chart_roi = document.analysis_panel.scope.resolve(
-                loaded.roi,
-                loaded.frame.spec.width,
-                loaded.frame.spec.height,
-            );
-            let (source_revision, display_image) = match document.analysis_panel.domain {
-                AnalysisDomain::RawBayer => (None, None),
-                AnalysisDomain::DisplayRgb => {
-                    let Some(preview) = &loaded.installed_color else {
-                        document.analysis_panel.wait_for_source();
-                        return;
-                    };
-                    (
-                        Some(preview.rendered_revision),
-                        Some(Arc::clone(&preview.image)),
-                    )
-                }
-            };
-            let key = AnalysisKey {
-                document_id: document.id,
-                generation: loaded.generation,
-                source_revision,
-                roi: chart_roi,
-                domain: document.analysis_panel.domain,
-            };
-            let desired = document.analysis_panel.set_desired(key);
-            let chart_ready = document.analysis_panel.has_current(key);
-            let stats_ready = loaded.stats.is_some();
-            let stats_pending =
-                document.analysis_pending_active == Some((loaded.generation, loaded.roi));
-            if desired != DesiredAnalysis::Submit && (stats_ready || stats_pending) {
-                return;
-            }
-            let compute_chart = !chart_ready;
-            document.analysis_pending_active = Some((loaded.generation, loaded.roi));
-            AnalysisRequest {
-                key,
-                active_roi: loaded.roi,
-                compute_chart,
-                frame: Arc::clone(&loaded.frame),
-                display_image,
-            }
+        let Some(active_id) = self.workspace.active_id() else {
+            return;
+        };
+        let request = if let Some(document) = self.workspace.document_mut(active_id) {
+            Self::analysis_request_for_raw(document)
+        } else if let Some(document) = self.workspace.image_mut(active_id) {
+            Self::analysis_request_for_image(document)
+        } else {
+            None
+        };
+        let Some(request) = request else {
+            return;
         };
         self.workspace
             .supersede_analysis_submissions_except(request.key.document_id);
         self.analysis_worker.submit(request);
+    }
+
+    fn analysis_request_for_raw(
+        document: &mut crate::workspace::RawDocument,
+    ) -> Option<AnalysisRequest> {
+        let loaded = &document.loaded;
+        let chart_roi = document.analysis_panel.scope.resolve(
+            loaded.roi,
+            loaded.frame.spec.width,
+            loaded.frame.spec.height,
+        );
+        let (source_revision, display_frame) = match document.analysis_panel.domain {
+            AnalysisDomain::RawBayer => (None, None),
+            AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => {
+                document.analysis_panel.wait_for_source();
+                return None;
+            }
+            AnalysisDomain::DisplayRgb => {
+                let Some(preview) = &loaded.installed_color else {
+                    document.analysis_panel.wait_for_source();
+                    return None;
+                };
+                (
+                    Some(preview.rendered_revision),
+                    Some(Arc::clone(&preview.frame)),
+                )
+            }
+        };
+        let key = AnalysisKey {
+            document_id: document.id,
+            generation: loaded.generation,
+            source_revision,
+            roi: chart_roi,
+            domain: document.analysis_panel.domain,
+        };
+        let desired = document.analysis_panel.set_desired(key);
+        let chart_ready = document.analysis_panel.has_current(key);
+        let stats_ready = loaded.stats.is_some();
+        let stats_pending =
+            document.analysis_pending_active == Some((loaded.generation, loaded.roi));
+        if desired != DesiredAnalysis::Submit && (stats_ready || stats_pending) {
+            return None;
+        }
+        let compute_chart = !chart_ready;
+        document.analysis_pending_active = Some((loaded.generation, loaded.roi));
+        Some(AnalysisRequest {
+            key,
+            active_roi: loaded.roi,
+            compute_chart,
+            native: NativeImage::Raw(Arc::clone(&loaded.frame)),
+            display_frame,
+        })
+    }
+
+    fn analysis_request_for_image(
+        document: &mut crate::workspace::ImageDocument,
+    ) -> Option<AnalysisRequest> {
+        let [width, height] = document.native.dimensions();
+        let chart_roi = document
+            .analysis_panel
+            .scope
+            .resolve(document.roi, width, height);
+        let (source_revision, display_frame) = match document.analysis_panel.domain {
+            AnalysisDomain::SourceRgb if matches!(&document.native, NativeImage::Rgba8(_)) => {
+                (None, None)
+            }
+            AnalysisDomain::SourceYuv if matches!(&document.native, NativeImage::Yuv420Sp(_)) => {
+                (None, None)
+            }
+            AnalysisDomain::DisplayRgb => (
+                Some(document.display.revision),
+                Some(Arc::clone(&document.display.frame)),
+            ),
+            AnalysisDomain::RawBayer | AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => {
+                document.analysis_panel.wait_for_source();
+                return None;
+            }
+        };
+        let key = AnalysisKey {
+            document_id: document.id,
+            generation: document.generation,
+            source_revision,
+            roi: chart_roi,
+            domain: document.analysis_panel.domain,
+        };
+        if document.analysis_panel.set_desired(key) != DesiredAnalysis::Submit {
+            return None;
+        }
+        document.analysis_pending_active = Some((document.generation, document.roi));
+        Some(AnalysisRequest {
+            key,
+            active_roi: document.roi,
+            compute_chart: true,
+            native: document.native.clone(),
+            display_frame,
+        })
     }
 
     fn poll_analysis_result(&mut self) {
@@ -903,40 +1088,66 @@ impl CameraToolboxApp {
             document_id: key.document_id,
             generation: key.generation,
         };
-        let Some(document) = self.workspace.matching_document_mut(identity) else {
-            tracing::debug!(
-                operation = "poll_histogram_analysis",
-                document_id = %key.document_id,
-                generation = key.generation,
-                "dropped analysis result for closed or replaced document"
-            );
+        if let Some(document) = self.workspace.matching_document_mut(identity) {
+            let accepted = document.analysis_panel.accept_result(result);
+            let Some((active_roi, stats)) = accepted else {
+                tracing::debug!(
+                    operation = "poll_histogram_analysis",
+                    document_id = %key.document_id,
+                    generation = key.generation,
+                    revision = ?key.source_revision,
+                    domain = key.domain.label(),
+                    "dropped stale or failed histogram analysis"
+                );
+                return;
+            };
+            if document.loaded.roi == active_roi {
+                document.loaded.stats = Some(stats);
+                document.analysis_pending_active = None;
+                document.mark_derived_loaded();
+                tracing::debug!(
+                    operation = "install_histogram_analysis",
+                    document_id = %key.document_id,
+                    generation = key.generation,
+                    revision = ?key.source_revision,
+                    domain = key.domain.label(),
+                    "installed histogram analysis"
+                );
+            }
             return;
-        };
-        let accepted = document.analysis_panel.accept_result(result);
-        let Some((active_roi, stats)) = accepted else {
-            tracing::debug!(
-                operation = "poll_histogram_analysis",
-                document_id = %key.document_id,
-                generation = key.generation,
-                revision = ?key.source_revision,
-                domain = key.domain.label(),
-                "dropped stale or failed histogram analysis"
-            );
-            return;
-        };
-        if document.loaded.roi == active_roi {
-            document.loaded.stats = Some(stats);
-            document.analysis_pending_active = None;
-            document.mark_derived_loaded();
-            tracing::debug!(
-                operation = "install_histogram_analysis",
-                document_id = %key.document_id,
-                generation = key.generation,
-                revision = ?key.source_revision,
-                domain = key.domain.label(),
-                "installed histogram analysis"
-            );
         }
+        if let Some(document) = self.workspace.matching_image_mut(identity) {
+            let accepted = document.analysis_panel.accept_result(result);
+            let Some((active_roi, _stats)) = accepted else {
+                tracing::debug!(
+                    operation = "poll_histogram_analysis",
+                    document_id = %key.document_id,
+                    generation = key.generation,
+                    revision = ?key.source_revision,
+                    domain = key.domain.label(),
+                    "dropped stale or failed static image analysis"
+                );
+                return;
+            };
+            if document.roi == active_roi {
+                document.analysis_pending_active = None;
+                tracing::debug!(
+                    operation = "install_histogram_analysis",
+                    document_id = %key.document_id,
+                    generation = key.generation,
+                    revision = ?key.source_revision,
+                    domain = key.domain.label(),
+                    "installed static image histogram analysis"
+                );
+            }
+            return;
+        }
+        tracing::debug!(
+            operation = "poll_histogram_analysis",
+            document_id = %key.document_id,
+            generation = key.generation,
+            "dropped analysis result for closed or replaced document"
+        );
     }
 
     fn render_status_bar(&self, ui: &mut egui::Ui) {
@@ -1000,6 +1211,33 @@ impl CameraToolboxApp {
                     document.metrics.preview_dropped,
                     document.metrics.decoder_resyncs
                 ));
+                return;
+            }
+            if let Some(document) = self.workspace.active_image() {
+                let [width, height] = document.native.dimensions();
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(format!("{:.0}%", document.viewer.zoom * 100.0));
+                    ui.separator();
+                    ui.label(format!(
+                        "ROI: {}×{}",
+                        document.roi.width, document.roi.height
+                    ));
+                    ui.separator();
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.add(egui::Label::new(&document.title).truncate());
+                            ui.separator();
+                            ui.label(format!(
+                                "{}×{} · {}",
+                                width,
+                                height,
+                                document.format_label()
+                            ));
+                        },
+                    );
+                });
                 return;
             }
             let Some(document) = self.workspace.active() else {
@@ -1121,17 +1359,44 @@ impl CameraToolboxApp {
                 reference,
                 remote,
             } => {
-                let attempt = self.begin_raw_open_attempt();
-                self.start_load_workspace_file(
-                    context,
-                    attempt,
-                    WorkspaceFileOpenRequest {
-                        display_path,
-                        file_system,
-                        reference,
-                        remote,
-                    },
-                );
+                let kind = ImageOpenPipeline::classify(&reference);
+                let request = WorkspaceFileOpenRequest {
+                    display_path: display_path.clone(),
+                    file_system,
+                    reference,
+                    remote,
+                };
+                match kind {
+                    Ok(ImageFileKind::Yuv420Sp { chroma_order_hint }) => {
+                        self.pending_yuv_open = Some(request);
+                        self.yuv_dialog.open(display_path, chroma_order_hint);
+                    }
+                    Ok(ImageFileKind::Raw | ImageFileKind::Png | ImageFileKind::Jpeg) => {
+                        self.pending_yuv_open = None;
+                        self.yuv_dialog.close();
+                        let attempt = self.begin_raw_open_attempt();
+                        self.start_load_workspace_file(
+                            context,
+                            attempt,
+                            request,
+                            ImageOpenMode::Auto,
+                        );
+                    }
+                    Err(error) => {
+                        let attempt = self.begin_raw_open_attempt();
+                        tracing::warn!(
+                            operation = "classify_image_file",
+                            path = %display_path.display(),
+                            error = %error,
+                            "rejected unsupported image file"
+                        );
+                        self.notifications.push_once(UiNotification::error(
+                            NotificationKey::RawLoadFailed { attempt },
+                            "Unsupported image file",
+                            &error.to_string(),
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1187,15 +1452,16 @@ impl CameraToolboxApp {
             candidate: pending.candidate.clone(),
             cancellation: cancellation.clone(),
         });
-        let pipeline = self.raw_pipeline.clone();
+        let pipeline = self.image_pipeline.clone();
         let sender = self.auto_open_sender.clone();
         let context = context.clone();
         thread::spawn(move || {
             let path = pending.request.display_path.clone();
             let mut ignore_progress = |_| {};
-            let result = decode_workspace_file_request(
+            let result = decode_workspace_image_request(
                 &pipeline,
                 pending.request,
+                ImageOpenMode::Auto,
                 cancellation,
                 &mut ignore_progress,
             )
@@ -1228,6 +1494,266 @@ impl CameraToolboxApp {
         self.raw_dialog.close(context);
     }
 
+    fn render_yuv_open_dialog(&mut self, context: &egui::Context) {
+        if let Some(spec) = self.yuv_dialog.show(context) {
+            let Some(request) = self.pending_yuv_open.take() else {
+                return;
+            };
+            let attempt = self.begin_raw_open_attempt();
+            self.start_load_workspace_file(
+                context,
+                attempt,
+                request,
+                ImageOpenMode::Yuv420Sp(spec),
+            );
+        } else if !self.yuv_dialog.is_open() {
+            self.pending_yuv_open = None;
+        }
+    }
+
+    fn render_yuv_save_dialog(&mut self, _context: &egui::Context) {
+        if let Some((chroma_order, matrix, range)) = self.yuv_save_dialog.show(_context) {
+            let Some(pending) = self.pending_yuv_save.take() else {
+                return;
+            };
+            self.save_worker.submit(SaveRequest {
+                key: pending.key,
+                path: pending.path,
+                format: SaveFormat::Yuv420Sp {
+                    chroma_order,
+                    matrix,
+                    range,
+                },
+                payload: SavePayload::Display(pending.frame),
+            });
+        } else if !self.yuv_save_dialog.is_open() {
+            self.pending_yuv_save = None;
+        }
+    }
+
+    fn start_save_active_image(&mut self, _context: &egui::Context) -> bool {
+        let Some((default_name, can_save_raw)) = self.active_save_defaults() else {
+            return false;
+        };
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Image", &["png", "raw", "nv12", "nv21", "yuv"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return false;
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        match extension.as_deref() {
+            Some("raw") if can_save_raw => self.submit_raw_save(path),
+            Some("raw") => {
+                if let Some(key) = self.active_save_key() {
+                    self.notify_save_error(
+                        key,
+                        "RAW save requires authoritative native RAW data".to_owned(),
+                    );
+                }
+                false
+            }
+            Some("png") => self.submit_png_save(path),
+            Some("nv12") | Some("nv21") | Some("yuv") => self.prepare_yuv_save(path),
+            _ => {
+                if let Some(key) = self.active_save_key() {
+                    self.notify_save_error(
+                        key,
+                        "choose a .raw, .png, .nv12, .nv21, or .yuv destination".to_owned(),
+                    );
+                }
+                false
+            }
+        }
+    }
+
+    fn active_save_defaults(&self) -> Option<(String, bool)> {
+        if let Some(document) = self.workspace.active() {
+            let stem = document
+                .title
+                .strip_suffix(".raw")
+                .unwrap_or(&document.title);
+            return Some((format!("{stem}.raw"), true));
+        }
+        let document = self.workspace.active_image()?;
+        let stem = document
+            .title
+            .rsplit_once('.')
+            .map_or(document.title.as_str(), |(stem, _)| stem);
+        Some((format!("{stem}.png"), false))
+    }
+
+    fn active_save_key(&self) -> Option<SaveKey> {
+        if let Some(document) = self.workspace.active() {
+            return Some(SaveKey {
+                document_id: document.id,
+                generation: document.loaded.generation,
+                revision: document.decode_generation,
+            });
+        }
+        let document = self.workspace.active_image()?;
+        Some(SaveKey {
+            document_id: document.id,
+            generation: document.generation,
+            revision: document.display.revision,
+        })
+    }
+
+    fn submit_raw_save(&mut self, path: PathBuf) -> bool {
+        let Some(document) = self.workspace.active() else {
+            return false;
+        };
+        let key = SaveKey {
+            document_id: document.id,
+            generation: document.loaded.generation,
+            revision: document.decode_generation,
+        };
+        self.save_worker.submit(SaveRequest {
+            key,
+            path,
+            format: SaveFormat::RawU16Le,
+            payload: SavePayload::Raw(Arc::clone(&document.loaded.frame)),
+        });
+        true
+    }
+
+    fn submit_png_save(&mut self, path: PathBuf) -> bool {
+        let Some((key, frame)) = self.active_display_save_snapshot() else {
+            if let Some(key) = self.active_save_key() {
+                self.notify_save_error(
+                    key,
+                    "PNG save requires an available immutable display revision".to_owned(),
+                );
+            }
+            return false;
+        };
+        self.save_worker.submit(SaveRequest {
+            key,
+            path,
+            format: SaveFormat::Png,
+            payload: SavePayload::Display(frame),
+        });
+        true
+    }
+
+    fn prepare_yuv_save(&mut self, path: PathBuf) -> bool {
+        let Some((key, frame)) = self.active_display_save_snapshot() else {
+            if let Some(key) = self.active_save_key() {
+                self.notify_save_error(
+                    key,
+                    "YUV save requires an available immutable display revision".to_owned(),
+                );
+            }
+            return false;
+        };
+        let extension = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(str::to_ascii_lowercase);
+        let chroma_order_hint = match extension.as_deref() {
+            Some("nv12") => Some(ChromaOrder::Uv),
+            Some("nv21") => Some(ChromaOrder::Vu),
+            _ => None,
+        };
+        let (matrix, range) = self.active_yuv_save_defaults();
+        self.pending_yuv_save = Some(PendingYuvSave {
+            key,
+            path: path.clone(),
+            frame: Arc::clone(&frame),
+        });
+        self.yuv_save_dialog.open(
+            path,
+            [frame.width, frame.height],
+            chroma_order_hint,
+            matrix,
+            range,
+        );
+        true
+    }
+
+    fn active_display_save_snapshot(&self) -> Option<(SaveKey, Arc<Rgba8Frame>)> {
+        if let Some(document) = self.workspace.active() {
+            let preview = document.loaded.installed_color.as_ref()?;
+            return Some((
+                SaveKey {
+                    document_id: document.id,
+                    generation: document.loaded.generation,
+                    revision: preview.rendered_revision,
+                },
+                Arc::clone(&preview.frame),
+            ));
+        }
+        let document = self.workspace.active_image()?;
+        Some((
+            SaveKey {
+                document_id: document.id,
+                generation: document.generation,
+                revision: document.display.revision,
+            },
+            Arc::clone(&document.display.frame),
+        ))
+    }
+
+    fn active_yuv_save_defaults(&self) -> (YuvMatrix, YuvRange) {
+        if let Some(document) = self.workspace.active_image()
+            && let NativeImage::Yuv420Sp(frame) = &document.native
+        {
+            return (frame.spec.matrix, frame.spec.range);
+        }
+        (YuvMatrix::Bt601, YuvRange::Limited)
+    }
+
+    fn poll_save_result(&mut self) {
+        while let Some(result) = self.save_worker.take_ready() {
+            self.install_save_result(result);
+        }
+    }
+
+    fn install_save_result(&mut self, result: SaveResult) {
+        match result.result {
+            Ok(()) => {
+                if let Some(document) = self.workspace.image_mut(result.key.document_id)
+                    && document.generation == result.key.generation
+                {
+                    document.unsaved = false;
+                }
+                tracing::debug!(
+                    operation = "save_image",
+                    document_id = %result.key.document_id,
+                    generation = result.key.generation,
+                    revision = result.key.revision,
+                    path = %result.path.display(),
+                    format = ?result.format,
+                    "saved image"
+                );
+            }
+            Err(error) => self.notify_save_error(result.key, error),
+        }
+    }
+
+    fn notify_save_error(&mut self, key: SaveKey, error: String) {
+        tracing::error!(
+            operation = "save_image",
+            document_id = %key.document_id,
+            generation = key.generation,
+            revision = key.revision,
+            error = %error,
+            "image save failed"
+        );
+        self.notifications.push_once(UiNotification::error(
+            NotificationKey::SaveFailed {
+                generation: key.generation,
+                revision: key.revision,
+            },
+            "Image save failed",
+            error,
+        ));
+    }
+
     fn start_load_raw(
         &mut self,
         context: &egui::Context,
@@ -1252,6 +1778,7 @@ impl CameraToolboxApp {
         let context = context.clone();
         thread::spawn(move || {
             let result = decode_raw_request(&pipeline, request, cancellation)
+                .map(OpenedFileDocument::Raw)
                 .map_err(|error| error.to_string());
             let _ = sender.send(RawOpenJobEvent::Finished(Box::new(RawOpenJobResult {
                 attempt,
@@ -1267,6 +1794,7 @@ impl CameraToolboxApp {
         context: &egui::Context,
         attempt: u64,
         request: WorkspaceFileOpenRequest,
+        mode: ImageOpenMode,
     ) {
         if let Some(active) = self.active_raw_open.take() {
             active.cancellation.cancel();
@@ -1282,7 +1810,7 @@ impl CameraToolboxApp {
             progress: None,
             cancellation: cancellation.clone(),
         });
-        let pipeline = self.raw_pipeline.clone();
+        let pipeline = self.image_pipeline.clone();
         let sender = self.raw_open_sender.clone();
         let context = context.clone();
         thread::spawn(move || {
@@ -1300,9 +1828,10 @@ impl CameraToolboxApp {
                     context.request_repaint();
                 }
             };
-            let result = decode_workspace_file_request(
+            let result = decode_workspace_image_request(
                 &pipeline,
                 request,
+                mode,
                 cancellation,
                 &mut report_progress,
             )
@@ -1343,22 +1872,30 @@ impl CameraToolboxApp {
                     }
                     self.active_raw_open = None;
                     match result.result {
-                        Ok(completed) => {
+                        Ok(OpenedFileDocument::Raw(completed)) => {
                             self.install_opened_raw(context, result.attempt, completed);
+                        }
+                        Ok(OpenedFileDocument::Image(completed)) => {
+                            self.install_opened_image(
+                                context,
+                                result.attempt,
+                                result.path.clone(),
+                                completed,
+                            );
                         }
                         Err(message) => {
                             tracing::error!(
-                                operation = "load_raw",
+                                operation = "load_image",
                                 attempt = result.attempt,
                                 path = %result.path.display(),
                                 error = %message,
-                                "RAW loading failed"
+                                "image loading failed"
                             );
                             self.notifications.push_once(UiNotification::error(
                                 NotificationKey::RawLoadFailed {
                                     attempt: result.attempt,
                                 },
-                                "RAW load failed",
+                                "Image load failed",
                                 &message,
                             ));
                             self.raw_dialog.set_error(message);
@@ -1385,7 +1922,15 @@ impl CameraToolboxApp {
             }
             self.active_auto_open = None;
             match result.result {
-                Ok(completed) => self.install_auto_opened_raw(context, result.candidate, completed),
+                Ok(OpenedFileDocument::Raw(completed)) => {
+                    self.install_auto_opened_raw(context, result.candidate, completed)
+                }
+                Ok(OpenedFileDocument::Image(completed)) => self.install_auto_opened_image(
+                    context,
+                    result.candidate,
+                    result.path,
+                    completed,
+                ),
                 Err(message) => {
                     tracing::error!(
                         operation = "auto_open_raw",
@@ -1415,7 +1960,11 @@ impl CameraToolboxApp {
                 loaded.frame.spec.max_code_value(),
                 loaded.diagnostics.out_of_range_pixels,
                 loaded.diagnostics.observed_max,
-                (first.x, first.y, first.value),
+                (
+                    first.x,
+                    first.y,
+                    first.raw_value.expect("RAW diagnostic carries a RAW code"),
+                ),
                 context.input(|input| input.time),
             )
         });
@@ -1461,6 +2010,126 @@ impl CameraToolboxApp {
         self.workspace.enforce_derived_budget();
     }
 
+    fn install_opened_image(
+        &mut self,
+        context: &egui::Context,
+        attempt: u64,
+        path: PathBuf,
+        completed: ImageOpenResult,
+    ) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let dimensions = completed.native.dimensions();
+        let kind = format!("{:?}", completed.kind);
+        let document_id = match self
+            .workspace
+            .open_image(generation, path.clone(), completed, true)
+        {
+            Ok(document_id) => document_id,
+            Err(error) => {
+                tracing::error!(
+                    operation = "open_image_document",
+                    attempt,
+                    generation,
+                    path = %path.display(),
+                    error = %error,
+                    "failed to create static image document"
+                );
+                self.notifications.push_once(UiNotification::error(
+                    NotificationKey::RawLoadFailed { attempt },
+                    "Image open failed",
+                    &error,
+                ));
+                return;
+            }
+        };
+        let texture_error = self
+            .workspace
+            .active_image_mut()
+            .and_then(|document| document.ensure_texture(context).err());
+        if let Some(error) = texture_error {
+            self.notifications.push_once(UiNotification::error(
+                NotificationKey::RawLoadFailed { attempt },
+                "Image texture failed",
+                &error,
+            ));
+        }
+        tracing::debug!(
+            operation = "open_image_document",
+            document_id = %document_id,
+            attempt,
+            generation,
+            path = %path.display(),
+            width = dimensions[0],
+            height = dimensions[1],
+            kind,
+            "opened static image in new tab"
+        );
+        self.workspace.enforce_derived_budget();
+    }
+
+    fn install_auto_opened_image(
+        &mut self,
+        context: &egui::Context,
+        candidate: AutoOpenCandidate,
+        path: PathBuf,
+        completed: ImageOpenResult,
+    ) {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let dimensions = completed.native.dimensions();
+        let kind = format!("{:?}", completed.kind);
+        let foreground = if candidate.activation == AutoOpenActivation::FollowLatest {
+            let existing_id = self.auto_open_documents.remove(candidate.rule_id.as_str());
+            let was_active = existing_id.is_some_and(|id| self.workspace.active_id() == Some(id));
+            if let Some(id) = existing_id {
+                self.close_document(context, id);
+            }
+            was_active
+        } else {
+            false
+        };
+        let document_id =
+            match self
+                .workspace
+                .open_image(generation, path.clone(), completed, foreground)
+            {
+                Ok(document_id) => document_id,
+                Err(error) => {
+                    tracing::error!(
+                        operation = "auto_open_image",
+                        rule_id = candidate.rule_id.as_str(),
+                        generation,
+                        path = %path.display(),
+                        error = %error,
+                        "failed to create auto-open static image document"
+                    );
+                    return;
+                }
+            };
+        match candidate.activation {
+            AutoOpenActivation::FollowLatest => {
+                self.auto_open_documents
+                    .insert(candidate.rule_id.as_str().to_owned(), document_id);
+            }
+            AutoOpenActivation::NewBackgroundTab => {
+                self.track_auto_open_background_tab(context, document_id);
+            }
+        }
+        tracing::debug!(
+            operation = "auto_open_image",
+            rule_id = candidate.rule_id.as_str(),
+            document_id = %document_id,
+            generation,
+            path = %path.display(),
+            width = dimensions[0],
+            height = dimensions[1],
+            kind,
+            "auto-opened static image"
+        );
+        self.workspace.enforce_derived_budget();
+    }
+
     fn install_auto_opened_raw(
         &mut self,
         context: &egui::Context,
@@ -1477,7 +2146,11 @@ impl CameraToolboxApp {
                 loaded.frame.spec.max_code_value(),
                 loaded.diagnostics.out_of_range_pixels,
                 loaded.diagnostics.observed_max,
-                (first.x, first.y, first.value),
+                (
+                    first.x,
+                    first.y,
+                    first.raw_value.expect("RAW diagnostic carries a RAW code"),
+                ),
                 context.input(|input| input.time),
             )
         });
@@ -1503,49 +2176,51 @@ impl CameraToolboxApp {
                 "auto-open RAW samples exceed declared bit-depth range"
             );
         }
-        if candidate.activation == AutoOpenActivation::FollowLatest {
-            let existing_id = self
-                .auto_open_documents
-                .get(candidate.rule_id.as_str())
-                .copied();
-            if let Some(document_id) = existing_id {
-                let previous_generation = self
-                    .workspace
-                    .document(document_id)
-                    .map(|document| document.loaded.generation);
-                if let Some(previous_generation) = previous_generation {
-                    let was_active = self.workspace.active_id() == Some(document_id);
-                    let replaced = self.workspace.replace_file_raw(
-                        document_id,
-                        loaded,
-                        completed.source,
-                        completed.interpretation,
-                        generation,
-                    );
-                    debug_assert!(
-                        replaced,
-                        "existing follow-latest document must still be replaceable"
-                    );
-                    self.notifications
-                        .clear_scope(NotificationScope::ImageGeneration(previous_generation));
-                    if let Some(notification) = notification {
-                        self.notifications.push_once(notification);
-                    }
-                    if was_active {
-                        self.request_current_color();
-                    }
-                    self.workspace.enforce_derived_budget();
-                    return;
+        let mut foreground = false;
+        if candidate.activation == AutoOpenActivation::FollowLatest
+            && let Some(document_id) = self.auto_open_documents.remove(candidate.rule_id.as_str())
+        {
+            let was_active = self.workspace.active_id() == Some(document_id);
+            let previous_generation = self
+                .workspace
+                .document(document_id)
+                .map(|document| document.loaded.generation);
+            if let Some(previous_generation) = previous_generation {
+                let replaced = self.workspace.replace_file_raw(
+                    document_id,
+                    loaded,
+                    completed.source,
+                    completed.interpretation,
+                    generation,
+                );
+                debug_assert!(
+                    replaced,
+                    "existing follow-latest document must still be replaceable"
+                );
+                self.auto_open_documents
+                    .insert(candidate.rule_id.as_str().to_owned(), document_id);
+                self.notifications
+                    .clear_scope(NotificationScope::ImageGeneration(previous_generation));
+                if let Some(notification) = notification {
+                    self.notifications.push_once(notification);
                 }
-                self.auto_open_documents.remove(candidate.rule_id.as_str());
+                if was_active {
+                    self.request_current_color();
+                }
+                self.workspace.enforce_derived_budget();
+                return;
             }
+            if was_active {
+                foreground = true;
+            }
+            self.close_document(context, document_id);
         }
         let document_id = self.workspace.open_file_raw(
             loaded,
             completed.source,
             completed.interpretation,
             generation,
-            false,
+            foreground,
         );
         match candidate.activation {
             AutoOpenActivation::FollowLatest => {
@@ -1570,7 +2245,7 @@ impl CameraToolboxApp {
         context: &egui::Context,
         document_id: DocumentId,
         decode_generation: u64,
-        source: RawSourceHandle,
+        source: ImageSourceHandle,
         params: RawDecodeParams,
         roi: Roi,
         path: PathBuf,
@@ -1637,7 +2312,11 @@ impl CameraToolboxApp {
                 loaded.frame.spec.max_code_value(),
                 loaded.diagnostics.out_of_range_pixels,
                 loaded.diagnostics.observed_max,
-                (first.x, first.y, first.value),
+                (
+                    first.x,
+                    first.y,
+                    first.raw_value.expect("RAW diagnostic carries a RAW code"),
+                ),
                 context.input(|input| input.time),
             )
         });
@@ -1775,6 +2454,7 @@ impl CameraToolboxApp {
                     result.revision,
                     result.params,
                     rendered.image,
+                    rendered.frame,
                     rendered.diagnostics,
                 );
                 document.loaded.color_edit.render_error = None;
@@ -1842,10 +2522,9 @@ impl CameraToolboxApp {
         let result = match asset.metadata.format {
             MediaFormat::RawPacked { bit_depth } => self
                 .open_packed_raw_asset(context, asset, snapshot, spec.bayer, bit_depth, foreground),
-            MediaFormat::Jpeg | MediaFormat::Yuv420Sp { .. } => self
-                .workspace
-                .open_asset(asset, snapshot, foreground)
-                .map(|_| ()),
+            MediaFormat::Jpeg | MediaFormat::Yuv420Sp { .. } => {
+                self.open_captured_raster_asset(asset, snapshot, foreground)
+            }
             ref format => Err(format!(
                 "captured media format {format:?} cannot be opened as an image"
             )),
@@ -1918,15 +2597,69 @@ impl CameraToolboxApp {
             .open_captured_raw(loaded, asset, snapshot, foreground);
         Ok(())
     }
+
+    fn open_captured_raster_asset(
+        &mut self,
+        asset: Arc<camera_toolbox_core::EphemeralAsset>,
+        snapshot: Arc<camera_toolbox_app::TargetResolutionSnapshot>,
+        foreground: bool,
+    ) -> Result<(), String> {
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let (native, display) = match asset.metadata.format {
+            MediaFormat::Jpeg => {
+                let bytes = asset_payload_bytes(&asset.source)?;
+                let frame = Arc::new(
+                    ImageRasterCodec
+                        .decode_rgba8(RasterFormat::Jpeg, bytes, 256 * 1024 * 1024)
+                        .map_err(|error| error.to_string())?,
+                );
+                (NativeImage::Rgba8(Arc::clone(&frame)), frame)
+            }
+            MediaFormat::Yuv420Sp { chroma_order } => {
+                let width = u32::try_from(asset_attribute_usize(&asset, "width")?)
+                    .map_err(|_| "captured YUV width does not fit u32".to_owned())?;
+                let height = u32::try_from(asset_attribute_usize(&asset, "height")?)
+                    .map_err(|_| "captured YUV height does not fit u32".to_owned())?;
+                let spec = Yuv420SpSpec {
+                    width,
+                    height,
+                    y_stride: asset_attribute_usize(&asset, "y_stride")?,
+                    chroma_stride: asset_attribute_usize(&asset, "chroma_stride")?,
+                    chroma_order,
+                    matrix: YuvMatrix::Bt601,
+                    range: YuvRange::Limited,
+                };
+                let bytes = Arc::new(asset_payload_bytes(&asset.source)?.to_vec());
+                let yuv = Arc::new(
+                    Yuv420SpFrame::from_contiguous(spec, bytes)
+                        .map_err(|error| error.to_string())?,
+                );
+                let display = Arc::new(
+                    yuv420sp_to_rgba8_with_cancel(&yuv, &|| false)
+                        .map_err(|error| error.to_string())?,
+                );
+                (NativeImage::Yuv420Sp(yuv), display)
+            }
+            ref format => {
+                return Err(format!(
+                    "captured media format {format:?} cannot be opened as an image"
+                ));
+            }
+        };
+        self.workspace
+            .open_captured_image(generation, asset, snapshot, native, display, foreground)?;
+        Ok(())
+    }
     fn save_active_ephemeral_source(&mut self) -> bool {
         let asset = self
             .workspace
-            .active_asset()
-            .map(|document| Arc::clone(&document.asset))
+            .active()
+            .and_then(|document| document.source_asset.as_ref().map(Arc::clone))
             .or_else(|| {
                 self.workspace
-                    .active()
-                    .and_then(|document| document.source_asset.as_ref().map(Arc::clone))
+                    .active_image()
+                    .and_then(|document| document.source.asset().map(Arc::clone))
             });
         let Some(asset) = asset else { return false };
         let extension = asset_extension(&asset.metadata.format);
@@ -1939,10 +2672,10 @@ impl CameraToolboxApp {
         };
         match save_asset_source(&path, &asset) {
             Ok(()) => {
-                if let Some(document) = self.workspace.active_asset_mut() {
-                    document.saved = true;
-                }
                 if let Some(document) = self.workspace.active_mut() {
+                    document.unsaved = false;
+                }
+                if let Some(document) = self.workspace.active_image_mut() {
                     document.unsaved = false;
                 }
                 true
@@ -1981,52 +2714,15 @@ impl CameraToolboxApp {
                 self.close_document(context, id);
             }
         } else if discard {
-            if let Some(document) = self.workspace.asset_mut(id) {
-                document.saved = true;
-            }
             if let Some(document) = self.workspace.document_mut(id) {
+                document.unsaved = false;
+            }
+            if let Some(document) = self.workspace.image_mut(id) {
                 document.unsaved = false;
             }
             self.pending_ephemeral_close = None;
             self.close_document(context, id);
         }
-    }
-
-    fn render_asset_viewer(
-        ui: &mut egui::Ui,
-        document: &mut crate::workspace::AssetDocument,
-    ) -> egui::Rect {
-        let rect = ui.max_rect();
-        ui.heading(&document.title);
-        ui.horizontal_wrapped(|ui| {
-            ui.label(format!("Format: {:?}", document.asset.metadata.format));
-            ui.label(format!(
-                "Source bytes: {}",
-                document.asset.byte_len().unwrap_or(0)
-            ));
-            ui.label(format!("Integrity: {:?}", document.asset.integrity));
-        });
-        ui.collapsing("Source metadata", |ui| {
-            for (key, value) in &document.asset.metadata.attributes {
-                ui.label(format!("{key}: {value}"));
-            }
-            ui.monospace(format!("target={}", document.resolution.aggregate_hash));
-        });
-        ui.separator();
-        if let Some(texture) = document.texture() {
-            let available = ui.available_size();
-            let source = texture.size_vec2();
-            let scale = (available.x / source.x)
-                .min(available.y / source.y)
-                .min(1.0)
-                .max(0.01);
-            ui.centered_and_justified(|ui| {
-                ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
-            });
-        } else {
-            ui.centered_and_justified(|ui| ui.spinner());
-        }
-        rect
     }
 
     fn handle_stream_panel_action(&mut self, action: StreamPanelAction) {
@@ -2253,20 +2949,22 @@ impl CameraToolboxApp {
     fn close_document(&mut self, context: &egui::Context, id: DocumentId) {
         if self
             .workspace
-            .asset(id)
-            .is_some_and(|document| !document.saved)
+            .document(id)
+            .is_some_and(|document| document.unsaved && document.source_asset.is_some())
             || self
                 .workspace
-                .document(id)
-                .is_some_and(|document| document.unsaved && document.source_asset.is_some())
+                .image(id)
+                .is_some_and(|document| document.unsaved && document.source.asset().is_some())
         {
             self.pending_ephemeral_close = Some(id);
             self.workspace.activate(id);
             return;
         }
         self.forget_auto_open_document(id);
-        if self.workspace.asset(id).is_some() {
-            self.workspace.remove_asset(id);
+        if self.workspace.image(id).is_some() {
+            self.workspace.remove_image(id);
+            self.ensure_active_resources(context);
+            self.workspace.enforce_derived_budget();
             return;
         }
         if let Some(document) = self.workspace.live_mut(id) {
@@ -2351,49 +3049,66 @@ fn decode_raw_request(
     })
 }
 
-fn decode_workspace_file_request(
-    pipeline: &RawOpenPipeline,
+fn decode_workspace_image_request(
+    pipeline: &ImageOpenPipeline,
     request: WorkspaceFileOpenRequest,
+    mode: ImageOpenMode,
     cancellation: FsCancellation,
     progress: &mut dyn FnMut(SourceReadProgress),
-) -> anyhow::Result<OpenedRawDocument> {
+) -> anyhow::Result<OpenedFileDocument> {
     tracing::debug!(
-        operation = "load_raw",
+        operation = "load_image",
         path = %request.display_path.display(),
         source_id = %request.reference.source_id,
-        "starting workspace RAW auto-open"
+        "starting workspace image open"
     );
     let mut control = FsControl::with_timeout(Duration::from_secs(30));
     control.cancellation = cancellation;
-    let result = pipeline.begin_with_progress(
+    let opened = pipeline.open_with_progress(
         &*request.file_system,
         &request.reference,
-        RawOpenMode::Auto,
+        mode,
         &control,
         progress,
     )?;
+    if !matches!(&opened.kind, ImageFileKind::Raw) {
+        return Ok(OpenedFileDocument::Image(opened));
+    }
+    let ImageOpenResult {
+        source,
+        native,
+        raw,
+        ..
+    } = opened;
+    let metadata = raw.ok_or_else(|| anyhow::anyhow!("RAW open result is missing metadata"))?;
+    let NativeImage::Raw(frame) = native else {
+        return Err(anyhow::anyhow!(
+            "RAW open result is missing native RAW data"
+        ));
+    };
+    let frame = Arc::try_unwrap(frame).unwrap_or_else(|frame| (*frame).clone());
     let roi = Roi {
         x: 0,
         y: 0,
-        width: result.frame.spec.width,
-        height: result.frame.spec.height,
+        width: frame.spec.width,
+        height: frame.spec.height,
     };
-    let stats = analyze_roi(&result.frame, roi)?;
-    Ok(OpenedRawDocument {
+    let stats = analyze_roi(&frame, roi)?;
+    Ok(OpenedFileDocument::Raw(OpenedRawDocument {
         report: LocalRawAnalyzeReport {
             path: request.display_path,
-            frame: result.frame,
+            frame,
             roi,
             stats,
         },
-        source: result.source,
-        interpretation: result.interpretation,
-    })
+        source,
+        interpretation: metadata.interpretation,
+    }))
 }
 
 fn decode_raw_reinterpret(
     pipeline: &RawOpenPipeline,
-    source: RawSourceHandle,
+    source: ImageSourceHandle,
     params: RawDecodeParams,
     decode_generation: u64,
     roi: Roi,
@@ -2427,6 +3142,28 @@ fn decode_raw_reinterpret(
         interpretation: result.interpretation,
     })
 }
+fn asset_payload_bytes(payload: &OwnedMediaPayload) -> Result<&[u8], String> {
+    match payload {
+        OwnedMediaPayload::Bytes(bytes) => Ok(bytes),
+        OwnedMediaPayload::Planes(_) => {
+            Err("multi-plane captured source requires a container format".to_owned())
+        }
+    }
+}
+
+fn asset_attribute_usize(
+    asset: &camera_toolbox_core::EphemeralAsset,
+    name: &str,
+) -> Result<usize, String> {
+    asset
+        .metadata
+        .attributes
+        .get(name)
+        .ok_or_else(|| format!("captured metadata is missing {name}"))?
+        .parse::<usize>()
+        .map_err(|error| format!("captured metadata {name} is invalid: {error}"))
+}
+
 fn asset_extension(format: &MediaFormat) -> &'static str {
     match format {
         MediaFormat::RawPacked { .. } | MediaFormat::RawU16Le { .. } => "raw",

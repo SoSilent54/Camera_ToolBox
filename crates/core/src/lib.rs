@@ -5,10 +5,13 @@
 pub mod analysis;
 pub mod asset;
 pub mod color;
+pub mod image;
+pub mod image_analysis;
 pub mod raw;
 pub mod raw_packing;
 pub mod raw_probe;
 pub mod sensor;
+pub mod yuv;
 
 pub use analysis::{
     AnalysisError, HistogramSeries, RawBayerHistogram, RawRoiAnalysis, Roi, RoiStats,
@@ -23,8 +26,20 @@ pub use color::{
     ColorRenderDiagnostics, ColorRenderError, DEFAULT_DISPLAY_GAMMA, DisplayTransform, LinearRgb,
     PreparedBayer, Rgb8, render_pixel_at,
 };
+pub use image::{
+    ImageFrameError, ImagePlane, NativeImage, NativePixelSample, Rgba8Frame, Yuv420SpFrame,
+    Yuv420SpSpec, YuvMatrix, YuvRange,
+};
+pub use image_analysis::{
+    ChannelAnalysis8, RgbRoiAnalysis, YuvRoiAnalysis, analyze_rgba8_with_cancel,
+    analyze_yuv420sp_with_cancel,
+};
 pub use raw::{BayerPattern, RawEncoding, RawFrame, RawFrameError, RawSpec};
 pub use raw_packing::{PackedRawSpec, RawPackingError, decode_le_continuous_raw};
 pub use raw_probe::{
     RawContainer, RawEndian, RawProbeCandidate, RawProbeInput, RawProbeReport, probe_raw_candidates,
+};
+pub use yuv::{
+    ImageConversionError, rgb_to_yuv, rgba8_to_yuv420sp_with_cancel, yuv_to_rgb,
+    yuv420sp_to_rgba8_with_cancel,
 };

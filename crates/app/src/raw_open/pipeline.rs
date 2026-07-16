@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::{FileRef, FileSystem, FsControl};
 
 use super::{
-    RawDecodeParams, RawDecodePreset, RawInterpretation, RawPresetError, RawSourceHandle,
+    ImageSourceHandle, RawDecodeParams, RawDecodePreset, RawInterpretation, RawPresetError,
     SourceCache, SourceCacheError, SourceReadProgress, explicit, select_automatic,
 };
 
@@ -25,14 +25,14 @@ pub enum RawOpenMode {
 
 #[derive(Debug)]
 pub struct RawOpenSession {
-    pub source: RawSourceHandle,
+    pub source: ImageSourceHandle,
     pub report: RawProbeReport,
     pub recommended: Option<RawInterpretation>,
 }
 
 #[derive(Debug)]
 pub struct RawOpenResult {
-    pub source: RawSourceHandle,
+    pub source: ImageSourceHandle,
     pub report: RawProbeReport,
     pub interpretation: RawInterpretation,
     pub frame: RawFrame,
@@ -181,7 +181,7 @@ impl RawOpenPipeline {
     /// 任务取消、缓存源读取失败或 RAW 字节与规格不匹配时返回错误。
     pub fn reinterpret(
         &self,
-        source: RawSourceHandle,
+        source: ImageSourceHandle,
         params: RawDecodeParams,
         generation: u64,
         control: &FsControl,
@@ -191,7 +191,7 @@ impl RawOpenPipeline {
     }
 
     fn decode_cached_source(
-        source: RawSourceHandle,
+        source: ImageSourceHandle,
         report: RawProbeReport,
         interpretation: RawInterpretation,
         generation: Option<u64>,
@@ -218,7 +218,7 @@ impl RawOpenPipeline {
     }
 }
 
-fn inspect_cached_source(source: &RawSourceHandle) -> Result<RawProbeReport, RawOpenError> {
+fn inspect_cached_source(source: &ImageSourceHandle) -> Result<RawProbeReport, RawOpenError> {
     let file_len = source.version().size;
     let window_len = file_len.min(PROBE_WINDOW_BYTES);
     let mut offsets = vec![0];

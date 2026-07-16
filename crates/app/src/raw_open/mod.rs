@@ -8,6 +8,6 @@ pub use pipeline::{RawOpenError, RawOpenMode, RawOpenPipeline, RawOpenResult, Ra
 pub use preset::{
     RawDecodeParams, RawDecodePreset, RawInterpretation, RawPresetError, RawPresetEvidence,
 };
-pub use source_cache::{RawSourceHandle, SourceCache, SourceCacheError, SourceReadProgress};
+pub use source_cache::{ImageSourceHandle, SourceCache, SourceCacheError, SourceReadProgress};
 
 pub(crate) use preset::{explicit, select_automatic};

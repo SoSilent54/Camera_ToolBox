@@ -10,7 +10,7 @@ use std::{
 
 use camera_toolbox_core::{
     ColorPipelineParams, ColorRenderDiagnostics, ColorRenderError, DisplayTransform, PreparedBayer,
-    RawFrame,
+    RawFrame, Rgba8Frame,
 };
 use eframe::egui::{self, ColorImage};
 
@@ -26,6 +26,7 @@ pub(crate) struct ColorRenderRequest {
 
 pub(crate) struct RenderedColorImage {
     pub(crate) image: Arc<ColorImage>,
+    pub(crate) frame: Arc<Rgba8Frame>,
     pub(crate) diagnostics: ColorRenderDiagnostics,
 }
 
@@ -210,6 +211,12 @@ where
         .checked_mul(height)
         .ok_or(camera_toolbox_core::RawFrameError::SizeOverflow)?;
     let mut pixels = vec![egui::Color32::BLACK; pixel_count];
+    let mut rgba = vec![
+        0u8;
+        pixel_count
+            .checked_mul(4)
+            .ok_or(camera_toolbox_core::RawFrameError::SizeOverflow)?
+    ];
     let mut diagnostics = ColorRenderDiagnostics::new(prepared.diagnostics());
 
     for y in 0..prepared.height() {
@@ -221,12 +228,18 @@ where
             let (linear, missing) = prepared.linear_rgb_at(x, y)?;
             let (rgb8, clipped) = display_transform.encode(linear);
             diagnostics.record_pixel(missing, clipped);
-            pixels[row_start + x as usize] = egui::Color32::from_rgb(rgb8.r, rgb8.g, rgb8.b);
+            let color = egui::Color32::from_rgb(rgb8.r, rgb8.g, rgb8.b);
+            pixels[row_start + x as usize] = color;
+            let rgba_start = (row_start + x as usize) * 4;
+            rgba[rgba_start..rgba_start + 4].copy_from_slice(&[rgb8.r, rgb8.g, rgb8.b, 255]);
         }
     }
 
+    let frame = Rgba8Frame::tight(prepared.width(), prepared.height(), Arc::<[u8]>::from(rgba))
+        .expect("prepared dimensions and RGBA allocation were validated");
     Ok(RenderedColorImage {
         image: Arc::new(ColorImage::new([width, height], pixels)),
+        frame: Arc::new(frame),
         diagnostics,
     })
 }

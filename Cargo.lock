@@ -462,6 +462,7 @@ dependencies = [
  "camera-toolbox-app",
  "camera-toolbox-core",
  "directories",
+ "image",
  "notify",
  "russh",
  "russh-sftp",

@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use camera_toolbox_app::LocalRawAnalyzeReport;
 use camera_toolbox_core::{
-    BayerPattern, ColorPipelineParams, ColorPixel, ColorRenderDiagnostics, RawFrame, Roi, RoiStats,
-    render_pixel_at,
+    BayerPattern, ColorPipelineParams, ColorPixel, ColorRenderDiagnostics, RawFrame, Rgba8Frame,
+    Roi, RoiStats, render_pixel_at,
 };
 use eframe::egui::{self, ColorImage, TextureHandle, TextureId, TextureOptions};
 
@@ -33,6 +33,7 @@ impl RawDiagnostics {
 pub(crate) struct InstalledColorPreview {
     texture: TextureHandle,
     pub(crate) image: Arc<ColorImage>,
+    pub(crate) frame: Arc<Rgba8Frame>,
     pub(crate) rendered_params: ColorPipelineParams,
     pub(crate) rendered_revision: u64,
     pub(crate) diagnostics: ColorRenderDiagnostics,
@@ -89,6 +90,7 @@ impl LoadedRaw {
         revision: u64,
         params: ColorPipelineParams,
         image: Arc<ColorImage>,
+        frame: Arc<Rgba8Frame>,
         diagnostics: ColorRenderDiagnostics,
     ) {
         let texture = if let Some(mut installed) = self.installed_color.take() {
@@ -106,6 +108,7 @@ impl LoadedRaw {
         self.installed_color = Some(InstalledColorPreview {
             texture,
             image,
+            frame,
             rendered_params: params,
             rendered_revision: revision,
             diagnostics,
@@ -231,7 +234,7 @@ pub(super) fn preview_with_diagnostics(frame: &RawFrame) -> (ColorImage, RawDiag
                 diagnostics.first_out_of_range.get_or_insert(CursorPixel {
                     x: u32::try_from(x).expect("x originates from u32 image width"),
                     y: u32::try_from(y).expect("y originates from u32 image height"),
-                    value,
+                    raw_value: Some(value),
                 });
                 preview.push(egui::Color32::MAGENTA);
             } else {
