@@ -515,7 +515,6 @@ impl CameraToolboxApp {
             );
             ui.close();
         }
-        ui.weak("Right-drag image to select ROI");
     }
 
     fn render_view_navigation(ui: &mut egui::Ui, document: &mut crate::workspace::RawDocument) {
