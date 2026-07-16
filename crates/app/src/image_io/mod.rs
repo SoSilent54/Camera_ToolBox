@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use camera_toolbox_core::{
     ChromaOrder, ImageConversionError, ImageFrameError, NativeImage, RawProbeReport, Rgba8Frame,
-    Yuv420SpFrame, Yuv420SpSpec, yuv420sp_to_rgba8_with_cancel,
+    Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange, yuv420sp_to_rgba8_with_cancel,
 };
 use thiserror::Error;
 
@@ -132,8 +132,8 @@ impl ImageOpenPipeline {
                 control,
                 progress,
             ),
-            (ImageFileKind::Yuv420Sp { .. }, ImageOpenMode::Auto) => {
-                Err(ImageOpenError::YuvParametersRequired)
+            (kind @ ImageFileKind::Yuv420Sp { .. }, ImageOpenMode::Auto) => {
+                self.open_auto_yuv(file_system, reference, kind, control, progress)
             }
             (
                 kind @ ImageFileKind::Yuv420Sp { chroma_order_hint },
@@ -213,7 +213,64 @@ impl ImageOpenPipeline {
         control: &FsControl,
         progress: &mut dyn FnMut(SourceReadProgress),
     ) -> Result<ImageOpenResult, ImageOpenError> {
+        Self::validate_yuv_kind(kind, spec)?;
+        let source = self.acquire(file_system, reference, control, progress)?;
+        self.decode_yuv_source(source, kind, spec, control)
+    }
+
+    fn open_auto_yuv(
+        &self,
+        file_system: &dyn FileSystem,
+        reference: &FileRef,
+        kind: ImageFileKind,
+        control: &FsControl,
+        progress: &mut dyn FnMut(SourceReadProgress),
+    ) -> Result<ImageOpenResult, ImageOpenError> {
+        let source = self.acquire(file_system, reference, control, progress)?;
+        let spec = infer_yuv420sp_spec(reference, kind, source.version().size)?;
+        self.decode_yuv_source(source, kind, spec, control)
+    }
+
+    /// 使用已缓存的不可变 headerless YUV payload 重新解释；不会访问文件系统。
+    ///
+    /// # Errors
+    ///
+    /// 参数、suffix hint、缓存长度或颜色转换无效时返回错误。
+    pub fn reinterpret_yuv(
+        &self,
+        source: ImageSourceHandle,
+        kind: ImageFileKind,
+        spec: Yuv420SpSpec,
+        control: &FsControl,
+    ) -> Result<ImageOpenResult, ImageOpenError> {
+        Self::validate_yuv_kind(kind, spec)?;
+        self.decode_yuv_source(source, kind, spec, control)
+    }
+
+    fn validate_yuv_kind(kind: ImageFileKind, spec: Yuv420SpSpec) -> Result<(), ImageOpenError> {
+        let ImageFileKind::Yuv420Sp { chroma_order_hint } = kind else {
+            return Err(ImageOpenError::ModeMismatch {
+                kind,
+                mode: "yuv420sp",
+            });
+        };
+        if chroma_order_hint.is_some_and(|expected| expected != spec.chroma_order) {
+            return Err(ImageOpenError::YuvChromaOrderMismatch {
+                expected: chroma_order_hint.expect("checked as Some"),
+                actual: spec.chroma_order,
+            });
+        }
         spec.validate()?;
+        Ok(())
+    }
+
+    fn decode_yuv_source(
+        &self,
+        source: ImageSourceHandle,
+        kind: ImageFileKind,
+        spec: Yuv420SpSpec,
+        control: &FsControl,
+    ) -> Result<ImageOpenResult, ImageOpenError> {
         let decoded_bytes = (spec.width as usize)
             .checked_mul(spec.height as usize)
             .and_then(|pixels| pixels.checked_mul(4))
@@ -224,7 +281,6 @@ impl ImageOpenPipeline {
                 limit: self.max_decoded_bytes,
             });
         }
-        let source = self.acquire(file_system, reference, control, progress)?;
         control.checkpoint()?;
         let native = Arc::new(Yuv420SpFrame::from_contiguous(spec, source.shared_bytes())?);
         let display = Arc::new(yuv420sp_to_rgba8_with_cancel(&native, || {
@@ -262,6 +318,93 @@ impl ImageOpenPipeline {
     }
 }
 
+fn infer_yuv420sp_spec(
+    reference: &FileRef,
+    kind: ImageFileKind,
+    source_len: u64,
+) -> Result<Yuv420SpSpec, ImageOpenError> {
+    let ImageFileKind::Yuv420Sp { chroma_order_hint } = kind else {
+        return Err(ImageOpenError::ModeMismatch {
+            kind,
+            mode: "yuv420sp",
+        });
+    };
+    let file_name = reference
+        .path
+        .file_name()
+        .ok_or(ImageOpenError::MissingFileName)?;
+    let stem = file_name
+        .rsplit_once('.')
+        .map_or(file_name, |(stem, _)| stem);
+    let (width, height) = parse_yuv_geometry(stem)
+        .ok_or_else(|| ImageOpenError::YuvGeometryMissing(file_name.to_owned()))??;
+    let spec = Yuv420SpSpec {
+        width,
+        height,
+        y_stride: width as usize,
+        chroma_stride: width as usize,
+        chroma_order: chroma_order_hint.unwrap_or(ChromaOrder::Uv),
+        matrix: YuvMatrix::Bt601,
+        range: YuvRange::Limited,
+    };
+    spec.validate()?;
+    let expected = spec.payload_len()?;
+    let actual =
+        usize::try_from(source_len).map_err(|_| ImageOpenError::YuvSourceTooLarge(source_len))?;
+    if expected != actual {
+        return Err(ImageOpenError::YuvPayloadLengthMismatch { expected, actual });
+    }
+    Ok(spec)
+}
+
+/// 从 basename 内唯一的 `WIDTHxHEIGHT` token 取得 headerless YUV 的初始几何。
+fn parse_yuv_geometry(stem: &str) -> Option<Result<(u32, u32), ImageOpenError>> {
+    let bytes = stem.as_bytes();
+    let mut candidate = None;
+    let mut start = 0;
+    while start < bytes.len() {
+        if !bytes[start].is_ascii_digit() || (start > 0 && bytes[start - 1].is_ascii_alphanumeric())
+        {
+            start += 1;
+            continue;
+        }
+        let mut separator = start;
+        while separator < bytes.len() && bytes[separator].is_ascii_digit() {
+            separator += 1;
+        }
+        if separator == bytes.len() || !matches!(bytes[separator], b'x' | b'X') {
+            start = separator.saturating_add(1);
+            continue;
+        }
+        let height_start = separator + 1;
+        let mut end = height_start;
+        while end < bytes.len() && bytes[end].is_ascii_digit() {
+            end += 1;
+        }
+        if end == height_start || (end < bytes.len() && bytes[end].is_ascii_alphanumeric()) {
+            start = end.saturating_add(1);
+            continue;
+        }
+        let width = parse_ascii_u32(&bytes[start..separator])?;
+        let height = parse_ascii_u32(&bytes[height_start..end])?;
+        if width == 0 || height == 0 || width % 2 != 0 || height % 2 != 0 {
+            return Some(Err(ImageOpenError::YuvInvalidGeometry { width, height }));
+        }
+        if candidate.replace((width, height)).is_some() {
+            return Some(Err(ImageOpenError::YuvGeometryAmbiguous(stem.to_owned())));
+        }
+        start = end;
+    }
+    Some(Ok(candidate?))
+}
+
+fn parse_ascii_u32(bytes: &[u8]) -> Option<u32> {
+    bytes.iter().try_fold(0_u32, |value, byte| {
+        value
+            .checked_mul(10)?
+            .checked_add(u32::from(byte.checked_sub(b'0')?))
+    })
+}
 /// suffix 只负责选择 workflow；headerless RAW/YUV 的解释参数仍由后续步骤确认。
 ///
 /// # Errors
@@ -311,8 +454,20 @@ pub enum ImageOpenError {
     MissingExtension,
     #[error("unsupported image extension .{0}")]
     UnsupportedExtension(String),
-    #[error("headerless YUV requires confirmed width, height, strides, layout, matrix, and range")]
-    YuvParametersRequired,
+    #[error(
+        "headerless YUV file name {0:?} needs one even WIDTHxHEIGHT token, for example frame_1920x1080.nv12"
+    )]
+    YuvGeometryMissing(String),
+    #[error("headerless YUV file name {0:?} contains multiple geometry tokens")]
+    YuvGeometryAmbiguous(String),
+    #[error("headerless YUV geometry {width}x{height} must use non-zero even dimensions")]
+    YuvInvalidGeometry { width: u32, height: u32 },
+    #[error(
+        "headerless YUV source length {actual} does not match tight-layout geometry ({expected} bytes expected)"
+    )]
+    YuvPayloadLengthMismatch { expected: usize, actual: usize },
+    #[error("headerless YUV source length {0} cannot be represented on this host")]
+    YuvSourceTooLarge(u64),
     #[error("image open mode {mode} does not match {kind:?}")]
     ModeMismatch {
         kind: ImageFileKind,
@@ -374,18 +529,56 @@ mod tests {
     }
 
     #[test]
-    fn bare_yuv_auto_mode_never_decodes_without_confirmation() {
-        let spec = Yuv420SpSpec {
-            width: 2,
-            height: 2,
-            y_stride: 2,
-            chroma_stride: 2,
-            chroma_order: ChromaOrder::Uv,
-            matrix: YuvMatrix::Bt601,
-            range: YuvRange::Limited,
+    fn auto_yuv_infers_tight_geometry_and_suffix_order() {
+        let spec = infer_yuv420sp_spec(
+            &reference("capture_640x480.nv21"),
+            ImageFileKind::Yuv420Sp {
+                chroma_order_hint: Some(ChromaOrder::Vu),
+            },
+            640 * 480 * 3 / 2,
+        )
+        .unwrap();
+        assert_eq!(spec.width, 640);
+        assert_eq!(spec.height, 480);
+        assert_eq!(spec.y_stride, 640);
+        assert_eq!(spec.chroma_stride, 640);
+        assert_eq!(spec.chroma_order, ChromaOrder::Vu);
+        assert_eq!(spec.matrix, YuvMatrix::Bt601);
+        assert_eq!(spec.range, YuvRange::Limited);
+    }
+
+    #[test]
+    fn auto_bare_yuv_defaults_to_uv() {
+        let spec = infer_yuv420sp_spec(
+            &reference("capture_2x2.yuv"),
+            ImageFileKind::Yuv420Sp {
+                chroma_order_hint: None,
+            },
+            6,
+        )
+        .unwrap();
+        assert_eq!(spec.chroma_order, ChromaOrder::Uv);
+    }
+
+    #[test]
+    fn auto_yuv_rejects_missing_ambiguous_or_mismatched_geometry() {
+        let kind = ImageFileKind::Yuv420Sp {
+            chroma_order_hint: Some(ChromaOrder::Uv),
         };
-        assert!(spec.validate().is_ok());
-        assert_eq!(mode_name(&ImageOpenMode::Auto), "auto");
-        assert_eq!(mode_name(&ImageOpenMode::Yuv420Sp(spec)), "yuv420sp");
+        assert!(matches!(
+            infer_yuv420sp_spec(&reference("capture.nv12"), kind, 6),
+            Err(ImageOpenError::YuvGeometryMissing(_))
+        ));
+        assert!(matches!(
+            infer_yuv420sp_spec(&reference("capture_2x2_4x4.nv12"), kind, 6),
+            Err(ImageOpenError::YuvGeometryAmbiguous(_))
+        ));
+        assert!(matches!(
+            infer_yuv420sp_spec(&reference("capture_2x2.nv12"), kind, 7),
+            Err(ImageOpenError::YuvPayloadLengthMismatch {
+                expected: 6,
+                actual: 7,
+            })
+        ));
     }
 }

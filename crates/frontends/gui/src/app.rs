@@ -23,8 +23,8 @@ use crate::{
     color_worker::{ColorRenderRequest, ColorRenderResult, ColorRenderWorker},
     explorer::{ExplorerAction, ExplorerState},
     histogram_link::{
-        HistogramBinSelection, HistogramPixelSample, ImageHistogramHover, SpatialHighlight,
-        SpatialHighlightRequest, SpatialHighlightResult, SpatialHighlightWorker,
+        DisplayHistogramImage, HistogramBinSelection, HistogramPixelSample, ImageHistogramHover,
+        SpatialHighlight, SpatialHighlightRequest, SpatialHighlightResult, SpatialHighlightWorker,
         display_histogram_sample,
     },
     image_save::{
@@ -43,7 +43,7 @@ use crate::{
         DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, TabBarAction,
         WorkspaceState, render_tab_bar,
     },
-    yuv_dialog::YuvOpenDialogState,
+    yuv_inspector::render_yuv_inspector,
 };
 use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
@@ -129,6 +129,12 @@ struct ReinterpretJobResult {
     result: Result<OpenedRawDocument, String>,
 }
 
+struct YuvReinterpretJobResult {
+    document_id: DocumentId,
+    decode_generation: u64,
+    result: Result<ImageOpenResult, String>,
+}
+
 struct PendingYuvSave {
     key: SaveKey,
     path: PathBuf,
@@ -142,7 +148,6 @@ pub(crate) struct CameraToolboxApp {
     explorer_panel_expanded: bool,
     empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
-    yuv_dialog: YuvOpenDialogState,
     yuv_save_dialog: YuvSaveDialogState,
     raw_pipeline: RawOpenPipeline,
     image_pipeline: ImageOpenPipeline,
@@ -158,7 +163,6 @@ pub(crate) struct CameraToolboxApp {
     raw_open_sender: Sender<RawOpenJobEvent>,
     raw_open_receiver: Receiver<RawOpenJobEvent>,
     active_raw_open: Option<ActiveRawOpenJob>,
-    pending_yuv_open: Option<WorkspaceFileOpenRequest>,
     pending_auto_open: VecDeque<PendingAutoOpenRequest>,
     pending_yuv_save: Option<PendingYuvSave>,
     auto_open_sender: Sender<AutoOpenJobResult>,
@@ -168,6 +172,8 @@ pub(crate) struct CameraToolboxApp {
     auto_open_background_tabs: VecDeque<DocumentId>,
     reinterpret_sender: Sender<ReinterpretJobResult>,
     reinterpret_receiver: Receiver<ReinterpretJobResult>,
+    yuv_reinterpret_sender: Sender<YuvReinterpretJobResult>,
+    yuv_reinterpret_receiver: Receiver<YuvReinterpretJobResult>,
 }
 
 impl CameraToolboxApp {
@@ -185,6 +191,7 @@ impl CameraToolboxApp {
         let workspace_settings = WorkspaceSettings::default();
         let (raw_open_sender, raw_open_receiver) = mpsc::channel();
         let (reinterpret_sender, reinterpret_receiver) = mpsc::channel();
+        let (yuv_reinterpret_sender, yuv_reinterpret_receiver) = mpsc::channel();
         let (auto_open_sender, auto_open_receiver) = mpsc::channel();
         let live_runtime = LiveRuntime::new().map_err(std::io::Error::other)?;
         #[cfg(feature = "platform-ssh")]
@@ -200,7 +207,6 @@ impl CameraToolboxApp {
             explorer_panel_expanded: false,
             empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
-            yuv_dialog: YuvOpenDialogState::default(),
             yuv_save_dialog: YuvSaveDialogState::default(),
             raw_pipeline,
             image_pipeline,
@@ -216,7 +222,6 @@ impl CameraToolboxApp {
             raw_open_sender,
             raw_open_receiver,
             active_raw_open: None,
-            pending_yuv_open: None,
             pending_yuv_save: None,
             pending_auto_open: VecDeque::new(),
             auto_open_sender,
@@ -226,6 +231,8 @@ impl CameraToolboxApp {
             auto_open_background_tabs: VecDeque::new(),
             reinterpret_sender,
             reinterpret_receiver,
+            yuv_reinterpret_sender,
+            yuv_reinterpret_receiver,
         })
     }
 }
@@ -242,6 +249,7 @@ impl eframe::App for CameraToolboxApp {
         self.enqueue_auto_open_candidates();
         self.dispatch_auto_open(&context);
         self.poll_reinterpret_result(&context);
+        self.poll_yuv_reinterpret_result(&context);
         self.poll_stream_events();
         for effect in self.live_runtime.poll_platform_events() {
             self.handle_platform_effect(&context, effect);
@@ -321,6 +329,7 @@ impl eframe::App for CameraToolboxApp {
         egui::Panel::bottom("status_bar").show(ui, |ui| self.render_status_bar(ui));
         self.render_analysis_panel_ui(ui);
         self.render_color_panel(ui);
+        self.render_yuv_inspector_panel(ui);
 
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
@@ -336,7 +345,13 @@ impl eframe::App for CameraToolboxApp {
                             document.roi,
                         )
                     });
-                    render_viewer(ui, image, &mut document.viewer, document.hover_view, None)
+                    render_viewer(
+                        ui,
+                        image,
+                        &mut document.viewer,
+                        document.hover_view,
+                        document.spatial_highlight.as_ref(),
+                    )
                 } else if let Some(document) = self.workspace.active_mut() {
                     let image = ViewerImage::raw(&document.loaded, document.display_mode);
                     render_viewer(
@@ -367,7 +382,6 @@ impl eframe::App for CameraToolboxApp {
             context.input(|input| input.time),
         );
         self.render_raw_open_dialog(&context);
-        self.render_yuv_open_dialog(&context);
         self.render_pending_ephemeral_close(&context);
         self.ensure_analysis();
         self.workspace.enforce_derived_budget();
@@ -662,25 +676,86 @@ impl CameraToolboxApp {
         }
     }
 
+    fn render_yuv_inspector_panel(&mut self, ui: &mut egui::Ui) {
+        let Some(document_id) = self.workspace.active_id() else {
+            return;
+        };
+        let mut request = None;
+        let Some(document) = self.workspace.image_mut(document_id) else {
+            return;
+        };
+        let source = document.yuv_workspace_source();
+        let mut params_changed = false;
+        {
+            let Some(inspector) = document.yuv_inspector.as_mut() else {
+                return;
+            };
+            egui::Panel::right("yuv_decode")
+                .resizable(true)
+                .default_size(280.0)
+                .min_size(240.0)
+                .max_size(420.0)
+                .show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .id_salt("yuv_decode_controls")
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            params_changed = render_yuv_inspector(ui, inspector, source.is_some())
+                                .params_changed;
+                        });
+                });
+        }
+        if params_changed {
+            // 草稿变更立即使在途结果过期，不能等到防抖提交后才更新 generation。
+            document.invalidate_yuv_reinterpretation();
+        }
+        let Some(inspector) = document.yuv_inspector.as_mut() else {
+            return;
+        };
+        if inspector.submission_due(Instant::now()) {
+            match inspector.decode_spec() {
+                Ok(spec) => match source {
+                    Some((source, kind)) => {
+                        let decode_generation = document.decode_generation.saturating_add(1);
+                        document.decode_generation = decode_generation;
+                        inspector.mark_submitted(decode_generation);
+                        request = Some((document.id, decode_generation, source, kind, spec));
+                    }
+                    None => inspector
+                        .mark_validation_error("当前文档没有可复用的不可变 YUV source".to_owned()),
+                },
+                Err(error) => inspector.mark_validation_error(error),
+            }
+        }
+        if let Some((document_id, decode_generation, source, kind, spec)) = request {
+            self.start_yuv_reinterpret(
+                ui.ctx(),
+                document_id,
+                decode_generation,
+                source,
+                kind,
+                spec,
+            );
+        }
+    }
+
     fn render_analysis_panel_ui(&mut self, ui: &mut egui::Ui) {
         let Some(active_id) = self.workspace.active_id() else {
             return;
         };
         let image_hover = self.image_histogram_hover();
-        let (expanded, default_size, min_size, supports_spatial) =
+        let (expanded, default_size, min_size) =
             if let Some(document) = self.workspace.document(active_id) {
                 (
                     document.analysis_panel.expanded,
                     document.analysis_panel.panel_height(),
                     document.analysis_panel.min_height(),
-                    true,
                 )
             } else if let Some(document) = self.workspace.image(active_id) {
                 (
                     document.analysis_panel.expanded,
                     document.analysis_panel.panel_height(),
                     document.analysis_panel.min_height(),
-                    false,
                 )
             } else {
                 return;
@@ -703,7 +778,7 @@ impl CameraToolboxApp {
                         .workspace
                         .image_mut(active_id)
                         .expect("active analysis document exists");
-                    render_analysis_panel(ui, &mut document.analysis_panel, None)
+                    render_analysis_panel(ui, &mut document.analysis_panel, image_hover)
                 }
             })
             .inner;
@@ -715,7 +790,7 @@ impl CameraToolboxApp {
             }
         }
         self.update_spatial_highlight(
-            response.hovered_bin.filter(|_| supports_spatial),
+            response.hovered_bin,
             response.selection_changed || response.view_interacting,
         );
     }
@@ -729,10 +804,7 @@ impl CameraToolboxApp {
             self.clear_active_spatial_highlight();
             return;
         };
-        let request = {
-            let Some(document) = self.workspace.active_mut() else {
-                return;
-            };
+        let request = if let Some(document) = self.workspace.active_mut() {
             if document.spatial_requested == Some(selection) {
                 return;
             }
@@ -758,22 +830,49 @@ impl CameraToolboxApp {
                         document.spatial_highlight = None;
                         return;
                     }
-                    Some(Arc::clone(&preview.image))
+                    Some(DisplayHistogramImage::Color(Arc::clone(&preview.image)))
                 }
-                AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => {
-                    document.spatial_requested = None;
-                    document.spatial_highlight = None;
-                    return;
-                }
+                AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => return,
             };
             document.spatial_highlight = None;
             document.viewer.evict_derived_resources();
             document.spatial_requested = Some(selection);
             SpatialHighlightRequest {
                 selection,
-                frame: Arc::clone(&document.loaded.frame),
+                native: NativeImage::Raw(Arc::clone(&document.loaded.frame)),
                 display_image,
             }
+        } else if let Some(document) = self.workspace.active_image_mut() {
+            if document.spatial_requested == Some(selection) {
+                return;
+            }
+            if document.analysis_panel.current_key() != Some(selection.key)
+                || document.id != selection.key.document_id
+                || document.generation != selection.key.generation
+                || !matches!(
+                    selection.key.domain,
+                    AnalysisDomain::SourceRgb
+                        | AnalysisDomain::SourceYuv
+                        | AnalysisDomain::DisplayRgb
+                )
+            {
+                document.spatial_requested = None;
+                document.spatial_highlight = None;
+                document.viewer.evict_derived_resources();
+                return;
+            }
+            let display_image = (selection.key.domain == AnalysisDomain::DisplayRgb)
+                .then(|| DisplayHistogramImage::Rgba8(Arc::clone(&document.display.frame)));
+            document.spatial_highlight = None;
+            document.viewer.evict_derived_resources();
+            document.spatial_requested = Some(selection);
+            SpatialHighlightRequest {
+                selection,
+                native: document.native.clone(),
+                display_image,
+            }
+        } else {
+            return;
         };
         self.workspace
             .supersede_spatial_submissions_except(request.selection.key.document_id);
@@ -781,15 +880,21 @@ impl CameraToolboxApp {
     }
 
     fn clear_active_spatial_highlight(&mut self) {
-        let Some(document) = self.workspace.active_mut() else {
-            return;
-        };
-        if document.spatial_requested.is_none() && document.spatial_highlight.is_none() {
-            return;
+        if let Some(document) = self.workspace.active_mut() {
+            if document.spatial_requested.is_none() && document.spatial_highlight.is_none() {
+                return;
+            }
+            document.spatial_requested = None;
+            document.spatial_highlight = None;
+            document.viewer.evict_derived_resources();
+        } else if let Some(document) = self.workspace.active_image_mut() {
+            if document.spatial_requested.is_none() && document.spatial_highlight.is_none() {
+                return;
+            }
+            document.spatial_requested = None;
+            document.spatial_highlight = None;
+            document.viewer.evict_derived_resources();
         }
-        document.spatial_requested = None;
-        document.spatial_highlight = None;
-        document.viewer.evict_derived_resources();
     }
 
     fn poll_spatial_highlight_result(&mut self) {
@@ -804,7 +909,37 @@ impl CameraToolboxApp {
             document_id: result.selection.key.document_id,
             generation: result.selection.key.generation,
         };
-        let Some(document) = self.workspace.matching_document_mut(identity) else {
+        let highlight = match result.result {
+            Ok(payload) => Some(SpatialHighlight {
+                selection: result.selection,
+                mask: payload.mask,
+                overlay_image: payload.overlay_image,
+            }),
+            Err(error) => {
+                tracing::warn!(
+                    operation = "build_histogram_spatial_highlight",
+                    document_id = %identity.document_id,
+                    generation = identity.generation,
+                    error = %error,
+                    "spatial highlight failed"
+                );
+                None
+            }
+        };
+        if let Some(document) = self.workspace.matching_document_mut(identity) {
+            if document.spatial_requested != Some(result.selection)
+                || document.analysis_panel.current_key() != Some(result.selection.key)
+            {
+                return;
+            }
+            document.spatial_requested = highlight.as_ref().map(|highlight| highlight.selection);
+            document.spatial_highlight = highlight;
+            if document.spatial_highlight.is_some() {
+                document.mark_derived_loaded();
+            }
+            return;
+        }
+        let Some(document) = self.workspace.matching_image_mut(identity) else {
             return;
         };
         if document.spatial_requested != Some(result.selection)
@@ -812,58 +947,78 @@ impl CameraToolboxApp {
         {
             return;
         }
-        match result.result {
-            Ok(payload) => {
-                document.spatial_highlight = Some(SpatialHighlight {
-                    selection: result.selection,
-                    mask: payload.mask,
-                    overlay_image: payload.overlay_image,
-                });
-                document.mark_derived_loaded();
-            }
-            Err(error) => {
-                tracing::warn!(
-                    operation = "build_histogram_spatial_highlight",
-                    document_id = %document.id,
-                    generation = result.selection.key.generation,
-                    error = %error,
-                    "spatial highlight failed"
-                );
-                document.spatial_requested = None;
-                document.spatial_highlight = None;
-            }
-        }
+        document.spatial_requested = highlight.as_ref().map(|highlight| highlight.selection);
+        document.spatial_highlight = highlight;
     }
 
     fn image_histogram_hover(&self) -> Option<ImageHistogramHover> {
-        let document = self.workspace.active()?;
+        if let Some(document) = self.workspace.active() {
+            let key = document.analysis_panel.current_key()?;
+            let cursor = document.viewer.cursor?;
+            if document.id != key.document_id
+                || document.loaded.generation != key.generation
+                || !key.roi.contains(cursor.x, cursor.y)
+            {
+                return None;
+            }
+            let row_width = usize::try_from(document.loaded.frame.spec.width).ok()?;
+            let index = usize::try_from(cursor.y)
+                .ok()?
+                .checked_mul(row_width)?
+                .checked_add(usize::try_from(cursor.x).ok()?)?;
+            let sample = match key.domain {
+                AnalysisDomain::RawBayer => HistogramPixelSample::Raw {
+                    site: document.loaded.frame.spec.bayer.site_at(cursor.x, cursor.y),
+                    value: *document.loaded.frame.pixels().get(index)?,
+                },
+                AnalysisDomain::DisplayRgb => {
+                    let preview = document.loaded.installed_color.as_ref()?;
+                    if Some(preview.rendered_revision) != key.source_revision {
+                        return None;
+                    }
+                    HistogramPixelSample::Display(display_histogram_sample(
+                        *preview.image.pixels.get(index)?,
+                    ))
+                }
+                AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => return None,
+            };
+            return Some(ImageHistogramHover {
+                key,
+                x: cursor.x,
+                y: cursor.y,
+                sample,
+            });
+        }
+
+        let document = self.workspace.active_image()?;
         let key = document.analysis_panel.current_key()?;
         let cursor = document.viewer.cursor?;
         if document.id != key.document_id
-            || document.loaded.generation != key.generation
+            || document.generation != key.generation
             || !key.roi.contains(cursor.x, cursor.y)
         {
             return None;
         }
-        let row_width = usize::try_from(document.loaded.frame.spec.width).ok()?;
-        let x = usize::try_from(cursor.x).ok()?;
-        let y = usize::try_from(cursor.y).ok()?;
-        let index = y.checked_mul(row_width)?.checked_add(x)?;
         let sample = match key.domain {
-            AnalysisDomain::RawBayer => HistogramPixelSample::Raw {
-                site: document.loaded.frame.spec.bayer.site_at(cursor.x, cursor.y),
-                value: *document.loaded.frame.pixels().get(index)?,
-            },
             AnalysisDomain::DisplayRgb => {
-                let preview = document.loaded.installed_color.as_ref()?;
-                if Some(preview.rendered_revision) != key.source_revision {
-                    return None;
-                }
-                HistogramPixelSample::Display(display_histogram_sample(
-                    *preview.image.pixels.get(index)?,
-                ))
+                let [r, g, b, _] = document.display.frame.pixel(cursor.x, cursor.y)?;
+                HistogramPixelSample::Display(display_histogram_sample(egui::Color32::from_rgb(
+                    r, g, b,
+                )))
             }
-            AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => return None,
+            AnalysisDomain::SourceRgb => match document.native.sample_at(cursor.x, cursor.y)? {
+                camera_toolbox_core::NativePixelSample::Rgba { r, g, b, a } => {
+                    HistogramPixelSample::SourceRgb { r, g, b, a }
+                }
+                _ => return None,
+            },
+            AnalysisDomain::SourceYuv => match document.native.sample_at(cursor.x, cursor.y)? {
+                camera_toolbox_core::NativePixelSample::Yuv { y, u, v, .. } => {
+                    HistogramPixelSample::SourceYuv { y, u, v }
+                }
+                _ => return None,
+            },
+            AnalysisDomain::RawBayer => return None,
         };
         Some(ImageHistogramHover {
             key,
@@ -1366,13 +1521,12 @@ impl CameraToolboxApp {
                     remote,
                 };
                 match kind {
-                    Ok(ImageFileKind::Yuv420Sp { chroma_order_hint }) => {
-                        self.pending_yuv_open = Some(request);
-                        self.yuv_dialog.open(display_path, chroma_order_hint);
-                    }
-                    Ok(ImageFileKind::Raw | ImageFileKind::Png | ImageFileKind::Jpeg) => {
-                        self.pending_yuv_open = None;
-                        self.yuv_dialog.close();
+                    Ok(
+                        ImageFileKind::Raw
+                        | ImageFileKind::Png
+                        | ImageFileKind::Jpeg
+                        | ImageFileKind::Yuv420Sp { .. },
+                    ) => {
                         let attempt = self.begin_raw_open_attempt();
                         self.start_load_workspace_file(
                             context,
@@ -1491,23 +1645,6 @@ impl CameraToolboxApp {
         let attempt = self.begin_raw_open_attempt();
         self.start_load_raw(context, attempt, request);
         self.raw_dialog.close(context);
-    }
-
-    fn render_yuv_open_dialog(&mut self, context: &egui::Context) {
-        if let Some(spec) = self.yuv_dialog.show(context) {
-            let Some(request) = self.pending_yuv_open.take() else {
-                return;
-            };
-            let attempt = self.begin_raw_open_attempt();
-            self.start_load_workspace_file(
-                context,
-                attempt,
-                request,
-                ImageOpenMode::Yuv420Sp(spec),
-            );
-        } else if !self.yuv_dialog.is_open() {
-            self.pending_yuv_open = None;
-        }
     }
 
     fn render_yuv_save_dialog(&mut self, _context: &egui::Context) {
@@ -2286,6 +2423,86 @@ impl CameraToolboxApp {
                     }
                 }
             }
+        }
+    }
+
+    fn start_yuv_reinterpret(
+        &mut self,
+        context: &egui::Context,
+        document_id: DocumentId,
+        decode_generation: u64,
+        source: ImageSourceHandle,
+        kind: ImageFileKind,
+        spec: Yuv420SpSpec,
+    ) {
+        let pipeline = self.image_pipeline.clone();
+        let sender = self.yuv_reinterpret_sender.clone();
+        let context = context.clone();
+        thread::spawn(move || {
+            let result = decode_yuv_reinterpret(&pipeline, source, kind, spec)
+                .map_err(|error| error.to_string());
+            let _ = sender.send(YuvReinterpretJobResult {
+                document_id,
+                decode_generation,
+                result,
+            });
+            context.request_repaint();
+        });
+    }
+
+    fn poll_yuv_reinterpret_result(&mut self, context: &egui::Context) {
+        loop {
+            let result = match self.yuv_reinterpret_receiver.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            match result.result {
+                Ok(completed) => self.install_reinterpreted_yuv(
+                    context,
+                    result.document_id,
+                    result.decode_generation,
+                    completed,
+                ),
+                Err(message) => {
+                    if let Some(document) = self.workspace.image_mut(result.document_id)
+                        && document.decode_generation == result.decode_generation
+                        && let Some(inspector) = &mut document.yuv_inspector
+                    {
+                        inspector.mark_error(result.decode_generation, message);
+                    }
+                }
+            }
+        }
+    }
+
+    fn install_reinterpreted_yuv(
+        &mut self,
+        _context: &egui::Context,
+        document_id: DocumentId,
+        decode_generation: u64,
+        completed: ImageOpenResult,
+    ) {
+        let Some(document) = self.workspace.image(document_id) else {
+            return;
+        };
+        if document.decode_generation != decode_generation {
+            return;
+        }
+        let Some(display) = completed.display else {
+            return;
+        };
+        if !matches!(completed.native, NativeImage::Yuv420Sp(_)) {
+            return;
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        if let Some(document) = self.workspace.image_mut(document_id) {
+            let _ = document.install_reinterpreted_yuv(
+                generation,
+                decode_generation,
+                completed.native,
+                display,
+            );
         }
     }
 
@@ -3140,6 +3357,16 @@ fn decode_raw_reinterpret(
         source: result.source,
         interpretation: result.interpretation,
     })
+}
+
+fn decode_yuv_reinterpret(
+    pipeline: &ImageOpenPipeline,
+    source: ImageSourceHandle,
+    kind: ImageFileKind,
+    spec: Yuv420SpSpec,
+) -> anyhow::Result<ImageOpenResult> {
+    let control = FsControl::with_timeout(Duration::from_secs(30));
+    Ok(pipeline.reinterpret_yuv(source, kind, spec, &control)?)
 }
 fn asset_payload_bytes(payload: &OwnedMediaPayload) -> Result<&[u8], String> {
     match payload {

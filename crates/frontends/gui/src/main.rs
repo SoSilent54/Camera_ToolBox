@@ -13,7 +13,7 @@ mod raw_dialog;
 mod raw_inspector;
 mod viewer;
 mod workspace;
-mod yuv_dialog;
+mod yuv_inspector;
 
 use std::sync::Arc;
 

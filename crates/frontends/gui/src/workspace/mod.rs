@@ -341,6 +341,11 @@ impl WorkspaceState {
                 document.spatial_requested = None;
             }
         }
+        for document in &mut self.image_documents {
+            if document.id != document_id {
+                document.spatial_requested = None;
+            }
+        }
     }
 
     pub(crate) fn activate(&mut self, id: DocumentId) -> bool {

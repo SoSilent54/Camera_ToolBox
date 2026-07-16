@@ -163,6 +163,46 @@ fn png_workspace_open_reaches_viewer_and_source_rgb_analysis() {
         .expect("source RGB analysis must install");
     assert_eq!(key.domain, AnalysisDomain::SourceRgb);
 
+    app.workspace
+        .active_image_mut()
+        .unwrap()
+        .analysis_panel
+        .domain = AnalysisDomain::DisplayRgb;
+    let display_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    while app
+        .workspace
+        .active_image()
+        .unwrap()
+        .analysis_panel
+        .current_key()
+        .is_none_or(|key| key.domain != AnalysisDomain::DisplayRgb)
+        && std::time::Instant::now() < display_deadline
+    {
+        app.ensure_analysis();
+        app.poll_analysis_result();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let display_key = app
+        .workspace
+        .active_image()
+        .unwrap()
+        .analysis_panel
+        .current_key()
+        .filter(|key| key.domain == AnalysisDomain::DisplayRgb)
+        .expect("static image display RGB analysis must install");
+    let display_selection = HistogramBinSelection {
+        key: display_key,
+        series: HistogramSeriesId::DisplayR,
+        bin_index: 255,
+        lower_code: 255,
+        upper_code: 255,
+    };
+    app.update_spatial_highlight(Some(display_selection), false);
+    assert_eq!(
+        app.workspace.active_image().unwrap().spatial_requested,
+        Some(display_selection)
+    );
+
     drop(app);
     std::fs::remove_dir_all(root).unwrap();
 }

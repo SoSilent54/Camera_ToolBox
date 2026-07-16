@@ -85,10 +85,11 @@ fn opens_png_and_yuv_through_transport_neutral_pipeline() {
 }
 
 #[test]
-fn yuv_confirmation_and_suffix_order_are_enforced_before_decode() {
+fn auto_yuv_uses_filename_geometry_and_suffix_order_before_decode() {
     let temp = TempDirectory::new();
-    fs::write(temp.path().join("sample.nv21"), [16_u8; 6]).unwrap();
-    fs::write(temp.path().join("sample.yuv"), [16_u8; 6]).unwrap();
+    fs::write(temp.path().join("sample_2x2.nv21"), [16_u8; 6]).unwrap();
+    fs::write(temp.path().join("sample_2x2.yuv"), [16_u8; 6]).unwrap();
+    fs::write(temp.path().join("sample.nv12"), [16_u8; 6]).unwrap();
     let source_id = FileSourceId::new("image-open-yuv-test").unwrap();
     let filesystem = LocalFileSystem::new(source_id.clone(), temp.path()).unwrap();
     let codec = Arc::new(ImageRasterCodec);
@@ -96,17 +97,47 @@ fn yuv_confirmation_and_suffix_order_are_enforced_before_decode() {
     let pipeline = ImageOpenPipeline::new(raw, codec, 1024, 1024);
     let control = FsControl::with_timeout(Duration::from_secs(5));
 
-    let bare_error = pipeline
+    let bare_result = pipeline
         .open_with_progress(
             &filesystem,
-            &file(&source_id, "sample.yuv"),
+            &file(&source_id, "sample_2x2.yuv"),
+            ImageOpenMode::Auto,
+            &control,
+            &mut |_| {},
+        )
+        .unwrap();
+    let NativeImage::Yuv420Sp(bare) = bare_result.native else {
+        panic!("expected native YUV frame");
+    };
+    assert_eq!(bare.spec.chroma_order, ChromaOrder::Uv);
+
+    let nv21_result = pipeline
+        .open_with_progress(
+            &filesystem,
+            &file(&source_id, "sample_2x2.nv21"),
+            ImageOpenMode::Auto,
+            &control,
+            &mut |_| {},
+        )
+        .unwrap();
+    let NativeImage::Yuv420Sp(nv21) = nv21_result.native else {
+        panic!("expected native YUV frame");
+    };
+    assert_eq!(nv21.spec.chroma_order, ChromaOrder::Vu);
+
+    let missing_geometry = pipeline
+        .open_with_progress(
+            &filesystem,
+            &file(&source_id, "sample.nv12"),
             ImageOpenMode::Auto,
             &control,
             &mut |_| {},
         )
         .unwrap_err();
-    assert!(matches!(bare_error, ImageOpenError::YuvParametersRequired));
-
+    assert!(matches!(
+        missing_geometry,
+        ImageOpenError::YuvGeometryMissing(_)
+    ));
     let wrong_order = Yuv420SpSpec {
         width: 2,
         height: 2,
@@ -119,7 +150,7 @@ fn yuv_confirmation_and_suffix_order_are_enforced_before_decode() {
     let order_error = pipeline
         .open_with_progress(
             &filesystem,
-            &file(&source_id, "sample.nv21"),
+            &file(&source_id, "sample_2x2.nv21"),
             ImageOpenMode::Yuv420Sp(wrong_order),
             &control,
             &mut |_| {},

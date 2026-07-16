@@ -752,6 +752,25 @@ fn prepare_image_plot_markers(
                 push_marker(HistogramSeriesId::RawAll, bin);
             }
         }
+        (AnalysisData::Rgb(_), HistogramPixelSample::SourceRgb { r, g, b, a }) => {
+            for (series_id, value) in [
+                (HistogramSeriesId::SourceR, r),
+                (HistogramSeriesId::SourceG, g),
+                (HistogramSeriesId::SourceB, b),
+                (HistogramSeriesId::SourceA, a),
+            ] {
+                push_marker(series_id, usize::from(value));
+            }
+        }
+        (AnalysisData::Yuv(_), HistogramPixelSample::SourceYuv { y, u, v }) => {
+            for (series_id, value) in [
+                (HistogramSeriesId::SourceY, y),
+                (HistogramSeriesId::SourceU, u),
+                (HistogramSeriesId::SourceV, v),
+            ] {
+                push_marker(series_id, usize::from(value));
+            }
+        }
         (AnalysisData::Display(_), HistogramPixelSample::Display(sample)) => {
             for series_id in [
                 HistogramSeriesId::DisplayR,

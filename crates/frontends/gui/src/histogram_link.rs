@@ -8,7 +8,7 @@ use std::{
     thread::{self, JoinHandle},
 };
 
-use camera_toolbox_core::{CfaSite, RawFrame};
+use camera_toolbox_core::{CfaSite, NativeImage, Rgba8Frame};
 use eframe::egui;
 
 use crate::analysis_worker::{AnalysisDomain, AnalysisKey};
@@ -25,6 +25,13 @@ pub(crate) enum HistogramSeriesId {
     RawGb,
     RawB,
     RawAll,
+    SourceR,
+    SourceG,
+    SourceB,
+    SourceA,
+    SourceY,
+    SourceU,
+    SourceV,
     DisplayR,
     DisplayG,
     DisplayB,
@@ -48,6 +55,13 @@ impl HistogramSeriesId {
             (AnalysisDomain::RawBayer, 2) => Some(Self::RawGb),
             (AnalysisDomain::RawBayer, 3) => Some(Self::RawB),
             (AnalysisDomain::RawBayer, 4) => Some(Self::RawAll),
+            (AnalysisDomain::SourceRgb, 0) => Some(Self::SourceR),
+            (AnalysisDomain::SourceRgb, 1) => Some(Self::SourceG),
+            (AnalysisDomain::SourceRgb, 2) => Some(Self::SourceB),
+            (AnalysisDomain::SourceRgb, 3) => Some(Self::SourceA),
+            (AnalysisDomain::SourceYuv, 0) => Some(Self::SourceY),
+            (AnalysisDomain::SourceYuv, 1) => Some(Self::SourceU),
+            (AnalysisDomain::SourceYuv, 2) => Some(Self::SourceV),
             (AnalysisDomain::DisplayRgb, 0) => Some(Self::DisplayR),
             (AnalysisDomain::DisplayRgb, 1) => Some(Self::DisplayG),
             (AnalysisDomain::DisplayRgb, 2) => Some(Self::DisplayB),
@@ -58,10 +72,10 @@ impl HistogramSeriesId {
 
     pub(crate) const fn plot_index(self) -> usize {
         match self {
-            Self::RawR | Self::DisplayR => 0,
-            Self::RawGr | Self::DisplayG => 1,
-            Self::RawGb | Self::DisplayB => 2,
-            Self::RawB | Self::DisplayLuma => 3,
+            Self::RawR | Self::SourceR | Self::SourceY | Self::DisplayR => 0,
+            Self::RawGr | Self::SourceG | Self::SourceU | Self::DisplayG => 1,
+            Self::RawGb | Self::SourceB | Self::SourceV | Self::DisplayB => 2,
+            Self::RawB | Self::SourceA | Self::DisplayLuma => 3,
             Self::RawAll => 4,
         }
     }
@@ -71,6 +85,10 @@ impl HistogramSeriesId {
             Self::RawR | Self::RawGr | Self::RawGb | Self::RawB | Self::RawAll => {
                 AnalysisDomain::RawBayer
             }
+            Self::SourceR | Self::SourceG | Self::SourceB | Self::SourceA => {
+                AnalysisDomain::SourceRgb
+            }
+            Self::SourceY | Self::SourceU | Self::SourceV => AnalysisDomain::SourceYuv,
             Self::DisplayR | Self::DisplayG | Self::DisplayB | Self::DisplayLuma => {
                 AnalysisDomain::DisplayRgb
             }
@@ -101,7 +119,25 @@ impl DisplayHistogramSample {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HistogramPixelSample {
     Raw { site: CfaSite, value: u16 },
+    SourceRgb { r: u8, g: u8, b: u8, a: u8 },
+    SourceYuv { y: u8, u: u8, v: u8 },
     Display(DisplayHistogramSample),
+}
+
+impl HistogramPixelSample {
+    pub(crate) const fn value(self, series: HistogramSeriesId) -> Option<u8> {
+        match (self, series) {
+            (Self::SourceRgb { r, .. }, HistogramSeriesId::SourceR) => Some(r),
+            (Self::SourceRgb { g, .. }, HistogramSeriesId::SourceG) => Some(g),
+            (Self::SourceRgb { b, .. }, HistogramSeriesId::SourceB) => Some(b),
+            (Self::SourceRgb { a, .. }, HistogramSeriesId::SourceA) => Some(a),
+            (Self::SourceYuv { y, .. }, HistogramSeriesId::SourceY) => Some(y),
+            (Self::SourceYuv { u, .. }, HistogramSeriesId::SourceU) => Some(u),
+            (Self::SourceYuv { v, .. }, HistogramSeriesId::SourceV) => Some(v),
+            (Self::Display(sample), series) => sample.value(series),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -251,10 +287,41 @@ impl SpatialHighlight {
     }
 }
 
+/// Display RGB analysis 的不可变采样源；避免为静态图像额外复制 ColorImage。
+pub(crate) enum DisplayHistogramImage {
+    Color(Arc<egui::ColorImage>),
+    Rgba8(Arc<Rgba8Frame>),
+}
+
+impl DisplayHistogramImage {
+    fn dimensions(&self) -> [u32; 2] {
+        match self {
+            Self::Color(image) => [image.size[0] as u32, image.size[1] as u32],
+            Self::Rgba8(frame) => [frame.width, frame.height],
+        }
+    }
+
+    fn sample(&self, x: u32, y: u32) -> Option<DisplayHistogramSample> {
+        match self {
+            Self::Color(image) => {
+                let index = y as usize * image.size[0] + x as usize;
+                image
+                    .pixels
+                    .get(index)
+                    .copied()
+                    .map(display_histogram_sample)
+            }
+            Self::Rgba8(frame) => frame
+                .pixel(x, y)
+                .map(|[r, g, b, _]| display_histogram_sample(egui::Color32::from_rgb(r, g, b))),
+        }
+    }
+}
+
 pub(crate) struct SpatialHighlightRequest {
     pub(crate) selection: HistogramBinSelection,
-    pub(crate) frame: Arc<RawFrame>,
-    pub(crate) display_image: Option<Arc<egui::ColorImage>>,
+    pub(crate) native: NativeImage,
+    pub(crate) display_image: Option<DisplayHistogramImage>,
 }
 
 pub(crate) struct SpatialHighlightPayload {
@@ -388,52 +455,70 @@ where
     if selection.series.domain() != selection.key.domain {
         return Some(Err("histogram series/domain mismatch".to_owned()));
     }
-    let spec = &request.frame.spec;
-    if selection.key.roi.clamped_to(spec.width, spec.height) != Some(selection.key.roi) {
+    let [width, height] = request.native.dimensions();
+    if selection.key.roi.clamped_to(width, height) != Some(selection.key.roi) {
         return Some(Err("histogram ROI is outside the source frame".to_owned()));
     }
     if selection.key.domain == AnalysisDomain::DisplayRgb {
         let Some(image) = request.display_image.as_ref() else {
             return Some(Err("display histogram source is unavailable".to_owned()));
         };
-        if image.size != [spec.width as usize, spec.height as usize] {
+        if image.dimensions() != [width, height] {
             return Some(Err("display histogram source dimensions changed".to_owned()));
         }
     }
-    let pixel_count = request.frame.pixels().len();
+    let pixel_count = match (width as usize).checked_mul(height as usize) {
+        Some(pixel_count) => pixel_count,
+        None => {
+            return Some(Err(
+                "source dimensions overflow host address space".to_owned()
+            ));
+        }
+    };
     let mut mask = SpatialMask {
-        width: spec.width,
-        height: spec.height,
+        width,
+        height,
         bits: vec![0; pixel_count.div_ceil(64)],
         matched_pixels: 0,
     };
-    let row_width = spec.width as usize;
     let roi = selection.key.roi;
     for y in roi.y..roi.y + roi.height {
         if is_cancelled() {
             return None;
         }
-        let row_start = y as usize * row_width;
         for x in roi.x..roi.x + roi.width {
-            let index = row_start + x as usize;
-            let matches = match selection.key.domain {
-                AnalysisDomain::RawBayer => {
+            let index = y as usize * width as usize + x as usize;
+            let matches = match (&request.native, selection.key.domain) {
+                (NativeImage::Raw(frame), AnalysisDomain::RawBayer) => {
                     let site_matches = selection.series == HistogramSeriesId::RawAll
                         || selection.series
-                            == HistogramSeriesId::raw_site(spec.bayer.site_at(x, y));
-                    site_matches && selection.matches_code(request.frame.pixels()[index])
+                            == HistogramSeriesId::raw_site(frame.spec.bayer.site_at(x, y));
+                    site_matches && selection.matches_code(frame.pixels()[index])
                 }
-                AnalysisDomain::DisplayRgb => {
-                    let pixel = request
-                        .display_image
-                        .as_ref()
-                        .expect("validated above")
-                        .pixels[index];
-                    display_histogram_sample(pixel)
-                        .value(selection.series)
-                        .is_some_and(|value| selection.matches_code(u16::from(value)))
+                (NativeImage::Rgba8(frame), AnalysisDomain::SourceRgb) => frame
+                    .pixel(x, y)
+                    .and_then(|[r, g, b, a]| {
+                        HistogramPixelSample::SourceRgb { r, g, b, a }.value(selection.series)
+                    })
+                    .is_some_and(|value| selection.matches_code(u16::from(value))),
+                (NativeImage::Yuv420Sp(frame), AnalysisDomain::SourceYuv) => frame
+                    .sample(x, y)
+                    .and_then(|(y, u, v)| {
+                        HistogramPixelSample::SourceYuv { y, u, v }.value(selection.series)
+                    })
+                    .is_some_and(|value| selection.matches_code(u16::from(value))),
+                (_, AnalysisDomain::DisplayRgb) => request
+                    .display_image
+                    .as_ref()
+                    .expect("validated above")
+                    .sample(x, y)
+                    .and_then(|sample| sample.value(selection.series))
+                    .is_some_and(|value| selection.matches_code(u16::from(value))),
+                _ => {
+                    return Some(Err(
+                        "histogram domain does not match native image".to_owned()
+                    ));
                 }
-                AnalysisDomain::SourceRgb | AnalysisDomain::SourceYuv => false,
             };
             if matches {
                 mask.bits[index / 64] |= 1u64 << (index % 64);
@@ -465,6 +550,7 @@ pub(crate) fn display_histogram_sample(pixel: egui::Color32) -> DisplayHistogram
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camera_toolbox_core::RawFrame;
 
     #[test]
     fn display_sample_uses_exact_bt709_integer_quantization() {
@@ -522,7 +608,7 @@ mod tests {
         };
         let request = SpatialHighlightRequest {
             selection: selection(AnalysisDomain::RawBayer, HistogramSeriesId::RawR, roi, 10),
-            frame,
+            native: NativeImage::Raw(frame),
             display_image: None,
         };
         let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
@@ -550,7 +636,7 @@ mod tests {
         };
         let request = SpatialHighlightRequest {
             selection: selection(AnalysisDomain::RawBayer, HistogramSeriesId::RawAll, roi, 10),
-            frame,
+            native: NativeImage::Raw(frame),
             display_image: None,
         };
         let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
@@ -586,8 +672,8 @@ mod tests {
                 roi,
                 54,
             ),
-            frame,
-            display_image: Some(image),
+            native: NativeImage::Raw(frame),
+            display_image: Some(DisplayHistogramImage::Color(image)),
         };
         let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
 
@@ -595,6 +681,42 @@ mod tests {
         assert!(mask.is_set(0));
         assert!(mask.is_set(2));
         assert!(!mask.is_set(3));
+    }
+
+    #[test]
+    fn static_display_spatial_mask_samples_display_rgba_without_copying() {
+        let display = Arc::new(
+            Rgba8Frame::tight(
+                2,
+                2,
+                Arc::from([
+                    10_u8, 1, 2, 255, 20, 3, 4, 255, 10, 5, 6, 255, 30, 7, 8, 255,
+                ]),
+            )
+            .unwrap(),
+        );
+        let roi = camera_toolbox_core::Roi {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let request = SpatialHighlightRequest {
+            selection: selection(
+                AnalysisDomain::DisplayRgb,
+                HistogramSeriesId::DisplayR,
+                roi,
+                10,
+            ),
+            native: NativeImage::Rgba8(Arc::clone(&display)),
+            display_image: Some(DisplayHistogramImage::Rgba8(display)),
+        };
+        let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
+
+        assert_eq!(mask.matched_pixels, 2);
+        assert!(mask.is_set(0));
+        assert!(mask.is_set(2));
+        assert!(!mask.is_set(1));
     }
 
     #[test]
@@ -608,7 +730,7 @@ mod tests {
         };
         let request = SpatialHighlightRequest {
             selection: selection(AnalysisDomain::RawBayer, HistogramSeriesId::RawAll, roi, 99),
-            frame,
+            native: NativeImage::Raw(frame),
             display_image: None,
         };
         let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
@@ -629,10 +751,88 @@ mod tests {
         };
         let request = SpatialHighlightRequest {
             selection: selection(AnalysisDomain::RawBayer, HistogramSeriesId::RawAll, roi, 10),
-            frame,
+            native: NativeImage::Raw(frame),
             display_image: None,
         };
 
         assert!(build_spatial_mask(&request, || true).is_none());
+    }
+
+    #[test]
+    fn source_rgb_spatial_mask_matches_native_channel_codes() {
+        let native = NativeImage::Rgba8(Arc::new(
+            camera_toolbox_core::Rgba8Frame::tight(
+                2,
+                2,
+                Arc::from([
+                    10_u8, 1, 2, 255, 20, 3, 4, 255, 10, 5, 6, 255, 30, 7, 8, 255,
+                ]),
+            )
+            .unwrap(),
+        ));
+        let roi = camera_toolbox_core::Roi {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let request = SpatialHighlightRequest {
+            selection: selection(
+                AnalysisDomain::SourceRgb,
+                HistogramSeriesId::SourceR,
+                roi,
+                10,
+            ),
+            native,
+            display_image: None,
+        };
+        let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
+
+        assert_eq!(mask.matched_pixels, 2);
+        assert!(mask.is_set(0));
+        assert!(mask.is_set(2));
+        assert!(!mask.is_set(1));
+    }
+
+    #[test]
+    fn source_yuv_spatial_mask_matches_native_chroma_codes() {
+        let spec = camera_toolbox_core::Yuv420SpSpec {
+            width: 2,
+            height: 2,
+            y_stride: 2,
+            chroma_stride: 2,
+            chroma_order: camera_toolbox_core::ChromaOrder::Uv,
+            matrix: camera_toolbox_core::YuvMatrix::Bt601,
+            range: camera_toolbox_core::YuvRange::Limited,
+        };
+        let native = NativeImage::Yuv420Sp(Arc::new(
+            camera_toolbox_core::Yuv420SpFrame::from_contiguous(
+                spec,
+                Arc::new(vec![10, 20, 30, 40, 50, 60]),
+            )
+            .unwrap(),
+        ));
+        let roi = camera_toolbox_core::Roi {
+            x: 0,
+            y: 0,
+            width: 2,
+            height: 2,
+        };
+        let request = SpatialHighlightRequest {
+            selection: selection(
+                AnalysisDomain::SourceYuv,
+                HistogramSeriesId::SourceU,
+                roi,
+                50,
+            ),
+            native,
+            display_image: None,
+        };
+        let mask = build_spatial_mask(&request, || false).unwrap().unwrap();
+
+        assert_eq!(mask.matched_pixels, 4);
+        for index in 0..4 {
+            assert!(mask.is_set(index));
+        }
     }
 }

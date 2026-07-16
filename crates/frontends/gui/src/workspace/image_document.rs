@@ -10,7 +10,9 @@ use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
 
 use crate::{
     analysis_panel::AnalysisPanelState,
+    histogram_link::{HistogramBinSelection, SpatialHighlight},
     viewer::{HoverViewSettings, ImageViewerState},
+    yuv_inspector::YuvInspectorState,
 };
 
 use super::DocumentId;
@@ -124,6 +126,10 @@ pub(crate) struct ImageDocument {
     pub(crate) roi: Roi,
     pub(crate) analysis_panel: AnalysisPanelState,
     pub(crate) analysis_pending_active: Option<(u64, Roi)>,
+    pub(crate) spatial_requested: Option<HistogramBinSelection>,
+    pub(crate) spatial_highlight: Option<SpatialHighlight>,
+    pub(crate) yuv_inspector: Option<YuvInspectorState>,
+    pub(crate) decode_generation: u64,
     pub(crate) last_access: u64,
     pub(crate) unsaved: bool,
 }
@@ -147,6 +153,12 @@ impl ImageDocument {
             .to_owned();
         let mut analysis_panel = AnalysisPanelState::default_for_native(&result.native);
         analysis_panel.open_for_first_image();
+        let yuv_inspector = match (&result.native, result.kind) {
+            (NativeImage::Yuv420Sp(frame), ImageFileKind::Yuv420Sp { chroma_order_hint }) => {
+                Some(YuvInspectorState::new(&frame.spec, chroma_order_hint))
+            }
+            _ => None,
+        };
         Ok(Self {
             id,
             title,
@@ -168,6 +180,10 @@ impl ImageDocument {
             },
             analysis_panel,
             analysis_pending_active: None,
+            spatial_requested: None,
+            spatial_highlight: None,
+            yuv_inspector,
+            decode_generation: 0,
             last_access,
             unsaved: false,
         })
@@ -202,9 +218,57 @@ impl ImageDocument {
             },
             analysis_panel,
             analysis_pending_active: None,
+            spatial_requested: None,
+            spatial_highlight: None,
+            yuv_inspector: None,
+            decode_generation: 0,
             last_access,
             unsaved: true,
         }
+    }
+
+    pub(crate) fn yuv_workspace_source(&self) -> Option<(ImageSourceHandle, ImageFileKind)> {
+        let ImageDocumentSource::WorkspaceFile { handle, kind, .. } = &self.source else {
+            return None;
+        };
+        matches!(kind, ImageFileKind::Yuv420Sp { .. }).then(|| (handle.clone(), *kind))
+    }
+
+    /// 草稿改变后立即废弃所有已提交的 YUV 重解释结果。
+    pub(crate) fn invalidate_yuv_reinterpretation(&mut self) {
+        self.decode_generation = self.decode_generation.saturating_add(1);
+    }
+
+    pub(crate) fn install_reinterpreted_yuv(
+        &mut self,
+        generation: u64,
+        decode_generation: u64,
+        native: NativeImage,
+        display: Arc<Rgba8Frame>,
+    ) -> bool {
+        if self.decode_generation != decode_generation {
+            return false;
+        }
+        let [width, height] = native.dimensions();
+        self.generation = generation;
+        self.native = native;
+        self.display = DisplaySurface::new(generation, display);
+        self.roi = Roi {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        self.viewer.evict_derived_resources();
+        self.analysis_panel = AnalysisPanelState::default_for_native(&self.native);
+        self.analysis_panel.open_for_first_image();
+        self.analysis_pending_active = None;
+        self.spatial_requested = None;
+        self.spatial_highlight = None;
+        if let Some(inspector) = &mut self.yuv_inspector {
+            inspector.mark_applied(decode_generation);
+        }
+        true
     }
 
     pub(crate) const fn status_label(&self) -> &'static str {
@@ -239,6 +303,11 @@ impl ImageDocument {
         self.display
             .derived_bytes(&self.native)
             .saturating_add(self.analysis_panel.derived_resource_bytes())
+            .saturating_add(
+                self.spatial_highlight
+                    .as_ref()
+                    .map_or(0, SpatialHighlight::estimated_bytes),
+            )
     }
 
     pub(crate) fn evict_derived_resources(&mut self) -> usize {
@@ -246,6 +315,8 @@ impl ImageDocument {
         self.display.evict_texture();
         self.viewer.evict_derived_resources();
         self.analysis_panel.evict_derived();
+        self.spatial_requested = None;
+        self.spatial_highlight = None;
         before.saturating_sub(self.derived_resource_bytes())
     }
 }
