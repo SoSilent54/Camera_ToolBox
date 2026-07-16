@@ -551,30 +551,36 @@ impl CameraToolboxApp {
                             &mut document.raw_inspector,
                             document.raw_source.is_some(),
                         );
-                        if inspector.apply_requested {
-                            let decode_generation = document.decode_generation.saturating_add(1);
-                            let bayer = document.loaded.color_edit.params.bayer;
+                        if inspector.params_changed {
+                            // 先使在途任务失效；真正提交时再分配一个严格更新的任务 generation。
+                            document.decode_generation =
+                                document.decode_generation.saturating_add(1);
+                        }
+                        if document.raw_inspector.submission_due(Instant::now()) {
+                            let bayer = document.loaded.frame.spec.bayer;
                             match document.raw_inspector.decode_params(bayer) {
-                                Ok(params) => {
-                                    let Some(source) = document.raw_source.clone() else {
-                                        document.raw_inspector.mark_error(
-                                            None,
-                                            "当前文档没有可复用的 RAW source".to_owned(),
-                                        );
-                                        return;
-                                    };
-                                    document.decode_generation = decode_generation;
-                                    document.raw_inspector.mark_submitted(decode_generation);
-                                    reinterpret_request = Some((
-                                        document.id,
-                                        decode_generation,
-                                        source,
-                                        params,
-                                        document.loaded.roi,
-                                        document.loaded.path.clone(),
-                                    ));
+                                Ok(params) => match document.raw_source.clone() {
+                                    Some(source) => {
+                                        let decode_generation =
+                                            document.decode_generation.saturating_add(1);
+                                        document.decode_generation = decode_generation;
+                                        document.raw_inspector.mark_submitted(decode_generation);
+                                        reinterpret_request = Some((
+                                            document.id,
+                                            decode_generation,
+                                            source,
+                                            params,
+                                            document.loaded.roi,
+                                            document.loaded.path.clone(),
+                                        ));
+                                    }
+                                    None => document.raw_inspector.mark_validation_error(
+                                        "当前文档没有可复用的 RAW source".to_owned(),
+                                    ),
+                                },
+                                Err(error) => {
+                                    document.raw_inspector.mark_validation_error(error);
                                 }
-                                Err(error) => document.raw_inspector.mark_error(None, error),
                             }
                         }
                         should_submit = response.params_changed

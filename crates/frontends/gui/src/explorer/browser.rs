@@ -39,6 +39,7 @@ impl MutationRequest {
 #[derive(Debug)]
 pub(super) enum BrowserCommand {
     NavigateUp,
+    NavigatePath(String),
     NavigateTo(SourcePath),
     Refresh,
     Open(FileRef),
@@ -81,6 +82,10 @@ pub(super) struct BrowserState {
     editor: Option<EntryEditor>,
     confirmation: Option<PendingConfirmation>,
     message: Option<String>,
+    navigation_identity: Option<(FileSourceId, SourcePath)>,
+    navigation_value: String,
+    navigation_dirty: bool,
+    navigation_error: Option<String>,
 }
 
 impl BrowserState {
@@ -92,6 +97,15 @@ impl BrowserState {
 
     pub(super) fn set_message(&mut self, message: impl Into<String>) {
         self.message = Some(message.into());
+    }
+
+    pub(super) fn set_navigation_error(&mut self, message: impl Into<String>) {
+        self.navigation_error = Some(message.into());
+    }
+
+    pub(super) fn confirm_navigation(&mut self) {
+        self.navigation_dirty = false;
+        self.navigation_error = None;
     }
 
     pub(super) fn complete_mutation(&mut self, request: &MutationRequest) {
@@ -145,47 +159,18 @@ impl BrowserState {
         ui: &mut egui::Ui,
         source_id: &FileSourceId,
         current_directory: &SourcePath,
+        navigation_path: &str,
         entries: &[FileEntry],
         selected: &mut Option<SourcePath>,
         capabilities: FileSystemCapabilities,
         busy: bool,
     ) -> Option<BrowserCommand> {
-        let mut command = None;
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    !current_directory.is_root() && !busy,
-                    egui::Button::new("Up"),
-                )
-                .clicked()
-            {
-                command = Some(BrowserCommand::NavigateUp);
-            }
-            if ui
-                .add_enabled(!busy, egui::Button::new("Refresh"))
-                .clicked()
-            {
-                command = Some(BrowserCommand::Refresh);
-            }
-            if ui
-                .add_enabled(
-                    capabilities.create_directory && !busy,
-                    egui::Button::new("New Folder"),
-                )
-                .clicked()
-            {
-                self.begin_new_folder(DirectoryRef::new(
-                    source_id.clone(),
-                    current_directory.clone(),
-                ));
-            }
-        });
+        self.sync_navigation(source_id, current_directory, navigation_path);
+        let current = DirectoryRef::new(source_id.clone(), current_directory.clone());
+        let mut command = self.render_navigation_row(ui, current_directory, busy);
 
         if let Some(message) = &self.message {
             ui.colored_label(egui::Color32::RED, message);
-        }
-        if let Some(editor_command) = self.render_new_folder_editor(ui, busy) {
-            command = Some(editor_command);
         }
 
         ui.separator();
@@ -197,10 +182,18 @@ impl BrowserState {
         });
         ui.separator();
 
-        let current = DirectoryRef::new(source_id.clone(), current_directory.clone());
         let table = ui.vertical(|ui| {
             ui.set_min_height(ui.available_height());
             egui::ScrollArea::vertical().show(ui, |ui| {
+                let parent_command = Self::render_parent_row(ui, current_directory, busy);
+                if command.is_none() {
+                    command = parent_command;
+                }
+                if let Some(editor_command) = self.render_new_folder_editor(ui, busy)
+                    && command.is_none()
+                {
+                    command = Some(editor_command);
+                }
                 for entry in entries {
                     if command.is_none() {
                         command = self.render_entry_row(
@@ -217,7 +210,8 @@ impl BrowserState {
                 }
             });
         });
-        table.response.context_menu(|ui| {
+        let background_response = table.response.interact(egui::Sense::click());
+        background_response.context_menu(|ui| {
             if ui
                 .add_enabled(
                     capabilities.create_directory && !busy,
@@ -251,6 +245,98 @@ impl BrowserState {
         command
     }
 
+    fn sync_navigation(
+        &mut self,
+        source_id: &FileSourceId,
+        current_directory: &SourcePath,
+        navigation_path: &str,
+    ) {
+        let identity_matches =
+            self.navigation_identity
+                .as_ref()
+                .is_some_and(|(source, directory)| {
+                    source == source_id && directory == current_directory
+                });
+        if !identity_matches || (!self.navigation_dirty && self.navigation_value != navigation_path)
+        {
+            self.navigation_identity = Some((source_id.clone(), current_directory.clone()));
+            navigation_path.clone_into(&mut self.navigation_value);
+            self.navigation_dirty = false;
+            self.navigation_error = None;
+        }
+    }
+
+    fn render_navigation_row(
+        &mut self,
+        ui: &mut egui::Ui,
+        current_directory: &SourcePath,
+        busy: bool,
+    ) -> Option<BrowserCommand> {
+        let mut command = None;
+        let mut commit_path = false;
+        ui.horizontal(|ui| {
+            ui.label("Path");
+            let response = ui.add_enabled(
+                !busy,
+                egui::TextEdit::singleline(&mut self.navigation_value)
+                    .id_source("explorer_current_path")
+                    .desired_width((ui.available_width() - 96.0).max(72.0)),
+            );
+            if response.changed() {
+                self.navigation_dirty = true;
+                self.navigation_error = None;
+            }
+            let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+            commit_path =
+                self.navigation_dirty && (response.lost_focus() || (response.has_focus() && enter));
+            if ui
+                .add_enabled(
+                    !current_directory.is_root() && !busy,
+                    egui::Button::new("Up"),
+                )
+                .clicked()
+            {
+                command = Some(BrowserCommand::NavigateUp);
+            }
+            if ui
+                .add_enabled(!busy, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                command = Some(BrowserCommand::Refresh);
+            }
+        });
+        if let Some(error) = &self.navigation_error {
+            ui.colored_label(egui::Color32::RED, error);
+        }
+        resolve_navigation_command(command, commit_path, &self.navigation_value)
+    }
+
+    fn render_parent_row(
+        ui: &mut egui::Ui,
+        current_directory: &SourcePath,
+        busy: bool,
+    ) -> Option<BrowserCommand> {
+        let enabled = !current_directory.is_root() && !busy;
+        let row = ui.horizontal(|ui| {
+            let size_width = 76.0;
+            let name_width =
+                (ui.available_width() - size_width - ui.spacing().item_spacing.x).max(48.0);
+            let response = ui.add_enabled(
+                enabled,
+                egui::Button::selectable(false, ())
+                    .left_text("[D] ...")
+                    .min_size(egui::vec2(name_width, 22.0))
+                    .sense(egui::Sense::click()),
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.monospace("—");
+            });
+            response
+        });
+        (row.inner.double_clicked_by(egui::PointerButton::Primary) && enabled)
+            .then_some(BrowserCommand::NavigateUp)
+    }
+
     fn render_entry_row(
         &mut self,
         ui: &mut egui::Ui,
@@ -278,7 +364,8 @@ impl BrowserState {
                 (ui.available_width() - size_width - ui.spacing().item_spacing.x).max(48.0);
             let response = ui.add_sized(
                 [name_width, 22.0],
-                egui::Button::selectable(selected_row, format!("{icon} {}", entry.name))
+                egui::Button::selectable(selected_row, ())
+                    .left_text(format!("{icon} {}", entry.name))
                     .sense(egui::Sense::click_and_drag()),
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -379,7 +466,7 @@ impl BrowserState {
     fn begin_new_folder(&mut self, parent: DirectoryRef) {
         self.editor = Some(EntryEditor::NewFolder {
             parent,
-            value: String::new(),
+            value: "New Folder".to_owned(),
             error: None,
             request_focus: true,
         });
@@ -410,17 +497,17 @@ impl BrowserState {
                 !busy,
                 egui::TextEdit::singleline(value)
                     .id_source("explorer_inline_rename")
-                    .desired_width(ui.available_width() - 76.0),
+                    .desired_width((ui.available_width() - 104.0).max(48.0)),
             );
             if *request_focus {
                 response.request_focus();
                 *request_focus = false;
             }
-            commit = response.has_focus()
-                && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-            cancel = response.has_focus()
-                && ui
-                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            let active = response.has_focus() || response.lost_focus();
+            commit |= active && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            cancel |= active && ui.input(|input| input.key_pressed(egui::Key::Escape));
+            commit |= ui.add_enabled(!busy, egui::Button::new("OK")).clicked();
+            cancel |= ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();
         });
         if let Some(error) = error {
             ui.colored_label(egui::Color32::RED, error);
@@ -490,17 +577,18 @@ impl BrowserState {
                 !busy,
                 egui::TextEdit::singleline(value)
                     .id_source("explorer_new_folder")
-                    .hint_text("New folder name"),
+                    .hint_text("New folder name")
+                    .desired_width((ui.available_width() - 128.0).max(48.0)),
             );
             if *request_focus {
                 response.request_focus();
                 *request_focus = false;
             }
-            commit = response.has_focus()
-                && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
-            cancel = response.has_focus()
-                && ui
-                    .input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
+            let active = response.has_focus() || response.lost_focus();
+            commit |= active && ui.input(|input| input.key_pressed(egui::Key::Enter));
+            cancel |= active && ui.input(|input| input.key_pressed(egui::Key::Escape));
+            commit |= ui.add_enabled(!busy, egui::Button::new("OK")).clicked();
+            cancel |= ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();
         });
         if let Some(error) = error {
             ui.colored_label(egui::Color32::RED, error);
@@ -618,6 +706,18 @@ impl BrowserState {
     }
 }
 
+fn resolve_navigation_command(
+    command: Option<BrowserCommand>,
+    commit_path: bool,
+    navigation_value: &str,
+) -> Option<BrowserCommand> {
+    if commit_path {
+        Some(BrowserCommand::NavigatePath(navigation_value.to_owned()))
+    } else {
+        command
+    }
+}
+
 fn open_command(entry: &FileEntry) -> Option<BrowserCommand> {
     match entry.kind {
         FileKind::Directory => Some(BrowserCommand::NavigateTo(entry.reference.path.clone())),
@@ -700,6 +800,106 @@ mod tests {
         entry
     }
 
+    fn render_browser_frame(
+        context: &egui::Context,
+        browser: &mut BrowserState,
+        entries: &[FileEntry],
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> (egui::FullOutput, Option<BrowserCommand>) {
+        let source_id = entries.first().map_or_else(
+            || FileSourceId::new("source").unwrap(),
+            |entry| entry.reference.source_id.clone(),
+        );
+        let current_directory = SourcePath::root();
+        let mut selected = None;
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(440.0, 360.0),
+            )),
+            time: Some(time),
+            ..Default::default()
+        };
+        input.events = events;
+        let mut command = None;
+        let output = context.run_ui(input, |ui| {
+            command = browser.render(
+                context,
+                ui,
+                &source_id,
+                &current_directory,
+                "/workspace",
+                entries,
+                &mut selected,
+                FileSystemCapabilities::READ_WRITE,
+                false,
+            );
+        });
+        (output, command)
+    }
+
+    fn accessibility_text(output: &egui::FullOutput) -> String {
+        output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree is enabled")
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn accessibility_center(
+        output: &egui::FullOutput,
+        role: egui::accesskit::Role,
+        label: Option<&str>,
+    ) -> egui::Pos2 {
+        let bounds = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree is enabled")
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == role && label.is_none_or(|label| node.label() == Some(label)))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .unwrap_or_else(|| panic!("accessibility node {role:?} {label:?} is visible"));
+        #[allow(clippy::cast_possible_truncation)]
+        egui::pos2(
+            ((bounds.x0 + bounds.x1) * 0.5) as f32,
+            ((bounds.y0 + bounds.y1) * 0.5) as f32,
+        )
+    }
+
+    fn pointer_button(
+        position: egui::Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn key_event(key: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
     #[test]
     fn formats_sizes_with_iec_units() {
         assert_eq!(format_file_size(17), "17 B");
@@ -711,6 +911,7 @@ mod tests {
     fn move_rejects_same_parent_and_descendant() {
         let entry = directory("capture");
         let source = entry.reference.source_id.clone();
+
         assert!(validate_move(&entry, &DirectoryRef::root(source.clone())).is_err());
         assert!(
             validate_move(
@@ -720,6 +921,84 @@ mod tests {
             .is_err()
         );
     }
+
+    #[test]
+    fn dirty_path_commit_precedes_up_and_refresh_buttons() {
+        for button_command in [BrowserCommand::NavigateUp, BrowserCommand::Refresh] {
+            let command = resolve_navigation_command(Some(button_command), true, "/next");
+            assert!(matches!(
+                command,
+                Some(BrowserCommand::NavigatePath(path)) if path == "/next"
+            ));
+        }
+
+        assert!(matches!(
+            resolve_navigation_command(Some(BrowserCommand::Refresh), false, "/next"),
+            Some(BrowserCommand::Refresh)
+        ));
+    }
+
+    #[test]
+    fn clicking_refresh_after_dirty_path_commits_path_on_focus_loss() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut browser = BrowserState::default();
+        let (output, _) = render_browser_frame(&context, &mut browser, &[], 0.0, Vec::new());
+        let path_position = accessibility_center(&output, egui::accesskit::Role::TextInput, None);
+        render_browser_frame(
+            &context,
+            &mut browser,
+            &[],
+            0.1,
+            vec![
+                egui::Event::PointerMoved(path_position),
+                pointer_button(path_position, egui::PointerButton::Primary, true),
+            ],
+        );
+        let (output, _) = render_browser_frame(
+            &context,
+            &mut browser,
+            &[],
+            0.11,
+            vec![pointer_button(
+                path_position,
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        browser.navigation_value = "/workspace/archive".to_owned();
+        browser.navigation_dirty = true;
+
+        let refresh_position =
+            accessibility_center(&output, egui::accesskit::Role::Button, Some("Refresh"));
+        let (_, press_command) = render_browser_frame(
+            &context,
+            &mut browser,
+            &[],
+            0.2,
+            vec![
+                egui::Event::PointerMoved(refresh_position),
+                pointer_button(refresh_position, egui::PointerButton::Primary, true),
+            ],
+        );
+        assert!(press_command.is_none());
+        let (_, release_command) = render_browser_frame(
+            &context,
+            &mut browser,
+            &[],
+            0.21,
+            vec![pointer_button(
+                refresh_position,
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        assert!(matches!(
+            release_command,
+            Some(BrowserCommand::NavigatePath(path)) if path == "/workspace/archive"
+        ));
+    }
+
     #[test]
     fn inline_editors_commit_cancel_and_retain_invalid_name_errors() {
         let entry = file("frame.raw");
@@ -770,6 +1049,138 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn inline_editors_accept_enter_and_expose_buttons() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let entry = file("frame.raw");
+        let mut browser = BrowserState::default();
+
+        browser.begin_rename(&entry);
+        if let Some(EntryEditor::Rename { value, .. }) = browser.editor.as_mut() {
+            *value = "renamed.raw".to_owned();
+        }
+        let (output, _) = render_browser_frame(
+            &context,
+            &mut browser,
+            std::slice::from_ref(&entry),
+            0.0,
+            Vec::new(),
+        );
+        let text = accessibility_text(&output);
+        assert!(text.contains("OK"));
+        assert!(text.contains("Cancel"));
+        let (_, command) = render_browser_frame(
+            &context,
+            &mut browser,
+            std::slice::from_ref(&entry),
+            0.1,
+            vec![key_event(egui::Key::Enter)],
+        );
+        assert!(matches!(
+            command,
+            Some(BrowserCommand::Mutate(MutationRequest::Rename {
+                new_name,
+                ..
+            })) if new_name.as_str() == "renamed.raw"
+        ));
+
+        browser.clear_transient();
+        browser.begin_new_folder(DirectoryRef::root(entry.reference.source_id.clone()));
+        if let Some(EntryEditor::NewFolder { value, .. }) = browser.editor.as_mut() {
+            *value = "capture".to_owned();
+        }
+        let (output, _) = render_browser_frame(
+            &context,
+            &mut browser,
+            std::slice::from_ref(&entry),
+            0.2,
+            Vec::new(),
+        );
+        let text = accessibility_text(&output);
+        assert!(text.contains("[D] ..."));
+        assert!(text.contains("capture"));
+        assert!(text.contains("OK"));
+        let (_, command) = render_browser_frame(
+            &context,
+            &mut browser,
+            std::slice::from_ref(&entry),
+            0.3,
+            vec![key_event(egui::Key::Enter)],
+        );
+        assert!(matches!(
+            command,
+            Some(BrowserCommand::Mutate(MutationRequest::CreateDirectory {
+                name,
+                ..
+            })) if name.as_str() == "capture"
+        ));
+    }
+
+    #[test]
+    fn browser_toolbar_omits_new_folder_and_keeps_parent_row() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut browser = BrowserState::default();
+        let (output, _) = render_browser_frame(&context, &mut browser, &[], 0.0, Vec::new());
+        let text = accessibility_text(&output);
+        assert!(text.contains("[D] ..."));
+        assert!(!text.contains("New Folder"));
+    }
+
+    #[test]
+    fn empty_browser_context_menu_still_offers_new_folder() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut browser = BrowserState::default();
+        let (output, _) = render_browser_frame(&context, &mut browser, &[], 0.0, Vec::new());
+        let parent_bounds = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree is enabled")
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.label() == Some("[D] ..."))
+                    .then(|| node.bounds())
+                    .flatten()
+            })
+            .expect("parent row is visible");
+        #[allow(clippy::cast_possible_truncation)]
+        let position = egui::pos2(
+            ((parent_bounds.x0 + parent_bounds.x1) * 0.5) as f32,
+            (parent_bounds.y1 + 40.0) as f32,
+        );
+        render_browser_frame(
+            &context,
+            &mut browser,
+            &[],
+            0.1,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Secondary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        let (output, _) = render_browser_frame(
+            &context,
+            &mut browser,
+            &[],
+            0.11,
+            vec![egui::Event::PointerButton {
+                pos: position,
+                button: egui::PointerButton::Secondary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        assert!(accessibility_text(&output).contains("New Folder"));
+    }
     #[test]
     fn delete_and_move_require_explicit_confirmation() {
         let entry = directory("capture");

@@ -1,8 +1,12 @@
 //! RAW 解码参数草稿与安全重新解码面板。
 
+use std::time::{Duration, Instant};
+
 use camera_toolbox_app::RawDecodeParams;
 use camera_toolbox_core::{BayerPattern, RawEncoding, RawSpec};
 use eframe::egui;
+
+const RAW_DECODE_DEBOUNCE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RawStorageUi {
@@ -32,7 +36,7 @@ impl RawEndianUi {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RawInspectorResponse {
-    pub(crate) apply_requested: bool,
+    pub(crate) params_changed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +46,10 @@ pub(crate) struct RawInspectorState {
     bit_depth: String,
     storage: RawStorageUi,
     endian: RawEndianUi,
+    revision: u64,
+    attempted_revision: Option<u64>,
+    submitted_revision: Option<u64>,
+    submit_at: Option<Instant>,
     pending_generation: Option<u64>,
     decode_error: Option<String>,
 }
@@ -54,6 +62,10 @@ impl RawInspectorState {
             bit_depth: spec.bit_depth.to_string(),
             storage: RawStorageUi::UnpackedU16,
             endian: RawEndianUi::Little,
+            revision: 1,
+            attempted_revision: Some(1),
+            submitted_revision: Some(1),
+            submit_at: None,
             pending_generation: None,
             decode_error: None,
         }
@@ -65,6 +77,9 @@ impl RawInspectorState {
         self.bit_depth = spec.bit_depth.to_string();
         self.storage = RawStorageUi::UnpackedU16;
         self.endian = RawEndianUi::Little;
+        self.attempted_revision = Some(self.revision);
+        self.submitted_revision = Some(self.revision);
+        self.submit_at = None;
         self.pending_generation = None;
         self.decode_error = None;
     }
@@ -84,9 +99,33 @@ impl RawInspectorState {
         })
     }
 
+    fn touch(&mut self, now: Instant) {
+        self.revision = self.revision.saturating_add(1);
+        self.submit_at = Some(now + RAW_DECODE_DEBOUNCE);
+        // 草稿变化后旧任务即失效；即使旧结果成功返回，也不能继续显示 pending。
+        self.pending_generation = None;
+        self.decode_error = None;
+    }
+
+    pub(crate) fn submission_due(&self, now: Instant) -> bool {
+        self.submit_at.is_some_and(|deadline| now >= deadline)
+            && self.attempted_revision != Some(self.revision)
+            && self.submitted_revision != Some(self.revision)
+    }
+
     pub(crate) fn mark_submitted(&mut self, generation: u64) {
+        self.attempted_revision = Some(self.revision);
+        self.submitted_revision = Some(self.revision);
+        self.submit_at = None;
         self.pending_generation = Some(generation);
         self.decode_error = None;
+    }
+
+    pub(crate) fn mark_validation_error(&mut self, message: String) {
+        self.attempted_revision = Some(self.revision);
+        self.submit_at = None;
+        self.pending_generation = None;
+        self.decode_error = Some(message);
     }
 
     pub(crate) fn mark_error(&mut self, generation: Option<u64>, message: String) {
@@ -96,6 +135,7 @@ impl RawInspectorState {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn pending_generation(&self) -> Option<u64> {
         self.pending_generation
     }
@@ -108,23 +148,32 @@ pub(crate) fn render_raw_inspector(
 ) -> RawInspectorResponse {
     ui.separator();
     ui.heading("RAW Decode");
+    let mut params_changed = false;
     egui::Grid::new("raw_inspector_grid")
         .num_columns(2)
         .spacing(egui::vec2(12.0, 8.0))
         .show(ui, |ui| {
             ui.label("Width");
-            ui.add(egui::TextEdit::singleline(&mut state.width).id_source("raw_inspector_width"));
+            params_changed |= ui
+                .add(egui::TextEdit::singleline(&mut state.width).id_source("raw_inspector_width"))
+                .changed();
             ui.end_row();
 
             ui.label("Height");
-            ui.add(egui::TextEdit::singleline(&mut state.height).id_source("raw_inspector_height"));
+            params_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut state.height).id_source("raw_inspector_height"),
+                )
+                .changed();
             ui.end_row();
 
             ui.label("Bit depth");
-            ui.add(
-                egui::TextEdit::singleline(&mut state.bit_depth)
-                    .id_source("raw_inspector_bit_depth"),
-            );
+            params_changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut state.bit_depth)
+                        .id_source("raw_inspector_bit_depth"),
+                )
+                .changed();
             ui.end_row();
 
             ui.label("Storage");
@@ -136,6 +185,10 @@ pub(crate) fn render_raw_inspector(
             ui.end_row();
         });
 
+    if params_changed {
+        state.touch(Instant::now());
+        ui.ctx().request_repaint_after(RAW_DECODE_DEBOUNCE);
+    }
     if let Some(error) = &state.decode_error {
         ui.colored_label(egui::Color32::RED, error);
     }
@@ -144,14 +197,12 @@ pub(crate) fn render_raw_inspector(
             ui.spinner();
             ui.label("Re-decoding RAW…");
         });
-    }
-    let apply_requested = ui
-        .add_enabled(can_apply, egui::Button::new("Apply Decode"))
-        .clicked();
-    if !can_apply {
+    } else if can_apply {
+        ui.small("Valid changes are applied automatically.");
+    } else {
         ui.small("当前文档没有可复用的不可变 RAW source。 ");
     }
-    RawInspectorResponse { apply_requested }
+    RawInspectorResponse { params_changed }
 }
 
 fn parse_u32_field(name: &str, value: &str) -> Result<u32, String> {
@@ -208,6 +259,31 @@ mod tests {
         state.mark_error(Some(6), "stale".to_owned());
         assert_eq!(state.pending_generation(), Some(7));
         state.mark_error(Some(7), "latest".to_owned());
+        assert_eq!(state.pending_generation(), None);
+    }
+
+    #[test]
+    fn changed_revision_is_debounced_and_attempted_once() {
+        let now = Instant::now();
+        let mut state = RawInspectorState::new(&spec());
+        state.touch(now);
+
+        assert!(!state.submission_due(now));
+        assert!(state.submission_due(now + RAW_DECODE_DEBOUNCE));
+        state.mark_validation_error("invalid draft".to_owned());
+        assert!(!state.submission_due(now + RAW_DECODE_DEBOUNCE));
+
+        state.touch(now);
+        state.mark_submitted(9);
+        assert_eq!(state.pending_generation(), Some(9));
+        assert!(!state.submission_due(now + RAW_DECODE_DEBOUNCE));
+    }
+
+    #[test]
+    fn editing_invalidates_visible_pending_generation() {
+        let mut state = RawInspectorState::new(&spec());
+        state.mark_submitted(7);
+        state.touch(Instant::now());
         assert_eq!(state.pending_generation(), None);
     }
 }

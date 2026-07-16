@@ -63,6 +63,12 @@ impl ColorEditState {
         self.render_error = Some(message);
     }
 
+    /// RAW frame 替换后保留用户草稿，仅允许当前 revision 重新渲染。
+    pub(crate) fn prepare_for_new_frame(&mut self) {
+        self.submitted_revision = None;
+        self.render_error = None;
+    }
+
     fn link_black_to_r(&mut self) {
         self.params.black_level = CfaQuad::splat(self.params.black_level.r);
     }
@@ -349,5 +355,35 @@ mod tests {
 
         assert_eq!(state.params.black_level, CfaQuad::splat(11));
         assert!((state.params.gain.gb - 1.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn preparing_for_new_frame_preserves_user_draft() {
+        let mut state = ColorEditState::new(&spec());
+        state.params.black_level = CfaQuad {
+            r: 1,
+            gr: 2,
+            gb: 3,
+            b: 4,
+        };
+        state.params.gain.r = 1.25;
+        state.set_gamma_value(1.8);
+        state.link_black = false;
+        state.link_green = false;
+        state.touch();
+        state.mark_submitted();
+        state.mark_error("old frame".to_owned());
+        let revision = state.revision;
+
+        state.prepare_for_new_frame();
+
+        assert_eq!(state.params.black_level.r, 1);
+        assert!((state.params.gain.r - 1.25).abs() < f32::EPSILON);
+        assert_gamma(state.params.display_gamma, 1.8);
+        assert!(!state.link_black);
+        assert!(!state.link_green);
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.submitted_revision, None);
+        assert_eq!(state.render_error, None);
     }
 }

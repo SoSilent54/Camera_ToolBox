@@ -115,7 +115,7 @@ impl RawDocument {
 
     pub(crate) fn install_reinterpreted(
         &mut self,
-        loaded: LoadedRaw,
+        mut loaded: LoadedRaw,
         source: RawSourceHandle,
         interpretation: RawInterpretation,
         decode_generation: u64,
@@ -127,6 +127,7 @@ impl RawDocument {
         } else {
             self.viewer.evict_derived_resources();
         }
+        loaded.inherit_color_edit_from(&mut self.loaded);
         self.loaded = loaded;
         self.raw_source = Some(source);
         self.interpretation = Some(interpretation.clone());

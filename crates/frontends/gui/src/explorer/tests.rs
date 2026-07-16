@@ -112,7 +112,15 @@ fn local_workspace_replaces_old_mount_ui_labels() {
     let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
     let text = visible_text(output);
 
-    for expected in ["Local", "Path", "Open Folder", "Name", "Size"] {
+    for expected in [
+        "Local",
+        "Root",
+        "Path",
+        "Open Folder",
+        "Name",
+        "Size",
+        "[D] ...",
+    ] {
         assert!(text.contains(expected), "missing {expected:?}");
     }
     for removed in ["Sources / Connections", "File Explorer", "Mount Local Path"] {
@@ -131,7 +139,7 @@ fn sftp_mode_exposes_ephemeral_login_fields() {
     let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
     let text = visible_text(output);
 
-    for expected in ["SFTP", "Endpoint", "Password", "Path", "Connect"] {
+    for expected in ["SFTP", "Endpoint", "Password", "Root", "Connect"] {
         assert!(text.contains(expected), "missing {expected:?}");
     }
     for removed in ["Expected host key", "Password slot", "Saved remote"] {
@@ -311,6 +319,73 @@ fn applying_local_root_populates_browser_from_monitor_baseline() {
 }
 
 #[test]
+fn path_navigation_and_parent_row_stay_synchronized() {
+    let directory = temp_directory();
+    fs::create_dir(directory.join("nested")).unwrap();
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut explorer = explorer_state();
+    let mut view = SourceView::try_local(directory.clone()).unwrap();
+    view.loaded_once = true;
+    explorer.local_path = directory.display().to_string();
+    explorer.local_view = Some(view);
+
+    let nested_path = directory.join("nested").display().to_string();
+    assert!(
+        explorer
+            .handle_browser_command(BrowserCommand::NavigatePath(nested_path.clone()), &context)
+            .is_none()
+    );
+    assert_eq!(
+        explorer.local_view.as_ref().unwrap().current_directory,
+        SourcePath::directory("nested").unwrap()
+    );
+    assert_eq!(
+        explorer.local_view.as_ref().unwrap().navigation_path(),
+        nested_path
+    );
+
+    let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
+    assert!(visible_text(output).contains(&nested_path));
+    let (output, _) = render_frame(&context, &mut explorer, 0.01, Vec::new());
+    let position = button_center(&output, "[D] ...");
+    for (time, pressed) in [(0.10, true), (0.11, false), (0.20, true), (0.21, false)] {
+        let (_, action) = render_frame(
+            &context,
+            &mut explorer,
+            time,
+            vec![
+                egui::Event::PointerMoved(position),
+                egui::Event::PointerButton {
+                    pos: position,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                },
+            ],
+        );
+        assert!(action.is_none());
+    }
+
+    let view = explorer.local_view.as_ref().unwrap();
+    assert!(view.current_directory.is_root());
+    assert_eq!(view.navigation_path(), directory.display().to_string());
+    assert!(view.parse_navigation_path("../escape").is_err());
+    assert!(
+        view.parse_navigation_path(&directory.with_extension("outside").display().to_string())
+            .is_err()
+    );
+    assert_eq!(
+        source_path_from_remote("/opt", "/opt/archive/raw").unwrap(),
+        SourcePath::directory("archive/raw").unwrap()
+    );
+    assert!(source_path_from_remote("/opt", "/other").is_err());
+
+    drop(explorer);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn directory_changes_remain_sorted_with_directories_first() {
     let source = FileSourceId::new("source").unwrap();
     let file = |name: &str, kind| FileEntry {
@@ -375,6 +450,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
     let credentials: Arc<dyn CredentialResolver> = memory.clone();
     let transport: Arc<dyn SshTransportFactory> = memory.clone();
     let context = egui::Context::default();
+    context.enable_accesskit();
     let mut explorer = ExplorerState::new(credentials, transport);
     explorer
         .finish_sftp_connection(
@@ -404,6 +480,16 @@ fn sftp_workspace_loads_and_polls_session_source() {
         explorer.poll_monitor(&context);
         std::thread::sleep(Duration::from_millis(5));
     }
+    let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
+    let text = visible_text(output);
+    for expected in ["Root", "Path", "Name", "Size", "[D] ..."] {
+        assert!(text.contains(expected), "missing {expected:?}");
+    }
+    assert_eq!(
+        explorer.sftp_view.as_ref().unwrap().navigation_path(),
+        "/opt"
+    );
+
     let first = explorer.sftp_view.as_ref().unwrap().entries[0]
         .reference
         .clone();

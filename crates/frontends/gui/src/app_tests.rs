@@ -78,6 +78,28 @@ fn app_with_loaded_raw(context: &egui::Context) -> CameraToolboxApp {
 }
 
 #[test]
+fn raw_decode_panel_applies_automatically_without_button() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = app_with_loaded_raw(&context);
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+    let text = output
+        .platform_output
+        .accesskit_update
+        .expect("accessibility tree is enabled")
+        .nodes
+        .into_iter()
+        .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(text.contains("RAW Decode"));
+    assert!(!text.contains("Apply Decode"));
+}
+
+#[test]
 fn color_panel_bottom_gain_remains_reachable_in_short_viewport() {
     let context = egui::Context::default();
     context.enable_accesskit();

@@ -76,6 +76,13 @@ impl LoadedRaw {
         }
     }
 
+    /// 将旧 RAW 的完整颜色草稿迁移到新 frame，并失效仅属于旧 frame 的派生预览。
+    pub(crate) fn inherit_color_edit_from(&mut self, previous: &mut Self) {
+        std::mem::swap(&mut self.color_edit, &mut previous.color_edit);
+        self.color_edit.prepare_for_new_frame();
+        self.installed_color = None;
+    }
+
     pub(crate) fn install_color(
         &mut self,
         context: &egui::Context,
@@ -244,5 +251,74 @@ pub(crate) const fn bayer_label(pattern: BayerPattern) -> &'static str {
         BayerPattern::Grbg => "grbg",
         BayerPattern::Gbrg => "gbrg",
         BayerPattern::Bggr => "bggr",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camera_toolbox_core::{CfaQuad, RawSpec};
+    use std::path::PathBuf;
+
+    fn loaded(generation: u64) -> LoadedRaw {
+        let spec = RawSpec {
+            width: 2,
+            height: 2,
+            bit_depth: 10,
+            bayer: BayerPattern::Rggb,
+        };
+        LoadedRaw {
+            generation,
+            path: PathBuf::from("frame.raw"),
+            frame: Arc::new(RawFrame::new(spec.clone(), vec![1, 2, 3, 4]).unwrap()),
+            roi: Roi {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            stats: None,
+            raw_texture: None,
+            installed_color: None,
+            color_edit: ColorEditState::new(&spec),
+            diagnostics: RawDiagnostics::default(),
+        }
+    }
+
+    #[test]
+    fn inheriting_color_edit_preserves_params_and_invalidates_submission() {
+        let mut previous = loaded(1);
+        previous.color_edit.params.bayer = BayerPattern::Bggr;
+        previous.color_edit.params.black_level = CfaQuad {
+            r: 10,
+            gr: 20,
+            gb: 30,
+            b: 40,
+        };
+        previous.color_edit.params.gain = CfaQuad {
+            r: 1.1,
+            gr: 1.2,
+            gb: 1.3,
+            b: 1.4,
+        };
+        previous.color_edit.params.display_gamma = Some(1.8);
+        previous.color_edit.link_black = false;
+        previous.color_edit.link_green = false;
+        previous.color_edit.touch();
+        previous.color_edit.mark_submitted();
+        let revision = previous.color_edit.revision;
+
+        let mut replacement = loaded(2);
+        replacement.inherit_color_edit_from(&mut previous);
+
+        assert_eq!(replacement.color_edit.params.bayer, BayerPattern::Bggr);
+        assert_eq!(replacement.color_edit.params.black_level.r, 10);
+        assert!((replacement.color_edit.params.gain.b - 1.4).abs() < f32::EPSILON);
+        assert_eq!(replacement.color_edit.params.display_gamma, Some(1.8));
+        assert!(!replacement.color_edit.link_black);
+        assert!(!replacement.color_edit.link_green);
+        assert_eq!(replacement.color_edit.revision, revision);
+        assert_eq!(replacement.color_edit.submitted_revision, None);
+        assert!(replacement.installed_color.is_none());
     }
 }

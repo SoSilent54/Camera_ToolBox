@@ -141,7 +141,7 @@ impl RemoteConnector {
                 .password(true)
                 .desired_width(ui.available_width()),
         );
-        ui.label("Path");
+        ui.label("Root");
         ui.add_enabled(
             enabled && !connecting,
             egui::TextEdit::singleline(&mut self.draft.remote_root)

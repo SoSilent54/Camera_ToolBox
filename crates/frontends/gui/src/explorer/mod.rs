@@ -186,13 +186,30 @@ impl SourceView {
         DirectoryRef::new(self.source_id().clone(), self.current_directory.clone())
     }
 
-    fn location_label(&self) -> String {
-        if self.current_directory.is_root() {
-            self.display_root.clone()
-        } else if self.display_root.ends_with('/') {
-            format!("{}{}", self.display_root, self.current_directory.as_str())
-        } else {
-            format!("{}/{}", self.display_root, self.current_directory.as_str())
+    fn navigation_path(&self) -> String {
+        navigation_path_for(&self.config, &self.current_directory)
+    }
+
+    fn parse_navigation_path(&self, value: &str) -> Result<SourcePath, String> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err("Path must not be empty".to_owned());
+        }
+        match &self.config {
+            MountedSourceConfig::Local { root, .. } => {
+                let candidate = Path::new(value);
+                let relative = if candidate.is_absolute() {
+                    candidate.strip_prefix(root).map_err(|_| {
+                        format!("Path must stay within Local root {}", root.display())
+                    })?
+                } else {
+                    candidate
+                };
+                source_path_from_native(relative)
+            }
+            MountedSourceConfig::Sftp { remote_root, .. } => {
+                source_path_from_remote(remote_root, value)
+            }
         }
     }
 
@@ -221,6 +238,79 @@ impl SourceView {
             root.join(self.current_directory.as_str())
         })
     }
+}
+
+fn navigation_path_for(config: &MountedSourceConfig, path: &SourcePath) -> String {
+    match config {
+        MountedSourceConfig::Local { root, .. } => {
+            if path.is_root() {
+                root.display().to_string()
+            } else {
+                root.join(path.as_str()).display().to_string()
+            }
+        }
+        MountedSourceConfig::Sftp { remote_root, .. } => join_remote_path(remote_root, path),
+    }
+}
+
+fn join_remote_path(remote_root: &str, path: &SourcePath) -> String {
+    let root = if remote_root == "/" {
+        "/"
+    } else {
+        remote_root.trim_end_matches('/')
+    };
+    if path.is_root() {
+        return root.to_owned();
+    }
+    if root == "/" {
+        format!("/{}", path.as_str())
+    } else {
+        format!("{root}/{}", path.as_str())
+    }
+}
+
+fn source_path_from_native(path: &Path) -> Result<SourcePath, String> {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => {
+                let component = component
+                    .to_str()
+                    .ok_or_else(|| "Path contains non-UTF-8 components".to_owned())?;
+                components.push(component);
+            }
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {
+                return Err("Path must stay within the active workspace root".to_owned());
+            }
+        }
+    }
+    SourcePath::directory(components.join("/")).map_err(|error| error.to_string())
+}
+
+fn source_path_from_remote(remote_root: &str, value: &str) -> Result<SourcePath, String> {
+    let root = if remote_root == "/" {
+        "/"
+    } else {
+        remote_root.trim_end_matches('/')
+    };
+    let relative = if value.starts_with('/') {
+        if root == "/" {
+            value.trim_start_matches('/')
+        } else if value == root {
+            ""
+        } else {
+            value
+                .strip_prefix(root)
+                .and_then(|suffix| suffix.strip_prefix('/'))
+                .ok_or_else(|| format!("Path must stay within SFTP root {root}"))?
+        }
+    } else {
+        value
+    };
+    SourcePath::directory(relative).map_err(|error| error.to_string())
 }
 
 struct ActiveDirectoryMonitor {
@@ -373,7 +463,6 @@ impl ExplorerState {
             }
             return action;
         };
-        ui.small(view.location_label());
         if view.loading || self.active_mutation.is_some() {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -405,7 +494,7 @@ impl ExplorerState {
     }
 
     fn render_local_controls(&mut self, context: &egui::Context, ui: &mut egui::Ui, enabled: bool) {
-        ui.label("Path");
+        ui.label("Root");
         let mut picked = None;
         let mut apply_now = false;
         ui.add_enabled_ui(enabled, |ui| {
@@ -419,11 +508,8 @@ impl ExplorerState {
                     self.local_apply_at = Some(Instant::now() + LOCAL_PATH_DEBOUNCE);
                     context.request_repaint_after(LOCAL_PATH_DEBOUNCE);
                 }
-                if response.has_focus()
-                    && ui.input_mut(|input| {
-                        input.consume_key(egui::Modifiers::NONE, egui::Key::Enter)
-                    })
-                {
+                let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
+                if (response.has_focus() || response.lost_focus()) && enter {
                     apply_now = true;
                 }
                 if ui.button("Open Folder").clicked() {
@@ -470,6 +556,8 @@ impl ExplorerState {
         let browser = &mut self.browser;
         match self.mode {
             WorkspaceMode::Local => {
+                let view = self.local_view.as_mut()?;
+                let navigation_path = view.navigation_path();
                 let SourceView {
                     config,
                     file_system,
@@ -477,12 +565,13 @@ impl ExplorerState {
                     selected,
                     entries,
                     ..
-                } = self.local_view.as_mut()?;
+                } = view;
                 browser.render(
                     context,
                     ui,
                     config.source_id(),
                     current_directory,
+                    &navigation_path,
                     entries,
                     selected,
                     file_system.capabilities(),
@@ -491,6 +580,8 @@ impl ExplorerState {
             }
             #[cfg(feature = "platform-ssh")]
             WorkspaceMode::Sftp => {
+                let view = self.sftp_view.as_mut()?;
+                let navigation_path = view.navigation_path();
                 let SourceView {
                     config,
                     file_system,
@@ -498,12 +589,13 @@ impl ExplorerState {
                     selected,
                     entries,
                     ..
-                } = self.sftp_view.as_mut()?;
+                } = view;
                 browser.render(
                     context,
                     ui,
                     config.source_id(),
                     current_directory,
+                    &navigation_path,
                     entries,
                     selected,
                     file_system.capabilities(),
@@ -525,6 +617,20 @@ impl ExplorerState {
                     .and_then(|view| view.current_directory.parent())
                 {
                     self.navigate_to(parent, context);
+                }
+                None
+            }
+            BrowserCommand::NavigatePath(value) => {
+                let parsed = self
+                    .active_view()
+                    .ok_or_else(|| "No active workspace source".to_owned())
+                    .and_then(|view| view.parse_navigation_path(&value));
+                match parsed {
+                    Ok(path) => {
+                        self.browser.confirm_navigation();
+                        self.navigate_to(path, context);
+                    }
+                    Err(error) => self.browser.set_navigation_error(error),
                 }
                 None
             }
