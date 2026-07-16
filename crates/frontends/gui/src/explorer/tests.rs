@@ -139,10 +139,10 @@ fn sftp_mode_exposes_ephemeral_login_fields() {
     let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
     let text = visible_text(output);
 
-    for expected in ["SFTP", "Endpoint", "Password", "Root", "Connect"] {
+    for expected in ["SFTP", "Endpoint", "Password", "Connect"] {
         assert!(text.contains(expected), "missing {expected:?}");
     }
-    for removed in ["Expected host key", "Password slot", "Saved remote"] {
+    for removed in ["Root", "Expected host key", "Password slot", "Saved remote"] {
         assert!(!text.contains(removed), "unexpected {removed:?}");
     }
 }
@@ -375,11 +375,19 @@ fn path_navigation_and_parent_row_stay_synchronized() {
         view.parse_navigation_path(&directory.with_extension("outside").display().to_string())
             .is_err()
     );
-    assert_eq!(
-        source_path_from_remote("/opt", "/opt/archive/raw").unwrap(),
-        SourcePath::directory("archive/raw").unwrap()
-    );
-    assert!(source_path_from_remote("/opt", "/other").is_err());
+    assert_eq!(source_path_from_remote("/").unwrap(), SourcePath::root());
+    for (absolute, relative) in [
+        ("/opt/archive/raw", "opt/archive/raw"),
+        ("/home/root", "home/root"),
+        ("/tmp", "tmp"),
+    ] {
+        assert_eq!(
+            source_path_from_remote(absolute).unwrap(),
+            SourcePath::directory(relative).unwrap()
+        );
+    }
+    assert!(source_path_from_remote("opt/relative").is_err());
+    assert!(source_path_from_remote("/opt/../etc").is_err());
 
     drop(explorer);
     fs::remove_dir_all(directory).unwrap();
@@ -437,6 +445,33 @@ fn wait_for_mutation(explorer: &mut ExplorerState, context: &egui::Context) {
         "SFTP mutation timed out"
     );
 }
+#[cfg(feature = "platform-ssh")]
+fn wait_for_sftp_directory(
+    explorer: &mut ExplorerState,
+    context: &egui::Context,
+    expected: &SourcePath,
+) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    loop {
+        explorer.poll_monitor(context);
+        let ready = explorer.sftp_view.as_ref().is_some_and(|view| {
+            &view.current_directory == expected && view.loaded_once && !view.loading
+        });
+        if ready || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let view = explorer.sftp_view.as_ref().unwrap();
+    assert_eq!(&view.current_directory, expected);
+    assert!(view.loaded_once, "SFTP directory did not load");
+    assert!(!view.loading, "SFTP directory remained loading");
+    assert!(
+        view.error.is_none(),
+        "SFTP directory error: {:?}",
+        view.error
+    );
+}
 
 #[cfg(feature = "platform-ssh")]
 #[test]
@@ -446,6 +481,10 @@ fn sftp_workspace_loads_and_polls_session_source() {
     memory.insert_file(
         "/opt/first.raw",
         remote_file("/opt/first.raw", &[1, 2, 3, 4]),
+    );
+    memory.insert_file(
+        "/tmp/second.raw",
+        remote_file("/tmp/second.raw", &[5, 6, 7, 8]),
     );
     let credentials: Arc<dyn CredentialResolver> = memory.clone();
     let transport: Arc<dyn SshTransportFactory> = memory.clone();
@@ -465,29 +504,87 @@ fn sftp_workspace_loads_and_polls_session_source() {
                     slot_id: "test".to_owned(),
                 },
             },
-            "/opt".to_owned(),
             &context,
         )
         .unwrap();
 
-    let baseline_deadline = Instant::now() + Duration::from_secs(1);
-    while !explorer
-        .sftp_view
-        .as_ref()
-        .is_some_and(|view| view.loaded_once)
-        && Instant::now() < baseline_deadline
-    {
-        explorer.poll_monitor(&context);
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
-    let text = visible_text(output);
-    for expected in ["Root", "Path", "Name", "Size", "[D] ..."] {
-        assert!(text.contains(expected), "missing {expected:?}");
-    }
+    assert_eq!(explorer.sftp_view.as_ref().unwrap().navigation_path(), "/");
+    assert!(
+        explorer
+            .handle_browser_command(BrowserCommand::NavigatePath("/opt".to_owned()), &context)
+            .is_none()
+    );
+    assert_eq!(
+        explorer.sftp_view.as_ref().unwrap().current_directory,
+        SourcePath::directory("opt").unwrap()
+    );
     assert_eq!(
         explorer.sftp_view.as_ref().unwrap().navigation_path(),
         "/opt"
+    );
+
+    wait_for_sftp_directory(
+        &mut explorer,
+        &context,
+        &SourcePath::directory("opt").unwrap(),
+    );
+    let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
+    let text = visible_text(output);
+    for expected in ["Path", "Name", "Size", "[D] ..."] {
+        assert!(text.contains(expected), "missing {expected:?}");
+    }
+    assert!(!text.contains("Root"));
+    assert_eq!(
+        explorer.sftp_view.as_ref().unwrap().navigation_path(),
+        "/opt"
+    );
+    assert_eq!(
+        explorer
+            .sftp_view
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["first.raw"]
+    );
+
+    assert!(
+        explorer
+            .handle_browser_command(BrowserCommand::NavigatePath("/tmp".to_owned()), &context)
+            .is_none()
+    );
+    wait_for_sftp_directory(
+        &mut explorer,
+        &context,
+        &SourcePath::directory("tmp").unwrap(),
+    );
+    assert_eq!(
+        explorer.sftp_view.as_ref().unwrap().navigation_path(),
+        "/tmp"
+    );
+    assert_eq!(
+        explorer
+            .sftp_view
+            .as_ref()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["second.raw"]
+    );
+
+    assert!(
+        explorer
+            .handle_browser_command(BrowserCommand::NavigatePath("/opt".to_owned()), &context)
+            .is_none()
+    );
+    wait_for_sftp_directory(
+        &mut explorer,
+        &context,
+        &SourcePath::directory("opt").unwrap(),
     );
 
     let first = explorer.sftp_view.as_ref().unwrap().entries[0]
@@ -502,7 +599,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
     let file_system = Arc::clone(&explorer.sftp_view.as_ref().unwrap().file_system);
     explorer.begin_mutation(
         MutationRequest::CreateDirectory {
-            parent: DirectoryRef::root(source.clone()),
+            parent: DirectoryRef::new(source.clone(), SourcePath::directory("opt").unwrap()),
             name: EntryName::new("archive").unwrap(),
         },
         &context,
@@ -520,7 +617,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
     wait_for_mutation(&mut explorer, &context);
     assert!(memory.contains_path("/opt/renamed.raw"));
 
-    let renamed = FileRef::new(source.clone(), SourcePath::new("renamed.raw").unwrap());
+    let renamed = FileRef::new(source.clone(), SourcePath::new("opt/renamed.raw").unwrap());
     let renamed_entry = file_system
         .stat(&renamed, &FsControl::with_timeout(Duration::from_secs(1)))
         .unwrap();
@@ -529,7 +626,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
             entry: renamed_entry,
             destination: DirectoryRef::new(
                 source.clone(),
-                SourcePath::directory("archive").unwrap(),
+                SourcePath::directory("opt/archive").unwrap(),
             ),
         },
         &context,
@@ -539,7 +636,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
 
     let moved = FileRef::new(
         source.clone(),
-        SourcePath::new("archive/renamed.raw").unwrap(),
+        SourcePath::new("opt/archive/renamed.raw").unwrap(),
     );
     let moved_entry = file_system
         .stat(&moved, &FsControl::with_timeout(Duration::from_secs(1)))
@@ -548,7 +645,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
     wait_for_mutation(&mut explorer, &context);
     assert!(!memory.contains_path("/opt/archive/renamed.raw"));
 
-    let archive = FileRef::new(source, SourcePath::new("archive").unwrap());
+    let archive = FileRef::new(source, SourcePath::new("opt/archive").unwrap());
     let archive_entry = file_system
         .stat(&archive, &FsControl::with_timeout(Duration::from_secs(1)))
         .unwrap();

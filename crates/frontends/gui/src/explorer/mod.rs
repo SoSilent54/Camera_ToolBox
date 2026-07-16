@@ -114,11 +114,10 @@ impl SourceView {
     #[cfg(feature = "platform-ssh")]
     fn try_sftp(
         connection: RemoteConnectionConfig,
-        remote_root: String,
         credentials: Arc<dyn CredentialResolver>,
         transport: Arc<dyn SshTransportFactory>,
     ) -> Result<Self, String> {
-        let source_id = sftp_source_id_for_mount(&connection.id, &remote_root)?;
+        let source_id = sftp_source_id_for_mount(&connection.id, remote::SFTP_NAMESPACE_ROOT)?;
         let credential_ref = match &connection.authentication {
             RemoteAuthentication::Password { slot_id } => format!("session:{slot_id}"),
             RemoteAuthentication::PrivateKeyFile { path } => {
@@ -142,7 +141,7 @@ impl SourceView {
         let file_system: Arc<dyn FileSystem> = Arc::new(
             SftpFileSystem::new(
                 source_id.clone(),
-                remote_root.clone(),
+                remote::SFTP_NAMESPACE_ROOT,
                 target,
                 credential_ref,
                 credentials,
@@ -154,19 +153,12 @@ impl SourceView {
             config: MountedSourceConfig::Sftp {
                 source_id,
                 connection_id: connection.id,
-                remote_root: remote_root.clone(),
+                remote_root: remote::SFTP_NAMESPACE_ROOT.to_owned(),
             },
-            display_root: if remote_root == "/" {
-                format!(
-                    "sftp://{}@{}:{}/",
-                    connection.username, connection.host, connection.port
-                )
-            } else {
-                format!(
-                    "sftp://{}@{}:{}{}",
-                    connection.username, connection.host, connection.port, remote_root
-                )
-            },
+            display_root: format!(
+                "sftp://{}@{}:{}/",
+                connection.username, connection.host, connection.port
+            ),
             file_system,
             current_directory: SourcePath::root(),
             selected: None,
@@ -207,9 +199,7 @@ impl SourceView {
                 };
                 source_path_from_native(relative)
             }
-            MountedSourceConfig::Sftp { remote_root, .. } => {
-                source_path_from_remote(remote_root, value)
-            }
+            MountedSourceConfig::Sftp { .. } => source_path_from_remote(value),
         }
     }
 
@@ -290,27 +280,12 @@ fn source_path_from_native(path: &Path) -> Result<SourcePath, String> {
     SourcePath::directory(components.join("/")).map_err(|error| error.to_string())
 }
 
-fn source_path_from_remote(remote_root: &str, value: &str) -> Result<SourcePath, String> {
-    let root = if remote_root == "/" {
-        "/"
-    } else {
-        remote_root.trim_end_matches('/')
-    };
-    let relative = if value.starts_with('/') {
-        if root == "/" {
-            value.trim_start_matches('/')
-        } else if value == root {
-            ""
-        } else {
-            value
-                .strip_prefix(root)
-                .and_then(|suffix| suffix.strip_prefix('/'))
-                .ok_or_else(|| format!("Path must stay within SFTP root {root}"))?
-        }
-    } else {
-        value
-    };
-    SourcePath::directory(relative).map_err(|error| error.to_string())
+fn source_path_from_remote(value: &str) -> Result<SourcePath, String> {
+    let value = value.trim();
+    if !value.starts_with('/') {
+        return Err("SFTP Path must be an absolute path".to_owned());
+    }
+    SourcePath::directory(value.trim_start_matches('/')).map_err(|error| error.to_string())
 }
 
 struct ActiveDirectoryMonitor {
@@ -680,12 +655,10 @@ impl ExplorerState {
     pub(crate) fn finish_sftp_connection(
         &mut self,
         connection: RemoteConnectionConfig,
-        remote_root: String,
         context: &egui::Context,
     ) -> Result<(), String> {
         let view = SourceView::try_sftp(
             connection,
-            remote_root.clone(),
             Arc::clone(&self.credentials),
             Arc::clone(&self.transport),
         )?;
@@ -695,7 +668,7 @@ impl ExplorerState {
         self.mode = WorkspaceMode::Sftp;
         self.browser.clear_transient();
         self.global_error = None;
-        self.remote.mark_connected(&remote_root);
+        self.remote.mark_connected();
         self.start_active_monitor(context);
         Ok(())
     }

@@ -1078,7 +1078,6 @@ impl CameraToolboxApp {
             ExplorerAction::ActivateSftp(RemoteConnectionCommit {
                 config,
                 session_password,
-                remote_root,
             }) => {
                 let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
                     &config.authentication
@@ -1105,10 +1104,7 @@ impl CameraToolboxApp {
                     ));
                     return;
                 }
-                if let Err(error) =
-                    self.explorer
-                        .finish_sftp_connection(config, remote_root, context)
-                {
+                if let Err(error) = self.explorer.finish_sftp_connection(config, context) {
                     tracing::error!(
                         operation = "explorer_activate_sftp",
                         error = %error,

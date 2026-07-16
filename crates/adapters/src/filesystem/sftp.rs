@@ -693,6 +693,29 @@ mod tests {
     }
 
     #[test]
+    fn canonical_path_outside_mounted_root_is_permission_denied() {
+        let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
+        memory.allow_credential("session:test");
+        memory.insert_directory("/opt");
+        memory.set_canonical_path("/opt/link", "/etc");
+        let fs = filesystem(memory, HOST_KEY);
+        let error = fs
+            .list(
+                &DirectoryRef::new(
+                    FileSourceId::new("remote-test").unwrap(),
+                    SourcePath::directory("link").unwrap(),
+                ),
+                ListPageRequest::default(),
+                &control(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            FileSystemError::PermissionDenied(reason) if reason.contains("escapes mounted SFTP root")
+        ));
+    }
+
+    #[test]
     fn changed_host_key_is_hard_blocked() {
         let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
         memory.allow_credential("session:test");

@@ -22,26 +22,17 @@ use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 const REMOTE_CONNECT_WATCHDOG: Duration = Duration::from_secs(30);
 
+pub(super) const SFTP_NAMESPACE_ROOT: &str = "/";
+
 pub(crate) struct RemoteConnectionCommit {
     pub(crate) config: RemoteConnectionConfig,
     pub(crate) session_password: SecretString,
-    pub(crate) remote_root: String,
 }
 
+#[derive(Default)]
 struct RemoteConnectionDraft {
     endpoint: String,
     password: SecretBox<String>,
-    remote_root: String,
-}
-
-impl Default for RemoteConnectionDraft {
-    fn default() -> Self {
-        Self {
-            endpoint: String::new(),
-            password: SecretBox::default(),
-            remote_root: "/opt".to_owned(),
-        }
-    }
 }
 
 impl RemoteConnectionDraft {
@@ -50,7 +41,6 @@ impl RemoteConnectionDraft {
         if self.password.expose_secret().is_empty() {
             return Err("Password must not be empty".to_owned());
         }
-        let remote_root = validate_remote_root(&self.remote_root)?;
         let id = remote_connection_id(&endpoint.host, endpoint.port, &endpoint.username)?;
         let slot_id = format!("credential-{}", id.as_str());
         Ok(RemoteConnectRequest {
@@ -60,7 +50,6 @@ impl RemoteConnectionDraft {
             port: endpoint.port,
             username: endpoint.username,
             password: SecretString::from(self.password.expose_secret().clone()),
-            remote_root,
         })
     }
 
@@ -82,7 +71,6 @@ struct RemoteConnectRequest {
     port: u16,
     username: String,
     password: SecretString,
-    remote_root: String,
 }
 
 struct RemoteConnectResult {
@@ -141,13 +129,6 @@ impl RemoteConnector {
                 .password(true)
                 .desired_width(ui.available_width()),
         );
-        ui.label("Root");
-        ui.add_enabled(
-            enabled && !connecting,
-            egui::TextEdit::singleline(&mut self.draft.remote_root)
-                .hint_text("/opt")
-                .desired_width(ui.available_width()),
-        );
         ui.horizontal(|ui| {
             if ui
                 .add_enabled(enabled && !connecting, egui::Button::new("Connect"))
@@ -179,10 +160,9 @@ impl RemoteConnector {
         completed
     }
 
-    pub(super) fn mark_connected(&mut self, remote_root: &str) {
+    pub(super) fn mark_connected(&mut self) {
         self.draft.clear_password();
-        self.draft.remote_root = remote_root.to_owned();
-        self.status = Some(format!("Connected; browsing {remote_root}"));
+        self.status = Some("Connected; browsing server filesystem".to_owned());
         self.error = None;
     }
 
@@ -319,8 +299,10 @@ fn run_remote_connect(
         )
         .map_err(|error| error.to_string())?;
     session
-        .canonicalize(&request.remote_root, &control)
-        .map_err(|error| format!("SSH login succeeded, but SFTP path is unavailable: {error}"))?;
+        .canonicalize(SFTP_NAMESPACE_ROOT, &control)
+        .map_err(|error| {
+            format!("SSH login succeeded, but the SFTP namespace is unavailable: {error}")
+        })?;
 
     let config = RemoteConnectionConfig {
         id: request.id,
@@ -337,7 +319,6 @@ fn run_remote_connect(
     Ok(RemoteConnectionCommit {
         config,
         session_password: password_for_session,
-        remote_root: request.remote_root,
     })
 }
 
@@ -408,21 +389,6 @@ fn parse_port(value: &str) -> Result<u16, String> {
     }
 }
 
-fn validate_remote_root(value: &str) -> Result<String, String> {
-    let value = value.trim();
-    if !value.starts_with('/')
-        || value.contains('\0')
-        || value.split('/').any(|component| component == "..")
-    {
-        return Err("SFTP path must be a safe absolute path".to_owned());
-    }
-    Ok(if value.len() > 1 {
-        value.trim_end_matches('/').to_owned()
-    } else {
-        "/".to_owned()
-    })
-}
-
 fn remote_connection_id(
     host: &str,
     port: u16,
@@ -476,18 +442,9 @@ mod tests {
     }
 
     #[test]
-    fn validates_safe_absolute_remote_root() {
-        assert_eq!(
-            validate_remote_root("/opt/capture/").unwrap(),
-            "/opt/capture"
-        );
-        assert!(validate_remote_root("relative").is_err());
-        assert!(validate_remote_root("/opt/../etc").is_err());
-    }
-    #[test]
-    fn connector_uses_process_only_password_without_host_key_pin() {
+    fn connector_uses_server_namespace_root_and_process_only_password() {
         let memory = Arc::new(MemorySshTransport::new("memory-host-key"));
-        memory.insert_directory("/opt");
+        memory.insert_directory(SFTP_NAMESPACE_ROOT);
         let transport: Arc<dyn SshTransportFactory> = memory;
         let context = egui::Context::default();
         let mut connector = RemoteConnector::new(transport);
@@ -497,7 +454,6 @@ mod tests {
             .password
             .expose_secret_mut()
             .push_str("memory-test-secret");
-        connector.draft.remote_root = "/opt".to_owned();
 
         connector.start(&context);
         let deadline = Instant::now() + Duration::from_secs(1);
@@ -509,7 +465,6 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
 
-        assert_eq!(commit.remote_root, "/opt");
         assert!(commit.config.expected_host_key.is_none());
         assert!(matches!(
             commit.config.authentication,
