@@ -14,7 +14,7 @@ use std::{
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use browser::{BrowserCommand, BrowserState, MutationRequest};
@@ -37,7 +37,6 @@ use eframe::egui;
 #[cfg(feature = "platform-ssh")]
 pub(crate) use remote::RemoteConnectionCommit;
 
-const LOCAL_PATH_DEBOUNCE: Duration = Duration::from_millis(300);
 const MUTATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MONITOR_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -76,7 +75,7 @@ pub(crate) struct MountBinding {
 
 struct SourceView {
     config: MountedSourceConfig,
-    display_root: String,
+    display_base: String,
     file_system: Arc<dyn FileSystem>,
     current_directory: SourcePath,
     selected: Option<SourcePath>,
@@ -88,20 +87,33 @@ struct SourceView {
 }
 
 impl SourceView {
-    fn try_local(root: PathBuf) -> Result<Self, String> {
-        let source_id = local_source_id_for_root(&root)?;
+    fn try_local(path: PathBuf) -> Result<Self, String> {
+        let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
+        if !path.is_dir() {
+            return Err(format!("{} is not a directory", path.display()));
+        }
+        let namespace_root = local_namespace_root(&path)?;
+        let source_id = local_source_id_for_root(&namespace_root)?;
         let file_system = Arc::new(
-            LocalFileSystem::new(source_id.clone(), &root).map_err(|error| error.to_string())?,
+            LocalFileSystem::new(source_id.clone(), &namespace_root)
+                .map_err(|error| error.to_string())?,
         );
         let root = file_system.root().to_path_buf();
+        let current_directory =
+            source_path_from_native(path.strip_prefix(&root).map_err(|_| {
+                format!(
+                    "Path is outside its filesystem namespace: {}",
+                    path.display()
+                )
+            })?)?;
         Ok(Self {
             config: MountedSourceConfig::Local {
                 source_id,
                 root: root.clone(),
             },
-            display_root: root.display().to_string(),
+            display_base: root.display().to_string(),
             file_system,
-            current_directory: SourcePath::root(),
+            current_directory,
             selected: None,
             entries: Vec::new(),
             loading: false,
@@ -155,7 +167,7 @@ impl SourceView {
                 connection_id: connection.id,
                 remote_root: remote::SFTP_NAMESPACE_ROOT.to_owned(),
             },
-            display_root: format!(
+            display_base: format!(
                 "sftp://{}@{}:{}/",
                 connection.username, connection.host, connection.port
             ),
@@ -182,35 +194,14 @@ impl SourceView {
         navigation_path_for(&self.config, &self.current_directory)
     }
 
-    fn parse_navigation_path(&self, value: &str) -> Result<SourcePath, String> {
-        let value = value.trim();
-        if value.is_empty() {
-            return Err("Path must not be empty".to_owned());
-        }
-        match &self.config {
-            MountedSourceConfig::Local { root, .. } => {
-                let candidate = Path::new(value);
-                let relative = if candidate.is_absolute() {
-                    candidate.strip_prefix(root).map_err(|_| {
-                        format!("Path must stay within Local root {}", root.display())
-                    })?
-                } else {
-                    candidate
-                };
-                source_path_from_native(relative)
-            }
-            MountedSourceConfig::Sftp { .. } => source_path_from_remote(value),
-        }
-    }
-
     fn display_path(&self, path: &SourcePath) -> PathBuf {
         if path.is_root() {
-            return PathBuf::from(&self.display_root);
+            return PathBuf::from(&self.display_base);
         }
-        if self.display_root.ends_with('/') {
-            PathBuf::from(format!("{}{}", self.display_root, path.as_str()))
+        if self.display_base.ends_with('/') {
+            PathBuf::from(format!("{}{}", self.display_base, path.as_str()))
         } else {
-            PathBuf::from(format!("{}/{}", self.display_root, path.as_str()))
+            PathBuf::from(format!("{}/{}", self.display_base, path.as_str()))
         }
     }
 
@@ -257,6 +248,44 @@ fn join_remote_path(remote_root: &str, path: &SourcePath) -> String {
     } else {
         format!("{root}/{}", path.as_str())
     }
+}
+
+fn local_path_from_native(value: &str) -> Result<PathBuf, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Local Path must not be empty".to_owned());
+    }
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err("Local Path must be an absolute path".to_owned());
+    }
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(component) => {
+                let component = component
+                    .to_str()
+                    .ok_or_else(|| "Path contains non-UTF-8 components".to_owned())?;
+                if component.chars().any(char::is_control) {
+                    return Err("Path contains control characters".to_owned());
+                }
+            }
+            std::path::Component::ParentDir => {
+                return Err("Local Path must not contain parent traversal".to_owned());
+            }
+            std::path::Component::CurDir
+            | std::path::Component::RootDir
+            | std::path::Component::Prefix(_) => {}
+        }
+    }
+    Ok(path)
+}
+
+fn local_namespace_root(path: &Path) -> Result<PathBuf, String> {
+    path.ancestors()
+        .last()
+        .filter(|root| root.is_absolute())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("Path has no filesystem namespace root: {}", path.display()))
 }
 
 fn source_path_from_native(path: &Path) -> Result<SourcePath, String> {
@@ -307,8 +336,6 @@ struct ActiveMutation {
 
 pub(crate) struct ExplorerState {
     mode: WorkspaceMode,
-    local_path: String,
-    local_apply_at: Option<Instant>,
     local_view: Option<SourceView>,
     #[cfg(feature = "platform-ssh")]
     sftp_view: Option<SourceView>,
@@ -341,8 +368,6 @@ impl ExplorerState {
         let (mutation_sender, mutation_receiver) = mpsc::channel();
         Self {
             mode: WorkspaceMode::Local,
-            local_path: default_local_path(),
-            local_apply_at: None,
             local_view: None,
             sftp_view: None,
             active_monitor: None,
@@ -363,8 +388,6 @@ impl ExplorerState {
         let (mutation_sender, mutation_receiver) = mpsc::channel();
         Self {
             mode: WorkspaceMode::Local,
-            local_path: default_local_path(),
-            local_apply_at: None,
             local_view: None,
             active_monitor: None,
             browser: BrowserState::default(),
@@ -380,11 +403,7 @@ impl ExplorerState {
         if self.local_view.is_some() {
             return;
         }
-        let path = PathBuf::from(self.local_path.trim());
-        if path.as_os_str().is_empty() {
-            return;
-        }
-        if let Err(error) = self.activate_local_root(path, context) {
+        if let Err(error) = self.activate_local_path(default_local_path(), context) {
             self.global_error = Some(format!("Open local path failed: {error}"));
         }
     }
@@ -415,16 +434,11 @@ impl ExplorerState {
         }
 
         let mut action = None;
-        match self.mode {
-            WorkspaceMode::Local => {
-                self.render_local_controls(context, ui, controls_enabled);
-            }
-            #[cfg(feature = "platform-ssh")]
-            WorkspaceMode::Sftp => {
-                if let Some(commit) = self.remote.render(context, ui, controls_enabled) {
-                    action = Some(ExplorerAction::ActivateSftp(commit));
-                }
-            }
+        #[cfg(feature = "platform-ssh")]
+        if self.mode == WorkspaceMode::Sftp
+            && let Some(commit) = self.remote.render(context, ui, controls_enabled)
+        {
+            action = Some(ExplorerAction::ActivateSftp(commit));
         }
 
         if let Some(error) = &self.global_error {
@@ -466,60 +480,6 @@ impl ExplorerState {
             action = Some(open_action);
         }
         action
-    }
-
-    fn render_local_controls(&mut self, context: &egui::Context, ui: &mut egui::Ui, enabled: bool) {
-        ui.label("Root");
-        let mut picked = None;
-        let mut apply_now = false;
-        ui.add_enabled_ui(enabled, |ui| {
-            ui.horizontal(|ui| {
-                let response = ui.add(
-                    egui::TextEdit::singleline(&mut self.local_path)
-                        .hint_text("/path/to/local/folder")
-                        .desired_width((ui.available_width() - 92.0).max(80.0)),
-                );
-                if response.changed() {
-                    self.local_apply_at = Some(Instant::now() + LOCAL_PATH_DEBOUNCE);
-                    context.request_repaint_after(LOCAL_PATH_DEBOUNCE);
-                }
-                let enter = ui.input(|input| input.key_pressed(egui::Key::Enter));
-                if (response.has_focus() || response.lost_focus()) && enter {
-                    apply_now = true;
-                }
-                if ui.button("Open Folder").clicked() {
-                    picked = rfd::FileDialog::new()
-                        .set_title("Open Local Folder")
-                        .pick_folder();
-                }
-            });
-        });
-        if !enabled {
-            return;
-        }
-
-        if let Some(path) = picked {
-            self.local_path = path.display().to_string();
-            apply_now = true;
-        }
-        if self
-            .local_apply_at
-            .is_some_and(|deadline| Instant::now() >= deadline)
-        {
-            apply_now = true;
-        }
-        if !apply_now {
-            return;
-        }
-        self.local_apply_at = None;
-        let path = PathBuf::from(self.local_path.trim());
-        if path.as_os_str().is_empty() {
-            self.global_error = Some("Local path must not be empty".to_owned());
-            return;
-        }
-        if let Err(error) = self.activate_local_root(path, context) {
-            self.global_error = Some(format!("Open local path failed: {error}"));
-        }
     }
 
     fn render_browser(
@@ -596,15 +556,20 @@ impl ExplorerState {
                 None
             }
             BrowserCommand::NavigatePath(value) => {
-                let parsed = self
-                    .active_view()
-                    .ok_or_else(|| "No active workspace source".to_owned())
-                    .and_then(|view| view.parse_navigation_path(&value));
-                match parsed {
-                    Ok(path) => {
-                        self.browser.confirm_navigation();
-                        self.navigate_to(path, context);
+                let result = match self.mode {
+                    WorkspaceMode::Local => local_path_from_native(&value)
+                        .and_then(|path| self.activate_local_path(path, context)),
+                    #[cfg(feature = "platform-ssh")]
+                    WorkspaceMode::Sftp => {
+                        let parsed = self
+                            .active_view()
+                            .ok_or_else(|| "No active workspace source".to_owned())
+                            .and_then(|_| source_path_from_remote(&value));
+                        parsed.map(|path| self.navigate_to(path, context))
                     }
+                };
+                match result {
+                    Ok(()) => self.browser.confirm_navigation(),
                     Err(error) => self.browser.set_navigation_error(error),
                 }
                 None
@@ -633,15 +598,14 @@ impl ExplorerState {
         self.start_active_monitor(context);
     }
 
-    fn activate_local_root(
+    fn activate_local_path(
         &mut self,
-        root: PathBuf,
+        path: PathBuf,
         context: &egui::Context,
     ) -> Result<(), String> {
-        let view = SourceView::try_local(root)?;
+        let view = SourceView::try_local(path)?;
         self.cancel_active_mutation();
         self.stop_active_monitor();
-        self.local_path = view.display_root.clone();
         self.local_view = Some(view);
         self.browser.clear_transient();
         self.global_error = None;
@@ -987,10 +951,8 @@ fn sort_entries(entries: &mut [FileEntry]) {
     });
 }
 
-fn default_local_path() -> String {
-    std::env::current_dir()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default()
+fn default_local_path() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"))
 }
 
 fn local_source_id_for_root(root: &Path) -> Result<FileSourceId, String> {

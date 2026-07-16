@@ -112,18 +112,16 @@ fn local_workspace_replaces_old_mount_ui_labels() {
     let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
     let text = visible_text(output);
 
-    for expected in [
-        "Local",
-        "Root",
-        "Path",
-        "Open Folder",
-        "Name",
-        "Size",
-        "[D] ...",
-    ] {
+    for expected in ["Local", "Path", "Name", "Size", "[D] ..."] {
         assert!(text.contains(expected), "missing {expected:?}");
     }
-    for removed in ["Sources / Connections", "File Explorer", "Mount Local Path"] {
+    for removed in [
+        "Root",
+        "Open Folder",
+        "Sources / Connections",
+        "File Explorer",
+        "Mount Local Path",
+    ] {
         assert!(!text.contains(removed), "unexpected {removed:?}");
     }
 }
@@ -169,7 +167,6 @@ fn double_click_file_emits_one_open_action() {
         },
     }];
     view.loaded_once = true;
-    explorer.local_path = directory.display().to_string();
     explorer.local_view = Some(view);
 
     let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
@@ -247,7 +244,6 @@ fn file_context_menu_exposes_required_commands() {
         },
     }];
     view.loaded_once = true;
-    explorer.local_path = directory.display().to_string();
     explorer.local_view = Some(view);
 
     let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
@@ -289,14 +285,14 @@ fn file_context_menu_exposes_required_commands() {
 }
 
 #[test]
-fn applying_local_root_populates_browser_from_monitor_baseline() {
+fn applying_local_path_populates_browser_from_monitor_baseline() {
     let directory = temp_directory();
     fs::write(directory.join("fresh.raw"), [1_u8, 2, 3, 4]).unwrap();
     let context = egui::Context::default();
     let mut explorer = explorer_state();
 
     explorer
-        .activate_local_root(directory.clone(), &context)
+        .activate_local_path(directory.clone(), &context)
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
     while !explorer
@@ -312,23 +308,44 @@ fn applying_local_root_populates_browser_from_monitor_baseline() {
     let view = explorer.local_view.as_ref().unwrap();
     assert_eq!(view.entries.len(), 1);
     assert_eq!(view.entries[0].name.as_str(), "fresh.raw");
-    assert_eq!(explorer.local_path, directory.display().to_string());
+    assert_eq!(view.navigation_path(), directory.display().to_string());
 
     drop(explorer);
     fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
-fn path_navigation_and_parent_row_stay_synchronized() {
+fn local_absolute_path_navigation_is_unrestricted_and_synchronized() {
     let directory = temp_directory();
+    let sibling = temp_directory();
     fs::create_dir(directory.join("nested")).unwrap();
     let context = egui::Context::default();
     context.enable_accesskit();
     let mut explorer = explorer_state();
-    let mut view = SourceView::try_local(directory.clone()).unwrap();
-    view.loaded_once = true;
-    explorer.local_path = directory.display().to_string();
-    explorer.local_view = Some(view);
+    explorer.local_view = Some(SourceView::try_local(directory.clone()).unwrap());
+    let source_id = explorer.local_view.as_ref().unwrap().source_id().clone();
+
+    let sibling_path = sibling.display().to_string();
+    assert!(
+        explorer
+            .handle_browser_command(BrowserCommand::NavigatePath(sibling_path.clone()), &context)
+            .is_none()
+    );
+    let view = explorer.local_view.as_ref().unwrap();
+    assert_eq!(view.source_id(), &source_id);
+    assert_eq!(view.navigation_path(), sibling_path);
+
+    let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
+    assert!(visible_text(output).contains(&sibling.display().to_string()));
+    assert!(
+        explorer
+            .handle_browser_command(BrowserCommand::NavigateUp, &context)
+            .is_none()
+    );
+    assert_eq!(
+        explorer.local_view.as_ref().unwrap().navigation_path(),
+        sibling.parent().unwrap().display().to_string()
+    );
 
     let nested_path = directory.join("nested").display().to_string();
     assert!(
@@ -337,44 +354,35 @@ fn path_navigation_and_parent_row_stay_synchronized() {
             .is_none()
     );
     assert_eq!(
-        explorer.local_view.as_ref().unwrap().current_directory,
-        SourcePath::directory("nested").unwrap()
-    );
-    assert_eq!(
         explorer.local_view.as_ref().unwrap().navigation_path(),
         nested_path
     );
-
-    let (output, _) = render_frame(&context, &mut explorer, 0.0, Vec::new());
-    assert!(visible_text(output).contains(&nested_path));
-    let (output, _) = render_frame(&context, &mut explorer, 0.01, Vec::new());
-    let position = button_center(&output, "[D] ...");
-    for (time, pressed) in [(0.10, true), (0.11, false), (0.20, true), (0.21, false)] {
-        let (_, action) = render_frame(
-            &context,
-            &mut explorer,
-            time,
-            vec![
-                egui::Event::PointerMoved(position),
-                egui::Event::PointerButton {
-                    pos: position,
-                    button: egui::PointerButton::Primary,
-                    pressed,
-                    modifiers: egui::Modifiers::default(),
-                },
-            ],
-        );
-        assert!(action.is_none());
-    }
-
-    let view = explorer.local_view.as_ref().unwrap();
-    assert!(view.current_directory.is_root());
-    assert_eq!(view.navigation_path(), directory.display().to_string());
-    assert!(view.parse_navigation_path("../escape").is_err());
+    let stable_path = explorer.local_view.as_ref().unwrap().navigation_path();
     assert!(
-        view.parse_navigation_path(&directory.with_extension("outside").display().to_string())
-            .is_err()
+        explorer
+            .handle_browser_command(
+                BrowserCommand::NavigatePath("relative".to_owned()),
+                &context
+            )
+            .is_none()
     );
+    assert_eq!(
+        explorer.local_view.as_ref().unwrap().navigation_path(),
+        stable_path
+    );
+    assert!(
+        explorer
+            .handle_browser_command(
+                BrowserCommand::NavigatePath("../escape".to_owned()),
+                &context
+            )
+            .is_none()
+    );
+    assert_eq!(
+        explorer.local_view.as_ref().unwrap().navigation_path(),
+        stable_path
+    );
+
     assert_eq!(source_path_from_remote("/").unwrap(), SourcePath::root());
     for (absolute, relative) in [
         ("/opt/archive/raw", "opt/archive/raw"),
@@ -391,6 +399,7 @@ fn path_navigation_and_parent_row_stay_synchronized() {
 
     drop(explorer);
     fs::remove_dir_all(directory).unwrap();
+    fs::remove_dir_all(sibling).unwrap();
 }
 
 #[test]
@@ -738,9 +747,11 @@ fn local_mutation_requests_execute_through_filesystem_port() {
     fs::write(directory.join("before.raw"), [1_u8, 2]).unwrap();
     let view = SourceView::try_local(directory.clone()).unwrap();
     let source = view.source_id().clone();
+    let workspace = view.current_directory.clone();
     let file_system = Arc::clone(&view.file_system);
 
-    let before = FileRef::new(source.clone(), SourcePath::new("before.raw").unwrap());
+    let before_name = EntryName::new("before.raw").unwrap();
+    let before = FileRef::new(source.clone(), workspace.join(&before_name));
     execute_mutation(
         &*file_system,
         &MutationRequest::Rename {
@@ -752,19 +763,21 @@ fn local_mutation_requests_execute_through_filesystem_port() {
     .unwrap();
     assert!(directory.join("renamed.raw").is_file());
 
-    let root = DirectoryRef::root(source.clone());
+    let destination_name = EntryName::new("destination").unwrap();
+    let destination = workspace.join(&destination_name);
     execute_mutation(
         &*file_system,
         &MutationRequest::CreateDirectory {
-            parent: root,
-            name: EntryName::new("destination").unwrap(),
+            parent: DirectoryRef::new(source.clone(), workspace.clone()),
+            name: destination_name,
         },
         FsCancellation::default(),
     )
     .unwrap();
     assert!(directory.join("destination").is_dir());
 
-    let renamed = FileRef::new(source.clone(), SourcePath::new("renamed.raw").unwrap());
+    let renamed_name = EntryName::new("renamed.raw").unwrap();
+    let renamed = FileRef::new(source.clone(), workspace.join(&renamed_name));
     let entry = file_system
         .stat(&renamed, &FsControl::with_timeout(Duration::from_secs(1)))
         .unwrap();
@@ -772,17 +785,14 @@ fn local_mutation_requests_execute_through_filesystem_port() {
         &*file_system,
         &MutationRequest::Move {
             entry,
-            destination: DirectoryRef::new(
-                source.clone(),
-                SourcePath::directory("destination").unwrap(),
-            ),
+            destination: DirectoryRef::new(source.clone(), destination.clone()),
         },
         FsCancellation::default(),
     )
     .unwrap();
     assert!(directory.join("destination/renamed.raw").is_file());
 
-    let moved = FileRef::new(source, SourcePath::new("destination/renamed.raw").unwrap());
+    let moved = FileRef::new(source, destination.join(&renamed_name));
     let entry = file_system
         .stat(&moved, &FsControl::with_timeout(Duration::from_secs(1)))
         .unwrap();
