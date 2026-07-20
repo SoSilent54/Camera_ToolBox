@@ -1,5 +1,7 @@
 //! Explorer 文件表格、上下文菜单、编辑器、拖放和危险操作确认。
 
+use std::collections::BTreeSet;
+
 use camera_toolbox_app::{
     DirectoryRef, EntryName, FileEntry, FileKind, FileRef, FileSourceId, FileSystemCapabilities,
     SourcePath,
@@ -44,6 +46,84 @@ pub(super) enum BrowserCommand {
     Refresh,
     Open(FileRef),
     Mutate(MutationRequest),
+}
+
+#[derive(Debug, Default)]
+pub(super) struct BrowserSelection {
+    paths: BTreeSet<SourcePath>,
+    anchor: Option<SourcePath>,
+}
+
+impl BrowserSelection {
+    pub(super) fn clear(&mut self) {
+        self.paths.clear();
+        self.anchor = None;
+    }
+
+    pub(super) fn contains(&self, path: &SourcePath) -> bool {
+        self.paths.contains(path)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.paths.len()
+    }
+
+    fn select_single(&mut self, path: &SourcePath) {
+        self.paths.clear();
+        self.paths.insert(path.clone());
+        self.anchor = Some(path.clone());
+    }
+
+    pub(super) fn select(
+        &mut self,
+        entries: &[FileEntry],
+        path: &SourcePath,
+        modifiers: egui::Modifiers,
+    ) {
+        let additive = modifiers.ctrl || modifiers.command;
+        if modifiers.shift
+            && let Some(anchor) = self.anchor.as_ref()
+            && let Some(anchor_index) = entries
+                .iter()
+                .position(|entry| &entry.reference.path == anchor)
+            && let Some(clicked_index) = entries
+                .iter()
+                .position(|entry| &entry.reference.path == path)
+        {
+            if !additive {
+                self.paths.clear();
+            }
+            let start = anchor_index.min(clicked_index);
+            let end = anchor_index.max(clicked_index);
+            self.paths.extend(
+                entries[start..=end]
+                    .iter()
+                    .map(|entry| entry.reference.path.clone()),
+            );
+            return;
+        }
+
+        if additive {
+            if !self.paths.insert(path.clone()) {
+                self.paths.remove(path);
+            }
+            self.anchor = Some(path.clone());
+        } else {
+            self.select_single(path);
+        }
+    }
+
+    fn retain_visible(&mut self, entries: &[FileEntry]) {
+        self.paths
+            .retain(|path| entries.iter().any(|entry| entry.reference.path == *path));
+        if self
+            .anchor
+            .as_ref()
+            .is_some_and(|anchor| !self.paths.contains(anchor))
+        {
+            self.anchor = self.paths.iter().next().cloned();
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -161,11 +241,12 @@ impl BrowserState {
         current_directory: &SourcePath,
         navigation_path: &str,
         entries: &[FileEntry],
-        selected: &mut Option<SourcePath>,
+        selection: &mut BrowserSelection,
         capabilities: FileSystemCapabilities,
         busy: bool,
     ) -> Option<BrowserCommand> {
         self.sync_navigation(source_id, current_directory, navigation_path);
+        selection.retain_visible(entries);
         let current = DirectoryRef::new(source_id.clone(), current_directory.clone());
         let mut command = self.render_navigation_row(ui, current_directory, busy);
 
@@ -199,13 +280,22 @@ impl BrowserState {
                         command = self.render_entry_row(
                             ui,
                             entry,
-                            selected,
+                            entries,
+                            selection,
                             &current,
                             capabilities,
                             busy,
                         );
                     } else {
-                        self.render_entry_row(ui, entry, selected, &current, capabilities, busy);
+                        self.render_entry_row(
+                            ui,
+                            entry,
+                            entries,
+                            selection,
+                            &current,
+                            capabilities,
+                            busy,
+                        );
                     }
                 }
             });
@@ -337,11 +427,13 @@ impl BrowserState {
             .then_some(BrowserCommand::NavigateUp)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_entry_row(
         &mut self,
         ui: &mut egui::Ui,
         entry: &FileEntry,
-        selected: &mut Option<SourcePath>,
+        entries: &[FileEntry],
+        selection: &mut BrowserSelection,
         current_directory: &DirectoryRef,
         capabilities: FileSystemCapabilities,
         busy: bool,
@@ -357,7 +449,7 @@ impl BrowserState {
             FileKind::Symlink => "[L]",
             FileKind::Other => "[?]",
         };
-        let selected_row = selected.as_ref() == Some(&entry.reference.path);
+        let selected_row = selection.contains(&entry.reference.path);
         let row = ui.horizontal(|ui| {
             let size_width = 76.0;
             let name_width =
@@ -375,7 +467,8 @@ impl BrowserState {
         });
         let response = row.inner;
         if response.clicked_by(egui::PointerButton::Primary) {
-            *selected = Some(entry.reference.path.clone());
+            let modifiers = ui.input(|input| input.modifiers);
+            selection.select(entries, &entry.reference.path, modifiers);
         }
         if response.double_clicked_by(egui::PointerButton::Primary)
             && !busy
@@ -406,12 +499,20 @@ impl BrowserState {
             }
         }
 
+        if response.secondary_clicked() && !selection.contains(&entry.reference.path) {
+            selection.select_single(&entry.reference.path);
+        }
+        let open_label = if selection.contains(&entry.reference.path) && selection.len() > 1 {
+            format!("Open selected ({})", selection.len())
+        } else {
+            "Open".to_owned()
+        };
         let mut menu_action = None;
         response.context_menu(|ui| {
             if ui
                 .add_enabled(
                     matches!(entry.kind, FileKind::File | FileKind::Directory) && !busy,
-                    egui::Button::new("Open"),
+                    egui::Button::new(open_label),
                 )
                 .clicked()
             {
@@ -812,7 +913,7 @@ mod tests {
             |entry| entry.reference.source_id.clone(),
         );
         let current_directory = SourcePath::root();
-        let mut selected = None;
+        let mut selection = BrowserSelection::default();
         let mut input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
@@ -831,7 +932,7 @@ mod tests {
                 &current_directory,
                 "/workspace",
                 entries,
-                &mut selected,
+                &mut selection,
                 FileSystemCapabilities::READ_WRITE,
                 false,
             );
@@ -898,6 +999,48 @@ mod tests {
             repeat: false,
             modifiers: egui::Modifiers::default(),
         }
+    }
+
+    #[test]
+    fn selection_supports_shift_ranges_and_ctrl_toggles() {
+        let entries = [file("a.png"), file("b.png"), file("c.png"), file("d.png")];
+        let mut selection = BrowserSelection::default();
+
+        selection.select(&entries, &entries[1].reference.path, egui::Modifiers::NONE);
+        selection.select(
+            &entries,
+            &entries[3].reference.path,
+            egui::Modifiers {
+                shift: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        assert!(!selection.contains(&entries[0].reference.path));
+        for entry in &entries[1..=3] {
+            assert!(selection.contains(&entry.reference.path));
+        }
+
+        selection.select(
+            &entries,
+            &entries[0].reference.path,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        assert_eq!(selection.len(), 4);
+        selection.select(
+            &entries,
+            &entries[2].reference.path,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        assert!(!selection.contains(&entries[2].reference.path));
+        assert_eq!(selection.len(), 3);
     }
 
     #[test]

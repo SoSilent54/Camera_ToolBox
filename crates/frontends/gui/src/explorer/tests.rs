@@ -362,6 +362,99 @@ fn open_command_in_calibration_rejects_non_png() {
 }
 
 #[test]
+fn multi_open_in_calibration_keeps_only_pngs_in_visible_order() {
+    let directory = temp_directory();
+    for name in ["first.png", "skip.jpg", "second.PNG", "skip.raw"] {
+        fs::write(directory.join(name), [1_u8]).unwrap();
+    }
+    let context = egui::Context::default();
+    let mut explorer = explorer_state();
+    let mut view = SourceView::try_local(directory.clone()).unwrap();
+    view.entries = ["first.png", "skip.jpg", "second.PNG", "skip.raw"]
+        .into_iter()
+        .map(|name| {
+            let entry_name = EntryName::new(name).unwrap();
+            FileEntry {
+                reference: FileRef::new(
+                    view.source_id().clone(),
+                    view.current_directory.join(&entry_name),
+                ),
+                name: entry_name,
+                kind: FileKind::File,
+                version: FileVersion {
+                    size: 1,
+                    modified_millis: Some(1),
+                },
+            }
+        })
+        .collect();
+    let paths = view
+        .entries
+        .iter()
+        .map(|entry| entry.reference.path.clone())
+        .collect::<Vec<_>>();
+    view.selection
+        .select(&view.entries, &paths[0], egui::Modifiers::NONE);
+    for path in &paths[1..] {
+        view.selection.select(
+            &view.entries,
+            path,
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+    }
+    let clicked = view.entries[1].reference.clone();
+    explorer.local_view = Some(view);
+
+    let action = explorer
+        .handle_browser_command_for_workspace(BrowserCommand::Open(clicked), &context, true)
+        .expect("multi-open imports supported PNGs");
+    let ExplorerAction::AddCalibration(candidates) = action else {
+        panic!("expected calibration dataset action");
+    };
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|candidate| candidate.entry.name.as_str())
+            .collect::<Vec<_>>(),
+        ["first.png", "second.PNG"]
+    );
+
+    let unsupported = {
+        let view = explorer.local_view.as_mut().unwrap();
+        view.selection.clear();
+        view.selection
+            .select(&view.entries, &paths[1], egui::Modifiers::NONE);
+        view.selection.select(
+            &view.entries,
+            &paths[3],
+            egui::Modifiers {
+                ctrl: true,
+                command: true,
+                ..egui::Modifiers::NONE
+            },
+        );
+        view.entries[1].reference.clone()
+    };
+    assert!(
+        explorer
+            .handle_browser_command_for_workspace(
+                BrowserCommand::Open(unsupported),
+                &context,
+                true,
+            )
+            .is_none(),
+        "an unsupported multi-selection is skipped without a single-file rejection"
+    );
+
+    drop(explorer);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn file_context_menu_exposes_required_commands() {
     let directory = temp_directory();
     fs::write(directory.join("frame.raw"), [1_u8, 2, 3, 4]).unwrap();

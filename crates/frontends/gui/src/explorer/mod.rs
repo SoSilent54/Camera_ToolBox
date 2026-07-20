@@ -17,7 +17,7 @@ use std::{
     time::Duration,
 };
 
-use browser::{BrowserCommand, BrowserState, MutationRequest};
+use browser::{BrowserCommand, BrowserSelection, BrowserState, MutationRequest};
 use camera_toolbox_adapters::filesystem::{
     DirectoryMonitorConfig, DirectoryMonitorEvent, DirectoryMonitorHandle, DirectoryMonitorState,
     LocalDirectoryMonitor, LocalFileSystem,
@@ -89,7 +89,7 @@ struct SourceView {
     display_base: String,
     file_system: Arc<dyn FileSystem>,
     current_directory: SourcePath,
-    selected: Option<SourcePath>,
+    selection: BrowserSelection,
     entries: Vec<FileEntry>,
     loading: bool,
     loaded_once: bool,
@@ -125,7 +125,7 @@ impl SourceView {
             display_base: root.display().to_string(),
             file_system,
             current_directory,
-            selected: None,
+            selection: BrowserSelection::default(),
             entries: Vec::new(),
             loading: false,
             loaded_once: false,
@@ -184,7 +184,7 @@ impl SourceView {
             ),
             file_system,
             current_directory: SourcePath::root(),
-            selected: None,
+            selection: BrowserSelection::default(),
             entries: Vec::new(),
             loading: false,
             loaded_once: false,
@@ -364,13 +364,11 @@ pub(crate) struct ExplorerState {
     #[cfg(feature = "platform-ssh")]
     remote: remote::RemoteConnector,
 }
-
 impl ExplorerState {
     #[cfg(not(feature = "platform-ssh"))]
     pub(crate) fn new() -> Self {
         Self::base()
     }
-
     #[cfg(feature = "platform-ssh")]
     pub(crate) fn new(
         credentials: Arc<dyn CredentialResolver>,
@@ -422,6 +420,7 @@ impl ExplorerState {
     pub(crate) fn render(
         &mut self,
         context: &egui::Context,
+
         ui: &mut egui::Ui,
         calibration_import_enabled: bool,
     ) -> Option<ExplorerAction> {
@@ -501,7 +500,10 @@ impl ExplorerState {
             let directory_count = self.calibration_candidates(false).len();
             ui.horizontal_wrapped(|ui| {
                 if ui
-                    .add_enabled(selected_count == 1, egui::Button::new("Add selected PNG"))
+                    .add_enabled(
+                        selected_count > 0,
+                        egui::Button::new(format!("Add selected PNGs ({selected_count})")),
+                    )
                     .clicked()
                 {
                     action = Some(ExplorerAction::AddCalibration(
@@ -533,7 +535,7 @@ impl ExplorerState {
         view.entries
             .iter()
             .filter(|entry| entry.kind == FileKind::File && is_png_path(&entry.reference.path))
-            .filter(|entry| !selected_only || view.selected.as_ref() == Some(&entry.reference.path))
+            .filter(|entry| !selected_only || view.selection.contains(&entry.reference.path))
             .map(|entry| CalibrationImportCandidate {
                 display_path: view.display_path(&entry.reference.path),
                 file_system: Arc::clone(&view.file_system),
@@ -558,7 +560,7 @@ impl ExplorerState {
                     config,
                     file_system,
                     current_directory,
-                    selected,
+                    selection,
                     entries,
                     ..
                 } = view;
@@ -569,7 +571,7 @@ impl ExplorerState {
                     current_directory,
                     &navigation_path,
                     entries,
-                    selected,
+                    selection,
                     file_system.capabilities(),
                     busy,
                 )
@@ -582,7 +584,7 @@ impl ExplorerState {
                     config,
                     file_system,
                     current_directory,
-                    selected,
+                    selection,
                     entries,
                     ..
                 } = view;
@@ -593,7 +595,7 @@ impl ExplorerState {
                     current_directory,
                     &navigation_path,
                     entries,
-                    selected,
+                    selection,
                     file_system.capabilities(),
                     busy,
                 )
@@ -725,7 +727,7 @@ impl ExplorerState {
             return;
         };
         view.current_directory = path;
-        view.selected = None;
+        view.selection.clear();
         self.browser.clear_transient();
         self.start_active_monitor(context);
     }
@@ -899,7 +901,7 @@ impl ExplorerState {
                 Ok(()) => {
                     self.browser.complete_mutation(&result.request);
                     if let Some(view) = self.active_view_mut() {
-                        view.selected = None;
+                        view.selection.clear();
                     }
                 }
                 Err(error) => self.browser.fail_mutation(&result.request, error),
@@ -944,6 +946,25 @@ impl ExplorerState {
             .entries
             .iter()
             .find(|entry| entry.reference == *reference)?;
+        if view.selection.contains(&reference.path) && view.selection.len() > 1 {
+            let candidates = view
+                .entries
+                .iter()
+                .filter(|entry| {
+                    view.selection.contains(&entry.reference.path)
+                        && entry.kind == FileKind::File
+                        && is_png_path(&entry.reference.path)
+                })
+                .map(|entry| CalibrationImportCandidate {
+                    display_path: view.display_path(&entry.reference.path),
+                    file_system: Arc::clone(&view.file_system),
+                    entry: entry.clone(),
+                    remote: view.is_remote(),
+                })
+                .collect::<Vec<_>>();
+            return (!candidates.is_empty()).then_some(ExplorerAction::AddCalibration(candidates));
+        }
+
         if !is_png_path(&reference.path) {
             return Some(ExplorerAction::CalibrationImportRejected { display_path });
         }
