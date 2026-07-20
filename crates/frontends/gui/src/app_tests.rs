@@ -1223,3 +1223,30 @@ fn remote_raw_progress_is_generation_safe_and_visible() {
     assert!(visible.contains("Transferring remote.raw"));
     assert!(visible.contains("50%"));
 }
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn calibration_workspace_switch_preserves_viewer_documents() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = app_with_loaded_raw(&context);
+    let viewer_document = app.workspace.active_id();
+    app.product_workspace = super::ProductWorkspace::Calibration;
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+    let visible = output
+        .platform_output
+        .accesskit_update
+        .expect("accessibility tree is enabled")
+        .nodes
+        .into_iter()
+        .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(app.is_calibration_workspace());
+    assert_eq!(app.workspace.active_id(), viewer_document);
+    assert!(visible.contains("Intrinsic Calibration"));
+    assert!(visible.contains("Dataset (0)"));
+}

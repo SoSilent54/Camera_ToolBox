@@ -84,6 +84,8 @@ jobs:
           components: clippy
       - name: Build unified product
         shell: bash
+        env:
+          CAMERA_TOOLBOX_CALIBRATION: "0"
         run: ./build.sh release
       - name: Test all adapter implementations together
         if: runner.os == 'Linux'

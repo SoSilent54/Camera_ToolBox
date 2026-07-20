@@ -41,6 +41,8 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build unified release
         shell: bash
+        env:
+          CAMERA_TOOLBOX_CALIBRATION: "0"
         run: ./build.sh release
 
       - name: Package Unix release
@@ -124,6 +126,8 @@ jobs:
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build unified release
+        env:
+          CAMERA_TOOLBOX_CALIBRATION: "0"
         run: ./build.sh release
       - name: Package Linux release
         env:

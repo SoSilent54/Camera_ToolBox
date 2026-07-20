@@ -11,6 +11,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(feature = "calibration-opencv")]
+use crate::calibration_workspace::CalibrationWorkspace;
+
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
 use crate::{
@@ -141,7 +144,18 @@ struct PendingYuvSave {
     frame: Arc<Rgba8Frame>,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProductWorkspace {
+    #[default]
+    Viewer,
+    #[cfg(feature = "calibration-opencv")]
+    Calibration,
+}
+
 pub(crate) struct CameraToolboxApp {
+    product_workspace: ProductWorkspace,
+    #[cfg(feature = "calibration-opencv")]
+    calibration: CalibrationWorkspace,
     workspace: WorkspaceState,
     auto_open: AutoOpenCoordinator,
     explorer: ExplorerState,
@@ -201,6 +215,9 @@ impl CameraToolboxApp {
         let explorer = ExplorerState::new();
         let auto_open = AutoOpenCoordinator::from_settings(&workspace_settings, &explorer);
         Ok(Self {
+            product_workspace: ProductWorkspace::Viewer,
+            #[cfg(feature = "calibration-opencv")]
+            calibration: CalibrationWorkspace::new(context)?,
             workspace: WorkspaceState::default(),
             explorer,
             auto_open,
@@ -279,12 +296,14 @@ impl eframe::App for CameraToolboxApp {
         }
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
-        let tab_action = egui::Panel::top("document_tabs")
-            .resizable(false)
-            .show(ui, |ui| render_tab_bar(ui, &self.workspace))
-            .inner;
-        if let Some(action) = tab_action {
-            self.handle_tab_action(&context, action);
+        if !self.is_calibration_workspace() {
+            let tab_action = egui::Panel::top("document_tabs")
+                .resizable(false)
+                .show(ui, |ui| render_tab_bar(ui, &self.workspace))
+                .inner;
+            if let Some(action) = tab_action {
+                self.handle_tab_action(&context, action);
+            }
         }
         let explorer_action = if self.explorer_panel_expanded {
             let mut collapse = false;
@@ -302,7 +321,8 @@ impl eframe::App for CameraToolboxApp {
                         });
                     });
                     ui.separator();
-                    self.explorer.render(&context, ui)
+                    self.explorer
+                        .render(&context, ui, self.is_calibration_workspace())
                 })
                 .inner;
             if collapse {
@@ -326,13 +346,29 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = explorer_action {
             self.handle_explorer_action(&context, action);
         }
-        egui::Panel::bottom("status_bar").show(ui, |ui| self.render_status_bar(ui));
-        self.render_analysis_panel_ui(ui);
-        self.render_color_panel(ui);
-        self.render_yuv_inspector_panel(ui);
+        egui::Panel::bottom("status_bar").show(ui, |ui| {
+            #[cfg(feature = "calibration-opencv")]
+            if self.is_calibration_workspace() {
+                self.calibration.render_status(ui);
+                return;
+            }
+            self.render_status_bar(ui);
+        });
+        if !self.is_calibration_workspace() {
+            self.render_analysis_panel_ui(ui);
+            self.render_color_panel(ui);
+            self.render_yuv_inspector_panel(ui);
+        }
 
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
+                #[cfg(feature = "calibration-opencv")]
+                if self.is_calibration_workspace() {
+                    return ViewerOutput {
+                        rect: self.calibration.render(&context, ui),
+                        action: None,
+                    };
+                }
                 if let Some(document) = self.workspace.active_live_mut() {
                     let rect = Self::render_live_viewer(ui, document, &self.live_runtime);
                     ViewerOutput { rect, action: None }
@@ -395,6 +431,33 @@ impl eframe::App for CameraToolboxApp {
 }
 
 impl CameraToolboxApp {
+    fn is_calibration_workspace(&self) -> bool {
+        #[cfg(feature = "calibration-opencv")]
+        {
+            self.product_workspace == ProductWorkspace::Calibration
+        }
+        #[cfg(not(feature = "calibration-opencv"))]
+        {
+            false
+        }
+    }
+
+    fn render_product_workspace_switch(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.product_workspace,
+                ProductWorkspace::Viewer,
+                "Viewer",
+            );
+            #[cfg(feature = "calibration-opencv")]
+            ui.selectable_value(
+                &mut self.product_workspace,
+                ProductWorkspace::Calibration,
+                "Calibration",
+            );
+        });
+    }
+
     fn render_menu_bar(&mut self, ui: &mut egui::Ui) {
         let mut request_color = false;
         egui::MenuBar::new().ui(ui, |ui| {
@@ -418,6 +481,8 @@ impl CameraToolboxApp {
                     ui.label("Unavailable on this platform");
                 }
             });
+            ui.separator();
+            self.render_product_workspace_switch(ui);
         });
         if request_color {
             self.request_current_color();
@@ -1550,6 +1615,27 @@ impl CameraToolboxApp {
                         ));
                     }
                 }
+            }
+            ExplorerAction::AddCalibration(candidates) => {
+                #[cfg(feature = "calibration-opencv")]
+                {
+                    self.product_workspace = ProductWorkspace::Calibration;
+                    self.calibration.import(candidates);
+                }
+                #[cfg(not(feature = "calibration-opencv"))]
+                {
+                    let _ = candidates;
+                    tracing::warn!(
+                        operation = "add_calibration_dataset",
+                        "calibration-opencv feature is disabled"
+                    );
+                }
+            }
+            ExplorerAction::CalibrationImportRejected { display_path } => {
+                #[cfg(feature = "calibration-opencv")]
+                self.calibration.reject_import(&display_path);
+                #[cfg(not(feature = "calibration-opencv"))]
+                let _ = display_path;
             }
         }
     }

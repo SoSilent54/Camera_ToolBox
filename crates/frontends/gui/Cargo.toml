@@ -11,7 +11,9 @@ name = "camera-toolbox"
 path = "src/main.rs"
 
 [features]
-default = ["platform-all"]
+default = ["product-all"]
+product-all = ["platform-all", "calibration-opencv"]
+calibration-opencv = ["camera-toolbox-adapters/calibration-opencv"]
 platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
 platform-local = [
     "camera-toolbox-adapters/platform-local",
@@ -37,10 +39,12 @@ camera-toolbox-cli = { path = "../cli", default-features = false }
 clap.workspace = true
 eframe.workspace = true
 egui_plot.workspace = true
+egui_extras.workspace = true
 rfd.workspace = true
 png.workspace = true
 image.workspace = true
 secrecy = { workspace = true, optional = true }
+serde_json.workspace = true
 tracing.workspace = true
 
 [lints]

@@ -6,8 +6,8 @@ usage() {
 Usage: ./build.sh [profile]
 
 Builds one camera-toolbox executable for the current native host with Local,
-CV610, and SSH-managed providers enabled together. OS/architecture builds are
-split by native GitHub Actions runners rather than by this script.
+CV610, SSH-managed providers, and OpenCV calibration enabled together. Set
+CAMERA_TOOLBOX_CALIBRATION=0 to build without the OpenCV dependency.
 
 Profiles:
   debug    Cargo dev profile (default)
@@ -41,17 +41,22 @@ case "$profile" in
         ;;
 esac
 
+features=product-all
+if [[ ${CAMERA_TOOLBOX_CALIBRATION:-1} == "0" ]]; then
+    features=platform-all
+fi
+
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 target_dir=${CARGO_TARGET_DIR:-"${project_root}/target"}
 
-printf 'Building camera-toolbox: providers=all profile=%s target_dir=%s\n' \
-    "$profile" "$target_dir"
+printf 'Building camera-toolbox: features=%s profile=%s target_dir=%s\n' \
+    "$features" "$profile" "$target_dir"
 
 CARGO_TARGET_DIR="$target_dir" cargo build \
     --manifest-path "${project_root}/Cargo.toml" \
     --package camera-toolbox \
     --bin camera-toolbox \
     --no-default-features \
-    --features platform-all \
+    --features "$features" \
     --locked \
     "${profile_args[@]}"

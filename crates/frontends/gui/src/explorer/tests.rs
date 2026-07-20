@@ -38,11 +38,52 @@ fn explorer_state() -> ExplorerState {
     }
 }
 
+fn explorer_with_file(directory: &PathBuf, name: &str) -> (ExplorerState, FileRef) {
+    let mut explorer = explorer_state();
+    let mut view = SourceView::try_local(directory.clone()).unwrap();
+    let entry_name = EntryName::new(name).unwrap();
+    let reference = FileRef::new(
+        view.source_id().clone(),
+        view.current_directory.join(&entry_name),
+    );
+    view.entries = vec![FileEntry {
+        reference: reference.clone(),
+        name: entry_name,
+        kind: FileKind::File,
+        version: FileVersion {
+            size: fs::metadata(directory.join(name)).unwrap().len(),
+            modified_millis: Some(1),
+        },
+    }];
+    view.loaded_once = true;
+    explorer.local_view = Some(view);
+    (explorer, reference)
+}
+
+fn pointer_button(position: egui::Pos2, button: egui::PointerButton, pressed: bool) -> egui::Event {
+    egui::Event::PointerButton {
+        pos: position,
+        button,
+        pressed,
+        modifiers: egui::Modifiers::default(),
+    }
+}
+
 fn render_frame(
     context: &egui::Context,
     explorer: &mut ExplorerState,
     time: f64,
     events: Vec<egui::Event>,
+) -> (egui::FullOutput, Option<ExplorerAction>) {
+    render_frame_for_workspace(context, explorer, time, events, false)
+}
+
+fn render_frame_for_workspace(
+    context: &egui::Context,
+    explorer: &mut ExplorerState,
+    time: f64,
+    events: Vec<egui::Event>,
+    calibration: bool,
 ) -> (egui::FullOutput, Option<ExplorerAction>) {
     let mut input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
@@ -54,7 +95,9 @@ fn render_frame(
     };
     input.events = events;
     let mut action = None;
-    let output = context.run_ui(input, |ui| action = explorer.render(context, ui));
+    let output = context.run_ui(input, |ui| {
+        action = explorer.render(context, ui, calibration);
+    });
     (output, action)
 }
 
@@ -217,6 +260,102 @@ fn double_click_file_emits_one_open_action() {
     };
     assert_eq!(opened, reference);
     assert!(!remote);
+
+    drop(explorer);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn double_click_png_routes_to_calibration_dataset() {
+    let directory = temp_directory();
+    fs::write(directory.join("board.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let (mut explorer, reference) = explorer_with_file(&directory, "board.png");
+
+    let (output, _) = render_frame_for_workspace(&context, &mut explorer, 0.0, Vec::new(), true);
+    let position = button_center(&output, "[F] board.png");
+    for (time, pressed) in [(0.10, true), (0.11, false), (0.20, true)] {
+        let (_, action) = render_frame_for_workspace(
+            &context,
+            &mut explorer,
+            time,
+            vec![
+                egui::Event::PointerMoved(position),
+                pointer_button(position, egui::PointerButton::Primary, pressed),
+            ],
+            true,
+        );
+        assert!(action.is_none());
+    }
+    let (_, action) = render_frame_for_workspace(
+        &context,
+        &mut explorer,
+        0.21,
+        vec![pointer_button(
+            position,
+            egui::PointerButton::Primary,
+            false,
+        )],
+        true,
+    );
+    let ExplorerAction::AddCalibration(candidates) = action.expect("double click adds PNG") else {
+        panic!("expected calibration dataset action");
+    };
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].entry.reference, reference);
+    assert_eq!(candidates[0].display_path, directory.join("board.png"));
+    let stat = candidates[0]
+        .file_system
+        .stat(
+            &candidates[0].entry.reference,
+            &FsControl::with_timeout(Duration::from_secs(1)),
+        )
+        .expect("calibration candidate resolves to the real file");
+    assert_eq!(stat.reference, reference);
+
+    drop(explorer);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn open_command_in_calibration_routes_to_dataset() {
+    let directory = temp_directory();
+    fs::write(directory.join("board.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+    let context = egui::Context::default();
+    let (mut explorer, reference) = explorer_with_file(&directory, "board.png");
+
+    let action = explorer
+        .handle_browser_command_for_workspace(
+            BrowserCommand::Open(reference.clone()),
+            &context,
+            true,
+        )
+        .expect("Open adds PNG");
+    let ExplorerAction::AddCalibration(candidates) = action else {
+        panic!("expected calibration dataset action");
+    };
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].entry.reference, reference);
+
+    drop(explorer);
+    fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn open_command_in_calibration_rejects_non_png() {
+    let directory = temp_directory();
+    fs::write(directory.join("frame.jpg"), [1_u8, 2, 3, 4]).unwrap();
+    let context = egui::Context::default();
+    let (mut explorer, reference) = explorer_with_file(&directory, "frame.jpg");
+
+    let action = explorer
+        .handle_browser_command_for_workspace(BrowserCommand::Open(reference), &context, true)
+        .expect("unsupported file reports rejection");
+    let ExplorerAction::CalibrationImportRejected { display_path } = action else {
+        panic!("expected explicit calibration import rejection");
+    };
+    assert_eq!(display_path, directory.join("frame.jpg"));
 
     drop(explorer);
     fs::remove_dir_all(directory).unwrap();

@@ -2,6 +2,8 @@ mod analysis_panel;
 mod analysis_worker;
 mod app;
 mod auto_open;
+#[cfg(feature = "calibration-opencv")]
+mod calibration_workspace;
 mod color_controls;
 mod color_worker;
 mod explorer;

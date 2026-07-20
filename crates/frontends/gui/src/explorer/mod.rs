@@ -57,6 +57,13 @@ impl WorkspaceMode {
     }
 }
 
+pub(crate) struct CalibrationImportCandidate {
+    pub(crate) display_path: PathBuf,
+    pub(crate) file_system: Arc<dyn FileSystem>,
+    pub(crate) entry: FileEntry,
+    pub(crate) remote: bool,
+}
+
 pub(crate) enum ExplorerAction {
     #[cfg(feature = "platform-ssh")]
     ActivateSftp(RemoteConnectionCommit),
@@ -65,6 +72,10 @@ pub(crate) enum ExplorerAction {
         file_system: Arc<dyn FileSystem>,
         reference: FileRef,
         remote: bool,
+    },
+    AddCalibration(Vec<CalibrationImportCandidate>),
+    CalibrationImportRejected {
+        display_path: PathBuf,
     },
 }
 
@@ -412,6 +423,7 @@ impl ExplorerState {
         &mut self,
         context: &egui::Context,
         ui: &mut egui::Ui,
+        calibration_import_enabled: bool,
     ) -> Option<ExplorerAction> {
         self.ensure_local_workspace(context);
         self.poll_monitor(context);
@@ -475,11 +487,60 @@ impl ExplorerState {
         let busy = self.active_mutation.is_some();
         let browser_command = self.render_browser(context, ui, busy);
         if let Some(command) = browser_command
-            && let Some(open_action) = self.handle_browser_command(command, context)
+            && let Some(open_action) = self.handle_browser_command_for_workspace(
+                command,
+                context,
+                calibration_import_enabled,
+            )
         {
             action = Some(open_action);
         }
+        if calibration_import_enabled {
+            ui.separator();
+            let selected_count = self.calibration_candidates(true).len();
+            let directory_count = self.calibration_candidates(false).len();
+            ui.horizontal_wrapped(|ui| {
+                if ui
+                    .add_enabled(selected_count == 1, egui::Button::new("Add selected PNG"))
+                    .clicked()
+                {
+                    action = Some(ExplorerAction::AddCalibration(
+                        self.calibration_candidates(true),
+                    ));
+                }
+                if ui
+                    .add_enabled(
+                        directory_count > 0,
+                        egui::Button::new(format!("Add directory PNGs ({directory_count})")),
+                    )
+                    .clicked()
+                {
+                    action = Some(ExplorerAction::AddCalibration(
+                        self.calibration_candidates(false),
+                    ));
+                }
+            });
+            ui.weak("Calibration accepts original PNG files only.");
+        }
+
         action
+    }
+
+    fn calibration_candidates(&self, selected_only: bool) -> Vec<CalibrationImportCandidate> {
+        let Some(view) = self.active_view() else {
+            return Vec::new();
+        };
+        view.entries
+            .iter()
+            .filter(|entry| entry.kind == FileKind::File && is_png_path(&entry.reference.path))
+            .filter(|entry| !selected_only || view.selected.as_ref() == Some(&entry.reference.path))
+            .map(|entry| CalibrationImportCandidate {
+                display_path: view.display_path(&entry.reference.path),
+                file_system: Arc::clone(&view.file_system),
+                entry: entry.clone(),
+                remote: view.is_remote(),
+            })
+            .collect()
     }
 
     fn render_browser(
@@ -545,6 +606,15 @@ impl ExplorerState {
         command: BrowserCommand,
         context: &egui::Context,
     ) -> Option<ExplorerAction> {
+        self.handle_browser_command_for_workspace(command, context, false)
+    }
+
+    fn handle_browser_command_for_workspace(
+        &mut self,
+        command: BrowserCommand,
+        context: &egui::Context,
+        calibration_import_enabled: bool,
+    ) -> Option<ExplorerAction> {
         match command {
             BrowserCommand::NavigateUp => {
                 if let Some(parent) = self
@@ -582,7 +652,13 @@ impl ExplorerState {
                 self.start_active_monitor(context);
                 None
             }
-            BrowserCommand::Open(reference) => self.open_action_for(&reference),
+            BrowserCommand::Open(reference) => {
+                if calibration_import_enabled {
+                    self.calibration_open_action_for(&reference)
+                } else {
+                    self.open_action_for(&reference)
+                }
+            }
             BrowserCommand::Mutate(request) => {
                 self.begin_mutation(request, context);
                 None
@@ -859,6 +935,28 @@ impl ExplorerState {
         })
     }
 
+    fn calibration_open_action_for(&self, reference: &FileRef) -> Option<ExplorerAction> {
+        let view = self
+            .views()
+            .find(|view| view.source_id() == &reference.source_id)?;
+        let display_path = view.display_path(&reference.path);
+        let entry = view
+            .entries
+            .iter()
+            .find(|entry| entry.reference == *reference)?;
+        if !is_png_path(&reference.path) {
+            return Some(ExplorerAction::CalibrationImportRejected { display_path });
+        }
+        Some(ExplorerAction::AddCalibration(vec![
+            CalibrationImportCandidate {
+                display_path,
+                file_system: Arc::clone(&view.file_system),
+                entry: entry.clone(),
+                remote: view.is_remote(),
+            },
+        ]))
+    }
+
     fn active_view(&self) -> Option<&SourceView> {
         match self.mode {
             WorkspaceMode::Local => self.local_view.as_ref(),
@@ -887,6 +985,13 @@ impl ExplorerState {
             }
         })
     }
+}
+
+fn is_png_path(path: &SourcePath) -> bool {
+    path.file_name()
+        .and_then(|name| Path::new(name).extension())
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("png"))
 }
 
 fn execute_mutation(
