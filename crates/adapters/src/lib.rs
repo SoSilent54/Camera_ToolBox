@@ -1,5 +1,7 @@
 //! Camera Toolbox starter adapters.
 
+#[cfg(feature = "calibration-opencv")]
+pub mod calibration;
 pub mod filesystem;
 pub mod image_codec;
 pub mod local_raw;
@@ -13,6 +15,8 @@ pub mod platforms {
     pub mod ssh_managed;
 }
 
+#[cfg(feature = "calibration-opencv")]
+pub use calibration::OpenCvCalibrationBackend;
 pub use image_codec::ImageRasterCodec;
 pub use local_raw::LocalRawLoader;
 pub use platform_registry::{PlatformRegistry, PlatformRegistryError};

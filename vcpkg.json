@@ -1,0 +1,16 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "camera-toolbox-native-dependencies",
+  "version-string": "0.1.0",
+  "builtin-baseline": "a51bb4d1434e6d0927ff79db8033bed8522b85df",
+  "dependencies": [
+    {
+      "name": "opencv4",
+      "default-features": false,
+      "features": [
+        "calib3d",
+        "png"
+      ]
+    }
+  ]
+}

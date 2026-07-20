@@ -8,6 +8,7 @@ publish.workspace = true
 [features]
 default = ["platform-all"]
 platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
+calibration-opencv = ["dep:opencv"]
 platform-local = []
 platform-cv610 = ["dep:sha2", "dep:socket2"]
 platform-ssh = [
@@ -27,6 +28,7 @@ directories = { workspace = true, optional = true }
 image.workspace = true
 notify.workspace = true
 sha2 = { workspace = true, optional = true }
+opencv = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
 thiserror.workspace = true
 russh = { workspace = true, optional = true }
@@ -36,6 +38,8 @@ tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 
 [dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 
 [lints]

@@ -18,7 +18,8 @@ pub use platform::*;
 pub use raw_open::*;
 
 pub use ports::{
-    ArtifactError, ArtifactStore, CaptureBackend, ExposureControl, RasterCodecError, RasterFormat,
+    ArtifactError, ArtifactStore, CalibrationBackend, CalibrationBackendError,
+    CalibrationCancellation, CaptureBackend, ExposureControl, RasterCodecError, RasterFormat,
     RasterImageCodec, RawFrameLoadError, RawFrameLoader, ReadableCaptureBackend, RegisterRead,
     RegisterWrite, SensorIdentity,
 };

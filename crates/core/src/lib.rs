@@ -4,6 +4,7 @@
 
 pub mod analysis;
 pub mod asset;
+pub mod calibration;
 pub mod color;
 pub mod image;
 pub mod image_analysis;
@@ -20,6 +21,11 @@ pub use analysis::{
 pub use asset::{
     AssetError, AssetId, CaptureMetadata, ChromaOrder, EphemeralAsset, IntegrityState, MediaFormat,
     OwnedMediaPayload, OwnedMediaPlane,
+};
+pub use calibration::{
+    BoardSpec, CalibrationDataError, CalibrationImageSize, CalibrationPoint, CalibrationRequest,
+    CalibrationSolution, ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics,
+    PANGBOT_CALIBRATION_FLAGS, ViewCalibrationResult,
 };
 pub use color::{
     BayerPrepareDiagnostics, CfaQuad, CfaSite, ColorPipelineParams, ColorPixel,
