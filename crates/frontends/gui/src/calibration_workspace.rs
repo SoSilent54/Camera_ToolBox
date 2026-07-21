@@ -797,12 +797,7 @@ impl CalibrationWorkspace {
         let CalibrationItemStatus::Found(detection) = &item.status else {
             return;
         };
-        let map = |point: CalibrationPoint| {
-            egui::pos2(
-                image_rect.left() + point.x / width as f32 * image_rect.width(),
-                image_rect.top() + point.y / height as f32 * image_rect.height(),
-            )
-        };
+        let map = |point| image_point_to_preview(point, image_rect, width, height);
         let projected = calibration_view(self.session.installed(), id)
             .map(|view| view.projected_points.as_slice());
         for (index, observed) in detection.corners.iter().copied().enumerate() {
@@ -1166,6 +1161,20 @@ impl CalibrationWorkspace {
             Err(error) => self.status = format!("Serialize calibration result failed: {error}"),
         }
     }
+}
+
+/// OpenCV 以整数坐标表示像素中心；egui 的 `[0, 1]` UV 则覆盖纹理边界。
+/// 因此先加半个像素，才能把检测点准确落到纹理中的连续图像坐标。
+fn image_point_to_preview(
+    point: CalibrationPoint,
+    image_rect: egui::Rect,
+    image_width: u32,
+    image_height: u32,
+) -> egui::Pos2 {
+    egui::pos2(
+        image_rect.left() + (point.x + 0.5) / image_width as f32 * image_rect.width(),
+        image_rect.top() + (point.y + 0.5) / image_height as f32 * image_rect.height(),
+    )
 }
 
 fn paint_reprojection_vector(painter: &egui::Painter, observed: egui::Pos2, projected: egui::Pos2) {
@@ -1772,6 +1781,28 @@ mod tests {
         state.zoom_by(2.0, anchor, viewport);
         let after = (anchor - viewport.min - state.pan) / state.zoom;
         assert!((before - after).length() < 1e-4);
+    }
+
+    #[test]
+    fn preview_mapping_aligns_opencv_coordinates_with_texel_centers_at_64x() {
+        let scale = 64.0;
+        let image_rect = egui::Rect::from_min_size(
+            egui::pos2(13.0, 17.0),
+            egui::vec2(640.0 * scale, 480.0 * scale),
+        );
+
+        assert_eq!(
+            image_point_to_preview(CalibrationPoint::new(0.0, 0.0), image_rect, 640, 480),
+            image_rect.min + egui::vec2(0.5 * scale, 0.5 * scale)
+        );
+        assert_eq!(
+            image_point_to_preview(CalibrationPoint::new(119.5, 99.5), image_rect, 640, 480,),
+            image_rect.min + egui::vec2(120.0 * scale, 100.0 * scale)
+        );
+        assert_eq!(
+            image_point_to_preview(CalibrationPoint::new(639.0, 479.0), image_rect, 640, 480,),
+            image_rect.max - egui::vec2(0.5 * scale, 0.5 * scale)
+        );
     }
 
     #[test]
