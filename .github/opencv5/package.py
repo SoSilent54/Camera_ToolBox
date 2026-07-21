@@ -276,9 +276,20 @@ def discover_layout(package_root: Path, version: str) -> dict[str, Path | str]:
         package_root.rglob("opencv2/core/version.hpp"), "OpenCV version header"
     )
     include_dir = version_header.parents[2]
-    cmake_config = one_path(package_root.rglob("OpenCVConfig.cmake"), "OpenCVConfig.cmake")
-
     system = platform.system()
+    cmake_configs = list(package_root.rglob("OpenCVConfig.cmake"))
+    if system == "Windows":
+        # Windows 根配置会按当前架构和 MSVC 版本转发到嵌套配置。
+        cmake_config = package_root / "OpenCVConfig.cmake"
+        if not cmake_config.is_file():
+            raise RuntimeError(f"Windows OpenCV root config is missing: {cmake_config}")
+        one_path(
+            (path for path in cmake_configs if path != cmake_config),
+            "nested Windows OpenCVConfig.cmake",
+        )
+    else:
+        cmake_config = one_path(cmake_configs, "OpenCVConfig.cmake")
+
     version_digits = version.replace(".", "")
     if system == "Windows":
         link_pattern = re.compile(rf"opencv_world{re.escape(version_digits)}\.lib$", re.IGNORECASE)
