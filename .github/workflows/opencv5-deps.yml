@@ -4,7 +4,7 @@ name: OpenCV 5 Dependencies
   workflow_dispatch:
     inputs:
       revision:
-        description: "Immutable dependency recipe revision"
+        description: "Create-once dependency recipe revision"
         required: true
         default: "1"
         type: string
@@ -24,11 +24,13 @@ jobs:
   preflight:
     name: Validate dependency release request
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write
     outputs:
       release_tag: ${{ steps.validate.outputs.release_tag }}
       revision: ${{ steps.validate.outputs.revision }}
     steps:
-      - name: Validate main ref, revision, and immutable tag
+      - name: Validate main ref, revision, and unused release target
         id: validate
         shell: bash
         env:
@@ -46,8 +48,18 @@ jobs:
             exit 1
           fi
           release_tag="opencv-deps-v${OPENCV_VERSION}-r${REVISION}"
-          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}" >/dev/null 2>&1; then
-            echo "dependency tag already exists and is immutable: $release_tag" >&2
+          existing_tag_ref="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${release_tag}" \
+              --jq ".[] | select(.ref == \"refs/tags/${release_tag}\") | .ref"
+          )"
+          existing_release_tag="$(
+            gh api --method GET --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${release_tag}\") | .tag_name"
+          )"
+          if [[ -n "$existing_tag_ref" || -n "$existing_release_tag" ]]; then
+            echo "dependency tag or release already exists: $release_tag" >&2
             exit 1
           fi
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
@@ -481,7 +493,28 @@ jobs:
           done
           sha256sum -c -- "${checksums[@]}"
           sha256sum -- "${expected[@]}" > SHA256SUMS
-      - name: Publish immutable OpenCV dependency assets
+      - name: Recheck unused release target
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.preflight.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          existing_tag_ref="$(
+            gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/git/matching-refs/tags/${RELEASE_TAG}" \
+              --jq ".[] | select(.ref == \"refs/tags/${RELEASE_TAG}\") | .ref"
+          )"
+          existing_release_tag="$(
+            gh api --method GET --paginate \
+              "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+              --jq ".[] | select(.tag_name == \"${RELEASE_TAG}\") | .tag_name"
+          )"
+          if [[ -n "$existing_tag_ref" || -n "$existing_release_tag" ]]; then
+            echo "dependency tag or release appeared after preflight: $RELEASE_TAG" >&2
+            exit 1
+          fi
+      - name: Publish create-once OpenCV dependency assets
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ needs.preflight.outputs.release_tag }}
@@ -493,11 +526,13 @@ jobs:
             Source commit: `${{ env.OPENCV_COMMIT }}`
             Linkage: shared `opencv_world`
             Codec policy: bundled PNG/zlib only
+            Workflow policy: reject existing tags/releases and never overwrite assets.
 
             Each archive was removed from its original install path, extracted elsewhere,
             and validated with native CMake and `opencv-rust 0.99.0` consumers before upload.
           generate_release_notes: false
           fail_on_unmatched_files: true
+          overwrite_files: false
           make_latest: false
           prerelease: false
           files: |
