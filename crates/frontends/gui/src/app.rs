@@ -11,11 +11,15 @@ use std::{
     time::{Duration, Instant},
 };
 
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+use crate::calibration_eeprom::CalibrationProvisionIntent;
 #[cfg(feature = "calibration-opencv")]
-use crate::calibration_workspace::CalibrationWorkspace;
+use crate::calibration_workspace::{CalibrationExport, CalibrationWorkspace};
 
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+use crate::platform_ui::EepromProvisioningTarget;
 use crate::{
     analysis_panel::{DesiredAnalysis, render_analysis_panel},
     analysis_worker::{
@@ -25,6 +29,7 @@ use crate::{
     color_controls::{DisplayMode, render_color_controls},
     color_worker::{ColorRenderRequest, ColorRenderResult, ColorRenderWorker},
     explorer::{ExplorerAction, ExplorerState},
+    export_dialog::ExportNameDialogState,
     histogram_link::{
         DisplayHistogramImage, HistogramBinSelection, HistogramPixelSample, ImageHistogramHover,
         SpatialHighlight, SpatialHighlightRequest, SpatialHighlightResult, SpatialHighlightWorker,
@@ -52,10 +57,17 @@ use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::RusshTransportFactory;
 use camera_toolbox_app::{
-    AutoOpenActivation, FileRef, FileSystem, FsCancellation, FsControl, ImageFileKind,
-    ImageOpenMode, ImageOpenPipeline, ImageOpenResult, ImageSourceHandle, LocalRawAnalyzeReport,
-    LocalRawAnalyzeRequest, RasterFormat, RasterImageCodec, RawDecodeParams, RawInterpretation,
-    RawOpenMode, RawOpenPipeline, SourceCache, SourceReadProgress, WorkspaceSettings,
+    AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
+    FsCancellation, FsControl, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
+    ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterFormat,
+    RasterImageCodec, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline,
+    SourceCache, SourceReadProgress, WorkspaceSettings,
+};
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+use camera_toolbox_app::{
+    DumpCancellation, EepromDryRunResult, EepromHelperResult, EepromInspectResult,
+    EepromProvisionOperation, EepromProvisionServiceError, EepromWriteResult, ExportArtifact,
+    ExportService, RemoteOperationControl, RemoteTimeouts,
 };
 use camera_toolbox_core::{
     ChromaOrder, MediaFormat, NativeImage, OwnedMediaPayload, PackedRawSpec, Rgba8Frame, Roi,
@@ -140,8 +152,242 @@ struct YuvReinterpretJobResult {
 
 struct PendingYuvSave {
     key: SaveKey,
-    path: PathBuf,
+    destination: ExportDestination,
+    target_label: String,
+    file_name: EntryName,
     frame: Arc<Rgba8Frame>,
+}
+
+struct ImageExportSnapshot {
+    raw: Option<(SaveKey, Arc<camera_toolbox_core::RawFrame>)>,
+    display: Option<(SaveKey, Arc<Rgba8Frame>)>,
+}
+
+enum PendingNamedExport {
+    Image {
+        destination: ExportDestination,
+        directory_label: String,
+        snapshot: ImageExportSnapshot,
+    },
+    #[cfg(feature = "calibration-opencv")]
+    Calibration {
+        destination: ExportDestination,
+        directory_label: String,
+        export: CalibrationExport,
+    },
+}
+
+#[cfg(feature = "calibration-opencv")]
+struct CalibrationExportResult {
+    destination: ExportDestination,
+    target_label: String,
+    label: &'static str,
+    result: Result<ExportReceipt, String>,
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Debug)]
+enum EepromOperationOutcome {
+    Inspect(EepromInspectResult),
+    DryRun {
+        request: camera_toolbox_core::EepromProvisionRequest,
+        result: EepromDryRunResult,
+        backup_file: String,
+        manifest_file: String,
+    },
+    Provision {
+        result: EepromWriteResult,
+        audit_file: String,
+    },
+    ProvisionAuditFailed {
+        result: EepromWriteResult,
+        error: String,
+    },
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+struct EepromOperationResult {
+    target_label: String,
+    destination: Option<ExportDestination>,
+    result: Result<EepromOperationOutcome, String>,
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn run_eeprom_operation(
+    target: EepromProvisioningTarget,
+    intent: CalibrationProvisionIntent,
+    destination: Option<&ExportDestination>,
+    directory_label: Option<&str>,
+    operation_id: u64,
+    cancellation: DumpCancellation,
+) -> Result<EepromOperationOutcome, String> {
+    let action = intent
+        .helper_action()
+        .ok_or_else(|| "cancel is not an executable EEPROM helper action".to_owned())?;
+    let control = RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(30),
+            overall: Duration::from_secs(120),
+        },
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let operation = EepromProvisionOperation {
+        sensor_mode: target.sensor_mode.clone(),
+        action: action.clone(),
+    };
+    let helper_result = match target.service.execute(operation, control) {
+        Ok(result) => result,
+        Err(error) => {
+            let mut message = format_eeprom_service_error(&error);
+            if matches!(&intent, CalibrationProvisionIntent::Provision { .. })
+                && let (Some(destination), Some(directory_label)) = (destination, directory_label)
+            {
+                let document = serde_json::json!({
+                    "schema_version": 1,
+                    "operation": "eeprom_provision_failure",
+                    "target": target.label,
+                    "target_snapshot_sha256": target.snapshot_hash.to_hex(),
+                    "request": action,
+                    "failure": eeprom_failure_json(&error),
+                });
+                let name = format!("eeprom-write-failure-{operation_id:06}.json");
+                match persist_eeprom_json(destination, directory_label, &name, &document) {
+                    Ok(label) => message.push_str(&format!("; failure audit: {label}")),
+                    Err(audit_error) => message
+                        .push_str(&format!("; failure audit save also failed: {audit_error}")),
+                }
+            }
+            return Err(message);
+        }
+    };
+
+    match (intent, helper_result) {
+        (CalibrationProvisionIntent::Inspect, EepromHelperResult::Inspect(result)) => {
+            Ok(EepromOperationOutcome::Inspect(result))
+        }
+        (CalibrationProvisionIntent::DryRun { request }, EepromHelperResult::DryRun(result)) => {
+            let destination = destination
+                .ok_or_else(|| "dry-run backup destination is unavailable".to_owned())?;
+            let directory_label = directory_label
+                .ok_or_else(|| "dry-run destination label is unavailable".to_owned())?;
+            let hash_prefix = &result.state.image_sha256[..result.state.image_sha256.len().min(12)];
+            let backup_name = format!("eeprom-backup-{operation_id:06}-{hash_prefix}.bin");
+            let backup_file = persist_eeprom_bytes(
+                destination,
+                directory_label,
+                &backup_name,
+                result.backup.clone(),
+            )?;
+            let manifest_name = format!("eeprom-dry-run-{operation_id:06}.json");
+            let document = serde_json::json!({
+                "schema_version": 1,
+                "operation": "eeprom_dry_run",
+                "target": target.label,
+                "target_snapshot_sha256": target.snapshot_hash.to_hex(),
+                "request": request,
+                "device_state": result.state,
+                "page_plan": result.page_plan,
+                "dry_run_token": result.dry_run_token,
+                "backup_file": backup_file,
+                "backup_sha256": camera_toolbox_app::SnapshotHash::digest_bytes(&result.backup)
+                    .to_hex(),
+            });
+            let manifest_file =
+                persist_eeprom_json(destination, directory_label, &manifest_name, &document)?;
+            Ok(EepromOperationOutcome::DryRun {
+                request,
+                result,
+                backup_file,
+                manifest_file,
+            })
+        }
+        (CalibrationProvisionIntent::Provision { .. }, EepromHelperResult::Provision(result)) => {
+            let destination = destination
+                .ok_or_else(|| "provision audit destination is unavailable".to_owned())?;
+            let directory_label = directory_label
+                .ok_or_else(|| "provision destination label is unavailable".to_owned())?;
+            let audit_name = format!("eeprom-write-success-{operation_id:06}.json");
+            let document = serde_json::json!({
+                "schema_version": 1,
+                "operation": "eeprom_provision_success",
+                "target": target.label,
+                "target_snapshot_sha256": target.snapshot_hash.to_hex(),
+                "request": action,
+                "result": result,
+            });
+            match persist_eeprom_json(destination, directory_label, &audit_name, &document) {
+                Ok(audit_file) => Ok(EepromOperationOutcome::Provision { result, audit_file }),
+                Err(error) => Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }),
+            }
+        }
+        (_, unexpected) => Err(format!(
+            "EEPROM helper returned an unexpected result kind: {unexpected:?}"
+        )),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn persist_eeprom_json(
+    destination: &ExportDestination,
+    directory_label: &str,
+    name: &str,
+    document: &serde_json::Value,
+) -> Result<String, String> {
+    let mut bytes = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
+    bytes.push(b'\n');
+    persist_eeprom_bytes(destination, directory_label, name, bytes)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn persist_eeprom_bytes(
+    destination: &ExportDestination,
+    directory_label: &str,
+    name: &str,
+    bytes: Vec<u8>,
+) -> Result<String, String> {
+    let file_name = EntryName::new(name.to_owned()).map_err(|error| error.to_string())?;
+    let artifact = ExportArtifact::new(file_name.clone(), bytes);
+    ExportService
+        .save_new(
+            destination,
+            &artifact,
+            &FsControl::with_timeout(Duration::from_secs(60)),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok(CameraToolboxApp::export_target_label(
+        directory_label,
+        &file_name,
+    ))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn format_eeprom_service_error(error: &EepromProvisionServiceError) -> String {
+    match error {
+        EepromProvisionServiceError::Helper(failure) => format!(
+            "EEPROM helper failure: code={}, message={}, rollback={:?}, rollback_error={}",
+            failure.code,
+            failure.message,
+            failure.rollback,
+            failure.rollback_error.as_deref().unwrap_or("none")
+        ),
+        _ => error.to_string(),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_failure_json(error: &EepromProvisionServiceError) -> serde_json::Value {
+    match error {
+        EepromProvisionServiceError::Helper(failure) => serde_json::json!({
+            "kind": "helper",
+            "detail": failure,
+        }),
+        _ => serde_json::json!({
+            "kind": "service",
+            "message": error.to_string(),
+        }),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -163,12 +409,27 @@ pub(crate) struct CameraToolboxApp {
     empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
     yuv_save_dialog: YuvSaveDialogState,
+    export_name_dialog: ExportNameDialogState,
     raw_pipeline: RawOpenPipeline,
     image_pipeline: ImageOpenPipeline,
     color_worker: ColorRenderWorker,
     analysis_worker: AnalysisWorker,
     spatial_worker: SpatialHighlightWorker,
     save_worker: ImageSaveWorker,
+    #[cfg(feature = "calibration-opencv")]
+    calibration_export_sender: Sender<CalibrationExportResult>,
+    #[cfg(feature = "calibration-opencv")]
+    calibration_export_receiver: Receiver<CalibrationExportResult>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    eeprom_operation_sender: Sender<EepromOperationResult>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    eeprom_operation_receiver: Receiver<EepromOperationResult>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    active_eeprom_cancellation: Option<DumpCancellation>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    active_eeprom_cancellable: bool,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    next_eeprom_operation: u64,
     notifications: NotificationCenter,
     next_generation: u64,
     live_runtime: LiveRuntime,
@@ -179,6 +440,7 @@ pub(crate) struct CameraToolboxApp {
     active_raw_open: Option<ActiveRawOpenJob>,
     pending_auto_open: VecDeque<PendingAutoOpenRequest>,
     pending_yuv_save: Option<PendingYuvSave>,
+    pending_named_export: Option<PendingNamedExport>,
     auto_open_sender: Sender<AutoOpenJobResult>,
     auto_open_receiver: Receiver<AutoOpenJobResult>,
     active_auto_open: Option<ActiveAutoOpenJob>,
@@ -207,6 +469,10 @@ impl CameraToolboxApp {
         let (reinterpret_sender, reinterpret_receiver) = mpsc::channel();
         let (yuv_reinterpret_sender, yuv_reinterpret_receiver) = mpsc::channel();
         let (auto_open_sender, auto_open_receiver) = mpsc::channel();
+        #[cfg(feature = "calibration-opencv")]
+        let (calibration_export_sender, calibration_export_receiver) = mpsc::channel();
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        let (eeprom_operation_sender, eeprom_operation_receiver) = mpsc::channel();
         let live_runtime = LiveRuntime::new().map_err(std::io::Error::other)?;
         #[cfg(feature = "platform-ssh")]
         let explorer =
@@ -225,12 +491,27 @@ impl CameraToolboxApp {
             empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
             yuv_save_dialog: YuvSaveDialogState::default(),
+            export_name_dialog: ExportNameDialogState::default(),
             raw_pipeline,
             image_pipeline,
             color_worker: ColorRenderWorker::new(context)?,
             analysis_worker: AnalysisWorker::new(context)?,
             spatial_worker: SpatialHighlightWorker::new(context)?,
             save_worker: ImageSaveWorker::new(context, codec)?,
+            #[cfg(feature = "calibration-opencv")]
+            calibration_export_sender,
+            #[cfg(feature = "calibration-opencv")]
+            calibration_export_receiver,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            eeprom_operation_sender,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            eeprom_operation_receiver,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            active_eeprom_cancellation: None,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            active_eeprom_cancellable: false,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            next_eeprom_operation: 1,
             notifications: NotificationCenter::default(),
             next_generation: 1,
             live_runtime,
@@ -239,8 +520,9 @@ impl CameraToolboxApp {
             raw_open_sender,
             raw_open_receiver,
             active_raw_open: None,
-            pending_yuv_save: None,
             pending_auto_open: VecDeque::new(),
+            pending_yuv_save: None,
+            pending_named_export: None,
             auto_open_sender,
             auto_open_receiver,
             active_auto_open: None,
@@ -260,7 +542,11 @@ impl eframe::App for CameraToolboxApp {
         self.poll_color_result(&context);
         self.poll_analysis_result();
         self.poll_spatial_highlight_result();
-        self.poll_save_result();
+        self.poll_save_result(&context);
+        #[cfg(feature = "calibration-opencv")]
+        self.poll_calibration_export_result(&context);
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        self.poll_eeprom_operation_result(&context);
         self.poll_raw_open_result(&context);
         self.poll_auto_open_result(&context);
         self.enqueue_auto_open_candidates();
@@ -296,6 +582,7 @@ impl eframe::App for CameraToolboxApp {
         }
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
+        self.live_runtime.show_device_manager(&context);
         if !self.is_calibration_workspace() {
             let tab_action = egui::Panel::top("document_tabs")
                 .resizable(false)
@@ -305,6 +592,9 @@ impl eframe::App for CameraToolboxApp {
                 self.handle_tab_action(&context, action);
             }
         }
+        let calibration_workspace = self.is_calibration_workspace();
+        let live_running = !self.workspace.live_documents().is_empty();
+        let mut platform_action = None;
         let explorer_action = if self.explorer_panel_expanded {
             let mut collapse = false;
             let action = egui::Panel::left("workspace_explorer_panel")
@@ -321,8 +611,11 @@ impl eframe::App for CameraToolboxApp {
                         });
                     });
                     ui.separator();
-                    self.explorer
-                        .render(&context, ui, self.is_calibration_workspace())
+                    ui.collapsing("Platform Controls", |ui| {
+                        platform_action = self.live_runtime.render_panel(ui, live_running);
+                    });
+                    ui.separator();
+                    self.explorer.render(&context, ui, calibration_workspace)
                 })
                 .inner;
             if collapse {
@@ -346,6 +639,9 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = explorer_action {
             self.handle_explorer_action(&context, action);
         }
+        if let Some(action) = platform_action {
+            self.handle_platform_ui_action(&context, action);
+        }
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             #[cfg(feature = "calibration-opencv")]
             if self.is_calibration_workspace() {
@@ -360,12 +656,38 @@ impl eframe::App for CameraToolboxApp {
             self.render_yuv_inspector_panel(ui);
         }
 
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_provision_label: Result<String, String> = {
+            #[cfg(feature = "platform-ssh")]
+            {
+                self.live_runtime
+                    .eeprom_provisioning_target()
+                    .map(|target| target.label)
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                Err("This build does not include SSH EEPROM provisioning.".to_owned())
+            }
+        };
+
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_export_error = self.explorer.active_save_destination().err();
+
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
                 #[cfg(feature = "calibration-opencv")]
                 if self.is_calibration_workspace() {
                     return ViewerOutput {
-                        rect: self.calibration.render(&context, ui),
+                        rect: self.calibration.render(
+                            &context,
+                            ui,
+                            calibration_export_error.is_none(),
+                            calibration_export_error.as_deref(),
+                            calibration_provision_label
+                                .as_ref()
+                                .map(|label| label.as_str())
+                                .map_err(|error| error.as_str()),
+                        ),
                         action: None,
                     };
                 }
@@ -411,6 +733,15 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
         }
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        if let Some(intent) = self.calibration.take_provision_intent() {
+            self.begin_eeprom_operation(&context, intent);
+        }
+        #[cfg(feature = "calibration-opencv")]
+        if let Some(export) = self.calibration.take_export() {
+            self.begin_calibration_export(export);
+        }
+        self.render_named_export_dialog(&context);
         self.render_yuv_save_dialog(&context);
         self.notifications.render(
             &context,
@@ -483,6 +814,8 @@ impl CameraToolboxApp {
             });
             ui.separator();
             self.render_product_workspace_switch(ui);
+            ui.separator();
+            self.live_runtime.render_target_toolbar(ui);
         });
         if request_color {
             self.request_current_color();
@@ -1733,14 +2066,16 @@ impl CameraToolboxApp {
         self.raw_dialog.close(context);
     }
 
-    fn render_yuv_save_dialog(&mut self, _context: &egui::Context) {
-        if let Some((chroma_order, matrix, range)) = self.yuv_save_dialog.show(_context) {
+    fn render_yuv_save_dialog(&mut self, context: &egui::Context) {
+        if let Some((chroma_order, matrix, range)) = self.yuv_save_dialog.show(context) {
             let Some(pending) = self.pending_yuv_save.take() else {
                 return;
             };
             self.save_worker.submit(SaveRequest {
                 key: pending.key,
-                path: pending.path,
+                destination: pending.destination,
+                target_label: pending.target_label,
+                file_name: pending.file_name,
                 format: SaveFormat::Yuv420Sp {
                     chroma_order,
                     matrix,
@@ -1753,171 +2088,454 @@ impl CameraToolboxApp {
         }
     }
 
-    fn start_save_active_image(&mut self, _context: &egui::Context) -> bool {
-        let Some((default_name, can_save_raw)) = self.active_save_defaults() else {
-            return false;
+    fn render_named_export_dialog(&mut self, context: &egui::Context) {
+        let Some(pending) = self.pending_named_export.as_ref() else {
+            return;
         };
-        let Some(path) = rfd::FileDialog::new()
-            .add_filter("Image", &["png", "raw", "nv12", "nv21", "yuv"])
-            .set_file_name(default_name)
-            .save_file()
-        else {
-            return false;
+        let directory_label = match pending {
+            PendingNamedExport::Image {
+                directory_label, ..
+            } => directory_label.clone(),
+            #[cfg(feature = "calibration-opencv")]
+            PendingNamedExport::Calibration {
+                directory_label, ..
+            } => directory_label.clone(),
         };
-        let extension = path
-            .extension()
-            .and_then(|extension| extension.to_str())
-            .map(str::to_ascii_lowercase);
-        match extension.as_deref() {
-            Some("raw") if can_save_raw => self.submit_raw_save(path),
-            Some("raw") => {
-                if let Some(key) = self.active_save_key() {
-                    self.notify_save_error(
-                        key,
-                        "RAW save requires authoritative native RAW data".to_owned(),
-                    );
-                }
-                false
+        let accepted = self.export_name_dialog.show(context, &directory_label);
+        if let Some(file_name) = accepted {
+            let pending = self
+                .pending_named_export
+                .take()
+                .expect("an open export dialog has a pending export");
+            match pending {
+                PendingNamedExport::Image {
+                    destination,
+                    directory_label,
+                    snapshot,
+                } => self.route_image_export(destination, directory_label, file_name, snapshot),
+                #[cfg(feature = "calibration-opencv")]
+                PendingNamedExport::Calibration {
+                    destination,
+                    directory_label,
+                    export,
+                } => self.submit_calibration_export(
+                    context,
+                    destination,
+                    directory_label,
+                    file_name,
+                    export,
+                ),
             }
-            Some("png") => self.submit_png_save(path),
-            Some("nv12") | Some("nv21") | Some("yuv") => self.prepare_yuv_save(path),
-            _ => {
-                if let Some(key) = self.active_save_key() {
-                    self.notify_save_error(
-                        key,
-                        "choose a .raw, .png, .nv12, .nv21, or .yuv destination".to_owned(),
-                    );
-                }
-                false
-            }
+        } else if !self.export_name_dialog.is_open() {
+            self.pending_named_export = None;
         }
     }
 
-    fn active_save_defaults(&self) -> Option<(String, bool)> {
+    fn start_save_active_image(&mut self, _context: &egui::Context) -> bool {
+        let Some(default_name) = self.active_save_default_name() else {
+            return false;
+        };
+        let Some(snapshot) = self.active_image_export_snapshot() else {
+            return false;
+        };
+        let destination = match self.explorer.active_save_destination() {
+            Ok(destination) => destination,
+            Err(error) => {
+                if let Some(key) = Self::snapshot_key(&snapshot) {
+                    self.notify_save_error(key, error);
+                }
+                return false;
+            }
+        };
+        let directory_label = self
+            .explorer
+            .active_save_target_label()
+            .unwrap_or_else(|| "Workspace".to_owned());
+        self.pending_named_export = Some(PendingNamedExport::Image {
+            destination,
+            directory_label,
+            snapshot,
+        });
+        self.export_name_dialog
+            .open("Save image to Workspace", default_name);
+        true
+    }
+
+    fn active_save_default_name(&self) -> Option<String> {
         if let Some(document) = self.workspace.active() {
             let stem = document
                 .title
                 .strip_suffix(".raw")
                 .unwrap_or(&document.title);
-            return Some((format!("{stem}.raw"), true));
+            return Some(format!("{stem}.raw"));
         }
         let document = self.workspace.active_image()?;
         let stem = document
             .title
             .rsplit_once('.')
             .map_or(document.title.as_str(), |(stem, _)| stem);
-        Some((format!("{stem}.png"), false))
+        Some(format!("{stem}.png"))
     }
 
-    fn active_save_key(&self) -> Option<SaveKey> {
+    fn active_image_export_snapshot(&self) -> Option<ImageExportSnapshot> {
         if let Some(document) = self.workspace.active() {
-            return Some(SaveKey {
+            let raw_key = SaveKey {
                 document_id: document.id,
                 generation: document.loaded.generation,
                 revision: document.decode_generation,
+            };
+            let display = document.loaded.installed_color.as_ref().map(|preview| {
+                (
+                    SaveKey {
+                        document_id: document.id,
+                        generation: document.loaded.generation,
+                        revision: preview.rendered_revision,
+                    },
+                    Arc::clone(&preview.frame),
+                )
+            });
+            return Some(ImageExportSnapshot {
+                raw: Some((raw_key, Arc::clone(&document.loaded.frame))),
+                display,
             });
         }
         let document = self.workspace.active_image()?;
-        Some(SaveKey {
-            document_id: document.id,
-            generation: document.generation,
-            revision: document.display.revision,
+        Some(ImageExportSnapshot {
+            raw: None,
+            display: Some((
+                SaveKey {
+                    document_id: document.id,
+                    generation: document.generation,
+                    revision: document.display.revision,
+                },
+                Arc::clone(&document.display.frame),
+            )),
         })
     }
 
-    fn submit_raw_save(&mut self, path: PathBuf) -> bool {
-        let Some(document) = self.workspace.active() else {
-            return false;
-        };
-        let key = SaveKey {
-            document_id: document.id,
-            generation: document.loaded.generation,
-            revision: document.decode_generation,
-        };
-        self.save_worker.submit(SaveRequest {
-            key,
-            path,
-            format: SaveFormat::RawU16Le,
-            payload: SavePayload::Raw(Arc::clone(&document.loaded.frame)),
-        });
-        true
+    fn snapshot_key(snapshot: &ImageExportSnapshot) -> Option<SaveKey> {
+        snapshot
+            .raw
+            .as_ref()
+            .map(|(key, _)| *key)
+            .or_else(|| snapshot.display.as_ref().map(|(key, _)| *key))
     }
 
-    fn submit_png_save(&mut self, path: PathBuf) -> bool {
-        let Some((key, frame)) = self.active_display_save_snapshot() else {
-            if let Some(key) = self.active_save_key() {
-                self.notify_save_error(
-                    key,
-                    "PNG save requires an available immutable display revision".to_owned(),
-                );
-            }
-            return false;
-        };
-        self.save_worker.submit(SaveRequest {
-            key,
-            path,
-            format: SaveFormat::Png,
-            payload: SavePayload::Display(frame),
-        });
-        true
-    }
-
-    fn prepare_yuv_save(&mut self, path: PathBuf) -> bool {
-        let Some((key, frame)) = self.active_display_save_snapshot() else {
-            if let Some(key) = self.active_save_key() {
-                self.notify_save_error(
-                    key,
-                    "YUV save requires an available immutable display revision".to_owned(),
-                );
-            }
-            return false;
-        };
-        let extension = path
+    fn route_image_export(
+        &mut self,
+        destination: ExportDestination,
+        directory_label: String,
+        file_name: EntryName,
+        snapshot: ImageExportSnapshot,
+    ) {
+        let extension = Path::new(file_name.as_str())
             .extension()
             .and_then(|extension| extension.to_str())
             .map(str::to_ascii_lowercase);
-        let chroma_order_hint = match extension.as_deref() {
-            Some("nv12") => Some(ChromaOrder::Uv),
-            Some("nv21") => Some(ChromaOrder::Vu),
-            _ => None,
-        };
-        let (matrix, range) = self.active_yuv_save_defaults();
-        self.pending_yuv_save = Some(PendingYuvSave {
-            key,
-            path: path.clone(),
-            frame: Arc::clone(&frame),
-        });
-        self.yuv_save_dialog.open(
-            path,
-            [frame.width, frame.height],
-            chroma_order_hint,
-            matrix,
-            range,
-        );
-        true
+        let target_label = Self::export_target_label(&directory_label, &file_name);
+        match extension.as_deref() {
+            Some("raw") => match snapshot.raw {
+                Some((key, frame)) => self.save_worker.submit(SaveRequest {
+                    key,
+                    destination,
+                    target_label,
+                    file_name,
+                    format: SaveFormat::RawU16Le,
+                    payload: SavePayload::Raw(frame),
+                }),
+                None => {
+                    if let Some(key) = snapshot.display.as_ref().map(|(key, _)| *key) {
+                        self.notify_save_error(
+                            key,
+                            "RAW save requires authoritative native RAW data".to_owned(),
+                        );
+                    }
+                }
+            },
+            Some("png") => match snapshot.display {
+                Some((key, frame)) => self.save_worker.submit(SaveRequest {
+                    key,
+                    destination,
+                    target_label,
+                    file_name,
+                    format: SaveFormat::Png,
+                    payload: SavePayload::Display(frame),
+                }),
+                None => {
+                    if let Some(key) = snapshot.raw.as_ref().map(|(key, _)| *key) {
+                        self.notify_save_error(
+                            key,
+                            "PNG save requires an available immutable display revision".to_owned(),
+                        );
+                    }
+                }
+            },
+            Some("nv12") | Some("nv21") | Some("yuv") => match snapshot.display {
+                Some((key, frame)) => {
+                    let chroma_order_hint = match extension.as_deref() {
+                        Some("nv12") => Some(ChromaOrder::Uv),
+                        Some("nv21") => Some(ChromaOrder::Vu),
+                        _ => None,
+                    };
+                    let (matrix, range) = self.active_yuv_save_defaults();
+                    self.pending_yuv_save = Some(PendingYuvSave {
+                        key,
+                        destination,
+                        target_label: target_label.clone(),
+                        file_name,
+                        frame: Arc::clone(&frame),
+                    });
+                    self.yuv_save_dialog.open(
+                        target_label,
+                        [frame.width, frame.height],
+                        chroma_order_hint,
+                        matrix,
+                        range,
+                    );
+                }
+                None => {
+                    if let Some(key) = snapshot.raw.as_ref().map(|(key, _)| *key) {
+                        self.notify_save_error(
+                            key,
+                            "YUV save requires an available immutable display revision".to_owned(),
+                        );
+                    }
+                }
+            },
+            _ => {
+                if let Some(key) = Self::snapshot_key(&snapshot) {
+                    self.notify_save_error(
+                        key,
+                        "choose a .raw, .png, .nv12, .nv21, or .yuv file name".to_owned(),
+                    );
+                }
+            }
+        }
     }
 
-    fn active_display_save_snapshot(&self) -> Option<(SaveKey, Arc<Rgba8Frame>)> {
-        if let Some(document) = self.workspace.active() {
-            let preview = document.loaded.installed_color.as_ref()?;
-            return Some((
-                SaveKey {
-                    document_id: document.id,
-                    generation: document.loaded.generation,
-                    revision: preview.rendered_revision,
-                },
-                Arc::clone(&preview.frame),
+    fn export_target_label(directory_label: &str, file_name: &EntryName) -> String {
+        if directory_label.ends_with('/') {
+            format!("{directory_label}{}", file_name.as_str())
+        } else {
+            format!("{directory_label}/{}", file_name.as_str())
+        }
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn begin_calibration_export(&mut self, export: CalibrationExport) {
+        let destination = match self.explorer.active_save_destination() {
+            Ok(destination) => destination,
+            Err(error) => {
+                self.calibration
+                    .report_export_finished(export.label(), "Workspace", Err(&error));
+                return;
+            }
+        };
+        let directory_label = self
+            .explorer
+            .active_save_target_label()
+            .unwrap_or_else(|| "Workspace".to_owned());
+        let suggested_name = export.suggested_name();
+        self.pending_named_export = Some(PendingNamedExport::Calibration {
+            destination,
+            directory_label,
+            export,
+        });
+        self.export_name_dialog
+            .open("Export calibration to Workspace", suggested_name);
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn submit_calibration_export(
+        &mut self,
+        context: &egui::Context,
+        destination: ExportDestination,
+        directory_label: String,
+        file_name: EntryName,
+        export: CalibrationExport,
+    ) {
+        let target_label = Self::export_target_label(&directory_label, &file_name);
+        let label = export.label();
+        self.calibration.report_export_started(label, &target_label);
+        let sender = self.calibration_export_sender.clone();
+        let worker_context = context.clone();
+        let worker_destination = destination.clone();
+        let worker_target_label = target_label.clone();
+        let spawn_result = thread::Builder::new()
+            .name("camera-toolbox-calibration-export".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    export.save_new(
+                        &worker_destination,
+                        &file_name,
+                        &FsControl::with_timeout(Duration::from_secs(60)),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(camera_toolbox_app::FileSystemError::Io(
+                        "calibration export worker panicked".to_owned(),
+                    ))
+                })
+                .map_err(|error| error.to_string());
+                let _ = sender.send(CalibrationExportResult {
+                    destination: worker_destination,
+                    target_label: worker_target_label,
+                    label,
+                    result,
+                });
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.calibration.report_export_finished(
+                label,
+                &target_label,
+                Err(&format!("start export worker failed: {error}")),
+            );
+        }
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn poll_calibration_export_result(&mut self, context: &egui::Context) {
+        while let Ok(result) = self.calibration_export_receiver.try_recv() {
+            match result.result {
+                Ok(receipt) => {
+                    self.explorer
+                        .refresh_save_destination(&result.destination, context);
+                    self.calibration.report_export_finished(
+                        result.label,
+                        &result.target_label,
+                        Ok(receipt.bytes_written()),
+                    );
+                }
+                Err(error) => self.calibration.report_export_finished(
+                    result.label,
+                    &result.target_label,
+                    Err(&error),
+                ),
+            }
+        }
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn begin_eeprom_operation(
+        &mut self,
+        context: &egui::Context,
+        intent: CalibrationProvisionIntent,
+    ) {
+        if matches!(&intent, CalibrationProvisionIntent::Cancel) {
+            if !self.active_eeprom_cancellable {
+                self.calibration.report_provision_error(
+                    "No cancellable EEPROM inspect/dry-run operation is active.",
+                );
+            } else if let Some(cancellation) = &self.active_eeprom_cancellation {
+                cancellation.cancel();
+            }
+            return;
+        }
+        if self.active_eeprom_cancellation.is_some() {
+            self.calibration
+                .report_provision_error("An EEPROM operation is already active.");
+            return;
+        }
+        let target = match self.live_runtime.eeprom_provisioning_target() {
+            Ok(target) => target,
+            Err(error) => {
+                self.calibration.report_provision_error(error);
+                return;
+            }
+        };
+        let needs_destination = !matches!(&intent, CalibrationProvisionIntent::Inspect);
+        let destination = if needs_destination {
+            match self.explorer.active_save_destination() {
+                Ok(destination) => Some(destination),
+                Err(error) => {
+                    self.calibration.report_provision_error(format!(
+                        "EEPROM backup/audit destination is unavailable: {error}"
+                    ));
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let directory_label = destination.as_ref().map(|_| {
+            self.explorer
+                .active_save_target_label()
+                .unwrap_or_else(|| "Workspace".to_owned())
+        });
+        let operation_id = self.next_eeprom_operation;
+        self.next_eeprom_operation = self.next_eeprom_operation.wrapping_add(1).max(1);
+        let cancellation = DumpCancellation::default();
+        self.active_eeprom_cancellation = Some(cancellation.clone());
+        self.active_eeprom_cancellable =
+            !matches!(&intent, CalibrationProvisionIntent::Provision { .. });
+        let sender = self.eeprom_operation_sender.clone();
+        let worker_context = context.clone();
+        let target_label = target.label.clone();
+        let worker_destination = destination.clone();
+        let spawn_result = thread::Builder::new()
+            .name("camera-toolbox-eeprom-operation".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_eeprom_operation(
+                        target,
+                        intent,
+                        worker_destination.as_ref(),
+                        directory_label.as_deref(),
+                        operation_id,
+                        cancellation,
+                    )
+                }))
+                .unwrap_or_else(|_| Err("EEPROM operation worker panicked".to_owned()));
+                let _ = sender.send(EepromOperationResult {
+                    target_label,
+                    destination: worker_destination,
+                    result,
+                });
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.active_eeprom_cancellation = None;
+            self.active_eeprom_cancellable = false;
+            self.calibration.report_provision_error(format!(
+                "Failed to start EEPROM operation worker: {error}"
             ));
         }
-        let document = self.workspace.active_image()?;
-        Some((
-            SaveKey {
-                document_id: document.id,
-                generation: document.generation,
-                revision: document.display.revision,
-            },
-            Arc::clone(&document.display.frame),
-        ))
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn poll_eeprom_operation_result(&mut self, context: &egui::Context) {
+        while let Ok(operation) = self.eeprom_operation_receiver.try_recv() {
+            self.active_eeprom_cancellation = None;
+            self.active_eeprom_cancellable = false;
+            if let Some(destination) = &operation.destination {
+                self.explorer.refresh_save_destination(destination, context);
+            }
+            match operation.result {
+                Ok(EepromOperationOutcome::Inspect(result)) => self
+                    .calibration
+                    .report_eeprom_inspect(operation.target_label, result),
+                Ok(EepromOperationOutcome::DryRun {
+                    request,
+                    result,
+                    backup_file,
+                    manifest_file,
+                }) => self.calibration.report_eeprom_dry_run(
+                    operation.target_label,
+                    request,
+                    result,
+                    backup_file,
+                    manifest_file,
+                ),
+                Ok(EepromOperationOutcome::Provision { result, audit_file }) => self
+                    .calibration
+                    .report_eeprom_provision(operation.target_label, &result, audit_file),
+                Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }) => self
+                    .calibration
+                    .report_eeprom_provision_audit_error(operation.target_label, &result, &error),
+                Err(error) => self.calibration.report_provision_error(error),
+            }
+        }
     }
 
     fn active_yuv_save_defaults(&self) -> (YuvMatrix, YuvRange) {
@@ -1929,15 +2547,19 @@ impl CameraToolboxApp {
         (YuvMatrix::Bt601, YuvRange::Limited)
     }
 
-    fn poll_save_result(&mut self) {
+    fn poll_save_result(&mut self, context: &egui::Context) {
         while let Some(result) = self.save_worker.take_ready() {
+            if result.result.is_ok() {
+                self.explorer
+                    .refresh_save_destination(&result.destination, context);
+            }
             self.install_save_result(result);
         }
     }
 
     fn install_save_result(&mut self, result: SaveResult) {
         match result.result {
-            Ok(()) => {
+            Ok(bytes_written) => {
                 if let Some(document) = self.workspace.image_mut(result.key.document_id)
                     && document.generation == result.key.generation
                 {
@@ -1948,7 +2570,8 @@ impl CameraToolboxApp {
                     document_id = %result.key.document_id,
                     generation = result.key.generation,
                     revision = result.key.revision,
-                    path = %result.path.display(),
+                    path = %result.target_label,
+                    bytes_written,
                     format = ?result.format,
                     "saved image"
                 );

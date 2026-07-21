@@ -740,7 +740,7 @@ fn sftp_workspace_loads_and_polls_session_source() {
                 host: "camera.test".to_owned(),
                 port: 22,
                 username: "root".to_owned(),
-                expected_host_key: None,
+                expected_host_key: Some("memory-host-key".to_owned()),
                 authentication: RemoteAuthentication::Password {
                     slot_id: "test".to_owned(),
                 },

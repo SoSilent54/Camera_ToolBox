@@ -2,6 +2,7 @@
 
 pub mod asset;
 pub mod calibration;
+pub mod export;
 pub mod filesystem;
 pub mod image_io;
 pub mod platform;
@@ -19,6 +20,7 @@ pub use calibration::{
     CalibrationSession, CalibrationSessionError, CalibrationSnapshot, InstalledCalibration,
     MIN_CALIBRATION_VIEWS, read_calibration_png,
 };
+pub use export::{ExportArtifact, ExportDestination, ExportReceipt, ExportService};
 pub use filesystem::*;
 pub use image_io::*;
 pub use platform::*;

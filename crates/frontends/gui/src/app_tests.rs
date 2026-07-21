@@ -2,8 +2,8 @@ use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
 use std::{path::PathBuf, sync::Arc};
 
 use camera_toolbox_app::{
-    FileRef, FileSourceId, FsCancellation, ImageOpenMode, LocalRawAnalyzeReport, RasterImageCodec,
-    SourcePath, SourceReadProgress,
+    DirectoryRef, ExportDestination, FileRef, FileSourceId, FsCancellation, ImageOpenMode,
+    LocalRawAnalyzeReport, RasterImageCodec, SourcePath, SourceReadProgress,
 };
 use camera_toolbox_core::{
     AssetId, BayerPattern, CaptureMetadata, ChromaOrder, EphemeralAsset, IntegrityState,
@@ -49,6 +49,14 @@ fn run_app_frame(
     };
     input.events = events;
     context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
+}
+
+fn test_export_destination() -> ExportDestination {
+    let source_id = FileSourceId::new("gui-save-result-test").unwrap();
+    let root = std::env::current_dir().unwrap();
+    let file_system: Arc<dyn camera_toolbox_app::FileSystem> =
+        Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
+    ExportDestination::new(DirectoryRef::root(source_id), file_system).unwrap()
 }
 
 fn loaded_raw(context: &egui::Context, name: &str, generation: u64) -> LoadedRaw {
@@ -810,15 +818,17 @@ fn image_save_does_not_clear_captured_raw_source_prompt() {
     );
     assert!(app.workspace.document(id).unwrap().unsaved);
 
+    let destination = test_export_destination();
     app.install_save_result(SaveResult {
         key: SaveKey {
             document_id: id,
             generation: 7,
             revision: 1,
         },
-        path: PathBuf::from("display.png"),
+        destination: destination.clone(),
+        target_label: "display.png".to_owned(),
         format: SaveFormat::Png,
-        result: Ok(()),
+        result: Ok(4),
     });
     assert!(app.workspace.document(id).unwrap().unsaved);
 
@@ -828,9 +838,10 @@ fn image_save_does_not_clear_captured_raw_source_prompt() {
             generation: 7,
             revision: 1,
         },
-        path: PathBuf::from("capture.raw"),
+        destination,
+        target_label: "capture.raw".to_owned(),
         format: SaveFormat::RawU16Le,
-        result: Ok(()),
+        result: Ok(4),
     });
     assert!(app.workspace.document(id).unwrap().unsaved);
 }
@@ -1249,4 +1260,168 @@ fn calibration_workspace_switch_preserves_viewer_documents() {
     assert_eq!(app.workspace.active_id(), viewer_document);
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+mod eeprom_operation_tests {
+    use super::super::*;
+    use std::{
+        fs,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use camera_toolbox_adapters::filesystem::LocalFileSystem;
+    use camera_toolbox_app::{
+        DirectoryRef, EepromDeviceState, EepromHelperFailure, EepromProvisionService,
+        EepromRollbackState, EepromSerialState, FileSourceId, SensorId, SnapshotHash,
+    };
+    use camera_toolbox_core::{
+        EepromProvisionRequest, EepromProvisioningMode, YG_STEREO_P24C64G_IMAGE_BYTES,
+        YG_STEREO_P24C64G_V1_MAP_ID,
+    };
+
+    #[derive(Clone)]
+    struct FixedEepromService {
+        result: Result<EepromHelperResult, EepromProvisionServiceError>,
+    }
+
+    impl EepromProvisionService for FixedEepromService {
+        fn service_id(&self) -> &str {
+            "fixed-test-eeprom"
+        }
+
+        fn execute(
+            &self,
+            _request: EepromProvisionOperation,
+            _control: RemoteOperationControl,
+        ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
+            self.result.clone()
+        }
+    }
+
+    fn state(hash: char) -> EepromDeviceState {
+        EepromDeviceState {
+            image_sha256: hash.to_string().repeat(64),
+            flag_valid: false,
+            serial: EepromSerialState::Empty,
+        }
+    }
+
+    fn request() -> EepromProvisionRequest {
+        EepromProvisionRequest {
+            map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
+            mode: EepromProvisioningMode::UpdateCalibration,
+            serial_number: "2T02D2567K0042".to_owned(),
+            overwrite_existing_serial: false,
+            segments: Vec::new(),
+        }
+    }
+
+    fn target(
+        result: Result<EepromHelperResult, EepromProvisionServiceError>,
+    ) -> EepromProvisioningTarget {
+        EepromProvisioningTarget {
+            service: Arc::new(FixedEepromService { result }),
+            sensor_mode: camera_toolbox_app::SensorModeKey {
+                sensor_id: SensorId::new("sensor-a").unwrap(),
+                mode_id: "mode-a".to_owned(),
+            },
+            snapshot_hash: SnapshotHash::digest_bytes(b"target"),
+            label: "SSH Camera / sensor-a:mode-a @test".to_owned(),
+        }
+    }
+
+    fn destination() -> (std::path::PathBuf, ExportDestination) {
+        let suffix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("camera-toolbox-eeprom-{suffix}"));
+        fs::create_dir_all(&root).unwrap();
+        let source_id = FileSourceId::new(format!("eeprom-worker-{suffix}")).unwrap();
+        let file_system: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
+        let destination =
+            ExportDestination::new(DirectoryRef::root(source_id), file_system).unwrap();
+        (root, destination)
+    }
+
+    #[test]
+    fn dry_run_persists_exact_backup_before_manifest() {
+        let backup = vec![0x5a; YG_STEREO_P24C64G_IMAGE_BYTES];
+        let helper = EepromHelperResult::DryRun(EepromDryRunResult {
+            state: state('a'),
+            backup: backup.clone(),
+            page_plan: Vec::new(),
+            dry_run_token: "b".repeat(64),
+        });
+        let (root, destination) = destination();
+
+        let outcome = run_eeprom_operation(
+            target(Ok(helper)),
+            CalibrationProvisionIntent::DryRun { request: request() },
+            Some(&destination),
+            Some(root.to_str().unwrap()),
+            42,
+            DumpCancellation::default(),
+        )
+        .unwrap();
+
+        let EepromOperationOutcome::DryRun {
+            backup_file,
+            manifest_file,
+            ..
+        } = outcome
+        else {
+            panic!("expected dry-run outcome")
+        };
+        let backup_path = root.join("eeprom-backup-000042-aaaaaaaaaaaa.bin");
+        let manifest_path = root.join("eeprom-dry-run-000042.json");
+        assert_eq!(fs::read(&backup_path).unwrap(), backup);
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["operation"], "eeprom_dry_run");
+        assert_eq!(manifest["dry_run_token"], "b".repeat(64));
+        assert!(backup_file.ends_with("eeprom-backup-000042-aaaaaaaaaaaa.bin"));
+        assert!(manifest_file.ends_with("eeprom-dry-run-000042.json"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provision_failure_saves_structured_rollback_audit() {
+        let failure = EepromHelperFailure {
+            code: "write_failed".to_owned(),
+            message: "simulated page failure".to_owned(),
+            before: Some(state('a')),
+            backup: vec![0x5a; YG_STEREO_P24C64G_IMAGE_BYTES],
+            rollback: EepromRollbackState::Restored,
+            rollback_error: None,
+        };
+        let (root, destination) = destination();
+
+        let error = run_eeprom_operation(
+            target(Err(EepromProvisionServiceError::Helper(failure))),
+            CalibrationProvisionIntent::Provision {
+                request: request(),
+                expected_before_sha256: "a".repeat(64),
+                dry_run_token: "b".repeat(64),
+            },
+            Some(&destination),
+            Some(root.to_str().unwrap()),
+            43,
+            DumpCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("rollback=Restored"));
+        let audit: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("eeprom-write-failure-000043.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(audit["operation"], "eeprom_provision_failure");
+        assert_eq!(audit["failure"]["detail"]["code"], "write_failed");
+        assert_eq!(audit["failure"]["detail"]["rollback"], "restored");
+        fs::remove_dir_all(root).unwrap();
+    }
 }

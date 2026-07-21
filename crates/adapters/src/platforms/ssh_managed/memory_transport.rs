@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    io,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -32,6 +33,7 @@ struct MemoryTransportState {
     event_error: Option<SshTransportError>,
     command_output: TransportCommandOutput,
     captured_argv: Vec<Vec<String>>,
+    captured_stdin: Vec<Vec<u8>>,
     read_calls: usize,
     read_chunk_bytes: usize,
     read_delay: Duration,
@@ -63,6 +65,7 @@ impl MemorySshTransport {
                     stderr_truncated: false,
                 },
                 captured_argv: Vec::new(),
+                captured_stdin: Vec::new(),
                 read_calls: 0,
                 read_chunk_bytes: 64 * 1024,
                 read_delay: Duration::ZERO,
@@ -93,6 +96,11 @@ impl MemorySshTransport {
     pub fn contains_path(&self, path: &str) -> bool {
         let state = self.lock();
         state.files.contains_key(path) || state.directories.contains(path)
+    }
+
+    #[must_use]
+    pub fn file_bytes(&self, path: &str) -> Option<Vec<u8>> {
+        self.lock().files.get(path).map(|file| file.bytes.clone())
     }
 
     pub fn set_canonical_path(&self, path: impl Into<String>, canonical: impl Into<String>) {
@@ -128,6 +136,11 @@ impl MemorySshTransport {
     #[must_use]
     pub fn captured_argv(&self) -> Vec<Vec<String>> {
         self.lock().captured_argv.clone()
+    }
+
+    #[must_use]
+    pub fn captured_stdin(&self) -> Vec<Vec<u8>> {
+        self.lock().captured_stdin.clone()
     }
 
     #[must_use]
@@ -190,6 +203,36 @@ impl MemorySshSession {
     }
 }
 
+struct MemoryWriteSink<'a> {
+    bytes: Vec<u8>,
+    control: &'a RemoteOperationControl,
+    failure: Option<SshTransportError>,
+}
+
+impl MemoryWriteSink<'_> {
+    fn checkpoint(&mut self) -> io::Result<()> {
+        match check_control(self.control) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.failure = Some(error.clone());
+                Err(io::Error::other(error.to_string()))
+            }
+        }
+    }
+}
+
+impl io::Write for MemoryWriteSink<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.checkpoint()?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.checkpoint()
+    }
+}
+
 impl SshTransportSession for MemorySshSession {
     fn execute_argv(
         &mut self,
@@ -200,6 +243,31 @@ impl SshTransportSession for MemorySshSession {
         check_control(control)?;
         let mut state = self.lock();
         state.captured_argv.push(argv.to_vec());
+        let mut output = state.command_output.clone();
+        bound_output(
+            &mut output.stdout,
+            output_limit,
+            &mut output.stdout_truncated,
+        );
+        bound_output(
+            &mut output.stderr,
+            output_limit,
+            &mut output.stderr_truncated,
+        );
+        Ok(output)
+    }
+
+    fn execute_argv_with_stdin(
+        &mut self,
+        argv: &[String],
+        stdin: &[u8],
+        output_limit: usize,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportCommandOutput, SshTransportError> {
+        check_control(control)?;
+        let mut state = self.lock();
+        state.captured_argv.push(argv.to_vec());
+        state.captured_stdin.push(stdin.to_vec());
         let mut output = state.command_output.clone();
         bound_output(
             &mut output.stdout,
@@ -415,6 +483,63 @@ impl SshTransportSession for MemorySshSession {
         }
         u64::try_from(total)
             .map_err(|_| SshTransportError::Transport("memory read length overflow".to_owned()))
+    }
+
+    fn write_file_new(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+        produce: &mut dyn FnMut(&mut dyn io::Write) -> Result<(), SshTransportError>,
+    ) -> Result<(), SshTransportError> {
+        check_control(control)?;
+        {
+            let state = self.lock();
+            if state.files.contains_key(path) || state.directories.contains(path) {
+                return Err(SshTransportError::AlreadyExists(path.to_owned()));
+            }
+            let parent = memory_parent(path);
+            if !state.directories.contains(parent) {
+                return Err(SshTransportError::NotFound(parent.to_owned()));
+            }
+        }
+
+        let mut writer = MemoryWriteSink {
+            bytes: Vec::new(),
+            control,
+            failure: None,
+        };
+        let produce_result = produce(&mut writer);
+        let failure = writer.failure.take();
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        produce_result?;
+        check_control(control)?;
+        let size = u64::try_from(writer.bytes.len())
+            .map_err(|_| SshTransportError::Transport("memory write length overflow".to_owned()))?;
+
+        let mut state = self.lock();
+        if state.files.contains_key(path) || state.directories.contains(path) {
+            return Err(SshTransportError::AlreadyExists(path.to_owned()));
+        }
+        let parent = memory_parent(path);
+        if !state.directories.contains(parent) {
+            return Err(SshTransportError::NotFound(parent.to_owned()));
+        }
+        state.files.insert(
+            path.to_owned(),
+            MemoryRemoteFile {
+                bytes: writer.bytes,
+                stats: VecDeque::from([RemoteFileStat {
+                    path: path.to_owned(),
+                    size,
+                    modified_seconds: 0,
+                    producer_marker: None,
+                    sha256: None,
+                }]),
+            },
+        );
+        Ok(())
     }
 
     fn mkdir(

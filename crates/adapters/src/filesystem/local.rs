@@ -2,10 +2,13 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    fs::{self, File},
-    io::{Read, Seek, SeekFrom},
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::UNIX_EPOCH,
 };
 
@@ -18,6 +21,38 @@ use camera_toolbox_app::{
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_LIST_PAGE_ENTRIES: usize = 1024;
 const MAX_ACTIVE_LIST_CURSORS: usize = 16;
+
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
+
+struct ControlledWriter<'a, W> {
+    inner: &'a mut W,
+    control: &'a FsControl,
+    control_error: Option<FileSystemError>,
+}
+
+impl<W: Write> ControlledWriter<'_, W> {
+    fn checkpoint(&mut self) -> std::io::Result<()> {
+        match self.control.checkpoint() {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.control_error = Some(error.clone());
+                Err(std::io::Error::other(error.to_string()))
+            }
+        }
+    }
+}
+
+impl<W: Write> Write for ControlledWriter<'_, W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.checkpoint()?;
+        self.inner.write(bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.checkpoint()?;
+        self.inner.flush()
+    }
+}
 
 struct LocalListCursor {
     directory: DirectoryRef,
@@ -116,6 +151,24 @@ impl LocalFileSystem {
             ));
         }
         Ok(parent.join(name.as_str()))
+    }
+
+    fn create_temporary_file(parent: &Path) -> Result<(PathBuf, File), FileSystemError> {
+        for _ in 0..32 {
+            let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(
+                ".camera-toolbox-export-{}-{id}.tmp",
+                std::process::id()
+            ));
+            match OpenOptions::new().write(true).create_new(true).open(&path) {
+                Ok(file) => return Ok((path, file)),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(map_io(error)),
+            }
+        }
+        Err(FileSystemError::Io(
+            "could not allocate a unique export staging filename".to_owned(),
+        ))
     }
 
     fn entry_from_path(
@@ -318,6 +371,56 @@ impl FileSystem for LocalFileSystem {
         })
     }
 
+    fn write_new_atomic(
+        &self,
+        parent: &DirectoryRef,
+        name: &EntryName,
+        control: &FsControl,
+        produce: &mut dyn FnMut(&mut dyn Write) -> Result<(), FileSystemError>,
+    ) -> Result<FileRef, FileSystemError> {
+        control.checkpoint()?;
+        let destination = self.resolve_destination(parent, name)?;
+        let staging_parent = destination
+            .parent()
+            .ok_or_else(|| FileSystemError::PathEscapesRoot(destination.display().to_string()))?;
+        let (staging, mut file) = Self::create_temporary_file(staging_parent)?;
+
+        let produce_result = {
+            let mut writer = ControlledWriter {
+                inner: &mut file,
+                control,
+                control_error: None,
+            };
+            let result = produce(&mut writer);
+            match writer.control_error.take() {
+                Some(error) => Err(error),
+                None => result,
+            }
+        };
+        let write_result = produce_result.and_then(|()| {
+            control.checkpoint()?;
+            file.sync_all().map_err(map_io)
+        });
+        drop(file);
+        if let Err(error) = write_result {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+        if let Err(error) = control.checkpoint() {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+
+        // hard_link 的“目标必须不存在”是内核原子条件，避免 rename 覆盖已有导出文件。
+        if let Err(error) = fs::hard_link(&staging, &destination).map_err(map_io) {
+            let _ = fs::remove_file(&staging);
+            return Err(error);
+        }
+        let _ = fs::remove_file(staging);
+
+        Ok(FileRef::new(self.source_id.clone(), parent.path.join(name)))
+    }
+
     fn mkdir(
         &self,
         parent: &DirectoryRef,
@@ -515,6 +618,52 @@ mod tests {
                 .entries
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn write_new_atomic_publishes_a_new_file_without_overwrite() {
+        let root = TestRoot::new();
+        let source_id = FileSourceId::new("local-export-test").unwrap();
+        let fs = LocalFileSystem::new(source_id.clone(), &root.0).unwrap();
+        let parent = DirectoryRef::root(source_id.clone());
+        let name = EntryName::new("intrinsics.yaml").unwrap();
+
+        let mut write_calibration = |writer: &mut dyn Write| {
+            writer
+                .write_all(b"calibration")
+                .map_err(FileSystemError::io)
+        };
+        let saved = fs
+            .write_new_atomic(&parent, &name, &control(), &mut write_calibration)
+            .unwrap();
+        assert_eq!(
+            saved,
+            FileRef::new(source_id, SourcePath::new("intrinsics.yaml").unwrap())
+        );
+        assert_eq!(
+            fs::read(root.0.join("intrinsics.yaml")).unwrap(),
+            b"calibration"
+        );
+        let mut write_replacement = |writer: &mut dyn Write| {
+            writer
+                .write_all(b"replacement")
+                .map_err(FileSystemError::io)
+        };
+        assert!(matches!(
+            fs.write_new_atomic(&parent, &name, &control(), &mut write_replacement),
+            Err(FileSystemError::AlreadyExists(_))
+        ));
+        assert_eq!(
+            fs::read(root.0.join("intrinsics.yaml")).unwrap(),
+            b"calibration"
+        );
+        assert!(fs::read_dir(&root.0).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".camera-toolbox-export-")
+        }));
     }
 
     #[test]

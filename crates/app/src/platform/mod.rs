@@ -2,6 +2,7 @@
 
 mod capability;
 mod controller;
+mod eeprom;
 mod events;
 mod ports;
 mod profile;
@@ -21,6 +22,13 @@ pub use capability::{
     TargetResolutionSnapshot,
 };
 pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
+pub use eeprom::{
+    EEPROM_HELPER_SCHEMA_VERSION, EEPROM_REMOTE_PROVISION_DISABLED_REASON, EepromDeviceState,
+    EepromDryRunResult, EepromHelperAction, EepromHelperFailure, EepromHelperOutput,
+    EepromHelperRequest, EepromHelperResult, EepromHelperTarget, EepromInspectResult,
+    EepromPageWritePlan, EepromProvisionOperation, EepromProvisionService,
+    EepromProvisionServiceError, EepromRollbackState, EepromSerialState, EepromWriteResult,
+};
 pub use events::{
     DumpJobEvent, DumpJobState, RemoteJobEvent, RemoteJobFailure, RemoteJobState,
     StreamSessionEvent,
@@ -38,7 +46,7 @@ pub use profile::{
     CapabilityResolutionKey, Cv610Config, Cv610DumpConfig, Cv610StreamConfig,
     DumpInitializationPolicy, LocalConfig, PlatformConfig, PlatformProfile, PlatformProfileId,
     ProfileError, SensorCatalog, SensorDescriptor, SensorId, SensorModeKey, SensorModeSnapshot,
-    SensorSelection, SshManagedConfig, validate_ssh_host,
+    SensorSelection, SshEepromConfig, SshEepromTargetConfig, SshManagedConfig, validate_ssh_host,
 };
 pub use profile_store::{PROFILE_STORE_SCHEMA_VERSION, ProfileStore, ProfileStoreError};
 pub use remote::{

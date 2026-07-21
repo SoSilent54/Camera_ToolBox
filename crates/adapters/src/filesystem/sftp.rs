@@ -1,7 +1,10 @@
 //! SFTP 文件源实现；host-key pin 与凭据解析沿用生产 SSH transport。
 
 use std::{
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,6 +22,10 @@ use crate::platforms::ssh_managed::{
 
 const MAX_LIST_PAGE_ENTRIES: usize = 1024;
 const MAX_RECURSIVE_DELETE_ENTRIES: usize = 16_384;
+const MAX_STAGING_NAME_ATTEMPTS: usize = 32;
+const EXPORT_PRODUCER_ABORT: &str = "export producer rejected the staging write sink";
+
+static NEXT_STAGING_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
 struct SftpConnectionState {
@@ -45,7 +52,7 @@ pub struct SftpFileSystem {
 }
 
 impl SftpFileSystem {
-    /// 创建严格 host-key pin 的 SFTP 挂载；不会在构造阶段连接网络。
+    /// 创建 SFTP 挂载；未 pin 主机密钥的挂载仅允许浏览和读取。
     ///
     /// # Errors
     ///
@@ -92,6 +99,23 @@ impl SftpFileSystem {
                 expected: self.source_id.clone(),
                 actual: actual.clone(),
             })
+        }
+    }
+
+    fn has_pinned_host_key(&self) -> bool {
+        self.target
+            .expected_host_key
+            .as_deref()
+            .is_some_and(|key| !key.trim().is_empty())
+    }
+
+    fn ensure_mutation_allowed(&self) -> Result<(), FileSystemError> {
+        if self.has_pinned_host_key() {
+            Ok(())
+        } else {
+            Err(FileSystemError::PermissionDenied(
+                "remote changes require a host-key-pinned SSH profile".to_owned(),
+            ))
         }
     }
 
@@ -218,6 +242,23 @@ impl SftpFileSystem {
         Ok(format!("{parent}/{name}"))
     }
 
+    fn staging_path(destination: &str) -> String {
+        let parent =
+            destination.rsplit_once('/').map_or(
+                "/",
+                |(parent, _)| if parent.is_empty() { "/" } else { parent },
+            );
+        let id = NEXT_STAGING_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        if parent == "/" {
+            format!("/.camera-toolbox-export-{}-{id}.tmp", std::process::id())
+        } else {
+            format!(
+                "{parent}/.camera-toolbox-export-{}-{id}.tmp",
+                std::process::id()
+            )
+        }
+    }
+
     fn remote_entry(
         &self,
         directory: &DirectoryRef,
@@ -249,7 +290,11 @@ impl FileSystem for SftpFileSystem {
     }
 
     fn capabilities(&self) -> FileSystemCapabilities {
-        FileSystemCapabilities::READ_WRITE
+        if self.has_pinned_host_key() {
+            FileSystemCapabilities::READ_WRITE
+        } else {
+            FileSystemCapabilities::READ_ONLY
+        }
     }
 
     fn list(
@@ -369,6 +414,77 @@ impl FileSystem for SftpFileSystem {
         })
     }
 
+    fn write_new_atomic(
+        &self,
+        parent: &DirectoryRef,
+        name: &EntryName,
+        control: &FsControl,
+        produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(), FileSystemError>,
+    ) -> Result<FileRef, FileSystemError> {
+        self.ensure_source(&parent.source_id)?;
+        self.ensure_mutation_allowed()?;
+        let mut producer_error = None;
+        let result = self.with_session(control, |session, root, remote_control| {
+            let destination = Self::destination_path(session, root, parent, name, remote_control)?;
+            ensure_remote_destination_absent(session, &destination, remote_control)?;
+
+            let mut staging = None;
+            for _ in 0..MAX_STAGING_NAME_ATTEMPTS {
+                let candidate = Self::staging_path(&destination);
+                let mut transport_producer = |writer: &mut dyn std::io::Write| match produce(writer)
+                {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        producer_error = Some(error);
+                        Err(SshTransportError::HelperProtocol(
+                            EXPORT_PRODUCER_ABORT.to_owned(),
+                        ))
+                    }
+                };
+                match session.write_file_new(&candidate, remote_control, &mut transport_producer) {
+                    Ok(()) => {
+                        staging = Some(candidate);
+                        break;
+                    }
+                    Err(SshTransportError::AlreadyExists(_)) => continue,
+                    Err(error) => {
+                        let _ = session.remove_file(&candidate, remote_control);
+                        return Err(error);
+                    }
+                }
+            }
+            let staging = staging.ok_or_else(|| {
+                SshTransportError::AlreadyExists(
+                    "could not allocate remote staging path".to_owned(),
+                )
+            })?;
+
+            let publish_result = (|| {
+                ensure_remote_destination_absent(session, &destination, remote_control)?;
+                session.rename(&staging, &destination, remote_control)
+            })();
+            if let Err(error) = publish_result {
+                let _ = session.remove_file(&staging, remote_control);
+                return Err(error);
+            }
+            Ok(())
+        });
+        match result {
+            Err(FileSystemError::Remote(reason)) if reason == EXPORT_PRODUCER_ABORT => {
+                Err(producer_error.unwrap_or_else(|| {
+                    FileSystemError::Remote("export producer aborted without an error".to_owned())
+                }))
+            }
+            Err(error) => Err(error),
+            Ok(()) => {
+                if let Some(error) = producer_error {
+                    return Err(error);
+                }
+                Ok(FileRef::new(self.source_id.clone(), parent.path.join(name)))
+            }
+        }
+    }
+
     fn mkdir(
         &self,
         parent: &DirectoryRef,
@@ -376,6 +492,7 @@ impl FileSystem for SftpFileSystem {
         control: &FsControl,
     ) -> Result<DirectoryRef, FileSystemError> {
         self.ensure_source(&parent.source_id)?;
+        self.ensure_mutation_allowed()?;
         self.with_session(control, |session, root, remote_control| {
             let path = Self::destination_path(session, root, parent, name, remote_control)?;
             ensure_remote_destination_absent(session, &path, remote_control)?;
@@ -391,6 +508,7 @@ impl FileSystem for SftpFileSystem {
         control: &FsControl,
     ) -> Result<FileRef, FileSystemError> {
         self.ensure_source(&reference.source_id)?;
+        self.ensure_mutation_allowed()?;
         let parent = reference.parent();
         self.with_session(control, |session, root, remote_control| {
             let source = Self::leaf_path(session, root, reference, remote_control)?;
@@ -413,6 +531,7 @@ impl FileSystem for SftpFileSystem {
     ) -> Result<FileRef, FileSystemError> {
         self.ensure_source(&reference.source_id)?;
         self.ensure_source(&destination.source_id)?;
+        self.ensure_mutation_allowed()?;
         let name = EntryName::new(reference.path.file_name().unwrap_or_default())
             .map_err(|error| FileSystemError::Remote(error.to_string()))?;
         self.with_session(control, |session, root, remote_control| {
@@ -434,6 +553,7 @@ impl FileSystem for SftpFileSystem {
         control: &FsControl,
     ) -> Result<(), FileSystemError> {
         self.ensure_source(&reference.source_id)?;
+        self.ensure_mutation_allowed()?;
         self.with_session(control, |session, root, remote_control| {
             let path = Self::leaf_path(session, root, reference, remote_control)?;
             let metadata = session.metadata(&path, remote_control)?;
@@ -561,9 +681,9 @@ fn map_transport(error: SshTransportError) -> FileSystemError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use std::collections::VecDeque;
+    use std::{collections::VecDeque, io::Write};
 
+    use super::*;
     use camera_toolbox_app::RemoteFileStat;
 
     use crate::platforms::ssh_managed::{MemoryRemoteFile, MemorySshTransport};
@@ -690,6 +810,104 @@ mod tests {
         )
         .unwrap();
         assert!(!memory.contains_path("/opt/archive"));
+    }
+
+    #[test]
+    fn pinned_sftp_writes_new_artifacts_without_overwrite() {
+        let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
+        memory.allow_credential("session:test");
+        memory.insert_directory("/opt");
+        let fs = filesystem(memory.clone(), HOST_KEY);
+        let root = DirectoryRef::root(FileSourceId::new("remote-test").unwrap());
+        let name = EntryName::new("intrinsics.yaml").unwrap();
+
+        let mut write_calibration = |writer: &mut dyn Write| {
+            writer
+                .write_all(b"calibration")
+                .map_err(FileSystemError::io)
+        };
+        let saved = fs
+            .write_new_atomic(&root, &name, &control(), &mut write_calibration)
+            .unwrap();
+        assert_eq!(
+            saved,
+            FileRef::new(
+                root.source_id.clone(),
+                SourcePath::new("intrinsics.yaml").unwrap()
+            )
+        );
+        assert!(memory.contains_path("/opt/intrinsics.yaml"));
+        assert_eq!(
+            memory.file_bytes("/opt/intrinsics.yaml"),
+            Some(b"calibration".to_vec())
+        );
+        let mut write_replacement = |writer: &mut dyn Write| {
+            writer
+                .write_all(b"replacement")
+                .map_err(FileSystemError::io)
+        };
+        assert!(matches!(
+            fs.write_new_atomic(&root, &name, &control(), &mut write_replacement),
+            Err(FileSystemError::AlreadyExists(_))
+        ));
+
+        let page = fs
+            .list(&root, ListPageRequest::default(), &control())
+            .unwrap();
+        assert!(
+            page.entries
+                .iter()
+                .all(|entry| !entry.name.as_str().starts_with(".camera-toolbox-export-"))
+        );
+    }
+
+    #[test]
+    fn browse_only_sftp_rejects_every_mutation_including_save() {
+        let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
+        memory.allow_credential("session:test");
+        let fs = SftpFileSystem::new(
+            FileSourceId::new("browse-only-test").unwrap(),
+            "/opt",
+            SshConnectionTarget {
+                host: "camera.test".to_owned(),
+                port: 22,
+                username: "root".to_owned(),
+                expected_host_key: None,
+                command_subsystem: None,
+                remote_event_subsystem: None,
+            },
+            "session:test",
+            memory.clone(),
+            memory,
+        )
+        .unwrap();
+        let root = DirectoryRef::root(FileSourceId::new("browse-only-test").unwrap());
+        let file = FileRef::new(root.source_id.clone(), SourcePath::new("old.yaml").unwrap());
+        let name = EntryName::new("new.yaml").unwrap();
+
+        assert_eq!(fs.capabilities(), FileSystemCapabilities::READ_ONLY);
+        let mut write_content =
+            |writer: &mut dyn Write| writer.write_all(b"content").map_err(FileSystemError::io);
+        assert!(matches!(
+            fs.write_new_atomic(&root, &name, &control(), &mut write_content),
+            Err(FileSystemError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            fs.mkdir(&root, &name, &control()),
+            Err(FileSystemError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            fs.rename(&file, &name, &control()),
+            Err(FileSystemError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            fs.move_entry(&file, &root, &control()),
+            Err(FileSystemError::PermissionDenied(_))
+        ));
+        assert!(matches!(
+            fs.delete(&file, false, &control()),
+            Err(FileSystemError::PermissionDenied(_))
+        ));
     }
 
     #[test]

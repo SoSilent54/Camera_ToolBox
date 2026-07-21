@@ -2,6 +2,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    io::Write,
     path::PathBuf,
     sync::{
         Arc,
@@ -15,15 +16,18 @@ use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
     AddCalibrationItemOutcome, CalibrationBackend, CalibrationCancellation, CalibrationItemId,
     CalibrationItemStatus, CalibrationJobToken, CalibrationSession, CalibrationSnapshot,
-    FileSystem, FsCancellation, FsControl, RasterFormat, RasterImageCodec, read_calibration_png,
+    EepromDryRunResult, EepromInspectResult, EepromWriteResult, EntryName, ExportDestination,
+    ExportReceipt, ExportService, FileSystem, FileSystemError, FsCancellation, FsControl,
+    RasterFormat, RasterImageCodec, read_calibration_png,
 };
 use camera_toolbox_core::{
-    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution, InitialIntrinsics,
-    Rgba8Frame, ViewCalibrationResult,
+    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution, FullEepromImage,
+    InitialIntrinsics, Rgba8Frame, ViewCalibrationResult, write_opencv_pinhole_radtan_yaml,
 };
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::calibration_eeprom::{CalibrationEepromState, CalibrationProvisionIntent};
 use crate::{explorer::CalibrationImportCandidate, viewer::pixel_inspection_texture_options};
 
 const MAX_DATASET_ITEMS: usize = 256;
@@ -46,6 +50,59 @@ const REPROJECTION_ARROW_HEAD_HALF_WIDTH: f32 = 2.5;
 enum CalibrationJobKind {
     Detect,
     Calibrate,
+}
+
+/// 标定页面支持的格式化导出；所有变体都通过同一 Explorer destination 保存。
+pub(crate) enum CalibrationExport {
+    Json(serde_json::Value),
+    Yaml(CalibrationSolution),
+    EepromBin(FullEepromImage),
+}
+
+impl CalibrationExport {
+    #[must_use]
+    pub(crate) const fn suggested_name(&self) -> &'static str {
+        match self {
+            Self::Json(_) => "camera_intrinsics.json",
+            Self::Yaml(_) => "camera_intrinsics.yaml",
+            Self::EepromBin(_) => "camera_eeprom.bin",
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn label(&self) -> &'static str {
+        match self {
+            Self::Json(_) => "calibration JSON",
+            Self::Yaml(_) => "calibration YAML",
+            Self::EepromBin(_) => "EEPROM BIN",
+        }
+    }
+
+    pub(crate) fn save_new(
+        &self,
+        destination: &ExportDestination,
+        name: &EntryName,
+        control: &FsControl,
+    ) -> Result<ExportReceipt, FileSystemError> {
+        ExportService.save_new_with(destination, name, control, &mut |writer| {
+            self.write_to(writer)
+        })
+    }
+
+    fn write_to(&self, writer: &mut dyn Write) -> Result<(), FileSystemError> {
+        match self {
+            Self::Json(document) => {
+                serde_json::to_writer_pretty(&mut *writer, document)
+                    .map_err(FileSystemError::io)?;
+                writer.write_all(b"\n").map_err(FileSystemError::io)
+            }
+            Self::Yaml(solution) => write_opencv_pinhole_radtan_yaml(writer, solution)
+                .map_err(|error| FileSystemError::Io(error.to_string())),
+            Self::EepromBin(image) => writer
+                .write_all(image.as_bytes())
+                .map_err(FileSystemError::io),
+        }
+    }
 }
 
 struct CalibrationSource {
@@ -300,6 +357,9 @@ pub(crate) struct CalibrationWorkspace {
     active_cancellation: Option<ActiveCancellation>,
     cancel_requested: bool,
     status: String,
+    serial_number: String,
+    pending_export: Option<CalibrationExport>,
+    eeprom: CalibrationEepromState,
     board_cols: u16,
     board_rows: u16,
     square_size: f64,
@@ -327,6 +387,9 @@ impl CalibrationWorkspace {
             active_cancellation: None,
             cancel_requested: false,
             status: "Add original PNG calibration images from Workspace Explorer.".to_owned(),
+            serial_number: String::new(),
+            pending_export: None,
+            eeprom: CalibrationEepromState::default(),
             board_cols: board.inner_cols,
             board_rows: board.inner_rows,
             square_size: board.square_size,
@@ -429,11 +492,88 @@ impl CalibrationWorkspace {
         );
     }
 
-    pub(crate) fn render(&mut self, context: &egui::Context, ui: &mut egui::Ui) -> egui::Rect {
+    pub(crate) fn take_export(&mut self) -> Option<CalibrationExport> {
+        self.pending_export.take()
+    }
+
+    pub(crate) fn take_provision_intent(&mut self) -> Option<CalibrationProvisionIntent> {
+        self.eeprom.take_intent()
+    }
+
+    pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
+        self.eeprom.report_error(message);
+    }
+
+    pub(crate) fn report_eeprom_inspect(
+        &mut self,
+        target_label: String,
+        result: EepromInspectResult,
+    ) {
+        self.eeprom.report_inspect(target_label, result);
+    }
+
+    pub(crate) fn report_eeprom_dry_run(
+        &mut self,
+        target_label: String,
+        request: camera_toolbox_core::EepromProvisionRequest,
+        result: EepromDryRunResult,
+        backup_file: String,
+        manifest_file: String,
+    ) {
+        self.eeprom
+            .report_dry_run(target_label, request, result, backup_file, manifest_file);
+    }
+
+    pub(crate) fn report_eeprom_provision(
+        &mut self,
+        target_label: String,
+        result: &EepromWriteResult,
+        audit_file: String,
+    ) {
+        self.eeprom
+            .report_provision(target_label, result, audit_file);
+    }
+
+    pub(crate) fn report_eeprom_provision_audit_error(
+        &mut self,
+        target_label: String,
+        result: &EepromWriteResult,
+        error: &str,
+    ) {
+        self.eeprom
+            .report_provision_audit_error(target_label, result, error);
+    }
+
+    pub(crate) fn report_export_started(&mut self, label: &str, target_label: &str) {
+        self.status = format!("Exporting {label} to {target_label}.");
+    }
+
+    pub(crate) fn report_export_finished(
+        &mut self,
+        label: &str,
+        target_label: &str,
+        result: Result<u64, &str>,
+    ) {
+        self.status = match result {
+            Ok(bytes_written) => {
+                format!("Exported {label} ({bytes_written} B) to {target_label}.")
+            }
+            Err(error) => format!("Export {label} failed: {error}"),
+        };
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        context: &egui::Context,
+        ui: &mut egui::Ui,
+        export_enabled: bool,
+        export_reason: Option<&str>,
+        provision_target: Result<&str, &str>,
+    ) -> egui::Rect {
         self.poll_worker(context);
         self.sync_coverage(context);
         let rect = ui.available_rect_before_wrap();
-        self.render_controls(ui);
+        self.render_controls(context, ui, export_enabled, export_reason, provision_target);
         ui.separator();
         ui.columns(2, |columns| {
             self.render_dataset(&mut columns[0]);
@@ -454,7 +594,14 @@ impl CalibrationWorkspace {
         }
     }
 
-    fn render_controls(&mut self, ui: &mut egui::Ui) {
+    fn render_controls(
+        &mut self,
+        context: &egui::Context,
+        ui: &mut egui::Ui,
+        export_enabled: bool,
+        export_reason: Option<&str>,
+        provision_target: Result<&str, &str>,
+    ) {
         self.refresh_auto_intrinsics_fields();
         let idle = self.active_job.is_none();
         ui.horizontal_wrapped(|ui| {
@@ -535,16 +682,70 @@ impl CalibrationWorkspace {
                 self.status =
                     "Cancel requested; waiting for the current OpenCV call boundary.".to_owned();
             }
+        });
+
+        ui.horizontal_wrapped(|ui| {
+            ui.label("EEPROM SN");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.serial_number)
+                    .desired_width(160.0)
+                    .hint_text("14 ASCII bytes"),
+            );
+            ui.weak("Required only for EEPROM BIN / direct provisioning.");
+        });
+        let regular_export_enabled = idle && self.session.installed().is_some() && export_enabled;
+        let eeprom_error = self.eeprom_image().err();
+        ui.horizontal_wrapped(|ui| {
             if ui
-                .add_enabled(
-                    idle && self.session.installed().is_some(),
-                    egui::Button::new("Export JSON"),
-                )
+                .add_enabled(regular_export_enabled, egui::Button::new("Export JSON"))
                 .clicked()
             {
-                self.export_json();
+                self.pending_export = self.json_export();
+            }
+            if ui
+                .add_enabled(
+                    regular_export_enabled,
+                    egui::Button::new("Export YAML Result"),
+                )
+                .clicked()
+                && let Some(installed) = self.session.installed()
+            {
+                self.pending_export = Some(CalibrationExport::Yaml(installed.solution.clone()));
+            }
+            let eeprom_enabled = regular_export_enabled && eeprom_error.is_none();
+            if ui
+                .add_enabled(eeprom_enabled, egui::Button::new("Save EEPROM BIN"))
+                .on_disabled_hover_text(
+                    eeprom_error
+                        .as_deref()
+                        .unwrap_or("A calibration result and valid 14-byte ASCII SN are required."),
+                )
+                .clicked()
+                && let Ok(image) = self.eeprom_image()
+            {
+                self.pending_export = Some(CalibrationExport::EepromBin(image));
             }
         });
+        if !export_enabled {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                export_reason.unwrap_or("Select a writable Explorer directory before exporting."),
+            );
+        }
+        let solution = self
+            .session
+            .installed()
+            .map(|installed| installed.solution.clone());
+        self.eeprom.render(
+            context,
+            ui,
+            solution.as_ref(),
+            &self.serial_number,
+            provision_target,
+            (!export_enabled).then_some(
+                export_reason.unwrap_or("Select a writable Explorer directory before exporting."),
+            ),
+        );
     }
 
     fn render_dataset(&mut self, ui: &mut egui::Ui) {
@@ -1089,10 +1290,8 @@ impl CalibrationWorkspace {
         Ok(initial)
     }
 
-    fn export_json(&mut self) {
-        let Some(installed) = self.session.installed() else {
-            return;
-        };
+    fn json_export(&self) -> Option<CalibrationExport> {
+        let installed = self.session.installed()?;
         let items = self
             .session
             .items()
@@ -1128,38 +1327,23 @@ impl CalibrationWorkspace {
                 }))
             })
             .collect::<Vec<_>>();
-        let payload = serde_json::json!({
+        Some(CalibrationExport::Json(serde_json::json!({
             "schema_version": 1,
             "algorithm": "PangbotCompatible",
             "board": installed.request.board,
             "initial_intrinsics": installed.request.initial_intrinsics,
             "items": items,
             "solution": installed.solution,
-        });
-        let Some(path) = rfd::FileDialog::new()
-            .set_file_name("camera_intrinsics.json")
-            .add_filter("JSON", &["json"])
-            .save_file()
-        else {
-            return;
-        };
-        match serde_json::to_vec_pretty(&payload) {
-            Ok(bytes) => {
-                let display_path = path.display().to_string();
-                match thread::Builder::new()
-                    .name("camera-toolbox-calibration-export".to_owned())
-                    .spawn(move || {
-                        if let Err(error) = std::fs::write(&path, bytes) {
-                            tracing::error!(operation = "export_calibration_json", path = %path.display(), error = %error, "failed to export calibration result");
-                        }
-                    })
-                {
-                    Ok(_) => self.status = format!("Exporting calibration JSON to {display_path}."),
-                    Err(error) => self.status = format!("Start calibration export failed: {error}"),
-                }
-            }
-            Err(error) => self.status = format!("Serialize calibration result failed: {error}"),
-        }
+        })))
+    }
+
+    fn eeprom_image(&self) -> Result<FullEepromImage, String> {
+        let installed = self
+            .session
+            .installed()
+            .ok_or_else(|| "Calibrate successfully before exporting EEPROM data.".to_owned())?;
+        FullEepromImage::from_solution(&installed.solution, &self.serial_number)
+            .map_err(|error| error.to_string())
     }
 }
 
@@ -1910,7 +2094,7 @@ mod tests {
             ..Default::default()
         };
         let output = context.run_ui(input, |ui| {
-            workspace.render(&context, ui);
+            workspace.render(&context, ui, true, None, Err("not configured"));
         });
         let text = output
             .platform_output

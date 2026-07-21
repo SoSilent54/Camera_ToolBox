@@ -493,6 +493,15 @@ mod tests {
         ) -> Result<ReadOutcome, FileSystemError> {
             self.inner.read(reference, request, control, consume)
         }
+        fn write_new_atomic(
+            &self,
+            parent: &DirectoryRef,
+            name: &EntryName,
+            control: &FsControl,
+            produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(), FileSystemError>,
+        ) -> Result<FileRef, FileSystemError> {
+            self.inner.write_new_atomic(parent, name, control, produce)
+        }
         fn mkdir(
             &self,
             parent: &DirectoryRef,

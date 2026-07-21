@@ -1,18 +1,20 @@
 //! 静态图像异步 Save、不可变快照与 YUV 输出参数确认。
 
 use std::{
-    fs::OpenOptions,
-    io::{BufWriter, Write},
-    path::{Path, PathBuf},
+    io::Write,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
+    time::Duration,
 };
 
-use camera_toolbox_app::RasterImageCodec;
+use camera_toolbox_app::{
+    EntryName, ExportDestination, ExportReceipt, ExportService, FileSystemError, FsControl,
+    RasterImageCodec,
+};
 use camera_toolbox_core::{
     ChromaOrder, RawFrame, Rgba8Frame, YuvMatrix, YuvRange, rgba8_to_yuv420sp_with_cancel,
 };
@@ -21,7 +23,7 @@ use eframe::egui;
 use crate::workspace::DocumentId;
 
 const RAW_WRITE_PIXELS: usize = 32 * 1024;
-
+const SAVE_TIMEOUT: Duration = Duration::from_secs(60);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SaveKey {
     pub(crate) document_id: DocumentId,
@@ -47,16 +49,19 @@ pub(crate) enum SavePayload {
 
 pub(crate) struct SaveRequest {
     pub(crate) key: SaveKey,
-    pub(crate) path: PathBuf,
+    pub(crate) destination: ExportDestination,
+    pub(crate) target_label: String,
+    pub(crate) file_name: EntryName,
     pub(crate) format: SaveFormat,
     pub(crate) payload: SavePayload,
 }
 
 pub(crate) struct SaveResult {
     pub(crate) key: SaveKey,
-    pub(crate) path: PathBuf,
+    pub(crate) destination: ExportDestination,
+    pub(crate) target_label: String,
     pub(crate) format: SaveFormat,
-    pub(crate) result: Result<(), String>,
+    pub(crate) result: Result<u64, String>,
 }
 
 enum WorkerCommand {
@@ -90,15 +95,18 @@ impl ImageSaveWorker {
                     };
                     let is_cancelled = || worker_shutdown.load(Ordering::Acquire);
                     let key = request.key;
-                    let path = request.path.clone();
+                    let destination = request.destination.clone();
+                    let target_label = request.target_label.clone();
                     let format = request.format;
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         save_request(&*codec, request, &is_cancelled)
                     }))
-                    .unwrap_or_else(|_| Err("save worker panicked".to_owned()));
+                    .unwrap_or_else(|_| Err("save worker panicked".to_owned()))
+                    .map(|receipt| receipt.bytes_written());
                     let _ = result_sender.send(SaveResult {
                         key,
-                        path,
+                        destination,
+                        target_label,
                         format,
                         result,
                     });
@@ -136,30 +144,23 @@ fn save_request(
     codec: &dyn RasterImageCodec,
     request: SaveRequest,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
+) -> Result<ExportReceipt, String> {
     if is_cancelled() {
-        return Err("save cancelled".to_owned());
+        return Err(FileSystemError::Cancelled.to_string());
     }
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&request.path)
-        .map_err(|error| destination_error(&request.path, error))?;
-    let result = {
-        let mut writer = BufWriter::new(&mut file);
-        let encoded = match (request.format, request.payload) {
+    let target_label = request.target_label.clone();
+    let control = FsControl::with_timeout(SAVE_TIMEOUT);
+    let mut producer = |writer: &mut dyn Write| {
+        if is_cancelled() {
+            return Err(FileSystemError::Cancelled);
+        }
+        match (request.format, &request.payload) {
             (SaveFormat::RawU16Le, SavePayload::Raw(frame)) => {
-                write_raw_u16le(&mut writer, &frame, is_cancelled)
+                write_raw_u16le(writer, frame, is_cancelled)
             }
-            (SaveFormat::Png, SavePayload::Display(frame)) => {
-                if is_cancelled() {
-                    Err("save cancelled".to_owned())
-                } else {
-                    codec
-                        .encode_png(&frame, &mut writer)
-                        .map_err(|error| error.to_string())
-                }
-            }
+            (SaveFormat::Png, SavePayload::Display(frame)) => codec
+                .encode_png(frame, writer)
+                .map_err(|error| FileSystemError::Io(error.to_string())),
             (
                 SaveFormat::Yuv420Sp {
                     chroma_order,
@@ -167,54 +168,42 @@ fn save_request(
                     range,
                 },
                 SavePayload::Display(frame),
-            ) => write_yuv420sp(
-                &mut writer,
-                &frame,
-                chroma_order,
-                matrix,
-                range,
-                is_cancelled,
-            ),
-            (SaveFormat::RawU16Le, SavePayload::Display(_)) => {
-                Err("RAW save requires authoritative native RAW data".to_owned())
-            }
+            ) => write_yuv420sp(writer, frame, chroma_order, matrix, range, is_cancelled),
+            (SaveFormat::RawU16Le, SavePayload::Display(_)) => Err(FileSystemError::Io(
+                "RAW save requires authoritative native RAW data".to_owned(),
+            )),
             (SaveFormat::Png | SaveFormat::Yuv420Sp { .. }, SavePayload::Raw(_)) => {
-                Err("PNG/YUV save requires an immutable display revision".to_owned())
+                Err(FileSystemError::Io(
+                    "PNG/YUV save requires an immutable display revision".to_owned(),
+                ))
             }
-        };
-        encoded.and_then(|()| writer.flush().map_err(|error| error.to_string()))
-    };
-    let result = result.and_then(|()| {
-        if is_cancelled() {
-            return Err("save cancelled".to_owned());
         }
-        file.sync_all().map_err(|error| error.to_string())
-    });
-    drop(file);
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&request.path);
-        return Err(format!("save incomplete: {error}"));
-    }
-    Ok(())
+    };
+    ExportService
+        .save_new_with(
+            &request.destination,
+            &request.file_name,
+            &control,
+            &mut producer,
+        )
+        .map_err(|error| save_error(&target_label, error))
 }
 
 fn write_raw_u16le(
     writer: &mut dyn Write,
     frame: &RawFrame,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
+) -> Result<(), FileSystemError> {
     let mut bytes = Vec::with_capacity(RAW_WRITE_PIXELS * 2);
     for pixels in frame.pixels().chunks(RAW_WRITE_PIXELS) {
         if is_cancelled() {
-            return Err("save cancelled".to_owned());
+            return Err(FileSystemError::Cancelled);
         }
         bytes.clear();
         for value in pixels {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        writer
-            .write_all(&bytes)
-            .map_err(|error| error.to_string())?;
+        writer.write_all(&bytes).map_err(FileSystemError::io)?;
     }
     Ok(())
 }
@@ -226,42 +215,40 @@ fn write_yuv420sp(
     matrix: YuvMatrix,
     range: YuvRange,
     is_cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
+) -> Result<(), FileSystemError> {
     let yuv = rgba8_to_yuv420sp_with_cancel(frame, chroma_order, matrix, range, is_cancelled)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| FileSystemError::Io(error.to_string()))?;
     for row in 0..yuv.y_plane().rows() {
         if is_cancelled() {
-            return Err("save cancelled".to_owned());
+            return Err(FileSystemError::Cancelled);
         }
         writer
             .write_all(yuv.y_plane().row(row).expect("validated Y row"))
-            .map_err(|error| error.to_string())?;
+            .map_err(FileSystemError::io)?;
     }
     for row in 0..yuv.chroma_plane().rows() {
         if is_cancelled() {
-            return Err("save cancelled".to_owned());
+            return Err(FileSystemError::Cancelled);
         }
         writer
             .write_all(yuv.chroma_plane().row(row).expect("validated chroma row"))
-            .map_err(|error| error.to_string())?;
+            .map_err(FileSystemError::io)?;
     }
     Ok(())
 }
 
-fn destination_error(path: &Path, error: std::io::Error) -> String {
-    if error.kind() == std::io::ErrorKind::AlreadyExists {
-        format!(
-            "destination already exists and was preserved; choose a new path: {}",
-            path.display()
-        )
-    } else {
-        error.to_string()
+fn save_error(target_label: &str, error: FileSystemError) -> String {
+    match error {
+        FileSystemError::AlreadyExists(_) => {
+            format!("destination already exists and was preserved: {target_label}")
+        }
+        other => other.to_string(),
     }
 }
 
 pub(crate) struct YuvSaveDialogState {
     open: bool,
-    path: PathBuf,
+    target_label: String,
     dimensions: [u32; 2],
     chroma_order: ChromaOrder,
     chroma_order_hint: Option<ChromaOrder>,
@@ -273,7 +260,7 @@ impl Default for YuvSaveDialogState {
     fn default() -> Self {
         Self {
             open: false,
-            path: PathBuf::new(),
+            target_label: String::new(),
             dimensions: [0, 0],
             chroma_order: ChromaOrder::Uv,
             chroma_order_hint: None,
@@ -286,13 +273,13 @@ impl Default for YuvSaveDialogState {
 impl YuvSaveDialogState {
     pub(crate) fn open(
         &mut self,
-        path: PathBuf,
+        target_label: String,
         dimensions: [u32; 2],
         chroma_order_hint: Option<ChromaOrder>,
         matrix: YuvMatrix,
         range: YuvRange,
     ) {
-        self.path = path;
+        self.target_label = target_label;
         self.dimensions = dimensions;
         self.chroma_order_hint = chroma_order_hint;
         self.chroma_order = chroma_order_hint.unwrap_or(ChromaOrder::Uv);
@@ -320,7 +307,7 @@ impl YuvSaveDialogState {
             .resizable(false)
             .open(&mut window_open)
             .show(context, |ui| {
-                ui.label(self.path.display().to_string());
+                ui.label(&self.target_label);
                 ui.label(format!("{}×{}", self.dimensions[0], self.dimensions[1]));
                 ui.colored_label(
                     egui::Color32::YELLOW,
@@ -379,11 +366,35 @@ impl YuvSaveDialogState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camera_toolbox_adapters::ImageRasterCodec;
+    use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
+    use camera_toolbox_app::{DirectoryRef, FileSourceId};
     use camera_toolbox_core::{BayerPattern, RawSpec};
 
+    fn test_destination(root: &std::path::Path) -> ExportDestination {
+        let source_id = FileSourceId::new("image-save-test").unwrap();
+        let file_system = Arc::new(LocalFileSystem::new(source_id.clone(), root).unwrap());
+        ExportDestination::new(DirectoryRef::root(source_id), file_system).unwrap()
+    }
+
+    fn save_request_for(
+        key: SaveKey,
+        destination: ExportDestination,
+        file_name: &str,
+        format: SaveFormat,
+        payload: SavePayload,
+    ) -> SaveRequest {
+        SaveRequest {
+            key,
+            target_label: file_name.to_owned(),
+            destination,
+            file_name: EntryName::new(file_name).unwrap(),
+            format,
+            payload,
+        }
+    }
+
     #[test]
-    fn raw_png_and_yuv_save_are_create_new_and_reopenable() {
+    fn raw_png_and_yuv_save_stream_to_create_new_destination_files() {
         let root = std::env::temp_dir().join(format!(
             "camera-toolbox-image-save-{}-{}",
             std::process::id(),
@@ -393,6 +404,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
+        let destination = test_destination(&root);
         let key = SaveKey {
             document_id: DocumentId::from_raw(1),
             generation: 1,
@@ -410,20 +422,21 @@ mod tests {
             )
             .unwrap(),
         );
-        let raw_path = root.join("frame.raw");
-        save_request(
+        let raw_receipt = save_request(
             &ImageRasterCodec,
-            SaveRequest {
+            save_request_for(
                 key,
-                path: raw_path.clone(),
-                format: SaveFormat::RawU16Le,
-                payload: SavePayload::Raw(raw),
-            },
+                destination.clone(),
+                "frame.raw",
+                SaveFormat::RawU16Le,
+                SavePayload::Raw(raw),
+            ),
             &|| false,
         )
         .unwrap();
+        assert_eq!(raw_receipt.bytes_written(), 8);
         assert_eq!(
-            std::fs::read(&raw_path).unwrap(),
+            std::fs::read(root.join("frame.raw")).unwrap(),
             [1, 0, 3, 2, 5, 4, 255, 3]
         );
 
@@ -437,45 +450,47 @@ mod tests {
             )
             .unwrap(),
         );
-        let png_path = root.join("frame.png");
         save_request(
             &ImageRasterCodec,
-            SaveRequest {
+            save_request_for(
                 key,
-                path: png_path.clone(),
-                format: SaveFormat::Png,
-                payload: SavePayload::Display(Arc::clone(&display)),
-            },
+                destination.clone(),
+                "frame.png",
+                SaveFormat::Png,
+                SavePayload::Display(Arc::clone(&display)),
+            ),
             &|| false,
         )
         .unwrap();
-        assert!(std::fs::metadata(&png_path).unwrap().len() > 0);
+        assert!(std::fs::metadata(root.join("frame.png")).unwrap().len() > 0);
 
-        let nv21_path = root.join("frame.nv21");
-        save_request(
+        let yuv_receipt = save_request(
             &ImageRasterCodec,
-            SaveRequest {
+            save_request_for(
                 key,
-                path: nv21_path.clone(),
-                format: SaveFormat::Yuv420Sp {
+                destination.clone(),
+                "frame.nv21",
+                SaveFormat::Yuv420Sp {
                     chroma_order: ChromaOrder::Vu,
                     matrix: YuvMatrix::Bt709,
                     range: YuvRange::Full,
                 },
-                payload: SavePayload::Display(display),
-            },
+                SavePayload::Display(display),
+            ),
             &|| false,
         )
         .unwrap();
-        assert_eq!(std::fs::metadata(&nv21_path).unwrap().len(), 6);
+        assert_eq!(yuv_receipt.bytes_written(), 6);
+        assert_eq!(std::fs::metadata(root.join("frame.nv21")).unwrap().len(), 6);
 
         let overwrite = save_request(
             &ImageRasterCodec,
-            SaveRequest {
+            save_request_for(
                 key,
-                path: raw_path,
-                format: SaveFormat::RawU16Le,
-                payload: SavePayload::Raw(Arc::new(
+                destination,
+                "frame.raw",
+                SaveFormat::RawU16Le,
+                SavePayload::Raw(Arc::new(
                     RawFrame::new(
                         RawSpec {
                             width: 2,
@@ -487,7 +502,7 @@ mod tests {
                     )
                     .unwrap(),
                 )),
-            },
+            ),
             &|| false,
         )
         .unwrap_err();
@@ -496,7 +511,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_serializes_distinct_save_requests() {
+    fn worker_serializes_distinct_streaming_save_requests() {
         let root = std::env::temp_dir().join(format!(
             "camera-toolbox-image-save-worker-{}-{}",
             std::process::id(),
@@ -506,6 +521,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&root).unwrap();
+        let destination = test_destination(&root);
         let context = egui::Context::default();
         let worker = ImageSaveWorker::new(&context, Arc::new(ImageRasterCodec)).unwrap();
         let key = SaveKey {
@@ -513,8 +529,6 @@ mod tests {
             generation: 2,
             revision: 1,
         };
-        let raw_path = root.join("first.raw");
-        let png_path = root.join("second.png");
         let raw = Arc::new(
             RawFrame::new(
                 RawSpec {
@@ -528,18 +542,20 @@ mod tests {
             .unwrap(),
         );
         let display = Arc::new(Rgba8Frame::tight(2, 2, Arc::<[u8]>::from(vec![255; 16])).unwrap());
-        worker.submit(SaveRequest {
+        worker.submit(save_request_for(
             key,
-            path: raw_path.clone(),
-            format: SaveFormat::RawU16Le,
-            payload: SavePayload::Raw(raw),
-        });
-        worker.submit(SaveRequest {
+            destination.clone(),
+            "first.raw",
+            SaveFormat::RawU16Le,
+            SavePayload::Raw(raw),
+        ));
+        worker.submit(save_request_for(
             key,
-            path: png_path.clone(),
-            format: SaveFormat::Png,
-            payload: SavePayload::Display(display),
-        });
+            destination,
+            "second.png",
+            SaveFormat::Png,
+            SavePayload::Display(display),
+        ));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let mut results = Vec::new();
@@ -552,8 +568,11 @@ mod tests {
         }
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|result| result.result.is_ok()));
-        assert_eq!(std::fs::read(&raw_path).unwrap(), [1, 0, 2, 0, 3, 0, 4, 0]);
-        assert!(std::fs::metadata(&png_path).unwrap().len() > 0);
+        assert_eq!(
+            std::fs::read(root.join("first.raw")).unwrap(),
+            [1, 0, 2, 0, 3, 0, 4, 0]
+        );
+        assert!(std::fs::metadata(root.join("second.png")).unwrap().len() > 0);
         drop(worker);
         std::fs::remove_dir_all(root).unwrap();
     }

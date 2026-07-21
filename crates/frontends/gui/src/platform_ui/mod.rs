@@ -12,6 +12,8 @@ mod ssh_runtime;
 mod stream_panel;
 
 pub(crate) use device_manager::{DeviceManagerAction, DeviceManagerState};
+#[cfg(feature = "platform-ssh")]
+pub(crate) use live_runtime::EepromProvisioningTarget;
 pub(crate) use live_runtime::{LiveRuntime, PlatformEffect, PlatformUiAction};
 #[cfg(feature = "platform-cv610")]
 pub(crate) use stream_panel::render_stream_panel;

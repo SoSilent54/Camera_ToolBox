@@ -15,6 +15,7 @@ use super::{DirectoryRef, EntryName, FileEntry, FileRef, FileSourceId, FileVersi
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FileSystemCapabilities {
     pub create_directory: bool,
+    pub write_new: bool,
     pub rename: bool,
     pub move_entry: bool,
     pub delete: bool,
@@ -23,6 +24,7 @@ pub struct FileSystemCapabilities {
 impl FileSystemCapabilities {
     pub const READ_ONLY: Self = Self {
         create_directory: false,
+        write_new: false,
         rename: false,
         move_entry: false,
         delete: false,
@@ -30,6 +32,7 @@ impl FileSystemCapabilities {
 
     pub const READ_WRITE: Self = Self {
         create_directory: true,
+        write_new: true,
         rename: true,
         move_entry: true,
         delete: true,
@@ -179,7 +182,8 @@ impl FsControl {
 
 /// Local 与 SFTP 必须共同满足的同步、可取消文件能力。
 ///
-/// `read` 以固定块回调，避免要求实现端一次性分配整个文件。
+/// `read` 以固定块回调，避免要求实现端一次性分配整个文件；
+/// `write_new_atomic` 是格式无关的显式导出端口，只创建此前不存在的文件。
 pub trait FileSystem: Send + Sync {
     fn source_id(&self) -> &FileSourceId;
     fn capabilities(&self) -> FileSystemCapabilities;
@@ -200,6 +204,21 @@ pub trait FileSystem: Send + Sync {
         control: &FsControl,
         consume: &mut dyn FnMut(&[u8]) -> Result<(), FileSystemError>,
     ) -> Result<ReadOutcome, FileSystemError>;
+
+    /// 在已挂载目录内创建一个此前不存在的文件并原子发布。
+    ///
+    /// producer 直接写入私有 staging sink，避免大文件保存先分配完整输出 buffer。
+    /// 默认实现保留给只读或仅实现读取的测试文件系统；声明 `write_new` capability
+    /// 的实现必须覆盖此方法。
+    fn write_new_atomic(
+        &self,
+        _parent: &DirectoryRef,
+        _name: &EntryName,
+        _control: &FsControl,
+        _produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(), FileSystemError>,
+    ) -> Result<FileRef, FileSystemError> {
+        Err(FileSystemError::Unsupported)
+    }
 
     fn mkdir(
         &self,

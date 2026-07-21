@@ -12,5 +12,8 @@ directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
+[dev-dependencies]
+parking_lot = "0.12"
+
 [lints]
 workspace = true

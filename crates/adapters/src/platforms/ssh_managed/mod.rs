@@ -3,6 +3,7 @@
 pub mod command;
 pub mod connection;
 pub mod credential;
+pub mod eeprom;
 pub mod host_key;
 pub mod memory_transport;
 pub mod provider;
@@ -21,6 +22,7 @@ pub use credential::{
     PrivateKeyDiscoveryError, ProductionCredentialResolver, discover_private_key_files,
     discover_private_key_files_in,
 };
+pub use eeprom::SshEepromProvisionService;
 pub use host_key::{
     HostKeyAssessment, HostKeyError, HostKeyManager, HostKeyTarget, HostKeyTrustOutcome,
     RusshServerHostKeyProbe, ServerHostKey, ServerHostKeyProbe,

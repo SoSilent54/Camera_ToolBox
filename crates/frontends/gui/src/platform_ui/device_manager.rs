@@ -127,6 +127,7 @@ pub(super) fn incomplete_ssh_template() -> SshManagedConfig {
         stability_interval_ms: 500,
         max_fetch_bytes: 256 * 1024 * 1024,
         command_output_bytes: 64 * 1024,
+        eeprom: None,
     }
 }
 

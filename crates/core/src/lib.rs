@@ -5,6 +5,8 @@
 pub mod analysis;
 pub mod asset;
 pub mod calibration;
+pub mod calibration_eeprom;
+pub mod calibration_yaml;
 pub mod color;
 pub mod image;
 pub mod image_analysis;
@@ -26,6 +28,16 @@ pub use calibration::{
     BoardSpec, CalibrationDataError, CalibrationImageSize, CalibrationPoint, CalibrationRequest,
     CalibrationSolution, ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics,
     PANGBOT_CALIBRATION_FLAGS, ViewCalibrationResult,
+};
+pub use calibration_eeprom::{
+    CalibrationStorageMap, EepromImageError, EepromProvisionRequest, EepromProvisionRequestError,
+    EepromProvisioningMode, EepromTransportSpec, EepromWriteSegment, FullEepromImage,
+    StorageEncoding, StorageField, YG_STEREO_P24C64G_FLAG, YG_STEREO_P24C64G_IMAGE_BYTES,
+    YG_STEREO_P24C64G_INTRINSICS_BYTES, YG_STEREO_P24C64G_V1_MAP_ID, serial_checksum,
+    yg_stereo_p24c64g_v1,
+};
+pub use calibration_yaml::{
+    CalibrationYamlError, encode_opencv_pinhole_radtan_yaml, write_opencv_pinhole_radtan_yaml,
 };
 pub use color::{
     BayerPrepareDiagnostics, CfaQuad, CfaSite, ColorPipelineParams, ColorPixel,

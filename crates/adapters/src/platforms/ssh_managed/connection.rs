@@ -10,18 +10,19 @@ use std::{
 use camera_toolbox_app::{RemoteFileStat, RemoteOperationControl};
 use russh::{ChannelMsg, client};
 use russh_sftp::{
-    client::{RawSftpSession, SftpSession, error::Error as SftpError},
-    protocol::StatusCode,
+    client::{RawSftpSession, SftpSession, error::Error as SftpError, fs::File as SftpFile},
+    protocol::{OpenFlags, StatusCode},
 };
 use secrecy::{ExposeSecret, SecretString};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::Instant as TokioInstant;
 use tokio_util::sync::CancellationToken;
 
 const ARGV_MAGIC: &[u8; 8] = b"CTARGV1\0";
 const WATCH_MAGIC: &[u8; 8] = b"CTWATCH1";
 const READ_CHUNK_BYTES: usize = 64 * 1024;
+const WRITE_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_EVENT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_CANDIDATES: usize = 4096;
 const MAX_DIRECTORY_METADATA_BYTES: usize = 1024 * 1024;
@@ -138,6 +139,17 @@ pub trait SshTransportSession: Send {
         control: &RemoteOperationControl,
     ) -> Result<TransportCommandOutput, SshTransportError>;
 
+    /// 执行固定 argv 并通过 stdin 发送 typed payload；默认 transport 不隐式降级到 argv。
+    fn execute_argv_with_stdin(
+        &mut self,
+        _argv: &[String],
+        _stdin: &[u8],
+        _output_limit: usize,
+        _control: &RemoteOperationControl,
+    ) -> Result<TransportCommandOutput, SshTransportError> {
+        Err(SshTransportError::Unsupported)
+    }
+
     fn canonicalize(
         &mut self,
         path: &str,
@@ -184,6 +196,16 @@ pub trait SshTransportSession: Send {
         control: &RemoteOperationControl,
         consume: &mut dyn FnMut(&[u8]) -> Result<(), SshTransportError>,
     ) -> Result<u64, SshTransportError>;
+
+    /// 使用 SFTP 的 CREATE|EXCL 新建受控 staging 文件；调用者负责最终发布与清理。
+    fn write_file_new(
+        &mut self,
+        _path: &str,
+        _control: &RemoteOperationControl,
+        _produce: &mut dyn FnMut(&mut dyn io::Write) -> Result<(), SshTransportError>,
+    ) -> Result<(), SshTransportError> {
+        Err(SshTransportError::Unsupported)
+    }
 
     fn mkdir(
         &mut self,
@@ -259,7 +281,163 @@ struct TransportDirectoryCursor {
     last_used: TokioInstant,
 }
 
+struct BlockingSftpWriter<'a> {
+    runtime: &'a tokio::runtime::Runtime,
+    file: SftpFile,
+    cancellation: CancellationToken,
+    deadline: TokioInstant,
+    idle: Duration,
+    failure: Option<SshTransportError>,
+}
+
+impl BlockingSftpWriter<'_> {
+    fn record_failure(&mut self, error: SshTransportError) -> io::Error {
+        if self.failure.is_none() {
+            self.failure = Some(error.clone());
+        }
+        io::Error::other(error.to_string())
+    }
+
+    fn finish(mut self) -> Result<(), SshTransportError> {
+        if let Some(error) = self.failure.take() {
+            let _ = self.runtime.block_on(async {
+                cancellable_until(
+                    &self.cancellation,
+                    self.deadline,
+                    self.idle,
+                    self.file.shutdown(),
+                )
+                .await
+            });
+            return Err(error);
+        }
+        self.runtime.block_on(async {
+            cancellable_until(
+                &self.cancellation,
+                self.deadline,
+                self.idle,
+                self.file.flush(),
+            )
+            .await?;
+            cancellable_until(
+                &self.cancellation,
+                self.deadline,
+                self.idle,
+                self.file.shutdown(),
+            )
+            .await
+        })
+    }
+}
+
+impl io::Write for BlockingSftpWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        let limit = bytes.len().min(WRITE_CHUNK_BYTES);
+        let result = self.runtime.block_on(async {
+            cancellable_until(
+                &self.cancellation,
+                self.deadline,
+                self.idle,
+                self.file.write(&bytes[..limit]),
+            )
+            .await
+        });
+        match result {
+            Ok(0) => Err(self.record_failure(SshTransportError::Transport(
+                "remote write returned zero bytes".to_owned(),
+            ))),
+            Ok(written) => Ok(written),
+            Err(error) => Err(self.record_failure(error)),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        let result = self.runtime.block_on(async {
+            cancellable_until(
+                &self.cancellation,
+                self.deadline,
+                self.idle,
+                self.file.flush(),
+            )
+            .await
+        });
+        result.map_err(|error| self.record_failure(error))
+    }
+}
+
 impl RusshTransportSession {
+    fn execute_argv_input(
+        &mut self,
+        argv: &[String],
+        stdin: Option<&[u8]>,
+        output_limit: usize,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportCommandOutput, SshTransportError> {
+        let dispatch = command_dispatch(argv, self.command_subsystem.as_deref())?;
+        let cancellation = self.cancellation.clone();
+        let idle = control.timeouts.idle;
+        let overall = control.remaining_overall();
+        if overall.is_zero() {
+            return Err(SshTransportError::TimedOut);
+        }
+        self.runtime.block_on(async {
+            let deadline = TokioInstant::now() + overall;
+            let mut channel = cancellable_until(
+                &cancellation,
+                deadline,
+                idle,
+                self.session.channel_open_session(),
+            )
+            .await?;
+            if !dispatch_channel_request(&channel, dispatch, &cancellation, deadline, idle).await? {
+                return Ok(empty_command_output(output_limit));
+            }
+            if let Some(stdin) = stdin {
+                cancellable_until(
+                    &cancellation,
+                    deadline,
+                    idle,
+                    channel.data_bytes(stdin.to_vec()),
+                )
+                .await?;
+                cancellable_until(&cancellation, deadline, idle, channel.eof()).await?;
+            }
+
+            let mut output = empty_command_output(output_limit);
+            loop {
+                let message = cancellable_until(&cancellation, deadline, idle, async {
+                    Ok::<_, io::Error>(channel.wait().await)
+                })
+                .await?;
+                let Some(message) = message else {
+                    break;
+                };
+                match message {
+                    ChannelMsg::Data { data } => append_bounded(
+                        &mut output.stdout,
+                        &data,
+                        output_limit,
+                        &mut output.stdout_truncated,
+                    ),
+                    ChannelMsg::ExtendedData { data, .. } => append_bounded(
+                        &mut output.stderr,
+                        &data,
+                        output_limit,
+                        &mut output.stderr_truncated,
+                    ),
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        output.exit_status = Some(exit_status);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(output)
+        })
+    }
+
     fn close_directory_cursor(&self, cursor: TransportDirectoryCursor) {
         self.runtime.block_on(async {
             let _ =
@@ -417,59 +595,17 @@ impl SshTransportSession for RusshTransportSession {
         output_limit: usize,
         control: &RemoteOperationControl,
     ) -> Result<TransportCommandOutput, SshTransportError> {
-        let dispatch = command_dispatch(argv, self.command_subsystem.as_deref())?;
-        let cancellation = self.cancellation.clone();
-        let idle = control.timeouts.idle;
-        let overall = control.remaining_overall();
-        if overall.is_zero() {
-            return Err(SshTransportError::TimedOut);
-        }
-        self.runtime.block_on(async {
-            let deadline = TokioInstant::now() + overall;
-            let mut channel = cancellable_until(
-                &cancellation,
-                deadline,
-                idle,
-                self.session.channel_open_session(),
-            )
-            .await?;
-            if !dispatch_channel_request(&channel, dispatch, &cancellation, deadline, idle).await? {
-                return Ok(empty_command_output(output_limit));
-            }
+        self.execute_argv_input(argv, None, output_limit, control)
+    }
 
-            let mut output = empty_command_output(output_limit);
-            loop {
-                let Ok(message) = cancellable_until(&cancellation, deadline, idle, async {
-                    Ok::<_, io::Error>(channel.wait().await)
-                })
-                .await
-                else {
-                    return Ok(output);
-                };
-                let Some(message) = message else {
-                    break;
-                };
-                match message {
-                    ChannelMsg::Data { data } => append_bounded(
-                        &mut output.stdout,
-                        &data,
-                        output_limit,
-                        &mut output.stdout_truncated,
-                    ),
-                    ChannelMsg::ExtendedData { data, .. } => append_bounded(
-                        &mut output.stderr,
-                        &data,
-                        output_limit,
-                        &mut output.stderr_truncated,
-                    ),
-                    ChannelMsg::ExitStatus { exit_status } => {
-                        output.exit_status = Some(exit_status);
-                    }
-                    _ => {}
-                }
-            }
-            Ok(output)
-        })
+    fn execute_argv_with_stdin(
+        &mut self,
+        argv: &[String],
+        stdin: &[u8],
+        output_limit: usize,
+        control: &RemoteOperationControl,
+    ) -> Result<TransportCommandOutput, SshTransportError> {
+        self.execute_argv_input(argv, Some(stdin), output_limit, control)
     }
 
     fn canonicalize(
@@ -753,6 +889,44 @@ impl SshTransportSession for RusshTransportSession {
             }
             Ok(total)
         })
+    }
+
+    fn write_file_new(
+        &mut self,
+        path: &str,
+        control: &RemoteOperationControl,
+        produce: &mut dyn FnMut(&mut dyn io::Write) -> Result<(), SshTransportError>,
+    ) -> Result<(), SshTransportError> {
+        let cancellation = self.cancellation.clone();
+        let overall = control.remaining_overall();
+        let idle = control.timeouts.idle;
+        let deadline = TokioInstant::now() + overall;
+        let path = path.to_owned();
+        let file = self.runtime.block_on(async {
+            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
+            cancellable_sftp_until(
+                &cancellation,
+                deadline,
+                idle,
+                sftp.open_with_flags(
+                    path,
+                    OpenFlags::CREATE | OpenFlags::EXCLUDE | OpenFlags::WRITE,
+                ),
+            )
+            .await
+        })?;
+        let mut writer = BlockingSftpWriter {
+            runtime: &self.runtime,
+            file,
+            cancellation,
+            deadline,
+            idle,
+            failure: None,
+        };
+        let produce_result = produce(&mut writer);
+        let finish_result = writer.finish();
+        finish_result?;
+        produce_result
     }
 
     fn mkdir(

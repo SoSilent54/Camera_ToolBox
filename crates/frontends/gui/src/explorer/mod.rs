@@ -28,8 +28,8 @@ use camera_toolbox_adapters::{
     platforms::ssh_managed::{CredentialResolver, SshConnectionTarget, SshTransportFactory},
 };
 use camera_toolbox_app::{
-    DirectoryChange, DirectoryRef, FileEntry, FileKind, FileRef, FileSourceId, FileSystem,
-    FsCancellation, FsControl, MountedSourceConfig, SourcePath,
+    DirectoryChange, DirectoryRef, ExportDestination, FileEntry, FileKind, FileRef, FileSourceId,
+    FileSystem, FsCancellation, FsControl, MountedSourceConfig, SourcePath,
 };
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{RemoteAuthentication, RemoteConnectionConfig};
@@ -157,7 +157,7 @@ impl SourceView {
             host: connection.host.clone(),
             port: connection.port,
             username: connection.username.clone(),
-            expected_host_key: None,
+            expected_host_key: connection.expected_host_key.clone(),
             command_subsystem: None,
             remote_event_subsystem: None,
         };
@@ -478,6 +478,19 @@ impl ExplorerState {
                 egui::Color32::YELLOW,
                 "Directory connection is stale; retrying automatically…",
             );
+        }
+        if view.is_remote() {
+            if view.file_system.capabilities().write_new {
+                ui.colored_label(
+                    egui::Color32::GREEN,
+                    "Pinned SSH source: exports create new files in this directory.",
+                );
+            } else {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    "Browse-only SSH source: pin and remount a server host key before exporting.",
+                );
+            }
         }
         if let Some(error) = &view.error {
             ui.colored_label(egui::Color32::RED, error);
@@ -923,6 +936,49 @@ impl ExplorerState {
                 config: view.config.clone(),
                 file_system: Arc::clone(&view.file_system),
             })
+    }
+
+    /// 返回当前 Explorer 目录的统一显式导出目标。
+    ///
+    /// SFTP source 只有在 host-key-pinned 文件系统声明 `write_new` capability 时可导出。
+    pub(crate) fn active_save_destination(&self) -> Result<ExportDestination, String> {
+        let view = self
+            .active_view()
+            .ok_or_else(|| "Select a local or pinned SSH directory before exporting.".to_owned())?;
+        if !view.file_system.capabilities().write_new {
+            let reason = if view.is_remote() {
+                "SSH source is browse-only; pin and remount its host key before exporting."
+            } else {
+                "Active file source does not support creating export files."
+            };
+            return Err(reason.to_owned());
+        }
+        ExportDestination::new(view.directory_ref(), Arc::clone(&view.file_system))
+            .map_err(|error| error.to_string())
+    }
+
+    #[must_use]
+    pub(crate) fn active_save_target_label(&self) -> Option<String> {
+        let view = self.active_view()?;
+        Some(
+            view.display_path(&view.current_directory)
+                .display()
+                .to_string(),
+        )
+    }
+
+    /// 导出成功后仅在结果属于当前目录时重启该目录 monitor。
+    pub(crate) fn refresh_save_destination(
+        &mut self,
+        destination: &ExportDestination,
+        context: &egui::Context,
+    ) {
+        if self
+            .active_view()
+            .is_some_and(|view| &view.directory_ref() == destination.directory())
+        {
+            self.start_active_monitor(context);
+        }
     }
 
     pub(crate) fn open_action_for(&self, reference: &FileRef) -> Option<ExplorerAction> {

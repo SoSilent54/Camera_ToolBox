@@ -3,10 +3,13 @@ mod analysis_worker;
 mod app;
 mod auto_open;
 #[cfg(feature = "calibration-opencv")]
+mod calibration_eeprom;
+#[cfg(feature = "calibration-opencv")]
 mod calibration_workspace;
 mod color_controls;
 mod color_worker;
 mod explorer;
+mod export_dialog;
 mod histogram_link;
 mod image_save;
 mod notification;
