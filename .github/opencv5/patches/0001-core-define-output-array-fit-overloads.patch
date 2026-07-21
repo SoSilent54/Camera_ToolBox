@@ -1,0 +1,34 @@
+diff --git a/modules/core/src/matrix_wrap.cpp b/modules/core/src/matrix_wrap.cpp
+index 6999264..869a6ee 100644
+--- a/modules/core/src/matrix_wrap.cpp
++++ b/modules/core/src/matrix_wrap.cpp
+@@ -1959,0 +1960,29 @@ void _OutputArray::createSameSize(const _InputArray& arr, int mtype) const
++void _OutputArray::fit(Size _sz, int mtype, int i,
++                       bool allowTransposed, _OutputArray::DepthMask fixedDepthMask) const
++{
++    int sizes[] = {_sz.height, _sz.width};
++    fit(2, sizes, mtype, i, allowTransposed, fixedDepthMask);
++}
++
++void _OutputArray::fit(int _rows, int _cols, int mtype, int i,
++                       bool allowTransposed, _OutputArray::DepthMask fixedDepthMask) const
++{
++    int sizes[] = {_rows, _cols};
++    fit(2, sizes, mtype, i, allowTransposed, fixedDepthMask);
++}
++
++void _OutputArray::fit(const MatShape& shape, int mtype, int i,
++                       bool allowTransposed, _OutputArray::DepthMask fixedDepthMask) const
++{
++    if (shape.dims < 0)
++        release();
++    else
++        fit(shape.dims, shape.p, mtype, i, allowTransposed, fixedDepthMask);
++}
++
++void _OutputArray::fitSameSize(const _InputArray& arr, int mtype) const
++{
++    int arrsz[CV_MAX_DIM], d = arr.sizend(arrsz);
++    fit(d, arrsz, mtype);
++}
++

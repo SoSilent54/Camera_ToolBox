@@ -134,6 +134,14 @@ jobs:
           set -euo pipefail
           actual=$(git -C .opencv-source rev-parse HEAD)
           test "$actual" = "$OPENCV_COMMIT"
+      - name: Apply pinned OpenCV compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/.github/opencv5/patches/0001-core-define-output-array-fit-overloads.patch"
+          git -C .opencv-source apply --unidiff-zero --check "$patch"
+          git -C .opencv-source apply --unidiff-zero "$patch"
+          git -C .opencv-source diff --check
       - name: Install Rust 1.88 smoke toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -242,6 +250,14 @@ jobs:
           set -euo pipefail
           actual=$(git -C .opencv-source rev-parse HEAD)
           test "$actual" = "$OPENCV_COMMIT"
+      - name: Apply pinned OpenCV compatibility patch
+        shell: bash
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/.github/opencv5/patches/0001-core-define-output-array-fit-overloads.patch"
+          git -C .opencv-source apply --unidiff-zero --check "$patch"
+          git -C .opencv-source apply --unidiff-zero "$patch"
+          git -C .opencv-source diff --check
       - name: Install native build and smoke dependencies
         shell: bash
         run: brew install llvm ninja
@@ -351,6 +367,17 @@ jobs:
           if ($actual -ne $env:OPENCV_COMMIT) {
             throw "unexpected OpenCV commit: $actual"
           }
+      - name: Apply pinned OpenCV compatibility patch
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $patch = Join-Path $env:GITHUB_WORKSPACE ".github/opencv5/patches/0001-core-define-output-array-fit-overloads.patch"
+          git -C .opencv-source apply --unidiff-zero --check $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C .opencv-source apply --unidiff-zero $patch
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git -C .opencv-source diff --check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Install LLVM and Ninja
         shell: pwsh
         run: choco install llvm ninja --yes --no-progress

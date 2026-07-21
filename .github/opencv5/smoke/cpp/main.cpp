@@ -16,6 +16,29 @@ int main() {
     return 1;
   }
 
+  cv::Mat fitted;
+  cv::_OutputArray fitted_output(fitted);
+  fitted_output.fit(cv::Size(3, 2), CV_8UC1);
+  const bool size_fit_ok =
+      fitted.rows == 2 && fitted.cols == 3 && fitted.type() == CV_8UC1;
+
+  fitted_output.fit(4, 5, CV_16UC1);
+  const bool rows_cols_fit_ok =
+      fitted.rows == 4 && fitted.cols == 5 && fitted.type() == CV_16UC1;
+
+  const cv::Mat shape_source(3, 2, CV_32FC1);
+  fitted_output.fit(shape_source.shape(), CV_32FC1);
+  const bool shape_fit_ok =
+      fitted.size() == shape_source.size() && fitted.type() == CV_32FC1;
+
+  fitted_output.fitSameSize(shape_source, CV_64FC1);
+  const bool same_size_fit_ok =
+      fitted.size() == shape_source.size() && fitted.type() == CV_64FC1;
+  if (!size_fit_ok || !rows_cols_fit_ok || !shape_fit_ok || !same_size_fit_ok) {
+    std::cerr << "OutputArray fit overload smoke failed\n";
+    return 6;
+  }
+
   const cv::Mat gray(64, 64, CV_8UC1, cv::Scalar::all(0));
   std::vector<unsigned char> png;
   if (!cv::imencode(".png", gray, png) || png.empty()) {
@@ -57,7 +80,7 @@ int main() {
     static_cast<void>(cv::calibrateCamera(
         empty_object_points, empty_image_points, cv::Size(64, 64),
         mutable_camera_matrix, mutable_distortion, rotations, translations));
-  } catch (const cv::Exception&) {
+  } catch (const cv::Exception &) {
     rejected_empty_calibration = true;
   }
   if (!rejected_empty_calibration) {
