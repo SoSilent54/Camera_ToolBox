@@ -24,7 +24,7 @@ use camera_toolbox_core::{
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
-use crate::explorer::CalibrationImportCandidate;
+use crate::{explorer::CalibrationImportCandidate, viewer::pixel_inspection_texture_options};
 
 const MAX_DATASET_ITEMS: usize = 256;
 const MAX_ENCODED_PNG_BYTES: u64 = 64 * 1024 * 1024;
@@ -1024,7 +1024,7 @@ impl CalibrationWorkspace {
         let texture = context.load_texture(
             format!("calibration-preview-{}", id.get()),
             image,
-            egui::TextureOptions::LINEAR,
+            pixel_inspection_texture_options(),
         );
         if let Some(source) = self.sources.get_mut(&id) {
             source.preview = Some(CalibrationPreview { frame, texture });
@@ -1585,6 +1585,17 @@ mod tests {
         let last_id = workspace.session.items()[1].id;
         assert_eq!(workspace.session.selected(), Some(last_id));
         assert!(workspace.sources[&last_id].preview.is_some());
+        let texture_id = workspace.sources[&last_id]
+            .preview
+            .as_ref()
+            .unwrap()
+            .texture
+            .id();
+        let texture_manager = context.tex_manager();
+        let options = texture_manager.read().meta(texture_id).unwrap().options;
+        assert_eq!(options.magnification, egui::TextureFilter::Nearest);
+        assert_eq!(options.minification, egui::TextureFilter::Linear);
+        assert_eq!(options.mipmap_mode, Some(egui::TextureFilter::Linear));
         std::fs::remove_dir_all(root).unwrap();
     }
 

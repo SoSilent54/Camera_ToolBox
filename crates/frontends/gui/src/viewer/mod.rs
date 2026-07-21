@@ -15,7 +15,7 @@ mod interaction;
 mod model;
 
 pub(crate) use hover::{HoverNeighborhood, HoverViewSettings};
-pub(crate) use model::{LoadedRaw, bayer_label};
+pub(crate) use model::{LoadedRaw, bayer_label, pixel_inspection_texture_options};
 
 use hover::{render_hover_view, render_native_hover_view};
 use interaction::{
@@ -33,7 +33,7 @@ use interaction::{
     roi_from_inclusive_pixels,
 };
 #[cfg(test)]
-use model::{preview_with_diagnostics, raw_texture_options};
+use model::preview_with_diagnostics;
 
 const MIN_ZOOM: f32 = 0.05;
 const MAX_ZOOM: f32 = 64.0;
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn texture_filters_smooth_minification_and_preserve_pixel_magnification() {
-        let options = raw_texture_options();
+        let options = pixel_inspection_texture_options();
 
         assert_eq!(options.magnification, egui::TextureFilter::Nearest);
         assert_eq!(options.minification, egui::TextureFilter::Linear);

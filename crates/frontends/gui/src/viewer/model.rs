@@ -61,7 +61,7 @@ impl LoadedRaw {
         let raw_texture = context.load_texture(
             format!("local-raw-preview:{generation}:{}", report.path.display()),
             image,
-            raw_texture_options(),
+            pixel_inspection_texture_options(),
         );
         let color_edit = ColorEditState::new(&report.frame.spec);
         Self {
@@ -96,13 +96,13 @@ impl LoadedRaw {
         let texture = if let Some(mut installed) = self.installed_color.take() {
             installed
                 .texture
-                .set(Arc::clone(&image), raw_texture_options());
+                .set(Arc::clone(&image), pixel_inspection_texture_options());
             installed.texture
         } else {
             context.load_texture(
                 format!("local-raw-color:{}", self.generation),
                 Arc::clone(&image),
-                raw_texture_options(),
+                pixel_inspection_texture_options(),
             )
         };
         self.installed_color = Some(InstalledColorPreview {
@@ -154,7 +154,7 @@ impl LoadedRaw {
                 self.path.display()
             ),
             image,
-            raw_texture_options(),
+            pixel_inspection_texture_options(),
         ));
     }
 
@@ -207,7 +207,7 @@ impl LoadedRaw {
 }
 
 /// 缩小时使用 mipmap 抑制混叠，放大时保持单像素边界。
-pub(super) const fn raw_texture_options() -> TextureOptions {
+pub(crate) const fn pixel_inspection_texture_options() -> TextureOptions {
     TextureOptions {
         magnification: egui::TextureFilter::Nearest,
         minification: egui::TextureFilter::Linear,

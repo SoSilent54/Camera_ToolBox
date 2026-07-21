@@ -6,12 +6,12 @@ use camera_toolbox_app::{
     ImageFileKind, ImageOpenResult, ImageSourceHandle, TargetResolutionSnapshot,
 };
 use camera_toolbox_core::{ChromaOrder, EphemeralAsset, NativeImage, Rgba8Frame, Roi};
-use eframe::egui::{self, ColorImage, TextureHandle, TextureOptions};
+use eframe::egui::{self, ColorImage, TextureHandle};
 
 use crate::{
     analysis_panel::AnalysisPanelState,
     histogram_link::{HistogramBinSelection, SpatialHighlight},
-    viewer::{HoverViewSettings, ImageViewerState},
+    viewer::{HoverViewSettings, ImageViewerState, pixel_inspection_texture_options},
     yuv_inspector::YuvInspectorState,
 };
 
@@ -81,12 +81,7 @@ impl DisplaySurface {
         self.texture = Some(context.load_texture(
             format!("image-document:{document_id}:{}", self.revision),
             image,
-            TextureOptions {
-                magnification: egui::TextureFilter::Nearest,
-                minification: egui::TextureFilter::Linear,
-                wrap_mode: egui::TextureWrapMode::ClampToEdge,
-                mipmap_mode: Some(egui::TextureFilter::Linear),
-            },
+            pixel_inspection_texture_options(),
         ));
         Ok(())
     }
