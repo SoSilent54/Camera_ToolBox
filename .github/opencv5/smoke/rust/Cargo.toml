@@ -1,0 +1,18 @@
+[package]
+name = "opencv5-dependency-smoke"
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[workspace]
+
+[dependencies]
+opencv = { version = "=0.99.0", default-features = false, features = [
+    "calib",
+    "clang-runtime",
+    "geometry",
+    "imgcodecs",
+    "imgproc",
+    "objdetect",
+] }

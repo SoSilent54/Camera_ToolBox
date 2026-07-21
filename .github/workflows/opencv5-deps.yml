@@ -1,0 +1,507 @@
+name: OpenCV 5 Dependencies
+
+"on":
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Immutable dependency recipe revision"
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: opencv-deps-5.0.0-r${{ inputs.revision }}
+  cancel-in-progress: false
+
+env:
+  OPENCV_VERSION: "5.0.0"
+  OPENCV_COMMIT: "40738fb16ceddb5fb3fea747585f7ce6abb0605b"
+
+jobs:
+  preflight:
+    name: Validate dependency release request
+    runs-on: ubuntu-22.04
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+      revision: ${{ steps.validate.outputs.revision }}
+    steps:
+      - name: Validate main ref, revision, and immutable tag
+        id: validate
+        shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "OpenCV dependency releases must be dispatched from $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+          if [[ ! "$REVISION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "revision must be a positive integer" >&2
+            exit 1
+          fi
+          release_tag="opencv-deps-v${OPENCV_VERSION}-r${REVISION}"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}" >/dev/null 2>&1; then
+            echo "dependency tag already exists and is immutable: $release_tag" >&2
+            exit 1
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "revision=$REVISION" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build ${{ matrix.platform }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    container:
+      image: ubuntu:${{ matrix.ubuntu_version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64-ubuntu20
+            runner: ubuntu-22.04
+            ubuntu_version: "20.04"
+            cpu_baseline: SSE3
+            cpu_dispatch: SSE4_1,SSE4_2,AVX,AVX2
+            cpu_baseline_disable: ""
+          - platform: linux-x86_64-ubuntu22
+            runner: ubuntu-22.04
+            ubuntu_version: "22.04"
+            cpu_baseline: SSE3
+            cpu_dispatch: SSE4_1,SSE4_2,AVX,AVX2
+            cpu_baseline_disable: ""
+          - platform: linux-aarch64-ubuntu20
+            runner: ubuntu-24.04-arm
+            ubuntu_version: "20.04"
+            cpu_baseline: DETECT
+            cpu_dispatch: NEON_FP16,NEON_DOTPROD
+            cpu_baseline_disable: FP16,NEON_FP16,NEON_BF16,NEON_DOTPROD,SVE
+          - platform: linux-aarch64-ubuntu22
+            runner: ubuntu-24.04-arm
+            ubuntu_version: "22.04"
+            cpu_baseline: DETECT
+            cpu_dispatch: NEON_FP16,NEON_DOTPROD
+            cpu_baseline_disable: FP16,NEON_FP16,NEON_BF16,NEON_DOTPROD,SVE
+    steps:
+      - name: Install native build and smoke dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            git \
+            libclang-dev \
+            llvm-dev \
+            ninja-build \
+            pkg-config \
+            python3
+      - name: Check out Camera Toolbox automation
+        uses: actions/checkout@v4
+      - name: Check out pinned OpenCV source
+        uses: actions/checkout@v4
+        with:
+          repository: opencv/opencv
+          ref: ${{ env.OPENCV_COMMIT }}
+          path: .opencv-source
+          fetch-depth: 1
+      - name: Verify OpenCV source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git -C .opencv-source rev-parse HEAD)
+          test "$actual" = "$OPENCV_COMMIT"
+      - name: Install Rust 1.88 smoke toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - name: Locate libclang
+        id: llvm
+        shell: bash
+        run: echo "libdir=$(llvm-config --libdir)" >> "$GITHUB_OUTPUT"
+      - name: Build and install OpenCV
+        shell: bash
+        env:
+          PLATFORM_ID: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/opencv5-$PLATFORM_ID"
+          rm -rf "$scratch"
+          mkdir -p "$scratch"
+          cmake \
+            -S "$GITHUB_WORKSPACE/.opencv-source" \
+            -B "$scratch/build" \
+            -G Ninja \
+            -C "$GITHUB_WORKSPACE/.github/opencv5/OpenCVDependency.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            "-DCPU_BASELINE=${{ matrix.cpu_baseline }}" \
+            "-DCPU_DISPATCH=${{ matrix.cpu_dispatch }}" \
+            "-DCPU_BASELINE_DISABLE=${{ matrix.cpu_baseline_disable }}" \
+            "-DCMAKE_INSTALL_PREFIX=$scratch/install" \
+            '-DCMAKE_INSTALL_RPATH=$ORIGIN'
+          cmake --build "$scratch/build" --parallel
+          cmake --install "$scratch/build"
+      - name: Package and verify relocated native libraries
+        id: package
+        shell: bash
+        env:
+          PLATFORM_ID: ${{ matrix.platform }}
+          REVISION: ${{ needs.preflight.outputs.revision }}
+        run: |
+          set -euo pipefail
+          python3 .github/opencv5/package.py \
+            --scratch-root "$RUNNER_TEMP/opencv5-$PLATFORM_ID" \
+            --source-root "$GITHUB_WORKSPACE/.opencv-source" \
+            --output-dir "$GITHUB_WORKSPACE/dist" \
+            --platform-id "$PLATFORM_ID" \
+            --version "$OPENCV_VERSION" \
+            --commit "$OPENCV_COMMIT" \
+            --revision "$REVISION" \
+            --archive-format tar.gz
+      - name: Build and run relocated CMake consumer
+        shell: bash
+        env:
+          LD_LIBRARY_PATH: ${{ steps.package.outputs.runtime_dir }}
+          PLATFORM_ID: ${{ matrix.platform }}
+        run: |
+          set -euo pipefail
+          build_dir="$RUNNER_TEMP/opencv5-$PLATFORM_ID/cpp-smoke"
+          cmake \
+            -S .github/opencv5/smoke/cpp \
+            -B "$build_dir" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            "-DOpenCV_DIR=${{ steps.package.outputs.cmake_dir }}"
+          cmake --build "$build_dir" --parallel
+          "$build_dir/opencv5_dependency_smoke"
+      - name: Build and run relocated opencv-rust consumer
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/opencv5-${{ matrix.platform }}/rust-target
+          LD_LIBRARY_PATH: ${{ steps.package.outputs.runtime_dir }}
+          LIBCLANG_PATH: ${{ steps.llvm.outputs.libdir }}
+          OPENCV_DISABLE_PROBES: pkg_config,cmake,vcpkg_cmake,vcpkg
+          OPENCV_INCLUDE_PATHS: ${{ steps.package.outputs.include_dir }}
+          OPENCV_LINK_LIBS: ${{ steps.package.outputs.link_lib }}
+          OPENCV_LINK_PATHS: ${{ steps.package.outputs.lib_dir }}
+        run: >-
+          cargo run --release --locked
+          --manifest-path .github/opencv5/smoke/rust/Cargo.toml
+      - name: Upload verified Linux dependency
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv5-${{ matrix.platform }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  build-macos:
+    name: Build macos-aarch64-macos14
+    needs: preflight
+    runs-on: macos-14
+    timeout-minutes: 180
+    steps:
+      - name: Check out Camera Toolbox automation
+        uses: actions/checkout@v4
+      - name: Check out pinned OpenCV source
+        uses: actions/checkout@v4
+        with:
+          repository: opencv/opencv
+          ref: ${{ env.OPENCV_COMMIT }}
+          path: .opencv-source
+          fetch-depth: 1
+      - name: Verify OpenCV source commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual=$(git -C .opencv-source rev-parse HEAD)
+          test "$actual" = "$OPENCV_COMMIT"
+      - name: Install native build and smoke dependencies
+        shell: bash
+        run: brew install llvm ninja
+      - name: Install Rust 1.88 smoke toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - name: Locate libclang
+        id: llvm
+        shell: bash
+        run: echo "libdir=$(brew --prefix llvm)/lib" >> "$GITHUB_OUTPUT"
+      - name: Build and install OpenCV
+        shell: bash
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/opencv5-macos-aarch64-macos14"
+          rm -rf "$scratch"
+          mkdir -p "$scratch"
+          cmake \
+            -S "$GITHUB_WORKSPACE/.opencv-source" \
+            -B "$scratch/build" \
+            -G Ninja \
+            -C "$GITHUB_WORKSPACE/.github/opencv5/OpenCVDependency.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_WITH_INSTALL_RPATH=ON \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            "-DCMAKE_INSTALL_PREFIX=$scratch/install" \
+            '-DCMAKE_INSTALL_NAME_DIR=@rpath' \
+            '-DCMAKE_INSTALL_RPATH=@loader_path'
+          cmake --build "$scratch/build" --parallel
+          cmake --install "$scratch/build"
+      - name: Package and verify relocated native libraries
+        id: package
+        shell: bash
+        env:
+          REVISION: ${{ needs.preflight.outputs.revision }}
+        run: |
+          set -euo pipefail
+          python3 .github/opencv5/package.py \
+            --scratch-root "$RUNNER_TEMP/opencv5-macos-aarch64-macos14" \
+            --source-root "$GITHUB_WORKSPACE/.opencv-source" \
+            --output-dir "$GITHUB_WORKSPACE/dist" \
+            --platform-id macos-aarch64-macos14 \
+            --version "$OPENCV_VERSION" \
+            --commit "$OPENCV_COMMIT" \
+            --revision "$REVISION" \
+            --archive-format tar.gz
+      - name: Build and run relocated CMake consumer
+        shell: bash
+        env:
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ steps.package.outputs.runtime_dir }}
+        run: |
+          set -euo pipefail
+          build_dir="$RUNNER_TEMP/opencv5-macos-aarch64-macos14/cpp-smoke"
+          cmake \
+            -S .github/opencv5/smoke/cpp \
+            -B "$build_dir" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            "-DOpenCV_DIR=${{ steps.package.outputs.cmake_dir }}"
+          cmake --build "$build_dir" --parallel
+          "$build_dir/opencv5_dependency_smoke"
+      - name: Build and run relocated opencv-rust consumer
+        shell: bash
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/opencv5-macos-aarch64-macos14/rust-target
+          DYLD_FALLBACK_LIBRARY_PATH: ${{ steps.package.outputs.runtime_dir }}:${{ steps.llvm.outputs.libdir }}
+          LIBCLANG_PATH: ${{ steps.llvm.outputs.libdir }}
+          OPENCV_DISABLE_PROBES: pkg_config,cmake,vcpkg_cmake,vcpkg
+          OPENCV_INCLUDE_PATHS: ${{ steps.package.outputs.include_dir }}
+          OPENCV_LINK_LIBS: ${{ steps.package.outputs.link_lib }}
+          OPENCV_LINK_PATHS: ${{ steps.package.outputs.lib_dir }}
+        run: >-
+          cargo run --release --locked
+          --manifest-path .github/opencv5/smoke/rust/Cargo.toml
+      - name: Upload verified macOS dependency
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv5-macos-aarch64-macos14
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  build-windows:
+    name: Build windows-x86_64-msvc
+    needs: preflight
+    runs-on: windows-2022
+    timeout-minutes: 180
+    steps:
+      - name: Check out Camera Toolbox automation
+        uses: actions/checkout@v4
+      - name: Check out pinned OpenCV source
+        uses: actions/checkout@v4
+        with:
+          repository: opencv/opencv
+          ref: ${{ env.OPENCV_COMMIT }}
+          path: .opencv-source
+          fetch-depth: 1
+      - name: Verify OpenCV source commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $actual = (git -C .opencv-source rev-parse HEAD).Trim()
+          if ($actual -ne $env:OPENCV_COMMIT) {
+            throw "unexpected OpenCV commit: $actual"
+          }
+      - name: Install LLVM and Ninja
+        shell: pwsh
+        run: choco install llvm ninja --yes --no-progress
+      - name: Activate Windows MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Install Rust 1.88 smoke toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.88.0"
+      - name: Build and install OpenCV
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $scratch = Join-Path $env:RUNNER_TEMP "opencv5-windows-x86_64-msvc"
+          if (Test-Path $scratch) {
+            Remove-Item -Recurse -Force $scratch
+          }
+          New-Item -ItemType Directory -Force -Path $scratch | Out-Null
+          $build = Join-Path $scratch "build"
+          $install = Join-Path $scratch "install"
+          cmake `
+            -S "$env:GITHUB_WORKSPACE/.opencv-source" `
+            -B $build `
+            -G Ninja `
+            -C "$env:GITHUB_WORKSPACE/.github/opencv5/OpenCVDependency.cmake" `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCPU_BASELINE=SSE3" `
+            "-DCPU_DISPATCH=SSE4_1,SSE4_2,AVX,AVX2" `
+            "-DCMAKE_INSTALL_PREFIX=$install"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build $build --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --install $build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package and verify relocated native libraries
+        id: package
+        shell: pwsh
+        env:
+          REVISION: ${{ needs.preflight.outputs.revision }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          python .github/opencv5/package.py `
+            --scratch-root "$env:RUNNER_TEMP/opencv5-windows-x86_64-msvc" `
+            --source-root "$env:GITHUB_WORKSPACE/.opencv-source" `
+            --output-dir "$env:GITHUB_WORKSPACE/dist" `
+            --platform-id windows-x86_64-msvc `
+            --version $env:OPENCV_VERSION `
+            --commit $env:OPENCV_COMMIT `
+            --revision $env:REVISION `
+            --archive-format zip
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Add relocated OpenCV runtime to PATH
+        shell: pwsh
+        run: '"${{ steps.package.outputs.runtime_dir }}" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
+      - name: Build and run relocated CMake consumer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $build = Join-Path $env:RUNNER_TEMP "opencv5-windows-x86_64-msvc/cpp-smoke"
+          cmake `
+            -S .github/opencv5/smoke/cpp `
+            -B $build `
+            -G Ninja `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DOpenCV_DIR=${{ steps.package.outputs.cmake_dir }}"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build $build --parallel
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & (Join-Path $build "opencv5_dependency_smoke.exe")
+      - name: Build and run relocated opencv-rust consumer
+        shell: pwsh
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/opencv5-windows-x86_64-msvc/rust-target
+          LIBCLANG_PATH: C:\Program Files\LLVM\bin
+          OPENCV_DISABLE_PROBES: pkg_config,cmake,vcpkg_cmake,vcpkg
+          OPENCV_INCLUDE_PATHS: ${{ steps.package.outputs.include_dir }}
+          OPENCV_LINK_LIBS: ${{ steps.package.outputs.link_lib }}
+          OPENCV_LINK_PATHS: ${{ steps.package.outputs.lib_dir }}
+          OPENCV_MSVC_CRT: dynamic
+        run: >-
+          cargo run --release --locked
+          --manifest-path .github/opencv5/smoke/rust/Cargo.toml
+      - name: Upload verified Windows dependency
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencv5-windows-x86_64-msvc
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish OpenCV dependency release
+    needs:
+      - preflight
+      - build-linux
+      - build-macos
+      - build-windows
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified dependency archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: opencv5-*
+          path: dist
+          merge-multiple: true
+      - name: Verify exact archive set and checksums
+        shell: bash
+        env:
+          REVISION: ${{ needs.preflight.outputs.revision }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          prefix="opencv-${OPENCV_VERSION}-r${REVISION}"
+          cd dist
+          expected=(
+            "${prefix}-windows-x86_64-msvc.zip"
+            "${prefix}-macos-aarch64-macos14.tar.gz"
+            "${prefix}-linux-x86_64-ubuntu20.tar.gz"
+            "${prefix}-linux-x86_64-ubuntu22.tar.gz"
+            "${prefix}-linux-aarch64-ubuntu20.tar.gz"
+            "${prefix}-linux-aarch64-ubuntu22.tar.gz"
+          )
+          archives=( *.tar.gz *.zip )
+          checksums=( *.sha256 )
+          if (( ${#archives[@]} != ${#expected[@]} || ${#checksums[@]} != ${#expected[@]} )); then
+            printf 'unexpected asset set: %s archives, %s checksums\n' \
+              "${#archives[@]}" "${#checksums[@]}" >&2
+            exit 1
+          fi
+          for asset in "${expected[@]}"; do
+            test -s "$asset"
+            test -s "$asset.sha256"
+          done
+          sha256sum -c -- "${checksums[@]}"
+          sha256sum -- "${expected[@]}" > SHA256SUMS
+      - name: Publish immutable OpenCV dependency assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.preflight.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          name: OpenCV 5.0.0 dependency r${{ needs.preflight.outputs.revision }}
+          body: |
+            Relocatable OpenCV 5.0.0 development/runtime dependencies for Camera Toolbox.
+
+            Source commit: `${{ env.OPENCV_COMMIT }}`
+            Linkage: shared `opencv_world`
+            Codec policy: bundled PNG/zlib only
+
+            Each archive was removed from its original install path, extracted elsewhere,
+            and validated with native CMake and `opencv-rust 0.99.0` consumers before upload.
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          make_latest: false
+          prerelease: false
+          files: |
+            dist/opencv-${{ env.OPENCV_VERSION }}-r${{ needs.preflight.outputs.revision }}-*.tar.gz
+            dist/opencv-${{ env.OPENCV_VERSION }}-r${{ needs.preflight.outputs.revision }}-*.zip
+            dist/*.sha256
+            dist/SHA256SUMS
