@@ -19,7 +19,7 @@ use camera_toolbox_app::{
 };
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution, InitialIntrinsics,
-    Rgba8Frame,
+    Rgba8Frame, ViewCalibrationResult,
 };
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -34,6 +34,11 @@ const COVERAGE_WIDTH: usize = 192;
 const COVERAGE_GAUSSIAN_SIGMA: f32 = 42.0 / 1920.0 * COVERAGE_WIDTH as f32;
 const MIN_PREVIEW_ZOOM: f32 = 0.05;
 const MAX_PREVIEW_ZOOM: f32 = 64.0;
+const OBSERVED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 230, 140);
+const REPROJECTED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 96, 96);
+const REPROJECTION_ARROW_WIDTH: f32 = 1.25;
+const REPROJECTION_ARROW_HEAD_LENGTH: f32 = 5.0;
+const REPROJECTION_ARROW_HEAD_HALF_WIDTH: f32 = 2.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalibrationJobKind {
@@ -603,10 +608,11 @@ impl CalibrationWorkspace {
                         }
                     });
                     row.col(|ui| {
-                        let mut response = ui.selectable_label(
-                            selected == Some(item.id),
-                            status_label(&item.status),
-                        );
+                        let mut label = egui::RichText::new(status_label(&item.status));
+                        if let Some(color) = status_color(&item.status) {
+                            label = label.color(color);
+                        }
+                        let mut response = ui.selectable_label(selected == Some(item.id), label);
                         if let CalibrationItemStatus::Failed(reason) = &item.status {
                             response = response.on_hover_text(reason);
                         }
@@ -731,8 +737,6 @@ impl CalibrationWorkspace {
                     ui.monospace(format!("{} views", coverage.enabled_views));
                 }
                 ui.separator();
-                ui.weak("Wheel: zoom · Primary drag: pan");
-                ui.separator();
                 ui.monospace(format!("{:.0}%", self.preview_viewport.zoom * 100.0));
                 if ui.small_button("Fit").clicked() {
                     self.preview_viewport.fit_on_next_frame = true;
@@ -817,23 +821,18 @@ impl CalibrationWorkspace {
                 image_rect.top() + point.y / height as f32 * image_rect.height(),
             )
         };
-        let projected = self.session.installed().and_then(|installed| {
-            installed
-                .item_ids
-                .iter()
-                .position(|item_id| *item_id == id)
-                .and_then(|index| installed.solution.views.get(index))
-                .map(|view| view.projected_points.as_slice())
-        });
+        let projected = calibration_view(self.session.installed(), id)
+            .map(|view| view.projected_points.as_slice());
         for (index, observed) in detection.corners.iter().copied().enumerate() {
-            let position = map(observed);
-            painter.circle_filled(position, 2.5, egui::Color32::LIGHT_GREEN);
+            let observed_position = map(observed);
             if let Some(projected) = projected.and_then(|points| points.get(index)).copied() {
-                painter.line_segment(
-                    [position, map(projected)],
-                    egui::Stroke::new(1.0, egui::Color32::RED),
-                );
+                paint_reprojection_vector(&painter, observed_position, map(projected));
             }
+            painter.circle_stroke(
+                observed_position,
+                3.0,
+                egui::Stroke::new(1.25, OBSERVED_POINT_COLOR),
+            );
         }
     }
 
@@ -1188,6 +1187,32 @@ impl CalibrationWorkspace {
     }
 }
 
+fn paint_reprojection_vector(painter: &egui::Painter, observed: egui::Pos2, projected: egui::Pos2) {
+    let vector = projected - observed;
+    let stroke = egui::Stroke::new(REPROJECTION_ARROW_WIDTH, REPROJECTED_POINT_COLOR);
+    painter.line_segment([observed, projected], stroke);
+    if vector.length_sq() > f32::EPSILON {
+        let direction = vector / vector.length();
+        let normal = egui::vec2(-direction.y, direction.x);
+        let arrow_base = projected - direction * REPROJECTION_ARROW_HEAD_LENGTH;
+        painter.line_segment(
+            [
+                projected,
+                arrow_base + normal * REPROJECTION_ARROW_HEAD_HALF_WIDTH,
+            ],
+            stroke,
+        );
+        painter.line_segment(
+            [
+                projected,
+                arrow_base - normal * REPROJECTION_ARROW_HEAD_HALF_WIDTH,
+            ],
+            stroke,
+        );
+    }
+    painter.circle_filled(projected, 2.0, REPROJECTED_POINT_COLOR);
+}
+
 fn status_label(status: &CalibrationItemStatus) -> &'static str {
     match status {
         CalibrationItemStatus::Pending => "Pending",
@@ -1199,6 +1224,18 @@ fn status_label(status: &CalibrationItemStatus) -> &'static str {
     }
 }
 
+fn status_color(status: &CalibrationItemStatus) -> Option<egui::Color32> {
+    match status {
+        CalibrationItemStatus::Found(_) => Some(OBSERVED_POINT_COLOR),
+        CalibrationItemStatus::NotFound { .. } | CalibrationItemStatus::Failed(_) => {
+            Some(REPROJECTED_POINT_COLOR)
+        }
+        CalibrationItemStatus::Pending
+        | CalibrationItemStatus::Reading
+        | CalibrationItemStatus::Detecting => None,
+    }
+}
+
 fn detection_size(status: &CalibrationItemStatus) -> Option<CalibrationImageSize> {
     match status {
         CalibrationItemStatus::Found(detection) => Some(detection.image_size),
@@ -1207,17 +1244,20 @@ fn detection_size(status: &CalibrationItemStatus) -> Option<CalibrationImageSize
     }
 }
 
+fn calibration_view(
+    installed: Option<&camera_toolbox_app::InstalledCalibration>,
+    item_id: CalibrationItemId,
+) -> Option<&ViewCalibrationResult> {
+    let installed = installed?;
+    let index = installed.item_ids.iter().position(|id| *id == item_id)?;
+    installed.solution.views.get(index)
+}
+
 fn calibration_metric(
     installed: Option<&camera_toolbox_app::InstalledCalibration>,
     item_id: CalibrationItemId,
 ) -> Option<f64> {
-    let installed = installed?;
-    let index = installed.item_ids.iter().position(|id| *id == item_id)?;
-    installed
-        .solution
-        .views
-        .get(index)
-        .map(|view| view.reprojection_rmse)
+    calibration_view(installed, item_id).map(|view| view.reprojection_rmse)
 }
 
 fn render_rmse_cell(ui: &mut egui::Ui, metric: Option<f64>, max_metric: f64) {
@@ -1777,6 +1817,9 @@ mod tests {
             .session
             .install_solution(snapshot, solution)
             .unwrap();
+        let installed = workspace.session.installed().unwrap();
+        let second_view = calibration_view(Some(installed), installed.item_ids[1]).unwrap();
+        assert!((second_view.reprojection_rmse - 0.15).abs() < 1e-12);
 
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -1811,5 +1854,34 @@ mod tests {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
         assert!(!text.contains("Reprojection RMSE"));
+        assert!(!text.contains("Wheel: zoom"));
+    }
+
+    #[test]
+    fn status_colors_distinguish_unprocessed_success_and_failure() {
+        let camera_toolbox_core::ChessboardDetectionOutcome::Found(detection) =
+            found_detection(640, 480)
+        else {
+            unreachable!();
+        };
+        assert_eq!(status_color(&CalibrationItemStatus::Pending), None);
+        assert_eq!(status_color(&CalibrationItemStatus::Reading), None);
+        assert_eq!(
+            status_color(&CalibrationItemStatus::Found(detection)),
+            Some(OBSERVED_POINT_COLOR)
+        );
+        assert_eq!(
+            status_color(&CalibrationItemStatus::NotFound {
+                image_size: CalibrationImageSize {
+                    width: 640,
+                    height: 480,
+                },
+            }),
+            Some(REPROJECTED_POINT_COLOR)
+        );
+        assert_eq!(
+            status_color(&CalibrationItemStatus::Failed("decode failed".to_owned())),
+            Some(REPROJECTED_POINT_COLOR)
+        );
     }
 }
