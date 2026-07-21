@@ -159,6 +159,9 @@ jobs:
       - name: Install Windows OpenCV with vcpkg
         if: runner.os == 'Windows'
         uses: lukka/run-vcpkg@v11
+        env:
+          VCPKG_INSTALLED_DIR: ${{ github.workspace }}/vcpkg_installed
+          VCPKG_DEFAULT_TRIPLET: x64-windows
         with:
           runVcpkgInstall: true
           vcpkgJsonGlob: '**/vcpkg.json'
@@ -175,6 +178,9 @@ jobs:
           $installedRoot = (Resolve-Path (Join-Path $env:GITHUB_WORKSPACE "vcpkg_installed\x64-windows")).Path
           $opencvDir = (Resolve-Path (Join-Path $installedRoot "share\opencv4")).Path
           $opencvDirCmake = $opencvDir -replace '\\', '/'
+          $runVcpkgRoot = (Resolve-Path $env:RUNVCPKG_VCPKG_ROOT).Path
+          "VCPKG_ROOT=$runVcpkgRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "VCPKGRS_TRIPLET=x64-windows" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OpenCV_DIR=$opencvDirCmake" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "OPENCV_CMAKE_ARGS=-DOpenCV_DIR=$opencvDirCmake -DCMAKE_C_COMPILER=cl.exe -DCMAKE_CXX_COMPILER=cl.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           (Join-Path $installedRoot "bin") | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
