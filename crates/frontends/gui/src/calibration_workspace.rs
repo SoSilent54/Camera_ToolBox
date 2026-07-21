@@ -36,6 +36,8 @@ const MIN_PREVIEW_ZOOM: f32 = 0.05;
 const MAX_PREVIEW_ZOOM: f32 = 64.0;
 const OBSERVED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 230, 140);
 const REPROJECTED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 96, 96);
+const RMSE_TEXT_ON_FILL: egui::Color32 = egui::Color32::from_rgb(12, 32, 45);
+const RMSE_TEXT_ON_TRACK: egui::Color32 = egui::Color32::WHITE;
 const REPROJECTION_ARROW_WIDTH: f32 = 1.25;
 const REPROJECTION_ARROW_HEAD_LENGTH: f32 = 5.0;
 const REPROJECTION_ARROW_HEAD_HALF_WIDTH: f32 = 2.5;
@@ -1246,21 +1248,30 @@ fn render_rmse_cell(ui: &mut egui::Ui, metric: Option<f64>, max_metric: f64) {
     };
     let size = egui::vec2(ui.available_width().max(24.0), 16.0);
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
-    ui.painter()
-        .rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
+    let painter = ui.painter();
+    painter.rect_filled(rect, 2.0, egui::Color32::DARK_GRAY);
     let ratio = (metric / max_metric).clamp(0.0, 1.0) as f32;
-    ui.painter().rect_filled(
-        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * ratio, rect.height())),
-        2.0,
-        egui::Color32::LIGHT_BLUE,
-    );
-    ui.painter().text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
+    let fill_rect =
+        egui::Rect::from_min_size(rect.min, egui::vec2(rect.width() * ratio, rect.height()));
+    painter.rect_filled(fill_rect, 2.0, egui::Color32::LIGHT_BLUE);
+
+    // 同一数值按进度边界分色，保证浅色填充区和深色轨道区都保持高对比度。
+    let galley = painter.layout_no_wrap(
         format!("{metric:.3}"),
         egui::FontId::monospace(11.0),
-        egui::Color32::WHITE,
+        egui::Color32::PLACEHOLDER,
     );
+    let text_position = rect.center() - galley.size() * 0.5;
+    painter
+        .with_clip_rect(fill_rect)
+        .galley_with_override_text_color(text_position, Arc::clone(&galley), RMSE_TEXT_ON_FILL);
+    let track_rect = egui::Rect::from_min_max(
+        egui::pos2(fill_rect.right(), rect.top()),
+        rect.right_bottom(),
+    );
+    painter
+        .with_clip_rect(track_rect)
+        .galley_with_override_text_color(text_position, galley, RMSE_TEXT_ON_TRACK);
     response.on_hover_text(format!("Reprojection RMSE: {metric:.6} px"));
 }
 
@@ -1776,6 +1787,7 @@ mod tests {
             workspace.session.items()[0].status,
             CalibrationItemStatus::Found(_)
         ));
+
         assert!(workspace.status.contains("detections were preserved"));
 
         workspace.board_cols = 12;
@@ -1785,6 +1797,30 @@ mod tests {
             CalibrationItemStatus::Pending
         ));
         assert!(workspace.status.contains("detections were invalidated"));
+    }
+
+    #[test]
+    fn rmse_text_colors_meet_contrast_on_both_progress_regions() {
+        fn relative_luminance(color: egui::Color32) -> f32 {
+            let linear = |channel: u8| {
+                let value = f32::from(channel) / 255.0;
+                if value <= 0.04045 {
+                    value / 12.92
+                } else {
+                    ((value + 0.055) / 1.055).powf(2.4)
+                }
+            };
+            0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+        }
+
+        fn contrast_ratio(first: egui::Color32, second: egui::Color32) -> f32 {
+            let first = relative_luminance(first);
+            let second = relative_luminance(second);
+            (first.max(second) + 0.05) / (first.min(second) + 0.05)
+        }
+
+        assert!(contrast_ratio(RMSE_TEXT_ON_FILL, egui::Color32::LIGHT_BLUE) >= 4.5);
+        assert!(contrast_ratio(RMSE_TEXT_ON_TRACK, egui::Color32::DARK_GRAY) >= 4.5);
     }
 
     #[test]
