@@ -69,7 +69,7 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
         checkpoint(cancellation)?;
 
         let mut gray = Mat::default();
-        imgproc::cvt_color(&bgr, &mut gray, imgproc::COLOR_BGR2GRAY, 0)
+        imgproc::cvt_color_def(&bgr, &mut gray, imgproc::COLOR_BGR2GRAY)
             .map_err(|error| cv_error("cvtColor(BGR2GRAY)", &error))?;
         let mut corners = Vector::<Point2f>::new();
         let board_size = Size::new(i32::from(board.inner_cols), i32::from(board.inner_rows));
@@ -412,14 +412,8 @@ mod tests {
 
         let mut baseline_gray = Mat::default();
         let mut decoded_gray = Mat::default();
-        imgproc::cvt_color(
-            &baseline_bgr,
-            &mut baseline_gray,
-            imgproc::COLOR_BGR2GRAY,
-            0,
-        )
-        .unwrap();
-        imgproc::cvt_color(&decoded_bgr, &mut decoded_gray, imgproc::COLOR_BGR2GRAY, 0).unwrap();
+        imgproc::cvt_color_def(&baseline_bgr, &mut baseline_gray, imgproc::COLOR_BGR2GRAY).unwrap();
+        imgproc::cvt_color_def(&decoded_bgr, &mut decoded_gray, imgproc::COLOR_BGR2GRAY).unwrap();
         assert_eq!(
             baseline_gray.data_bytes().unwrap(),
             decoded_gray.data_bytes().unwrap()
