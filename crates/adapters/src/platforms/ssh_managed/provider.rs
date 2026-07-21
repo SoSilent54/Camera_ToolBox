@@ -4,8 +4,7 @@ use std::{collections::BTreeSet, sync::Arc, time::Duration};
 
 use camera_toolbox_app::{
     CapabilityKind, CapabilityLimits, CapabilityRequirement, CapabilityResolutionError,
-    CapabilityVariant, CommandService, ConcurrencyPolicy, EepromProvisionService,
-    EepromProvisionServiceError, EvidenceMaturity, InitializationState,
+    CapabilityVariant, CommandService, ConcurrencyPolicy, EvidenceMaturity, InitializationState,
     PlatformCapabilityDescriptor, PlatformCapabilityHandle, PlatformConfig, PlatformKind,
     PlatformProfile, ProfileError, RemoteFileService, SshManagedBindings,
 };
@@ -16,7 +15,6 @@ use super::{
     connection::{
         CredentialResolver, RusshTransportFactory, SshConnectionTarget, SshTransportFactory,
     },
-    eeprom::SshEepromProvisionService,
     remote_file::SshRemoteFileService,
 };
 
@@ -103,31 +101,6 @@ impl SshManagedPlatformProvider {
                 descriptor,
             })
         };
-        let eeprom = config
-            .eeprom
-            .as_ref()
-            .map(|eeprom_config| {
-                let service = SshEepromProvisionService::new(
-                    format!("ssh-managed:{}:eeprom", profile.id.as_str()),
-                    SshConnectionTarget {
-                        host: config.host.clone(),
-                        port: config.port,
-                        username: config.username.clone(),
-                        expected_host_key: Some(config.expected_host_key.clone()),
-                        command_subsystem: config.command_subsystem.clone(),
-                        remote_event_subsystem: config.remote_event_subsystem.clone(),
-                    },
-                    config.credential_ref.clone(),
-                    eeprom_config,
-                    Arc::clone(&self.resolver),
-                    Arc::clone(&self.transport),
-                )?;
-                Ok::<_, EepromProvisionServiceError>(PlatformCapabilityHandle {
-                    service: Arc::new(service) as Arc<dyn EepromProvisionService>,
-                    descriptor: Arc::new(eeprom_descriptor(config, platform_snapshot_hash)),
-                })
-            })
-            .transpose()?;
         let target = SshConnectionTarget {
             host: config.host.clone(),
             port: config.port,
@@ -179,7 +152,6 @@ impl SshManagedPlatformProvider {
             platform_snapshot_hash,
             Some(remote_file),
             command,
-            eeprom,
         )
         .map_err(Into::into)
     }
@@ -215,31 +187,6 @@ fn command_descriptor(
     }
 }
 
-fn eeprom_descriptor(
-    config: &camera_toolbox_app::SshManagedConfig,
-    platform_snapshot_hash: camera_toolbox_app::SnapshotHash,
-) -> PlatformCapabilityDescriptor {
-    PlatformCapabilityDescriptor {
-        capability: CapabilityKind::EepromProvision,
-        requirement: CapabilityRequirement::SensorScoped,
-        provider: PlatformKind::SshManaged,
-        driver: "camera-toolbox-eeprom-helper-json-v1".to_owned(),
-        evidence: EvidenceMaturity::ProtocolVerified,
-        minimum_sensor_evidence: EvidenceMaturity::UserConfirmed,
-        initialization: InitializationState::NotRequired,
-        concurrency: ConcurrencyPolicy::Exclusive,
-        hard_limits: CapabilityLimits {
-            max_payload_bytes: config
-                .eeprom
-                .as_ref()
-                .map(|eeprom| eeprom.output_limit_bytes),
-            max_concurrent_operations: Some(1),
-        },
-        supported_variants: BTreeSet::from([CapabilityVariant::EepromInspectDryRun]),
-        platform_snapshot_hash,
-    }
-}
-
 #[derive(Debug, Error)]
 pub enum SshManagedProviderError {
     #[error("SSH-managed provider requires an SshManaged profile")]
@@ -252,6 +199,4 @@ pub enum SshManagedProviderError {
     Profile(#[from] ProfileError),
     #[error(transparent)]
     Capability(#[from] CapabilityResolutionError),
-    #[error(transparent)]
-    Eeprom(#[from] EepromProvisionServiceError),
 }

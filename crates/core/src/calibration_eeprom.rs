@@ -401,8 +401,9 @@ fn validated_distortion(values: &[f64]) -> Result<[f64; 12], EepromImageError> {
             actual: values.len(),
         });
     }
+    // 与 make_eeprom_bin.py --yml 保持一致：只写 OpenCV 前 8 项，s1..s4 默认清零。
     let mut distortion = [0.0_f64; 12];
-    distortion[..values.len()].copy_from_slice(values);
+    distortion[..8].copy_from_slice(&values[..8]);
     Ok(distortion)
 }
 
@@ -466,37 +467,18 @@ mod tests {
     }
 
     #[test]
-    fn full_image_uses_the_documented_p24c64g_layout() {
+    fn full_image_matches_make_eeprom_bin_default_byte_for_byte() {
         let image = FullEepromImage::from_solution(&solution(), "2T02D2567K0042").unwrap();
-        let bytes = image.as_bytes();
+        let golden: &[u8; YG_STEREO_P24C64G_IMAGE_BYTES] =
+            include_bytes!("fixtures/yg_stereo_p24c64g_script_default.bin");
 
-        assert_eq!(bytes.len(), YG_STEREO_P24C64G_IMAGE_BYTES);
-        assert_eq!(&bytes[FLAG_OFFSET..FLAG_OFFSET + 8], b"hessian\0");
-        assert_eq!(
-            u32::from_le_bytes(bytes[WIDTH_OFFSET..WIDTH_OFFSET + 4].try_into().unwrap()),
-            1920
+        assert_eq!(image.as_bytes(), golden);
+        let thin_prism_offset = DISTORTION_OFFSET + 8 * std::mem::size_of::<f32>();
+        assert!(
+            image.as_bytes()[thin_prism_offset..thin_prism_offset + 4 * 4]
+                .iter()
+                .all(|byte| *byte == 0)
         );
-        assert_eq!(
-            u32::from_le_bytes(bytes[HEIGHT_OFFSET..HEIGHT_OFFSET + 4].try_into().unwrap()),
-            1080
-        );
-        assert_eq!(
-            f32::from_le_bytes(bytes[FX_OFFSET..FX_OFFSET + 4].try_into().unwrap()),
-            1234.56_f32
-        );
-        assert_eq!(
-            f32::from_le_bytes(bytes[CY_OFFSET..CY_OFFSET + 4].try_into().unwrap()),
-            540.34_f32
-        );
-        assert_eq!(
-            &bytes[SERIAL_OFFSET..SERIAL_OFFSET + SERIAL_BYTES],
-            b"2T02D2567K0042"
-        );
-        assert_eq!(
-            bytes[SERIAL_CHECKSUM_OFFSET],
-            serial_checksum(b"2T02D2567K0042")
-        );
-        assert!(bytes[0x0058..SERIAL_OFFSET].iter().all(|byte| *byte == 0));
     }
 
     #[test]

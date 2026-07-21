@@ -12,14 +12,12 @@ use std::{
 };
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-use crate::calibration_eeprom::CalibrationProvisionIntent;
+use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvisionIntent};
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{CalibrationExport, CalibrationWorkspace};
 
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
-#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-use crate::platform_ui::EepromProvisioningTarget;
 use crate::{
     analysis_panel::{DesiredAnalysis, render_analysis_panel},
     analysis_worker::{
@@ -55,7 +53,9 @@ use crate::{
 };
 use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
-use camera_toolbox_adapters::platforms::ssh_managed::RusshTransportFactory;
+use camera_toolbox_adapters::platforms::ssh_managed::{
+    RusshTransportFactory, SshConnectionTarget, SshEepromProvisionService,
+};
 use camera_toolbox_app::{
     AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
     FsCancellation, FsControl, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
@@ -66,8 +66,9 @@ use camera_toolbox_app::{
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_app::{
     DumpCancellation, EepromDryRunResult, EepromHelperResult, EepromInspectResult,
-    EepromProvisionOperation, EepromProvisionServiceError, EepromWriteResult, ExportArtifact,
-    ExportService, RemoteOperationControl, RemoteTimeouts,
+    EepromProvisionOperation, EepromProvisionService, EepromProvisionServiceError,
+    EepromWriteResult, ExportArtifact, ExportService, RemoteOperationControl, RemoteTimeouts,
+    SnapshotHash,
 };
 use camera_toolbox_core::{
     ChromaOrder, MediaFormat, NativeImage, OwnedMediaPayload, PackedRawSpec, Rgba8Frame, Roi,
@@ -186,6 +187,14 @@ struct CalibrationExportResult {
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Clone)]
+struct EepromProvisioningTarget {
+    service: Arc<dyn EepromProvisionService>,
+    snapshot_hash: SnapshotHash,
+    label: String,
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 #[derive(Debug)]
 enum EepromOperationOutcome {
     Inspect(EepromInspectResult),
@@ -206,10 +215,41 @@ enum EepromOperationOutcome {
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Debug)]
+struct EepromOperationFailure {
+    message: String,
+    provision_state_unknown: bool,
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+impl EepromOperationFailure {
+    fn known(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            provision_state_unknown: false,
+        }
+    }
+
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            provision_state_unknown: true,
+        }
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+impl From<String> for EepromOperationFailure {
+    fn from(message: String) -> Self {
+        Self::known(message)
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 struct EepromOperationResult {
     target_label: String,
     destination: Option<ExportDestination>,
-    result: Result<EepromOperationOutcome, String>,
+    result: Result<EepromOperationOutcome, EepromOperationFailure>,
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -220,7 +260,7 @@ fn run_eeprom_operation(
     directory_label: Option<&str>,
     operation_id: u64,
     cancellation: DumpCancellation,
-) -> Result<EepromOperationOutcome, String> {
+) -> Result<EepromOperationOutcome, EepromOperationFailure> {
     let action = intent
         .helper_action()
         .ok_or_else(|| "cancel is not an executable EEPROM helper action".to_owned())?;
@@ -233,13 +273,34 @@ fn run_eeprom_operation(
         cancellation,
     )
     .map_err(|error| error.to_string())?;
+    let experimental_disconnect_risk_acknowledged = match &intent {
+        CalibrationProvisionIntent::Provision {
+            experimental_disconnect_risk_acknowledged,
+            ..
+        } => *experimental_disconnect_risk_acknowledged,
+        _ => false,
+    };
     let operation = EepromProvisionOperation {
-        sensor_mode: target.sensor_mode.clone(),
         action: action.clone(),
+        experimental_disconnect_risk_acknowledged,
     };
     let helper_result = match target.service.execute(operation, control) {
         Ok(result) => result,
         Err(error) => {
+            let provision_state_unknown = matches!(
+                (&intent, &error),
+                (
+                    CalibrationProvisionIntent::Provision { .. },
+                    EepromProvisionServiceError::Transport(_)
+                        | EepromProvisionServiceError::Protocol(_)
+                )
+            ) || matches!(
+                (&intent, &error),
+                (
+                    CalibrationProvisionIntent::Provision { .. },
+                    EepromProvisionServiceError::Helper(failure)
+                ) if failure.rollback == camera_toolbox_app::EepromRollbackState::Failed
+            );
             let mut message = format_eeprom_service_error(&error);
             if matches!(&intent, CalibrationProvisionIntent::Provision { .. })
                 && let (Some(destination), Some(directory_label)) = (destination, directory_label)
@@ -251,6 +312,7 @@ fn run_eeprom_operation(
                     "target_snapshot_sha256": target.snapshot_hash.to_hex(),
                     "request": action,
                     "failure": eeprom_failure_json(&error),
+                    "device_state_unknown": provision_state_unknown,
                 });
                 let name = format!("eeprom-write-failure-{operation_id:06}.json");
                 match persist_eeprom_json(destination, directory_label, &name, &document) {
@@ -259,7 +321,11 @@ fn run_eeprom_operation(
                         .push_str(&format!("; failure audit save also failed: {audit_error}")),
                 }
             }
-            return Err(message);
+            return Err(if provision_state_unknown {
+                EepromOperationFailure::unknown(message)
+            } else {
+                EepromOperationFailure::known(message)
+            });
         }
     };
 
@@ -322,9 +388,9 @@ fn run_eeprom_operation(
                 Err(error) => Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }),
             }
         }
-        (_, unexpected) => Err(format!(
+        (_, unexpected) => Err(EepromOperationFailure::known(format!(
             "EEPROM helper returned an unexpected result kind: {unexpected:?}"
-        )),
+        ))),
     }
 }
 
@@ -421,6 +487,8 @@ pub(crate) struct CameraToolboxApp {
     #[cfg(feature = "calibration-opencv")]
     calibration_export_receiver: Receiver<CalibrationExportResult>,
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    eeprom_target: Option<EepromProvisioningTarget>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     eeprom_operation_sender: Sender<EepromOperationResult>,
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     eeprom_operation_receiver: Receiver<EepromOperationResult>,
@@ -503,6 +571,8 @@ impl CameraToolboxApp {
             #[cfg(feature = "calibration-opencv")]
             calibration_export_receiver,
             #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            eeprom_target: None,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
             eeprom_operation_sender,
             #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
             eeprom_operation_receiver,
@@ -582,7 +652,6 @@ impl eframe::App for CameraToolboxApp {
         }
 
         egui::Panel::top("menu_bar").show(ui, |ui| self.render_menu_bar(ui));
-        self.live_runtime.show_device_manager(&context);
         if !self.is_calibration_workspace() {
             let tab_action = egui::Panel::top("document_tabs")
                 .resizable(false)
@@ -593,8 +662,6 @@ impl eframe::App for CameraToolboxApp {
             }
         }
         let calibration_workspace = self.is_calibration_workspace();
-        let live_running = !self.workspace.live_documents().is_empty();
-        let mut platform_action = None;
         let explorer_action = if self.explorer_panel_expanded {
             let mut collapse = false;
             let action = egui::Panel::left("workspace_explorer_panel")
@@ -609,10 +676,6 @@ impl eframe::App for CameraToolboxApp {
                                 collapse = true;
                             }
                         });
-                    });
-                    ui.separator();
-                    ui.collapsing("Platform Controls", |ui| {
-                        platform_action = self.live_runtime.render_panel(ui, live_running);
                     });
                     ui.separator();
                     self.explorer.render(&context, ui, calibration_workspace)
@@ -639,9 +702,6 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = explorer_action {
             self.handle_explorer_action(&context, action);
         }
-        if let Some(action) = platform_action {
-            self.handle_platform_ui_action(&context, action);
-        }
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             #[cfg(feature = "calibration-opencv")]
             if self.is_calibration_workspace() {
@@ -660,17 +720,18 @@ impl eframe::App for CameraToolboxApp {
         let calibration_provision_label: Result<String, String> = {
             #[cfg(feature = "platform-ssh")]
             {
-                self.live_runtime
-                    .eeprom_provisioning_target()
-                    .map(|target| target.label)
+                self.eeprom_target
+                    .as_ref()
+                    .map(|target| target.label.clone())
+                    .ok_or_else(|| {
+                        "Configure the EEPROM SSH target in the Calibration panel.".to_owned()
+                    })
             }
             #[cfg(not(feature = "platform-ssh"))]
             {
                 Err("This build does not include SSH EEPROM provisioning.".to_owned())
             }
         };
-
-        #[cfg(feature = "calibration-opencv")]
         let calibration_export_error = self.explorer.active_save_destination().err();
 
         let viewer_output = egui::CentralPanel::default()
@@ -814,8 +875,6 @@ impl CameraToolboxApp {
             });
             ui.separator();
             self.render_product_workspace_switch(ui);
-            ui.separator();
-            self.live_runtime.render_target_toolbar(ui);
         });
         if request_color {
             self.request_current_color();
@@ -2417,11 +2476,85 @@ impl CameraToolboxApp {
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn configure_eeprom_target(
+        &mut self,
+        request: CalibrationEepromTargetRequest,
+    ) -> Result<String, String> {
+        const CREDENTIAL_ID: &str = "calibration-eeprom";
+        const CREDENTIAL_REF: &str = "session:calibration-eeprom";
+        let connection = SshConnectionTarget {
+            host: request.host.clone(),
+            port: request.port,
+            username: request.username.clone(),
+            expected_host_key: Some(request.expected_host_key.clone()),
+            command_subsystem: None,
+            remote_event_subsystem: None,
+        };
+        let target_document = serde_json::json!({
+            "host": request.host,
+            "port": request.port,
+            "username": request.username,
+            "expected_host_key": request.expected_host_key,
+            "helper_program": request.helper_program,
+            "i2c_bus": request.i2c_bus,
+            "map_id": camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID,
+        });
+        let target_bytes =
+            serde_json::to_vec(&target_document).map_err(|error| error.to_string())?;
+        let snapshot_hash = SnapshotHash::digest_bytes(&target_bytes);
+        let service = SshEepromProvisionService::new(
+            format!("calibration-eeprom-{}", &snapshot_hash.to_hex()[..12]),
+            connection,
+            CREDENTIAL_REF.to_owned(),
+            target_document["helper_program"]
+                .as_str()
+                .expect("helper program was serialized as string")
+                .to_owned(),
+            65_536,
+            request.i2c_bus,
+            self.live_runtime.ssh_resolver(),
+            Arc::new(RusshTransportFactory),
+        )
+        .map_err(|error| error.to_string())?;
+        let credential_ref = self
+            .live_runtime
+            .ssh_credential_resolver()
+            .register_session_password(CREDENTIAL_ID, request.password)?;
+        if credential_ref != CREDENTIAL_REF {
+            return Err("EEPROM credential registry returned an unexpected reference".to_owned());
+        }
+        let label = format!(
+            "{}@{}:{} / i2c-{} @{}",
+            target_document["username"].as_str().unwrap_or(""),
+            target_document["host"].as_str().unwrap_or(""),
+            request.port,
+            request.i2c_bus,
+            &snapshot_hash.to_hex()[..12],
+        );
+        self.eeprom_target = Some(EepromProvisioningTarget {
+            service: Arc::new(service),
+            snapshot_hash,
+            label: label.clone(),
+        });
+        Ok(label)
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     fn begin_eeprom_operation(
         &mut self,
         context: &egui::Context,
         intent: CalibrationProvisionIntent,
     ) {
+        let intent = match intent {
+            CalibrationProvisionIntent::ConfigureTarget(request) => {
+                match self.configure_eeprom_target(request) {
+                    Ok(label) => self.calibration.report_target_configured(&label),
+                    Err(error) => self.calibration.report_provision_error(error),
+                }
+                return;
+            }
+            other => other,
+        };
         if matches!(&intent, CalibrationProvisionIntent::Cancel) {
             if !self.active_eeprom_cancellable {
                 self.calibration.report_provision_error(
@@ -2437,10 +2570,12 @@ impl CameraToolboxApp {
                 .report_provision_error("An EEPROM operation is already active.");
             return;
         }
-        let target = match self.live_runtime.eeprom_provisioning_target() {
-            Ok(target) => target,
-            Err(error) => {
-                self.calibration.report_provision_error(error);
+        let target = match self.eeprom_target.clone() {
+            Some(target) => target,
+            None => {
+                self.calibration.report_provision_error(
+                    "Configure the EEPROM SSH target in the Calibration panel.",
+                );
                 return;
             }
         };
@@ -2473,6 +2608,7 @@ impl CameraToolboxApp {
         let worker_context = context.clone();
         let target_label = target.label.clone();
         let worker_destination = destination.clone();
+        let provision_attempt = matches!(&intent, CalibrationProvisionIntent::Provision { .. });
         let spawn_result = thread::Builder::new()
             .name("camera-toolbox-eeprom-operation".to_owned())
             .spawn(move || {
@@ -2486,7 +2622,13 @@ impl CameraToolboxApp {
                         cancellation,
                     )
                 }))
-                .unwrap_or_else(|_| Err("EEPROM operation worker panicked".to_owned()));
+                .unwrap_or_else(|_| {
+                    Err(if provision_attempt {
+                        EepromOperationFailure::unknown("EEPROM operation worker panicked")
+                    } else {
+                        EepromOperationFailure::known("EEPROM operation worker panicked")
+                    })
+                });
                 let _ = sender.send(EepromOperationResult {
                     target_label,
                     destination: worker_destination,
@@ -2533,7 +2675,10 @@ impl CameraToolboxApp {
                 Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }) => self
                     .calibration
                     .report_eeprom_provision_audit_error(operation.target_label, &result, &error),
-                Err(error) => self.calibration.report_provision_error(error),
+                Err(error) if error.provision_state_unknown => self
+                    .calibration
+                    .report_eeprom_provision_unknown(error.message),
+                Err(error) => self.calibration.report_provision_error(error.message),
             }
         }
     }

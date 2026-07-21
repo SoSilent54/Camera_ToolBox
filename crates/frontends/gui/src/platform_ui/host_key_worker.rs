@@ -476,7 +476,6 @@ mod tests {
             stability_interval_ms: 500,
             max_fetch_bytes: 1024,
             command_output_bytes: 1024,
-            eeprom: None,
         }
     }
 

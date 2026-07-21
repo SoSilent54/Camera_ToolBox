@@ -11,11 +11,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    CapabilityKind, CapabilityResolutionError, CapabilityResolutionKey, DefaultCapabilityResolver,
-    EvidenceMaturity, EvidencedCapabilityDeclaration, LocalConfig, PlatformBindings,
-    PlatformConfig, PlatformProfile, PlatformProfileId, ProfileError, SensorDescriptor, SensorId,
-    SensorModeKey, SensorPlatformCapabilityCell, SensorPlatformCapabilityMatrix, SensorSelection,
-    TargetResolutionSnapshot,
+    CapabilityResolutionError, CapabilityResolutionKey, DefaultCapabilityResolver, LocalConfig,
+    PlatformBindings, PlatformConfig, PlatformProfile, PlatformProfileId, ProfileError,
+    SensorDescriptor, SensorId, SensorModeKey, SensorPlatformCapabilityCell,
+    SensorPlatformCapabilityMatrix, SensorSelection, TargetResolutionSnapshot,
 };
 
 pub const PROFILE_STORE_SCHEMA_VERSION: u32 = 1;
@@ -146,50 +145,6 @@ impl ProfileStore {
             }
             other => ProfileStoreError::Capability(other),
         })
-    }
-
-    /// 设置或删除精确 Sensor/Mode × Platform cell 的单项能力声明，并保留其他能力规则。
-    ///
-    /// # Errors
-    ///
-    /// Sensor/Mode、platform 引用无效或 cell 规则冲突时返回错误。
-    pub fn set_capability_declaration(
-        &mut self,
-        sensor_mode: SensorModeKey,
-        platform_id: PlatformProfileId,
-        capability: CapabilityKind,
-        declaration: Option<(bool, EvidenceMaturity)>,
-    ) -> Result<(), ProfileStoreError> {
-        let existing = self.matrix.get(&sensor_mode, &platform_id).cloned();
-        let Some((supported, evidence)) = declaration else {
-            let Some(mut cell) = existing else {
-                return Ok(());
-            };
-            cell.declarations
-                .retain(|item| item.capability != capability);
-            if cell.declarations.is_empty() && cell.restrictions.is_empty() {
-                self.matrix.remove(&sensor_mode, &platform_id);
-            } else {
-                self.matrix.upsert(cell)?;
-            }
-            return Ok(());
-        };
-        let mut cell = existing.unwrap_or_else(|| SensorPlatformCapabilityCell {
-            sensor_mode: sensor_mode.clone(),
-            platform_id: platform_id.clone(),
-            restrictions: Vec::new(),
-            declarations: Vec::new(),
-        });
-        cell.declarations
-            .retain(|item| item.capability != capability);
-        cell.declarations.push(EvidencedCapabilityDeclaration {
-            capability,
-            supported,
-            evidence,
-        });
-        self.validate_cell_references(&cell)?;
-        self.matrix.upsert(cell)?;
-        Ok(())
     }
 
     /// 从 store 强制查找精确 sparse cell，调用方无法遗漏已配置限制。
@@ -502,7 +457,6 @@ mod tests {
                 stability_interval_ms: 500,
                 max_fetch_bytes: 256 * 1024 * 1024,
                 command_output_bytes: 64 * 1024,
-                eeprom: None,
             }),
         };
         assert!(!format!("{profile:?}").contains("id_ed25519"));
@@ -585,7 +539,6 @@ mod tests {
                 stability_interval_ms: 500,
                 max_fetch_bytes: 1024,
                 command_output_bytes: 1024,
-                eeprom: None,
             }),
         };
         assert!(matches!(
@@ -614,58 +567,5 @@ mod tests {
         let text = String::from_utf8(store.export_json().unwrap()).unwrap();
         assert!(text.contains("\"provider\": \"hisilicon-cv610-pq\""));
         assert!(!text.contains("ssh-managed"));
-    }
-
-    #[test]
-    fn setting_eeprom_declaration_preserves_other_cell_rules() {
-        let mut store = ProfileStore::new();
-        let platform = local("local-a");
-        let platform_id = platform.id.clone();
-        store.insert_platform(platform).unwrap();
-        store.insert_sensor(sensor()).unwrap();
-        let mode = SensorModeKey {
-            sensor_id: SensorId::new("sensor-a").unwrap(),
-            mode_id: "mode-a".to_owned(),
-        };
-        store
-            .insert_capability_cell(SensorPlatformCapabilityCell {
-                sensor_mode: mode.clone(),
-                platform_id: platform_id.clone(),
-                restrictions: vec![CapabilityRestriction {
-                    capability: CapabilityKind::Dump,
-                    allowed_variants: BTreeSet::from([CapabilityVariant::Raw12]),
-                }],
-                declarations: vec![EvidencedCapabilityDeclaration {
-                    capability: CapabilityKind::Dump,
-                    supported: true,
-                    evidence: EvidenceMaturity::ProfileDeclared,
-                }],
-            })
-            .unwrap();
-
-        store
-            .set_capability_declaration(
-                mode.clone(),
-                platform_id.clone(),
-                CapabilityKind::EepromProvision,
-                Some((true, EvidenceMaturity::UserConfirmed)),
-            )
-            .unwrap();
-        let cell = store.matrix().get(&mode, &platform_id).unwrap();
-        assert_eq!(cell.restrictions.len(), 1);
-        assert_eq!(cell.declarations.len(), 2);
-
-        store
-            .set_capability_declaration(
-                mode.clone(),
-                platform_id.clone(),
-                CapabilityKind::EepromProvision,
-                None,
-            )
-            .unwrap();
-        let cell = store.matrix().get(&mode, &platform_id).unwrap();
-        assert_eq!(cell.restrictions.len(), 1);
-        assert_eq!(cell.declarations.len(), 1);
-        assert_eq!(cell.declarations[0].capability, CapabilityKind::Dump);
     }
 }

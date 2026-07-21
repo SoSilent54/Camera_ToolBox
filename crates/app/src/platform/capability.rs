@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, sync::Arc};
 
 use super::{
-    eeprom::EepromProvisionService,
     ports::{DumpService, StreamService},
     remote::{CommandService, RemoteFileService},
 };
@@ -37,7 +36,6 @@ pub enum CapabilityKind {
     RegisterRead,
     RegisterWrite,
     ExposureControl,
-    EepromProvision,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -56,9 +54,6 @@ pub enum CapabilityVariant {
     ArgvSubsystemCommand,
     RegisterAccess,
     Exposure,
-    EepromFullProvision,
-    EepromUpdateCalibration,
-    EepromInspectDryRun,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,7 +172,7 @@ impl SensorPlatformCapabilityCell {
     }
 }
 
-const ALL_CAPABILITY_KINDS: [CapabilityKind; 9] = [
+const ALL_CAPABILITY_KINDS: [CapabilityKind; 8] = [
     CapabilityKind::LocalOpen,
     CapabilityKind::Dump,
     CapabilityKind::Stream,
@@ -186,7 +181,6 @@ const ALL_CAPABILITY_KINDS: [CapabilityKind; 9] = [
     CapabilityKind::RegisterRead,
     CapabilityKind::RegisterWrite,
     CapabilityKind::ExposureControl,
-    CapabilityKind::EepromProvision,
 ];
 
 const fn capability_kind_tag(value: CapabilityKind) -> u8 {
@@ -237,25 +231,6 @@ impl SensorPlatformCapabilityMatrix {
         }
         self.cells.insert(key, cell);
         Ok(())
-    }
-
-    pub(crate) fn upsert(
-        &mut self,
-        mut cell: SensorPlatformCapabilityCell,
-    ) -> Result<(), CapabilityResolutionError> {
-        validate_cell(&cell)?;
-        cell.restrictions
-            .sort_by_key(|restriction| restriction.capability);
-        cell.declarations
-            .sort_by_key(|declaration| declaration.capability);
-        let key = (cell.sensor_mode.clone(), cell.platform_id.clone());
-        self.cells.insert(key, cell);
-        Ok(())
-    }
-
-    pub(crate) fn remove(&mut self, sensor_mode: &SensorModeKey, platform_id: &PlatformProfileId) {
-        self.cells
-            .remove(&(sensor_mode.clone(), platform_id.clone()));
     }
 
     #[must_use]
@@ -375,7 +350,6 @@ impl LocalBindings {
         validate_handle(
             PlatformKind::Local,
             CapabilityKind::LocalOpen,
-            CapabilityRequirement::PlatformOnly,
             platform_snapshot_hash,
             open.as_ref(),
         )?;
@@ -409,14 +383,12 @@ impl Cv610Bindings {
         validate_handle(
             PlatformKind::HisiliconCv610,
             CapabilityKind::Dump,
-            CapabilityRequirement::PlatformOnly,
             platform_snapshot_hash,
             dump.as_ref(),
         )?;
         validate_handle(
             PlatformKind::HisiliconCv610,
             CapabilityKind::Stream,
-            CapabilityRequirement::PlatformOnly,
             platform_snapshot_hash,
             stream.as_ref(),
         )?;
@@ -429,14 +401,13 @@ impl Cv610Bindings {
     }
 }
 
-/// SSH-managed 暴露 PlatformOnly 文件/命令能力与精确 Sensor×Platform gated EEPROM helper。
+/// SSH-managed 当前只暴露 `PlatformOnly` RemoteFile/Command handles。
 #[derive(Clone)]
 pub struct SshManagedBindings {
     pub platform_id: PlatformProfileId,
     pub platform_snapshot_hash: SnapshotHash,
     pub remote_file: Option<PlatformCapabilityHandle<dyn RemoteFileService>>,
     pub command: Option<PlatformCapabilityHandle<dyn CommandService>>,
-    pub eeprom: Option<PlatformCapabilityHandle<dyn EepromProvisionService>>,
 }
 
 impl SshManagedBindings {
@@ -448,35 +419,24 @@ impl SshManagedBindings {
         platform_snapshot_hash: SnapshotHash,
         remote_file: Option<PlatformCapabilityHandle<dyn RemoteFileService>>,
         command: Option<PlatformCapabilityHandle<dyn CommandService>>,
-        eeprom: Option<PlatformCapabilityHandle<dyn EepromProvisionService>>,
     ) -> Result<Self, CapabilityResolutionError> {
         validate_handle(
             PlatformKind::SshManaged,
             CapabilityKind::RemoteFile,
-            CapabilityRequirement::PlatformOnly,
             platform_snapshot_hash,
             remote_file.as_ref(),
         )?;
         validate_handle(
             PlatformKind::SshManaged,
             CapabilityKind::Command,
-            CapabilityRequirement::PlatformOnly,
             platform_snapshot_hash,
             command.as_ref(),
-        )?;
-        validate_handle(
-            PlatformKind::SshManaged,
-            CapabilityKind::EepromProvision,
-            CapabilityRequirement::SensorScoped,
-            platform_snapshot_hash,
-            eeprom.as_ref(),
         )?;
         Ok(Self {
             platform_id,
             platform_snapshot_hash,
             remote_file,
             command,
-            eeprom,
         })
     }
 }
@@ -533,7 +493,6 @@ pub struct ResolvedCv610Bindings {
 pub struct ResolvedSshManagedBindings {
     pub remote_file: Option<ResolvedCapabilityHandle<dyn RemoteFileService>>,
     pub command: Option<ResolvedCapabilityHandle<dyn CommandService>>,
-    pub eeprom: Option<ResolvedCapabilityHandle<dyn EepromProvisionService>>,
 }
 
 #[derive(Clone)]
@@ -565,9 +524,6 @@ impl ResolvedTargetBindings {
                 .map(|handle| &handle.descriptor),
             (Self::SshManaged(bindings), CapabilityKind::Command) => {
                 bindings.command.as_ref().map(|handle| &handle.descriptor)
-            }
-            (Self::SshManaged(bindings), CapabilityKind::EepromProvision) => {
-                bindings.eeprom.as_ref().map(|handle| &handle.descriptor)
             }
             _ => None,
         }
@@ -659,14 +615,6 @@ impl DefaultCapabilityResolver {
                     command: resolve_typed_handle(
                         key,
                         bindings.command.as_ref(),
-                        sensor_hash,
-                        cell,
-                        cell_hash,
-                        aggregate_hash,
-                    ),
-                    eeprom: resolve_typed_handle(
-                        key,
-                        bindings.eeprom.as_ref(),
                         sensor_hash,
                         cell,
                         cell_hash,
@@ -840,7 +788,6 @@ fn derive_descriptor(
 fn validate_handle<S: ?Sized>(
     provider: PlatformKind,
     capability: CapabilityKind,
-    requirement: CapabilityRequirement,
     platform_hash: SnapshotHash,
     handle: Option<&PlatformCapabilityHandle<S>>,
 ) -> Result<(), CapabilityResolutionError> {
@@ -853,8 +800,8 @@ fn validate_handle<S: ?Sized>(
     if handle.descriptor.capability != capability {
         return Err(CapabilityResolutionError::HandleCapabilityMismatch);
     }
-    if handle.descriptor.requirement != requirement {
-        return Err(CapabilityResolutionError::HandleRequirementMismatch);
+    if handle.descriptor.requirement != CapabilityRequirement::PlatformOnly {
+        return Err(CapabilityResolutionError::ProductionHandleMustBePlatformOnly);
     }
     if handle.descriptor.supported_variants.is_empty() {
         return Err(CapabilityResolutionError::EmptyCandidateVariants);
@@ -889,8 +836,8 @@ pub enum CapabilityResolutionError {
     HandleCapabilityMismatch,
     #[error("candidate descriptor uses another platform snapshot hash")]
     CandidatePlatformHashMismatch,
-    #[error("typed handle requirement does not match its binding slot")]
-    HandleRequirementMismatch,
+    #[error("current provider bindings only accept PlatformOnly handles")]
+    ProductionHandleMustBePlatformOnly,
     #[error("candidate capability must support at least one variant")]
     EmptyCandidateVariants,
 }
@@ -901,10 +848,6 @@ mod tests {
 
     use super::*;
     use crate::platform::profile::{PlatformProfileId, SensorId};
-    use crate::{
-        EepromHelperResult, EepromProvisionOperation, EepromProvisionServiceError,
-        RemoteOperationControl,
-    };
 
     struct TestDumpService {
         id: &'static str,
@@ -928,24 +871,6 @@ mod tests {
         }
     }
     struct TestSensorService;
-
-    struct TestEepromService;
-
-    impl EepromProvisionService for TestEepromService {
-        fn service_id(&self) -> &str {
-            "test-eeprom"
-        }
-
-        fn execute(
-            &self,
-            request: EepromProvisionOperation,
-            _control: RemoteOperationControl,
-        ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
-            Err(EepromProvisionServiceError::TargetNotConfigured(
-                request.sensor_mode,
-            ))
-        }
-    }
 
     fn platform_id(value: &str) -> PlatformProfileId {
         PlatformProfileId::new(value).unwrap()
@@ -1304,91 +1229,5 @@ mod tests {
                 CapabilityKind::Dump
             ))
         ));
-    }
-
-    #[test]
-    fn eeprom_candidate_requires_positive_exact_sensor_cell() {
-        let id = platform_id("ssh-a");
-        let platform_hash = SnapshotHash::digest_bytes(b"ssh-platform-a");
-        let descriptor = Arc::new(PlatformCapabilityDescriptor {
-            capability: CapabilityKind::EepromProvision,
-            requirement: CapabilityRequirement::SensorScoped,
-            provider: PlatformKind::SshManaged,
-            driver: "ssh-eeprom-test".to_owned(),
-            evidence: EvidenceMaturity::ProtocolVerified,
-            minimum_sensor_evidence: EvidenceMaturity::UserConfirmed,
-            initialization: InitializationState::DirectProbe,
-            concurrency: ConcurrencyPolicy::Exclusive,
-            hard_limits: CapabilityLimits {
-                max_payload_bytes: Some(308),
-                max_concurrent_operations: Some(1),
-            },
-            supported_variants: [
-                CapabilityVariant::EepromFullProvision,
-                CapabilityVariant::EepromUpdateCalibration,
-            ]
-            .into_iter()
-            .collect(),
-            platform_snapshot_hash: platform_hash,
-        });
-        let service: Arc<dyn EepromProvisionService> = Arc::new(TestEepromService);
-        let platform = PlatformBindings::SshManaged(Arc::new(
-            SshManagedBindings::new(
-                id.clone(),
-                platform_hash,
-                None,
-                None,
-                Some(PlatformCapabilityHandle {
-                    service,
-                    descriptor,
-                }),
-            )
-            .unwrap(),
-        ));
-        let mode = mode_key("sensor-a", "linear");
-        let sensor = sensor_snapshot(mode.clone());
-        let key = CapabilityResolutionKey {
-            platform_id: id.clone(),
-            sensor: SensorSelection::Mode(mode.clone()),
-        };
-        let undeclared = SensorPlatformCapabilityCell {
-            sensor_mode: mode.clone(),
-            platform_id: id.clone(),
-            restrictions: Vec::new(),
-            declarations: Vec::new(),
-        };
-        let snapshot = DefaultCapabilityResolver
-            .resolve(&key, &platform, Some(&sensor), Some(&undeclared))
-            .unwrap();
-        let ResolvedTargetBindings::SshManaged(bindings) = snapshot.bindings.as_ref() else {
-            panic!("expected SSH bindings")
-        };
-        assert!(bindings.eeprom.is_none());
-
-        let declared = SensorPlatformCapabilityCell {
-            declarations: vec![EvidencedCapabilityDeclaration {
-                capability: CapabilityKind::EepromProvision,
-                supported: true,
-                evidence: EvidenceMaturity::UserConfirmed,
-            }],
-            ..undeclared
-        };
-        let snapshot = DefaultCapabilityResolver
-            .resolve(&key, &platform, Some(&sensor), Some(&declared))
-            .unwrap();
-        let ResolvedTargetBindings::SshManaged(bindings) = snapshot.bindings.as_ref() else {
-            panic!("expected SSH bindings")
-        };
-        let eeprom = bindings.eeprom.as_ref().expect("declaration must resolve");
-        assert_eq!(eeprom.service.service_id(), "test-eeprom");
-        assert_eq!(
-            eeprom.descriptor.supported_variants,
-            [
-                CapabilityVariant::EepromFullProvision,
-                CapabilityVariant::EepromUpdateCalibration,
-            ]
-            .into_iter()
-            .collect()
-        );
     }
 }

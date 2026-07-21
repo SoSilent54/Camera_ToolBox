@@ -23,7 +23,7 @@ pub use capability::{
 };
 pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
 pub use eeprom::{
-    EEPROM_HELPER_SCHEMA_VERSION, EEPROM_REMOTE_PROVISION_DISABLED_REASON, EepromDeviceState,
+    EEPROM_EXPERIMENTAL_PROVISION_WARNING, EEPROM_HELPER_SCHEMA_VERSION, EepromDeviceState,
     EepromDryRunResult, EepromHelperAction, EepromHelperFailure, EepromHelperOutput,
     EepromHelperRequest, EepromHelperResult, EepromHelperTarget, EepromInspectResult,
     EepromPageWritePlan, EepromProvisionOperation, EepromProvisionService,
@@ -46,7 +46,7 @@ pub use profile::{
     CapabilityResolutionKey, Cv610Config, Cv610DumpConfig, Cv610StreamConfig,
     DumpInitializationPolicy, LocalConfig, PlatformConfig, PlatformProfile, PlatformProfileId,
     ProfileError, SensorCatalog, SensorDescriptor, SensorId, SensorModeKey, SensorModeSnapshot,
-    SensorSelection, SshEepromConfig, SshEepromTargetConfig, SshManagedConfig, validate_ssh_host,
+    SensorSelection, SshManagedConfig, validate_ssh_host,
 };
 pub use profile_store::{PROFILE_STORE_SCHEMA_VERSION, ProfileStore, ProfileStoreError};
 pub use remote::{

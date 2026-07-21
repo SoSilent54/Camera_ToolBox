@@ -1267,14 +1267,14 @@ mod eeprom_operation_tests {
     use super::super::*;
     use std::{
         fs,
-        sync::Arc,
+        sync::{Arc, mpsc},
         time::{SystemTime, UNIX_EPOCH},
     };
 
     use camera_toolbox_adapters::filesystem::LocalFileSystem;
     use camera_toolbox_app::{
         DirectoryRef, EepromDeviceState, EepromHelperFailure, EepromProvisionService,
-        EepromRollbackState, EepromSerialState, FileSourceId, SensorId, SnapshotHash,
+        EepromRollbackState, EepromSerialState, FileSourceId, SnapshotHash,
     };
     use camera_toolbox_core::{
         EepromProvisionRequest, EepromProvisioningMode, YG_STEREO_P24C64G_IMAGE_BYTES,
@@ -1297,6 +1297,27 @@ mod eeprom_operation_tests {
             _control: RemoteOperationControl,
         ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
             self.result.clone()
+        }
+    }
+
+    struct RecordingEepromService {
+        sender: mpsc::Sender<EepromProvisionOperation>,
+    }
+
+    impl EepromProvisionService for RecordingEepromService {
+        fn service_id(&self) -> &str {
+            "recording-test-eeprom"
+        }
+
+        fn execute(
+            &self,
+            request: EepromProvisionOperation,
+            _control: RemoteOperationControl,
+        ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
+            self.sender.send(request).unwrap();
+            Err(EepromProvisionServiceError::InvalidRequest(
+                "recording stop".to_owned(),
+            ))
         }
     }
 
@@ -1323,12 +1344,8 @@ mod eeprom_operation_tests {
     ) -> EepromProvisioningTarget {
         EepromProvisioningTarget {
             service: Arc::new(FixedEepromService { result }),
-            sensor_mode: camera_toolbox_app::SensorModeKey {
-                sensor_id: SensorId::new("sensor-a").unwrap(),
-                mode_id: "mode-a".to_owned(),
-            },
             snapshot_hash: SnapshotHash::digest_bytes(b"target"),
-            label: "SSH Camera / sensor-a:mode-a @test".to_owned(),
+            label: "root@camera.local:22 / i2c-7 @test".to_owned(),
         }
     }
 
@@ -1406,6 +1423,7 @@ mod eeprom_operation_tests {
                 request: request(),
                 expected_before_sha256: "a".repeat(64),
                 dry_run_token: "b".repeat(64),
+                experimental_disconnect_risk_acknowledged: true,
             },
             Some(&destination),
             Some(root.to_str().unwrap()),
@@ -1414,7 +1432,8 @@ mod eeprom_operation_tests {
         )
         .unwrap_err();
 
-        assert!(error.contains("rollback=Restored"));
+        assert!(error.message.contains("rollback=Restored"));
+        assert!(!error.provision_state_unknown);
         let audit: serde_json::Value = serde_json::from_slice(
             &fs::read(root.join("eeprom-write-failure-000043.json")).unwrap(),
         )
@@ -1423,5 +1442,95 @@ mod eeprom_operation_tests {
         assert_eq!(audit["failure"]["detail"]["code"], "write_failed");
         assert_eq!(audit["failure"]["detail"]["rollback"], "restored");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provision_failed_rollback_marks_device_unknown() {
+        let failure = EepromHelperFailure {
+            code: "rollback_failed".to_owned(),
+            message: "write and rollback both failed".to_owned(),
+            before: Some(state('a')),
+            backup: vec![0x5a; YG_STEREO_P24C64G_IMAGE_BYTES],
+            rollback: EepromRollbackState::Failed,
+            rollback_error: Some("read-back mismatch".to_owned()),
+        };
+
+        let error = run_eeprom_operation(
+            target(Err(EepromProvisionServiceError::Helper(failure))),
+            CalibrationProvisionIntent::Provision {
+                request: request(),
+                expected_before_sha256: "a".repeat(64),
+                dry_run_token: "b".repeat(64),
+                experimental_disconnect_risk_acknowledged: true,
+            },
+            None,
+            None,
+            44,
+            DumpCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.provision_state_unknown);
+        assert!(error.message.contains("rollback=Failed"));
+    }
+    #[test]
+    fn provision_transport_failure_marks_device_unknown() {
+        let (root, destination) = destination();
+
+        let error = run_eeprom_operation(
+            target(Err(EepromProvisionServiceError::Transport(
+                "SSH response was lost".to_owned(),
+            ))),
+            CalibrationProvisionIntent::Provision {
+                request: request(),
+                expected_before_sha256: "a".repeat(64),
+                dry_run_token: "b".repeat(64),
+                experimental_disconnect_risk_acknowledged: true,
+            },
+            Some(&destination),
+            Some(root.to_str().unwrap()),
+            44,
+            DumpCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.provision_state_unknown);
+        assert!(error.message.contains("SSH response was lost"));
+        let audit: serde_json::Value = serde_json::from_slice(
+            &fs::read(root.join("eeprom-write-failure-000044.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(audit["device_state_unknown"], true);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn worker_passes_captured_disconnect_risk_acknowledgement_unchanged() {
+        let (sender, receiver) = mpsc::channel();
+        let target = EepromProvisioningTarget {
+            service: Arc::new(RecordingEepromService { sender }),
+            snapshot_hash: SnapshotHash::digest_bytes(b"target"),
+            label: "root@camera.local:22 / i2c-7 @test".to_owned(),
+        };
+
+        let _ = run_eeprom_operation(
+            target,
+            CalibrationProvisionIntent::Provision {
+                request: request(),
+                expected_before_sha256: "a".repeat(64),
+                dry_run_token: "b".repeat(64),
+                experimental_disconnect_risk_acknowledged: true,
+            },
+            None,
+            None,
+            45,
+            DumpCancellation::default(),
+        );
+        assert!(
+            receiver
+                .recv()
+                .unwrap()
+                .experimental_disconnect_risk_acknowledged
+        );
     }
 }

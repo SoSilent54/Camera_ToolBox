@@ -153,18 +153,6 @@ impl PlatformConfig {
                 hash.u64(config.stability_interval_ms);
                 hash.u64(config.max_fetch_bytes);
                 hash.u64(config.command_output_bytes);
-                hash.boolean(config.eeprom.is_some());
-                if let Some(eeprom) = &config.eeprom {
-                    hash.string(&eeprom.helper_program);
-                    hash.u64(eeprom.output_limit_bytes);
-                    hash.u64(eeprom.targets.len() as u64);
-                    for target in &eeprom.targets {
-                        hash.string(target.sensor_mode.sensor_id.as_str());
-                        hash.string(&target.sensor_mode.mode_id);
-                        hash.string(&target.map_id);
-                        hash.u16(target.i2c_bus);
-                    }
-                }
             }
         }
     }
@@ -273,9 +261,6 @@ pub struct SshManagedConfig {
     pub stability_interval_ms: u64,
     pub max_fetch_bytes: u64,
     pub command_output_bytes: u64,
-    /// 只有持久化、严格 host-key-pinned profile 才能绑定 EEPROM helper。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub eeprom: Option<SshEepromConfig>,
 }
 
 impl fmt::Debug for SshManagedConfig {
@@ -297,26 +282,8 @@ impl fmt::Debug for SshManagedConfig {
             .field("stability_interval_ms", &self.stability_interval_ms)
             .field("max_fetch_bytes", &self.max_fetch_bytes)
             .field("command_output_bytes", &self.command_output_bytes)
-            .field("eeprom", &self.eeprom)
             .finish()
     }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SshEepromConfig {
-    /// 目标板上固定 helper 的绝对路径；不会被 GUI 请求覆盖。
-    pub helper_program: String,
-    pub output_limit_bytes: u64,
-    pub targets: Vec<SshEepromTargetConfig>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SshEepromTargetConfig {
-    pub sensor_mode: SensorModeKey,
-    pub map_id: String,
-    pub i2c_bus: u16,
 }
 
 impl SshManagedConfig {
@@ -372,49 +339,8 @@ impl SshManagedConfig {
         if self.command_output_bytes == 0 {
             return Err(ProfileError::ZeroCommandOutputLimit);
         }
-        if let Some(eeprom) = &self.eeprom {
-            eeprom.validate()?;
-        }
         Ok(())
     }
-}
-
-impl SshEepromConfig {
-    fn validate(&self) -> Result<(), ProfileError> {
-        if !is_normalized_absolute_path(&self.helper_program) {
-            return Err(ProfileError::InvalidEepromHelperProgram);
-        }
-        if !(1_024..=1_048_576).contains(&self.output_limit_bytes) {
-            return Err(ProfileError::InvalidEepromOutputLimit(
-                self.output_limit_bytes,
-            ));
-        }
-        if self.targets.is_empty() {
-            return Err(ProfileError::EmptyEepromTargets);
-        }
-        let mut keys = BTreeSet::new();
-        for target in &self.targets {
-            if !keys.insert(target.sensor_mode.clone()) {
-                return Err(ProfileError::DuplicateEepromTarget(
-                    target.sensor_mode.clone(),
-                ));
-            }
-            if target.map_id != camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID {
-                return Err(ProfileError::UnsupportedEepromMap(target.map_id.clone()));
-            }
-        }
-        Ok(())
-    }
-}
-
-fn is_normalized_absolute_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() > 1
-        && !path.ends_with('/')
-        && !path.bytes().any(|byte| byte.is_ascii_control())
-        && path[1..]
-            .split('/')
-            .all(|component| !component.is_empty() && component != "." && component != "..")
 }
 
 fn validate_subsystem(subsystem: &str) -> Result<(), ProfileError> {
@@ -671,16 +597,6 @@ pub enum ProfileError {
     ZeroSshFetchLimit,
     #[error("command output limit must be non-zero")]
     ZeroCommandOutputLimit,
-    #[error("EEPROM helper program must be an absolute normalized path")]
-    InvalidEepromHelperProgram,
-    #[error("EEPROM helper output limit must be in 1024..=1048576 bytes, got {0}")]
-    InvalidEepromOutputLimit(u64),
-    #[error("EEPROM helper configuration requires at least one Sensor/Mode target")]
-    EmptyEepromTargets,
-    #[error("duplicate EEPROM target for Sensor/Mode {0:?}")]
-    DuplicateEepromTarget(SensorModeKey),
-    #[error("unsupported calibration EEPROM map: {0}")]
-    UnsupportedEepromMap(String),
     #[error("sensor mode not found: {0}")]
     UnknownSensorMode(String),
     #[error("sensor mode key {key_mode_id} does not match mode {mode_id}")]
@@ -732,77 +648,7 @@ mod tests {
             stability_interval_ms: 500,
             max_fetch_bytes: 1024,
             command_output_bytes: 1024,
-            eeprom: None,
         }
-    }
-
-    fn eeprom_config() -> SshEepromConfig {
-        SshEepromConfig {
-            helper_program: "/usr/local/libexec/camera-toolbox-eeprom-helper".to_owned(),
-            output_limit_bytes: 4096,
-            targets: vec![SshEepromTargetConfig {
-                sensor_mode: SensorModeKey {
-                    sensor_id: SensorId::new("imx219").unwrap(),
-                    mode_id: "1920x1080".to_owned(),
-                },
-                map_id: camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
-                i2c_bus: 7,
-            }],
-        }
-    }
-
-    #[test]
-    fn eeprom_config_is_optional_but_hashes_every_target_field() {
-        let legacy = ssh_config("camera.local");
-        let serialized = serde_json::to_value(&legacy).unwrap();
-        assert!(serialized.get("eeprom").is_none());
-        let decoded: SshManagedConfig = serde_json::from_value(serialized).unwrap();
-        assert_eq!(decoded.eeprom, None);
-
-        let mut with_eeprom = legacy;
-        with_eeprom.eeprom = Some(eeprom_config());
-        let profile = PlatformProfile {
-            id: PlatformProfileId::new("ssh-camera").unwrap(),
-            display_name: "SSH Camera".to_owned(),
-            config: PlatformConfig::SshManaged(with_eeprom.clone()),
-        };
-        let original_hash = profile.snapshot_hash().unwrap();
-        with_eeprom.eeprom.as_mut().unwrap().targets[0].i2c_bus = 8;
-        let changed = PlatformProfile {
-            config: PlatformConfig::SshManaged(with_eeprom),
-            ..profile
-        };
-        assert_ne!(original_hash, changed.snapshot_hash().unwrap());
-    }
-
-    #[test]
-    fn eeprom_config_rejects_noncanonical_helper_and_duplicate_target() {
-        for helper in [
-            "relative/helper",
-            "/usr//helper",
-            "/usr/./helper",
-            "/usr/../helper",
-            "/usr/helper/",
-            "/",
-        ] {
-            let mut config = ssh_config("camera.local");
-            let mut eeprom = eeprom_config();
-            eeprom.helper_program = helper.to_owned();
-            config.eeprom = Some(eeprom);
-            assert!(matches!(
-                config.validate(),
-                Err(ProfileError::InvalidEepromHelperProgram)
-            ));
-        }
-
-        let mut config = ssh_config("camera.local");
-        let mut eeprom = eeprom_config();
-        eeprom.targets.push(eeprom.targets[0].clone());
-        config.eeprom = Some(eeprom);
-        assert!(matches!(
-            config.validate(),
-            Err(ProfileError::DuplicateEepromTarget(_))
-        ));
     }
 
     #[test]

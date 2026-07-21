@@ -1,7 +1,5 @@
 //! GUI 平台运行时：静态 profile 选择、typed binding/resolution、后台 jobs 与 event 路由。
 
-#[cfg(feature = "platform-ssh")]
-use std::collections::BTreeSet;
 use std::{collections::BTreeMap, sync::Arc};
 #[cfg(feature = "platform-ssh")]
 use std::{path::Path, time::Duration};
@@ -14,25 +12,23 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     CommandRecipeRegistry, CredentialResolver, ProductionCredentialResolver,
     SshManagedPlatformProvider, production_recipe_registry_from_env,
 };
-#[cfg(any(feature = "platform-cv610", feature = "platform-ssh"))]
+#[cfg(feature = "platform-cv610")]
 use camera_toolbox_app::ResolvedTargetBindings;
-#[cfg(feature = "platform-ssh")]
-use camera_toolbox_app::{
-    CapabilityKind, CommandParameter, CommandTerminal, EvidenceMaturity, RemoteDiscoveryRequest,
-    RemoteFileRequest, RemoteJobState, RemoteOpenDisposition, RemoteTimeouts, RemoteWatchEvent,
-    RemoteWatchRequest, TypedCommandRequest,
-};
 use camera_toolbox_app::{
     CaptureStore, CaptureStoreLimits, LatestDecodedFrameSlot, OperationId, PlatformBindings,
     PlatformConfig, PlatformController, PlatformProfileId, ProfileStore, SensorSelection,
     StreamSessionEvent, StreamSessionId, TargetResolutionSnapshot,
 };
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::{
+    CommandParameter, CommandTerminal, RemoteDiscoveryRequest, RemoteFileRequest, RemoteJobState,
+    RemoteOpenDisposition, RemoteTimeouts, RemoteWatchEvent, RemoteWatchRequest,
+    TypedCommandRequest,
+};
 #[cfg(feature = "platform-cv610")]
 use camera_toolbox_app::{
     DumpJobState, DumpTimeouts, StreamTimeouts, VerifiedDumpKind, VerifiedDumpRequest,
 };
-#[cfg(feature = "platform-ssh")]
-use camera_toolbox_app::{EepromProvisionService, SensorModeKey};
 use camera_toolbox_core::{AssetId, BayerPattern, EphemeralAsset, MediaFormat};
 use eframe::egui;
 
@@ -82,63 +78,6 @@ struct JobContext {
     intent: OpenIntent,
     format: MediaFormat,
     spec: AssetOpenSpec,
-}
-
-#[cfg(feature = "platform-ssh")]
-#[derive(Clone)]
-pub(crate) struct EepromProvisioningTarget {
-    pub(crate) service: Arc<dyn EepromProvisionService>,
-    pub(crate) sensor_mode: SensorModeKey,
-    pub(crate) snapshot_hash: camera_toolbox_app::SnapshotHash,
-    pub(crate) label: String,
-}
-
-#[cfg(feature = "platform-ssh")]
-fn eeprom_target_keys(profile: &camera_toolbox_app::PlatformProfile) -> BTreeSet<SensorModeKey> {
-    let PlatformConfig::SshManaged(config) = &profile.config else {
-        return BTreeSet::new();
-    };
-    config
-        .eeprom
-        .as_ref()
-        .map(|eeprom| {
-            eeprom
-                .targets
-                .iter()
-                .map(|target| target.sensor_mode.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-#[cfg(feature = "platform-ssh")]
-fn sync_eeprom_capability_declarations(
-    store: &mut ProfileStore,
-    profile: &camera_toolbox_app::PlatformProfile,
-    old_targets: &BTreeSet<SensorModeKey>,
-) -> Result<(), String> {
-    let new_targets = eeprom_target_keys(profile);
-    for target in old_targets.difference(&new_targets) {
-        store
-            .set_capability_declaration(
-                target.clone(),
-                profile.id.clone(),
-                CapabilityKind::EepromProvision,
-                None,
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    for target in &new_targets {
-        store
-            .set_capability_declaration(
-                target.clone(),
-                profile.id.clone(),
-                CapabilityKind::EepromProvision,
-                Some((true, EvidenceMaturity::UserConfirmed)),
-            )
-            .map_err(|error| error.to_string())?;
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -466,22 +405,13 @@ impl LiveRuntime {
                         _ => None,
                     });
                 #[cfg(feature = "platform-ssh")]
-                let old_eeprom_targets = draft
-                    .original_id
-                    .as_ref()
-                    .and_then(|id| self.profiles.platform(id))
-                    .map(eeprom_target_keys)
-                    .unwrap_or_default();
-                #[cfg(feature = "platform-ssh")]
                 let normalized = normalize_profile_commit(&self.profiles, draft, ssh_auth)?;
                 #[cfg(not(feature = "platform-ssh"))]
                 let normalized = normalize_profile_commit(&self.profiles, draft)?;
                 let profile = normalized.profile;
                 let original_id = normalized.original_id;
-                let mut candidate =
+                let candidate =
                     apply_profile_candidate(&self.profiles, profile.clone(), original_id.as_ref())?;
-                #[cfg(feature = "platform-ssh")]
-                sync_eeprom_capability_declarations(&mut candidate, &profile, &old_eeprom_targets)?;
                 self.profiles = candidate;
                 #[cfg(feature = "platform-ssh")]
                 {
@@ -547,24 +477,7 @@ impl LiveRuntime {
                         PlatformConfig::SshManaged(config) => Some(config.credential_ref.clone()),
                         _ => None,
                     });
-                #[cfg(feature = "platform-ssh")]
-                let old_eeprom_targets = self
-                    .profiles
-                    .platform(&id)
-                    .map(eeprom_target_keys)
-                    .unwrap_or_default();
                 let mut candidate = self.profiles.clone();
-                #[cfg(feature = "platform-ssh")]
-                for target in &old_eeprom_targets {
-                    candidate
-                        .set_capability_declaration(
-                            target.clone(),
-                            id.clone(),
-                            CapabilityKind::EepromProvision,
-                            None,
-                        )
-                        .map_err(|error| error.to_string())?;
-                }
                 candidate
                     .remove_platform(&id)
                     .map_err(|error| error.to_string())?;
@@ -1109,40 +1022,6 @@ impl LiveRuntime {
             .latest_stream_frame(&session_id)
             .ok_or_else(|| "stream controller did not retain latest-frame slot".to_owned())?;
         Ok((session_id, latest))
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn eeprom_provisioning_target(&self) -> Result<EepromProvisioningTarget, String> {
-        let snapshot = self.snapshot.clone().ok_or_else(|| {
-            self.binding_error
-                .clone()
-                .unwrap_or_else(|| "Select a resolved SSH Sensor/Mode target.".to_owned())
-        })?;
-        let SensorSelection::Mode(sensor_mode) = &snapshot.key.sensor else {
-            return Err("Select a Sensor/Mode before EEPROM provisioning.".to_owned());
-        };
-        let ResolvedTargetBindings::SshManaged(bindings) = snapshot.bindings.as_ref() else {
-            return Err("Selected platform is not SSH-managed.".to_owned());
-        };
-        let handle = bindings.eeprom.as_ref().ok_or_else(|| {
-            "Selected Sensor×Platform cell does not expose EEPROM provisioning.".to_owned()
-        })?;
-        let profile = self
-            .profiles
-            .platform(&snapshot.key.platform_id)
-            .ok_or_else(|| "Selected platform profile no longer exists.".to_owned())?;
-        Ok(EepromProvisioningTarget {
-            service: Arc::clone(&handle.service),
-            sensor_mode: sensor_mode.clone(),
-            snapshot_hash: snapshot.aggregate_hash,
-            label: format!(
-                "{} / {}:{} @{}",
-                profile.display_name,
-                sensor_mode.sensor_id.as_str(),
-                sensor_mode.mode_id,
-                &snapshot.aggregate_hash.to_hex()[..12],
-            ),
-        })
     }
 
     #[cfg(test)]

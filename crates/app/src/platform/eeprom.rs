@@ -4,12 +4,12 @@ use camera_toolbox_core::EepromProvisionRequest;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{RemoteOperationControl, SensorModeKey};
+use super::RemoteOperationControl;
 
 /// GUI、SSH adapter 与目标 helper 共同支持的协议版本。
 pub const EEPROM_HELPER_SCHEMA_VERSION: u32 = 1;
-/// 当前 SSH exec 在 channel 中断时无法保证 helper 完成或回滚，因此只开放 inspect/dry-run。
-pub const EEPROM_REMOTE_PROVISION_DISABLED_REASON: &str = "Remote EEPROM writes are disabled until helper execution survives SSH timeout/disconnect and returns a durable result.";
+/// 实验性远程写入不会把 SSH 断线伪装成可恢复事务；调用端必须显式确认该风险。
+pub const EEPROM_EXPERIMENTAL_PROVISION_WARNING: &str = "Experimental write: if SSH is interrupted after writing begins, device state is unknown. Do not retry; inspect the EEPROM and use the saved backup.";
 
 /// helper 进程实际访问的目标；bus 只能来自已持久化平台配置。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,11 +132,12 @@ pub enum EepromHelperOutput {
     Failure { failure: EepromHelperFailure },
 }
 
-/// GUI 提交给已解析 Sensor×Platform handle 的请求；不包含命令或 helper 路径。
+/// GUI 提交给固定 EEPROM SSH target 的请求；helper 路径、map 和 bus 不来自该请求。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EepromProvisionOperation {
-    pub sensor_mode: SensorModeKey,
     pub action: EepromHelperAction,
+    /// 仅 Provision 使用；adapter 必须拒绝未显式确认断线风险的写入。
+    pub experimental_disconnect_risk_acknowledged: bool,
 }
 
 pub trait EepromProvisionService: Send + Sync {
@@ -154,8 +155,6 @@ pub trait EepromProvisionService: Send + Sync {
 
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
 pub enum EepromProvisionServiceError {
-    #[error("no EEPROM target is configured for Sensor/Mode {0:?}")]
-    TargetNotConfigured(SensorModeKey),
     #[error("EEPROM request map {request_map} does not match configured map {configured_map}")]
     MapMismatch {
         request_map: String,

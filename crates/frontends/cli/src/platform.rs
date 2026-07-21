@@ -986,7 +986,6 @@ fn capability_name(capability: CapabilityKind) -> &'static str {
         CapabilityKind::RegisterRead => "register_read",
         CapabilityKind::RegisterWrite => "register_write",
         CapabilityKind::ExposureControl => "exposure_control",
-        CapabilityKind::EepromProvision => "eeprom_provision",
     }
 }
 
@@ -1005,9 +1004,6 @@ fn capability_variant_name(variant: CapabilityVariant) -> &'static str {
         CapabilityVariant::ArgvSubsystemCommand => "argv_subsystem_command",
         CapabilityVariant::RegisterAccess => "register_access",
         CapabilityVariant::Exposure => "exposure",
-        CapabilityVariant::EepromInspectDryRun => "eeprom_inspect_dry_run",
-        CapabilityVariant::EepromFullProvision => "eeprom_full_provision",
-        CapabilityVariant::EepromUpdateCalibration => "eeprom_update_calibration",
     }
 }
 

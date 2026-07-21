@@ -1,5 +1,7 @@
 //! `camera-toolbox-eeprom-helper --json-stdin`：目标侧唯一受支持入口。
 
+#[cfg(target_os = "linux")]
+mod device_lock;
 mod engine;
 #[cfg(target_os = "linux")]
 mod linux_i2c;
@@ -65,7 +67,13 @@ fn run() -> EepromHelperOutput {
     #[cfg(target_os = "linux")]
     {
         let bus = request.target.i2c_bus;
-        let mut device = match linux_i2c::LinuxEepromDevice::open(bus, yg_stereo_p24c64g_v1()) {
+        let map = yg_stereo_p24c64g_v1();
+        let _device_lock =
+            match device_lock::EepromDeviceLock::acquire(bus, map.transport.i2c_address) {
+                Ok(device_lock) => device_lock,
+                Err(error) => return failed(error.code(), error.message()),
+            };
+        let mut device = match linux_i2c::LinuxEepromDevice::open(bus, map) {
             Ok(device) => device,
             Err(error) => return failed("device_open_failed", error),
         };

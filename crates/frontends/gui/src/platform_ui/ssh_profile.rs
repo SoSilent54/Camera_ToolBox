@@ -5,10 +5,7 @@ use std::path::PathBuf;
 use camera_toolbox_adapters::platforms::ssh_managed::{
     HostKeyAssessment, HostKeyTarget, ServerHostKey, discover_private_key_files,
 };
-use camera_toolbox_app::{
-    PlatformConfig, PlatformProfile, PlatformProfileId, SensorId, SensorModeKey, SshEepromConfig,
-    SshEepromTargetConfig, SshManagedConfig,
-};
+use camera_toolbox_app::{PlatformConfig, PlatformProfile, PlatformProfileId, SshManagedConfig};
 use eframe::egui::{self, TextBuffer};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString, zeroize::Zeroize};
 
@@ -26,13 +23,6 @@ use super::host_key_worker::{
 pub(super) enum SshAuthMode {
     Password,
     PrivateKeyFile,
-}
-
-#[derive(Clone, Debug)]
-struct EepromTargetDraft {
-    sensor_id: String,
-    mode_id: String,
-    i2c_bus: u16,
 }
 
 /// Commit 动作独占 secret，刻意不实现 Clone/Debug。
@@ -142,10 +132,6 @@ pub(super) struct SshEditorState {
     advanced_remote_path: bool,
     capture_enabled: bool,
     rdk_template: bool,
-    eeprom_enabled: bool,
-    eeprom_helper_program: String,
-    eeprom_output_limit_bytes: u64,
-    eeprom_targets: Vec<EepromTargetDraft>,
     host_generation: u64,
     host_status: HostIdentityStatus,
     host_worker: Option<HostKeyWorker>,
@@ -190,10 +176,6 @@ impl SshEditorState {
             advanced_remote_path: false,
             capture_enabled: false,
             rdk_template: false,
-            eeprom_enabled: false,
-            eeprom_helper_program: "/usr/local/libexec/camera-toolbox-eeprom-helper".to_owned(),
-            eeprom_output_limit_bytes: 65_536,
-            eeprom_targets: Vec::new(),
             host_generation: 1,
             host_status,
             host_worker,
@@ -227,22 +209,6 @@ impl SshEditorState {
                 combine_remote_file(&config.remote_artifact_dir, &config.remote_artifact_glob);
         } else {
             state.advanced_remote_path = true;
-        }
-        if let Some(eeprom) = &config.eeprom {
-            state.eeprom_enabled = true;
-            state
-                .eeprom_helper_program
-                .clone_from(&eeprom.helper_program);
-            state.eeprom_output_limit_bytes = eeprom.output_limit_bytes;
-            state.eeprom_targets = eeprom
-                .targets
-                .iter()
-                .map(|target| EepromTargetDraft {
-                    sensor_id: target.sensor_mode.sensor_id.as_str().to_owned(),
-                    mode_id: target.sensor_mode.mode_id.clone(),
-                    i2c_bus: target.i2c_bus,
-                })
-                .collect();
         }
         state.host_status = status_from_existing_pin(&config.expected_host_key);
         state
@@ -602,92 +568,6 @@ impl SshEditorState {
         ui.add(egui::DragValue::new(&mut config.max_fetch_bytes).range(1..=1_073_741_824_u64));
         ui.label("Command output limit bytes");
         ui.add(egui::DragValue::new(&mut config.command_output_bytes).range(1..=16_777_216_u64));
-        ui.separator();
-        self.render_eeprom(ui);
-    }
-
-    fn render_eeprom(&mut self, ui: &mut egui::Ui) {
-        ui.checkbox(
-            &mut self.eeprom_enabled,
-            "Enable controlled calibration EEPROM provisioning",
-        );
-        if !self.eeprom_enabled {
-            ui.weak("EEPROM helper is not bound for this platform profile.");
-            return;
-        }
-        ui.strong("EEPROM helper (fixed profile configuration)");
-        text_row(ui, "Absolute helper path", &mut self.eeprom_helper_program);
-        ui.label("Helper output hard limit bytes");
-        ui.add(
-            egui::DragValue::new(&mut self.eeprom_output_limit_bytes).range(1_024..=1_048_576_u64),
-        );
-        ui.label("Sensor/Mode → I²C bus targets");
-        let mut remove = None;
-        egui::Grid::new("ssh_eeprom_targets")
-            .num_columns(5)
-            .striped(true)
-            .show(ui, |ui| {
-                ui.strong("Sensor ID");
-                ui.strong("Mode ID");
-                ui.strong("Map");
-                ui.strong("Bus");
-                ui.end_row();
-                for (index, target) in self.eeprom_targets.iter_mut().enumerate() {
-                    ui.add(egui::TextEdit::singleline(&mut target.sensor_id));
-                    ui.add(egui::TextEdit::singleline(&mut target.mode_id));
-                    ui.monospace(camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID);
-                    ui.add(egui::DragValue::new(&mut target.i2c_bus));
-                    if ui.small_button("Remove").clicked() {
-                        remove = Some(index);
-                    }
-                    ui.end_row();
-                }
-            });
-        if let Some(index) = remove {
-            self.eeprom_targets.remove(index);
-        }
-        if ui.button("Add Sensor/Mode target").clicked() {
-            self.eeprom_targets.push(EepromTargetDraft {
-                sensor_id: String::new(),
-                mode_id: String::new(),
-                i2c_bus: 0,
-            });
-        }
-        ui.weak(
-            "Saving verifies each Sensor/Mode exists, then records a UserConfirmed exact-cell EEPROM declaration. Bus, map and helper cannot be overridden by calibration actions.",
-        );
-    }
-
-    fn sync_eeprom_config(&self, config: &mut SshManagedConfig) -> Result<(), String> {
-        if !self.eeprom_enabled {
-            config.eeprom = None;
-            return Ok(());
-        }
-        if self.eeprom_targets.is_empty() {
-            return Err("add at least one EEPROM Sensor/Mode target".to_owned());
-        }
-        let mut targets = Vec::with_capacity(self.eeprom_targets.len());
-        for target in &self.eeprom_targets {
-            let sensor_id = SensorId::new(target.sensor_id.clone())
-                .map_err(|error| format!("invalid EEPROM sensor ID: {error}"))?;
-            if target.mode_id.trim().is_empty() || target.mode_id.trim() != target.mode_id {
-                return Err("EEPROM mode ID must be non-empty without edge whitespace".to_owned());
-            }
-            targets.push(SshEepromTargetConfig {
-                sensor_mode: SensorModeKey {
-                    sensor_id,
-                    mode_id: target.mode_id.clone(),
-                },
-                map_id: camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
-                i2c_bus: target.i2c_bus,
-            });
-        }
-        config.eeprom = Some(SshEepromConfig {
-            helper_program: self.eeprom_helper_program.clone(),
-            output_limit_bytes: self.eeprom_output_limit_bytes,
-            targets,
-        });
-        Ok(())
     }
 
     pub(super) fn prepare_commit(
@@ -728,7 +608,6 @@ impl SshEditorState {
                 Some(validate_client_private_key(path)?)
             }
         };
-        self.sync_eeprom_config(config)?;
         let mut validation = config.clone();
         validation.credential_ref = match selected_key.as_ref() {
             Some(path) => format!("key-file:{}", path.display()),

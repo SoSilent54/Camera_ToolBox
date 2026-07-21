@@ -500,8 +500,17 @@ impl CalibrationWorkspace {
         self.eeprom.take_intent()
     }
 
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_configured(&mut self, label: &str) {
+        self.eeprom.report_target_configured(label);
+    }
+
     pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
         self.eeprom.report_error(message);
+    }
+
+    pub(crate) fn report_eeprom_provision_unknown(&mut self, message: impl Into<String>) {
+        self.eeprom.report_provision_unknown(message);
     }
 
     pub(crate) fn report_eeprom_inspect(
