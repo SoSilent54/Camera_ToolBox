@@ -509,6 +509,16 @@ mod tests {
     }
 
     #[test]
+    fn object_points_use_inner_corner_layout_and_square_size() {
+        let points = object_points(BoardSpec::new(3, 2, 40.0).unwrap()).unwrap();
+        assert_eq!(points.len(), 6);
+        let points = points.to_vec();
+        assert_eq!(points[0], Point3f::new(0.0, 0.0, 0.0));
+        assert_eq!(points[2], Point3f::new(80.0, 0.0, 0.0));
+        assert_eq!(points[5], Point3f::new(80.0, 40.0, 0.0));
+    }
+
+    #[test]
     fn calibration_matches_pangbot_fixed_observation_contract() {
         let request = pangbot_synthetic_request();
         let solution = OpenCvCalibrationBackend

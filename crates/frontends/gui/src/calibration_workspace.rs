@@ -314,7 +314,7 @@ pub(crate) struct CalibrationWorkspace {
 
 impl CalibrationWorkspace {
     pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
-        let board = BoardSpec::new(11, 8, 20.0).expect("default board is valid");
+        let board = BoardSpec::new(11, 8, 40.0).expect("default board is valid");
         Ok(Self {
             session: CalibrationSession::new(board),
             sources: HashMap::new(),
@@ -463,7 +463,7 @@ impl CalibrationWorkspace {
                 ui.add(egui::DragValue::new(&mut self.board_cols).range(2..=256));
                 ui.label("×");
                 ui.add(egui::DragValue::new(&mut self.board_rows).range(2..=256));
-                ui.label("Square size");
+                ui.label("Square size (mm)");
                 ui.add(
                     egui::DragValue::new(&mut self.square_size)
                         .speed(0.1)
@@ -549,7 +549,6 @@ impl CalibrationWorkspace {
         ui.heading(format!("Dataset ({})", self.session.items().len()));
         let mut toggle = None;
         let mut select = None;
-        let mut remove = None;
         let installed = self.session.installed();
         let selected = self.session.selected();
         let items = self.session.items();
@@ -619,9 +618,6 @@ impl CalibrationWorkspace {
                         if response.clicked() {
                             select = Some(item.id);
                         }
-                        if idle && response.secondary_clicked() {
-                            remove = Some(item.id);
-                        }
                     });
                     row.col(|ui| {
                         if ui
@@ -676,36 +672,20 @@ impl CalibrationWorkspace {
         if let Some(id) = select {
             let _ = self.session.set_selected(id);
         }
-        if let Some(id) = remove {
-            self.remove_item(id);
+        if ui
+            .add_enabled(
+                idle && !self.session.items().is_empty(),
+                egui::Button::new("Clear"),
+            )
+            .clicked()
+        {
+            self.session.clear();
+            self.sources.clear();
+            self.coverage = None;
+            self.preview_mode = CalibrationPreviewMode::InputImage;
+            self.coverage_dirty = false;
+            self.status = "Dataset cleared.".to_owned();
         }
-        ui.horizontal(|ui| {
-            let selected = self.session.selected();
-            if ui
-                .add_enabled(
-                    idle && selected.is_some(),
-                    egui::Button::new("Remove selected"),
-                )
-                .clicked()
-                && let Some(id) = selected
-            {
-                self.remove_item(id);
-            }
-            if ui
-                .add_enabled(
-                    idle && !self.session.items().is_empty(),
-                    egui::Button::new("Clear"),
-                )
-                .clicked()
-            {
-                self.session.clear();
-                self.sources.clear();
-                self.coverage = None;
-                self.preview_mode = CalibrationPreviewMode::InputImage;
-                self.coverage_dirty = false;
-                self.status = "Dataset cleared.".to_owned();
-            }
-        });
     }
 
     fn render_inspection(&mut self, ui: &mut egui::Ui) {
@@ -844,13 +824,24 @@ impl CalibrationWorkspace {
                 return false;
             }
         };
+        let previous = self.session.board();
+        let corner_layout_changed =
+            previous.inner_cols != board.inner_cols || previous.inner_rows != board.inner_rows;
         if let Err(error) = self.session.set_board(board) {
             self.status = format!("Invalid board: {error}");
             return false;
         }
-        self.coverage_dirty = true;
-        self.status =
-            "Board applied; existing detections were invalidated if it changed.".to_owned();
+        if corner_layout_changed {
+            self.coverage_dirty = true;
+            self.status =
+                "Inner-corner layout applied; existing detections were invalidated.".to_owned();
+        } else if previous != board {
+            self.status =
+                "Square size applied in mm; detections were preserved and calibration was invalidated."
+                    .to_owned();
+        } else {
+            self.status = "Board unchanged; detections were preserved.".to_owned();
+        }
         true
     }
 
@@ -1099,18 +1090,6 @@ impl CalibrationWorkspace {
         };
         initial.validate().map_err(|error| error.to_string())?;
         Ok(initial)
-    }
-
-    fn remove_item(&mut self, id: CalibrationItemId) {
-        if self.active_job.is_some() {
-            self.status = "Cancel the active job before changing the dataset.".to_owned();
-            return;
-        }
-        if self.session.remove(id).is_ok() {
-            self.sources.remove(&id);
-            self.coverage_dirty = true;
-            self.status = "Dataset item removed.".to_owned();
-        }
     }
 
     fn export_json(&mut self) {
@@ -1774,6 +1753,30 @@ mod tests {
     }
 
     #[test]
+    fn square_size_apply_preserves_detections_and_inner_corner_change_invalidates_them() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        assert_eq!(workspace.session.board().square_size, 40.0);
+        install_detection_outcome(&mut workspace, "view.png", found_detection(640, 480));
+
+        workspace.square_size = 45.0;
+        assert!(workspace.apply_board());
+        assert!(matches!(
+            workspace.session.items()[0].status,
+            CalibrationItemStatus::Found(_)
+        ));
+        assert!(workspace.status.contains("detections were preserved"));
+
+        workspace.board_cols = 12;
+        assert!(workspace.apply_board());
+        assert!(matches!(
+            workspace.session.items()[0].status,
+            CalibrationItemStatus::Pending
+        ));
+        assert!(workspace.status.contains("detections were invalidated"));
+    }
+
+    #[test]
     fn installed_solution_renders_intrinsics_distortion_and_inline_rmse() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -1850,11 +1853,13 @@ mod tests {
             "620.00000000",
             "Distortion coefficients (OpenCV order)",
             "k1[0] = 0.1000000000",
+            "Square size (mm)",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
         assert!(!text.contains("Reprojection RMSE"));
         assert!(!text.contains("Wheel: zoom"));
+        assert!(!text.contains("Remove selected"));
     }
 
     #[test]

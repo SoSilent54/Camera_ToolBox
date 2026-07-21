@@ -228,7 +228,10 @@ impl CalibrationSession {
         self.installed.as_ref()
     }
 
-    /// 更新棋盘定义并使既有检测失效。
+    /// 更新棋盘定义。
+    ///
+    /// 内角点行列改变时，既有检测与新 pattern 不再匹配，全部重置为 `Pending`；
+    /// 仅相邻角点物理尺寸改变时，保留像素检测结果，只使既有标定解失效。
     ///
     /// # Errors
     ///
@@ -238,9 +241,13 @@ impl CalibrationSession {
         if self.board == board {
             return Ok(());
         }
+        let corner_layout_changed =
+            self.board.inner_cols != board.inner_cols || self.board.inner_rows != board.inner_rows;
         self.board = board;
-        for item in &mut self.items {
-            item.status = CalibrationItemStatus::Pending;
+        if corner_layout_changed {
+            for item in &mut self.items {
+                item.status = CalibrationItemStatus::Pending;
+            }
         }
         self.invalidate();
         Ok(())
@@ -606,6 +613,28 @@ mod tests {
         }
     }
 
+    fn solution(snapshot: &CalibrationSnapshot) -> CalibrationSolution {
+        CalibrationSolution {
+            image_size: snapshot.request.image_size,
+            camera_matrix: snapshot.request.initial_intrinsics.camera_matrix,
+            distortion_coefficients: vec![0.0; 12],
+            rms_error: 0.1,
+            calibration_flags: PANGBOT_CALIBRATION_FLAGS,
+            views: snapshot
+                .request
+                .image_points
+                .iter()
+                .map(|points| ViewCalibrationResult {
+                    rotation_vector: [0.0; 3],
+                    translation_vector: [0.0, 0.0, 1.0],
+                    projected_points: points.clone(),
+                    reprojection_rmse: 0.1,
+                    max_reprojection_error: 0.2,
+                })
+                .collect(),
+        }
+    }
+
     fn add_found(session: &mut CalibrationSession, name: &str, size: u64) -> CalibrationItemId {
         let AddCalibrationItemOutcome::Added(id) =
             session.add_or_refresh(reference(name), version(size), name.to_owned())
@@ -659,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn board_change_marks_all_items_pending() {
+    fn board_corner_layout_change_marks_all_items_pending() {
         let mut session = CalibrationSession::new(board());
         add_found(&mut session, "a.png", 10);
         session
@@ -669,6 +698,39 @@ mod tests {
             session.items()[0].status,
             CalibrationItemStatus::Pending
         ));
+    }
+
+    #[test]
+    fn square_size_change_preserves_detections_and_invalidates_solution() {
+        let mut session = CalibrationSession::new(board());
+        add_found(&mut session, "a.png", 10);
+        add_found(&mut session, "b.png", 20);
+        add_found(&mut session, "c.png", 30);
+        let snapshot = session.calibration_snapshot(intrinsics()).unwrap();
+        let solution = solution(&snapshot);
+        session.install_solution(snapshot, solution).unwrap();
+
+        session
+            .set_board(BoardSpec::new(2, 2, 40.0).unwrap())
+            .unwrap();
+
+        assert!(
+            session
+                .items()
+                .iter()
+                .all(|item| matches!(item.status, CalibrationItemStatus::Found(_)))
+        );
+        assert!(session.installed().is_none());
+        assert_eq!(session.board().square_size, 40.0);
+        assert_eq!(
+            session
+                .calibration_snapshot(intrinsics())
+                .unwrap()
+                .request
+                .board
+                .square_size,
+            40.0
+        );
     }
 
     #[test]
@@ -730,25 +792,7 @@ mod tests {
         add_found(&mut session, "b.png", 20);
         add_found(&mut session, "c.png", 30);
         let snapshot = session.calibration_snapshot(intrinsics()).unwrap();
-        let solution = CalibrationSolution {
-            image_size: snapshot.request.image_size,
-            camera_matrix: snapshot.request.initial_intrinsics.camera_matrix,
-            distortion_coefficients: vec![0.0; 12],
-            rms_error: 0.1,
-            calibration_flags: PANGBOT_CALIBRATION_FLAGS,
-            views: snapshot
-                .request
-                .image_points
-                .iter()
-                .map(|points| ViewCalibrationResult {
-                    rotation_vector: [0.0; 3],
-                    translation_vector: [0.0, 0.0, 1.0],
-                    projected_points: points.clone(),
-                    reprojection_rmse: 0.1,
-                    max_reprojection_error: 0.2,
-                })
-                .collect(),
-        };
+        let solution = solution(&snapshot);
         session.install_solution(snapshot, solution).unwrap();
         assert!(session.installed().is_some());
         session.set_enabled(session.items()[0].id, false).unwrap();
