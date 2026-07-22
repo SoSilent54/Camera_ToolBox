@@ -98,6 +98,12 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+      - name: Report Windows native toolchain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          where.exe link.exe
+          where.exe cl.exe
       - name: Prepare pinned OpenCV 5 dependency
         shell: bash
         run: |

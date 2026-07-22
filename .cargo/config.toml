@@ -1,3 +1,8 @@
+include = [{ path = "opencv5.local.toml", optional = true }]
+
+[env]
+OPENCV_DISABLE_PROBES = { value = "pkg_config,cmake,vcpkg_cmake,vcpkg", force = true }
+
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
 

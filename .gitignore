@@ -2,6 +2,7 @@
 /target/
 /.deps/
 /.ai_doc/
+/.cargo/opencv5.local.toml
 
 # Local project data and settings
 /local_data/

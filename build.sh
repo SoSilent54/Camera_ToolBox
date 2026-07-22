@@ -1,6 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+configure_windows_msvc_linker() {
+    if [[ ${OS:-} != "Windows_NT" || -n ${CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER:-} ]]; then
+        return
+    fi
+    if [[ -z ${VCToolsInstallDir:-} ]]; then
+        printf 'error: VCToolsInstallDir is not set; run from an activated MSVC x64 environment\n' >&2
+        exit 1
+    fi
+    if ! command -v cygpath >/dev/null 2>&1; then
+        printf 'error: cygpath is required when build.sh runs on Windows\n' >&2
+        exit 1
+    fi
+
+    local tools_dir linker_unix linker_windows
+    tools_dir=$(cygpath --unix "$VCToolsInstallDir")
+    linker_unix="${tools_dir%/}/bin/Hostx64/x64/link.exe"
+    if [[ ! -f $linker_unix ]]; then
+        printf 'error: MSVC linker does not exist: %s\n' "$linker_unix" >&2
+        exit 1
+    fi
+    linker_windows=$(cygpath --windows "$linker_unix")
+    export CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER="$linker_windows"
+    printf 'Using MSVC linker: %s\n' "$linker_windows"
+}
+
 usage() {
     cat <<'EOF'
 Usage: ./build.sh [profile]
@@ -53,6 +78,7 @@ fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 target_dir=${CARGO_TARGET_DIR:-"${project_root}/target"}
 export CARGO_TARGET_DIR="$target_dir"
+configure_windows_msvc_linker
 
 printf 'Building camera-toolbox: features=%s profile=%s target_dir=%s\n' \
     "$features" "$profile" "$target_dir"
