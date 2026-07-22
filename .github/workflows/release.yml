@@ -37,12 +37,34 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install macOS LLVM
+        if: runner.os == 'macOS'
+        run: brew install llvm
+      - name: Install Windows LLVM
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install llvm --yes --no-progress
+      - name: Activate Windows MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - name: Prepare pinned OpenCV 5 dependency
+        shell: bash
+        run: |
+          python_command=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
+          "$python_command" scripts/opencv5_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build unified release
         shell: bash
-        env:
-          CAMERA_TOOLBOX_CALIBRATION: "0"
         run: ./build.sh release
 
       - name: Package Unix release
@@ -55,6 +77,9 @@ jobs:
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
+          "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
+          env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
+            "dist/${bundle}/camera-toolbox" --help >/dev/null
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
 
       - name: Package Windows release
@@ -67,6 +92,10 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
           Copy-Item README.md "dist/$bundle/"
+          & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          & "dist/$bundle/camera-toolbox.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged camera-toolbox smoke failed" }
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$bundle.zip" -Force
 
       - name: Upload release archive
@@ -110,9 +139,12 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential \
+            clang \
             ca-certificates \
             curl \
             git \
+            libclang-dev \
+            python3 \
             pkg-config \
             libasound2-dev \
             libegl1-mesa-dev \
@@ -123,11 +155,14 @@ jobs:
             libxkbcommon-dev
       - name: Check out source
         uses: actions/checkout@v4
+      - name: Prepare pinned OpenCV 5 dependency
+        run: >-
+          python3 scripts/opencv5_dependency.py prepare
+          --github-env "$GITHUB_ENV"
+          --github-path "$GITHUB_PATH"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build unified release
-        env:
-          CAMERA_TOOLBOX_CALIBRATION: "0"
         run: ./build.sh release
       - name: Package Linux release
         env:
@@ -137,6 +172,8 @@ jobs:
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
+          "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
+          env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
       - name: Upload release archive
         uses: actions/upload-artifact@v4

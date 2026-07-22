@@ -33,13 +33,15 @@ cargo fmt --all -- --check
 ./build.sh debug
 ```
 
-`build.sh` 不选择 Local/CV610/SSH 功能平台；每次都统一编译这三个 provider。可选参数为 `debug`（默认）或 `release`，产物使用标准 Cargo 路径 `target/<profile>/camera-toolbox`。脚本只为当前原生系统构建，不把 OS 名伪装成跨平台参数；Windows、macOS、Linux 的编译由对应 GitHub Actions runner 承担。
+`build.sh` 不选择 Local/CV610/SSH 功能平台；每次都统一编译三个 provider 和 OpenCV 标定。可选参数为 `debug`（默认）或 `release`，产物使用标准 Cargo 路径 `target/<profile>/camera-toolbox`。本机只需提供 Python 3、Clang/libclang 和 GUI 系统开发库；脚本会下载、校验并解压固定的 `opencv-deps-v5.0.0-r1` 平台资产到 `.deps/opencv5`，不使用系统 OpenCV 或 vcpkg，并把 `opencv_world` 运行库复制到可执行文件旁。可通过 `CAMERA_TOOLBOX_OPENCV_CACHE` 更改缓存目录；`CAMERA_TOOLBOX_CALIBRATION=0` 仅用于无需 OpenCV 的 agent/平台无关检查。
+
+脚本只为当前原生系统构建，不把 OS 名伪装成跨平台参数；Windows、macOS、Linux 的编译由对应 GitHub Actions runner 承担。
 
 ## CI 与发布
 
-- 每个分支 push 会在 Linux x86_64、macOS aarch64、Windows x86_64 runner 上分别编译同一个全 provider 产品；完整测试与 Clippy 在 Linux job 执行，macOS/Windows 至少验证原生 release 编译。Clippy 仅报告 warning，不以 `-D warnings` 阻断。
+- 每个分支 push 会在 Linux x86_64、macOS aarch64、Windows x86_64 runner 上使用固定 OpenCV 5 资产分别编译同一个完整产品；标定算法测试、完整产品测试与 Clippy 在 Linux job 执行，macOS/Windows 验证原生 release 编译和启动。Clippy 仅报告 warning，不以 `-D warnings` 阻断。
 - 也可在 GitHub `Actions -> CI -> Run workflow` 中手动执行同一套检查。
-- 推送任意 Git tag 会生成 6 个归档；每个归档都只有一个同时包含全部 provider 的 `camera-toolbox` 可执行文件：
+- 推送 `v*` Git tag 会生成 6 个归档；每个归档都包含全 provider 的 `camera-toolbox` 可执行文件、对应平台的 `opencv_world` 运行库、OpenCV 许可证和 README：
   - `camera-toolbox-macos-aarch64`
   - `camera-toolbox-windows-x86_64`
   - `camera-toolbox-linux-{x86_64|aarch64}-ubuntu{20|22}`

@@ -36,7 +36,14 @@ png = "0.17"
 fs2 = "0.4.3"
 i2cdev = "0.6.2"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-opencv = { version = "0.99.0", default-features = false, features = ["calib3d", "clang-runtime", "imgcodecs", "imgproc"] }
+opencv = { version = "=0.99.0", default-features = false, features = [
+    "calib",
+    "clang-runtime",
+    "geometry",
+    "imgcodecs",
+    "imgproc",
+    "objdetect",
+] }
 notify = "8.2"
 russh = { version = "0.62", default-features = false, features = ["ring", "rsa"] }
 russh-sftp = "2.3"

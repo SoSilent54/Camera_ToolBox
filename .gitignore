@@ -1,5 +1,6 @@
 # Generated and local-only artifacts
 /target/
+/.deps/
 /.ai_doc/
 
 # Local project data and settings

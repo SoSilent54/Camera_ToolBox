@@ -6,21 +6,23 @@ use camera_toolbox_core::{
     ChessboardDetection, ChessboardDetectionOutcome, PANGBOT_CALIBRATION_FLAGS,
     ViewCalibrationResult,
 };
-use opencv::calib3d;
+use opencv::calib;
 use opencv::core::{self, Mat, Point2f, Point3f, Size, TermCriteria, Vector};
+use opencv::geometry;
 use opencv::imgcodecs;
 use opencv::imgproc;
+use opencv::objdetect;
 use opencv::prelude::*;
 
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
-const DETECTOR_FLAGS: i32 = calib3d::CALIB_CB_ADAPTIVE_THRESH | calib3d::CALIB_CB_NORMALIZE_IMAGE;
+const DETECTOR_FLAGS: i32 =
+    objdetect::CALIB_CB_ADAPTIVE_THRESH | objdetect::CALIB_CB_NORMALIZE_IMAGE;
 const SUBPIX_WINDOW: Size = Size::new(11, 11);
 const SUBPIX_ZERO_ZONE: Size = Size::new(-1, -1);
 const SUBPIX_MAX_ITERATIONS: i32 = 100;
 const SUBPIX_EPSILON: f64 = 1e-4;
-const CALIBRATION_FLAGS: i32 = calib3d::CALIB_USE_INTRINSIC_GUESS
-    | calib3d::CALIB_RATIONAL_MODEL
-    | calib3d::CALIB_THIN_PRISM_MODEL;
+const CALIBRATION_FLAGS: i32 =
+    calib::CALIB_USE_INTRINSIC_GUESS | calib::CALIB_RATIONAL_MODEL | calib::CALIB_THIN_PRISM_MODEL;
 const CALIBRATION_MAX_ITERATIONS: i32 = 30;
 const CALIBRATION_EPSILON: f64 = f64::EPSILON;
 
@@ -74,7 +76,7 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
         let mut corners = Vector::<Point2f>::new();
         let board_size = Size::new(i32::from(board.inner_cols), i32::from(board.inner_rows));
         let found =
-            calib3d::find_chessboard_corners(&gray, board_size, &mut corners, DETECTOR_FLAGS)
+            objdetect::find_chessboard_corners(&gray, board_size, &mut corners, DETECTOR_FLAGS)
                 .map_err(|error| cv_error("findChessboardCorners", &error))?;
         checkpoint(cancellation)?;
 
@@ -150,7 +152,7 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
             i32::try_from(request.image_size.width).map_err(|_| size_conversion_error())?,
             i32::try_from(request.image_size.height).map_err(|_| size_conversion_error())?,
         );
-        let rms_error = calib3d::calibrate_camera(
+        let rms_error = calib::calibrate_camera(
             &object_points,
             &image_points,
             image_size,
@@ -192,7 +194,7 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
                 .get(index)
                 .map_err(|error| cv_error("read translation vector", &error))?;
             let mut projected = Vector::<Point2f>::new();
-            calib3d::project_points_def(
+            geometry::project_points_def(
                 &object_points_one_view,
                 &rotation,
                 &translation,
@@ -359,6 +361,7 @@ mod tests {
     #[test]
     fn linked_opencv_runtime_is_available() {
         let version = core::get_version_string().unwrap();
+        assert_eq!(version, "5.0.0");
         let build_information = OpenCvCalibrationBackend.build_information().unwrap();
         println!("OpenCV runtime: {version}");
         assert!(build_information.contains(&version));
@@ -420,7 +423,7 @@ mod tests {
         );
 
         let mut baseline_corners = Vector::<Point2f>::new();
-        let found = calib3d::find_chessboard_corners_def(
+        let found = objdetect::find_chessboard_corners_def(
             &baseline_gray,
             Size::new(11, 8),
             &mut baseline_corners,
@@ -559,7 +562,7 @@ mod tests {
                 let rotation = Mat::from_slice_2d(&[&rotation]).unwrap();
                 let translation = Mat::from_slice_2d(&[&translation]).unwrap();
                 let mut projected = Vector::<Point2f>::new();
-                calib3d::project_points_def(
+                geometry::project_points_def(
                     &objects,
                     &rotation,
                     &translation,
