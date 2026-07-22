@@ -429,7 +429,7 @@ def main() -> int:
 
     digest = sha256(archive_path)
     checksum_path = output_dir / f"{asset_name}.sha256"
-    checksum_path.write_text(f"{digest}  {asset_name}\n", encoding="utf-8")
+    checksum_path.write_bytes(f"{digest}  {asset_name}\n".encode("ascii"))
 
     for path in (build_root, install_root, stage_root):
         safe_remove(path, scratch_root)
