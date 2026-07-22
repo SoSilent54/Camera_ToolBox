@@ -273,16 +273,8 @@ fn run_eeprom_operation(
         cancellation,
     )
     .map_err(|error| error.to_string())?;
-    let experimental_disconnect_risk_acknowledged = match &intent {
-        CalibrationProvisionIntent::Provision {
-            experimental_disconnect_risk_acknowledged,
-            ..
-        } => *experimental_disconnect_risk_acknowledged,
-        _ => false,
-    };
     let operation = EepromProvisionOperation {
         action: action.clone(),
-        experimental_disconnect_risk_acknowledged,
     };
     let helper_result = match target.service.execute(operation, control) {
         Ok(result) => result,
@@ -717,6 +709,20 @@ impl eframe::App for CameraToolboxApp {
         }
 
         #[cfg(feature = "calibration-opencv")]
+        let calibration_sftp_label: Result<String, String> = {
+            #[cfg(feature = "platform-ssh")]
+            {
+                self.explorer
+                    .connected_sftp_label()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "Connect Explorer SFTP before configuring EEPROM.".to_owned())
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                Err("This build does not include Explorer SFTP.".to_owned())
+            }
+        };
+        #[cfg(feature = "calibration-opencv")]
         let calibration_provision_label: Result<String, String> = {
             #[cfg(feature = "platform-ssh")]
             {
@@ -724,7 +730,8 @@ impl eframe::App for CameraToolboxApp {
                     .as_ref()
                     .map(|target| target.label.clone())
                     .ok_or_else(|| {
-                        "Configure the EEPROM SSH target in the Calibration panel.".to_owned()
+                        "Use the connected Explorer SFTP source for EEPROM, then Inspect."
+                            .to_owned()
                     })
             }
             #[cfg(not(feature = "platform-ssh"))]
@@ -744,6 +751,10 @@ impl eframe::App for CameraToolboxApp {
                             ui,
                             calibration_export_error.is_none(),
                             calibration_export_error.as_deref(),
+                            calibration_sftp_label
+                                .as_ref()
+                                .map(|label| label.as_str())
+                                .map_err(|error| error.as_str()),
                             calibration_provision_label
                                 .as_ref()
                                 .map(|label| label.as_str())
@@ -1928,6 +1939,17 @@ impl CameraToolboxApp {
                 config,
                 session_password,
             }) => {
+                #[cfg(feature = "calibration-opencv")]
+                if self.active_eeprom_cancellation.is_some() {
+                    self.explorer.set_remote_connection_error(
+                        "Wait for the active EEPROM operation to finish before replacing Explorer SFTP.",
+                    );
+                    return;
+                }
+                #[cfg(feature = "calibration-opencv")]
+                self.invalidate_eeprom_target(
+                    "Explorer SFTP connection changed. Select it again for EEPROM and Inspect.",
+                );
                 let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
                     &config.authentication
                 else {
@@ -2476,26 +2498,48 @@ impl CameraToolboxApp {
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn invalidate_eeprom_target(&mut self, message: impl Into<String>) {
+        self.eeprom_target = None;
+        self.calibration.report_target_invalidated(message);
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     fn configure_eeprom_target(
         &mut self,
         request: CalibrationEepromTargetRequest,
     ) -> Result<String, String> {
-        const CREDENTIAL_ID: &str = "calibration-eeprom";
-        const CREDENTIAL_REF: &str = "session:calibration-eeprom";
+        let source = self
+            .explorer
+            .connected_sftp_connection()
+            .cloned()
+            .ok_or_else(|| "Connect Explorer SFTP before configuring EEPROM.".to_owned())?;
+        let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
+        else {
+            return Err("EEPROM requires the Explorer SFTP process-only password".to_owned());
+        };
+        let expected_host_key = source
+            .expected_host_key
+            .clone()
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| {
+                "Explorer SFTP has no verified host identity; reconnect before EEPROM use."
+                    .to_owned()
+            })?;
+        let credential_ref = format!("session:{slot_id}");
         let connection = SshConnectionTarget {
-            host: request.host.clone(),
-            port: request.port,
-            username: request.username.clone(),
-            expected_host_key: Some(request.expected_host_key.clone()),
+            host: source.host.clone(),
+            port: source.port,
+            username: source.username.clone(),
+            expected_host_key: Some(expected_host_key.clone()),
             command_subsystem: None,
             remote_event_subsystem: None,
         };
         let target_document = serde_json::json!({
-            "host": request.host,
-            "port": request.port,
-            "username": request.username,
-            "expected_host_key": request.expected_host_key,
-            "helper_program": request.helper_program,
+            "connection_id": source.id.as_str(),
+            "host": source.host,
+            "port": source.port,
+            "username": source.username,
+            "expected_host_key": expected_host_key,
             "i2c_bus": request.i2c_bus,
             "map_id": camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID,
         });
@@ -2505,29 +2549,18 @@ impl CameraToolboxApp {
         let service = SshEepromProvisionService::new(
             format!("calibration-eeprom-{}", &snapshot_hash.to_hex()[..12]),
             connection,
-            CREDENTIAL_REF.to_owned(),
-            target_document["helper_program"]
-                .as_str()
-                .expect("helper program was serialized as string")
-                .to_owned(),
+            credential_ref,
             65_536,
             request.i2c_bus,
             self.live_runtime.ssh_resolver(),
             Arc::new(RusshTransportFactory),
         )
         .map_err(|error| error.to_string())?;
-        let credential_ref = self
-            .live_runtime
-            .ssh_credential_resolver()
-            .register_session_password(CREDENTIAL_ID, request.password)?;
-        if credential_ref != CREDENTIAL_REF {
-            return Err("EEPROM credential registry returned an unexpected reference".to_owned());
-        }
         let label = format!(
             "{}@{}:{} / i2c-{} @{}",
             target_document["username"].as_str().unwrap_or(""),
             target_document["host"].as_str().unwrap_or(""),
-            request.port,
+            target_document["port"].as_u64().unwrap_or(0),
             request.i2c_bus,
             &snapshot_hash.to_hex()[..12],
         );
@@ -2547,9 +2580,18 @@ impl CameraToolboxApp {
     ) {
         let intent = match intent {
             CalibrationProvisionIntent::ConfigureTarget(request) => {
+                if self.active_eeprom_cancellation.is_some() {
+                    self.calibration.report_provision_error(
+                        "Wait for the active EEPROM operation to finish before reconfiguring its target.",
+                    );
+                    return;
+                }
+                self.invalidate_eeprom_target(
+                    "Reconfiguring EEPROM target; previous Inspect and Dry-run are invalid.",
+                );
                 match self.configure_eeprom_target(request) {
                     Ok(label) => self.calibration.report_target_configured(&label),
-                    Err(error) => self.calibration.report_provision_error(error),
+                    Err(error) => self.calibration.report_target_configuration_failed(error),
                 }
                 return;
             }

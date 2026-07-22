@@ -505,6 +505,16 @@ impl CalibrationWorkspace {
         self.eeprom.report_target_configured(label);
     }
 
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_configuration_failed(&mut self, message: impl Into<String>) {
+        self.eeprom.report_target_configuration_failed(message);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_invalidated(&mut self, message: impl Into<String>) {
+        self.eeprom.report_target_invalidated(message);
+    }
+
     pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
         self.eeprom.report_error(message);
     }
@@ -577,12 +587,20 @@ impl CalibrationWorkspace {
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
+        sftp_source: Result<&str, &str>,
         provision_target: Result<&str, &str>,
     ) -> egui::Rect {
         self.poll_worker(context);
         self.sync_coverage(context);
         let rect = ui.available_rect_before_wrap();
-        self.render_controls(context, ui, export_enabled, export_reason, provision_target);
+        self.render_controls(
+            context,
+            ui,
+            export_enabled,
+            export_reason,
+            sftp_source,
+            provision_target,
+        );
         ui.separator();
         ui.columns(2, |columns| {
             self.render_dataset(&mut columns[0]);
@@ -609,6 +627,7 @@ impl CalibrationWorkspace {
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
+        sftp_source: Result<&str, &str>,
         provision_target: Result<&str, &str>,
     ) {
         self.refresh_auto_intrinsics_fields();
@@ -750,6 +769,7 @@ impl CalibrationWorkspace {
             ui,
             solution.as_ref(),
             &self.serial_number,
+            sftp_source,
             provision_target,
             (!export_enabled).then_some(
                 export_reason.unwrap_or("Select a writable Explorer directory before exporting."),
@@ -2103,7 +2123,14 @@ mod tests {
             ..Default::default()
         };
         let output = context.run_ui(input, |ui| {
-            workspace.render(&context, ui, true, None, Err("not configured"));
+            workspace.render(
+                &context,
+                ui,
+                true,
+                None,
+                Err("SFTP not connected"),
+                Err("EEPROM not configured"),
+            );
         });
         let text = output
             .platform_output

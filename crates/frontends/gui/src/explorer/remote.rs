@@ -11,7 +11,8 @@ use std::{
 };
 
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    SshConnectionTarget, SshCredential, SshTransportFactory,
+    HostKeyAssessment, HostKeyManager, HostKeyTarget, SshConnectionTarget, SshCredential,
+    SshTransportFactory,
 };
 use camera_toolbox_app::{
     DumpCancellation, RemoteAuthentication, RemoteConnectionConfig, RemoteConnectionId,
@@ -21,6 +22,7 @@ use eframe::egui;
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 const REMOTE_CONNECT_WATCHDOG: Duration = Duration::from_secs(30);
+const HOST_KEY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) const SFTP_NAMESPACE_ROOT: &str = "/";
 
@@ -88,6 +90,7 @@ struct ActiveRemoteConnect {
 pub(super) struct RemoteConnector {
     draft: RemoteConnectionDraft,
     transport: Arc<dyn SshTransportFactory>,
+    host_keys: Option<Arc<HostKeyManager>>,
     status: Option<String>,
     error: Option<String>,
     next_generation: u64,
@@ -96,9 +99,33 @@ pub(super) struct RemoteConnector {
 
 impl RemoteConnector {
     pub(super) fn new(transport: Arc<dyn SshTransportFactory>) -> Self {
+        let (host_keys, error) = match HostKeyManager::production() {
+            Ok(manager) => (Some(Arc::new(manager)), None),
+            Err(error) => (
+                None,
+                Some(format!("SSH host identity store is unavailable: {error}")),
+            ),
+        };
         Self {
             draft: RemoteConnectionDraft::default(),
             transport,
+            host_keys,
+            status: None,
+            error,
+            next_generation: 1,
+            active: None,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_host_key_manager(
+        transport: Arc<dyn SshTransportFactory>,
+        host_keys: Arc<HostKeyManager>,
+    ) -> Self {
+        Self {
+            draft: RemoteConnectionDraft::default(),
+            transport,
+            host_keys: Some(host_keys),
             status: None,
             error: None,
             next_generation: 1,
@@ -145,7 +172,7 @@ impl RemoteConnector {
                 self.error = None;
             }
         });
-        ui.small("Host identity is not verified or saved. Use this only on a trusted network.");
+        ui.small("First connection trusts the observed host key automatically; later key changes are rejected before password authentication.");
         if let Some(status) = &self.status {
             ui.horizontal(|ui| {
                 if connecting {
@@ -183,6 +210,10 @@ impl RemoteConnector {
                 return;
             }
         };
+        let Some(host_keys) = self.host_keys.clone() else {
+            self.error = Some("SSH host identity store is unavailable".to_owned());
+            return;
+        };
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let cancellation = DumpCancellation::default();
@@ -200,8 +231,12 @@ impl RemoteConnector {
         let transport = Arc::clone(&self.transport);
         let context = context.clone();
         thread::spawn(move || {
-            let result =
-                run_remote_connect_guarded(request, transport.as_ref(), worker_cancellation);
+            let result = run_remote_connect_guarded(
+                request,
+                transport.as_ref(),
+                host_keys.as_ref(),
+                worker_cancellation,
+            );
             let _ = sender.send(RemoteConnectResult { generation, result });
             context.request_repaint();
         });
@@ -270,6 +305,7 @@ impl RemoteConnector {
 fn run_remote_connect(
     request: RemoteConnectRequest,
     transport: &dyn SshTransportFactory,
+    host_keys: &HostKeyManager,
     cancellation: DumpCancellation,
 ) -> Result<RemoteConnectionCommit, String> {
     let password_for_transport = SecretString::from(request.password.expose_secret());
@@ -283,11 +319,12 @@ fn run_remote_connect(
         cancellation,
     )
     .map_err(|error| error.to_string())?;
+    let host_key = resolve_sftp_host_key(host_keys, &request.host, request.port)?;
     let target = SshConnectionTarget {
         host: request.host.clone(),
         port: request.port,
         username: request.username.clone(),
-        expected_host_key: None,
+        expected_host_key: Some(host_key.clone()),
         command_subsystem: None,
         remote_event_subsystem: None,
     };
@@ -310,7 +347,7 @@ fn run_remote_connect(
         host: request.host,
         port: request.port,
         username: request.username,
-        expected_host_key: None,
+        expected_host_key: Some(host_key),
         authentication: RemoteAuthentication::Password {
             slot_id: request.slot_id,
         },
@@ -325,12 +362,37 @@ fn run_remote_connect(
 fn run_remote_connect_guarded(
     request: RemoteConnectRequest,
     transport: &dyn SshTransportFactory,
+    host_keys: &HostKeyManager,
     cancellation: DumpCancellation,
 ) -> Result<RemoteConnectionCommit, String> {
     catch_unwind(AssertUnwindSafe(|| {
-        run_remote_connect(request, transport, cancellation)
+        run_remote_connect(request, transport, host_keys, cancellation)
     }))
     .unwrap_or_else(|_| Err("Remote connection worker crashed unexpectedly".to_owned()))
+}
+
+fn resolve_sftp_host_key(
+    manager: &HostKeyManager,
+    host: &str,
+    port: u16,
+) -> Result<String, String> {
+    let target = HostKeyTarget::new(host, port).map_err(|error| error.to_string())?;
+    match manager
+        .scan_and_assess(&target, HOST_KEY_SCAN_TIMEOUT)
+        .map_err(|error| format!("SSH host identity scan failed: {error}"))?
+    {
+        HostKeyAssessment::Trusted(key) => Ok(key.openssh().to_owned()),
+        HostKeyAssessment::Unknown(key) => {
+            manager
+                .trust(&target, &key)
+                .map_err(|error| format!("Trust SSH host identity failed: {error}"))?;
+            Ok(key.openssh().to_owned())
+        }
+        HostKeyAssessment::Changed(key) => Err(format!(
+            "SSH host identity changed (observed {}). Refusing password authentication.",
+            key.fingerprint()
+        )),
+    }
 }
 
 fn parse_endpoint(value: &str) -> Result<ParsedEndpoint, String> {
@@ -413,7 +475,76 @@ fn remote_connection_id(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camera_toolbox_adapters::platforms::ssh_managed::MemorySshTransport;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use camera_toolbox_adapters::platforms::ssh_managed::{
+        HostKeyError, MemorySshTransport, ServerHostKey, ServerHostKeyProbe,
+    };
+
+    const KEY_A: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    const KEY_B: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIA6rWI3G1sz07DnfFlrouTcysQlj2P+jpNSOEWD9OJ3X";
+
+    struct FixedProbe(ServerHostKey);
+
+    impl ServerHostKeyProbe for FixedProbe {
+        fn probe(
+            &self,
+            _target: &HostKeyTarget,
+            _timeout: Duration,
+        ) -> Result<ServerHostKey, HostKeyError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct HostKeyFixture {
+        directory: PathBuf,
+        path: PathBuf,
+        manager: Arc<HostKeyManager>,
+    }
+
+    impl HostKeyFixture {
+        fn new(label: &str, key: &str) -> Self {
+            static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+            let unique = format!(
+                "camera-toolbox-sftp-tofu-{label}-{}-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos(),
+                NEXT_ID.fetch_add(1, Ordering::Relaxed)
+            );
+            let directory = std::env::temp_dir().join(unique);
+            fs::create_dir_all(&directory).unwrap();
+            let directory = fs::canonicalize(directory).unwrap();
+            let path = directory.join("known_hosts");
+            let manager = Arc::new(
+                HostKeyManager::with_probe(
+                    &path,
+                    Arc::new(FixedProbe(ServerHostKey::from_openssh(key).unwrap())),
+                )
+                .unwrap(),
+            );
+            Self {
+                directory,
+                path,
+                manager,
+            }
+        }
+    }
+
+    impl Drop for HostKeyFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.directory);
+        }
+    }
 
     #[test]
     fn parses_hostname_default_port_and_bracketed_ipv6() {
@@ -442,12 +573,14 @@ mod tests {
     }
 
     #[test]
-    fn connector_uses_server_namespace_root_and_process_only_password() {
-        let memory = Arc::new(MemorySshTransport::new("memory-host-key"));
+    fn connector_auto_trusts_host_and_returns_pinned_process_only_connection() {
+        let fixture = HostKeyFixture::new("connect", KEY_A);
+        let memory = Arc::new(MemorySshTransport::new(KEY_A));
         memory.insert_directory(SFTP_NAMESPACE_ROOT);
         let transport: Arc<dyn SshTransportFactory> = memory;
         let context = egui::Context::default();
-        let mut connector = RemoteConnector::new(transport);
+        let mut connector =
+            RemoteConnector::with_host_key_manager(transport, Arc::clone(&fixture.manager));
         connector.draft.endpoint = "root@camera.test:22".to_owned();
         connector
             .draft
@@ -465,11 +598,39 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
 
-        assert!(commit.config.expected_host_key.is_none());
+        assert_eq!(commit.config.expected_host_key.as_deref(), Some(KEY_A));
         assert!(matches!(
             commit.config.authentication,
             RemoteAuthentication::Password { .. }
         ));
         assert!(!commit.session_password.expose_secret().is_empty());
+        assert!(matches!(
+            fixture
+                .manager
+                .scan_and_assess(
+                    &HostKeyTarget::new("camera.test", 22).unwrap(),
+                    HOST_KEY_SCAN_TIMEOUT,
+                )
+                .unwrap(),
+            HostKeyAssessment::Trusted(_)
+        ));
+    }
+
+    #[test]
+    fn changed_host_key_is_rejected_before_password_authentication() {
+        let fixture = HostKeyFixture::new("changed", KEY_A);
+        let target = HostKeyTarget::new("camera.test", 22).unwrap();
+        let key_a = ServerHostKey::from_openssh(KEY_A).unwrap();
+        fixture.manager.trust(&target, &key_a).unwrap();
+        let changed_manager = HostKeyManager::with_probe(
+            &fixture.path,
+            Arc::new(FixedProbe(ServerHostKey::from_openssh(KEY_B).unwrap())),
+        )
+        .unwrap();
+
+        let error = resolve_sftp_host_key(&changed_manager, "camera.test", 22).unwrap_err();
+
+        assert!(error.contains("identity changed"));
+        assert!(error.contains("Refusing password authentication"));
     }
 }

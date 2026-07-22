@@ -350,6 +350,8 @@ pub(crate) struct ExplorerState {
     local_view: Option<SourceView>,
     #[cfg(feature = "platform-ssh")]
     sftp_view: Option<SourceView>,
+    #[cfg(feature = "platform-ssh")]
+    sftp_connection: Option<RemoteConnectionConfig>,
     active_monitor: Option<ActiveDirectoryMonitor>,
     browser: BrowserState,
     global_error: Option<String>,
@@ -379,6 +381,7 @@ impl ExplorerState {
             mode: WorkspaceMode::Local,
             local_view: None,
             sftp_view: None,
+            sftp_connection: None,
             active_monitor: None,
             browser: BrowserState::default(),
             global_error: None,
@@ -713,13 +716,14 @@ impl ExplorerState {
         context: &egui::Context,
     ) -> Result<(), String> {
         let view = SourceView::try_sftp(
-            connection,
+            connection.clone(),
             Arc::clone(&self.credentials),
             Arc::clone(&self.transport),
         )?;
         self.cancel_active_mutation();
         self.stop_active_monitor();
         self.sftp_view = Some(view);
+        self.sftp_connection = Some(connection);
         self.mode = WorkspaceMode::Sftp;
         self.browser.clear_transient();
         self.global_error = None;
@@ -936,6 +940,18 @@ impl ExplorerState {
                 config: view.config.clone(),
                 file_system: Arc::clone(&view.file_system),
             })
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn connected_sftp_connection(&self) -> Option<&RemoteConnectionConfig> {
+        self.sftp_view.as_ref()?;
+        self.sftp_connection.as_ref()
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn connected_sftp_label(&self) -> Option<&str> {
+        self.connected_sftp_connection()
+            .map(|connection| connection.display_name.as_str())
     }
 
     /// 返回当前 Explorer 目录的统一显式导出目标。

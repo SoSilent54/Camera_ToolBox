@@ -1,4 +1,4 @@
-//! 标定 EEPROM 的 GUI 安全状态机；不接受 helper 路径、I²C bus 或任意命令。
+//! 标定 EEPROM 的 GUI 安全状态机；SSH 登录复用 Explorer SFTP，仅选择 I²C bus。
 
 use camera_toolbox_app::{
     EEPROM_EXPERIMENTAL_PROVISION_WARNING, EepromDeviceState, EepromDryRunResult,
@@ -9,62 +9,12 @@ use camera_toolbox_core::{
     CalibrationSolution, EepromProvisionRequest, EepromProvisioningMode, FullEepromImage,
 };
 use eframe::egui;
-#[cfg(feature = "platform-ssh")]
-use eframe::egui::TextBuffer;
-#[cfg(feature = "platform-ssh")]
-use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString};
 
 #[cfg(feature = "platform-ssh")]
-/// Calibration 工作区独占的 EEPROM SSH target；不暴露旧 Platform/Profile/Sensor 概念。
+/// 复用当前 Explorer SFTP 连接，仅选择目标物理 I²C bus。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CalibrationEepromTargetRequest {
-    pub(crate) host: String,
-    pub(crate) port: u16,
-    pub(crate) username: String,
-    pub(crate) expected_host_key: String,
-    pub(crate) password: SecretString,
-    pub(crate) helper_program: String,
     pub(crate) i2c_bus: u16,
-}
-
-#[cfg(feature = "platform-ssh")]
-#[derive(Default)]
-struct EepromSecretInput {
-    value: SecretBox<String>,
-}
-
-#[cfg(feature = "platform-ssh")]
-impl EepromSecretInput {
-    fn is_empty(&self) -> bool {
-        self.value.expose_secret().is_empty()
-    }
-
-    fn take(&mut self) -> Option<SecretString> {
-        let value = std::mem::take(self.value.expose_secret_mut());
-        (!value.is_empty()).then(|| SecretString::from(value))
-    }
-}
-
-#[cfg(feature = "platform-ssh")]
-impl TextBuffer for EepromSecretInput {
-    fn is_mutable(&self) -> bool {
-        true
-    }
-
-    fn as_str(&self) -> &str {
-        self.value.expose_secret()
-    }
-
-    fn insert_text(&mut self, text: &str, char_index: egui::text::CharIndex) -> usize {
-        self.value.expose_secret_mut().insert_text(text, char_index)
-    }
-
-    fn delete_char_range(&mut self, range: std::ops::Range<egui::text::CharIndex>) {
-        self.value.expose_secret_mut().delete_char_range(range);
-    }
-
-    fn type_id(&self) -> std::any::TypeId {
-        std::any::TypeId::of::<Self>()
-    }
 }
 
 pub(crate) enum CalibrationProvisionIntent {
@@ -79,7 +29,6 @@ pub(crate) enum CalibrationProvisionIntent {
         request: EepromProvisionRequest,
         expected_before_sha256: String,
         dry_run_token: String,
-        experimental_disconnect_risk_acknowledged: bool,
     },
 }
 
@@ -97,7 +46,6 @@ impl CalibrationProvisionIntent {
                 request,
                 expected_before_sha256,
                 dry_run_token,
-                experimental_disconnect_risk_acknowledged: _,
             } => Some(EepromHelperAction::Provision {
                 request: request.clone(),
                 expected_before_sha256: expected_before_sha256.clone(),
@@ -126,20 +74,7 @@ pub(crate) struct CalibrationEepromState {
     mode: EepromProvisioningMode,
     device: Option<EepromDeviceState>,
     #[cfg(feature = "platform-ssh")]
-    target_host: String,
-    #[cfg(feature = "platform-ssh")]
-    target_port: u16,
-    #[cfg(feature = "platform-ssh")]
-    target_username: String,
-    #[cfg(feature = "platform-ssh")]
-    target_host_key: String,
-    #[cfg(feature = "platform-ssh")]
-    target_password: EepromSecretInput,
-    #[cfg(feature = "platform-ssh")]
-    target_helper_program: String,
-    #[cfg(feature = "platform-ssh")]
     target_i2c_bus: u16,
-    experimental_risk_acknowledged: bool,
     inspected_target: Option<String>,
     prepared: Option<PreparedProvision>,
     overwrite_existing_serial: bool,
@@ -157,20 +92,7 @@ impl Default for CalibrationEepromState {
             mode: EepromProvisioningMode::FullProvision,
             device: None,
             #[cfg(feature = "platform-ssh")]
-            target_host: String::new(),
-            #[cfg(feature = "platform-ssh")]
-            target_port: 22,
-            #[cfg(feature = "platform-ssh")]
-            target_username: String::new(),
-            #[cfg(feature = "platform-ssh")]
-            target_host_key: String::new(),
-            #[cfg(feature = "platform-ssh")]
-            target_password: EepromSecretInput::default(),
-            #[cfg(feature = "platform-ssh")]
-            target_helper_program: "/usr/local/libexec/camera-toolbox-eeprom-helper".to_owned(),
-            #[cfg(feature = "platform-ssh")]
             target_i2c_bus: 0,
-            experimental_risk_acknowledged: false,
             inspected_target: None,
             prepared: None,
             overwrite_existing_serial: false,
@@ -191,12 +113,43 @@ impl CalibrationEepromState {
 
     #[cfg(feature = "platform-ssh")]
     pub(crate) fn report_target_configured(&mut self, label: &str) {
+        self.clear_target_dependent_state();
+        self.status = format!("EEPROM SSH target configured: {label}. Inspect before writing.");
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_configuration_failed(&mut self, message: impl Into<String>) {
+        self.clear_target_dependent_state();
+        self.status = format!("EEPROM SSH target configuration failed: {}", message.into());
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_invalidated(&mut self, message: impl Into<String>) {
+        self.clear_target_dependent_state();
+        self.status = message.into();
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn begin_target_configuration(&mut self) {
+        self.clear_target_dependent_state();
+        self.pending = Some(CalibrationProvisionIntent::ConfigureTarget(
+            CalibrationEepromTargetRequest {
+                i2c_bus: self.target_i2c_bus,
+            },
+        ));
+        self.status = "Configuring EEPROM from the active Explorer SFTP connection...".to_owned();
+    }
+
+    fn clear_target_dependent_state(&mut self) {
+        self.busy = false;
+        self.active_operation = None;
+        self.cancel_requested = false;
+        self.confirmation_open = false;
         self.device = None;
         self.inspected_target = None;
         self.prepared = None;
         self.overwrite_existing_serial = false;
-        self.experimental_risk_acknowledged = false;
-        self.status = format!("EEPROM SSH target configured: {label}. Inspect before writing.");
+        self.pending = None;
     }
 
     pub(crate) fn report_provision_unknown(&mut self, message: impl Into<String>) {
@@ -208,7 +161,6 @@ impl CalibrationEepromState {
         self.inspected_target = None;
         self.prepared = None;
         self.overwrite_existing_serial = false;
-        self.experimental_risk_acknowledged = false;
         self.pending = None;
         self.status = format!(
             "EEPROM state is UNKNOWN after the write attempt. Do not retry. Re-inspect the device and use the saved backup if required. {}",
@@ -255,7 +207,6 @@ impl CalibrationEepromState {
             backup_file,
             manifest_file,
         });
-        self.experimental_risk_acknowledged = false;
         self.status = "Dry-run accepted; backup and manifest were saved create-new.".to_owned();
     }
 
@@ -273,7 +224,6 @@ impl CalibrationEepromState {
         self.cancel_requested = false;
         self.confirmation_open = false;
         self.overwrite_existing_serial = false;
-        self.experimental_risk_acknowledged = false;
         self.status = format!(
             "EEPROM write and bytewise verification succeeded; audit saved as {audit_file}."
         );
@@ -293,7 +243,6 @@ impl CalibrationEepromState {
         self.cancel_requested = false;
         self.confirmation_open = false;
         self.overwrite_existing_serial = false;
-        self.experimental_risk_acknowledged = false;
         self.status = format!(
             "EEPROM write and bytewise verification succeeded, but final audit save failed: {error}. The pre-write dry-run manifest remains authoritative."
         );
@@ -305,13 +254,16 @@ impl CalibrationEepromState {
         ui: &mut egui::Ui,
         solution: Option<&CalibrationSolution>,
         serial_number: &str,
+        sftp_source: Result<&str, &str>,
         target: Result<&str, &str>,
         save_destination_error: Option<&str>,
     ) {
         ui.separator();
         ui.strong("EEPROM Provisioning");
+        #[cfg(not(feature = "platform-ssh"))]
+        let _ = sftp_source;
         #[cfg(feature = "platform-ssh")]
-        self.render_target_editor(ui);
+        self.render_target_editor(ui, sftp_source);
         let target_label = target.ok();
         match target {
             Ok(label) => ui.label(format!("Resolved target: {label}")),
@@ -326,7 +278,6 @@ impl CalibrationEepromState {
             self.inspected_target = None;
             self.prepared = None;
             self.overwrite_existing_serial = false;
-            self.experimental_risk_acknowledged = false;
             self.status = "Target changed; inspect the newly selected EEPROM.".to_owned();
         }
 
@@ -437,13 +388,9 @@ impl CalibrationEepromState {
             render_page_plan(ui, &prepared.result.page_plan);
         }
         ui.colored_label(egui::Color32::YELLOW, EEPROM_EXPERIMENTAL_PROVISION_WARNING);
-        ui.checkbox(
-            &mut self.experimental_risk_acknowledged,
-            "I understand that SSH interruption can leave the EEPROM state unknown",
-        );
         if ui
             .add_enabled(
-                !self.busy && prepared_current && self.experimental_risk_acknowledged,
+                !self.busy && prepared_current,
                 egui::Button::new("Experimental Write EEPROM...").fill(egui::Color32::DARK_RED),
             )
             .clicked()
@@ -478,72 +425,38 @@ impl CalibrationEepromState {
     }
 
     #[cfg(feature = "platform-ssh")]
-    fn render_target_editor(&mut self, ui: &mut egui::Ui) {
+    fn render_target_editor(&mut self, ui: &mut egui::Ui, sftp_source: Result<&str, &str>) {
         ui.collapsing("EEPROM SSH Target", |ui| {
-            ui.weak("Calibration-only target. It does not create a Platform/Profile/Sensor entry.");
-            egui::Grid::new("calibration_eeprom_ssh_target")
-                .num_columns(2)
-                .show(ui, |ui| {
-                    ui.label("Host / IP");
-                    ui.text_edit_singleline(&mut self.target_host);
-                    ui.end_row();
-                    ui.label("SSH port");
-                    ui.add(egui::DragValue::new(&mut self.target_port).range(1..=u16::MAX));
-                    ui.end_row();
-                    ui.label("Username");
-                    ui.text_edit_singleline(&mut self.target_username);
-                    ui.end_row();
-                    ui.label("Pinned host key");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.target_host_key)
-                            .hint_text("ssh-ed25519 AAAA..."),
-                    );
-                    ui.end_row();
-                    ui.label("Password");
-                    ui.add(egui::TextEdit::singleline(&mut self.target_password).password(true));
-                    ui.end_row();
-                    ui.label("Helper program");
-                    ui.text_edit_singleline(&mut self.target_helper_program);
-                    ui.end_row();
-                    ui.label("I²C bus");
-                    ui.add(egui::DragValue::new(&mut self.target_i2c_bus));
-                    ui.end_row();
-                });
+            ui.weak("Reuses the active Explorer SFTP endpoint and process-only password.");
+            match sftp_source {
+                Ok(label) => {
+                    ui.label(format!("Explorer SFTP: {label}"));
+                }
+                Err(reason) => {
+                    ui.colored_label(egui::Color32::YELLOW, reason);
+                }
+            }
+            ui.horizontal(|ui| {
+                ui.label("I²C bus");
+                ui.add(egui::DragValue::new(&mut self.target_i2c_bus));
+            });
             ui.weak(
-                "The server host key is mandatory and the password remains in process memory only.",
+                "The remote helper path is fixed by the installation package. Host identity is pinned automatically by Explorer SFTP TOFU.",
             );
-            let complete = !self.busy
-                && !self.target_host.trim().is_empty()
-                && !self.target_username.trim().is_empty()
-                && !self.target_host_key.trim().is_empty()
-                && !self.target_helper_program.trim().is_empty()
-                && !self.target_password.is_empty();
             if ui
-                .add_enabled(complete, egui::Button::new("Apply EEPROM target"))
+                .add_enabled(
+                    !self.busy && sftp_source.is_ok(),
+                    egui::Button::new("Use Explorer SFTP for EEPROM"),
+                )
                 .clicked()
             {
-                let password = self
-                    .target_password
-                    .take()
-                    .expect("enabled only while password is present");
-                self.pending = Some(CalibrationProvisionIntent::ConfigureTarget(
-                    CalibrationEepromTargetRequest {
-                        host: self.target_host.trim().to_owned(),
-                        port: self.target_port,
-                        username: self.target_username.trim().to_owned(),
-                        expected_host_key: self.target_host_key.trim().to_owned(),
-                        password,
-                        helper_program: self.target_helper_program.trim().to_owned(),
-                        i2c_bus: self.target_i2c_bus,
-                    },
-                ));
-                self.status = "Validating the EEPROM SSH target...".to_owned();
+                self.begin_target_configuration();
             }
         });
     }
 
     fn confirmed_provision_intent(&self) -> Option<CalibrationProvisionIntent> {
-        if self.busy || !self.experimental_risk_acknowledged {
+        if self.busy {
             return None;
         }
         let prepared = self.prepared.as_ref()?;
@@ -551,7 +464,6 @@ impl CalibrationEepromState {
             request: prepared.request.clone(),
             expected_before_sha256: prepared.result.state.image_sha256.clone(),
             dry_run_token: prepared.result.dry_run_token.clone(),
-            experimental_disconnect_risk_acknowledged: self.experimental_risk_acknowledged,
         })
     }
 
@@ -693,11 +605,9 @@ mod tests {
             request: request(),
             expected_before_sha256: "a".repeat(64),
             dry_run_token: "b".repeat(64),
-            experimental_disconnect_risk_acknowledged: true,
         });
         state.busy = true;
         state.active_operation = Some(ActiveEepromOperation::Provision);
-        state.experimental_risk_acknowledged = true;
 
         state.report_provision_unknown("SSH response was lost");
 
@@ -706,13 +616,12 @@ mod tests {
         assert!(state.prepared.is_none());
         assert!(state.pending.is_none());
         assert!(!state.busy);
-        assert!(!state.experimental_risk_acknowledged);
         assert!(state.status.contains("UNKNOWN"));
         assert!(state.status.contains("Re-inspect"));
     }
 
     #[test]
-    fn final_write_intent_requires_current_disconnect_risk_acknowledgement() {
+    fn final_write_intent_requires_prepared_idle_state() {
         let mut state = CalibrationEepromState::default();
         state.prepared = Some(PreparedProvision {
             request: request(),
@@ -727,16 +636,44 @@ mod tests {
             manifest_file: "manifest.json".to_owned(),
         });
 
-        assert!(state.confirmed_provision_intent().is_none());
-        state.experimental_risk_acknowledged = true;
         assert!(matches!(
             state.confirmed_provision_intent(),
-            Some(CalibrationProvisionIntent::Provision {
-                experimental_disconnect_risk_acknowledged: true,
-                ..
-            })
+            Some(CalibrationProvisionIntent::Provision { .. })
         ));
         state.busy = true;
         assert!(state.confirmed_provision_intent().is_none());
+    }
+
+    #[test]
+    fn failed_reconfiguration_invalidates_existing_prepared_provision() {
+        let mut state = CalibrationEepromState::default();
+        state.prepared = Some(PreparedProvision {
+            request: request(),
+            result: EepromDryRunResult {
+                state: device_state(),
+                backup: vec![0; 308],
+                page_plan: Vec::new(),
+                dry_run_token: "b".repeat(64),
+            },
+            target_label: "root@old-camera / i2c-7".to_owned(),
+            backup_file: "backup.bin".to_owned(),
+            manifest_file: "manifest.json".to_owned(),
+        });
+        state.device = Some(device_state());
+        state.inspected_target = Some("root@old-camera / i2c-7".to_owned());
+        assert!(state.confirmed_provision_intent().is_some());
+
+        state.begin_target_configuration();
+        assert!(matches!(
+            state.take_intent(),
+            Some(CalibrationProvisionIntent::ConfigureTarget(_))
+        ));
+        state.report_target_configuration_failed("no active SFTP source");
+
+        assert!(state.device.is_none());
+        assert!(state.inspected_target.is_none());
+        assert!(state.prepared.is_none());
+        assert!(state.confirmed_provision_intent().is_none());
+        assert!(state.take_intent().is_none());
     }
 }

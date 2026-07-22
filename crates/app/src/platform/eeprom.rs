@@ -8,7 +8,7 @@ use super::RemoteOperationControl;
 
 /// GUI、SSH adapter 与目标 helper 共同支持的协议版本。
 pub const EEPROM_HELPER_SCHEMA_VERSION: u32 = 1;
-/// 实验性远程写入不会把 SSH 断线伪装成可恢复事务；调用端必须显式确认该风险。
+/// 实验性远程写入不会把 SSH 断线伪装成可恢复事务；GUI 最终模态窗必须展示该风险。
 pub const EEPROM_EXPERIMENTAL_PROVISION_WARNING: &str = "Experimental write: if SSH is interrupted after writing begins, device state is unknown. Do not retry; inspect the EEPROM and use the saved backup.";
 
 /// helper 进程实际访问的目标；bus 只能来自已持久化平台配置。
@@ -136,8 +136,6 @@ pub enum EepromHelperOutput {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EepromProvisionOperation {
     pub action: EepromHelperAction,
-    /// 仅 Provision 使用；adapter 必须拒绝未显式确认断线风险的写入。
-    pub experimental_disconnect_risk_acknowledged: bool,
 }
 
 pub trait EepromProvisionService: Send + Sync {

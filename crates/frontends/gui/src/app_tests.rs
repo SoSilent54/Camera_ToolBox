@@ -1267,7 +1267,7 @@ mod eeprom_operation_tests {
     use super::super::*;
     use std::{
         fs,
-        sync::{Arc, mpsc},
+        sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -1297,27 +1297,6 @@ mod eeprom_operation_tests {
             _control: RemoteOperationControl,
         ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
             self.result.clone()
-        }
-    }
-
-    struct RecordingEepromService {
-        sender: mpsc::Sender<EepromProvisionOperation>,
-    }
-
-    impl EepromProvisionService for RecordingEepromService {
-        fn service_id(&self) -> &str {
-            "recording-test-eeprom"
-        }
-
-        fn execute(
-            &self,
-            request: EepromProvisionOperation,
-            _control: RemoteOperationControl,
-        ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
-            self.sender.send(request).unwrap();
-            Err(EepromProvisionServiceError::InvalidRequest(
-                "recording stop".to_owned(),
-            ))
         }
     }
 
@@ -1423,7 +1402,6 @@ mod eeprom_operation_tests {
                 request: request(),
                 expected_before_sha256: "a".repeat(64),
                 dry_run_token: "b".repeat(64),
-                experimental_disconnect_risk_acknowledged: true,
             },
             Some(&destination),
             Some(root.to_str().unwrap()),
@@ -1461,7 +1439,6 @@ mod eeprom_operation_tests {
                 request: request(),
                 expected_before_sha256: "a".repeat(64),
                 dry_run_token: "b".repeat(64),
-                experimental_disconnect_risk_acknowledged: true,
             },
             None,
             None,
@@ -1485,7 +1462,6 @@ mod eeprom_operation_tests {
                 request: request(),
                 expected_before_sha256: "a".repeat(64),
                 dry_run_token: "b".repeat(64),
-                experimental_disconnect_risk_acknowledged: true,
             },
             Some(&destination),
             Some(root.to_str().unwrap()),
@@ -1503,34 +1479,40 @@ mod eeprom_operation_tests {
         assert_eq!(audit["device_state_unknown"], true);
         fs::remove_dir_all(root).unwrap();
     }
-
     #[test]
-    fn worker_passes_captured_disconnect_risk_acknowledgement_unchanged() {
-        let (sender, receiver) = mpsc::channel();
-        let target = EepromProvisioningTarget {
-            service: Arc::new(RecordingEepromService { sender }),
-            snapshot_hash: SnapshotHash::digest_bytes(b"target"),
-            label: "root@camera.local:22 / i2c-7 @test".to_owned(),
-        };
+    fn failed_reconfiguration_drops_previous_eeprom_target() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.eeprom_target = Some(target(Err(EepromProvisionServiceError::Transport(
+            "unused fixture".to_owned(),
+        ))));
 
-        let _ = run_eeprom_operation(
-            target,
-            CalibrationProvisionIntent::Provision {
-                request: request(),
-                expected_before_sha256: "a".repeat(64),
-                dry_run_token: "b".repeat(64),
-                experimental_disconnect_risk_acknowledged: true,
-            },
-            None,
-            None,
-            45,
-            DumpCancellation::default(),
+        app.begin_eeprom_operation(
+            &context,
+            CalibrationProvisionIntent::ConfigureTarget(CalibrationEepromTargetRequest {
+                i2c_bus: 7,
+            }),
         );
-        assert!(
-            receiver
-                .recv()
-                .unwrap()
-                .experimental_disconnect_risk_acknowledged
+
+        assert!(app.eeprom_target.is_none());
+    }
+    #[test]
+    fn active_operation_rejects_target_reconfiguration_without_dropping_target() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.eeprom_target = Some(target(Err(EepromProvisionServiceError::Transport(
+            "unused fixture".to_owned(),
+        ))));
+        app.active_eeprom_cancellation = Some(DumpCancellation::default());
+
+        app.begin_eeprom_operation(
+            &context,
+            CalibrationProvisionIntent::ConfigureTarget(CalibrationEepromTargetRequest {
+                i2c_bus: 7,
+            }),
         );
+
+        assert!(app.eeprom_target.is_some());
+        assert!(app.active_eeprom_cancellation.is_some());
     }
 }

@@ -3,10 +3,9 @@
 use std::sync::Arc;
 
 use camera_toolbox_app::{
-    EEPROM_EXPERIMENTAL_PROVISION_WARNING, EEPROM_HELPER_SCHEMA_VERSION, EepromHelperAction,
-    EepromHelperOutput, EepromHelperRequest, EepromHelperResult, EepromHelperTarget,
-    EepromProvisionOperation, EepromProvisionService, EepromProvisionServiceError,
-    RemoteOperationControl,
+    EEPROM_HELPER_SCHEMA_VERSION, EepromHelperAction, EepromHelperOutput, EepromHelperRequest,
+    EepromHelperResult, EepromHelperTarget, EepromProvisionOperation, EepromProvisionService,
+    EepromProvisionServiceError, RemoteOperationControl,
 };
 use camera_toolbox_core::{YG_STEREO_P24C64G_IMAGE_BYTES, YG_STEREO_P24C64G_V1_MAP_ID};
 
@@ -17,11 +16,13 @@ use super::{
     },
 };
 
+/// 由目标板安装包提供的固定 helper；GUI 和 operation 均不能覆盖。
+pub const EEPROM_HELPER_PROGRAM: &str = "/usr/local/libexec/camera-toolbox-eeprom-helper";
+
 pub struct SshEepromProvisionService {
     service_id: String,
     target: SshConnectionTarget,
     credential_ref: String,
-    helper_program: String,
     output_limit: usize,
     helper_target: EepromHelperTarget,
     resolver: Arc<dyn CredentialResolver>,
@@ -35,7 +36,6 @@ impl SshEepromProvisionService {
         service_id: String,
         target: SshConnectionTarget,
         credential_ref: String,
-        helper_program: String,
         output_limit_bytes: u64,
         i2c_bus: u16,
         resolver: Arc<dyn CredentialResolver>,
@@ -55,11 +55,6 @@ impl SshEepromProvisionService {
                 "EEPROM SSH target host key is invalid: {error}"
             ))
         })?;
-        if !is_normalized_absolute_path(&helper_program) {
-            return Err(EepromProvisionServiceError::Protocol(
-                "EEPROM helper program must be a normalized absolute path".to_owned(),
-            ));
-        }
         if !(1_024..=1_048_576).contains(&output_limit_bytes) {
             return Err(EepromProvisionServiceError::Protocol(
                 "EEPROM helper output limit must be within 1024..=1048576".to_owned(),
@@ -74,7 +69,6 @@ impl SshEepromProvisionService {
             service_id,
             target,
             credential_ref,
-            helper_program,
             output_limit,
             helper_target: EepromHelperTarget {
                 map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
@@ -84,15 +78,6 @@ impl SshEepromProvisionService {
             transport,
         })
     }
-}
-
-fn is_normalized_absolute_path(path: &str) -> bool {
-    path.starts_with('/')
-        && path.len() > 1
-        && !path.ends_with('/')
-        && !path.contains("//")
-        && !path.contains(char::is_control)
-        && !path.split('/').any(|part| matches!(part, "." | ".."))
 }
 
 impl EepromProvisionService for SshEepromProvisionService {
@@ -115,13 +100,6 @@ impl EepromProvisionService for SshEepromProvisionService {
                 "operation timed out".to_owned(),
             ));
         }
-        if matches!(&request.action, EepromHelperAction::Provision { .. })
-            && !request.experimental_disconnect_risk_acknowledged
-        {
-            return Err(EepromProvisionServiceError::Protocol(format!(
-                "explicit experimental disconnect-risk acknowledgement is required: {EEPROM_EXPERIMENTAL_PROVISION_WARNING}"
-            )));
-        }
         let target = self.helper_target.clone();
         validate_action(&request.action, &target)?;
         let payload = serde_json::to_vec(&EepromHelperRequest {
@@ -141,7 +119,7 @@ impl EepromProvisionService for SshEepromProvisionService {
             .map_err(|error| EepromProvisionServiceError::Transport(error.to_string()))?;
         let output = session
             .execute_argv_with_stdin(
-                &[self.helper_program.clone(), "--json-stdin".to_owned()],
+                &[EEPROM_HELPER_PROGRAM.to_owned(), "--json-stdin".to_owned()],
                 &payload,
                 self.output_limit,
                 &control,
@@ -357,7 +335,6 @@ mod tests {
             "test-eeprom".to_owned(),
             target(Some(expected_host_key)),
             "slot:test".to_owned(),
-            "/usr/local/libexec/camera-toolbox-eeprom-helper".to_owned(),
             4096,
             7,
             resolver,
@@ -391,7 +368,6 @@ mod tests {
             .execute(
                 EepromProvisionOperation {
                     action: EepromHelperAction::Inspect,
-                    experimental_disconnect_risk_acknowledged: false,
                 },
                 control(),
             )
@@ -401,7 +377,7 @@ mod tests {
         assert_eq!(
             memory.captured_argv(),
             vec![vec![
-                "/usr/local/libexec/camera-toolbox-eeprom-helper".to_owned(),
+                EEPROM_HELPER_PROGRAM.to_owned(),
                 "--json-stdin".to_owned(),
             ]]
         );
@@ -423,7 +399,6 @@ mod tests {
             .execute(
                 EepromProvisionOperation {
                     action: EepromHelperAction::Inspect,
-                    experimental_disconnect_risk_acknowledged: false,
                 },
                 control(),
             )
@@ -498,41 +473,6 @@ mod tests {
     }
 
     #[test]
-    fn remote_provision_requires_explicit_disconnect_risk_acknowledgement() {
-        let memory = Arc::new(MemorySshTransport::new(PINNED_HOST_KEY));
-        let service = service(&memory, PINNED_HOST_KEY);
-        let request = EepromProvisionRequest {
-            map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
-            mode: EepromProvisioningMode::UpdateCalibration,
-            serial_number: "2T02D2567K0042".to_owned(),
-            overwrite_existing_serial: false,
-            segments: Vec::new(),
-        };
-
-        let error = service
-            .execute(
-                EepromProvisionOperation {
-                    action: EepromHelperAction::Provision {
-                        request,
-                        expected_before_sha256: "a".repeat(64),
-                        dry_run_token: "b".repeat(64),
-                    },
-                    experimental_disconnect_risk_acknowledged: false,
-                },
-                control(),
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            error,
-            EepromProvisionServiceError::Protocol(message)
-                if message.contains("explicit experimental disconnect-risk acknowledgement")
-        ));
-        assert!(memory.captured_argv().is_empty());
-        assert!(memory.captured_stdin().is_empty());
-    }
-
-    #[test]
     fn rejects_missing_or_invalid_host_key_before_any_transport_use() {
         let memory = Arc::new(MemorySshTransport::new(PINNED_HOST_KEY));
         let resolver: Arc<dyn CredentialResolver> = memory.clone();
@@ -543,7 +483,6 @@ mod tests {
                 "test-eeprom".to_owned(),
                 target(expected_host_key),
                 "slot:test".to_owned(),
-                "/usr/local/libexec/camera-toolbox-eeprom-helper".to_owned(),
                 4096,
                 7,
                 resolver.clone(),
