@@ -17,7 +17,13 @@ use opencv::prelude::*;
 const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 const DETECTOR_FLAGS: i32 =
     objdetect::CALIB_CB_ADAPTIVE_THRESH | objdetect::CALIB_CB_NORMALIZE_IMAGE;
-const SUBPIX_WINDOW: Size = Size::new(11, 11);
+const SUBPIX_MIN_HALF_WINDOW: i32 = 3;
+const SUBPIX_MAX_WINDOW: Size = Size::new(11, 11);
+const SUBPIX_MIN_GRID_SPACING: f32 = 12.0;
+const SUBPIX_WINDOW_TO_SPACING_RATIO: f32 = 0.25;
+const SUBPIX_NEAR_LIMIT_RATIO: f32 = 0.8;
+const SUBPIX_STABILITY_PERTURBATION: f32 = 0.25;
+const SUBPIX_STABILITY_TOLERANCE: f32 = 0.05;
 const SUBPIX_ZERO_ZONE: Size = Size::new(-1, -1);
 const SUBPIX_MAX_ITERATIONS: i32 = 100;
 const SUBPIX_EPSILON: f64 = 1e-4;
@@ -85,20 +91,16 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
                 image_size: actual_size,
             });
         }
-        let criteria = TermCriteria::new(
-            core::TermCriteria_EPS | core::TermCriteria_COUNT,
-            SUBPIX_MAX_ITERATIONS,
-            SUBPIX_EPSILON,
-        )
-        .map_err(|error| cv_error("TermCriteria(subpixel)", &error))?;
-        imgproc::corner_sub_pix(
-            &gray,
-            &mut corners,
-            SUBPIX_WINDOW,
-            SUBPIX_ZERO_ZONE,
-            criteria,
-        )
-        .map_err(|error| cv_error("cornerSubPix", &error))?;
+        let refinement = refine_detected_corners(&gray, &mut corners, board, cancellation)?;
+        debug_assert!(
+            refinement.final_window.is_none() || refinement.preferred_window.is_some(),
+            "a final subpixel window requires a preferred window"
+        );
+        if !refinement.accepted {
+            return Ok(ChessboardDetectionOutcome::NotFound {
+                image_size: actual_size,
+            });
+        }
         checkpoint(cancellation)?;
 
         let detection = ChessboardDetection {
@@ -231,6 +233,232 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
         solution.validate_against(request)?;
         Ok(solution)
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SubpixelRefinementReport {
+    accepted: bool,
+    preferred_window: Option<Size>,
+    final_window: Option<Size>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct SubpixelRefinementStats {
+    unchanged_indices: Vec<usize>,
+    near_limit_count: usize,
+}
+
+/// 由棋盘拓扑相邻点的低分位间距选择逐帧半窗口，避免远侧压缩区域混入相邻角点。
+#[allow(clippy::cast_possible_truncation)] // 缩放值已在 3..=11 内取整并限幅。
+fn adaptive_subpixel_window(initial: &[Point2f], board: BoardSpec) -> Option<Size> {
+    let rows = usize::from(board.inner_rows);
+    let columns = usize::from(board.inner_cols);
+    if initial.len() != rows.checked_mul(columns)? {
+        return None;
+    }
+
+    let horizontal_count = rows.checked_mul(columns.checked_sub(1)?)?;
+    let vertical_count = rows.checked_sub(1)?.checked_mul(columns)?;
+    let mut squared_spacings = Vec::with_capacity(horizontal_count.checked_add(vertical_count)?);
+    let mut collect_spacing = |first: Point2f, second: Point2f| {
+        let dx = second.x - first.x;
+        let dy = second.y - first.y;
+        let squared = dx.mul_add(dx, dy * dy);
+        if squared.is_finite() && squared > 0.0 {
+            squared_spacings.push(squared);
+        }
+    };
+    for row in 0..rows {
+        let row_start = row * columns;
+        for column in 0..columns - 1 {
+            collect_spacing(initial[row_start + column], initial[row_start + column + 1]);
+        }
+    }
+    for row in 0..rows - 1 {
+        let row_start = row * columns;
+        let next_row_start = row_start + columns;
+        for column in 0..columns {
+            collect_spacing(
+                initial[row_start + column],
+                initial[next_row_start + column],
+            );
+        }
+    }
+    if squared_spacings.is_empty() {
+        return None;
+    }
+
+    squared_spacings.sort_unstable_by(f32::total_cmp);
+    let lower_decile_index = (squared_spacings.len() - 1) / 10;
+    let lower_decile_spacing = squared_spacings[lower_decile_index].sqrt();
+    if lower_decile_spacing < SUBPIX_MIN_GRID_SPACING {
+        return None;
+    }
+    let half_window = (lower_decile_spacing * SUBPIX_WINDOW_TO_SPACING_RATIO)
+        .round()
+        .clamp(
+            SUBPIX_MIN_HALF_WINDOW as f32,
+            SUBPIX_MAX_WINDOW.width as f32,
+        ) as i32;
+    Some(Size::new(half_window, half_window))
+}
+
+#[allow(clippy::cast_precision_loss)] // 半窗口固定在 3..=11，转换不会损失有效精度。
+fn subpixel_refinement_stats(
+    initial: &[Point2f],
+    refined: &[Point2f],
+    window: Size,
+) -> Option<SubpixelRefinementStats> {
+    if initial.len() != refined.len() {
+        return None;
+    }
+    let near_limit_x = SUBPIX_NEAR_LIMIT_RATIO * window.width as f32;
+    let near_limit_y = SUBPIX_NEAR_LIMIT_RATIO * window.height as f32;
+    let mut unchanged_indices = Vec::new();
+    let mut near_limit_count = 0;
+    for (index, (initial, refined)) in initial.iter().zip(refined).enumerate() {
+        if initial.x.to_bits() == refined.x.to_bits() && initial.y.to_bits() == refined.y.to_bits()
+        {
+            unchanged_indices.push(index);
+        }
+        let dx = (refined.x - initial.x).abs();
+        let dy = (refined.y - initial.y).abs();
+        near_limit_count += usize::from(dx >= near_limit_x || dy >= near_limit_y);
+    }
+    Some(SubpixelRefinementStats {
+        unchanged_indices,
+        near_limit_count,
+    })
+}
+
+fn corner_sub_pix_with_window(
+    gray: &Mat,
+    corners: &mut Vector<Point2f>,
+    window: Size,
+) -> Result<(), CalibrationBackendError> {
+    let criteria = TermCriteria::new(
+        core::TermCriteria_EPS | core::TermCriteria_COUNT,
+        SUBPIX_MAX_ITERATIONS,
+        SUBPIX_EPSILON,
+    )
+    .map_err(|error| cv_error("TermCriteria(subpixel)", &error))?;
+    imgproc::corner_sub_pix(gray, corners, window, SUBPIX_ZERO_ZONE, criteria)
+        .map_err(|error| cv_error("cornerSubPix", &error))
+}
+
+/// 从小扰动重新收敛到同一点，才能把“未移动”视为初值已处于稳定最优点。
+#[allow(clippy::cast_precision_loss)] // OpenCV 图像尺寸转换仅用于 0.25 px 的内向扰动。
+fn unchanged_points_are_stable(
+    gray: &Mat,
+    refined: &[Point2f],
+    unchanged_indices: &[usize],
+    window: Size,
+    cancellation: &CalibrationCancellation,
+) -> Result<bool, CalibrationBackendError> {
+    if unchanged_indices.is_empty() {
+        return Ok(true);
+    }
+
+    let center_x = gray.cols() as f32 * 0.5;
+    let center_y = gray.rows() as f32 * 0.5;
+    let mut stability_probe = Vector::from_iter(unchanged_indices.iter().map(|&index| {
+        let point = refined[index];
+        let dx = if point.x < center_x {
+            SUBPIX_STABILITY_PERTURBATION
+        } else {
+            -SUBPIX_STABILITY_PERTURBATION
+        };
+        let dy = if point.y < center_y {
+            SUBPIX_STABILITY_PERTURBATION
+        } else {
+            -SUBPIX_STABILITY_PERTURBATION
+        };
+        Point2f::new(point.x + dx, point.y + dy)
+    }));
+    corner_sub_pix_with_window(gray, &mut stability_probe, window)?;
+    checkpoint(cancellation)?;
+
+    Ok(stability_probe
+        .to_vec()
+        .iter()
+        .zip(unchanged_indices)
+        .all(|(probe, &index)| {
+            let reference = refined[index];
+            (probe.x - reference.x).abs() <= SUBPIX_STABILITY_TOLERANCE
+                && (probe.y - reference.y).abs() <= SUBPIX_STABILITY_TOLERANCE
+        }))
+}
+
+fn subpixel_pass_is_stable(
+    gray: &Mat,
+    refined: &[Point2f],
+    stats: &SubpixelRefinementStats,
+    window: Size,
+    cancellation: &CalibrationCancellation,
+) -> Result<bool, CalibrationBackendError> {
+    if stats.near_limit_count > 0 {
+        return Ok(false);
+    }
+    unchanged_points_are_stable(
+        gray,
+        refined,
+        &stats.unchanged_indices,
+        window,
+        cancellation,
+    )
+}
+
+/// 防止动态小窗口触发 OpenCV 静默回退，同时保留可稳定复现的首选窗口。
+fn refine_detected_corners(
+    gray: &Mat,
+    corners: &mut Vector<Point2f>,
+    board: BoardSpec,
+    cancellation: &CalibrationCancellation,
+) -> Result<SubpixelRefinementReport, CalibrationBackendError> {
+    let initial = corners.to_vec();
+    let Some(preferred_window) = adaptive_subpixel_window(&initial, board) else {
+        return Ok(SubpixelRefinementReport {
+            accepted: false,
+            preferred_window: None,
+            final_window: None,
+        });
+    };
+
+    let mut final_window = preferred_window;
+    corner_sub_pix_with_window(gray, corners, final_window)?;
+    checkpoint(cancellation)?;
+    let mut refined = corners.to_vec();
+    let Some(mut stats) = subpixel_refinement_stats(&initial, &refined, final_window) else {
+        return Ok(SubpixelRefinementReport {
+            accepted: false,
+            preferred_window: Some(preferred_window),
+            final_window: Some(final_window),
+        });
+    };
+    let mut accepted = subpixel_pass_is_stable(gray, &refined, &stats, final_window, cancellation)?;
+
+    if !accepted && final_window != SUBPIX_MAX_WINDOW {
+        *corners = Vector::from_iter(initial.iter().copied());
+        final_window = SUBPIX_MAX_WINDOW;
+        corner_sub_pix_with_window(gray, corners, final_window)?;
+        checkpoint(cancellation)?;
+        refined = corners.to_vec();
+        let Some(retry_stats) = subpixel_refinement_stats(&initial, &refined, final_window) else {
+            return Ok(SubpixelRefinementReport {
+                accepted: false,
+                preferred_window: Some(preferred_window),
+                final_window: Some(final_window),
+            });
+        };
+        stats = retry_stats;
+        accepted = subpixel_pass_is_stable(gray, &refined, &stats, final_window, cancellation)?;
+    }
+
+    Ok(SubpixelRefinementReport {
+        accepted,
+        preferred_window: Some(preferred_window),
+        final_window: Some(final_window),
+    })
 }
 
 fn checkpoint(cancellation: &CalibrationCancellation) -> Result<(), CalibrationBackendError> {
@@ -368,12 +596,137 @@ mod tests {
     }
 
     #[test]
-    fn pangbot_implicit_detector_parameters_are_locked() {
+    fn subpixel_refinement_parameters_are_locked() {
         assert_eq!(DETECTOR_FLAGS, 3);
-        assert_eq!(SUBPIX_WINDOW, Size::new(11, 11));
+        assert_eq!(SUBPIX_MIN_HALF_WINDOW, 3);
+        assert_eq!(SUBPIX_MAX_WINDOW, Size::new(11, 11));
+        assert_eq!(SUBPIX_MIN_GRID_SPACING, 12.0);
+        assert_eq!(SUBPIX_WINDOW_TO_SPACING_RATIO, 0.25);
+        assert_eq!(SUBPIX_NEAR_LIMIT_RATIO, 0.8);
+        assert_eq!(SUBPIX_STABILITY_PERTURBATION, 0.25);
+        assert_eq!(SUBPIX_STABILITY_TOLERANCE, 0.05);
         assert_eq!(SUBPIX_ZERO_ZONE, Size::new(-1, -1));
         assert_eq!(SUBPIX_MAX_ITERATIONS, 100);
         assert_eq!(SUBPIX_EPSILON, 1e-4);
+    }
+
+    #[test]
+    fn adaptive_subpixel_window_uses_lower_decile_and_bounds() {
+        let board = BoardSpec::new(4, 3, 20.0).unwrap();
+        let compressed = grid_points(&[0.0, 20.0, 60.0, 100.0], &[0.0, 40.0, 80.0]);
+        assert_eq!(
+            adaptive_subpixel_window(&compressed, board),
+            Some(Size::new(5, 5))
+        );
+
+        let nominal = grid_points(&[0.0, 40.0, 80.0, 120.0], &[0.0, 40.0, 80.0]);
+        assert_eq!(
+            adaptive_subpixel_window(&nominal, board),
+            Some(Size::new(10, 10))
+        );
+
+        let large = grid_points(&[0.0, 80.0, 160.0, 240.0], &[0.0, 80.0, 160.0]);
+        assert_eq!(
+            adaptive_subpixel_window(&large, board),
+            Some(Size::new(11, 11))
+        );
+
+        let undersampled = grid_points(&[0.0, 11.0, 22.0, 33.0], &[0.0, 11.0, 22.0]);
+        assert_eq!(adaptive_subpixel_window(&undersampled, board), None);
+    }
+
+    #[test]
+    fn subpixel_stats_detect_unchanged_and_near_limit_points() {
+        let initial = [
+            Point2f::new(1.0, 1.0),
+            Point2f::new(10.0, 10.0),
+            Point2f::new(20.0, 20.0),
+        ];
+        let refined = [
+            initial[0],
+            Point2f::new(17.9, 10.0),
+            Point2f::new(28.0, 20.0),
+        ];
+        let stats = subpixel_refinement_stats(&initial, &refined, Size::new(10, 10)).unwrap();
+        assert_eq!(stats.unchanged_indices, vec![0]);
+        assert_eq!(stats.near_limit_count, 1);
+        assert!(stats.near_limit_count > 0);
+    }
+
+    #[test]
+    fn blank_image_rejects_unstable_unchanged_refinement() {
+        let gray = Mat::zeros(240, 320, core::CV_8UC1)
+            .unwrap()
+            .to_mat()
+            .unwrap();
+        let board = BoardSpec::new(4, 3, 20.0).unwrap();
+        let mut corners = Vector::from_iter(grid_points(
+            &[40.0, 80.0, 120.0, 160.0],
+            &[40.0, 80.0, 120.0],
+        ));
+        let report = refine_detected_corners(
+            &gray,
+            &mut corners,
+            board,
+            &CalibrationCancellation::default(),
+        )
+        .unwrap();
+        assert!(!report.accepted);
+        assert_eq!(report.preferred_window, Some(Size::new(10, 10)));
+        assert_eq!(report.final_window, Some(Size::new(11, 11)));
+    }
+
+    #[test]
+    fn synthetic_checkerboard_retains_preferred_window_across_scales() {
+        let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/data/chessboard_11x8_clean.png");
+        let source =
+            imgcodecs::imread(fixture_path.to_str().unwrap(), imgcodecs::IMREAD_GRAYSCALE).unwrap();
+        let board = BoardSpec::new(11, 8, 20.0).unwrap();
+        let cases = [
+            (Size::new(320, 240), Size::new(5, 5)),
+            (Size::new(640, 480), Size::new(10, 10)),
+            (Size::new(1280, 960), Size::new(11, 11)),
+        ];
+
+        for (image_size, expected_window) in cases {
+            let mut gray = Mat::default();
+            imgproc::resize(
+                &source,
+                &mut gray,
+                image_size,
+                0.0,
+                0.0,
+                imgproc::INTER_LINEAR,
+            )
+            .unwrap();
+            let mut corners = Vector::<Point2f>::new();
+            let found = objdetect::find_chessboard_corners(
+                &gray,
+                Size::new(11, 8),
+                &mut corners,
+                DETECTOR_FLAGS,
+            )
+            .unwrap();
+            assert!(found, "checkerboard not found at {image_size:?}");
+
+            let report = refine_detected_corners(
+                &gray,
+                &mut corners,
+                board,
+                &CalibrationCancellation::default(),
+            )
+            .unwrap();
+            assert!(report.accepted, "unstable refinement at {image_size:?}");
+            assert_eq!(report.preferred_window, Some(expected_window));
+            assert_eq!(report.final_window, Some(expected_window));
+        }
+    }
+
+    fn grid_points(xs: &[f32], ys: &[f32]) -> Vec<Point2f> {
+        ys.iter()
+            .flat_map(|&y| xs.iter().map(move |&x| Point2f::new(x, y)))
+            .collect()
     }
 
     #[test]
@@ -396,7 +749,7 @@ mod tests {
         ));
     }
     #[test]
-    fn encoded_png_matches_pangbot_imread_pixel_and_corner_chain() {
+    fn clean_png_preserves_reference_pixel_and_corner_output() {
         let fixture_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/data/chessboard_11x8_clean.png");
         let encoded = include_bytes!("../tests/data/chessboard_11x8_clean.png");
