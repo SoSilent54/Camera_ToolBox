@@ -84,7 +84,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl file make nasm pkg-config python3 xz-utils
+            build-essential ca-certificates curl file make nasm patchelf pkg-config python3 xz-utils
       - name: Build, package, and smoke FFmpeg
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -99,10 +99,16 @@ jobs:
           echo "${FFMPEG_SOURCE_SHA256}  $scratch/source.tar.xz" | sha256sum --check --strict
           tar -C "$scratch" -xf "$scratch/source.tar.xz"
           cd "$scratch/ffmpeg-${FFMPEG_VERSION}"
+          configure_options=()
+          # Ubuntu 20.04 自带的 NASM 无法汇编 FFmpeg 8.1 的 x86 swscale 宏；禁用 x86 汇编以保持受控源码构建可复现。
+          if [[ "$PLATFORM" == "linux-x86_64-ubuntu20" ]]; then
+            configure_options+=(--disable-x86asm)
+          fi
           ./configure --prefix="$prefix" --disable-autodetect --disable-debug --disable-doc \
             --disable-programs --disable-static --enable-shared --enable-small \
             --enable-protocol=rtp,tcp,udp --enable-demuxer=rtsp \
-            --enable-decoder=h264,hevc --enable-parser=h264,hevc --enable-swscale
+            --enable-decoder=h264,hevc --enable-parser=h264,hevc --enable-swscale \
+            "${configure_options[@]}"
           make -j"$(nproc)"
           make install
           runtime="$prefix/lib"
@@ -113,6 +119,8 @@ jobs:
           mkdir -p "$stage/runtime" "$stage/licenses"
           cp -aL "$prefix/include" "$prefix/lib" "$stage/"
           cp -aL "$runtime"/libav*.so* "$runtime"/libswscale*.so* "$runtime"/libswresample*.so* "$stage/runtime/"
+          # RUNPATH 只对直接依赖生效；每个 FFmpeg 共享库都必须从同目录解析其传递依赖。
+          find "$stage/runtime" -type f -name 'lib*.so*' -exec patchelf --set-rpath '$ORIGIN' {} +
           cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
           printf 'ffmpeg_version=%s\nffmpeg_commit=%s\nsource_sha256=%s\nrecipe_revision=%s\n' \
             "$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$FFMPEG_SOURCE_SHA256" "$REVISION" > "$stage/MANIFEST"
@@ -228,6 +236,12 @@ jobs:
           scratch="$RUNNER_TEMP/ffmpeg-$platform_id"
           prefix="$scratch/prefix"
           mkdir -p "$scratch" "$GITHUB_WORKSPACE/dist"
+          : "${VCToolsInstallDir:?MSVC environment was not initialized}"
+          msvc_bin="$(cygpath -u "$VCToolsInstallDir")/bin/Hostx64/x64"
+          test -x "$msvc_bin/cl.exe"
+          test -x "$msvc_bin/link.exe"
+          # setup-msys2 把 /usr/bin 放在 PATH 首位；在 MSYS shell 内重新置顶 MSVC 工具目录。
+          export PATH="$msvc_bin:$PATH"
           cl_path="$(command -v cl)"
           link_path="$(command -v link.exe)"
           test -n "$cl_path"
