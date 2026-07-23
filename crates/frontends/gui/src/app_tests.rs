@@ -1636,3 +1636,35 @@ mod eeprom_operation_tests {
         assert!(app.active_eeprom_cancellation.is_some());
     }
 }
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn live_overlay_maps_pixel_centers_and_rejects_out_of_bounds_points() {
+    let image_rect = egui::Rect::from_min_size(egui::pos2(10.0, 20.0), egui::vec2(200.0, 100.0));
+    let image_size = camera_toolbox_core::CalibrationImageSize::new(2, 2).unwrap();
+
+    assert_eq!(
+        CameraToolboxApp::live_overlay_point(
+            camera_toolbox_core::CalibrationPoint::new(0.0, 0.0),
+            image_size,
+            image_rect,
+        ),
+        Some(egui::pos2(60.0, 45.0))
+    );
+    assert_eq!(
+        CameraToolboxApp::live_overlay_point(
+            camera_toolbox_core::CalibrationPoint::new(1.0, 1.0),
+            image_size,
+            image_rect,
+        ),
+        Some(egui::pos2(160.0, 95.0))
+    );
+    assert_eq!(
+        CameraToolboxApp::live_overlay_point(
+            camera_toolbox_core::CalibrationPoint::new(-1.0, 0.0),
+            image_size,
+            image_rect,
+        ),
+        None
+    );
+}

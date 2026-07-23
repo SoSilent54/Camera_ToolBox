@@ -15,17 +15,19 @@ use std::{
 
 use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
-    AddCalibrationItemOutcome, CalibrationBackend, CalibrationCancellation, CalibrationEncodedPng,
-    CalibrationInputKey, CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus,
-    CalibrationJobToken, CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame,
-    EepromDryRunResult, EepromInspectResult, EepromWriteResult, EntryName, ExportDestination,
-    ExportReceipt, ExportService, FileSourceId, FileSystem, FileSystemError, FsCancellation,
-    FsControl, OperationId, RasterImageCodec, SnapshotHash, StreamCaptureId, StreamFrameIdentity,
+    AddCalibrationItemOutcome, AutoCandidateCommit, AutoCandidateId, AutoCandidateToken,
+    CalibrationBackend, CalibrationCancellation, CalibrationEncodedPng, CalibrationInputKey,
+    CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
+    CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EepromDryRunResult,
+    EepromInspectResult, EepromWriteResult, EntryName, ExportDestination, ExportReceipt,
+    ExportService, FileSourceId, FileSystem, FileSystemError, FsCancellation, FsControl,
+    OperationId, RasterImageCodec, SnapshotHash, StreamCaptureId, StreamFrameIdentity,
+    StreamSessionId, host_monotonic_time_ns,
 };
 use camera_toolbox_core::{
     AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
-    CaptureMetadata, EphemeralAsset, FullEepromImage, InitialIntrinsics, IntegrityState,
-    MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult,
+    CaptureMetadata, ChessboardDetection, EphemeralAsset, FullEepromImage, InitialIntrinsics,
+    IntegrityState, MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult,
     write_opencv_pinhole_radtan_yaml,
 };
 use eframe::egui;
@@ -34,15 +36,19 @@ use egui_extras::{Column, TableBuilder};
 use crate::calibration_eeprom::{CalibrationEepromState, CalibrationProvisionIntent};
 use crate::calibration_pipeline::{
     CalibrationDetectionPipeline, DetectionProduct, DetectionStageEvent, DetectionStageResult,
-    LoadedDetectionJob, MAX_ENCODED_PNG_BYTES, MAX_INFLIGHT_ENCODED_BYTES, ReadJob, ReadSource,
-    ReadStageEvent, ReadStageResult,
+    EncodedDetectionRequest, LoadedDetectionJob, MAX_ENCODED_PNG_BYTES, MAX_INFLIGHT_ENCODED_BYTES,
+    PipelineStageError, ReadJob, ReadSource, ReadStageEvent, ReadStageResult,
 };
 use crate::{explorer::CalibrationImportCandidate, viewer::pixel_inspection_texture_options};
 
 const MAX_DATASET_ITEMS: usize = 256;
 const REMOTE_READS_PER_SOURCE: usize = 8;
+const AUTO_CAPTURE_ANALYSIS_INTERVAL_NS: u64 = 200_000_000;
+const AUTO_CAPTURE_ACCEPT_COOLDOWN_NS: u64 = 750_000_000;
 const COVERAGE_WIDTH: usize = 192;
 const COVERAGE_GAUSSIAN_SIGMA: f32 = 42.0 / 1920.0 * COVERAGE_WIDTH as f32;
+pub(crate) const VIEWER_COVERAGE_COLUMNS: usize = 48;
+pub(crate) const VIEWER_COVERAGE_ROWS: usize = 36;
 const MIN_PREVIEW_ZOOM: f32 = 0.05;
 const MAX_PREVIEW_ZOOM: f32 = 64.0;
 const OBSERVED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 230, 140);
@@ -217,6 +223,98 @@ impl Drop for StreamCalibrationSource {
     }
 }
 
+struct FrozenStreamInput {
+    source: CalibrationSource,
+    encoded: CalibrationEncodedPng,
+}
+
+fn freeze_stream_input(
+    frame: &Arc<DecodedVideoFrame>,
+    store: CaptureStore,
+) -> Result<FrozenStreamInput, String> {
+    let rgba = Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba))
+        .map_err(|error| format!("Cannot freeze displayed stream frame: {error}"))?;
+    let image_size = CalibrationImageSize::new(frame.width, frame.height)
+        .map_err(|error| format!("Cannot capture displayed stream frame: {error}"))?;
+    let mut encoded = Vec::new();
+    ImageRasterCodec
+        .encode_png(&rgba, &mut encoded)
+        .map_err(|error| format!("Cannot encode displayed stream frame as PNG: {error}"))?;
+    if encoded.len() > MAX_ENCODED_PNG_BYTES as usize {
+        return Err(format!(
+            "Encoded stream frame is {} bytes, limit is {} bytes.",
+            encoded.len(),
+            MAX_ENCODED_PNG_BYTES
+        ));
+    }
+
+    let content_sha256 = SnapshotHash::digest_bytes(&encoded).to_hex();
+    let asset_id = AssetId::new(format!(
+        "calibration-stream-{}-{}-{}-{content_sha256}",
+        frame.identity.stream_id.as_str(),
+        frame.identity.channel,
+        frame.identity.frame_sequence,
+    ))
+    .map_err(|error| format!("Cannot identify captured stream frame: {error}"))?;
+    let operation_id = OperationId::new(format!("capture-{}", asset_id.as_str()))
+        .map_err(|error| format!("Cannot reserve captured stream frame: {error}"))?;
+    let bytes: Arc<[u8]> = Arc::from(encoded);
+    let reservation = store
+        .reserve(operation_id, bytes.len())
+        .map_err(|error| format!("Cannot reserve memory for captured stream frame: {error}"))?;
+    let mut attributes = BTreeMap::new();
+    attributes.insert(
+        "stream_id".to_owned(),
+        frame.identity.stream_id.as_str().to_owned(),
+    );
+    attributes.insert("channel".to_owned(), frame.identity.channel.to_string());
+    attributes.insert(
+        "frame_sequence".to_owned(),
+        frame.identity.frame_sequence.to_string(),
+    );
+    attributes.insert(
+        "host_monotonic_time_ns".to_owned(),
+        frame.identity.host_monotonic_time_ns.to_string(),
+    );
+    attributes.insert(
+        "source_pts".to_owned(),
+        format!("{:?}", frame.identity.source_pts),
+    );
+    attributes.insert("width".to_owned(), frame.width.to_string());
+    attributes.insert("height".to_owned(), frame.height.to_string());
+    let asset = EphemeralAsset::new(
+        asset_id,
+        OwnedMediaPayload::Bytes(Arc::clone(&bytes)),
+        CaptureMetadata {
+            format: MediaFormat::Png,
+            source_name: format!(
+                "RTSP ch{} frame {}",
+                frame.identity.channel, frame.identity.frame_sequence
+            ),
+            attributes,
+        },
+        IntegrityState::Verified {
+            algorithm: "sha256".to_owned(),
+            digest: content_sha256.clone(),
+        },
+    );
+    let asset = store
+        .publish_validated(reservation, asset)
+        .map_err(|error| format!("Cannot publish captured stream frame: {error}"))?;
+    let source_revision = CalibrationInputRevision::EphemeralPng {
+        content_sha256,
+        encoded_bytes: asset.byte_len().unwrap_or_default() as u64,
+    };
+    Ok(FrozenStreamInput {
+        source: CalibrationSource::stream(store, asset, frame.identity.clone(), image_size),
+        encoded: CalibrationEncodedPng {
+            bytes,
+            image_size,
+            source_revision,
+        },
+    })
+}
+
 struct CalibrationPreview {
     frame: Arc<Rgba8Frame>,
     texture: egui::TextureHandle,
@@ -314,6 +412,32 @@ struct CoverageVisualization {
     enabled_views: usize,
 }
 
+#[derive(Clone)]
+struct IdentityBoundDetection {
+    identity: StreamFrameIdentity,
+    detection: ChessboardDetection,
+}
+
+#[derive(Clone)]
+pub(crate) struct ViewerDetectionOverlay {
+    pub(crate) image_size: CalibrationImageSize,
+    pub(crate) corners: Vec<CalibrationPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewerCoverageCell {
+    pub(crate) column: usize,
+    pub(crate) row: usize,
+    pub(crate) density: f32,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct CalibrationViewerOverlay {
+    pub(crate) detection: Option<ViewerDetectionOverlay>,
+    pub(crate) coverage: Vec<ViewerCoverageCell>,
+    pub(crate) coverage_views: usize,
+}
+
 struct ActiveCancellation {
     token: CalibrationJobToken,
     file_system: FsCancellation,
@@ -336,6 +460,36 @@ struct DetectionBatch {
     terminal_status: Option<String>,
     cancellations: HashMap<CalibrationItemId, ActiveCancellation>,
     active_remote_sources: HashMap<FileSourceId, usize>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCandidateState {
+    Queued,
+    Submitted,
+    Detecting,
+}
+
+struct PendingCandidate {
+    token: AutoCandidateToken,
+    source: CalibrationSource,
+    encoded: Option<CalibrationEncodedPng>,
+    cancellation: CalibrationCancellation,
+    state: AutoCandidateState,
+}
+
+#[derive(Default)]
+struct AutoCaptureSession {
+    pending: Option<PendingCandidate>,
+    last_observed: Option<StreamCaptureId>,
+    last_observed_at_ns: u64,
+    latest_detection: Option<IdentityBoundDetection>,
+    last_accepted_at_ns: u64,
+    next_candidate_id: u64,
+}
+
+enum CandidateTerminal {
+    Detection(Result<DetectionProduct, PipelineStageError>),
+    Discard(String),
 }
 
 enum WorkerCommand {
@@ -411,11 +565,12 @@ pub(crate) struct CalibrationWorkspace {
     worker: CalibrationWorker,
     detection_pipeline: CalibrationDetectionPipeline,
     pending_reads: VecDeque<ReadJob>,
-    pending_loaded: VecDeque<LoadedDetectionJob>,
+    pending_dataset_loaded: VecDeque<LoadedDetectionJob>,
     pending_imports: VecDeque<CalibrationImportCandidate>,
     active_job: Option<CalibrationJobKind>,
     active_detection_batch: Option<DetectionBatch>,
     calibration_cancellation: Option<CalibrationCancellation>,
+    auto_capture: AutoCaptureSession,
     next_detection_batch_id: u64,
     status: String,
     serial_number: String,
@@ -445,7 +600,7 @@ impl CalibrationWorkspace {
             worker: CalibrationWorker::new(context)?,
             detection_pipeline: CalibrationDetectionPipeline::new(context)?,
             pending_reads: VecDeque::new(),
-            pending_loaded: VecDeque::new(),
+            pending_dataset_loaded: VecDeque::new(),
             pending_imports: VecDeque::new(),
             active_job: None,
             active_detection_batch: None,
@@ -468,6 +623,10 @@ impl CalibrationWorkspace {
             coverage: None,
             coverage_dirty: true,
             auto_capture_enabled: false,
+            auto_capture: AutoCaptureSession {
+                next_candidate_id: 1,
+                ..AutoCaptureSession::default()
+            },
         })
     }
 
@@ -566,8 +725,7 @@ impl CalibrationWorkspace {
             return;
         }
 
-        let capture_id = StreamCaptureId::from(&frame.identity);
-        let input = CalibrationInputKey::StreamCapture(capture_id);
+        let input = CalibrationInputKey::StreamCapture(StreamCaptureId::from(&frame.identity));
         if let Some(existing_id) = self
             .session
             .items()
@@ -580,138 +738,276 @@ impl CalibrationWorkspace {
                 "This displayed stream frame is already in the calibration dataset.".to_owned();
             return;
         }
-
-        let rgba = match Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba)) {
-            Ok(rgba) => rgba,
-            Err(error) => {
-                self.status = format!("Cannot freeze displayed stream frame: {error}");
-                return;
-            }
-        };
-        let image_size = match CalibrationImageSize::new(frame.width, frame.height) {
-            Ok(image_size) => image_size,
-            Err(error) => {
-                self.status = format!("Cannot capture displayed stream frame: {error}");
-                return;
-            }
-        };
-        let mut encoded = Vec::new();
-        if let Err(error) = ImageRasterCodec.encode_png(&rgba, &mut encoded) {
-            self.status = format!("Cannot encode displayed stream frame as PNG: {error}");
-            return;
-        }
-        if encoded.len() > MAX_ENCODED_PNG_BYTES as usize {
-            self.status = format!(
-                "Encoded stream frame is {} bytes, limit is {} bytes.",
-                encoded.len(),
-                MAX_ENCODED_PNG_BYTES
-            );
+        if self
+            .auto_capture
+            .pending
+            .as_ref()
+            .is_some_and(|candidate| candidate.token.frame_identity() == &frame.identity)
+        {
+            self.status =
+                "This displayed stream frame is already an automatic candidate.".to_owned();
             return;
         }
 
-        let content_sha256 = SnapshotHash::digest_bytes(&encoded).to_hex();
-        let asset_id = match AssetId::new(format!(
-            "calibration-stream-{}-{}-{}-{content_sha256}",
-            frame.identity.stream_id.as_str(),
-            frame.identity.channel,
-            frame.identity.frame_sequence,
-        )) {
-            Ok(asset_id) => asset_id,
+        let FrozenStreamInput { source, encoded } = match freeze_stream_input(&frame, store) {
+            Ok(frozen) => frozen,
             Err(error) => {
-                self.status = format!("Cannot identify captured stream frame: {error}");
+                self.status = error;
                 return;
             }
         };
-        let operation_id = match OperationId::new(format!("capture-{}", asset_id.as_str())) {
-            Ok(operation_id) => operation_id,
-            Err(error) => {
-                self.status = format!("Cannot reserve captured stream frame: {error}");
-                return;
-            }
-        };
-        let bytes: Arc<[u8]> = Arc::from(encoded);
-        let reservation = match store.reserve(operation_id, bytes.len()) {
-            Ok(reservation) => reservation,
-            Err(error) => {
-                self.status = format!("Cannot reserve memory for captured stream frame: {error}");
-                return;
-            }
-        };
-        let mut attributes = BTreeMap::new();
-        attributes.insert(
-            "stream_id".to_owned(),
-            frame.identity.stream_id.as_str().to_owned(),
+        let outcome = self.session.add_or_refresh(
+            input,
+            encoded.source_revision,
+            source.display_name.clone(),
         );
-        attributes.insert("channel".to_owned(), frame.identity.channel.to_string());
-        attributes.insert(
-            "frame_sequence".to_owned(),
-            frame.identity.frame_sequence.to_string(),
-        );
-        attributes.insert(
-            "host_monotonic_time_ns".to_owned(),
-            frame.identity.host_monotonic_time_ns.to_string(),
-        );
-        attributes.insert(
-            "source_pts".to_owned(),
-            format!("{:?}", frame.identity.source_pts),
-        );
-        attributes.insert("width".to_owned(), frame.width.to_string());
-        attributes.insert("height".to_owned(), frame.height.to_string());
-        let asset = EphemeralAsset::new(
-            asset_id,
-            OwnedMediaPayload::Bytes(bytes),
-            CaptureMetadata {
-                format: MediaFormat::Png,
-                source_name: format!(
-                    "RTSP ch{} frame {}",
-                    frame.identity.channel, frame.identity.frame_sequence
-                ),
-                attributes,
-            },
-            IntegrityState::Verified {
-                algorithm: "sha256".to_owned(),
-                digest: content_sha256.clone(),
-            },
-        );
-        let asset = match store.publish_validated(reservation, asset) {
-            Ok(asset) => asset,
-            Err(error) => {
-                self.status = format!("Cannot publish captured stream frame: {error}");
-                return;
-            }
-        };
-        let revision = CalibrationInputRevision::EphemeralPng {
-            content_sha256,
-            encoded_bytes: asset.byte_len().unwrap_or_default() as u64,
-        };
-        let display_name = format!(
-            "RTSP ch{} frame {}",
-            frame.identity.channel, frame.identity.frame_sequence
-        );
-        let outcome = self.session.add_or_refresh(input, revision, display_name);
         let id = match outcome {
             AddCalibrationItemOutcome::Added(id) | AddCalibrationItemOutcome::SourceChanged(id) => {
                 id
             }
             AddCalibrationItemOutcome::AlreadyPresent(id) => {
-                let asset_id = asset.id.clone();
-                drop(asset);
-                let _ = store.release(&asset_id);
                 let _ = self.session.set_selected(id);
                 self.status =
                     "This displayed stream frame is already in the calibration dataset.".to_owned();
                 return;
             }
         };
-        self.sources.insert(
-            id,
-            CalibrationSource::stream(store, asset, frame.identity.clone(), image_size),
-        );
+        self.sources.insert(id, source);
         let _ = self.session.set_selected(id);
         self.coverage_dirty = true;
         self.status =
             "Captured displayed stream frame; submitting authoritative detection.".to_owned();
         self.start_detection_items(vec![id]);
+    }
+
+    /// 观察 Viewer 已安装的不可变帧；按完整 identity 去重并以 5 Hz 限频。
+    pub(crate) fn observe_live_frame(
+        &mut self,
+        frame: Arc<DecodedVideoFrame>,
+        store: CaptureStore,
+    ) {
+        if !self.auto_capture_enabled
+            || self.active_job.is_some()
+            || self.auto_capture.pending.is_some()
+            || self.session.items().len() >= MAX_DATASET_ITEMS
+        {
+            return;
+        }
+        let capture_id = StreamCaptureId::from(&frame.identity);
+        if self.auto_capture.last_observed.as_ref() == Some(&capture_id)
+            || self
+                .session
+                .items()
+                .iter()
+                .any(|item| item.input == CalibrationInputKey::StreamCapture(capture_id.clone()))
+        {
+            return;
+        }
+        let now_ns = host_monotonic_time_ns();
+        if (self.auto_capture.last_observed.is_some()
+            && now_ns.saturating_sub(self.auto_capture.last_observed_at_ns)
+                < AUTO_CAPTURE_ANALYSIS_INTERVAL_NS)
+            || (self.auto_capture.last_accepted_at_ns != 0
+                && now_ns.saturating_sub(self.auto_capture.last_accepted_at_ns)
+                    < AUTO_CAPTURE_ACCEPT_COOLDOWN_NS)
+        {
+            return;
+        }
+        self.auto_capture.last_observed = Some(capture_id);
+        self.auto_capture.last_observed_at_ns = now_ns;
+
+        let FrozenStreamInput { source, encoded } = match freeze_stream_input(&frame, store) {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                self.status = format!("Automatic capture rejected before detection: {error}");
+                return;
+            }
+        };
+        let candidate_id = AutoCandidateId::new(self.auto_capture.next_candidate_id);
+        self.auto_capture.next_candidate_id =
+            self.auto_capture.next_candidate_id.wrapping_add(1).max(1);
+        let token = match self.session.bind_auto_candidate(
+            candidate_id,
+            frame.identity.clone(),
+            encoded.source_revision.clone(),
+            source.display_name.clone(),
+        ) {
+            Ok(token) => token,
+            Err(error) => {
+                self.status = format!("Automatic candidate rejected: {error}");
+                return;
+            }
+        };
+        self.auto_capture.pending = Some(PendingCandidate {
+            token,
+            source,
+            encoded: Some(encoded),
+            cancellation: CalibrationCancellation::default(),
+            state: AutoCandidateState::Queued,
+        });
+        self.status = format!(
+            "Automatic candidate {} queued for authoritative detection.",
+            candidate_id.get()
+        );
+    }
+
+    pub(crate) fn stream_disconnected(&mut self, session_id: &StreamSessionId) {
+        let pending_matches = self
+            .auto_capture
+            .pending
+            .as_ref()
+            .is_some_and(|candidate| candidate.token.frame_identity().stream_id == *session_id);
+        if pending_matches {
+            self.cancel_auto_candidate(
+                "Automatic candidate cancelled because its live stream disconnected.",
+            );
+            return;
+        }
+        if self
+            .auto_capture
+            .latest_detection
+            .as_ref()
+            .is_some_and(|latest| latest.identity.stream_id == *session_id)
+        {
+            self.auto_capture.latest_detection = None;
+        }
+    }
+
+    fn dispatch_auto_candidate(&mut self, context: &egui::Context) {
+        let Some(candidate) = self.auto_capture.pending.as_mut() else {
+            return;
+        };
+        if candidate.state != AutoCandidateState::Queued {
+            return;
+        }
+        let Some(encoded) = candidate.encoded.take() else {
+            return;
+        };
+        let candidate_id = candidate.token.id();
+        let job = LoadedDetectionJob::from_encoded(
+            candidate_id.get(),
+            EncodedDetectionRequest::Candidate(candidate.token.clone()),
+            encoded,
+            candidate.cancellation.clone(),
+        );
+        match self.detection_pipeline.try_submit_detection(job) {
+            Ok(()) => candidate.state = AutoCandidateState::Submitted,
+            Err(TrySendError::Full(job)) => candidate.encoded = Some(job.encoded),
+            Err(TrySendError::Disconnected(_)) => self.finalize_candidate(
+                Some(context),
+                candidate_id,
+                CandidateTerminal::Discard(
+                    "Calibration detection workers stopped unexpectedly.".to_owned(),
+                ),
+            ),
+        }
+    }
+
+    fn finalize_candidate(
+        &mut self,
+        context: Option<&egui::Context>,
+        candidate_id: AutoCandidateId,
+        terminal: CandidateTerminal,
+    ) {
+        let Some(candidate) = self.auto_capture.pending.take() else {
+            return;
+        };
+        if candidate.token.id() != candidate_id {
+            self.auto_capture.pending = Some(candidate);
+            return;
+        }
+        let PendingCandidate {
+            token,
+            source,
+            cancellation,
+            ..
+        } = candidate;
+        cancellation.cancel();
+        match terminal {
+            CandidateTerminal::Detection(Ok(DetectionProduct {
+                source_revision,
+                outcome: camera_toolbox_core::ChessboardDetectionOutcome::Found(detection),
+                preview,
+            })) => {
+                self.auto_capture.latest_detection = Some(IdentityBoundDetection {
+                    identity: token.frame_identity().clone(),
+                    detection: detection.clone(),
+                });
+                let commit = AutoCandidateCommit::new(token, source_revision, detection);
+                match self.session.commit_auto_candidate(commit) {
+                    Ok(item_id) => {
+                        self.sources.insert(item_id, source);
+                        if let (Some(context), Some(frame)) = (context, preview) {
+                            self.install_preview(context, item_id, frame);
+                        }
+                        self.auto_capture.last_accepted_at_ns = host_monotonic_time_ns();
+                        self.coverage_dirty = true;
+                        self.status = format!(
+                            "Automatic capture committed as dataset item {}.",
+                            item_id.get()
+                        );
+                    }
+                    Err(error) => {
+                        self.status = format!("Automatic candidate commit rejected: {error}");
+                    }
+                }
+            }
+            CandidateTerminal::Detection(Ok(DetectionProduct {
+                outcome: camera_toolbox_core::ChessboardDetectionOutcome::NotFound { .. },
+                ..
+            })) => {
+                self.auto_capture.latest_detection = None;
+                self.status = "Automatic candidate rejected: chessboard not found.".to_owned();
+            }
+            CandidateTerminal::Detection(Err(error)) => {
+                self.auto_capture.latest_detection = None;
+                self.status = if error.is_cancelled() {
+                    "Automatic candidate cancelled.".to_owned()
+                } else {
+                    format!("Automatic candidate detection failed: {error}")
+                };
+            }
+            CandidateTerminal::Discard(message) => {
+                self.auto_capture.latest_detection = None;
+                self.status = message;
+            }
+        }
+    }
+
+    fn cancel_auto_candidate(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        if let Some(candidate_id) = self
+            .auto_capture
+            .pending
+            .as_ref()
+            .map(|candidate| candidate.token.id())
+        {
+            self.finalize_candidate(None, candidate_id, CandidateTerminal::Discard(message));
+        } else {
+            self.status = message;
+        }
+    }
+
+    fn remember_stream_detection(
+        &mut self,
+        item_id: CalibrationItemId,
+        outcome: &camera_toolbox_core::ChessboardDetectionOutcome,
+    ) {
+        let Some(source) = self.sources.get(&item_id) else {
+            return;
+        };
+        let CalibrationSourceKind::Stream(stream) = &source.kind else {
+            return;
+        };
+        self.auto_capture.latest_detection = match outcome {
+            camera_toolbox_core::ChessboardDetectionOutcome::Found(detection) => {
+                Some(IdentityBoundDetection {
+                    identity: stream.identity.clone(),
+                    detection: detection.clone(),
+                })
+            }
+            camera_toolbox_core::ChessboardDetectionOutcome::NotFound { .. } => None,
+        };
     }
 
     pub(crate) fn take_export(&mut self) -> Option<CalibrationExport> {
@@ -803,6 +1099,87 @@ impl CalibrationWorkspace {
         };
     }
 
+    /// 推进所有后台队列；必须由应用主循环每帧调用，不依赖当前可见 workspace。
+    pub(crate) fn tick(&mut self, context: &egui::Context) {
+        self.poll_worker(context);
+    }
+
+    /// 为当前 live frame 生成 identity-safe 检测点和同采集组的归一化 coverage。
+    pub(crate) fn viewer_overlay(&self, frame: &DecodedVideoFrame) -> CalibrationViewerOverlay {
+        let Ok(image_size) = CalibrationImageSize::new(frame.width, frame.height) else {
+            return CalibrationViewerOverlay::default();
+        };
+        let detection = self
+            .auto_capture
+            .latest_detection
+            .as_ref()
+            .filter(|latest| {
+                latest.identity == frame.identity && latest.detection.image_size == image_size
+            })
+            .map(|latest| ViewerDetectionOverlay {
+                image_size,
+                corners: latest.detection.corners.clone(),
+            });
+
+        let mut counts = vec![0_u32; VIEWER_COVERAGE_COLUMNS * VIEWER_COVERAGE_ROWS];
+        let mut coverage_views = 0_usize;
+        for item in self.session.items().iter().filter(|item| item.enabled) {
+            let CalibrationItemStatus::Found(item_detection) = &item.status else {
+                continue;
+            };
+            if item_detection.image_size != image_size {
+                continue;
+            }
+            let Some(source) = self.sources.get(&item.id) else {
+                continue;
+            };
+            let CalibrationSourceKind::Stream(stream) = &source.kind else {
+                continue;
+            };
+            if stream.identity.stream_id != frame.identity.stream_id
+                || stream.identity.channel != frame.identity.channel
+                || stream.image_size != image_size
+            {
+                continue;
+            }
+            coverage_views = coverage_views.saturating_add(1);
+            for corner in &item_detection.corners {
+                let normalized_x = (corner.x + 0.5) / image_size.width as f32;
+                let normalized_y = (corner.y + 0.5) / image_size.height as f32;
+                if !(0.0..1.0).contains(&normalized_x) || !(0.0..1.0).contains(&normalized_y) {
+                    continue;
+                }
+                let column = ((normalized_x * VIEWER_COVERAGE_COLUMNS as f32) as usize)
+                    .min(VIEWER_COVERAGE_COLUMNS - 1);
+                let row = ((normalized_y * VIEWER_COVERAGE_ROWS as f32) as usize)
+                    .min(VIEWER_COVERAGE_ROWS - 1);
+                let index = row * VIEWER_COVERAGE_COLUMNS + column;
+                counts[index] = counts[index].saturating_add(1);
+            }
+        }
+        let maximum = counts.iter().copied().max().unwrap_or_default();
+        let coverage = if maximum == 0 {
+            Vec::new()
+        } else {
+            counts
+                .into_iter()
+                .enumerate()
+                .filter_map(|(index, count)| {
+                    (count != 0).then_some(ViewerCoverageCell {
+                        column: index % VIEWER_COVERAGE_COLUMNS,
+                        row: index / VIEWER_COVERAGE_COLUMNS,
+                        density: count as f32 / maximum as f32,
+                    })
+                })
+                .collect()
+        };
+        CalibrationViewerOverlay {
+            detection,
+            coverage,
+            coverage_views,
+        }
+    }
+
     pub(crate) fn render(
         &mut self,
         context: &egui::Context,
@@ -812,7 +1189,6 @@ impl CalibrationWorkspace {
         sftp_source: Result<&str, &str>,
         provision_target: Result<&str, &str>,
     ) -> egui::Rect {
-        self.poll_worker(context);
         self.sync_coverage(context);
         let rect = ui.available_rect_before_wrap();
         self.render_controls(
@@ -832,7 +1208,7 @@ impl CalibrationWorkspace {
     }
 
     pub(crate) fn render_status(&self, ui: &mut egui::Ui) {
-        if self.active_job.is_some() {
+        if self.active_job.is_some() || self.auto_capture.pending.is_some() {
             ui.spinner();
             ui.separator();
         }
@@ -882,8 +1258,15 @@ impl CalibrationWorkspace {
                 ),
             );
             ui.weak(
-                "Disabled in Phase 2 foundation: automatic quality, pose-diversity, and coverage admission is not yet qualified.",
+                "Detection and ownership foundation is ready; production admission remains disabled until a versioned acquisition profile and CH0 qualification are available.",
             );
+            if let Some(candidate) = self.auto_capture.pending.as_ref() {
+                ui.monospace(format!(
+                    "Candidate {}: {:?}",
+                    candidate.token.id().get(),
+                    candidate.state
+                ));
+            }
         });
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(idle, |ui| {
@@ -1289,6 +1672,14 @@ impl CalibrationWorkspace {
             self.status = format!("Invalid board: {error}");
             return false;
         }
+        if previous != board {
+            self.session.invalidate_auto_admission();
+            if self.auto_capture.pending.is_some() {
+                self.cancel_auto_candidate(
+                    "Automatic candidate cancelled because the board specification changed.",
+                );
+            }
+        }
         if corner_layout_changed {
             self.coverage_dirty = true;
             self.status =
@@ -1327,7 +1718,7 @@ impl CalibrationWorkspace {
         }
         debug_assert!(self.active_detection_batch.is_none());
         debug_assert!(self.pending_reads.is_empty());
-        debug_assert!(self.pending_loaded.is_empty());
+        debug_assert!(self.pending_dataset_loaded.is_empty());
 
         let batch_id = self.next_detection_batch_id;
         self.next_detection_batch_id = self.next_detection_batch_id.wrapping_add(1).max(1);
@@ -1396,10 +1787,10 @@ impl CalibrationWorkspace {
                     .map(|source| source.encoded_png(token.source_revision()));
                 match direct {
                     Some(Ok(Some(encoded))) => {
-                        self.pending_loaded
+                        self.pending_dataset_loaded
                             .push_back(LoadedDetectionJob::from_encoded(
                                 batch_id,
-                                token,
+                                EncodedDetectionRequest::Dataset(token),
                                 encoded,
                                 calibration_cancellation.clone(),
                             ))
@@ -1517,24 +1908,31 @@ impl CalibrationWorkspace {
 
     fn dispatch_loaded_detections(&mut self) {
         loop {
-            let Some(job) = self.pending_loaded.pop_front() else {
+            let Some(job) = self.pending_dataset_loaded.pop_front() else {
                 break;
             };
             match self.detection_pipeline.try_submit_detection(job) {
                 Ok(()) => {}
                 Err(TrySendError::Full(job)) => {
-                    self.pending_loaded.push_front(job);
+                    self.pending_dataset_loaded.push_front(job);
                     break;
                 }
                 Err(TrySendError::Disconnected(job)) => {
                     let message = "Calibration detection workers stopped unexpectedly.".to_owned();
-                    let _ = self.session.install_failure(&job.token, message.clone());
-                    self.complete_detection_item(
-                        job.batch_id,
-                        job.token.item_id,
-                        job.reserved_bytes,
-                    );
-                    self.abort_detection_batch(message);
+                    match &job.request {
+                        EncodedDetectionRequest::Dataset(token) => {
+                            let _ = self.session.install_failure(token, message.clone());
+                            self.complete_detection_item(
+                                job.batch_id,
+                                token.item_id,
+                                job.reserved_bytes,
+                            );
+                            self.abort_detection_batch(message);
+                        }
+                        EncodedDetectionRequest::Candidate(_) => {
+                            self.status = message;
+                        }
+                    }
                     break;
                 }
             }
@@ -1550,6 +1948,20 @@ impl CalibrationWorkspace {
                     if matches!(self.active_job, Some(CalibrationJobKind::Detect)) {
                         self.abort_detection_batch(
                             "Calibration detection workers stopped unexpectedly.".to_owned(),
+                        );
+                    }
+                    if let Some(candidate_id) = self
+                        .auto_capture
+                        .pending
+                        .as_ref()
+                        .map(|candidate| candidate.token.id())
+                    {
+                        self.finalize_candidate(
+                            Some(context),
+                            candidate_id,
+                            CandidateTerminal::Discard(
+                                "Calibration detection workers stopped unexpectedly.".to_owned(),
+                            ),
                         );
                     }
                     break;
@@ -1578,6 +1990,7 @@ impl CalibrationWorkspace {
 
         self.dispatch_pending_reads();
         self.finish_detection_batch_if_ready();
+        self.dispatch_auto_candidate(context);
     }
 
     fn handle_read_event(&mut self, event: ReadStageEvent) {
@@ -1626,7 +2039,7 @@ impl CalibrationWorkspace {
         let cancelled = batch.cancel_requested;
         match result {
             Ok(job) if !cancelled => match self.session.mark_detect_queued(&token) {
-                Ok(()) => self.pending_loaded.push_back(job),
+                Ok(()) => self.pending_dataset_loaded.push_back(job),
                 Err(error) => {
                     self.status = error.to_string();
                     self.complete_detection_item(batch_id, token.item_id, reserved_bytes);
@@ -1651,7 +2064,10 @@ impl CalibrationWorkspace {
 
     fn handle_detection_event(&mut self, context: &egui::Context, event: DetectionStageEvent) {
         match event {
-            DetectionStageEvent::Started { batch_id, token } => {
+            DetectionStageEvent::Started {
+                batch_id,
+                request: EncodedDetectionRequest::Dataset(token),
+            } => {
                 let Some(batch) = self.active_detection_batch.as_ref() else {
                     return;
                 };
@@ -1662,6 +2078,17 @@ impl CalibrationWorkspace {
                     self.status = error.to_string();
                 }
             }
+            DetectionStageEvent::Started {
+                request: EncodedDetectionRequest::Candidate(token),
+                ..
+            } => {
+                if let Some(candidate) = self.auto_capture.pending.as_mut()
+                    && candidate.token == token
+                {
+                    candidate.state = AutoCandidateState::Detecting;
+                    self.status = format!("Detecting automatic candidate {}.", token.id().get());
+                }
+            }
             DetectionStageEvent::Finished(result) => self.handle_detection_result(context, result),
         }
     }
@@ -1669,10 +2096,21 @@ impl CalibrationWorkspace {
     fn handle_detection_result(&mut self, context: &egui::Context, result: DetectionStageResult) {
         let DetectionStageResult {
             batch_id,
-            token,
+            request,
             reserved_bytes,
             result,
         } = result;
+        let token = match request {
+            EncodedDetectionRequest::Candidate(token) => {
+                self.finalize_candidate(
+                    Some(context),
+                    token.id(),
+                    CandidateTerminal::Detection(result),
+                );
+                return;
+            }
+            EncodedDetectionRequest::Dataset(token) => token,
+        };
         let Some(batch) = self.active_detection_batch.as_ref() else {
             return;
         };
@@ -1693,6 +2131,7 @@ impl CalibrationWorkspace {
                         &outcome,
                         camera_toolbox_core::ChessboardDetectionOutcome::Found(_)
                     );
+                    self.remember_stream_detection(token.item_id, &outcome);
                     match self
                         .session
                         .install_detection(&token, source_revision, outcome)
@@ -1776,10 +2215,12 @@ impl CalibrationWorkspace {
             let _ = self.session.cancel_detection(&job.token);
             self.complete_detection_item(job.batch_id, job.token.item_id, 0);
         }
-        let pending_loaded: Vec<_> = self.pending_loaded.drain(..).collect();
+        let pending_loaded: Vec<_> = self.pending_dataset_loaded.drain(..).collect();
         for job in pending_loaded {
-            let _ = self.session.cancel_detection(&job.token);
-            self.complete_detection_item(job.batch_id, job.token.item_id, job.reserved_bytes);
+            if let EncodedDetectionRequest::Dataset(token) = job.request {
+                let _ = self.session.cancel_detection(&token);
+                self.complete_detection_item(job.batch_id, token.item_id, job.reserved_bytes);
+            }
         }
         self.status = "Cancel requested; waiting for active file/OpenCV operations.".to_owned();
         self.finish_detection_batch_if_ready();
@@ -1794,7 +2235,7 @@ impl CalibrationWorkspace {
             let _ = self.session.cancel_detection(&cancellation.token);
         }
         self.pending_reads.clear();
-        self.pending_loaded.clear();
+        self.pending_dataset_loaded.clear();
         self.active_job = None;
         let pending: Vec<_> = self.pending_imports.drain(..).collect();
         if !pending.is_empty() {
@@ -1809,7 +2250,7 @@ impl CalibrationWorkspace {
         };
         if batch.completed < batch.total
             || !self.pending_reads.is_empty()
-            || !self.pending_loaded.is_empty()
+            || !self.pending_dataset_loaded.is_empty()
         {
             if !batch.cancel_requested {
                 self.status = format!(
@@ -2076,6 +2517,18 @@ impl Drop for CalibrationWorkspace {
             for cancellation in batch.cancellations.values() {
                 cancellation.cancel();
             }
+        }
+        if let Some(candidate_id) = self
+            .auto_capture
+            .pending
+            .as_ref()
+            .map(|candidate| candidate.token.id())
+        {
+            self.finalize_candidate(
+                None,
+                candidate_id,
+                CandidateTerminal::Discard("Calibration workspace closed.".to_owned()),
+            );
         }
     }
 }
@@ -2463,7 +2916,9 @@ fn render_calibration_result(
 mod tests {
     use super::*;
     use camera_toolbox_adapters::filesystem::LocalFileSystem;
-    use camera_toolbox_app::{FileSourceId, FileSystem, SourcePath};
+    use camera_toolbox_app::{
+        CaptureStoreLimits, FileSourceId, FileSystem, SourcePath, StreamSessionId,
+    };
     use std::time::Instant;
 
     #[test]
@@ -2594,7 +3049,7 @@ mod tests {
             &context,
             DetectionStageResult {
                 batch_id: 1,
-                token: second_token,
+                request: EncodedDetectionRequest::Dataset(second_token),
                 reserved_bytes: 0,
                 result: Ok(DetectionProduct {
                     source_revision: version.clone().into(),
@@ -2610,7 +3065,7 @@ mod tests {
             &context,
             DetectionStageResult {
                 batch_id: 1,
-                token: first_token,
+                request: EncodedDetectionRequest::Dataset(first_token),
                 reserved_bytes: 0,
                 result: Ok(DetectionProduct {
                     source_revision: version.into(),
@@ -2656,7 +3111,7 @@ mod tests {
 
         assert!(workspace.active_job.is_none());
         assert!(workspace.pending_reads.is_empty());
-        assert!(workspace.pending_loaded.is_empty());
+        assert!(workspace.pending_dataset_loaded.is_empty());
         assert!(matches!(
             &workspace.session.items()[0].status,
             CalibrationItemStatus::Failed(message) if message.contains("limit")
@@ -3098,5 +3553,206 @@ mod tests {
             status_color(&CalibrationItemStatus::Failed("decode failed".to_owned())),
             Some(REPROJECTED_POINT_COLOR)
         );
+    }
+
+    fn auto_capture_store() -> CaptureStore {
+        CaptureStore::new(CaptureStoreLimits::new(4 * 1024 * 1024, 8 * 1024 * 1024).unwrap())
+    }
+
+    fn live_frame(sequence: u64) -> Arc<DecodedVideoFrame> {
+        Arc::new(DecodedVideoFrame {
+            width: 640,
+            height: 480,
+            rgba: Arc::from(vec![127_u8; 640 * 480 * 4]),
+            identity: StreamFrameIdentity::unavailable(
+                StreamSessionId::new("auto-capture-workspace-test").unwrap(),
+                0,
+                sequence,
+                "test fixture",
+            ),
+        })
+    }
+
+    fn pending_candidate_asset_id(workspace: &CalibrationWorkspace) -> AssetId {
+        let candidate = workspace
+            .auto_capture
+            .pending
+            .as_ref()
+            .expect("automatic candidate must be pending");
+        let CalibrationSourceKind::Stream(stream) = &candidate.source.kind else {
+            panic!("automatic candidate must own a stream source");
+        };
+        stream
+            .asset
+            .as_ref()
+            .expect("pending stream source must own its asset")
+            .id
+            .clone()
+    }
+
+    #[test]
+    fn automatic_candidate_success_transfers_the_same_asset_into_dataset() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let baseline = store.stats().unwrap();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_capture_enabled = true;
+        let displayed = live_frame(1);
+        workspace.observe_live_frame(Arc::clone(&displayed), store.clone());
+
+        let asset_id = pending_candidate_asset_id(&workspace);
+        let candidate = workspace.auto_capture.pending.as_ref().unwrap();
+        let candidate_id = candidate.token.id();
+        let source_revision = candidate.token.source_revision().clone();
+        let camera_toolbox_core::ChessboardDetectionOutcome::Found(detection) =
+            found_detection(640, 480)
+        else {
+            unreachable!();
+        };
+        workspace.finalize_candidate(
+            Some(&context),
+            candidate_id,
+            CandidateTerminal::Detection(Ok(DetectionProduct {
+                source_revision,
+                outcome: camera_toolbox_core::ChessboardDetectionOutcome::Found(detection),
+                preview: None,
+            })),
+        );
+
+        assert!(workspace.auto_capture.pending.is_none());
+        assert_eq!(workspace.session.items().len(), 1);
+        let item_id = workspace.session.items()[0].id;
+        let CalibrationSourceKind::Stream(stream) = &workspace.sources[&item_id].kind else {
+            panic!("committed candidate must retain its stream source");
+        };
+        assert_eq!(stream.asset.as_ref().unwrap().id, asset_id);
+        assert!(store.get(&asset_id).unwrap().is_some());
+        let committed = store.stats().unwrap();
+        assert_eq!(committed.reserved_bytes, baseline.reserved_bytes);
+        assert_eq!(committed.reservation_count, baseline.reservation_count);
+        assert_eq!(committed.asset_count, baseline.asset_count + 1);
+        assert!(committed.published_bytes > baseline.published_bytes);
+        let matching_overlay = workspace.viewer_overlay(&displayed);
+        assert_eq!(
+            matching_overlay.detection.as_ref().unwrap().corners.len(),
+            88
+        );
+        assert_eq!(matching_overlay.coverage_views, 1);
+        assert!(!matching_overlay.coverage.is_empty());
+        assert!(
+            matching_overlay
+                .coverage
+                .iter()
+                .all(|cell| (0.0..=1.0).contains(&cell.density))
+        );
+
+        let advanced = live_frame(2);
+        let advanced_overlay = workspace.viewer_overlay(&advanced);
+        assert!(advanced_overlay.detection.is_none());
+        assert_eq!(advanced_overlay.coverage_views, 1);
+        assert!(!advanced_overlay.coverage.is_empty());
+
+        let mut incompatible_channel = (*advanced).clone();
+        incompatible_channel.identity.channel = 3;
+        let incompatible_overlay = workspace.viewer_overlay(&incompatible_channel);
+        assert!(incompatible_overlay.detection.is_none());
+        assert_eq!(incompatible_overlay.coverage_views, 0);
+        assert!(incompatible_overlay.coverage.is_empty());
+    }
+
+    #[test]
+    fn rejected_automatic_candidate_releases_asset_and_preserves_dataset() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let baseline = store.stats().unwrap();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_capture_enabled = true;
+        workspace.observe_live_frame(live_frame(2), store.clone());
+
+        let asset_id = pending_candidate_asset_id(&workspace);
+        let candidate = workspace.auto_capture.pending.as_ref().unwrap();
+        let candidate_id = candidate.token.id();
+        let source_revision = candidate.token.source_revision().clone();
+        assert!(store.get(&asset_id).unwrap().is_some());
+        workspace.finalize_candidate(
+            Some(&context),
+            candidate_id,
+            CandidateTerminal::Detection(Ok(DetectionProduct {
+                source_revision,
+                outcome: camera_toolbox_core::ChessboardDetectionOutcome::NotFound {
+                    image_size: CalibrationImageSize::new(640, 480).unwrap(),
+                },
+                preview: None,
+            })),
+        );
+
+        assert!(workspace.auto_capture.pending.is_none());
+        assert!(workspace.session.items().is_empty());
+        assert!(workspace.sources.is_empty());
+        assert!(store.get(&asset_id).unwrap().is_none());
+        assert_eq!(store.stats().unwrap(), baseline);
+    }
+
+    #[test]
+    fn automatic_blank_frame_round_trip_releases_candidate_asset() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let baseline = store.stats().unwrap();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_capture_enabled = true;
+        workspace.observe_live_frame(live_frame(3), store.clone());
+        let asset_id = pending_candidate_asset_id(&workspace);
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+            workspace.tick(&context);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            workspace.auto_capture.pending.is_none(),
+            "candidate worker did not finish: {}",
+            workspace.status
+        );
+        assert!(workspace.session.items().is_empty());
+        assert!(store.get(&asset_id).unwrap().is_none());
+        assert_eq!(store.stats().unwrap(), baseline);
+        assert!(workspace.status.contains("chessboard not found"));
+    }
+
+    #[test]
+    fn stream_disconnect_releases_matching_pending_candidate() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let baseline = store.stats().unwrap();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_capture_enabled = true;
+        let frame = live_frame(4);
+        workspace.observe_live_frame(Arc::clone(&frame), store.clone());
+        let asset_id = pending_candidate_asset_id(&workspace);
+
+        workspace.stream_disconnected(&frame.identity.stream_id);
+
+        assert!(workspace.auto_capture.pending.is_none());
+        assert!(workspace.session.items().is_empty());
+        assert!(store.get(&asset_id).unwrap().is_none());
+        assert_eq!(store.stats().unwrap(), baseline);
+        assert!(workspace.status.contains("disconnected"));
+    }
+
+    #[test]
+    fn workspace_shutdown_releases_pending_candidate() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let baseline = store.stats().unwrap();
+        let asset_id = {
+            let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+            workspace.auto_capture_enabled = true;
+            workspace.observe_live_frame(live_frame(5), store.clone());
+            pending_candidate_asset_id(&workspace)
+        };
+
+        assert!(store.get(&asset_id).unwrap().is_none());
+        assert_eq!(store.stats().unwrap(), baseline);
     }
 }

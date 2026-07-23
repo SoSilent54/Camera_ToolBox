@@ -15,7 +15,10 @@ use std::{
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvisionIntent};
 #[cfg(feature = "calibration-opencv")]
-use crate::calibration_workspace::{CalibrationExport, CalibrationWorkspace};
+use crate::calibration_workspace::{
+    CalibrationExport, CalibrationViewerOverlay, CalibrationWorkspace, VIEWER_COVERAGE_COLUMNS,
+    VIEWER_COVERAGE_ROWS,
+};
 
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
@@ -651,8 +654,24 @@ impl eframe::App for CameraToolboxApp {
             self.handle_platform_effect(&context, effect);
         }
         self.advance_live_close_deadlines();
+        #[cfg(feature = "calibration-opencv")]
+        let displayed_live_frame = if let Some(document) = self.workspace.active_live_mut() {
+            document.install_latest_texture(&context);
+            document.displayed_frame().cloned()
+        } else {
+            None
+        };
+        #[cfg(not(feature = "calibration-opencv"))]
         if let Some(document) = self.workspace.active_live_mut() {
             document.install_latest_texture(&context);
+        }
+        #[cfg(feature = "calibration-opencv")]
+        {
+            self.calibration.tick(&context);
+            if let Some(frame) = displayed_live_frame {
+                self.calibration
+                    .observe_live_frame(frame, self.live_runtime.capture_store().clone());
+            }
         }
         self.ensure_active_resources(&context);
         if let Some(document) = self.workspace.active_image_mut() {
@@ -794,6 +813,12 @@ impl eframe::App for CameraToolboxApp {
         let mut calibration_capture_request: Option<
             Arc<camera_toolbox_app::DecodedVideoFrame>,
         > = None;
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_viewer_overlay = self
+            .workspace
+            .active_live()
+            .and_then(LiveDocument::displayed_frame)
+            .map(|frame| self.calibration.viewer_overlay(frame));
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
                 #[cfg(feature = "calibration-opencv")]
@@ -822,6 +847,8 @@ impl eframe::App for CameraToolboxApp {
                         document,
                         &self.live_runtime,
                         cfg!(feature = "calibration-opencv"),
+                        #[cfg(feature = "calibration-opencv")]
+                        calibration_viewer_overlay.as_ref(),
                     );
                     #[cfg(feature = "calibration-opencv")]
                     {
@@ -4122,6 +4149,13 @@ impl CameraToolboxApp {
                     break;
                 }
             };
+            #[cfg(feature = "calibration-opencv")]
+            if matches!(
+                &event.event,
+                camera_toolbox_app::StreamServiceEvent::Terminal(_)
+            ) {
+                self.calibration.stream_disconnected(&event.session_id);
+            }
             if let Some(document) = self.workspace.live_by_session_mut(&event.session_id) {
                 document.apply_event(event.event);
             }
@@ -4142,16 +4176,18 @@ impl CameraToolboxApp {
             })
             .collect();
         for (id, session_id) in expired {
-            if self.live_runtime.force_cleanup(&session_id)
-                && let Some(document) = self.workspace.live_mut(id)
-            {
-                document.latest_frame.clear();
-                document.release_texture();
-                document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
-                    terminal: camera_toolbox_app::StreamTerminal::Forced {
-                        remote_state_unknown: true,
-                    },
-                };
+            if self.live_runtime.force_cleanup(&session_id) {
+                #[cfg(feature = "calibration-opencv")]
+                self.calibration.stream_disconnected(&session_id);
+                if let Some(document) = self.workspace.live_mut(id) {
+                    document.latest_frame.clear();
+                    document.release_texture();
+                    document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
+                        terminal: camera_toolbox_app::StreamTerminal::Forced {
+                            remote_state_unknown: true,
+                        },
+                    };
+                }
             }
         }
     }
@@ -4161,6 +4197,9 @@ impl CameraToolboxApp {
         document: &mut LiveDocument,
         runtime: &LiveRuntime,
         calibration_capture_enabled: bool,
+        #[cfg(feature = "calibration-opencv")] calibration_overlay: Option<
+            &CalibrationViewerOverlay,
+        >,
     ) -> (
         egui::Rect,
         Option<Arc<camera_toolbox_app::DecodedVideoFrame>>,
@@ -4179,6 +4218,10 @@ impl CameraToolboxApp {
                     .clicked()
             {
                 capture_request = displayed_frame.clone();
+            }
+            if calibration_capture_enabled {
+                ui.checkbox(&mut document.show_calibration_detection, "Board detection");
+                ui.checkbox(&mut document.show_calibration_coverage, "Dataset coverage");
             }
             if ui.button("Snapshot...").clicked()
                 && let Some(frame) = displayed_frame.as_ref()
@@ -4254,7 +4297,9 @@ impl CameraToolboxApp {
                 ));
                 ui.label(format!(
                     "Present {:.1} fps",
-                    document.metrics.presented_fps_millihz as f64 / 1_000.0
+                    document.presented_fps_millihz_at(camera_toolbox_app::host_monotonic_time_ns())
+                        as f64
+                        / 1_000.0
                 ));
                 ui.label(format!(
                     "Host presentation {:.2} ms",
@@ -4324,6 +4369,21 @@ impl CameraToolboxApp {
                 .min(1.0)
                 .max(0.01);
             ui.centered_and_justified(|ui| {
+                #[cfg(feature = "calibration-opencv")]
+                {
+                    let response =
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
+                    if let Some(overlay) = calibration_overlay {
+                        Self::paint_live_calibration_overlay(
+                            &ui.painter_at(response.rect),
+                            response.rect,
+                            overlay,
+                            document.show_calibration_detection,
+                            document.show_calibration_coverage,
+                        );
+                    }
+                }
+                #[cfg(not(feature = "calibration-opencv"))]
                 ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
             });
         } else {
@@ -4333,6 +4393,85 @@ impl CameraToolboxApp {
             });
         }
         (rect, capture_request)
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_calibration_overlay(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        overlay: &CalibrationViewerOverlay,
+        show_detection: bool,
+        show_coverage: bool,
+    ) {
+        if show_coverage {
+            for cell in &overlay.coverage {
+                let x0 = image_rect.left()
+                    + cell.column as f32 / VIEWER_COVERAGE_COLUMNS as f32 * image_rect.width();
+                let x1 = image_rect.left()
+                    + (cell.column + 1) as f32 / VIEWER_COVERAGE_COLUMNS as f32
+                        * image_rect.width();
+                let y0 = image_rect.top()
+                    + cell.row as f32 / VIEWER_COVERAGE_ROWS as f32 * image_rect.height();
+                let y1 = image_rect.top()
+                    + (cell.row + 1) as f32 / VIEWER_COVERAGE_ROWS as f32 * image_rect.height();
+                let density = cell.density.clamp(0.0, 1.0);
+                let color = egui::Color32::from_rgba_unmultiplied(
+                    (255.0 * density) as u8,
+                    (220.0 * (1.0 - (density * 2.0 - 1.0).abs())) as u8,
+                    (255.0 * (1.0 - density)) as u8,
+                    (36.0 + 84.0 * density) as u8,
+                );
+                painter.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
+                    0.0,
+                    color,
+                );
+            }
+            if overlay.coverage_views > 0 {
+                painter.text(
+                    image_rect.left_top() + egui::vec2(8.0, 8.0),
+                    egui::Align2::LEFT_TOP,
+                    format!("Coverage: {} views", overlay.coverage_views),
+                    egui::FontId::monospace(12.0),
+                    egui::Color32::WHITE,
+                );
+            }
+        }
+        if show_detection && let Some(detection) = &overlay.detection {
+            for point in &detection.corners {
+                if let Some(position) =
+                    Self::live_overlay_point(*point, detection.image_size, image_rect)
+                {
+                    painter.circle_filled(position, 3.5, egui::Color32::from_rgb(80, 255, 120));
+                    painter.circle_stroke(
+                        position,
+                        4.5,
+                        egui::Stroke::new(1.0, egui::Color32::BLACK),
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    pub(crate) fn live_overlay_point(
+        point: camera_toolbox_core::CalibrationPoint,
+        image_size: camera_toolbox_core::CalibrationImageSize,
+        image_rect: egui::Rect,
+    ) -> Option<egui::Pos2> {
+        let normalized_x = (point.x + 0.5) / image_size.width as f32;
+        let normalized_y = (point.y + 0.5) / image_size.height as f32;
+        if !normalized_x.is_finite()
+            || !normalized_y.is_finite()
+            || !(0.0..=1.0).contains(&normalized_x)
+            || !(0.0..=1.0).contains(&normalized_y)
+        {
+            return None;
+        }
+        Some(egui::pos2(
+            image_rect.left() + normalized_x * image_rect.width(),
+            image_rect.top() + normalized_y * image_rect.height(),
+        ))
     }
 
     fn forget_auto_open_document(&mut self, id: DocumentId) {

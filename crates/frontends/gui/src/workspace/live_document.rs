@@ -82,6 +82,8 @@ pub(crate) struct LiveDocument {
     pub(crate) annexb_recording: Option<RecordingState>,
     pub(crate) presented_frames: u64,
     pub(crate) last_snapshot: Option<String>,
+    pub(crate) show_calibration_detection: bool,
+    pub(crate) show_calibration_coverage: bool,
     texture: Option<egui::TextureHandle>,
     displayed_frame: Option<Arc<DecodedVideoFrame>>,
     /// 最近一秒实际安装纹理的时刻；只计最新帧，不为预览建立队列。
@@ -110,6 +112,8 @@ impl LiveDocument {
             annexb_recording: None,
             presented_frames: 0,
             last_snapshot: None,
+            show_calibration_detection: true,
+            show_calibration_coverage: true,
             texture: None,
             displayed_frame: None,
             presentation_samples_ns: VecDeque::new(),
@@ -202,6 +206,33 @@ impl LiveDocument {
             .unwrap_or(u64::MAX),
             _ => 0,
         };
+    }
+
+    /// 按当前单调时间计算展示帧率；停帧超过窗口后必须归零。
+    pub(crate) fn presented_fps_millihz_at(&self, now_ns: u64) -> u64 {
+        const PRESENTATION_WINDOW_NS: u64 = 1_000_000_000;
+        let mut samples = self
+            .presentation_samples_ns
+            .iter()
+            .copied()
+            .filter(|sample| now_ns.saturating_sub(*sample) <= PRESENTATION_WINDOW_NS);
+        let Some(first) = samples.next() else {
+            return 0;
+        };
+        let mut last = first;
+        let mut count = 1_u128;
+        for sample in samples {
+            last = sample;
+            count = count.saturating_add(1);
+        }
+        if last == first {
+            return 0;
+        }
+        u64::try_from(
+            count.saturating_sub(1).saturating_mul(1_000_000_000_000)
+                / u128::from(last.saturating_sub(first)),
+        )
+        .unwrap_or(u64::MAX)
     }
 
     pub(crate) fn texture(&self) -> Option<&egui::TextureHandle> {
@@ -324,5 +355,21 @@ mod tests {
                 <= latest_now.saturating_sub(published_host_time_ns)
         );
         assert_eq!(document.metrics.presented_fps_millihz, 0);
+    }
+
+    #[test]
+    fn presentation_fps_returns_to_zero_after_frames_stop() {
+        let mut document = LiveDocument::new(
+            DocumentId::from_raw(1),
+            StreamSessionId::new("live-document-test").unwrap(),
+            Arc::new(LatestDecodedFrameSlot::default()),
+            source(),
+        );
+        document
+            .presentation_samples_ns
+            .extend([1_000_000_000, 1_500_000_000, 2_000_000_000]);
+
+        assert_eq!(document.presented_fps_millihz_at(2_000_000_000), 2_000);
+        assert_eq!(document.presented_fps_millihz_at(3_000_000_001), 0);
     }
 }

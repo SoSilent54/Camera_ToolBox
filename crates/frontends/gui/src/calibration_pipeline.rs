@@ -12,12 +12,12 @@ use std::{
 
 use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
-    CalibrationBackend, CalibrationBackendError, CalibrationCancellation, CalibrationEncodedPng,
-    CalibrationInputError, CalibrationInputRevision, CalibrationJobToken, FileRef, FileSourceId,
-    FileSystem, FileSystemError, FsCancellation, FsControl, RasterFormat, RasterImageCodec,
-    read_calibration_png,
+    AutoCandidateToken, CalibrationBackend, CalibrationBackendError, CalibrationCancellation,
+    CalibrationEncodedPng, CalibrationInputError, CalibrationInputRevision, CalibrationJobToken,
+    FileRef, FileSourceId, FileSystem, FileSystemError, FsCancellation, FsControl, RasterFormat,
+    RasterImageCodec, read_calibration_png,
 };
-use camera_toolbox_core::{ChessboardDetectionOutcome, Rgba8Frame};
+use camera_toolbox_core::{BoardSpec, ChessboardDetectionOutcome, Rgba8Frame};
 use eframe::egui;
 
 pub(crate) const IO_WORKERS: usize = 8;
@@ -76,9 +76,50 @@ impl ReadJob {
     }
 }
 
+/// 同一条 encoded-PNG worker 通道的两类请求。
+#[derive(Clone, Debug)]
+pub(crate) enum EncodedDetectionRequest {
+    Dataset(CalibrationJobToken),
+    Candidate(AutoCandidateToken),
+}
+
+impl EncodedDetectionRequest {
+    #[must_use]
+    pub(crate) const fn board(&self) -> BoardSpec {
+        match self {
+            Self::Dataset(token) => token.board(),
+            Self::Candidate(token) => token.board(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn source_revision(&self) -> &CalibrationInputRevision {
+        match self {
+            Self::Dataset(token) => token.source_revision(),
+            Self::Candidate(token) => token.source_revision(),
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn kind(&self) -> &'static str {
+        match self {
+            Self::Dataset(_) => "dataset",
+            Self::Candidate(_) => "candidate",
+        }
+    }
+
+    #[must_use]
+    pub(crate) const fn id(&self) -> u64 {
+        match self {
+            Self::Dataset(token) => token.item_id.get(),
+            Self::Candidate(token) => token.id().get(),
+        }
+    }
+}
+
 pub(crate) struct LoadedDetectionJob {
     pub batch_id: u64,
-    pub token: CalibrationJobToken,
+    pub request: EncodedDetectionRequest,
     pub encoded: CalibrationEncodedPng,
     pub cancellation: CalibrationCancellation,
     pub reserved_bytes: u64,
@@ -88,13 +129,13 @@ pub(crate) struct LoadedDetectionJob {
 impl LoadedDetectionJob {
     pub(crate) fn from_encoded(
         batch_id: u64,
-        token: CalibrationJobToken,
+        request: EncodedDetectionRequest,
         encoded: CalibrationEncodedPng,
         cancellation: CalibrationCancellation,
     ) -> Self {
         Self {
             batch_id,
-            token,
+            request,
             encoded,
             cancellation,
             reserved_bytes: 0,
@@ -127,7 +168,7 @@ pub(crate) struct DetectionProduct {
 
 pub(crate) struct DetectionStageResult {
     pub batch_id: u64,
-    pub token: CalibrationJobToken,
+    pub request: EncodedDetectionRequest,
     pub reserved_bytes: u64,
     pub result: Result<DetectionProduct, PipelineStageError>,
 }
@@ -135,7 +176,7 @@ pub(crate) struct DetectionStageResult {
 pub(crate) enum DetectionStageEvent {
     Started {
         batch_id: u64,
-        token: CalibrationJobToken,
+        request: EncodedDetectionRequest,
     },
     Finished(DetectionStageResult),
 }
@@ -321,7 +362,7 @@ fn spawn_detection_worker(
                 if events
                     .send(DetectionStageEvent::Started {
                         batch_id: job.batch_id,
-                        token: job.token.clone(),
+                        request: job.request.clone(),
                     })
                     .is_err()
                 {
@@ -358,7 +399,7 @@ fn run_read(job: ReadJob) -> ReadStageResult {
         )
         .map(|encoded| LoadedDetectionJob {
             batch_id: job.batch_id,
-            token: job.token.clone(),
+            request: EncodedDetectionRequest::Dataset(job.token.clone()),
             encoded,
             cancellation: job.calibration_cancellation,
             reserved_bytes: job.reserved_bytes,
@@ -398,15 +439,27 @@ fn run_detection(
 ) -> DetectionStageResult {
     let queue_wait = job.queued_at.elapsed();
     let detection_started = Instant::now();
-    let detection = backend.detect_png(
-        &job.encoded.bytes,
-        job.encoded.image_size,
-        MAX_DECODED_PREVIEW_BYTES,
-        job.token.board(),
-        &job.cancellation,
-    );
+    let request_kind = job.request.kind();
+    let request_id = job.request.id();
+    let detection = if job.encoded.source_revision != *job.request.source_revision() {
+        Err(PipelineStageError {
+            message: "encoded calibration PNG revision does not match its detection request"
+                .to_owned(),
+            cancelled: false,
+        })
+    } else {
+        backend
+            .detect_png(
+                &job.encoded.bytes,
+                job.encoded.image_size,
+                MAX_DECODED_PREVIEW_BYTES,
+                job.request.board(),
+                &job.cancellation,
+            )
+            .map_err(backend_error)
+    };
     let detection_elapsed = detection_started.elapsed();
-    let result = detection.map_err(backend_error).map(|outcome| {
+    let result = detection.map(|outcome| {
         let preview_started = Instant::now();
         let preview = preview_codec
             .decode_rgba8(
@@ -420,7 +473,8 @@ fn run_detection(
         tracing::debug!(
             operation = "calibration_pipeline_detect",
             batch_id = job.batch_id,
-            item_id = job.token.item_id.get(),
+            request_kind,
+            request_id,
             queue_wait_ms = queue_wait.as_secs_f64() * 1000.0,
             detect_ms = detection_elapsed.as_secs_f64() * 1000.0,
             preview_ms = preview_elapsed.as_secs_f64() * 1000.0,
@@ -437,7 +491,8 @@ fn run_detection(
         tracing::debug!(
             operation = "calibration_pipeline_detect",
             batch_id = job.batch_id,
-            item_id = job.token.item_id.get(),
+            request_kind,
+            request_id,
             queue_wait_ms = queue_wait.as_secs_f64() * 1000.0,
             detect_ms = detection_elapsed.as_secs_f64() * 1000.0,
             error = %error,
@@ -446,7 +501,7 @@ fn run_detection(
     }
     DetectionStageResult {
         batch_id: job.batch_id,
-        token: job.token,
+        request: job.request,
         reserved_bytes: job.reserved_bytes,
         result,
     }
@@ -679,7 +734,7 @@ mod tests {
             pipeline
                 .try_submit_detection(LoadedDetectionJob {
                     batch_id: 1,
-                    token: a_token,
+                    request: EncodedDetectionRequest::Dataset(a_token),
                     encoded: CalibrationEncodedPng {
                         bytes: png.clone().into(),
                         image_size: CalibrationImageSize::new(1, 1).unwrap(),
@@ -759,7 +814,7 @@ mod tests {
             pipeline
                 .try_submit_detection(LoadedDetectionJob {
                     batch_id: 1,
-                    token,
+                    request: EncodedDetectionRequest::Dataset(token),
                     encoded: CalibrationEncodedPng {
                         bytes: png.into(),
                         image_size: CalibrationImageSize::new(1, 1).unwrap(),
@@ -811,15 +866,22 @@ mod tests {
         let mut results = Vec::with_capacity(expected_results);
         while results.len() < expected_results {
             match pipeline.try_detection_event() {
-                Ok(DetectionStageEvent::Started { token, .. }) => {
+                Ok(DetectionStageEvent::Started {
+                    request: EncodedDetectionRequest::Dataset(token),
+                    ..
+                }) => {
                     assert!(
                         started.insert(token.item_id),
                         "detection start event must be emitted once per item"
                     );
                 }
+                Ok(DetectionStageEvent::Started { .. }) => panic!("unexpected candidate request"),
                 Ok(DetectionStageEvent::Finished(result)) => {
+                    let EncodedDetectionRequest::Dataset(token) = &result.request else {
+                        panic!("unexpected candidate request");
+                    };
                     assert!(
-                        started.contains(&result.token.item_id),
+                        started.contains(&token.item_id),
                         "detection start event must precede completion"
                     );
                     results.push(result);

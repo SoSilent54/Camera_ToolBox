@@ -250,6 +250,85 @@ impl CalibrationJobToken {
     }
 }
 
+/// 自动候选的会话内身份；它在 Dataset item 创建前存在。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AutoCandidateId(u64);
+
+impl AutoCandidateId {
+    #[must_use]
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// 自动候选从冻结 PNG 到最终提交都必须保持一致的不可变绑定。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoCandidateToken {
+    id: AutoCandidateId,
+    input: CalibrationInputKey,
+    source_revision: CalibrationInputRevision,
+    display_name: String,
+    frame_identity: StreamFrameIdentity,
+    board: BoardSpec,
+    fit_manifest_revision: u64,
+    admission_revision: u64,
+}
+
+impl AutoCandidateToken {
+    #[must_use]
+    pub const fn id(&self) -> AutoCandidateId {
+        self.id
+    }
+
+    #[must_use]
+    pub const fn board(&self) -> BoardSpec {
+        self.board
+    }
+
+    #[must_use]
+    pub fn source_revision(&self) -> &CalibrationInputRevision {
+        &self.source_revision
+    }
+
+    #[must_use]
+    pub fn frame_identity(&self) -> &StreamFrameIdentity {
+        &self.frame_identity
+    }
+
+    #[must_use]
+    pub const fn admission_revision(&self) -> u64 {
+        self.admission_revision
+    }
+}
+
+/// authoritative detection 与其原始候选 token 的单一提交对象。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoCandidateCommit {
+    token: AutoCandidateToken,
+    observed_revision: CalibrationInputRevision,
+    detection: ChessboardDetection,
+}
+
+impl AutoCandidateCommit {
+    #[must_use]
+    pub const fn new(
+        token: AutoCandidateToken,
+        observed_revision: CalibrationInputRevision,
+        detection: ChessboardDetection,
+    ) -> Self {
+        Self {
+            token,
+            observed_revision,
+            detection,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationSnapshot {
     pub item_ids: Vec<CalibrationItemId>,
@@ -279,6 +358,7 @@ pub struct CalibrationSession {
     installed: Option<InstalledCalibration>,
     solution_revision: u64,
     detection_epoch: u64,
+    auto_admission_revision: u64,
     active_detection_jobs: HashMap<CalibrationItemId, u64>,
     next_detection_job_id: u64,
     next_id: u64,
@@ -294,6 +374,7 @@ impl CalibrationSession {
             installed: None,
             solution_revision: 1,
             detection_epoch: 1,
+            auto_admission_revision: 1,
             active_detection_jobs: HashMap::new(),
             next_detection_job_id: 1,
             next_id: 1,
@@ -387,6 +468,96 @@ impl CalibrationSession {
         self.selected.get_or_insert(id);
         self.invalidate_detection_epoch();
         AddCalibrationItemOutcome::Added(id)
+    }
+
+    /// 为尚未入库的直播 PNG 创建不可变候选绑定，不修改 Dataset。
+    ///
+    /// # Errors
+    ///
+    /// 输入不是匹配 identity 的 stream PNG、输入已存在或 revision 无效时返回错误。
+    pub fn bind_auto_candidate(
+        &self,
+        id: AutoCandidateId,
+        frame_identity: StreamFrameIdentity,
+        source_revision: CalibrationInputRevision,
+        display_name: String,
+    ) -> Result<AutoCandidateToken, CalibrationSessionError> {
+        let input = CalibrationInputKey::StreamCapture(StreamCaptureId::from(&frame_identity));
+        if self.items.iter().any(|item| item.input == input) {
+            return Err(CalibrationSessionError::AutoCandidateAlreadyPresent);
+        }
+        if !matches!(
+            &source_revision,
+            CalibrationInputRevision::EphemeralPng {
+                content_sha256,
+                encoded_bytes,
+            } if !content_sha256.is_empty() && *encoded_bytes > 0
+        ) {
+            return Err(CalibrationSessionError::InvalidAutoCandidateRevision);
+        }
+        Ok(AutoCandidateToken {
+            id,
+            input,
+            source_revision,
+            display_name,
+            frame_identity,
+            board: self.board,
+            fit_manifest_revision: self.solution_revision,
+            admission_revision: self.auto_admission_revision,
+        })
+    }
+
+    /// 原子提交已通过 authoritative detection 的自动候选。
+    ///
+    /// # Errors
+    ///
+    /// 任一不可变 binding 已过期、输入已存在或角点无效时返回错误，且 Dataset 不变。
+    pub fn commit_auto_candidate(
+        &mut self,
+        commit: AutoCandidateCommit,
+    ) -> Result<CalibrationItemId, CalibrationSessionError> {
+        let AutoCandidateCommit {
+            token,
+            observed_revision,
+            detection,
+        } = commit;
+        if token.board != self.board
+            || token.fit_manifest_revision != self.solution_revision
+            || token.admission_revision != self.auto_admission_revision
+        {
+            return Err(CalibrationSessionError::StaleAutoCandidate);
+        }
+        if observed_revision != token.source_revision {
+            return Err(CalibrationSessionError::InvalidAutoCandidateRevision);
+        }
+        let expected_input =
+            CalibrationInputKey::StreamCapture(StreamCaptureId::from(&token.frame_identity));
+        if token.input != expected_input {
+            return Err(CalibrationSessionError::InvalidAutoCandidateIdentity);
+        }
+        if self.items.iter().any(|item| item.input == token.input) {
+            return Err(CalibrationSessionError::AutoCandidateAlreadyPresent);
+        }
+        detection.validate(token.board)?;
+
+        let id = CalibrationItemId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        self.items.push(CalibrationDatasetItem {
+            id,
+            input: token.input,
+            revision: token.source_revision,
+            display_name: token.display_name,
+            enabled: true,
+            status: CalibrationItemStatus::Found(detection),
+        });
+        self.selected = Some(id);
+        // 自动候选只改变 solver 输入；不得使其他 Dataset 检测令牌过期。
+        self.invalidate_solution();
+        Ok(id)
+    }
+    /// 使所有尚未提交的自动候选失效；不影响 Dataset detection token。
+    pub fn invalidate_auto_admission(&mut self) {
+        self.auto_admission_revision = self.auto_admission_revision.wrapping_add(1).max(1);
     }
 
     /// # Errors
@@ -775,6 +946,14 @@ pub enum CalibrationSessionError {
     SourceChanged(CalibrationItemId),
     #[error("calibration result is stale")]
     StaleResult,
+    #[error("automatic candidate input already exists in the dataset")]
+    AutoCandidateAlreadyPresent,
+    #[error("automatic candidate binding is stale")]
+    StaleAutoCandidate,
+    #[error("automatic candidate PNG revision is invalid or mismatched")]
+    InvalidAutoCandidateRevision,
+    #[error("automatic candidate identity does not match its stream frame")]
+    InvalidAutoCandidateIdentity,
     #[error("calibration needs at least {required} detected views, found {found}")]
     NotEnoughViews { found: usize, required: usize },
     #[error("calibration images must share one size: expected {expected:?}, got {actual:?}")]
@@ -1145,5 +1324,84 @@ mod tests {
         assert!(session.installed().is_some());
         session.set_enabled(session.items()[0].id, false).unwrap();
         assert!(session.installed().is_none());
+    }
+
+    fn auto_candidate_fixture(
+        session: &CalibrationSession,
+        candidate_id: u64,
+        sequence: u64,
+    ) -> (AutoCandidateToken, CalibrationInputRevision) {
+        let identity = StreamFrameIdentity::unavailable(
+            StreamSessionId::new("auto-capture-test").unwrap(),
+            0,
+            sequence,
+            "test fixture",
+        );
+        let revision = CalibrationInputRevision::EphemeralPng {
+            content_sha256: format!("{sequence:064x}"),
+            encoded_bytes: 128,
+        };
+        let token = session
+            .bind_auto_candidate(
+                AutoCandidateId::new(candidate_id),
+                identity,
+                revision.clone(),
+                format!("candidate-{sequence}"),
+            )
+            .unwrap();
+        (token, revision)
+    }
+
+    #[test]
+    fn stale_auto_admission_revision_cannot_mutate_dataset() {
+        let mut session = CalibrationSession::new(board());
+        let (token, revision) = auto_candidate_fixture(&session, 1, 7);
+        session.invalidate_auto_admission();
+        let ChessboardDetectionOutcome::Found(found) = detection() else {
+            panic!("fixture must contain a found detection");
+        };
+
+        assert_eq!(
+            session.commit_auto_candidate(AutoCandidateCommit::new(token, revision, found)),
+            Err(CalibrationSessionError::StaleAutoCandidate)
+        );
+        assert!(session.items().is_empty());
+        assert_eq!(session.selected(), None);
+    }
+
+    #[test]
+    fn auto_candidate_commit_preserves_active_dataset_detection_token() {
+        let mut session = CalibrationSession::new(board());
+        let AddCalibrationItemOutcome::Added(dataset_id) = session.add_or_refresh(
+            reference("dataset.png"),
+            version(10),
+            "dataset.png".to_owned(),
+        ) else {
+            panic!("expected dataset item");
+        };
+        let dataset_token = session.begin_detection(dataset_id).unwrap();
+        let (candidate_token, candidate_revision) = auto_candidate_fixture(&session, 1, 8);
+        let ChessboardDetectionOutcome::Found(candidate_detection) = detection() else {
+            panic!("fixture must contain a found detection");
+        };
+        session
+            .commit_auto_candidate(AutoCandidateCommit::new(
+                candidate_token,
+                candidate_revision,
+                candidate_detection,
+            ))
+            .unwrap();
+
+        session.mark_reading(&dataset_token).unwrap();
+        session.mark_detect_queued(&dataset_token).unwrap();
+        session.mark_detecting(&dataset_token).unwrap();
+        session
+            .install_detection(&dataset_token, version(10), detection())
+            .unwrap();
+        assert!(matches!(
+            session.item(dataset_id).unwrap().status,
+            CalibrationItemStatus::Found(_)
+        ));
+        assert_eq!(session.items().len(), 2);
     }
 }
