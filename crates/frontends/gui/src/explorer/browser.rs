@@ -1110,6 +1110,26 @@ mod tests {
 
     #[test]
     fn narrow_columns_keep_long_name_and_size_in_separate_cells() {
+        fn shape_contains_text(shape: &egui::epaint::Shape, needle: &str) -> bool {
+            match shape {
+                egui::epaint::Shape::Text(text) => text.galley.job.text.contains(needle),
+                egui::epaint::Shape::Vec(shapes) => shapes
+                    .iter()
+                    .any(|shape| shape_contains_text(shape, needle)),
+                _ => false,
+            }
+        }
+
+        fn text_clip_rect(output: &egui::FullOutput, needle: &str) -> egui::Rect {
+            output
+                .shapes
+                .iter()
+                .find_map(|clipped| {
+                    shape_contains_text(&clipped.shape, needle).then_some(clipped.clip_rect)
+                })
+                .unwrap_or_else(|| panic!("rendered text {needle:?} must be visible"))
+        }
+
         let mut entry = file(&format!("{}.raw", "long_file_name_".repeat(24)));
         entry.version.size = u64::MAX;
         let long_size = format_entry_size(&entry);
@@ -1128,34 +1148,34 @@ mod tests {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(96.0, 64.0),
+                egui::vec2(96.0, 180.0),
             )),
             ..Default::default()
         };
-        let mut cells = None;
-        context.run_ui(input, |ui| {
-            ui.horizontal(|ui| {
-                let (name_width, size_width) =
-                    file_table_column_widths(ui.available_width(), ui.spacing().item_spacing.x);
-                let (name_rect, _) = render_clipped_cell(
-                    ui,
-                    egui::vec2(name_width, 22.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| ui.add(egui::Button::new(entry.name.as_str())),
-                );
-                let (size_rect, _) = render_clipped_cell(
-                    ui,
-                    egui::vec2(size_width, 22.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| ui.monospace(&long_size),
-                );
-                cells = Some((name_rect, size_rect));
-            });
+        let mut browser = BrowserState::default();
+        let mut selection = BrowserSelection::default();
+        let output = context.run_ui(input, |ui| {
+            let _ = browser.render(
+                &context,
+                ui,
+                &entry.reference.source_id,
+                &SourcePath::root(),
+                "/workspace",
+                std::slice::from_ref(&entry),
+                &mut selection,
+                FileSystemCapabilities::READ_WRITE,
+                false,
+            );
         });
-        let (name_rect, size_rect) = cells.expect("both narrow cells are rendered");
+        let name_clip = text_clip_rect(&output, entry.name.as_str());
+        let size_clip = text_clip_rect(&output, &long_size);
         assert!(
-            name_rect.right() <= size_rect.left(),
-            "long content must not move the size cell: {name_rect:?}, {size_rect:?}"
+            name_clip.right() <= size_clip.left(),
+            "actual entry row must clip Name before Size: {name_clip:?}, {size_clip:?}"
+        );
+        assert!(
+            size_clip.right() <= 96.0 + f32::EPSILON,
+            "Size cell must stay inside the narrow Explorer: {size_clip:?}"
         );
     }
 
