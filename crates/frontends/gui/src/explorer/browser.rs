@@ -256,46 +256,106 @@ impl BrowserState {
 
         ui.separator();
         ui.horizontal(|ui| {
-            ui.strong("Name");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.strong("Size");
-            });
+            let (name_width, size_width) =
+                file_table_column_widths(ui.available_width(), ui.spacing().item_spacing.x);
+            render_clipped_cell(
+                ui,
+                egui::vec2(name_width, 24.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| ui.strong("Name"),
+            );
+            render_clipped_cell(
+                ui,
+                egui::vec2(size_width, 24.0),
+                egui::Layout::right_to_left(egui::Align::Center),
+                |ui| ui.strong("Size"),
+            );
         });
         ui.separator();
 
         let table = ui.vertical(|ui| {
             ui.set_min_height(ui.available_height());
             egui::ScrollArea::vertical().show(ui, |ui| {
-                let parent_command = Self::render_parent_row(ui, current_directory, busy);
+                let parent_command = ui.horizontal(|ui| {
+                    let (name_width, size_width) =
+                        file_table_column_widths(ui.available_width(), ui.spacing().item_spacing.x);
+                    let parent_command = render_clipped_cell(
+                        ui,
+                        egui::vec2(name_width, 22.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| Self::render_parent_name_cell(ui, current_directory, busy),
+                    );
+                    render_clipped_cell(
+                        ui,
+                        egui::vec2(size_width, 22.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| ui.monospace("—"),
+                    );
+                    parent_command
+                });
                 if command.is_none() {
-                    command = parent_command;
+                    command = parent_command.inner;
                 }
-                if let Some(editor_command) = self.render_new_folder_editor(ui, busy)
-                    && command.is_none()
-                {
-                    command = Some(editor_command);
+                if matches!(self.editor, Some(EntryEditor::NewFolder { .. })) {
+                    let editor_command = ui.horizontal(|ui| {
+                        let (name_width, size_width) = file_table_column_widths(
+                            ui.available_width(),
+                            ui.spacing().item_spacing.x,
+                        );
+                        let editor_command = render_clipped_cell(
+                            ui,
+                            egui::vec2(name_width, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| self.render_new_folder_editor(ui, busy),
+                        );
+                        render_clipped_cell(
+                            ui,
+                            egui::vec2(size_width, 22.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.monospace("—"),
+                        );
+                        editor_command
+                    });
+                    if command.is_none() {
+                        command = editor_command.inner;
+                    }
                 }
                 for entry in entries {
+                    let entry_command = ui.horizontal(|ui| {
+                        let (name_width, size_width) = file_table_column_widths(
+                            ui.available_width(),
+                            ui.spacing().item_spacing.x,
+                        );
+                        let entry_command = render_clipped_cell(
+                            ui,
+                            egui::vec2(name_width, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                if self.editor_matches(entry) {
+                                    self.render_rename_editor(ui, busy)
+                                } else {
+                                    self.render_entry_name_cell(
+                                        ui,
+                                        entry,
+                                        entries,
+                                        selection,
+                                        &current,
+                                        capabilities,
+                                        busy,
+                                    )
+                                }
+                            },
+                        );
+                        render_clipped_cell(
+                            ui,
+                            egui::vec2(size_width, 22.0),
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| ui.monospace(format_entry_size(entry)),
+                        );
+                        entry_command
+                    });
                     if command.is_none() {
-                        command = self.render_entry_row(
-                            ui,
-                            entry,
-                            entries,
-                            selection,
-                            &current,
-                            capabilities,
-                            busy,
-                        );
-                    } else {
-                        self.render_entry_row(
-                            ui,
-                            entry,
-                            entries,
-                            selection,
-                            &current,
-                            capabilities,
-                            busy,
-                        );
+                        command = entry_command.inner;
                     }
                 }
             });
@@ -401,34 +461,25 @@ impl BrowserState {
         resolve_navigation_command(command, commit_path, &self.navigation_value)
     }
 
-    fn render_parent_row(
+    fn render_parent_name_cell(
         ui: &mut egui::Ui,
         current_directory: &SourcePath,
         busy: bool,
     ) -> Option<BrowserCommand> {
         let enabled = !current_directory.is_root() && !busy;
-        let row = ui.horizontal(|ui| {
-            let size_width = 76.0;
-            let name_width =
-                (ui.available_width() - size_width - ui.spacing().item_spacing.x).max(48.0);
-            let response = ui.add_enabled(
-                enabled,
-                egui::Button::selectable(false, ())
-                    .left_text("[D] ...")
-                    .min_size(egui::vec2(name_width, 22.0))
-                    .sense(egui::Sense::click()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.monospace("—");
-            });
-            response
-        });
-        (row.inner.double_clicked_by(egui::PointerButton::Primary) && enabled)
+        let response = ui.add_enabled(
+            enabled,
+            egui::Button::selectable(false, ())
+                .left_text("[D] ...")
+                .min_size(egui::vec2(ui.available_width(), 22.0))
+                .sense(egui::Sense::click()),
+        );
+        (response.double_clicked_by(egui::PointerButton::Primary) && enabled)
             .then_some(BrowserCommand::NavigateUp)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn render_entry_row(
+    fn render_entry_name_cell(
         &mut self,
         ui: &mut egui::Ui,
         entry: &FileEntry,
@@ -438,11 +489,6 @@ impl BrowserState {
         capabilities: FileSystemCapabilities,
         busy: bool,
     ) -> Option<BrowserCommand> {
-        if self.editor_matches(entry) {
-            return self.render_rename_editor(ui, busy);
-        }
-
-        let mut command = None;
         let icon = match entry.kind {
             FileKind::Directory => "[D]",
             FileKind::File => "[F]",
@@ -450,22 +496,13 @@ impl BrowserState {
             FileKind::Other => "[?]",
         };
         let selected_row = selection.contains(&entry.reference.path);
-        let row = ui.horizontal(|ui| {
-            let size_width = 76.0;
-            let name_width =
-                (ui.available_width() - size_width - ui.spacing().item_spacing.x).max(48.0);
-            let response = ui.add_sized(
-                [name_width, 22.0],
-                egui::Button::selectable(selected_row, ())
-                    .left_text(format!("{icon} {}", entry.name))
-                    .sense(egui::Sense::click_and_drag()),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.monospace(format_entry_size(entry));
-            });
-            response
-        });
-        let response = row.inner;
+        let response = ui.add_sized(
+            [ui.available_width(), 22.0],
+            egui::Button::selectable(selected_row, ())
+                .left_text(format!("{icon} {}", entry.name))
+                .sense(egui::Sense::click_and_drag()),
+        );
+        let mut command = None;
         if response.clicked_by(egui::PointerButton::Primary) {
             let modifiers = ui.input(|input| input.modifiers);
             selection.select(entries, &entry.reference.path, modifiers);
@@ -849,6 +886,31 @@ fn validate_move(entry: &FileEntry, destination: &DirectoryRef) -> Result<(), St
     Ok(())
 }
 
+/// 所有宽度均由当前行的可用空间切分；内容长度不会改变列几何关系。
+fn file_table_column_widths(available_width: f32, spacing: f32) -> (f32, f32) {
+    const PREFERRED_SIZE_WIDTH: f32 = 80.0;
+    const RESERVED_NAME_WIDTH: f32 = 48.0;
+
+    let usable_width = (available_width - spacing).max(0.0);
+    let size_width = (usable_width - RESERVED_NAME_WIDTH).clamp(0.0, PREFERRED_SIZE_WIDTH);
+    let name_width = usable_width - size_width;
+    (name_width, size_width)
+}
+
+/// 将子控件限制在分配给它的列中，避免长文件名或尺寸文本越过分栏边界。
+fn render_clipped_cell<T>(
+    ui: &mut egui::Ui,
+    size: egui::Vec2,
+    layout: egui::Layout,
+    add_contents: impl FnOnce(&mut egui::Ui) -> T,
+) -> T {
+    ui.allocate_ui_with_layout(size, layout, |ui| {
+        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
+        add_contents(ui)
+    })
+    .inner
+}
+
 fn format_entry_size(entry: &FileEntry) -> String {
     if entry.kind == FileKind::Directory {
         "—".to_owned()
@@ -1041,6 +1103,23 @@ mod tests {
         );
         assert!(!selection.contains(&entries[2].reference.path));
         assert_eq!(selection.len(), 3);
+    }
+
+    #[test]
+    fn narrow_columns_keep_long_name_and_size_in_separate_cells() {
+        let mut entry = file(&format!("{}.raw", "long_file_name_".repeat(24)));
+        entry.version.size = u64::MAX;
+        assert!(entry.name.as_str().len() > 80);
+        assert!(format_entry_size(&entry).len() > 8);
+
+        // 列宽只取决于面板几何；长内容由 render_clipped_cell 裁剪，不能扩张到相邻列。
+        for available_width in [24.0, 56.0, 96.0, 160.0, 480.0] {
+            let spacing = 8.0;
+            let (name_width, size_width) = file_table_column_widths(available_width, spacing);
+            assert!(name_width >= 0.0);
+            assert!(size_width >= 0.0);
+            assert!(name_width + size_width + spacing <= available_width + f32::EPSILON);
+        }
     }
 
     #[test]
