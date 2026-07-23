@@ -1,0 +1,301 @@
+name: FFmpeg Dependencies
+
+"on":
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Create-once dependency recipe revision
+        required: true
+        default: "1"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-deps-8.1.2-r${{ inputs.revision }}
+  cancel-in-progress: false
+
+env:
+  FFMPEG_VERSION: "8.1.2"
+  FFMPEG_COMMIT: "38b88335f99e76ed89ff3c93f877fdefce736c13"
+  FFMPEG_SOURCE_SHA256: "464beb5e7bf0c311e68b45ae2f04e9cc2af88851abb4082231742a74d97b524c"
+
+jobs:
+  preflight:
+    name: Validate dependency release request
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    outputs:
+      release_tag: ${{ steps.validate.outputs.release_tag }}
+    steps:
+      - name: Validate main ref, revision, and unused release target
+        id: validate
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" != "refs/heads/$DEFAULT_BRANCH" ]]; then
+            echo "FFmpeg dependency releases must be dispatched from $DEFAULT_BRANCH" >&2
+            exit 1
+          fi
+          if [[ ! "$REVISION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "revision must be a positive integer" >&2
+            exit 1
+          fi
+          release_tag="ffmpeg-deps-v${FFMPEG_VERSION}-r${REVISION}"
+          if gh release view "$release_tag" >/dev/null 2>&1 || \
+             gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${release_tag}" >/dev/null 2>&1; then
+            echo "dependency tag or release already exists: $release_tag" >&2
+            exit 1
+          fi
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+  build-linux:
+    name: Build ${{ matrix.platform }}
+    needs: preflight
+    runs-on: ${{ matrix.runner }}
+    container: ubuntu:${{ matrix.ubuntu }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux-x86_64-ubuntu20
+            runner: ubuntu-22.04
+            ubuntu: "20.04"
+          - platform: linux-x86_64-ubuntu22
+            runner: ubuntu-22.04
+            ubuntu: "22.04"
+          - platform: linux-aarch64-ubuntu20
+            runner: ubuntu-24.04-arm
+            ubuntu: "20.04"
+          - platform: linux-aarch64-ubuntu22
+            runner: ubuntu-24.04-arm
+            ubuntu: "22.04"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build prerequisites
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential ca-certificates curl file make nasm pkg-config xz-utils
+      - name: Build, package, and smoke FFmpeg
+        env:
+          PLATFORM: ${{ matrix.platform }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/ffmpeg-$PLATFORM"
+          prefix="$scratch/prefix"
+          mkdir -p "$scratch" "$GITHUB_WORKSPACE/dist"
+          curl --fail --location --retry 3 --output "$scratch/source.tar.xz" \
+            "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          echo "${FFMPEG_SOURCE_SHA256}  $scratch/source.tar.xz" | sha256sum --check --strict
+          tar -C "$scratch" -xf "$scratch/source.tar.xz"
+          cd "$scratch/ffmpeg-${FFMPEG_VERSION}"
+          ./configure --prefix="$prefix" --disable-autodetect --disable-debug --disable-doc \
+            --disable-programs --disable-static --enable-shared --enable-small \
+            --enable-protocol=rtp,tcp,udp --enable-demuxer=rtsp \
+            --enable-decoder=h264,hevc --enable-parser=h264,hevc --enable-swscale
+          make -j"$(nproc)"
+          make install
+          runtime="$prefix/lib"
+          test -f "$prefix/include/libavcodec/avcodec.h"
+          test -d "$prefix/lib/pkgconfig"
+          for library in avutil avcodec avformat swscale; do find "$runtime" -name "lib${library}.so*" -print -quit | grep -q .; done
+          stage="$scratch/stage/ffmpeg"
+          mkdir -p "$stage/runtime" "$stage/licenses"
+          cp -aL "$prefix/include" "$prefix/lib" "$stage/"
+          cp -aL "$runtime"/libav*.so* "$runtime"/libswscale*.so* "$stage/runtime/"
+          cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
+          printf 'ffmpeg_version=%s\nffmpeg_commit=%s\nsource_sha256=%s\nrecipe_revision=%s\n' \
+            "$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$FFMPEG_SOURCE_SHA256" "$REVISION" > "$stage/MANIFEST"
+          cat > "$scratch/smoke.c" <<'EOF'
+          #include <libavcodec/avcodec.h>
+          #include <libavformat/avformat.h>
+          #include <libavutil/avutil.h>
+          #include <libswscale/swscale.h>
+          int main(void) {
+              return avcodec_version() == 0 || avformat_version() == 0 ||
+                     avutil_version() == 0 || swscale_version() == 0;
+          }
+          EOF
+          cc "$scratch/smoke.c" -I"$stage/include" -L"$stage/lib" \
+            -lavcodec -lavformat -lavutil -lswscale \
+            -Wl,-rpath,"$stage/runtime" -o "$scratch/ffmpeg-dependency-smoke"
+          "$scratch/ffmpeg-dependency-smoke"
+          test -z "$(find "$stage" -type l -print -quit)"
+          archive="ffmpeg-${FFMPEG_VERSION}-r${REVISION}-${PLATFORM}.tar.gz"
+          tar -C "$scratch/stage" -czf "$GITHUB_WORKSPACE/dist/$archive" ffmpeg
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum "$archive" > "$archive.sha256")
+          python3 "$GITHUB_WORKSPACE/scripts/ffmpeg_dependency.py" verify-archive \
+            --platform "$PLATFORM" "$GITHUB_WORKSPACE/dist/$archive"
+      - name: Upload verified dependency
+        uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-${{ matrix.platform }}
+          path: |
+            dist/ffmpeg-*.tar.gz
+            dist/ffmpeg-*.tar.gz.sha256
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macos-aarch64-macos14
+    needs: preflight
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build, package, and smoke FFmpeg
+        env:
+          PLATFORM: macos-aarch64-macos14
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/ffmpeg-$PLATFORM"
+          prefix="$scratch/prefix"
+          mkdir -p "$scratch" "$GITHUB_WORKSPACE/dist"
+          curl --fail --location --retry 3 --output "$scratch/source.tar.xz" "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          echo "${FFMPEG_SOURCE_SHA256}  $scratch/source.tar.xz" | shasum -a 256 --check
+          tar -C "$scratch" -xf "$scratch/source.tar.xz"
+          cd "$scratch/ffmpeg-${FFMPEG_VERSION}"
+          ./configure --prefix="$prefix" --arch=arm64 --install-name-dir='@rpath' \
+            --disable-autodetect --disable-debug --disable-doc --disable-programs \
+            --disable-static --enable-shared --enable-small --enable-protocol=rtp,tcp,udp \
+            --enable-demuxer=rtsp --enable-decoder=h264,hevc \
+            --enable-parser=h264,hevc --enable-swscale
+          make -j"$(sysctl -n hw.ncpu)"
+          make install
+          stage="$scratch/stage/ffmpeg"
+          mkdir -p "$stage/runtime" "$stage/licenses"
+          cp -RL "$prefix/include" "$prefix/lib" "$stage/"
+          cp -L "$prefix/lib"/libav*.dylib "$prefix/lib"/libswscale*.dylib "$stage/runtime/"
+          ! otool -L "$stage/runtime"/libavcodec*.dylib | grep -F "$prefix"
+          cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
+          printf 'ffmpeg_version=%s\nffmpeg_commit=%s\nsource_sha256=%s\nrecipe_revision=%s\n' "$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$FFMPEG_SOURCE_SHA256" "$REVISION" > "$stage/MANIFEST"
+          cat > "$scratch/smoke.c" <<'EOF'
+          #include <libavcodec/avcodec.h>
+          #include <libavformat/avformat.h>
+          #include <libavutil/avutil.h>
+          #include <libswscale/swscale.h>
+          int main(void) {
+              return avcodec_version() == 0 || avformat_version() == 0 ||
+                     avutil_version() == 0 || swscale_version() == 0;
+          }
+          EOF
+          cc "$scratch/smoke.c" -I"$stage/include" -L"$stage/lib" \
+            -lavcodec -lavformat -lavutil -lswscale \
+            -Wl,-rpath,"$stage/runtime" -o "$scratch/ffmpeg-dependency-smoke"
+          "$scratch/ffmpeg-dependency-smoke"
+          test -z "$(find "$stage" -type l -print -quit)"
+          archive="ffmpeg-${FFMPEG_VERSION}-r${REVISION}-${PLATFORM}.tar.gz"
+          tar -C "$scratch/stage" -czf "$GITHUB_WORKSPACE/dist/$archive" ffmpeg
+          (cd "$GITHUB_WORKSPACE/dist" && shasum -a 256 "$archive" > "$archive.sha256")
+          python3 "$GITHUB_WORKSPACE/scripts/ffmpeg_dependency.py" verify-archive \
+            --platform "$PLATFORM" "$GITHUB_WORKSPACE/dist/$archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-macos-aarch64-macos14
+          path: |
+            dist/ffmpeg-*.tar.gz
+            dist/ffmpeg-*.tar.gz.sha256
+          if-no-files-found: error
+
+  build-windows:
+    name: Build windows-x86_64-msvc
+    needs: preflight
+    runs-on: windows-latest
+    steps:
+      - uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+      - uses: msys2/setup-msys2@v2
+        with:
+          install: make nasm pkgconf diffutils zip
+      - uses: actions/checkout@v4
+      - name: Build, package, and smoke FFmpeg
+        shell: msys2 {0}
+        env:
+          PLATFORM: windows-x86_64-msvc
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          scratch="$RUNNER_TEMP/ffmpeg-$PLATFORM"
+          prefix="$scratch/prefix"
+          mkdir -p "$scratch" "$GITHUB_WORKSPACE/dist"
+          curl --fail --location --retry 3 --output "$scratch/source.tar.xz" "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
+          echo "${FFMPEG_SOURCE_SHA256}  $scratch/source.tar.xz" | sha256sum --check --strict
+          tar -C "$scratch" -xf "$scratch/source.tar.xz"
+          cd "$scratch/ffmpeg-${FFMPEG_VERSION}"
+          ./configure --toolchain=msvc --arch=x86_64 --target-os=win64 --prefix="$prefix" \
+            --disable-autodetect --disable-debug --disable-doc --disable-programs --disable-static \
+            --enable-shared --enable-small --enable-protocol=rtp,tcp,udp --enable-demuxer=rtsp \
+            --enable-decoder=h264,hevc --enable-parser=h264,hevc --enable-swscale
+          make -j"$(nproc)"
+          make install
+          stage="$scratch/stage/ffmpeg"
+          mkdir -p "$stage/runtime" "$stage/licenses"
+          cp -aL "$prefix/include" "$prefix/lib" "$stage/"
+          cp -aL "$prefix/bin"/av*.dll "$prefix/bin"/swscale*.dll "$stage/runtime/"
+          cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
+          printf 'ffmpeg_version=%s\nffmpeg_commit=%s\nsource_sha256=%s\nrecipe_revision=%s\n' "$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$FFMPEG_SOURCE_SHA256" "$REVISION" > "$stage/MANIFEST"
+          archive="ffmpeg-${FFMPEG_VERSION}-r${REVISION}-${PLATFORM}.zip"
+          cat > "$scratch/smoke.c" <<'EOF'
+          #include <libavcodec/avcodec.h>
+          #include <libavformat/avformat.h>
+          #include <libavutil/avutil.h>
+          #include <libswscale/swscale.h>
+          int main(void) {
+              return avcodec_version() == 0 || avformat_version() == 0 ||
+                     avutil_version() == 0 || swscale_version() == 0;
+          }
+          EOF
+          cl /nologo /I"$stage/include" "$scratch/smoke.c" /link \
+            /LIBPATH:"$stage/lib" avcodec.lib avformat.lib avutil.lib swscale.lib \
+            /OUT:"$scratch/ffmpeg-dependency-smoke.exe"
+          PATH="$stage/runtime:$PATH" "$scratch/ffmpeg-dependency-smoke.exe"
+          test -z "$(find "$stage" -type l -print -quit)"
+          (cd "$scratch/stage" && zip -qr "$GITHUB_WORKSPACE/dist/$archive" ffmpeg)
+          (cd "$GITHUB_WORKSPACE/dist" && sha256sum "$archive" > "$archive.sha256")
+
+          python "$GITHUB_WORKSPACE/scripts/ffmpeg_dependency.py" verify-archive \
+            --platform "$PLATFORM" "$GITHUB_WORKSPACE/dist/$archive"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffmpeg-windows-x86_64-msvc
+          path: |
+            dist/ffmpeg-*.zip
+            dist/ffmpeg-*.zip.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish immutable dependency release
+    needs: [preflight, build-linux, build-macos, build-windows]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ffmpeg-*
+          path: dist
+          merge-multiple: true
+      - name: Verify and create release checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          test "$(find . -name 'ffmpeg-*.tar.gz' -o -name 'ffmpeg-*.zip' | wc -l)" -eq 6
+          cat ./*.sha256 > SHA256SUMS
+          sha256sum --check --strict SHA256SUMS
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ needs.preflight.outputs.release_tag }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/ffmpeg-*.tar.gz
+            dist/ffmpeg-*.zip
+            dist/SHA256SUMS
