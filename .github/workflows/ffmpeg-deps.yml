@@ -117,8 +117,9 @@ jobs:
           for library in avutil avcodec avformat swscale swresample; do find "$runtime" -name "lib${library}.so*" -print -quit | grep -q .; done
           stage="$scratch/stage/ffmpeg"
           mkdir -p "$stage/runtime" "$stage/licenses"
-          cp -aL "$prefix/include" "$prefix/lib" "$stage/"
-          cp -aL "$runtime"/libav*.so* "$runtime"/libswscale*.so* "$runtime"/libswresample*.so* "$stage/runtime/"
+          # 不保留 hardlink；consumer 会拒绝任何 archive link entry。
+          cp -RL "$prefix/include" "$prefix/lib" "$stage/"
+          cp -L "$runtime"/libav*.so* "$runtime"/libswscale*.so* "$runtime"/libswresample*.so* "$stage/runtime/"
           # RUNPATH 只对直接依赖生效；每个 FFmpeg 共享库都必须从同目录解析其传递依赖。
           find "$stage/runtime" -type f -name 'lib*.so*' -exec patchelf --set-rpath '$ORIGIN' {} +
           cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
@@ -233,7 +234,9 @@ jobs:
           set -euo pipefail
           platform_id="windows-x86_64-msvc"
           revision="${{ inputs.revision }}"
-          scratch="$RUNNER_TEMP/ffmpeg-$platform_id"
+          # GitHub 注入的是 Win32 路径；MSYS tar/make 只能安全处理 POSIX 路径。
+          scratch="$(cygpath -u "$RUNNER_TEMP")/ffmpeg-$platform_id"
+          GITHUB_WORKSPACE="$(cygpath -u "$GITHUB_WORKSPACE")"
           prefix="$scratch/prefix"
           mkdir -p "$scratch" "$GITHUB_WORKSPACE/dist"
           : "${VCToolsInstallDir:?MSVC environment was not initialized}"
@@ -265,8 +268,8 @@ jobs:
           make install
           stage="$scratch/stage/ffmpeg"
           mkdir -p "$stage/runtime" "$stage/licenses"
-          cp -aL "$prefix/include" "$prefix/lib" "$stage/"
-          cp -aL "$prefix/bin"/av*.dll "$prefix/bin"/swscale*.dll "$prefix/bin"/swresample*.dll "$stage/runtime/"
+          cp -RL "$prefix/include" "$prefix/lib" "$stage/"
+          cp -L "$prefix/bin"/av*.dll "$prefix/bin"/swscale*.dll "$prefix/bin"/swresample*.dll "$stage/runtime/"
           cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
           printf 'ffmpeg_version=%s\nffmpeg_commit=%s\nsource_sha256=%s\nrecipe_revision=%s\n' "$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$FFMPEG_SOURCE_SHA256" "$revision" > "$stage/MANIFEST"
           archive="ffmpeg-${FFMPEG_VERSION}-r${revision}-${platform_id}.zip"
