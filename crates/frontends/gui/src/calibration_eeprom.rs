@@ -441,7 +441,7 @@ impl CalibrationEepromState {
                 ui.add(egui::DragValue::new(&mut self.target_i2c_bus));
             });
             ui.weak(
-                "The remote helper path is fixed by the installation package. Host identity is pinned automatically by Explorer SFTP TOFU.",
+                "Before each EEPROM operation, Camera Toolbox uploads the bundled companion helper to /usr/local/libexec/camera-toolbox-eeprom-helper, runs chmod 755, then reuses the Explorer SFTP password. SSH host keys are not saved or verified.",
             );
             if ui
                 .add_enabled(

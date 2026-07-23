@@ -9,15 +9,25 @@ use camera_toolbox_app::{
 };
 use camera_toolbox_core::{YG_STEREO_P24C64G_IMAGE_BYTES, YG_STEREO_P24C64G_V1_MAP_ID};
 
-use super::{
-    ServerHostKey,
-    connection::{
-        CredentialResolver, SshConnectionTarget, SshTransportFactory, TransportCommandOutput,
-    },
+use super::connection::{
+    CredentialResolver, SshConnectionTarget, SshTransportFactory, SshTransportSession,
+    TransportCommandOutput,
 };
 
-/// 由目标板安装包提供的固定 helper；GUI 和 operation 均不能覆盖。
+/// GUI 每次 EEPROM 操作前都会把本地 companion helper 覆盖上传到该固定路径并 chmod 755。
 pub const EEPROM_HELPER_PROGRAM: &str = "/usr/local/libexec/camera-toolbox-eeprom-helper";
+const EEPROM_HELPER_INSTALL_PROGRAM: &str = "/bin/sh";
+const EEPROM_HELPER_INSTALL_SCRIPT: &str = concat!(
+    "set -u; ",
+    "umask 022; ",
+    "helper=/usr/local/libexec/camera-toolbox-eeprom-helper; ",
+    "if mkdir -p /usr/local/libexec; then ",
+    "if cat > \"$helper\"; then ",
+    "chmod 755 \"$helper\"; ",
+    "else status=$?; cat >/dev/null; exit \"$status\"; fi; ",
+    "else status=$?; cat >/dev/null; exit \"$status\"; fi",
+);
+const EEPROM_HELPER_INSTALL_OUTPUT_LIMIT: usize = 4096;
 
 pub struct SshEepromProvisionService {
     service_id: String,
@@ -25,6 +35,7 @@ pub struct SshEepromProvisionService {
     credential_ref: String,
     output_limit: usize,
     helper_target: EepromHelperTarget,
+    helper_payload: Arc<[u8]>,
     resolver: Arc<dyn CredentialResolver>,
     transport: Arc<dyn SshTransportFactory>,
 }
@@ -34,27 +45,16 @@ impl SshEepromProvisionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         service_id: String,
-        target: SshConnectionTarget,
+        mut target: SshConnectionTarget,
         credential_ref: String,
         output_limit_bytes: u64,
         i2c_bus: u16,
+        helper_payload: Arc<[u8]>,
         resolver: Arc<dyn CredentialResolver>,
         transport: Arc<dyn SshTransportFactory>,
     ) -> Result<Self, EepromProvisionServiceError> {
-        let expected_host_key = target
-            .expected_host_key
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                EepromProvisionServiceError::Protocol(
-                    "EEPROM SSH target requires a pinned server host key".to_owned(),
-                )
-            })?;
-        ServerHostKey::from_openssh(expected_host_key).map_err(|error| {
-            EepromProvisionServiceError::Protocol(format!(
-                "EEPROM SSH target host key is invalid: {error}"
-            ))
-        })?;
+        // EEPROM 复用 Explorer SFTP 的密码会话；与 SFTP 一致，不持久化或校验 SSH host key。
+        target.expected_host_key = None;
         if !(1_024..=1_048_576).contains(&output_limit_bytes) {
             return Err(EepromProvisionServiceError::Protocol(
                 "EEPROM helper output limit must be within 1024..=1048576".to_owned(),
@@ -74,6 +74,7 @@ impl SshEepromProvisionService {
                 map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
                 i2c_bus: u32::from(i2c_bus),
             },
+            helper_payload,
             resolver,
             transport,
         })
@@ -116,7 +117,12 @@ impl EepromProvisionService for SshEepromProvisionService {
         let mut session = self
             .transport
             .connect(&self.target, credential, &control)
-            .map_err(|error| EepromProvisionServiceError::Transport(error.to_string()))?;
+            .map_err(|error| {
+                EepromProvisionServiceError::Transport(format!(
+                    "EEPROM SSH connection failed: {error}"
+                ))
+            })?;
+        install_helper(&mut *session, &self.helper_payload, &control)?;
         let output = session
             .execute_argv_with_stdin(
                 &[EEPROM_HELPER_PROGRAM.to_owned(), "--json-stdin".to_owned()],
@@ -124,9 +130,47 @@ impl EepromProvisionService for SshEepromProvisionService {
                 self.output_limit,
                 &control,
             )
-            .map_err(|error| EepromProvisionServiceError::Transport(error.to_string()))?;
+            .map_err(|error| {
+                EepromProvisionServiceError::Transport(format!(
+                    "EEPROM helper execution failed: {error}"
+                ))
+            })?;
         decode_output(&request.action, output)
     }
+}
+
+fn install_helper(
+    session: &mut dyn SshTransportSession,
+    helper_payload: &[u8],
+    control: &RemoteOperationControl,
+) -> Result<(), EepromProvisionServiceError> {
+    let output = session
+        .execute_argv_with_stdin(
+            &[
+                EEPROM_HELPER_INSTALL_PROGRAM.to_owned(),
+                "-c".to_owned(),
+                EEPROM_HELPER_INSTALL_SCRIPT.to_owned(),
+            ],
+            helper_payload,
+            EEPROM_HELPER_INSTALL_OUTPUT_LIMIT,
+            control,
+        )
+        .map_err(|error| {
+            EepromProvisionServiceError::Transport(format!(
+                "EEPROM helper upload command failed: {error}"
+            ))
+        })?;
+    if output.exit_status == Some(0) {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Err(EepromProvisionServiceError::Transport(format!(
+        "EEPROM helper upload failed: exit={:?}, stderr={}, stdout={}",
+        output.exit_status,
+        stderr.trim(),
+        stdout.trim()
+    )))
 }
 
 fn validate_action(
@@ -290,10 +334,25 @@ mod tests {
         EepromProvisionRequest, EepromProvisioningMode, YG_STEREO_P24C64G_V1_MAP_ID,
     };
 
+    use super::super::connection::{SshCredential, SshTransportError};
     use super::super::memory_transport::MemorySshTransport;
 
-    const PINNED_HOST_KEY: &str =
+    struct FailingConnectTransport;
+
+    impl SshTransportFactory for FailingConnectTransport {
+        fn connect(
+            &self,
+            _target: &SshConnectionTarget,
+            _credential: SshCredential,
+            _control: &RemoteOperationControl,
+        ) -> Result<Box<dyn SshTransportSession>, SshTransportError> {
+            Err(SshTransportError::TimedOut)
+        }
+    }
+
+    const STALE_HOST_KEY: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f";
+    const HELPER_PAYLOAD: &[u8] = b"test-eeprom-helper-binary";
 
     fn device_state(hash: char) -> EepromDeviceState {
         EepromDeviceState {
@@ -324,19 +383,24 @@ mod tests {
         }
     }
 
-    fn service(
+    fn service(memory: &Arc<MemorySshTransport>) -> SshEepromProvisionService {
+        service_with_target(memory, target(None))
+    }
+
+    fn service_with_target(
         memory: &Arc<MemorySshTransport>,
-        expected_host_key: &str,
+        target: SshConnectionTarget,
     ) -> SshEepromProvisionService {
         memory.allow_credential("slot:test");
         let resolver: Arc<dyn CredentialResolver> = memory.clone();
         let transport: Arc<dyn SshTransportFactory> = memory.clone();
         SshEepromProvisionService::new(
             "test-eeprom".to_owned(),
-            target(Some(expected_host_key)),
+            target,
             "slot:test".to_owned(),
             4096,
             7,
+            Arc::<[u8]>::from(HELPER_PAYLOAD),
             resolver,
             transport,
         )
@@ -356,13 +420,49 @@ mod tests {
     }
 
     #[test]
+    fn ssh_connection_failure_reports_stage_before_upload() {
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
+        memory.allow_credential("slot:test");
+        let resolver: Arc<dyn CredentialResolver> = memory.clone();
+        let transport: Arc<dyn SshTransportFactory> = Arc::new(FailingConnectTransport);
+        let service = SshEepromProvisionService::new(
+            "test-eeprom".to_owned(),
+            target(None),
+            "slot:test".to_owned(),
+            4096,
+            7,
+            Arc::<[u8]>::from(HELPER_PAYLOAD),
+            resolver,
+            transport,
+        )
+        .unwrap();
+
+        let error = service
+            .execute(
+                EepromProvisionOperation {
+                    action: EepromHelperAction::Inspect,
+                },
+                control(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            EepromProvisionServiceError::Transport(message)
+                if message == "EEPROM SSH connection failed: operation timed out"
+        ));
+        assert!(memory.captured_argv().is_empty());
+        assert!(memory.captured_stdin().is_empty());
+    }
+
+    #[test]
     fn sends_only_fixed_helper_argv_and_typed_json_stdin() {
-        let memory = Arc::new(MemorySshTransport::new(PINNED_HOST_KEY));
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
         memory.set_command_output(output(EepromHelperResult::Inspect(EepromInspectResult {
             state: device_state('a'),
             backup: vec![0; YG_STEREO_P24C64G_IMAGE_BYTES],
         })));
-        let service = service(&memory, PINNED_HOST_KEY);
+        let service = service(&memory);
 
         let result = service
             .execute(
@@ -376,14 +476,19 @@ mod tests {
         assert!(matches!(result, EepromHelperResult::Inspect(_)));
         assert_eq!(
             memory.captured_argv(),
-            vec![vec![
-                EEPROM_HELPER_PROGRAM.to_owned(),
-                "--json-stdin".to_owned(),
-            ]]
+            vec![
+                vec![
+                    EEPROM_HELPER_INSTALL_PROGRAM.to_owned(),
+                    "-c".to_owned(),
+                    EEPROM_HELPER_INSTALL_SCRIPT.to_owned(),
+                ],
+                vec![EEPROM_HELPER_PROGRAM.to_owned(), "--json-stdin".to_owned(),],
+            ]
         );
         let requests = memory.captured_stdin();
-        assert_eq!(requests.len(), 1);
-        let request: EepromHelperRequest = serde_json::from_slice(&requests[0]).unwrap();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], HELPER_PAYLOAD);
+        let request: EepromHelperRequest = serde_json::from_slice(&requests[1]).unwrap();
         assert_eq!(request.schema_version, EEPROM_HELPER_SCHEMA_VERSION);
         assert_eq!(request.target.map_id, YG_STEREO_P24C64G_V1_MAP_ID);
         assert_eq!(request.target.i2c_bus, 7);
@@ -391,9 +496,55 @@ mod tests {
     }
 
     #[test]
-    fn host_key_mismatch_prevents_helper_invocation() {
-        let memory = Arc::new(MemorySshTransport::new("different-key"));
-        let service = service(&memory, PINNED_HOST_KEY);
+    fn helper_install_script_uploads_to_fixed_path_and_drains_on_failures() {
+        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("mkdir -p /usr/local/libexec"));
+        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("cat > \"$helper\""));
+        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("chmod 755 \"$helper\""));
+        assert!(!EEPROM_HELPER_INSTALL_SCRIPT.contains("/tmp"));
+        assert!(!EEPROM_HELPER_INSTALL_SCRIPT.contains("mv "));
+        assert_eq!(
+            EEPROM_HELPER_INSTALL_SCRIPT
+                .matches("cat >/dev/null")
+                .count(),
+            2
+        );
+    }
+
+    #[test]
+    fn stale_host_key_does_not_prevent_helper_invocation() {
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
+        memory.set_command_output(output(EepromHelperResult::Inspect(EepromInspectResult {
+            state: device_state('a'),
+            backup: vec![0; YG_STEREO_P24C64G_IMAGE_BYTES],
+        })));
+        let service = service_with_target(&memory, target(Some(STALE_HOST_KEY)));
+
+        let result = service
+            .execute(
+                EepromProvisionOperation {
+                    action: EepromHelperAction::Inspect,
+                },
+                control(),
+            )
+            .unwrap();
+
+        assert!(matches!(result, EepromHelperResult::Inspect(_)));
+        assert_eq!(memory.captured_argv().len(), 2);
+        assert_eq!(memory.captured_stdin().len(), 2);
+    }
+
+    #[test]
+    fn helper_upload_failure_reports_stage_and_skips_helper_invocation() {
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
+        memory.set_command_output(TransportCommandOutput {
+            stdout: Vec::new(),
+            stderr: b"mkdir: can't create directory '/usr/local/libexec': Permission denied"
+                .to_vec(),
+            exit_status: Some(1),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+        let service = service(&memory);
 
         let error = service
             .execute(
@@ -404,9 +555,14 @@ mod tests {
             )
             .unwrap_err();
 
-        assert!(matches!(error, EepromProvisionServiceError::Transport(_)));
-        assert!(memory.captured_argv().is_empty());
-        assert!(memory.captured_stdin().is_empty());
+        assert!(matches!(
+            &error,
+            EepromProvisionServiceError::Transport(message)
+                if message.contains("EEPROM helper upload failed")
+                    && message.contains("Permission denied")
+        ));
+        assert_eq!(memory.captured_argv().len(), 1);
+        assert_eq!(memory.captured_stdin(), vec![HELPER_PAYLOAD.to_vec()]);
     }
 
     #[test]
@@ -473,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn rejects_missing_or_invalid_host_key_before_any_transport_use() {
-        let memory = Arc::new(MemorySshTransport::new(PINNED_HOST_KEY));
+    fn accepts_missing_blank_or_invalid_host_key_without_transport_use() {
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
         let resolver: Arc<dyn CredentialResolver> = memory.clone();
         let transport: Arc<dyn SshTransportFactory> = memory.clone();
 
@@ -485,13 +641,11 @@ mod tests {
                 "slot:test".to_owned(),
                 4096,
                 7,
+                Arc::<[u8]>::from(HELPER_PAYLOAD),
                 resolver.clone(),
                 transport.clone(),
             );
-            assert!(matches!(
-                result,
-                Err(EepromProvisionServiceError::Protocol(_))
-            ));
+            assert!(result.is_ok());
         }
 
         assert!(memory.captured_argv().is_empty());

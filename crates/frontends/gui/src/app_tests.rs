@@ -1271,10 +1271,14 @@ mod eeprom_operation_tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use camera_toolbox_adapters::filesystem::LocalFileSystem;
+    use camera_toolbox_adapters::{
+        filesystem::LocalFileSystem,
+        platforms::ssh_managed::{CredentialResolver, MemorySshTransport, SshTransportFactory},
+    };
     use camera_toolbox_app::{
         DirectoryRef, EepromDeviceState, EepromHelperFailure, EepromProvisionService,
-        EepromRollbackState, EepromSerialState, FileSourceId, SnapshotHash,
+        EepromRollbackState, EepromSerialState, FileSourceId, RemoteAuthentication,
+        RemoteConnectionConfig, RemoteConnectionId, SnapshotHash,
     };
     use camera_toolbox_core::{
         EepromProvisionRequest, EepromProvisioningMode, YG_STEREO_P24C64G_IMAGE_BYTES,
@@ -1496,6 +1500,53 @@ mod eeprom_operation_tests {
 
         assert!(app.eeprom_target.is_none());
     }
+    #[test]
+    fn configures_eeprom_from_password_sftp_without_verified_host_identity() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        let helper_path = CameraToolboxApp::local_eeprom_helper_candidates()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::write(&helper_path, b"test-eeprom-helper").unwrap();
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
+        memory.allow_credential("session:test");
+        let credentials: Arc<dyn CredentialResolver> = memory.clone();
+        let transport: Arc<dyn SshTransportFactory> = memory.clone();
+        app.explorer = ExplorerState::new(credentials, transport);
+        app.explorer
+            .finish_sftp_connection(
+                RemoteConnectionConfig {
+                    id: RemoteConnectionId::new("memory-eeprom").unwrap(),
+                    display_name: "root@camera.test:22".to_owned(),
+                    host: "camera.test".to_owned(),
+                    port: 22,
+                    username: "root".to_owned(),
+                    expected_host_key: None,
+                    authentication: RemoteAuthentication::Password {
+                        slot_id: "test".to_owned(),
+                    },
+                },
+                &context,
+            )
+            .unwrap();
+
+        app.begin_eeprom_operation(
+            &context,
+            CalibrationProvisionIntent::ConfigureTarget(CalibrationEepromTargetRequest {
+                i2c_bus: 7,
+            }),
+        );
+
+        let target = app
+            .eeprom_target
+            .as_ref()
+            .expect("EEPROM target configured");
+        assert!(target.label.starts_with("root@camera.test:22 / i2c-7 @"));
+        let _ = fs::remove_file(helper_path);
+    }
+
     #[test]
     fn active_operation_rejects_target_reconfiguration_without_dropping_target() {
         let context = egui::Context::default();

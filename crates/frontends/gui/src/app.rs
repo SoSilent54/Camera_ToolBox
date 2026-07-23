@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
+    fs,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -2504,6 +2505,58 @@ impl CameraToolboxApp {
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn local_eeprom_helper_program_name() -> String {
+        format!(
+            "camera-toolbox-eeprom-helper{}",
+            std::env::consts::EXE_SUFFIX
+        )
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn local_eeprom_helper_candidates() -> Result<Vec<PathBuf>, String> {
+        let current = std::env::current_exe()
+            .map_err(|error| format!("Resolve current executable failed: {error}"))?;
+        let parent = current
+            .parent()
+            .ok_or_else(|| format!("Current executable has no parent: {}", current.display()))?;
+        let program = Self::local_eeprom_helper_program_name();
+        let mut candidates = vec![parent.join(&program)];
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "deps")
+            && let Some(profile_dir) = parent.parent()
+        {
+            candidates.push(profile_dir.join(program));
+        }
+        Ok(candidates)
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn read_local_eeprom_helper_payload() -> Result<Arc<[u8]>, String> {
+        let candidates = Self::local_eeprom_helper_candidates()?;
+        let mut missing = Vec::new();
+        for candidate in &candidates {
+            match fs::read(candidate) {
+                Ok(bytes) => return Ok(Arc::<[u8]>::from(bytes.into_boxed_slice())),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(candidate.display().to_string());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Read EEPROM helper {} failed: {error}",
+                        candidate.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "EEPROM helper binary not found; expected {}",
+            missing.join(" or ")
+        ))
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     fn configure_eeprom_target(
         &mut self,
         request: CalibrationEepromTargetRequest,
@@ -2517,20 +2570,12 @@ impl CameraToolboxApp {
         else {
             return Err("EEPROM requires the Explorer SFTP process-only password".to_owned());
         };
-        let expected_host_key = source
-            .expected_host_key
-            .clone()
-            .filter(|key| !key.trim().is_empty())
-            .ok_or_else(|| {
-                "Explorer SFTP has no verified host identity; reconnect before EEPROM use."
-                    .to_owned()
-            })?;
         let credential_ref = format!("session:{slot_id}");
         let connection = SshConnectionTarget {
             host: source.host.clone(),
             port: source.port,
             username: source.username.clone(),
-            expected_host_key: Some(expected_host_key.clone()),
+            expected_host_key: None,
             command_subsystem: None,
             remote_event_subsystem: None,
         };
@@ -2539,19 +2584,20 @@ impl CameraToolboxApp {
             "host": source.host,
             "port": source.port,
             "username": source.username,
-            "expected_host_key": expected_host_key,
             "i2c_bus": request.i2c_bus,
             "map_id": camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID,
         });
         let target_bytes =
             serde_json::to_vec(&target_document).map_err(|error| error.to_string())?;
         let snapshot_hash = SnapshotHash::digest_bytes(&target_bytes);
+        let helper_payload = Self::read_local_eeprom_helper_payload()?;
         let service = SshEepromProvisionService::new(
             format!("calibration-eeprom-{}", &snapshot_hash.to_hex()[..12]),
             connection,
             credential_ref,
             65_536,
             request.i2c_bus,
+            helper_payload,
             self.live_runtime.ssh_resolver(),
             Arc::new(RusshTransportFactory),
         )

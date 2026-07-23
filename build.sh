@@ -94,6 +94,15 @@ cargo_args=(
     "${profile_args[@]}"
 )
 
+helper_args=(
+    build
+    --manifest-path "${project_root}/Cargo.toml"
+    --package camera-toolbox-eeprom-helper
+    --bin camera-toolbox-eeprom-helper
+    --locked
+    "${profile_args[@]}"
+)
+
 if (( calibration_enabled )); then
     python_command=${PYTHON:-python3}
     dependency_tool="${project_root}/scripts/opencv5_dependency.py"
@@ -102,8 +111,10 @@ if (( calibration_enabled )); then
         exit 1
     fi
     "$python_command" "$dependency_tool" run -- cargo "${cargo_args[@]}"
+    cargo "${helper_args[@]}"
     "$python_command" "$dependency_tool" bundle \
         --destination "${target_dir}/${profile}"
 else
     cargo "${cargo_args[@]}"
+    cargo "${helper_args[@]}"
 fi

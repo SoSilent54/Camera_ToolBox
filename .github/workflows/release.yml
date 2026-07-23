@@ -76,6 +76,7 @@ jobs:
           bundle="camera-toolbox-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
+          install -m 755 "target/release/camera-toolbox-eeprom-helper" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
@@ -91,6 +92,7 @@ jobs:
           $bundle = "camera-toolbox-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
+          Copy-Item "target/release/camera-toolbox-eeprom-helper.exe" "dist/$bundle/"
           Copy-Item README.md "dist/$bundle/"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
@@ -171,6 +173,7 @@ jobs:
           bundle="camera-toolbox-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
+          install -m 755 "target/release/camera-toolbox-eeprom-helper" "dist/${bundle}/"
           install -m 644 README.md "dist/${bundle}/"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
