@@ -81,7 +81,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-            build-essential ca-certificates curl file make nasm pkg-config xz-utils
+            build-essential ca-certificates curl file make nasm pkg-config python3 xz-utils
       - name: Build, package, and smoke FFmpeg
         env:
           PLATFORM: ${{ matrix.platform }}
@@ -213,6 +213,7 @@ jobs:
           arch: x64
       - uses: msys2/setup-msys2@v2
         with:
+          path-type: inherit
           install: make nasm pkgconf diffutils zip
       - uses: actions/checkout@v4
       - name: Build, package, and smoke FFmpeg
@@ -225,6 +226,17 @@ jobs:
           scratch="$RUNNER_TEMP/ffmpeg-$PLATFORM"
           prefix="$scratch/prefix"
           mkdir -p "$scratch" "$GITHUB_WORKSPACE/dist"
+          cl_path="$(command -v cl)"
+          link_path="$(command -v link.exe)"
+          test -n "$cl_path"
+          test -n "$link_path"
+          case "$link_path" in
+            /usr/bin/link|/usr/bin/link.exe)
+              echo "MSYS link resolved instead of MSVC link.exe: $link_path" >&2
+              exit 1
+              ;;
+          esac
+          printf 'Using MSVC compiler: %s\nUsing MSVC linker: %s\n' "$cl_path" "$link_path"
           curl --fail --location --retry 3 --output "$scratch/source.tar.xz" "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz"
           echo "${FFMPEG_SOURCE_SHA256}  $scratch/source.tar.xz" | sha256sum --check --strict
           tar -C "$scratch" -xf "$scratch/source.tar.xz"
