@@ -11,7 +11,10 @@ use std::{
     },
 };
 
-use camera_toolbox_app::{LatestDecodedFrameSlot, StreamCancellation};
+use camera_toolbox_app::{
+    DecodedVideoFrame, LatestDecodedFrameSlot, StreamCancellation, StreamFrameIdentity,
+    StreamSessionId,
+};
 use thiserror::Error;
 
 use crate::platforms::hisilicon_cv610::VideoCodec;
@@ -67,6 +70,8 @@ impl FfmpegDecoder {
         height: u32,
         input_capacity: usize,
         latest: Arc<LatestDecodedFrameSlot>,
+        session_id: StreamSessionId,
+        channel: u16,
         cancellation: &StreamCancellation,
     ) -> Result<Self, FfmpegDecoderError> {
         if input_capacity == 0 {
@@ -159,6 +164,7 @@ impl FfmpegDecoder {
             .name("cv610-ffmpeg-stdout".to_owned())
             .spawn(move || {
                 let mut stdout = stdout;
+                let mut frame_sequence = 0_u64;
                 loop {
                     let mut frame: Arc<[u8]> = vec![0_u8; frame_bytes].into();
                     let Some(buffer) = Arc::get_mut(&mut frame) else {
@@ -167,7 +173,18 @@ impl FfmpegDecoder {
                     if read_exact_or_eof(&mut stdout, buffer).is_err() {
                         break;
                     }
-                    latest.publish(width, height, frame);
+                    latest.publish(DecodedVideoFrame {
+                        width,
+                        height,
+                        rgba: frame,
+                        identity: StreamFrameIdentity::unavailable(
+                            session_id.clone(),
+                            channel,
+                            frame_sequence,
+                            "CV610 rawvideo decoder has no frame source PTS",
+                        ),
+                    });
+                    frame_sequence = frame_sequence.saturating_add(1);
                     output_stats.decoded.fetch_add(1, Ordering::Relaxed);
                 }
             })
@@ -327,6 +344,8 @@ mod tests {
             2,
             1,
             latest,
+            StreamSessionId::new("test-missing").unwrap(),
+            0,
             &cancellation,
         )
         .err()
@@ -355,6 +374,8 @@ mod tests {
             2,
             1,
             latest,
+            StreamSessionId::new("test-bounded").unwrap(),
+            0,
             &cancellation,
         )
         .unwrap();
@@ -410,6 +431,8 @@ mod tests {
             2,
             1,
             Arc::new(LatestDecodedFrameSlot::default()),
+            StreamSessionId::new("test-eof").unwrap(),
+            0,
             &StreamCancellation::default(),
         )
         .unwrap();

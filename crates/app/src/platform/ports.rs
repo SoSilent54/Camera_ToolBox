@@ -355,6 +355,8 @@ pub struct StreamOpenRequest {
     pub channel: u16,
     pub media: String,
     pub cseq: u32,
+    /// 会话级偏好；仅表示请求，实际解码后端由服务端事件报告。
+    pub prefer_hardware_acceleration: bool,
     pub recording: StreamRecordingRequest,
 }
 
@@ -504,6 +506,14 @@ pub struct StreamMetrics {
     pub decoder_resyncs: u64,
     pub decoded_frames: u64,
     pub presented_frames: u64,
+    /// decoder 发布帧数在最近采样窗口内换算的毫赫兹；0 表示尚无样本。
+    pub decoded_fps_millihz: u64,
+    /// GUI texture 安装数在最近一秒窗口内换算的毫赫兹；仅本机显示指标。
+    pub presented_fps_millihz: u64,
+    /// decoder publish 到 GUI texture install 的本机单调时钟差；不是网络或源端延迟。
+    pub host_presentation_delay_ns: u64,
+    /// 实际解码后端或明确的软件回退原因。
+    pub decoder_backend: Option<String>,
     pub transport_queue_bytes: usize,
     pub recorder_queue_bytes: usize,
     pub preview_queue_depth: usize,
@@ -577,41 +587,118 @@ pub enum StreamServiceError {
     WorkerStart(String),
 }
 
-/// FFmpeg rawvideo 的 host-output 时间语义；rawvideo 不伪造源 RTP PTS。
+/// FFmpeg 采样到的源帧 PTS；rawvideo 本身不携带此信息。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourcePts {
+    Known {
+        ticks: i64,
+        time_base_numerator: u32,
+        time_base_denominator: u32,
+        provenance: SourcePtsProvenance,
+    },
+    Unavailable {
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SourcePtsProvenance {
+    FfmpegDecodedFrame,
+    FfmpegShowinfo,
+    Unavailable,
+}
+
+/// 直播帧跨 Viewer 与后续数据集时不可变的来源和时钟语义。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamFrameIdentity {
+    pub stream_id: crate::platform::StreamSessionId,
+    pub channel: u16,
+    pub frame_sequence: u64,
+    pub source_pts: SourcePts,
+    pub host_monotonic_time_ns: u64,
+}
+
+/// 返回进程内共享 epoch 的单调时钟。跨线程时差必须只使用此函数的两个采样值。
+#[must_use]
+pub fn host_monotonic_time_ns() -> u64 {
+    static PROCESS_START: std::sync::LazyLock<std::time::Instant> =
+        std::sync::LazyLock::new(std::time::Instant::now);
+    let elapsed = std::time::Instant::now().saturating_duration_since(*PROCESS_START);
+    u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl StreamFrameIdentity {
+    #[must_use]
+    pub fn unavailable(
+        stream_id: crate::platform::StreamSessionId,
+        channel: u16,
+        frame_sequence: u64,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            stream_id,
+            channel,
+            frame_sequence,
+            source_pts: SourcePts::Unavailable {
+                reason: reason.into(),
+            },
+            host_monotonic_time_ns: host_monotonic_time_ns(),
+        }
+    }
+    #[must_use]
+    pub fn known(
+        stream_id: crate::platform::StreamSessionId,
+        channel: u16,
+        frame_sequence: u64,
+        source_pts: SourcePts,
+    ) -> Self {
+        Self::known_at(
+            stream_id,
+            channel,
+            frame_sequence,
+            source_pts,
+            host_monotonic_time_ns(),
+        )
+    }
+
+    /// 构造使用调用方刚采样的共享单调时钟的身份，用于 publish 边界。
+    #[must_use]
+    pub fn known_at(
+        stream_id: crate::platform::StreamSessionId,
+        channel: u16,
+        frame_sequence: u64,
+        source_pts: SourcePts,
+        host_monotonic_time_ns: u64,
+    ) -> Self {
+        Self {
+            stream_id,
+            channel,
+            frame_sequence,
+            source_pts,
+            host_monotonic_time_ns,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DecodedVideoFrame {
     pub width: u32,
     pub height: u32,
     pub rgba: Arc<[u8]>,
-    pub host_output_time: std::time::SystemTime,
-    pub source_rtp_pts: Option<u32>,
-    pub revision: u64,
+    pub identity: StreamFrameIdentity,
 }
 
 #[derive(Default)]
 pub struct LatestDecodedFrameSlot {
     frame: Mutex<Option<Arc<DecodedVideoFrame>>>,
-    revision: std::sync::atomic::AtomicU64,
 }
 
 impl LatestDecodedFrameSlot {
-    pub fn publish(&self, width: u32, height: u32, rgba: Arc<[u8]>) {
-        let revision = self
-            .revision
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-            .saturating_add(1);
-        let frame = Arc::new(DecodedVideoFrame {
-            width,
-            height,
-            rgba,
-            host_output_time: std::time::SystemTime::now(),
-            source_rtp_pts: None,
-            revision,
-        });
+    pub fn publish(&self, frame: DecodedVideoFrame) {
         *self
             .frame
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(frame);
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(frame));
     }
 
     #[must_use]

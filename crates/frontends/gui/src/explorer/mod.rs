@@ -45,6 +45,7 @@ enum WorkspaceMode {
     Local,
     #[cfg(feature = "platform-ssh")]
     Sftp,
+    Rtsp,
 }
 
 impl WorkspaceMode {
@@ -53,6 +54,7 @@ impl WorkspaceMode {
             Self::Local => "Local",
             #[cfg(feature = "platform-ssh")]
             Self::Sftp => "SFTP",
+            Self::Rtsp => "RTSP",
         }
     }
 }
@@ -440,7 +442,6 @@ impl ExplorerState {
         ui: &mut egui::Ui,
         calibration_import_enabled: bool,
     ) -> Option<ExplorerAction> {
-        self.ensure_local_workspace(context);
         self.poll_monitor(context);
         self.poll_mutation(context);
 
@@ -454,11 +455,16 @@ impl ExplorerState {
                     ui.selectable_value(&mut self.mode, WorkspaceMode::Local, "Local");
                     #[cfg(feature = "platform-ssh")]
                     ui.selectable_value(&mut self.mode, WorkspaceMode::Sftp, "SFTP");
+                    ui.selectable_value(&mut self.mode, WorkspaceMode::Rtsp, "RTSP");
                 });
         });
         if self.mode != previous_mode {
             self.switch_mode(context);
         }
+        if self.mode == WorkspaceMode::Rtsp {
+            return None;
+        }
+        self.ensure_local_workspace(context);
 
         let mut action = None;
         #[cfg(feature = "platform-ssh")]
@@ -548,6 +554,26 @@ impl ExplorerState {
         action
     }
 
+    #[must_use]
+    pub(crate) const fn is_rtsp_mode(&self) -> bool {
+        matches!(self.mode, WorkspaceMode::Rtsp)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_rtsp_mode_for_test(&mut self) {
+        self.mode = WorkspaceMode::Rtsp;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_local_mode_for_test(&mut self) {
+        self.mode = WorkspaceMode::Local;
+    }
+
+    #[cfg(all(test, feature = "platform-ssh"))]
+    pub(crate) fn select_sftp_mode_for_test(&mut self) {
+        self.mode = WorkspaceMode::Sftp;
+    }
+
     fn calibration_candidates(&self, selected_only: bool) -> Vec<CalibrationImportCandidate> {
         let Some(view) = self.active_view() else {
             return Vec::new();
@@ -620,6 +646,7 @@ impl ExplorerState {
                     busy,
                 )
             }
+            WorkspaceMode::Rtsp => None,
         }
     }
 
@@ -658,6 +685,9 @@ impl ExplorerState {
                             .ok_or_else(|| "No active workspace source".to_owned())
                             .and_then(|_| source_path_from_remote(&value));
                         parsed.map(|path| self.navigate_to(path, context))
+                    }
+                    WorkspaceMode::Rtsp => {
+                        Err("RTSP workspace has no file path navigation".to_owned())
                     }
                 };
                 match result {
@@ -1059,6 +1089,7 @@ impl ExplorerState {
             WorkspaceMode::Local => self.local_view.as_ref(),
             #[cfg(feature = "platform-ssh")]
             WorkspaceMode::Sftp => self.sftp_view.as_ref(),
+            WorkspaceMode::Rtsp => None,
         }
     }
 
@@ -1067,6 +1098,7 @@ impl ExplorerState {
             WorkspaceMode::Local => self.local_view.as_mut(),
             #[cfg(feature = "platform-ssh")]
             WorkspaceMode::Sftp => self.sftp_view.as_mut(),
+            WorkspaceMode::Rtsp => None,
         }
     }
 

@@ -457,6 +457,7 @@ mod tests {
                 stability_interval_ms: 500,
                 max_fetch_bytes: 256 * 1024 * 1024,
                 command_output_bytes: 64 * 1024,
+                rtsp: None,
             }),
         };
         assert!(!format!("{profile:?}").contains("id_ed25519"));
@@ -539,6 +540,7 @@ mod tests {
                 stability_interval_ms: 500,
                 max_fetch_bytes: 1024,
                 command_output_bytes: 1024,
+                rtsp: None,
             }),
         };
         assert!(matches!(

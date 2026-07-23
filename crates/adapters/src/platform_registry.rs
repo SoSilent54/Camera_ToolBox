@@ -192,6 +192,7 @@ mod tests {
                 stability_interval_ms: 100,
                 max_fetch_bytes: 1024,
                 command_output_bytes: 128,
+                rtsp: None,
             }),
         }
     }

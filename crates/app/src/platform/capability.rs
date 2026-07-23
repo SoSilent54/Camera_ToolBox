@@ -401,13 +401,14 @@ impl Cv610Bindings {
     }
 }
 
-/// SSH-managed 当前只暴露 `PlatformOnly` RemoteFile/Command handles。
+/// SSH-managed 可暴露 RemoteFile、Command 及可选主机直连 RTSP Stream handles。
 #[derive(Clone)]
 pub struct SshManagedBindings {
     pub platform_id: PlatformProfileId,
     pub platform_snapshot_hash: SnapshotHash,
     pub remote_file: Option<PlatformCapabilityHandle<dyn RemoteFileService>>,
     pub command: Option<PlatformCapabilityHandle<dyn CommandService>>,
+    pub stream: Option<PlatformCapabilityHandle<dyn StreamService>>,
 }
 
 impl SshManagedBindings {
@@ -419,6 +420,7 @@ impl SshManagedBindings {
         platform_snapshot_hash: SnapshotHash,
         remote_file: Option<PlatformCapabilityHandle<dyn RemoteFileService>>,
         command: Option<PlatformCapabilityHandle<dyn CommandService>>,
+        stream: Option<PlatformCapabilityHandle<dyn StreamService>>,
     ) -> Result<Self, CapabilityResolutionError> {
         validate_handle(
             PlatformKind::SshManaged,
@@ -432,11 +434,18 @@ impl SshManagedBindings {
             platform_snapshot_hash,
             command.as_ref(),
         )?;
+        validate_handle(
+            PlatformKind::SshManaged,
+            CapabilityKind::Stream,
+            platform_snapshot_hash,
+            stream.as_ref(),
+        )?;
         Ok(Self {
             platform_id,
             platform_snapshot_hash,
             remote_file,
             command,
+            stream,
         })
     }
 }
@@ -493,6 +502,7 @@ pub struct ResolvedCv610Bindings {
 pub struct ResolvedSshManagedBindings {
     pub remote_file: Option<ResolvedCapabilityHandle<dyn RemoteFileService>>,
     pub command: Option<ResolvedCapabilityHandle<dyn CommandService>>,
+    pub stream: Option<ResolvedCapabilityHandle<dyn StreamService>>,
 }
 
 #[derive(Clone)]
@@ -524,6 +534,9 @@ impl ResolvedTargetBindings {
                 .map(|handle| &handle.descriptor),
             (Self::SshManaged(bindings), CapabilityKind::Command) => {
                 bindings.command.as_ref().map(|handle| &handle.descriptor)
+            }
+            (Self::SshManaged(bindings), CapabilityKind::Stream) => {
+                bindings.stream.as_ref().map(|handle| &handle.descriptor)
             }
             _ => None,
         }
@@ -615,6 +628,14 @@ impl DefaultCapabilityResolver {
                     command: resolve_typed_handle(
                         key,
                         bindings.command.as_ref(),
+                        sensor_hash,
+                        cell,
+                        cell_hash,
+                        aggregate_hash,
+                    ),
+                    stream: resolve_typed_handle(
+                        key,
+                        bindings.stream.as_ref(),
                         sensor_hash,
                         cell,
                         cell_hash,

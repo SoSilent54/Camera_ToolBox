@@ -5,7 +5,10 @@ use std::path::PathBuf;
 use camera_toolbox_adapters::platforms::ssh_managed::{
     HostKeyAssessment, HostKeyTarget, ServerHostKey, discover_private_key_files,
 };
-use camera_toolbox_app::{PlatformConfig, PlatformProfile, PlatformProfileId, SshManagedConfig};
+use camera_toolbox_app::{
+    PlatformConfig, PlatformProfile, PlatformProfileId, RtspCodec, RtspStreamConfig, RtspTransport,
+    SshManagedConfig,
+};
 use eframe::egui::{self, TextBuffer};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString, zeroize::Zeroize};
 
@@ -322,6 +325,55 @@ impl SshEditorState {
             )
         {
             self.invalidate_connection_test();
+        }
+
+        ui.separator();
+        let mut rtsp_enabled = config.rtsp.is_some();
+        if ui
+            .checkbox(&mut rtsp_enabled, "Enable host-decoded RTSP Viewer")
+            .changed()
+        {
+            config.rtsp = rtsp_enabled.then(|| RtspStreamConfig {
+                url: String::new(),
+                channel: 0,
+                width: 1920,
+                height: 1080,
+                codec: RtspCodec::H264,
+                transport: RtspTransport::Tcp,
+            });
+        }
+        if let Some(rtsp) = config.rtsp.as_mut() {
+            egui::Grid::new("ssh_rtsp_fields")
+                .num_columns(2)
+                .show(ui, |ui| {
+                    text_row(ui, "RTSP URL", &mut rtsp.url);
+                    ui.label("Channel");
+                    ui.add(egui::DragValue::new(&mut rtsp.channel).range(0..=255));
+                    ui.end_row();
+                    ui.label("Frame width");
+                    ui.add(egui::DragValue::new(&mut rtsp.width).range(1..=16_384));
+                    ui.end_row();
+                    ui.label("Frame height");
+                    ui.add(egui::DragValue::new(&mut rtsp.height).range(1..=16_384));
+                    ui.end_row();
+                    ui.label("Declared codec");
+                    egui::ComboBox::from_id_salt("ssh_rtsp_codec")
+                        .selected_text(format!("{:?}", rtsp.codec))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut rtsp.codec, RtspCodec::H264, "H.264");
+                            ui.selectable_value(&mut rtsp.codec, RtspCodec::H265, "H.265");
+                        });
+                    ui.end_row();
+                    ui.label("RTSP transport");
+                    egui::ComboBox::from_id_salt("ssh_rtsp_transport")
+                        .selected_text(format!("{:?}", rtsp.transport))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut rtsp.transport, RtspTransport::Tcp, "TCP");
+                            ui.selectable_value(&mut rtsp.transport, RtspTransport::Udp, "UDP");
+                        });
+                    ui.end_row();
+                });
+            ui.weak("Credentials in RTSP URLs are rejected. Use a credential-free endpoint or an external credential reference.");
         }
 
         let test_in_progress = self

@@ -4,7 +4,7 @@ use std::{collections::BTreeMap, sync::Arc};
 #[cfg(feature = "platform-ssh")]
 use std::{path::Path, time::Duration};
 
-use camera_toolbox_adapters::PlatformRegistry;
+use crate::workspace::LiveStreamSource;
 #[cfg(feature = "platform-cv610")]
 use camera_toolbox_adapters::platforms::hisilicon_cv610::HisiliconCv610Provider;
 #[cfg(feature = "platform-ssh")]
@@ -12,12 +12,14 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     CommandRecipeRegistry, CredentialResolver, ProductionCredentialResolver,
     SshManagedPlatformProvider, production_recipe_registry_from_env,
 };
+use camera_toolbox_adapters::{PlatformRegistry, media::FfmpegRtspStreamService};
 #[cfg(feature = "platform-cv610")]
 use camera_toolbox_app::ResolvedTargetBindings;
 use camera_toolbox_app::{
     CaptureStore, CaptureStoreLimits, LatestDecodedFrameSlot, OperationId, PlatformBindings,
-    PlatformConfig, PlatformController, PlatformProfileId, ProfileStore, SensorSelection,
-    StreamSessionEvent, StreamSessionId, TargetResolutionSnapshot,
+    PlatformConfig, PlatformController, PlatformProfileId, ProfileStore, RtspStreamConfig,
+    SensorSelection, StreamOpenRequest, StreamRecordingRequest, StreamSessionEvent,
+    StreamSessionId, StreamTimeouts, TargetResolutionSnapshot,
 };
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{
@@ -25,10 +27,7 @@ use camera_toolbox_app::{
     RemoteOpenDisposition, RemoteTimeouts, RemoteWatchEvent, RemoteWatchRequest,
     TypedCommandRequest,
 };
-#[cfg(feature = "platform-cv610")]
-use camera_toolbox_app::{
-    DumpJobState, DumpTimeouts, StreamTimeouts, VerifiedDumpKind, VerifiedDumpRequest,
-};
+use camera_toolbox_app::{DumpJobState, DumpTimeouts, VerifiedDumpKind, VerifiedDumpRequest};
 use camera_toolbox_core::{AssetId, BayerPattern, EphemeralAsset, MediaFormat};
 use eframe::egui;
 
@@ -363,6 +362,30 @@ impl LiveRuntime {
                                 self.capture_panel.watcher_operation = None;
                             }
                         }
+                    }
+                }
+                #[cfg(feature = "platform-ssh")]
+                if let Some(rtsp) = config.rtsp.as_ref() {
+                    ui.separator();
+                    ui.heading("RTSP Viewer");
+                    ui.label(format!(
+                        "Channel {} — {}×{} — declared {:?}",
+                        rtsp.channel, rtsp.width, rtsp.height, rtsp.codec
+                    ));
+                    ui.checkbox(
+                        &mut self.panel.prefer_hardware_acceleration,
+                        "Prefer hardware acceleration",
+                    );
+                    ui.weak(
+                        "A preference only; the actual backend is reported by the live Viewer.",
+                    );
+                    ui.label("Preview is host-decoded and is not recorded by default.");
+                    if live_running {
+                        if ui.button("Stop RTSP Viewer").clicked() {
+                            action = Some(PlatformUiAction::Stream(StreamPanelAction::RequestStop));
+                        }
+                    } else if ui.button("Start RTSP Viewer").clicked() {
+                        action = Some(PlatformUiAction::Stream(StreamPanelAction::Start));
                     }
                 }
                 #[cfg(not(feature = "platform-ssh"))]
@@ -973,38 +996,116 @@ impl LiveRuntime {
 
     pub(crate) fn start(
         &mut self,
-    ) -> Result<(StreamSessionId, Arc<LatestDecodedFrameSlot>), String> {
-        #[cfg(feature = "platform-cv610")]
-        {
-            let snapshot = self.snapshot.clone().ok_or_else(|| {
-                self.binding_error
-                    .clone()
-                    .unwrap_or_else(|| "no resolved target".to_owned())
-            })?;
-            let profile = self
-                .selected_profile
-                .as_ref()
-                .and_then(|id| self.profiles.platform(id))
-                .ok_or_else(|| "selected profile no longer exists".to_owned())?;
-            let PlatformConfig::HisiliconCv610(config) = &profile.config else {
-                return Err("selected platform does not provide CV610 Stream".to_owned());
-            };
-            let request = self
-                .panel
-                .request(config.stream.channel, &config.stream.media)?;
-            let session_id = self
-                .controller
-                .submit_stream(snapshot, request, StreamTimeouts::default())
-                .map_err(|error| error.to_string())?;
-            let latest = self
-                .controller
-                .latest_stream_frame(&session_id)
-                .ok_or_else(|| "stream controller did not retain latest-frame slot".to_owned())?;
-            self.panel.last_error = None;
-            return Ok((session_id, latest));
-        }
-        #[cfg(not(feature = "platform-cv610"))]
-        Err("CV610 platform is not compiled in this build".to_owned())
+    ) -> Result<
+        (
+            StreamSessionId,
+            Arc<LatestDecodedFrameSlot>,
+            LiveStreamSource,
+        ),
+        String,
+    > {
+        let snapshot = self.snapshot.clone().ok_or_else(|| {
+            self.binding_error
+                .clone()
+                .unwrap_or_else(|| "no resolved target".to_owned())
+        })?;
+        let profile = self
+            .selected_profile
+            .as_ref()
+            .and_then(|id| self.profiles.platform(id))
+            .ok_or_else(|| "selected profile no longer exists".to_owned())?;
+        let profile_id = profile.id.clone();
+        let profile_label = profile.display_name.clone();
+        let (request, source) = match &profile.config {
+            PlatformConfig::HisiliconCv610(config) => (
+                self.panel
+                    .request(config.stream.channel, &config.stream.media)?,
+                LiveStreamSource::Cv610 {
+                    profile_id,
+                    profile_label,
+                    channel: config.stream.channel,
+                },
+            ),
+            PlatformConfig::SshManaged(config) => {
+                let rtsp = config
+                    .rtsp
+                    .as_ref()
+                    .ok_or_else(|| "selected SSH profile has no RTSP source".to_owned())?;
+                (
+                    StreamOpenRequest {
+                        channel: rtsp.channel,
+                        media: "rtsp".to_owned(),
+                        cseq: 1,
+                        prefer_hardware_acceleration: self.panel.prefer_hardware_acceleration,
+                        recording: StreamRecordingRequest::default(),
+                    },
+                    LiveStreamSource::Rtsp {
+                        label: profile_label,
+                        channel: rtsp.channel,
+                        transport: rtsp.transport,
+                    },
+                )
+            }
+            PlatformConfig::Local(_) => {
+                return Err("selected platform has no live stream".to_owned());
+            }
+        };
+        let session_id = self
+            .controller
+            .submit_stream(snapshot, request, StreamTimeouts::default())
+            .map_err(|error| error.to_string())?;
+        let latest = self
+            .controller
+            .latest_stream_frame(&session_id)
+            .ok_or_else(|| "stream controller did not retain latest-frame slot".to_owned())?;
+        self.panel.last_error = None;
+        Ok((session_id, latest, source))
+    }
+    pub(crate) fn start_direct_rtsp(
+        &self,
+        config: RtspStreamConfig,
+        prefer_hardware_acceleration: bool,
+    ) -> Result<
+        (
+            StreamSessionId,
+            Arc<LatestDecodedFrameSlot>,
+            LiveStreamSource,
+        ),
+        String,
+    > {
+        config.validate().map_err(|error| error.to_string())?;
+        let request = StreamOpenRequest {
+            channel: config.channel,
+            media: "rtsp".to_owned(),
+            cseq: 1,
+            prefer_hardware_acceleration,
+            recording: StreamRecordingRequest::default(),
+        };
+        let session_id = self
+            .controller
+            .submit_stream_service(
+                Arc::new(FfmpegRtspStreamService::new(
+                    format!("direct-rtsp-ch{}", config.channel),
+                    config.clone(),
+                )),
+                1,
+                request,
+                StreamTimeouts::default(),
+            )
+            .map_err(|error| error.to_string())?;
+        let latest = self
+            .controller
+            .latest_stream_frame(&session_id)
+            .ok_or_else(|| "stream controller did not retain latest-frame slot".to_owned())?;
+        Ok((
+            session_id,
+            latest,
+            LiveStreamSource::Rtsp {
+                label: "Direct URL".to_owned(),
+                channel: config.channel,
+                transport: config.transport,
+            },
+        ))
     }
 
     #[cfg(all(test, feature = "platform-cv610"))]

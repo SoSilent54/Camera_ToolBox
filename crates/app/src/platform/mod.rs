@@ -36,17 +36,18 @@ pub use events::{
 pub use ports::{
     DecodedVideoFrame, DumpCancellation, DumpEnvelope, DumpOperationControl, DumpOperationResult,
     DumpService, DumpServiceError, DumpSourceDescriptor, DumpStage, DumpTimeouts,
-    DumpTruncationStage, LatestDecodedFrameSlot, RecordingBranch, RecordingState,
-    StreamCancellation, StreamCodec, StreamMediaInfo, StreamMetrics, StreamOpenRequest,
-    StreamOperationControl, StreamRecordingRequest, StreamService, StreamServiceError,
-    StreamServiceEvent, StreamSession, StreamStage, StreamTerminal, StreamTimeouts,
-    VerifiedDumpKind, VerifiedDumpRequest,
+    DumpTruncationStage, LatestDecodedFrameSlot, RecordingBranch, RecordingState, SourcePts,
+    SourcePtsProvenance, StreamCancellation, StreamCodec, StreamFrameIdentity, StreamMediaInfo,
+    StreamMetrics, StreamOpenRequest, StreamOperationControl, StreamRecordingRequest,
+    StreamService, StreamServiceError, StreamServiceEvent, StreamSession, StreamStage,
+    StreamTerminal, StreamTimeouts, VerifiedDumpKind, VerifiedDumpRequest, host_monotonic_time_ns,
 };
 pub use profile::{
     CapabilityResolutionKey, Cv610Config, Cv610DumpConfig, Cv610StreamConfig,
     DumpInitializationPolicy, LocalConfig, PlatformConfig, PlatformProfile, PlatformProfileId,
-    ProfileError, SensorCatalog, SensorDescriptor, SensorId, SensorModeKey, SensorModeSnapshot,
-    SensorSelection, SshManagedConfig, validate_ssh_host,
+    ProfileError, RtspCodec, RtspStreamConfig, RtspTransport, SensorCatalog, SensorDescriptor,
+    SensorId, SensorModeKey, SensorModeSnapshot, SensorSelection, SshManagedConfig,
+    validate_ssh_host,
 };
 pub use profile_store::{PROFILE_STORE_SCHEMA_VERSION, ProfileStore, ProfileStoreError};
 pub use remote::{

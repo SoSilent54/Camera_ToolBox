@@ -6,7 +6,7 @@ use camera_toolbox_app::{
     CapabilityKind, CapabilityLimits, CapabilityRequirement, CapabilityResolutionError,
     CapabilityVariant, CommandService, ConcurrencyPolicy, EvidenceMaturity, InitializationState,
     PlatformCapabilityDescriptor, PlatformCapabilityHandle, PlatformConfig, PlatformKind,
-    PlatformProfile, ProfileError, RemoteFileService, SshManagedBindings,
+    PlatformProfile, ProfileError, RemoteFileService, RtspCodec, SshManagedBindings, StreamService,
 };
 use thiserror::Error;
 
@@ -17,6 +17,7 @@ use super::{
     },
     remote_file::SshRemoteFileService,
 };
+use crate::media::FfmpegRtspStreamService;
 
 pub struct SshManagedPlatformProvider {
     resolver: Arc<dyn CredentialResolver>,
@@ -147,11 +148,40 @@ impl SshManagedPlatformProvider {
                 service: Arc::new(remote_file_service),
                 descriptor: remote_descriptor,
             };
+        let stream = config.rtsp.as_ref().map(|rtsp| {
+            let descriptor = Arc::new(PlatformCapabilityDescriptor {
+                capability: CapabilityKind::Stream,
+                requirement: CapabilityRequirement::PlatformOnly,
+                provider: PlatformKind::SshManaged,
+                driver: "ffmpeg-rtsp-showinfo-v1".to_owned(),
+                evidence: EvidenceMaturity::ProfileDeclared,
+                minimum_sensor_evidence: EvidenceMaturity::Unknown,
+                initialization: InitializationState::NotRequired,
+                concurrency: ConcurrencyPolicy::Independent,
+                hard_limits: CapabilityLimits {
+                    max_payload_bytes: None,
+                    max_concurrent_operations: Some(1),
+                },
+                supported_variants: BTreeSet::from([match rtsp.codec {
+                    RtspCodec::H264 => CapabilityVariant::H264,
+                    RtspCodec::H265 => CapabilityVariant::H265,
+                }]),
+                platform_snapshot_hash,
+            });
+            PlatformCapabilityHandle {
+                service: Arc::new(FfmpegRtspStreamService::new(
+                    format!("ssh-managed:{}:rtsp", profile.id.as_str()),
+                    rtsp.clone(),
+                )) as Arc<dyn StreamService>,
+                descriptor,
+            }
+        });
         SshManagedBindings::new(
             profile.id.clone(),
             platform_snapshot_hash,
             Some(remote_file),
             command,
+            stream,
         )
         .map_err(Into::into)
     }

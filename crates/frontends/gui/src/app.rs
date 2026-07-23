@@ -61,8 +61,8 @@ use camera_toolbox_app::{
     AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
     FsCancellation, FsControl, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
     ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterFormat,
-    RasterImageCodec, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline,
-    SourceCache, SourceReadProgress, WorkspaceSettings,
+    RasterImageCodec, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec,
+    RtspStreamConfig, RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
 };
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_app::{
@@ -457,6 +457,33 @@ enum ProductWorkspace {
     Calibration,
 }
 
+#[derive(Debug, Clone)]
+struct DirectRtspWorkspace {
+    url: String,
+    channel: u16,
+    width: u32,
+    height: u32,
+    codec: RtspCodec,
+    transport: RtspTransport,
+    prefer_hardware_acceleration: bool,
+    last_error: Option<String>,
+}
+
+impl Default for DirectRtspWorkspace {
+    fn default() -> Self {
+        Self {
+            url: "rtsp://".to_owned(),
+            channel: 0,
+            width: 1920,
+            height: 1080,
+            codec: RtspCodec::H264,
+            transport: RtspTransport::Tcp,
+            prefer_hardware_acceleration: false,
+            last_error: None,
+        }
+    }
+}
+
 pub(crate) struct CameraToolboxApp {
     product_workspace: ProductWorkspace,
     #[cfg(feature = "calibration-opencv")]
@@ -465,6 +492,7 @@ pub(crate) struct CameraToolboxApp {
     auto_open: AutoOpenCoordinator,
     explorer: ExplorerState,
     explorer_panel_expanded: bool,
+    direct_rtsp: DirectRtspWorkspace,
     empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
     yuv_save_dialog: YuvSaveDialogState,
@@ -549,6 +577,7 @@ impl CameraToolboxApp {
             explorer,
             auto_open,
             explorer_panel_expanded: false,
+            direct_rtsp: DirectRtspWorkspace::default(),
             empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
             yuv_save_dialog: YuvSaveDialogState::default(),
@@ -655,9 +684,11 @@ impl eframe::App for CameraToolboxApp {
             }
         }
         let calibration_workspace = self.is_calibration_workspace();
-        let explorer_action = if self.explorer_panel_expanded {
+        let (direct_rtsp_config, explorer_action, workspace_stream_action) = if self
+            .explorer_panel_expanded
+        {
             let mut collapse = false;
-            let action = egui::Panel::left("workspace_explorer_panel")
+            let actions = egui::Panel::left("workspace_explorer_panel")
                 .resizable(true)
                 .default_size(280.0)
                 .min_size(220.0)
@@ -671,13 +702,23 @@ impl eframe::App for CameraToolboxApp {
                         });
                     });
                     ui.separator();
-                    self.explorer.render(&context, ui, calibration_workspace)
+                    let explorer_action = self.explorer.render(&context, ui, calibration_workspace);
+                    let (direct_rtsp_config, stream_action) = if self.explorer.is_rtsp_mode() {
+                        ui.separator();
+                        let direct_rtsp_config = self.render_direct_rtsp_workspace(ui);
+                        ui.separator();
+                        let stream_action = self.render_workspace_stream_section(ui);
+                        (direct_rtsp_config, stream_action)
+                    } else {
+                        (None, None)
+                    };
+                    (direct_rtsp_config, explorer_action, stream_action)
                 })
                 .inner;
             if collapse {
                 self.explorer_panel_expanded = false;
             }
-            action
+            actions
         } else {
             let expand = egui::Panel::left("workspace_explorer_panel_rail")
                 .resizable(false)
@@ -690,10 +731,16 @@ impl eframe::App for CameraToolboxApp {
             if expand {
                 self.explorer_panel_expanded = true;
             }
-            None
+            (None, None, None)
         };
         if let Some(action) = explorer_action {
             self.handle_explorer_action(&context, action);
+        }
+        if let Some(config) = direct_rtsp_config {
+            self.start_direct_rtsp(config);
+        }
+        if let Some(action) = workspace_stream_action {
+            self.handle_stream_panel_action(action);
         }
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             #[cfg(feature = "calibration-opencv")]
@@ -3905,11 +3952,113 @@ impl CameraToolboxApp {
         }
     }
 
+    fn render_direct_rtsp_workspace(&mut self, ui: &mut egui::Ui) -> Option<RtspStreamConfig> {
+        ui.heading("RTSP Stream");
+        ui.weak("Independent live-image input; it does not use Local or SFTP mounts.");
+        ui.label("URL");
+        ui.text_edit_singleline(&mut self.direct_rtsp.url);
+        ui.horizontal(|ui| {
+            ui.label("Channel");
+            ui.add(egui::DragValue::new(&mut self.direct_rtsp.channel).range(0..=255));
+            ui.label("Width");
+            ui.add(egui::DragValue::new(&mut self.direct_rtsp.width).range(1..=16_384));
+            ui.label("Height");
+            ui.add(egui::DragValue::new(&mut self.direct_rtsp.height).range(1..=16_384));
+        });
+        ui.horizontal(|ui| {
+            ui.label("Codec");
+            ui.radio_value(&mut self.direct_rtsp.codec, RtspCodec::H264, "H.264");
+            ui.radio_value(&mut self.direct_rtsp.codec, RtspCodec::H265, "H.265");
+        });
+        ui.horizontal(|ui| {
+            ui.label("Transport");
+            ui.radio_value(&mut self.direct_rtsp.transport, RtspTransport::Tcp, "TCP");
+            ui.radio_value(&mut self.direct_rtsp.transport, RtspTransport::Udp, "UDP");
+        });
+        ui.checkbox(
+            &mut self.direct_rtsp.prefer_hardware_acceleration,
+            "Prefer hardware acceleration",
+        );
+        ui.weak("A preference only; the Viewer reports the actual decoder backend after connect.");
+        if let Some(error) = self.direct_rtsp.last_error.as_deref() {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        if ui.button("Connect RTSP").clicked() {
+            return Some(RtspStreamConfig {
+                url: self.direct_rtsp.url.clone(),
+                channel: self.direct_rtsp.channel,
+                width: self.direct_rtsp.width,
+                height: self.direct_rtsp.height,
+                codec: self.direct_rtsp.codec,
+                transport: self.direct_rtsp.transport,
+            });
+        }
+        None
+    }
+
+    fn render_workspace_stream_section(&mut self, ui: &mut egui::Ui) -> Option<StreamPanelAction> {
+        ui.heading("Active Streams");
+        let active = self.workspace.active_id();
+        let streams: Vec<_> = self
+            .workspace
+            .live_documents()
+            .iter()
+            .map(|document| {
+                (
+                    document.id,
+                    document.title.clone(),
+                    document.source.detail(),
+                    document.status_label(),
+                    format!("{:?}", document.stage),
+                )
+            })
+            .collect();
+        if streams.is_empty() {
+            ui.weak("No active stream documents.");
+            return None;
+        }
+        let mut activate = None;
+        for (id, title, detail, status, stage) in streams {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                if ui.selectable_label(active == Some(id), title).clicked() {
+                    activate = Some(id);
+                }
+                ui.small(format!("{detail} · {stage} · {status}"));
+            });
+        }
+        if let Some(id) = activate {
+            self.workspace.activate(id);
+        }
+        if self
+            .workspace
+            .active_live()
+            .is_some_and(|document| matches!(document.lifecycle, LiveDocumentLifecycle::Open))
+            && ui.button("Request stop active stream").clicked()
+        {
+            return Some(StreamPanelAction::RequestStop);
+        }
+        None
+    }
+
+    fn start_direct_rtsp(&mut self, config: RtspStreamConfig) {
+        let prefer_hardware_acceleration = self.direct_rtsp.prefer_hardware_acceleration;
+        match self
+            .live_runtime
+            .start_direct_rtsp(config, prefer_hardware_acceleration)
+        {
+            Ok((session_id, latest_frame, source)) => {
+                self.workspace.open_live(session_id, latest_frame, source);
+                self.direct_rtsp.last_error = None;
+            }
+            Err(error) => self.direct_rtsp.last_error = Some(error),
+        }
+    }
+
     fn handle_stream_panel_action(&mut self, action: StreamPanelAction) {
         match action {
             StreamPanelAction::Start => match self.live_runtime.start() {
-                Ok((session_id, latest_frame)) => {
-                    self.workspace.open_live(session_id, latest_frame);
+                Ok((session_id, latest_frame, source)) => {
+                    self.workspace.open_live(session_id, latest_frame, source);
                     self.live_runtime.panel.last_error = None;
                 }
                 Err(error) => self.live_runtime.panel.last_error = Some(error),
@@ -3969,6 +4118,8 @@ impl CameraToolboxApp {
             if self.live_runtime.force_cleanup(&session_id)
                 && let Some(document) = self.workspace.live_mut(id)
             {
+                document.latest_frame.clear();
+                document.release_texture();
                 document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
                     terminal: camera_toolbox_app::StreamTerminal::Forced {
                         remote_state_unknown: true,
@@ -3984,20 +4135,23 @@ impl CameraToolboxApp {
         runtime: &LiveRuntime,
     ) -> egui::Rect {
         let rect = ui.max_rect();
+        let displayed_frame = document.displayed_frame().cloned();
         ui.horizontal(|ui| {
             ui.heading(&document.title);
             if ui.button("Snapshot...").clicked()
-                && let Some(frame) = document.latest_frame.latest()
+                && let Some(frame) = displayed_frame.as_ref()
                 && let Some(path) = rfd::FileDialog::new()
                     .add_filter("PNG image", &["png"])
                     .save_file()
             {
-                document.last_snapshot = Some(match write_live_snapshot(&path, &frame) {
+                document.last_snapshot = Some(match write_live_snapshot(&path, frame) {
                     Ok(()) => format!("Saved {}", path.display()),
                     Err(error) => format!("Snapshot failed: {error}"),
                 });
             }
         });
+        ui.label(document.source.detail());
+        ui.label(format!("Stream stage: {:?}", document.stage));
         if let Some(message) = document.last_snapshot.as_deref() {
             ui.label(message);
         }
@@ -4052,6 +4206,27 @@ impl CameraToolboxApp {
                 ui.label(format!("Dropped {}", document.metrics.preview_dropped));
                 ui.end_row();
                 ui.label(format!("Decoded {}", document.metrics.decoded_frames));
+                ui.label(format!(
+                    "Decode {:.1} fps",
+                    document.metrics.decoded_fps_millihz as f64 / 1_000.0
+                ));
+                ui.label(format!(
+                    "Present {:.1} fps",
+                    document.metrics.presented_fps_millihz as f64 / 1_000.0
+                ));
+                ui.label(format!(
+                    "Host presentation {:.2} ms",
+                    document.metrics.host_presentation_delay_ns as f64 / 1_000_000.0
+                ));
+                ui.end_row();
+                ui.label(format!(
+                    "Decoder {}",
+                    document
+                        .metrics
+                        .decoder_backend
+                        .as_deref()
+                        .unwrap_or("Not reported")
+                ));
                 ui.label(format!("Presented {}", document.presented_frames));
                 ui.label(format!("Resync {}", document.metrics.decoder_resyncs));
                 ui.label(format!("Record {} B", document.metrics.record_bytes));
@@ -4069,7 +4244,33 @@ impl CameraToolboxApp {
                     "Record Q {} B",
                     document.metrics.recorder_queue_bytes
                 ));
-                ui.label("source_rtp_pts=None");
+                let provenance = displayed_frame.as_ref().map_or_else(
+                    || "No displayed frame".to_owned(),
+                    |frame| match &frame.identity.source_pts {
+                        camera_toolbox_app::SourcePts::Known {
+                            ticks,
+                            time_base_numerator,
+                            time_base_denominator,
+                            provenance,
+                        } => format!(
+                            "{} ch{} seq{} PTS {} @ {}/{} ({provenance:?}), host monotonic {} ns",
+                            frame.identity.stream_id.as_str(),
+                            frame.identity.channel,
+                            frame.identity.frame_sequence,
+                            ticks,
+                            time_base_numerator,
+                            time_base_denominator,
+                            frame.identity.host_monotonic_time_ns,
+                        ),
+                        camera_toolbox_app::SourcePts::Unavailable { reason } => format!(
+                            "{} ch{} seq{} PTS unavailable: {reason}",
+                            frame.identity.stream_id.as_str(),
+                            frame.identity.channel,
+                            frame.identity.frame_sequence,
+                        ),
+                    },
+                );
+                ui.label(provenance);
                 ui.end_row();
             });
         ui.separator();

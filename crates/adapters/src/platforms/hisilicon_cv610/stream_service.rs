@@ -148,7 +148,7 @@ impl StreamService for Cv610StreamService {
 #[allow(clippy::too_many_arguments)]
 fn run_session(
     endpoint: &Cv610StreamEndpoint,
-    _session_id: &StreamSessionId,
+    session_id: &StreamSessionId,
     request: StreamOpenRequest,
     control: &StreamOperationControl,
     latest_frame: Arc<LatestDecodedFrameSlot>,
@@ -298,6 +298,8 @@ fn run_session(
         description.height,
         decoder_capacity,
         latest_frame,
+        session_id.clone(),
+        request.channel,
         &control.cancellation,
     ) {
         Ok(decoder) => Some(decoder),
@@ -588,6 +590,7 @@ fn report_metrics(
         preview_queue_depth: preview_depth.map_or(0, |depth| depth.load(Ordering::Acquire)),
         decoder_queue_depth: decoder_stats.input_depth,
         record_bytes: counters.record_bytes.load(Ordering::Relaxed),
+        ..StreamMetrics::default()
     }));
 }
 
@@ -1122,6 +1125,7 @@ mod tests {
                     channel: 0,
                     media: "video_data".to_owned(),
                     cseq: 1,
+                    prefer_hardware_acceleration: false,
                     recording: StreamRecordingRequest {
                         transport_destination: Some(transport.clone()),
                         annexb_destination: Some(annexb.clone()),
@@ -1242,6 +1246,7 @@ mod tests {
                     channel: 0,
                     media: "video_data".to_owned(),
                     cseq: 1,
+                    prefer_hardware_acceleration: false,
                     recording: StreamRecordingRequest::default(),
                 },
                 control,

@@ -51,12 +51,64 @@ fn run_app_frame(
     context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
 }
 
+fn accessibility_text(output: &egui::FullOutput) -> String {
+    output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("accessibility tree is enabled")
+        .nodes
+        .iter()
+        .filter_map(|(_, node)| node.label().or_else(|| node.value()))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn test_export_destination() -> ExportDestination {
     let source_id = FileSourceId::new("gui-save-result-test").unwrap();
     let root = std::env::current_dir().unwrap();
     let file_system: Arc<dyn camera_toolbox_app::FileSystem> =
         Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
     ExportDestination::new(DirectoryRef::root(source_id), file_system).unwrap()
+}
+
+fn test_live_source() -> crate::workspace::LiveStreamSource {
+    crate::workspace::LiveStreamSource::Rtsp {
+        label: "Test".to_owned(),
+        channel: 0,
+        transport: camera_toolbox_app::RtspTransport::Tcp,
+    }
+}
+
+#[test]
+fn workspace_source_modes_render_rtsp_controls_exclusively() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    let mut frame = eframe::Frame::_new_kittest();
+
+    app.explorer.select_local_mode_for_test();
+    let local = accessibility_text(&run_app_frame(&context, &mut app, &mut frame, Vec::new()));
+    assert!(!local.contains("Connect RTSP"));
+    assert!(!local.contains("RTSP Stream"));
+    assert!(!local.contains("Prefer hardware acceleration"));
+
+    #[cfg(feature = "platform-ssh")]
+    {
+        app.explorer.select_sftp_mode_for_test();
+        let sftp = accessibility_text(&run_app_frame(&context, &mut app, &mut frame, Vec::new()));
+        assert!(!sftp.contains("Connect RTSP"));
+        assert!(!sftp.contains("RTSP Stream"));
+        assert!(!sftp.contains("Prefer hardware acceleration"));
+    }
+
+    app.explorer.select_rtsp_mode_for_test();
+    let rtsp = accessibility_text(&run_app_frame(&context, &mut app, &mut frame, Vec::new()));
+    assert!(rtsp.contains("RTSP Stream"));
+    assert!(rtsp.contains("Connect RTSP"));
+    assert!(rtsp.contains("Prefer hardware acceleration"));
+    assert!(!rtsp.contains("Name"));
 }
 
 fn loaded_raw(context: &egui::Context, name: &str, generation: u64) -> LoadedRaw {
@@ -914,10 +966,12 @@ fn closing_inactive_live_tab_activates_its_confirmation() {
     let first = app.workspace.open_live(
         camera_toolbox_app::StreamSessionId::new("inactive-first").unwrap(),
         Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default()),
+        test_live_source(),
     );
     let second = app.workspace.open_live(
         camera_toolbox_app::StreamSessionId::new("active-second").unwrap(),
         Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default()),
+        test_live_source(),
     );
     assert!(app.workspace.activate(second));
 
@@ -1072,11 +1126,14 @@ fn ignored_eof_sidecar_stays_closing_until_gui_deadline_then_is_forced() {
                 channel: 0,
                 media: "video_data".to_owned(),
                 cseq: 1,
+                prefer_hardware_acceleration: false,
                 recording: StreamRecordingRequest::default(),
             },
         )
         .unwrap();
-    let document_id = app.workspace.open_live(session_id.clone(), latest);
+    let document_id = app
+        .workspace
+        .open_live(session_id.clone(), latest, test_live_source());
     let pid_deadline = Instant::now() + Duration::from_secs(1);
     while !pid_file.exists() && Instant::now() < pid_deadline {
         std::thread::sleep(Duration::from_millis(10));

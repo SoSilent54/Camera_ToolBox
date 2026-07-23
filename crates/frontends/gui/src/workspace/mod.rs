@@ -15,7 +15,7 @@ mod tabs;
 
 pub(crate) use document::RawDocument;
 pub(crate) use image_document::ImageDocument;
-pub(crate) use live_document::{LiveDocument, LiveDocumentLifecycle};
+pub(crate) use live_document::{LiveDocument, LiveDocumentLifecycle, LiveStreamSource};
 pub(crate) use tabs::{TabBarAction, render_tab_bar};
 
 pub(crate) const DEFAULT_DERIVED_RESOURCE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
@@ -141,11 +141,12 @@ impl WorkspaceState {
         &mut self,
         session_id: camera_toolbox_app::StreamSessionId,
         latest_frame: std::sync::Arc<camera_toolbox_app::LatestDecodedFrameSlot>,
+        source: LiveStreamSource,
     ) -> DocumentId {
         let id = DocumentId(self.next_document_id);
         self.next_document_id = self.next_document_id.saturating_add(1);
         self.live_documents
-            .push(LiveDocument::new(id, session_id, latest_frame));
+            .push(LiveDocument::new(id, session_id, latest_frame, source));
         self.active = Some(id);
         id
     }

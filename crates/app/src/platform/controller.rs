@@ -19,15 +19,15 @@ use super::{
     RemoteFileRequest, RemoteJobEvent, RemoteJobFailure, RemoteJobState, RemoteOpenDisposition,
     RemoteOperationControl, RemoteServiceError, RemoteTimeouts, RemoteWatchEvent,
     RemoteWatchRequest, ResolvedTargetBindings, StreamCancellation, StreamOpenRequest,
-    StreamOperationControl, StreamServiceError, StreamSession, StreamSessionEvent, StreamSessionId,
-    StreamTimeouts, TargetResolutionSnapshot, TypedCommandRequest, VerifiedDumpKind,
-    VerifiedDumpRequest,
+    StreamOperationControl, StreamService, StreamServiceError, StreamSession, StreamSessionEvent,
+    StreamSessionId, StreamTimeouts, TargetResolutionSnapshot, TypedCommandRequest,
+    VerifiedDumpKind, VerifiedDumpRequest,
 };
 
 struct ControllerStreamSession {
     session: Arc<StreamSession>,
     service_id: String,
-    _snapshot: Arc<TargetResolutionSnapshot>,
+    _snapshot: Option<Arc<TargetResolutionSnapshot>>,
 }
 
 #[derive(Clone)]
@@ -566,13 +566,12 @@ impl PlatformController {
         timeouts: StreamTimeouts,
     ) -> Result<StreamSessionId, StreamSubmitError> {
         request.validate()?;
-        let ResolvedTargetBindings::Cv610(bindings) = snapshot.bindings.as_ref() else {
-            return Err(StreamSubmitError::StreamUnavailable);
-        };
-        let handle = bindings
-            .stream
-            .as_ref()
-            .ok_or(StreamSubmitError::StreamUnavailable)?;
+        let handle = match snapshot.bindings.as_ref() {
+            ResolvedTargetBindings::Cv610(bindings) => bindings.stream.as_ref(),
+            ResolvedTargetBindings::SshManaged(bindings) => bindings.stream.as_ref(),
+            ResolvedTargetBindings::Local(_) => None,
+        }
+        .ok_or(StreamSubmitError::StreamUnavailable)?;
         if !handle
             .descriptor
             .supported_variants
@@ -634,7 +633,73 @@ impl PlatformController {
                 Arc::new(ControllerStreamSession {
                     session: Arc::new(session),
                     service_id,
-                    _snapshot: snapshot,
+                    _snapshot: Some(snapshot),
+                }),
+            );
+        Ok(session_id)
+    }
+
+    /// 提交不依赖 platform profile 的通用实时服务，例如用户直接输入的 RTSP URL。
+    ///
+    /// 调用方提供 service 所属的并发上限；controller 仍统一管理会话、事件与终止清理。
+    pub fn submit_stream_service(
+        &self,
+        service: Arc<dyn StreamService>,
+        concurrent_limit: usize,
+        request: StreamOpenRequest,
+        timeouts: StreamTimeouts,
+    ) -> Result<StreamSessionId, StreamSubmitError> {
+        request.validate()?;
+        let concurrent_limit = concurrent_limit.max(1);
+        let service_id = service.service_id().to_owned();
+        let active_for_service = self
+            .sessions
+            .lock()
+            .map_err(|_| StreamSubmitError::SessionRegistryPoisoned)?
+            .values()
+            .filter(|session| session.service_id == service_id)
+            .count();
+        if active_for_service >= concurrent_limit {
+            return Err(StreamSubmitError::TooManySessions {
+                limit: concurrent_limit,
+            });
+        }
+        let sequence = self.next_session.fetch_add(1, Ordering::Relaxed);
+        if sequence == 0 {
+            return Err(StreamSubmitError::SessionIdExhausted);
+        }
+        let session_id = StreamSessionId::new(format!("stream-{sequence}"))
+            .map_err(|_| StreamSubmitError::SessionIdExhausted)?;
+        let cancellation = StreamCancellation::default();
+        let events = Arc::clone(&self.stream_events);
+        let terminals = Arc::clone(&self.stream_terminals);
+        let reporter_session = session_id.clone();
+        let reporter_service = service_id.clone();
+        let reporter = Arc::new(move |event| {
+            push_stream_event(
+                &events,
+                &terminals,
+                StreamSessionEvent {
+                    session_id: reporter_session.clone(),
+                    service_id: reporter_service.clone(),
+                    event,
+                },
+            );
+        });
+        let control = StreamOperationControl::new(timeouts, cancellation, reporter)?;
+        let session = service.open(session_id.clone(), request, control)?;
+        if session.session_id != session_id {
+            return Err(StreamSubmitError::SessionIdentityMismatch);
+        }
+        self.sessions
+            .lock()
+            .map_err(|_| StreamSubmitError::SessionRegistryPoisoned)?
+            .insert(
+                session_id.clone(),
+                Arc::new(ControllerStreamSession {
+                    session: Arc::new(session),
+                    service_id,
+                    _snapshot: None,
                 }),
             );
         Ok(session_id)

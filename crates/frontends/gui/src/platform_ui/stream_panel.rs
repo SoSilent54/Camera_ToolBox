@@ -8,6 +8,7 @@ use eframe::egui;
 #[derive(Debug, Clone)]
 pub(crate) struct StreamPanelState {
     pub(crate) quota_mib: u64,
+    pub(crate) prefer_hardware_acceleration: bool,
     pub(crate) transport_destination: Option<PathBuf>,
     pub(crate) annexb_destination: Option<PathBuf>,
     pub(crate) timestamp_destination: Option<PathBuf>,
@@ -18,6 +19,7 @@ pub(crate) struct StreamPanelState {
 impl Default for StreamPanelState {
     fn default() -> Self {
         Self {
+            prefer_hardware_acceleration: false,
             quota_mib: 512,
             transport_destination: None,
             annexb_destination: None,
@@ -38,6 +40,7 @@ impl StreamPanelState {
             channel,
             media: media.to_owned(),
             cseq: 1,
+            prefer_hardware_acceleration: self.prefer_hardware_acceleration,
             recording: StreamRecordingRequest {
                 transport_destination: self.transport_destination.clone(),
                 annexb_destination: self.annexb_destination.clone(),

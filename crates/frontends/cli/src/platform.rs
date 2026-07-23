@@ -415,6 +415,7 @@ fn stream_record(args: &StreamRecordArgs) -> Result<CommandReport> {
         channel: config.stream.channel,
         media: config.stream.media.clone(),
         cseq: 1,
+        prefer_hardware_acceleration: false,
         recording: StreamRecordingRequest {
             transport_destination: args.transport_output.clone(),
             annexb_destination: args.annexb_output.clone(),

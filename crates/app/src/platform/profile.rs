@@ -153,6 +153,15 @@ impl PlatformConfig {
                 hash.u64(config.stability_interval_ms);
                 hash.u64(config.max_fetch_bytes);
                 hash.u64(config.command_output_bytes);
+                hash.boolean(config.rtsp.is_some());
+                if let Some(rtsp) = &config.rtsp {
+                    hash.string(&rtsp.url);
+                    hash.u16(rtsp.channel);
+                    hash.u32(rtsp.width);
+                    hash.u32(rtsp.height);
+                    hash.u8(rtsp.codec.snapshot_tag());
+                    hash.u8(rtsp.transport.snapshot_tag());
+                }
             }
         }
     }
@@ -238,6 +247,106 @@ impl Default for Cv610StreamConfig {
     }
 }
 
+/// SSH-managed profile 中由主机直接拉取的 RTSP 视频源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RtspTransport {
+    Tcp,
+    Udp,
+}
+
+impl Default for RtspTransport {
+    fn default() -> Self {
+        Self::Tcp
+    }
+}
+
+impl RtspTransport {
+    const fn snapshot_tag(self) -> u8 {
+        match self {
+            Self::Tcp => 0,
+            Self::Udp => 1,
+        }
+    }
+}
+
+/// Profile 声明的预期视频编码；实际会话不得在未完成协商时提升能力证据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RtspCodec {
+    H264,
+    H265,
+}
+
+impl Default for RtspCodec {
+    fn default() -> Self {
+        Self::H264
+    }
+}
+
+impl RtspCodec {
+    const fn snapshot_tag(self) -> u8 {
+        match self {
+            Self::H264 => 0,
+            Self::H265 => 1,
+        }
+    }
+}
+
+/// RTSP rawvideo 输出需要固定 frame extent；源 PTS 始终另行携带时间基。
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RtspStreamConfig {
+    pub url: String,
+    pub channel: u16,
+    pub width: u32,
+    pub height: u32,
+    #[serde(default)]
+    pub codec: RtspCodec,
+    #[serde(default)]
+    pub transport: RtspTransport,
+}
+
+impl fmt::Debug for RtspStreamConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RtspStreamConfig")
+            .field("url", &"[REDACTED]")
+            .field("channel", &self.channel)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("transport", &self.transport)
+            .field("codec", &self.codec)
+            .finish()
+    }
+}
+
+impl RtspStreamConfig {
+    pub fn validate(&self) -> Result<(), ProfileError> {
+        let authority = self
+            .url
+            .strip_prefix("rtsp://")
+            .and_then(|rest| rest.split('/').next());
+        if self.url.trim() != self.url
+            || authority.is_none_or(str::is_empty)
+            || authority.is_some_and(|value| value.contains('@'))
+            || self.url.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err(ProfileError::InvalidRtspUrl);
+        }
+        if self.width == 0 || self.height == 0 {
+            return Err(ProfileError::InvalidRtspFrameExtent {
+                width: self.width,
+                height: self.height,
+            });
+        }
+        if self.channel > u16::from(u8::MAX) {
+            return Err(ProfileError::InvalidRtspChannel(self.channel));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SshManagedConfig {
@@ -261,6 +370,9 @@ pub struct SshManagedConfig {
     pub stability_interval_ms: u64,
     pub max_fetch_bytes: u64,
     pub command_output_bytes: u64,
+    /// 可选 RTSP 输入；未配置时 SSH profile 保持 command/SFTP-only 行为。
+    #[serde(default)]
+    pub rtsp: Option<RtspStreamConfig>,
 }
 
 impl fmt::Debug for SshManagedConfig {
@@ -282,6 +394,7 @@ impl fmt::Debug for SshManagedConfig {
             .field("stability_interval_ms", &self.stability_interval_ms)
             .field("max_fetch_bytes", &self.max_fetch_bytes)
             .field("command_output_bytes", &self.command_output_bytes)
+            .field("rtsp", &self.rtsp)
             .finish()
     }
 }
@@ -338,6 +451,9 @@ impl SshManagedConfig {
         }
         if self.command_output_bytes == 0 {
             return Err(ProfileError::ZeroCommandOutputLimit);
+        }
+        if let Some(rtsp) = &self.rtsp {
+            rtsp.validate()?;
         }
         Ok(())
     }
@@ -597,6 +713,12 @@ pub enum ProfileError {
     ZeroSshFetchLimit,
     #[error("command output limit must be non-zero")]
     ZeroCommandOutputLimit,
+    #[error("RTSP URL must be a non-empty credential-free rtsp:// URL without control characters")]
+    InvalidRtspUrl,
+    #[error("RTSP frame extent must be non-zero, got {width}x{height}")]
+    InvalidRtspFrameExtent { width: u32, height: u32 },
+    #[error("RTSP channel must fit one interleaved byte, got {0}")]
+    InvalidRtspChannel(u16),
     #[error("sensor mode not found: {0}")]
     UnknownSensorMode(String),
     #[error("sensor mode key {key_mode_id} does not match mode {mode_id}")]
@@ -648,6 +770,63 @@ mod tests {
             stability_interval_ms: 500,
             max_fetch_bytes: 1024,
             command_output_bytes: 1024,
+            rtsp: None,
+        }
+    }
+
+    fn rtsp_config(url: &str) -> RtspStreamConfig {
+        RtspStreamConfig {
+            url: url.to_owned(),
+            channel: 0,
+            width: 1920,
+            height: 1080,
+            codec: RtspCodec::H264,
+            transport: RtspTransport::Tcp,
+        }
+    }
+
+    #[test]
+    fn rtsp_debug_redacts_authority_and_validation_rejects_userinfo() {
+        let config = rtsp_config("rtsp://operator:secret@camera.example/live/ch0");
+        let rendered = format!("{config:?}");
+        assert!(rendered.contains("url: \"[REDACTED]\""));
+        assert!(!rendered.contains("operator"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("camera.example"));
+        assert!(matches!(
+            config.validate(),
+            Err(ProfileError::InvalidRtspUrl)
+        ));
+    }
+
+    #[test]
+    fn ssh_config_debug_does_not_leak_rtsp_userinfo() {
+        let mut config = ssh_config("camera.local");
+        config.rtsp = Some(rtsp_config(
+            "rtsp://operator:secret@camera.example/live/ch0",
+        ));
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("operator"));
+        assert!(!rendered.contains("secret"));
+        assert!(!rendered.contains("camera.example"));
+        assert!(rendered.contains("[REDACTED]"));
+    }
+    #[test]
+    fn rtsp_configuration_requires_credential_free_absolute_url() {
+        assert!(
+            rtsp_config("rtsp://camera.example/live/ch0")
+                .validate()
+                .is_ok()
+        );
+        for url in [
+            "rtsps://camera.example/live",
+            "rtsp://camera.example@evil/live",
+            "rtsp://",
+        ] {
+            assert!(matches!(
+                rtsp_config(url).validate(),
+                Err(ProfileError::InvalidRtspUrl)
+            ));
         }
     }
 

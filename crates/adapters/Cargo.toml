@@ -24,6 +24,7 @@ platform-ssh = [
 
 [dependencies]
 camera-toolbox-app.workspace = true
+camera-toolbox-ffmpeg-bridge.workspace = true
 camera-toolbox-core.workspace = true
 directories = { workspace = true, optional = true }
 image.workspace = true
@@ -31,6 +32,7 @@ notify.workspace = true
 sha2 = { workspace = true, optional = true }
 opencv = { workspace = true, optional = true }
 socket2 = { workspace = true, optional = true }
+ffmpeg-next.workspace = true
 thiserror.workspace = true
 russh = { workspace = true, optional = true }
 russh-sftp = { workspace = true, optional = true }
