@@ -457,19 +457,17 @@ impl CalibrationSession {
 
     /// 为已冻结、已预检的 encoded PNG 直接进入 detection queue 创建令牌。
     ///
-    /// 调用方必须紧接着提交该 token；channel 拒绝时必须 `cancel_detection` 或
-    /// `install_failure` 回滚。worker 发送 `Started` 前状态始终为 `DetectQueued`。
+    /// 调用方必须紧接着将任务放入 `pending_loaded`；channel 满时该状态保持为
+    /// `DetectQueued`，直到 worker 发出 `Started`。
     ///
     /// # Errors
     ///
     /// 数据项不存在或已有任务在途时返回错误。
-    /// 为内存 PNG 保留检测令牌；调用方必须在检测 channel 接受任务后调用
-    /// `mark_encoded_detect_queued`。
     pub fn begin_encoded_detection(
         &mut self,
         id: CalibrationItemId,
     ) -> Result<CalibrationJobToken, CalibrationSessionError> {
-        self.begin_detection_with_status(id, CalibrationItemStatus::Pending)
+        self.begin_detection_with_status(id, CalibrationItemStatus::DetectQueued)
     }
 
     fn begin_detection_with_status(
@@ -532,17 +530,6 @@ impl CalibrationSession {
         token: &CalibrationJobToken,
     ) -> Result<(), CalibrationSessionError> {
         self.mark_detection_queued_from(token, CalibrationItemStatus::Reading)
-    }
-
-    /// 内存 PNG 被检测 channel 接收后标记为待检测。
-    ///
-    /// 该单独转换确保 channel 拒绝或仍在 GUI pending 队列中的 stream snapshot
-    /// 不会被错误展示为已经排队给 worker。
-    pub fn mark_encoded_detect_queued(
-        &mut self,
-        token: &CalibrationJobToken,
-    ) -> Result<(), CalibrationSessionError> {
-        self.mark_detection_queued_from(token, CalibrationItemStatus::Pending)
     }
 
     fn mark_detection_queued_from(
@@ -733,7 +720,9 @@ impl CalibrationSession {
         token: &CalibrationJobToken,
     ) -> Result<(), CalibrationSessionError> {
         self.validate_token(token)?;
-        if self.active_detection_jobs.get(&token.item_id) != Some(&token.job_id) {
+        if self.active_detection_jobs.get(&token.item_id) != Some(&token.job_id)
+            || !self.item(token.item_id)?.status.is_busy()
+        {
             return Err(CalibrationSessionError::StaleResult);
         }
         Ok(())
@@ -898,15 +887,6 @@ mod tests {
         };
 
         let token = session.begin_encoded_detection(id).unwrap();
-        assert!(matches!(
-            session.items()[0].status,
-            CalibrationItemStatus::Pending
-        ));
-        assert_eq!(
-            session.mark_detecting(&token),
-            Err(CalibrationSessionError::StaleResult)
-        );
-        session.mark_encoded_detect_queued(&token).unwrap();
         assert!(matches!(
             session.items()[0].status,
             CalibrationItemStatus::DetectQueued

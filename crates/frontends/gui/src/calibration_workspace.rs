@@ -1520,22 +1520,8 @@ impl CalibrationWorkspace {
             let Some(job) = self.pending_loaded.pop_front() else {
                 break;
             };
-            let token = job.token.clone();
-            let direct_stream_input = self.session.items().iter().any(|item| {
-                item.id == token.item_id
-                    && matches!(item.input, CalibrationInputKey::StreamCapture(_))
-            });
             match self.detection_pipeline.try_submit_detection(job) {
-                Ok(()) => {
-                    if direct_stream_input {
-                        if let Err(error) = self.session.mark_encoded_detect_queued(&token) {
-                            self.abort_detection_batch(format!(
-                                "Could not commit stream detection queue admission: {error}"
-                            ));
-                            break;
-                        }
-                    }
-                }
+                Ok(()) => {}
                 Err(TrySendError::Full(job)) => {
                     self.pending_loaded.push_front(job);
                     break;
