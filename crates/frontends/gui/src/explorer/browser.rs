@@ -258,13 +258,13 @@ impl BrowserState {
         ui.horizontal(|ui| {
             let (name_width, size_width) =
                 file_table_column_widths(ui.available_width(), ui.spacing().item_spacing.x);
-            render_clipped_cell(
+            let _ = render_clipped_cell(
                 ui,
                 egui::vec2(name_width, 24.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| ui.strong("Name"),
             );
-            render_clipped_cell(
+            let _ = render_clipped_cell(
                 ui,
                 egui::vec2(size_width, 24.0),
                 egui::Layout::right_to_left(egui::Align::Center),
@@ -284,8 +284,9 @@ impl BrowserState {
                         egui::vec2(name_width, 22.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| Self::render_parent_name_cell(ui, current_directory, busy),
-                    );
-                    render_clipped_cell(
+                    )
+                    .1;
+                    let _ = render_clipped_cell(
                         ui,
                         egui::vec2(size_width, 22.0),
                         egui::Layout::right_to_left(egui::Align::Center),
@@ -307,8 +308,9 @@ impl BrowserState {
                             egui::vec2(name_width, 22.0),
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| self.render_new_folder_editor(ui, busy),
-                        );
-                        render_clipped_cell(
+                        )
+                        .1;
+                        let _ = render_clipped_cell(
                             ui,
                             egui::vec2(size_width, 22.0),
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -345,8 +347,9 @@ impl BrowserState {
                                     )
                                 }
                             },
-                        );
-                        render_clipped_cell(
+                        )
+                        .1;
+                        let _ = render_clipped_cell(
                             ui,
                             egui::vec2(size_width, 22.0),
                             egui::Layout::right_to_left(egui::Align::Center),
@@ -897,18 +900,18 @@ fn file_table_column_widths(available_width: f32, spacing: f32) -> (f32, f32) {
     (name_width, size_width)
 }
 
-/// 将子控件限制在分配给它的列中，避免长文件名或尺寸文本越过分栏边界。
+/// 先在父 UI 预留精确列宽，再在固定矩形内创建子 UI，防止子控件的最小尺寸扩张父布局。
 fn render_clipped_cell<T>(
     ui: &mut egui::Ui,
     size: egui::Vec2,
     layout: egui::Layout,
     add_contents: impl FnOnce(&mut egui::Ui) -> T,
-) -> T {
-    ui.allocate_ui_with_layout(size, layout, |ui| {
-        ui.set_clip_rect(ui.clip_rect().intersect(ui.max_rect()));
-        add_contents(ui)
-    })
-    .inner
+) -> (egui::Rect, T) {
+    let parent_clip = ui.clip_rect();
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    let mut cell = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(layout));
+    cell.set_clip_rect(parent_clip.intersect(rect));
+    (rect, add_contents(&mut cell))
 }
 
 fn format_entry_size(entry: &FileEntry) -> String {
@@ -1109,10 +1112,10 @@ mod tests {
     fn narrow_columns_keep_long_name_and_size_in_separate_cells() {
         let mut entry = file(&format!("{}.raw", "long_file_name_".repeat(24)));
         entry.version.size = u64::MAX;
+        let long_size = format_entry_size(&entry);
         assert!(entry.name.as_str().len() > 80);
-        assert!(format_entry_size(&entry).len() > 8);
+        assert!(long_size.len() > 8);
 
-        // 列宽只取决于面板几何；长内容由 render_clipped_cell 裁剪，不能扩张到相邻列。
         for available_width in [24.0, 56.0, 96.0, 160.0, 480.0] {
             let spacing = 8.0;
             let (name_width, size_width) = file_table_column_widths(available_width, spacing);
@@ -1120,6 +1123,40 @@ mod tests {
             assert!(size_width >= 0.0);
             assert!(name_width + size_width + spacing <= available_width + f32::EPSILON);
         }
+
+        let context = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(96.0, 64.0),
+            )),
+            ..Default::default()
+        };
+        let mut cells = None;
+        context.run_ui(input, |ui| {
+            ui.horizontal(|ui| {
+                let (name_width, size_width) =
+                    file_table_column_widths(ui.available_width(), ui.spacing().item_spacing.x);
+                let (name_rect, _) = render_clipped_cell(
+                    ui,
+                    egui::vec2(name_width, 22.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| ui.add(egui::Button::new(entry.name.as_str())),
+                );
+                let (size_rect, _) = render_clipped_cell(
+                    ui,
+                    egui::vec2(size_width, 22.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| ui.monospace(&long_size),
+                );
+                cells = Some((name_rect, size_rect));
+            });
+        });
+        let (name_rect, size_rect) = cells.expect("both narrow cells are rendered");
+        assert!(
+            name_rect.right() <= size_rect.left(),
+            "long content must not move the size cell: {name_rect:?}, {size_rect:?}"
+        );
     }
 
     #[test]
