@@ -469,8 +469,15 @@ enum AutoCandidateState {
     Detecting,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CandidateIntent {
+    PreviewOnly,
+    AutoCommit,
+}
+
 struct PendingCandidate {
     token: AutoCandidateToken,
+    intent: CandidateIntent,
     source: CalibrationSource,
     encoded: Option<CalibrationEncodedPng>,
     cancellation: CalibrationCancellation,
@@ -780,26 +787,33 @@ impl CalibrationWorkspace {
         self.start_detection_items(vec![id]);
     }
 
-    /// 观察 Viewer 已安装的不可变帧；按完整 identity 去重并以 5 Hz 限频。
+    /// 观察 Viewer 已安装的不可变帧；预览检测与自动准入使用同一 worker，但终态互不混淆。
     pub(crate) fn observe_live_frame(
         &mut self,
         frame: Arc<DecodedVideoFrame>,
         store: CaptureStore,
+        preview_requested: bool,
     ) {
-        if !self.auto_capture_enabled
-            || self.active_job.is_some()
+        let intent = if self.auto_capture_enabled {
+            CandidateIntent::AutoCommit
+        } else if preview_requested {
+            CandidateIntent::PreviewOnly
+        } else {
+            return;
+        };
+        if self.active_job.is_some()
             || self.auto_capture.pending.is_some()
-            || self.session.items().len() >= MAX_DATASET_ITEMS
+            || (intent == CandidateIntent::AutoCommit
+                && self.session.items().len() >= MAX_DATASET_ITEMS)
         {
             return;
         }
         let capture_id = StreamCaptureId::from(&frame.identity);
         if self.auto_capture.last_observed.as_ref() == Some(&capture_id)
-            || self
-                .session
-                .items()
-                .iter()
-                .any(|item| item.input == CalibrationInputKey::StreamCapture(capture_id.clone()))
+            || (intent == CandidateIntent::AutoCommit
+                && self.session.items().iter().any(|item| {
+                    item.input == CalibrationInputKey::StreamCapture(capture_id.clone())
+                }))
         {
             return;
         }
@@ -807,7 +821,8 @@ impl CalibrationWorkspace {
         if (self.auto_capture.last_observed.is_some()
             && now_ns.saturating_sub(self.auto_capture.last_observed_at_ns)
                 < AUTO_CAPTURE_ANALYSIS_INTERVAL_NS)
-            || (self.auto_capture.last_accepted_at_ns != 0
+            || (intent == CandidateIntent::AutoCommit
+                && self.auto_capture.last_accepted_at_ns != 0
                 && now_ns.saturating_sub(self.auto_capture.last_accepted_at_ns)
                     < AUTO_CAPTURE_ACCEPT_COOLDOWN_NS)
         {
@@ -819,7 +834,11 @@ impl CalibrationWorkspace {
         let FrozenStreamInput { source, encoded } = match freeze_stream_input(&frame, store) {
             Ok(frozen) => frozen,
             Err(error) => {
-                self.status = format!("Automatic capture rejected before detection: {error}");
+                let operation = match intent {
+                    CandidateIntent::PreviewOnly => "Board preview",
+                    CandidateIntent::AutoCommit => "Automatic capture",
+                };
+                self.status = format!("{operation} rejected before detection: {error}");
                 return;
             }
         };
@@ -834,21 +853,32 @@ impl CalibrationWorkspace {
         ) {
             Ok(token) => token,
             Err(error) => {
-                self.status = format!("Automatic candidate rejected: {error}");
+                let operation = match intent {
+                    CandidateIntent::PreviewOnly => "Board preview candidate",
+                    CandidateIntent::AutoCommit => "Automatic candidate",
+                };
+                self.status = format!("{operation} rejected: {error}");
                 return;
             }
         };
         self.auto_capture.pending = Some(PendingCandidate {
             token,
+            intent,
             source,
             encoded: Some(encoded),
             cancellation: CalibrationCancellation::default(),
             state: AutoCandidateState::Queued,
         });
-        self.status = format!(
-            "Automatic candidate {} queued for authoritative detection.",
-            candidate_id.get()
-        );
+        self.status = match intent {
+            CandidateIntent::PreviewOnly => format!(
+                "Live board preview candidate {} queued for detection.",
+                candidate_id.get()
+            ),
+            CandidateIntent::AutoCommit => format!(
+                "Automatic candidate {} queued for authoritative detection.",
+                candidate_id.get()
+            ),
+        };
     }
 
     pub(crate) fn stream_disconnected(&mut self, session_id: &StreamSessionId) {
@@ -859,7 +889,7 @@ impl CalibrationWorkspace {
             .is_some_and(|candidate| candidate.token.frame_identity().stream_id == *session_id);
         if pending_matches {
             self.cancel_auto_candidate(
-                "Automatic candidate cancelled because its live stream disconnected.",
+                "Live detection candidate cancelled because its stream disconnected.",
             );
             return;
         }
@@ -918,6 +948,7 @@ impl CalibrationWorkspace {
         }
         let PendingCandidate {
             token,
+            intent,
             source,
             cancellation,
             ..
@@ -929,26 +960,42 @@ impl CalibrationWorkspace {
                 outcome: camera_toolbox_core::ChessboardDetectionOutcome::Found(detection),
                 preview,
             })) => {
+                if source_revision != *token.source_revision() {
+                    self.auto_capture.latest_detection = None;
+                    self.status = "Live detection source revision changed.".to_owned();
+                    return;
+                }
                 self.auto_capture.latest_detection = Some(IdentityBoundDetection {
                     identity: token.frame_identity().clone(),
                     detection: detection.clone(),
                 });
-                let commit = AutoCandidateCommit::new(token, source_revision, detection);
-                match self.session.commit_auto_candidate(commit) {
-                    Ok(item_id) => {
-                        self.sources.insert(item_id, source);
-                        if let (Some(context), Some(frame)) = (context, preview) {
-                            self.install_preview(context, item_id, frame);
-                        }
-                        self.auto_capture.last_accepted_at_ns = host_monotonic_time_ns();
-                        self.coverage_dirty = true;
+                match intent {
+                    CandidateIntent::PreviewOnly => {
                         self.status = format!(
-                            "Automatic capture committed as dataset item {}.",
-                            item_id.get()
+                            "Board preview detected on stream frame {}.",
+                            token.frame_identity().frame_sequence
                         );
                     }
-                    Err(error) => {
-                        self.status = format!("Automatic candidate commit rejected: {error}");
+                    CandidateIntent::AutoCommit => {
+                        let commit = AutoCandidateCommit::new(token, source_revision, detection);
+                        match self.session.commit_auto_candidate(commit) {
+                            Ok(item_id) => {
+                                self.sources.insert(item_id, source);
+                                if let (Some(context), Some(frame)) = (context, preview) {
+                                    self.install_preview(context, item_id, frame);
+                                }
+                                self.auto_capture.last_accepted_at_ns = host_monotonic_time_ns();
+                                self.coverage_dirty = true;
+                                self.status = format!(
+                                    "Automatic capture committed as dataset item {}.",
+                                    item_id.get()
+                                );
+                            }
+                            Err(error) => {
+                                self.status =
+                                    format!("Automatic candidate commit rejected: {error}");
+                            }
+                        }
                     }
                 }
             }
@@ -957,14 +1004,30 @@ impl CalibrationWorkspace {
                 ..
             })) => {
                 self.auto_capture.latest_detection = None;
-                self.status = "Automatic candidate rejected: chessboard not found.".to_owned();
+                self.status = match intent {
+                    CandidateIntent::PreviewOnly => {
+                        "Board preview: chessboard not found.".to_owned()
+                    }
+                    CandidateIntent::AutoCommit => {
+                        "Automatic candidate rejected: chessboard not found.".to_owned()
+                    }
+                };
             }
             CandidateTerminal::Detection(Err(error)) => {
                 self.auto_capture.latest_detection = None;
-                self.status = if error.is_cancelled() {
-                    "Automatic candidate cancelled.".to_owned()
-                } else {
-                    format!("Automatic candidate detection failed: {error}")
+                self.status = match (intent, error.is_cancelled()) {
+                    (CandidateIntent::PreviewOnly, true) => {
+                        "Board preview detection cancelled.".to_owned()
+                    }
+                    (CandidateIntent::PreviewOnly, false) => {
+                        format!("Board preview detection failed: {error}")
+                    }
+                    (CandidateIntent::AutoCommit, true) => {
+                        "Automatic candidate cancelled.".to_owned()
+                    }
+                    (CandidateIntent::AutoCommit, false) => {
+                        format!("Automatic candidate detection failed: {error}")
+                    }
                 };
             }
             CandidateTerminal::Discard(message) => {
@@ -1676,7 +1739,7 @@ impl CalibrationWorkspace {
             self.session.invalidate_auto_admission();
             if self.auto_capture.pending.is_some() {
                 self.cancel_auto_candidate(
-                    "Automatic candidate cancelled because the board specification changed.",
+                    "Live detection candidate cancelled because the board specification changed.",
                 );
             }
         }
@@ -2086,7 +2149,14 @@ impl CalibrationWorkspace {
                     && candidate.token == token
                 {
                     candidate.state = AutoCandidateState::Detecting;
-                    self.status = format!("Detecting automatic candidate {}.", token.id().get());
+                    self.status = match candidate.intent {
+                        CandidateIntent::PreviewOnly => {
+                            format!("Detecting board preview candidate {}.", token.id().get())
+                        }
+                        CandidateIntent::AutoCommit => {
+                            format!("Detecting automatic candidate {}.", token.id().get())
+                        }
+                    };
                 }
             }
             DetectionStageEvent::Finished(result) => self.handle_detection_result(context, result),
@@ -3573,6 +3643,25 @@ mod tests {
         })
     }
 
+    fn chessboard_live_frame(sequence: u64) -> Arc<DecodedVideoFrame> {
+        let rgba = image::load_from_memory(include_bytes!(
+            "../../../adapters/tests/data/chessboard_11x8_clean.png"
+        ))
+        .unwrap()
+        .to_rgba8();
+        Arc::new(DecodedVideoFrame {
+            width: rgba.width(),
+            height: rgba.height(),
+            rgba: Arc::from(rgba.into_raw()),
+            identity: StreamFrameIdentity::unavailable(
+                StreamSessionId::new("board-preview-workspace-test").unwrap(),
+                0,
+                sequence,
+                "test fixture",
+            ),
+        })
+    }
+
     fn pending_candidate_asset_id(workspace: &CalibrationWorkspace) -> AssetId {
         let candidate = workspace
             .auto_capture
@@ -3591,6 +3680,46 @@ mod tests {
     }
 
     #[test]
+    fn board_preview_detects_corners_by_default_without_mutating_dataset() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let baseline = store.stats().unwrap();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        assert!(!workspace.auto_capture_enabled);
+        let displayed = chessboard_live_frame(1);
+        workspace.observe_live_frame(Arc::clone(&displayed), store.clone(), false);
+        assert!(workspace.auto_capture.pending.is_none());
+        assert_eq!(store.stats().unwrap(), baseline);
+
+        workspace.observe_live_frame(Arc::clone(&displayed), store.clone(), true);
+
+        let asset_id = pending_candidate_asset_id(&workspace);
+        assert_eq!(
+            workspace.auto_capture.pending.as_ref().unwrap().intent,
+            CandidateIntent::PreviewOnly
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+            workspace.tick(&context);
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(
+            workspace.auto_capture.pending.is_none(),
+            "preview worker did not finish: {}",
+            workspace.status
+        );
+        assert!(workspace.session.items().is_empty());
+        assert!(workspace.sources.is_empty());
+        assert!(store.get(&asset_id).unwrap().is_none());
+        assert_eq!(store.stats().unwrap(), baseline);
+        let overlay = workspace.viewer_overlay(&displayed);
+        assert_eq!(overlay.detection.unwrap().corners.len(), 88);
+        assert_eq!(overlay.coverage_views, 0);
+        assert!(overlay.coverage.is_empty());
+    }
+
+    #[test]
     fn automatic_candidate_success_transfers_the_same_asset_into_dataset() {
         let context = egui::Context::default();
         let store = auto_capture_store();
@@ -3598,7 +3727,7 @@ mod tests {
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         workspace.auto_capture_enabled = true;
         let displayed = live_frame(1);
-        workspace.observe_live_frame(Arc::clone(&displayed), store.clone());
+        workspace.observe_live_frame(Arc::clone(&displayed), store.clone(), false);
 
         let asset_id = pending_candidate_asset_id(&workspace);
         let candidate = workspace.auto_capture.pending.as_ref().unwrap();
@@ -3667,7 +3796,7 @@ mod tests {
         let baseline = store.stats().unwrap();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         workspace.auto_capture_enabled = true;
-        workspace.observe_live_frame(live_frame(2), store.clone());
+        workspace.observe_live_frame(live_frame(2), store.clone(), false);
 
         let asset_id = pending_candidate_asset_id(&workspace);
         let candidate = workspace.auto_capture.pending.as_ref().unwrap();
@@ -3700,7 +3829,7 @@ mod tests {
         let baseline = store.stats().unwrap();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         workspace.auto_capture_enabled = true;
-        workspace.observe_live_frame(live_frame(3), store.clone());
+        workspace.observe_live_frame(live_frame(3), store.clone(), false);
         let asset_id = pending_candidate_asset_id(&workspace);
 
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -3728,7 +3857,7 @@ mod tests {
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         workspace.auto_capture_enabled = true;
         let frame = live_frame(4);
-        workspace.observe_live_frame(Arc::clone(&frame), store.clone());
+        workspace.observe_live_frame(Arc::clone(&frame), store.clone(), false);
         let asset_id = pending_candidate_asset_id(&workspace);
 
         workspace.stream_disconnected(&frame.identity.stream_id);
@@ -3748,7 +3877,7 @@ mod tests {
         let asset_id = {
             let mut workspace = CalibrationWorkspace::new(&context).unwrap();
             workspace.auto_capture_enabled = true;
-            workspace.observe_live_frame(live_frame(5), store.clone());
+            workspace.observe_live_frame(live_frame(5), store.clone(), false);
             pending_candidate_asset_id(&workspace)
         };
 

@@ -657,7 +657,10 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         let displayed_live_frame = if let Some(document) = self.workspace.active_live_mut() {
             document.install_latest_texture(&context);
-            document.displayed_frame().cloned()
+            document
+                .displayed_frame()
+                .cloned()
+                .map(|frame| (frame, document.show_calibration_detection))
         } else {
             None
         };
@@ -668,9 +671,12 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         {
             self.calibration.tick(&context);
-            if let Some(frame) = displayed_live_frame {
-                self.calibration
-                    .observe_live_frame(frame, self.live_runtime.capture_store().clone());
+            if let Some((frame, preview_requested)) = displayed_live_frame {
+                self.calibration.observe_live_frame(
+                    frame,
+                    self.live_runtime.capture_store().clone(),
+                    preview_requested,
+                );
             }
         }
         self.ensure_active_resources(&context);
