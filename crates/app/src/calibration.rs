@@ -1,5 +1,7 @@
 //! 标定数据集会话与结果安装事务。
 
+use std::collections::HashMap;
+
 use camera_toolbox_core::{
     BoardSpec, CalibrationDataError, CalibrationImageSize, CalibrationRequest, CalibrationSolution,
     ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics,
@@ -120,7 +122,9 @@ impl CalibrationItemId {
 #[derive(Clone, Debug, PartialEq)]
 pub enum CalibrationItemStatus {
     Pending,
+    ReadQueued,
     Reading,
+    DetectQueued,
     Detecting,
     Found(ChessboardDetection),
     NotFound { image_size: CalibrationImageSize },
@@ -130,7 +134,10 @@ pub enum CalibrationItemStatus {
 impl CalibrationItemStatus {
     #[must_use]
     pub const fn is_busy(&self) -> bool {
-        matches!(self, Self::Reading | Self::Detecting)
+        matches!(
+            self,
+            Self::ReadQueued | Self::Reading | Self::DetectQueued | Self::Detecting
+        )
     }
 }
 
@@ -147,7 +154,8 @@ pub struct CalibrationDatasetItem {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationJobToken {
     pub item_id: CalibrationItemId,
-    generation: u64,
+    detection_epoch: u64,
+    job_id: u64,
     source_version: FileVersion,
     board: BoardSpec,
 }
@@ -168,7 +176,7 @@ impl CalibrationJobToken {
 pub struct CalibrationSnapshot {
     pub item_ids: Vec<CalibrationItemId>,
     pub request: CalibrationRequest,
-    generation: u64,
+    solution_revision: u64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -191,7 +199,10 @@ pub struct CalibrationSession {
     items: Vec<CalibrationDatasetItem>,
     selected: Option<CalibrationItemId>,
     installed: Option<InstalledCalibration>,
-    generation: u64,
+    solution_revision: u64,
+    detection_epoch: u64,
+    active_detection_jobs: HashMap<CalibrationItemId, u64>,
+    next_detection_job_id: u64,
     next_id: u64,
 }
 
@@ -203,7 +214,10 @@ impl CalibrationSession {
             items: Vec::new(),
             selected: None,
             installed: None,
-            generation: 1,
+            solution_revision: 1,
+            detection_epoch: 1,
+            active_detection_jobs: HashMap::new(),
+            next_detection_job_id: 1,
             next_id: 1,
         }
     }
@@ -244,12 +258,12 @@ impl CalibrationSession {
         let corner_layout_changed =
             self.board.inner_cols != board.inner_cols || self.board.inner_rows != board.inner_rows;
         self.board = board;
-        if corner_layout_changed {
-            for item in &mut self.items {
+        for item in &mut self.items {
+            if corner_layout_changed || item.status.is_busy() {
                 item.status = CalibrationItemStatus::Pending;
             }
         }
-        self.invalidate();
+        self.invalidate_detection_epoch();
         Ok(())
     }
 
@@ -258,7 +272,7 @@ impl CalibrationSession {
         for item in &mut self.items {
             item.status = CalibrationItemStatus::Pending;
         }
-        self.invalidate();
+        self.invalidate_detection_epoch();
     }
 
     pub fn add_or_refresh(
@@ -280,7 +294,7 @@ impl CalibrationSession {
             item.display_name = display_name;
             item.status = CalibrationItemStatus::Pending;
             let id = item.id;
-            self.invalidate();
+            self.invalidate_detection_epoch();
             return AddCalibrationItemOutcome::SourceChanged(id);
         }
 
@@ -295,7 +309,7 @@ impl CalibrationSession {
             status: CalibrationItemStatus::Pending,
         });
         self.selected.get_or_insert(id);
-        self.invalidate();
+        self.invalidate_detection_epoch();
         AddCalibrationItemOutcome::Added(id)
     }
 
@@ -319,7 +333,7 @@ impl CalibrationSession {
         let item = self.item_mut(id)?;
         if item.enabled != enabled {
             item.enabled = enabled;
-            self.invalidate();
+            self.invalidate_detection_epoch();
         }
         Ok(())
     }
@@ -340,7 +354,7 @@ impl CalibrationSession {
                 .get(index.min(self.items.len().saturating_sub(1)))
                 .map(|item| item.id);
         }
-        self.invalidate();
+        self.invalidate_detection_epoch();
         Ok(())
     }
 
@@ -350,10 +364,10 @@ impl CalibrationSession {
         }
         self.items.clear();
         self.selected = None;
-        self.invalidate();
+        self.invalidate_detection_epoch();
     }
 
-    /// 创建绑定当前 board、source version 与 generation 的检测令牌。
+    /// 创建绑定当前 board、source version、detection epoch 与唯一 job ID 的检测令牌。
     ///
     /// # Errors
     ///
@@ -368,26 +382,78 @@ impl CalibrationSession {
             if item.status.is_busy() {
                 return Err(CalibrationSessionError::ItemBusy(id));
             }
-            item.status = CalibrationItemStatus::Reading;
+            item.status = CalibrationItemStatus::ReadQueued;
             item.version
         };
-        self.invalidate();
+        let job_id = self.next_detection_job_id;
+        self.next_detection_job_id = self.next_detection_job_id.wrapping_add(1).max(1);
+        self.active_detection_jobs.insert(id, job_id);
+        self.invalidate_solution();
         Ok(CalibrationJobToken {
             item_id: id,
-            generation: self.generation,
+            detection_epoch: self.detection_epoch,
+            job_id,
             source_version,
             board,
         })
     }
 
+    /// 将已进入 I/O worker 的读取任务从排队状态切换为活动读取。
+    ///
     /// # Errors
     ///
-    /// 令牌已过期或数据项不存在时返回错误。
+    /// 令牌已过期、数据项不存在或任务不在读取队列中时返回错误。
+    pub fn mark_reading(
+        &mut self,
+        token: &CalibrationJobToken,
+    ) -> Result<(), CalibrationSessionError> {
+        self.validate_active_token(token)?;
+        if !matches!(
+            self.item(token.item_id)?.status,
+            CalibrationItemStatus::ReadQueued
+        ) {
+            return Err(CalibrationSessionError::StaleResult);
+        }
+        self.item_mut(token.item_id)?.status = CalibrationItemStatus::Reading;
+        Ok(())
+    }
+
+    /// 读取成功后标记为待检测；任务仍在检测 worker 的队列中。
+    ///
+    /// # Errors
+    ///
+    /// 令牌已过期、数据项不存在或读取尚未完成时返回错误。
+    pub fn mark_detect_queued(
+        &mut self,
+        token: &CalibrationJobToken,
+    ) -> Result<(), CalibrationSessionError> {
+        self.validate_active_token(token)?;
+        if !matches!(
+            self.item(token.item_id)?.status,
+            CalibrationItemStatus::Reading
+        ) {
+            return Err(CalibrationSessionError::StaleResult);
+        }
+        self.item_mut(token.item_id)?.status = CalibrationItemStatus::DetectQueued;
+        Ok(())
+    }
+
+    /// 检测 worker 取到任务时标记为活动检测。
+    ///
+    /// # Errors
+    ///
+    /// 令牌已过期、数据项不存在或任务仍未进入检测队列时返回错误。
     pub fn mark_detecting(
         &mut self,
         token: &CalibrationJobToken,
     ) -> Result<(), CalibrationSessionError> {
-        self.validate_token(token)?;
+        self.validate_active_token(token)?;
+        if !matches!(
+            self.item(token.item_id)?.status,
+            CalibrationItemStatus::DetectQueued
+        ) {
+            return Err(CalibrationSessionError::StaleResult);
+        }
         self.item_mut(token.item_id)?.status = CalibrationItemStatus::Detecting;
         Ok(())
     }
@@ -403,10 +469,11 @@ impl CalibrationSession {
         observed_version: FileVersion,
         outcome: ChessboardDetectionOutcome,
     ) -> Result<(), CalibrationSessionError> {
-        self.validate_token(token)?;
+        self.validate_active_token(token)?;
         if observed_version != token.source_version {
+            self.active_detection_jobs.remove(&token.item_id);
             self.item_mut(token.item_id)?.status = CalibrationItemStatus::Pending;
-            self.invalidate();
+            self.invalidate_solution();
             return Err(CalibrationSessionError::SourceChanged(token.item_id));
         }
         let status = match outcome {
@@ -418,8 +485,9 @@ impl CalibrationSession {
                 CalibrationItemStatus::NotFound { image_size }
             }
         };
+        self.active_detection_jobs.remove(&token.item_id);
         self.item_mut(token.item_id)?.status = status;
-        self.invalidate();
+        self.invalidate_solution();
         Ok(())
     }
 
@@ -431,9 +499,26 @@ impl CalibrationSession {
         token: &CalibrationJobToken,
         message: String,
     ) -> Result<(), CalibrationSessionError> {
-        self.validate_token(token)?;
+        self.validate_active_token(token)?;
+        self.active_detection_jobs.remove(&token.item_id);
         self.item_mut(token.item_id)?.status = CalibrationItemStatus::Failed(message);
-        self.invalidate();
+        self.invalidate_solution();
+        Ok(())
+    }
+
+    /// 用户取消检测时仅清除 busy 状态；后续到达的旧结果会被 active-token 校验拒绝。
+    ///
+    /// # Errors
+    ///
+    /// 令牌已过期或数据项不存在时返回错误。
+    pub fn cancel_detection(
+        &mut self,
+        token: &CalibrationJobToken,
+    ) -> Result<(), CalibrationSessionError> {
+        self.validate_active_token(token)?;
+        self.active_detection_jobs.remove(&token.item_id);
+        self.item_mut(token.item_id)?.status = CalibrationItemStatus::Pending;
+        self.invalidate_solution();
         Ok(())
     }
 
@@ -486,11 +571,11 @@ impl CalibrationSession {
         Ok(CalibrationSnapshot {
             item_ids,
             request,
-            generation: self.generation,
+            solution_revision: self.solution_revision,
         })
     }
 
-    /// 仅在 session generation 未变化时安装并再次校验解算结果。
+    /// 仅在 session solution revision 未变化时安装并再次校验解算结果。
     ///
     /// # Errors
     ///
@@ -500,7 +585,7 @@ impl CalibrationSession {
         snapshot: CalibrationSnapshot,
         solution: CalibrationSolution,
     ) -> Result<(), CalibrationSessionError> {
-        if snapshot.generation != self.generation {
+        if snapshot.solution_revision != self.solution_revision {
             return Err(CalibrationSessionError::StaleResult);
         }
         solution.validate_against(&snapshot.request)?;
@@ -513,12 +598,25 @@ impl CalibrationSession {
     }
 
     fn validate_token(&self, token: &CalibrationJobToken) -> Result<(), CalibrationSessionError> {
-        if token.generation != self.generation || token.board != self.board {
+        if token.detection_epoch != self.detection_epoch || token.board != self.board {
             return Err(CalibrationSessionError::StaleResult);
         }
         let item = self.item(token.item_id)?;
         if item.version != token.source_version {
             return Err(CalibrationSessionError::SourceChanged(token.item_id));
+        }
+        Ok(())
+    }
+
+    fn validate_active_token(
+        &self,
+        token: &CalibrationJobToken,
+    ) -> Result<(), CalibrationSessionError> {
+        self.validate_token(token)?;
+        if self.active_detection_jobs.get(&token.item_id) != Some(&token.job_id)
+            || !self.item(token.item_id)?.status.is_busy()
+        {
+            return Err(CalibrationSessionError::StaleResult);
         }
         Ok(())
     }
@@ -543,9 +641,20 @@ impl CalibrationSession {
             .ok_or(CalibrationSessionError::UnknownItem(id))
     }
 
-    fn invalidate(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
+    fn invalidate_solution(&mut self) {
+        self.solution_revision = self.solution_revision.wrapping_add(1);
         self.installed = None;
+    }
+
+    fn invalidate_detection_epoch(&mut self) {
+        self.detection_epoch = self.detection_epoch.wrapping_add(1);
+        self.active_detection_jobs.clear();
+        for item in &mut self.items {
+            if item.status.is_busy() {
+                item.status = CalibrationItemStatus::Pending;
+            }
+        }
+        self.invalidate_solution();
     }
 }
 
@@ -642,11 +751,47 @@ mod tests {
             panic!("expected added item");
         };
         let token = session.begin_detection(id).unwrap();
+        session.mark_reading(&token).unwrap();
+        session.mark_detect_queued(&token).unwrap();
         session.mark_detecting(&token).unwrap();
         session
             .install_detection(&token, version(size), detection())
             .unwrap();
         id
+    }
+
+    #[test]
+    fn detection_status_distinguishes_read_and_detect_queues() {
+        let mut session = CalibrationSession::new(board());
+        let AddCalibrationItemOutcome::Added(id) =
+            session.add_or_refresh(reference("a.png"), version(10), "a.png".into())
+        else {
+            panic!();
+        };
+        let token = session.begin_detection(id).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::ReadQueued
+        ));
+        assert_eq!(
+            session.mark_detect_queued(&token),
+            Err(CalibrationSessionError::StaleResult)
+        );
+        session.mark_reading(&token).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::Reading
+        ));
+        session.mark_detect_queued(&token).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::DetectQueued
+        ));
+        session.mark_detecting(&token).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::Detecting
+        ));
     }
 
     #[test]
@@ -769,6 +914,71 @@ mod tests {
             session.install_detection(&token, version(10), detection()),
             Err(CalibrationSessionError::StaleResult)
         );
+    }
+
+    #[test]
+    fn concurrent_detection_tokens_install_in_reverse_order() {
+        let mut session = CalibrationSession::new(board());
+        let AddCalibrationItemOutcome::Added(first) =
+            session.add_or_refresh(reference("a.png"), version(10), "a.png".into())
+        else {
+            panic!();
+        };
+        let AddCalibrationItemOutcome::Added(second) =
+            session.add_or_refresh(reference("b.png"), version(20), "b.png".into())
+        else {
+            panic!();
+        };
+        let first_token = session.begin_detection(first).unwrap();
+        let second_token = session.begin_detection(second).unwrap();
+        session.mark_reading(&first_token).unwrap();
+        session.mark_reading(&second_token).unwrap();
+        session.mark_detect_queued(&first_token).unwrap();
+        session.mark_detect_queued(&second_token).unwrap();
+        session.mark_detecting(&first_token).unwrap();
+        session.mark_detecting(&second_token).unwrap();
+
+        session
+            .install_detection(&second_token, version(20), detection())
+            .unwrap();
+        session
+            .install_detection(&first_token, version(10), detection())
+            .unwrap();
+
+        assert!(
+            session
+                .items()
+                .iter()
+                .all(|item| matches!(item.status, CalibrationItemStatus::Found(_)))
+        );
+    }
+
+    #[test]
+    fn restarted_detection_rejects_result_from_cancelled_job() {
+        let mut session = CalibrationSession::new(board());
+        let AddCalibrationItemOutcome::Added(id) =
+            session.add_or_refresh(reference("a.png"), version(10), "a.png".into())
+        else {
+            panic!();
+        };
+        let cancelled_token = session.begin_detection(id).unwrap();
+        session.cancel_detection(&cancelled_token).unwrap();
+        let active_token = session.begin_detection(id).unwrap();
+        session.mark_reading(&active_token).unwrap();
+        session.mark_detect_queued(&active_token).unwrap();
+        session.mark_detecting(&active_token).unwrap();
+
+        assert_eq!(
+            session.install_detection(&cancelled_token, version(10), detection()),
+            Err(CalibrationSessionError::StaleResult)
+        );
+        session
+            .install_detection(&active_token, version(10), detection())
+            .unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::Found(_)
+        ));
     }
 
     #[test]

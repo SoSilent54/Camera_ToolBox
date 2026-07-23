@@ -5,6 +5,8 @@ mod auto_open;
 #[cfg(feature = "calibration-opencv")]
 mod calibration_eeprom;
 #[cfg(feature = "calibration-opencv")]
+mod calibration_pipeline;
+#[cfg(feature = "calibration-opencv")]
 mod calibration_workspace;
 mod color_controls;
 mod color_worker;

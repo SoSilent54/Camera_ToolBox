@@ -1,24 +1,25 @@
 //! 同窗标定工作区；GUI 只编排 app 端口，文件读取和 OpenCV 均在后台执行。
 
+#[cfg(test)]
+use std::time::Duration;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     io::Write,
     path::PathBuf,
     sync::{
         Arc,
-        mpsc::{self, Receiver, Sender, TryRecvError},
+        mpsc::{self, Receiver, Sender, TryRecvError, TrySendError},
     },
     thread,
-    time::Duration,
 };
 
-use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
+use camera_toolbox_adapters::OpenCvCalibrationBackend;
 use camera_toolbox_app::{
     AddCalibrationItemOutcome, CalibrationBackend, CalibrationCancellation, CalibrationItemId,
     CalibrationItemStatus, CalibrationJobToken, CalibrationSession, CalibrationSnapshot,
     EepromDryRunResult, EepromInspectResult, EepromWriteResult, EntryName, ExportDestination,
-    ExportReceipt, ExportService, FileSystem, FileSystemError, FsCancellation, FsControl,
-    RasterFormat, RasterImageCodec, read_calibration_png,
+    ExportReceipt, ExportService, FileSourceId, FileSystem, FileSystemError, FsCancellation,
+    FsControl,
 };
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution, FullEepromImage,
@@ -28,12 +29,15 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::calibration_eeprom::{CalibrationEepromState, CalibrationProvisionIntent};
+use crate::calibration_pipeline::{
+    CalibrationDetectionPipeline, DetectionProduct, DetectionStageEvent, DetectionStageResult,
+    LoadedDetectionJob, MAX_ENCODED_PNG_BYTES, MAX_INFLIGHT_ENCODED_BYTES, ReadJob, ReadSource,
+    ReadStageEvent, ReadStageResult,
+};
 use crate::{explorer::CalibrationImportCandidate, viewer::pixel_inspection_texture_options};
 
 const MAX_DATASET_ITEMS: usize = 256;
-const MAX_ENCODED_PNG_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_DECODED_PREVIEW_BYTES: usize = 256 * 1024 * 1024;
-const FILE_READ_TIMEOUT: Duration = Duration::from_secs(60);
+const REMOTE_READS_PER_SOURCE: usize = 8;
 const COVERAGE_WIDTH: usize = 192;
 const COVERAGE_GAUSSIAN_SIGMA: f32 = 42.0 / 1920.0 * COVERAGE_WIDTH as f32;
 const MIN_PREVIEW_ZOOM: f32 = 0.05;
@@ -210,6 +214,7 @@ struct CoverageVisualization {
 }
 
 struct ActiveCancellation {
+    token: CalibrationJobToken,
     file_system: FsCancellation,
     calibration: CalibrationCancellation,
 }
@@ -221,16 +226,18 @@ impl ActiveCancellation {
     }
 }
 
-struct DetectionCommand {
-    token: CalibrationJobToken,
-    file_system: Arc<dyn FileSystem>,
-    reference: camera_toolbox_app::FileRef,
-    file_cancellation: FsCancellation,
-    calibration_cancellation: CalibrationCancellation,
+struct DetectionBatch {
+    id: u64,
+    total: usize,
+    completed: usize,
+    reserved_encoded_bytes: u64,
+    cancel_requested: bool,
+    terminal_status: Option<String>,
+    cancellations: HashMap<CalibrationItemId, ActiveCancellation>,
+    active_remote_sources: HashMap<FileSourceId, usize>,
 }
 
 enum WorkerCommand {
-    Detect(DetectionCommand),
     Calibrate {
         snapshot: CalibrationSnapshot,
         cancellation: CalibrationCancellation,
@@ -239,20 +246,10 @@ enum WorkerCommand {
 }
 
 enum WorkerEvent {
-    Detection {
-        token: CalibrationJobToken,
-        result: Result<DetectionProduct, String>,
-    },
     Calibration {
         snapshot: CalibrationSnapshot,
         result: Result<CalibrationSolution, String>,
     },
-}
-
-struct DetectionProduct {
-    source_version: camera_toolbox_app::FileVersion,
-    outcome: camera_toolbox_core::ChessboardDetectionOutcome,
-    preview: Option<Arc<Rgba8Frame>>,
 }
 
 struct CalibrationWorker {
@@ -266,16 +263,11 @@ impl CalibrationWorker {
         let (event_sender, event_receiver) = mpsc::channel();
         let repaint = context.clone();
         thread::Builder::new()
-            .name("camera-toolbox-calibration".to_owned())
+            .name("camera-toolbox-calibration-solve".to_owned())
             .spawn(move || {
                 let backend = OpenCvCalibrationBackend;
-                let preview_codec = ImageRasterCodec;
                 while let Ok(command) = command_receiver.recv() {
                     let event = match command {
-                        WorkerCommand::Detect(command) => WorkerEvent::Detection {
-                            token: command.token.clone(),
-                            result: run_detection(&backend, &preview_codec, command),
-                        },
                         WorkerCommand::Calibrate {
                             snapshot,
                             cancellation,
@@ -312,50 +304,18 @@ impl Drop for CalibrationWorker {
     }
 }
 
-fn run_detection(
-    backend: &dyn CalibrationBackend,
-    preview_codec: &dyn RasterImageCodec,
-    command: DetectionCommand,
-) -> Result<DetectionProduct, String> {
-    let mut control = FsControl::with_timeout(FILE_READ_TIMEOUT);
-    control.cancellation = command.file_cancellation;
-    let encoded = read_calibration_png(
-        command.file_system.as_ref(),
-        &command.reference,
-        command.token.source_version(),
-        MAX_ENCODED_PNG_BYTES,
-        &control,
-    )
-    .map_err(|error| error.to_string())?;
-    let outcome = backend
-        .detect_png(
-            &encoded.bytes,
-            encoded.image_size,
-            MAX_DECODED_PREVIEW_BYTES,
-            command.token.board(),
-            &command.calibration_cancellation,
-        )
-        .map_err(|error| error.to_string())?;
-    let preview = preview_codec
-        .decode_rgba8(RasterFormat::Png, &encoded.bytes, MAX_DECODED_PREVIEW_BYTES)
-        .ok()
-        .map(Arc::new);
-    Ok(DetectionProduct {
-        source_version: encoded.source_version,
-        outcome,
-        preview,
-    })
-}
-
 pub(crate) struct CalibrationWorkspace {
     session: CalibrationSession,
     sources: HashMap<CalibrationItemId, CalibrationSource>,
     worker: CalibrationWorker,
-    detect_queue: VecDeque<CalibrationItemId>,
+    detection_pipeline: CalibrationDetectionPipeline,
+    pending_reads: VecDeque<ReadJob>,
+    pending_loaded: VecDeque<LoadedDetectionJob>,
     pending_imports: VecDeque<CalibrationImportCandidate>,
     active_job: Option<CalibrationJobKind>,
-    active_cancellation: Option<ActiveCancellation>,
-    cancel_requested: bool,
+    active_detection_batch: Option<DetectionBatch>,
+    calibration_cancellation: Option<CalibrationCancellation>,
+    next_detection_batch_id: u64,
     status: String,
     serial_number: String,
     pending_export: Option<CalibrationExport>,
@@ -381,11 +341,14 @@ impl CalibrationWorkspace {
             session: CalibrationSession::new(board),
             sources: HashMap::new(),
             worker: CalibrationWorker::new(context)?,
-            detect_queue: VecDeque::new(),
+            detection_pipeline: CalibrationDetectionPipeline::new(context)?,
+            pending_reads: VecDeque::new(),
+            pending_loaded: VecDeque::new(),
             pending_imports: VecDeque::new(),
             active_job: None,
-            active_cancellation: None,
-            cancel_requested: false,
+            active_detection_batch: None,
+            calibration_cancellation: None,
+            next_detection_batch_id: 1,
             status: "Add original PNG calibration images from Workspace Explorer.".to_owned(),
             serial_number: String::new(),
             pending_export: None,
@@ -429,6 +392,7 @@ impl CalibrationWorkspace {
         let mut added = 0_usize;
         let mut refreshed = 0_usize;
         let mut skipped = offered.saturating_sub(available);
+        let mut detection_ids = Vec::new();
         for candidate in candidates.into_iter().take(available) {
             let name = candidate.entry.name.as_str().to_owned();
             let outcome = self.session.add_or_refresh(
@@ -459,8 +423,8 @@ impl CalibrationWorkspace {
                     preview: None,
                 },
             );
-            if auto_detect {
-                self.enqueue_detection(id);
+            if auto_detect && !detection_ids.contains(&id) {
+                detection_ids.push(id);
             }
         }
         if added > 0 || refreshed > 0 {
@@ -468,20 +432,8 @@ impl CalibrationWorkspace {
         }
         self.status =
             format!("Dataset updated: {added} added, {refreshed} refreshed, {skipped} unchanged.");
-        if auto_detect && self.active_job.is_none() && !self.detect_queue.is_empty() {
-            self.cancel_requested = false;
-            self.dispatch_next_detection();
-        }
-    }
-
-    fn enqueue_detection(&mut self, id: CalibrationItemId) {
-        let already_active = self
-            .session
-            .items()
-            .iter()
-            .any(|item| item.id == id && item.status.is_busy());
-        if !already_active && !self.detect_queue.contains(&id) {
-            self.detect_queue.push_back(id);
+        if auto_detect && self.active_job.is_none() && !detection_ids.is_empty() {
+            self.start_detection_items(detection_ids);
         }
     }
 
@@ -702,13 +654,7 @@ impl CalibrationWorkspace {
                 .add_enabled(self.active_job.is_some(), egui::Button::new("Cancel"))
                 .clicked()
             {
-                self.cancel_requested = true;
-                self.detect_queue.clear();
-                if let Some(cancellation) = &self.active_cancellation {
-                    cancellation.cancel();
-                }
-                self.status =
-                    "Cancel requested; waiting for the current OpenCV call boundary.".to_owned();
+                self.cancel_active_job();
             }
         });
 
@@ -1079,67 +1025,498 @@ impl CalibrationWorkspace {
         self.session.reset_detections();
         self.coverage = None;
         self.coverage_dirty = false;
-        self.detect_queue = self
+        let ids = self
             .session
             .items()
             .iter()
             .filter(|item| item.enabled)
             .map(|item| item.id)
             .collect();
-        self.cancel_requested = false;
-        self.dispatch_next_detection();
+        self.start_detection_items(ids);
     }
 
-    fn dispatch_next_detection(&mut self) {
-        let Some(id) = self.detect_queue.pop_front() else {
-            self.active_job = None;
-            self.active_cancellation = None;
-            self.status = "Detection completed.".to_owned();
+    fn start_detection_items(&mut self, ids: Vec<CalibrationItemId>) {
+        if ids.is_empty() {
+            self.status = "No calibration images are enabled for detection.".to_owned();
             return;
-        };
-        let Some(source) = self.sources.get(&id) else {
-            self.status = "Dataset source binding is unavailable.".to_owned();
-            self.detect_queue.clear();
-            return;
-        };
-        let file_system = Arc::clone(&source.file_system);
-        let reference = self
-            .session
-            .items()
-            .iter()
-            .find(|item| item.id == id)
-            .map(|item| item.reference.clone());
-        let Some(reference) = reference else {
-            return;
-        };
-        let token = match self.session.begin_detection(id) {
-            Ok(token) => token,
-            Err(error) => {
-                self.status = error.to_string();
-                self.detect_queue.clear();
-                return;
-            }
-        };
-        let file_cancellation = FsCancellation::default();
+        }
+        debug_assert!(self.active_detection_batch.is_none());
+        debug_assert!(self.pending_reads.is_empty());
+        debug_assert!(self.pending_loaded.is_empty());
+
+        let batch_id = self.next_detection_batch_id;
+        self.next_detection_batch_id = self.next_detection_batch_id.wrapping_add(1).max(1);
         let calibration_cancellation = CalibrationCancellation::default();
-        if let Err(error) = self.worker.send(WorkerCommand::Detect(DetectionCommand {
-            token: token.clone(),
-            file_system,
-            reference,
-            file_cancellation: file_cancellation.clone(),
-            calibration_cancellation: calibration_cancellation.clone(),
-        })) {
-            let _ = self.session.install_failure(&token, error.clone());
-            self.status = error;
-            self.detect_queue.clear();
+        let mut batch = DetectionBatch {
+            id: batch_id,
+            total: 0,
+            completed: 0,
+            reserved_encoded_bytes: 0,
+            cancel_requested: false,
+            terminal_status: None,
+            cancellations: HashMap::new(),
+            active_remote_sources: HashMap::new(),
+        };
+        let mut seen = HashSet::new();
+
+        for id in ids.into_iter().filter(|id| seen.insert(*id)) {
+            let reference = self
+                .session
+                .items()
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.reference.clone());
+            let source = self
+                .sources
+                .get(&id)
+                .map(|source| (Arc::clone(&source.file_system), source.remote));
+            let token = match self.session.begin_detection(id) {
+                Ok(token) => token,
+                Err(error) => {
+                    self.status = error.to_string();
+                    continue;
+                }
+            };
+            batch.total += 1;
+            if token.source_version().size > MAX_ENCODED_PNG_BYTES {
+                let message = format!(
+                    "Encoded calibration image is {} bytes, limit is {} bytes.",
+                    token.source_version().size,
+                    MAX_ENCODED_PNG_BYTES
+                );
+                let _ = self.session.install_failure(&token, message.clone());
+                batch.completed += 1;
+                self.status = message;
+                continue;
+            }
+            let (Some(reference), Some((file_system, remote))) = (reference, source) else {
+                let message = "Dataset source binding is unavailable.".to_owned();
+                let _ = self.session.install_failure(&token, message.clone());
+                batch.completed += 1;
+                self.status = message;
+                continue;
+            };
+            let file_cancellation = FsCancellation::default();
+            batch.cancellations.insert(
+                id,
+                ActiveCancellation {
+                    token: token.clone(),
+                    file_system: file_cancellation.clone(),
+                    calibration: calibration_cancellation.clone(),
+                },
+            );
+            self.pending_reads.push_back(ReadJob::new(
+                batch_id,
+                token,
+                ReadSource {
+                    source_id: reference.source_id.clone(),
+                    remote,
+                },
+                file_system,
+                reference,
+                file_cancellation,
+                calibration_cancellation.clone(),
+            ));
+        }
+
+        if batch.total == 0 {
+            self.status = "No calibration images could be queued for detection.".to_owned();
             return;
         }
         self.active_job = Some(CalibrationJobKind::Detect);
-        self.active_cancellation = Some(ActiveCancellation {
-            file_system: file_cancellation,
-            calibration: calibration_cancellation,
+        self.active_detection_batch = Some(batch);
+        self.dispatch_detection_pipeline();
+        self.finish_detection_batch_if_ready();
+    }
+
+    fn dispatch_detection_pipeline(&mut self) {
+        self.dispatch_loaded_detections();
+        self.dispatch_pending_reads();
+    }
+
+    fn dispatch_pending_reads(&mut self) {
+        let attempts = self.pending_reads.len();
+        for _ in 0..attempts {
+            let Some(job) = self.pending_reads.pop_front() else {
+                break;
+            };
+            let Some(batch) = self.active_detection_batch.as_ref() else {
+                break;
+            };
+            if batch.cancel_requested || batch.id != job.batch_id {
+                self.pending_reads.push_front(job);
+                break;
+            }
+            let source_blocked = job.source.remote
+                && batch
+                    .active_remote_sources
+                    .get(&job.source.source_id)
+                    .copied()
+                    .unwrap_or(0)
+                    >= REMOTE_READS_PER_SOURCE;
+            let budget_blocked = batch
+                .reserved_encoded_bytes
+                .saturating_add(job.reserved_bytes)
+                > MAX_INFLIGHT_ENCODED_BYTES;
+            if source_blocked || budget_blocked {
+                self.pending_reads.push_back(job);
+                continue;
+            }
+            let source = job.source.clone();
+            let reserved_bytes = job.reserved_bytes;
+            match self.detection_pipeline.try_submit_read(job) {
+                Ok(()) => {
+                    let batch = self
+                        .active_detection_batch
+                        .as_mut()
+                        .expect("active batch was checked");
+                    batch.reserved_encoded_bytes =
+                        batch.reserved_encoded_bytes.saturating_add(reserved_bytes);
+                    if source.remote {
+                        let active = batch
+                            .active_remote_sources
+                            .entry(source.source_id)
+                            .or_insert(0);
+                        *active = active.saturating_add(1);
+                    }
+                }
+                Err(TrySendError::Full(job)) => {
+                    self.pending_reads.push_front(job);
+                    break;
+                }
+                Err(TrySendError::Disconnected(job)) => {
+                    let message = "Calibration read workers stopped unexpectedly.".to_owned();
+                    let _ = self.session.install_failure(&job.token, message.clone());
+                    self.complete_detection_item(job.batch_id, job.token.item_id, 0);
+                    self.abort_detection_batch(message);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn dispatch_loaded_detections(&mut self) {
+        loop {
+            let Some(job) = self.pending_loaded.pop_front() else {
+                break;
+            };
+            match self.detection_pipeline.try_submit_detection(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(job)) => {
+                    self.pending_loaded.push_front(job);
+                    break;
+                }
+                Err(TrySendError::Disconnected(job)) => {
+                    let message = "Calibration detection workers stopped unexpectedly.".to_owned();
+                    let _ = self.session.install_failure(&job.token, message.clone());
+                    self.complete_detection_item(
+                        job.batch_id,
+                        job.token.item_id,
+                        job.reserved_bytes,
+                    );
+                    self.abort_detection_batch(message);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn poll_detection_pipeline(&mut self, context: &egui::Context) {
+        loop {
+            match self.detection_pipeline.try_detection_event() {
+                Ok(event) => self.handle_detection_event(context, event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if matches!(self.active_job, Some(CalibrationJobKind::Detect)) {
+                        self.abort_detection_batch(
+                            "Calibration detection workers stopped unexpectedly.".to_owned(),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        self.dispatch_loaded_detections();
+
+        loop {
+            match self.detection_pipeline.try_read_event() {
+                Ok(event) => {
+                    self.handle_read_event(event);
+                    self.dispatch_loaded_detections();
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    if matches!(self.active_job, Some(CalibrationJobKind::Detect)) {
+                        self.abort_detection_batch(
+                            "Calibration read workers stopped unexpectedly.".to_owned(),
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+
+        self.dispatch_pending_reads();
+        self.finish_detection_batch_if_ready();
+    }
+
+    fn handle_read_event(&mut self, event: ReadStageEvent) {
+        match event {
+            ReadStageEvent::Started { batch_id, token } => {
+                let Some(batch) = self.active_detection_batch.as_ref() else {
+                    return;
+                };
+                if batch.id != batch_id || batch.cancel_requested {
+                    return;
+                }
+                if let Err(error) = self.session.mark_reading(&token) {
+                    self.status = error.to_string();
+                }
+            }
+            ReadStageEvent::Finished(result) => self.handle_read_result(result),
+        }
+    }
+
+    fn handle_read_result(&mut self, result: ReadStageResult) {
+        let ReadStageResult {
+            batch_id,
+            token,
+            source,
+            reserved_bytes,
+            result,
+        } = result;
+        let Some(batch) = self.active_detection_batch.as_mut() else {
+            return;
+        };
+        if batch.id != batch_id {
+            return;
+        }
+        if source.remote {
+            let remove_source = batch
+                .active_remote_sources
+                .get_mut(&source.source_id)
+                .is_some_and(|active| {
+                    *active = active.saturating_sub(1);
+                    *active == 0
+                });
+            if remove_source {
+                batch.active_remote_sources.remove(&source.source_id);
+            }
+        }
+        let cancelled = batch.cancel_requested;
+        match result {
+            Ok(job) if !cancelled => match self.session.mark_detect_queued(&token) {
+                Ok(()) => self.pending_loaded.push_back(job),
+                Err(error) => {
+                    self.status = error.to_string();
+                    self.complete_detection_item(batch_id, token.item_id, reserved_bytes);
+                }
+            },
+            Ok(_) => {
+                let _ = self.session.cancel_detection(&token);
+                self.complete_detection_item(batch_id, token.item_id, reserved_bytes);
+            }
+            Err(error) => {
+                if cancelled || error.is_cancelled() {
+                    let _ = self.session.cancel_detection(&token);
+                } else {
+                    let message = error.to_string();
+                    let _ = self.session.install_failure(&token, message.clone());
+                    self.status = message;
+                }
+                self.complete_detection_item(batch_id, token.item_id, reserved_bytes);
+            }
+        }
+    }
+
+    fn handle_detection_event(&mut self, context: &egui::Context, event: DetectionStageEvent) {
+        match event {
+            DetectionStageEvent::Started { batch_id, token } => {
+                let Some(batch) = self.active_detection_batch.as_ref() else {
+                    return;
+                };
+                if batch.id != batch_id || batch.cancel_requested {
+                    return;
+                }
+                if let Err(error) = self.session.mark_detecting(&token) {
+                    self.status = error.to_string();
+                }
+            }
+            DetectionStageEvent::Finished(result) => self.handle_detection_result(context, result),
+        }
+    }
+
+    fn handle_detection_result(&mut self, context: &egui::Context, result: DetectionStageResult) {
+        let DetectionStageResult {
+            batch_id,
+            token,
+            reserved_bytes,
+            result,
+        } = result;
+        let Some(batch) = self.active_detection_batch.as_ref() else {
+            return;
+        };
+        if batch.id != batch_id {
+            return;
+        }
+        let cancelled = batch.cancel_requested;
+        if cancelled {
+            let _ = self.session.cancel_detection(&token);
+        } else {
+            match result {
+                Ok(DetectionProduct {
+                    source_version,
+                    outcome,
+                    preview,
+                }) => {
+                    let found = matches!(
+                        &outcome,
+                        camera_toolbox_core::ChessboardDetectionOutcome::Found(_)
+                    );
+                    match self
+                        .session
+                        .install_detection(&token, source_version, outcome)
+                    {
+                        Ok(()) => {
+                            // 多 worker 的完成顺序不等于导入顺序；每个刚 Found 的图像立即成为预览目标。
+                            if found {
+                                let _ = self.session.set_selected(token.item_id);
+                            }
+                            if let Some(frame) = preview {
+                                self.install_preview(context, token.item_id, frame);
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let _ = self.session.install_failure(&token, message.clone());
+                            self.status = message;
+                        }
+                    }
+                }
+                Err(error) if error.is_cancelled() => {
+                    let _ = self.session.cancel_detection(&token);
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = self.session.install_failure(&token, message.clone());
+                    self.status = message;
+                }
+            }
+        }
+        self.coverage_dirty = true;
+        self.complete_detection_item(batch_id, token.item_id, reserved_bytes);
+    }
+
+    fn complete_detection_item(
+        &mut self,
+        batch_id: u64,
+        item_id: CalibrationItemId,
+        reserved_bytes: u64,
+    ) {
+        let Some(batch) = self.active_detection_batch.as_mut() else {
+            return;
+        };
+        if batch.id != batch_id {
+            return;
+        }
+        batch.reserved_encoded_bytes = batch.reserved_encoded_bytes.saturating_sub(reserved_bytes);
+        if batch.cancellations.remove(&item_id).is_some() {
+            batch.completed = batch.completed.saturating_add(1);
+        }
+    }
+
+    fn cancel_active_job(&mut self) {
+        match self.active_job {
+            Some(CalibrationJobKind::Detect) => {
+                self.request_detection_cancel("Detection cancelled.".to_owned());
+            }
+            Some(CalibrationJobKind::Calibrate) => {
+                if let Some(cancellation) = &self.calibration_cancellation {
+                    cancellation.cancel();
+                }
+                self.status =
+                    "Cancel requested; waiting for the current OpenCV call boundary.".to_owned();
+            }
+            None => {}
+        }
+    }
+
+    fn request_detection_cancel(&mut self, terminal_status: String) {
+        let Some(batch) = self.active_detection_batch.as_mut() else {
+            return;
+        };
+        batch.cancel_requested = true;
+        batch.terminal_status = Some(terminal_status);
+        for cancellation in batch.cancellations.values() {
+            cancellation.cancel();
+        }
+
+        let pending_reads: Vec<_> = self.pending_reads.drain(..).collect();
+        for job in pending_reads {
+            let _ = self.session.cancel_detection(&job.token);
+            self.complete_detection_item(job.batch_id, job.token.item_id, 0);
+        }
+        let pending_loaded: Vec<_> = self.pending_loaded.drain(..).collect();
+        for job in pending_loaded {
+            let _ = self.session.cancel_detection(&job.token);
+            self.complete_detection_item(job.batch_id, job.token.item_id, job.reserved_bytes);
+        }
+        self.status = "Cancel requested; waiting for active file/OpenCV operations.".to_owned();
+        self.finish_detection_batch_if_ready();
+    }
+
+    fn abort_detection_batch(&mut self, status: String) {
+        let Some(batch) = self.active_detection_batch.take() else {
+            return;
+        };
+        for cancellation in batch.cancellations.values() {
+            cancellation.cancel();
+            let _ = self.session.cancel_detection(&cancellation.token);
+        }
+        self.pending_reads.clear();
+        self.pending_loaded.clear();
+        self.active_job = None;
+        let pending: Vec<_> = self.pending_imports.drain(..).collect();
+        if !pending.is_empty() {
+            self.import_candidates(pending, false);
+        }
+        self.status = status;
+    }
+
+    fn finish_detection_batch_if_ready(&mut self) {
+        let Some(batch) = self.active_detection_batch.as_ref() else {
+            return;
+        };
+        if batch.completed < batch.total
+            || !self.pending_reads.is_empty()
+            || !self.pending_loaded.is_empty()
+        {
+            if !batch.cancel_requested {
+                self.status = format!(
+                    "Detecting calibration images: {}/{} completed…",
+                    batch.completed, batch.total
+                );
+            }
+            return;
+        }
+
+        let batch = self
+            .active_detection_batch
+            .take()
+            .expect("batch was checked");
+        self.active_job = None;
+        let final_status = batch.terminal_status.unwrap_or_else(|| {
+            format!(
+                "Detection completed: {}/{} processed.",
+                batch.completed, batch.total
+            )
         });
-        self.status = format!("Detecting item {}…", id.get());
+        let pending: Vec<_> = self.pending_imports.drain(..).collect();
+        if pending.is_empty() {
+            self.status = final_status;
+        } else {
+            self.import_candidates(pending, !batch.cancel_requested);
+        }
     }
 
     fn start_calibration(&mut self) {
@@ -1162,70 +1539,28 @@ impl CalibrationWorkspace {
             return;
         }
         self.active_job = Some(CalibrationJobKind::Calibrate);
-        self.active_cancellation = Some(ActiveCancellation {
-            file_system: FsCancellation::default(),
-            calibration: cancellation,
-        });
-        self.cancel_requested = false;
+        self.calibration_cancellation = Some(cancellation);
         self.status = "Running Pangbot-compatible calibration…".to_owned();
     }
 
     fn poll_worker(&mut self, context: &egui::Context) {
+        self.poll_detection_pipeline(context);
         loop {
             let event = match self.worker.receiver.try_recv() {
                 Ok(event) => event,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    self.active_job = None;
-                    self.active_cancellation = None;
-                    self.detect_queue.clear();
-                    self.status = "Calibration worker stopped unexpectedly.".to_owned();
+                    if matches!(self.active_job, Some(CalibrationJobKind::Calibrate)) {
+                        self.active_job = None;
+                        self.calibration_cancellation = None;
+                        self.status = "Calibration worker stopped unexpectedly.".to_owned();
+                    }
                     break;
                 }
             };
             self.active_job = None;
-            self.active_cancellation = None;
+            self.calibration_cancellation = None;
             match event {
-                WorkerEvent::Detection { token, result } => {
-                    match result {
-                        Ok(product) => {
-                            let DetectionProduct {
-                                source_version,
-                                outcome,
-                                preview,
-                            } = product;
-                            match self
-                                .session
-                                .install_detection(&token, source_version, outcome)
-                            {
-                                Ok(()) => {
-                                    if let Some(frame) = preview {
-                                        self.install_preview(context, token.item_id, frame);
-                                    }
-                                    let _ = self.session.set_selected(token.item_id);
-                                }
-                                Err(error) => self.status = error.to_string(),
-                            }
-                        }
-                        Err(error) => {
-                            let _ = self.session.install_failure(&token, error.clone());
-                            self.status = error;
-                        }
-                    }
-                    self.coverage_dirty = true;
-                    if self.cancel_requested {
-                        self.cancel_requested = false;
-                        self.detect_queue.clear();
-                        let pending = self.pending_imports.drain(..).collect();
-                        self.import_candidates(pending, false);
-                        self.status = "Detection cancelled.".to_owned();
-                    } else if self.pending_imports.is_empty() {
-                        self.dispatch_next_detection();
-                    } else {
-                        let pending = self.pending_imports.drain(..).collect();
-                        self.import_candidates(pending, true);
-                    }
-                }
                 WorkerEvent::Calibration { snapshot, result } => match result {
                     Ok(solution) => match self.session.install_solution(snapshot, solution) {
                         Ok(()) => {
@@ -1329,7 +1664,9 @@ impl CalibrationWorkspace {
                 let source = self.sources.get(&item.id)?;
                 let (status, reason, corners) = match &item.status {
                     CalibrationItemStatus::Pending => ("pending", None, None),
+                    CalibrationItemStatus::ReadQueued => ("read_queued", None, None),
                     CalibrationItemStatus::Reading => ("reading", None, None),
+                    CalibrationItemStatus::DetectQueued => ("detect_queued", None, None),
                     CalibrationItemStatus::Detecting => ("detecting", None, None),
                     CalibrationItemStatus::Found(detection) => {
                         ("found", None, Some(detection.corners.len()))
@@ -1376,6 +1713,19 @@ impl CalibrationWorkspace {
     }
 }
 
+impl Drop for CalibrationWorkspace {
+    fn drop(&mut self) {
+        if let Some(cancellation) = &self.calibration_cancellation {
+            cancellation.cancel();
+        }
+        if let Some(batch) = &self.active_detection_batch {
+            for cancellation in batch.cancellations.values() {
+                cancellation.cancel();
+            }
+        }
+    }
+}
+
 /// OpenCV 以整数坐标表示像素中心；egui 的 `[0, 1]` UV 则覆盖纹理边界。
 /// 因此先加半个像素，才能把检测点准确落到纹理中的连续图像坐标。
 fn image_point_to_preview(
@@ -1419,7 +1769,9 @@ fn paint_reprojection_vector(painter: &egui::Painter, observed: egui::Pos2, proj
 fn status_label(status: &CalibrationItemStatus) -> &'static str {
     match status {
         CalibrationItemStatus::Pending => "Pending",
+        CalibrationItemStatus::ReadQueued => "Read queued",
         CalibrationItemStatus::Reading => "Reading",
+        CalibrationItemStatus::DetectQueued => "Detect queued",
         CalibrationItemStatus::Detecting => "Detecting",
         CalibrationItemStatus::Found(_) => "Found",
         CalibrationItemStatus::NotFound { .. } => "Not found",
@@ -1434,7 +1786,9 @@ fn status_color(status: &CalibrationItemStatus) -> Option<egui::Color32> {
             Some(REPROJECTED_POINT_COLOR)
         }
         CalibrationItemStatus::Pending
+        | CalibrationItemStatus::ReadQueued
         | CalibrationItemStatus::Reading
+        | CalibrationItemStatus::DetectQueued
         | CalibrationItemStatus::Detecting => None,
     }
 }
@@ -1759,7 +2113,7 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn opened_pngs_are_detected_in_order_and_last_result_is_selected() {
+    fn opened_pngs_produce_preview_with_mode_unchanged() {
         let root = std::env::temp_dir().join(format!(
             "camera-toolbox-calibration-{}-{}",
             std::process::id(),
@@ -1815,10 +2169,12 @@ mod tests {
         );
         workspace.sync_coverage(&context);
         assert_eq!(workspace.preview_mode, CalibrationPreviewMode::Overlay);
-        let last_id = workspace.session.items()[1].id;
-        assert_eq!(workspace.session.selected(), Some(last_id));
-        assert!(workspace.sources[&last_id].preview.is_some());
-        let texture_id = workspace.sources[&last_id]
+        let selected_id = workspace
+            .session
+            .selected()
+            .expect("a found result must be selected");
+        assert!(workspace.sources[&selected_id].preview.is_some());
+        let texture_id = workspace.sources[&selected_id]
             .preview
             .as_ref()
             .unwrap()
@@ -1833,26 +2189,213 @@ mod tests {
     }
 
     #[test]
-    fn manual_detection_resets_results_for_enabled_and_disabled_items() {
+    fn latest_found_completion_selects_preview_without_changing_layers() {
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        install_detection_outcome(&mut workspace, "enabled.png", found_detection(640, 480));
-        let disabled =
-            install_detection_outcome(&mut workspace, "disabled.png", found_detection(640, 480));
+        let source_id = FileSourceId::new("calibration-selection-test").unwrap();
+        let version = camera_toolbox_app::FileVersion {
+            size: 1,
+            modified_millis: Some(1),
+        };
+        let first_reference = camera_toolbox_app::FileRef::new(
+            source_id.clone(),
+            SourcePath::new("first.png").unwrap(),
+        );
+        let second_reference =
+            camera_toolbox_app::FileRef::new(source_id, SourcePath::new("second.png").unwrap());
+        let AddCalibrationItemOutcome::Added(first) =
+            workspace
+                .session
+                .add_or_refresh(first_reference, version, "first.png".to_owned())
+        else {
+            panic!("first image must be added");
+        };
+        let AddCalibrationItemOutcome::Added(second) =
+            workspace
+                .session
+                .add_or_refresh(second_reference, version, "second.png".to_owned())
+        else {
+            panic!("second image must be added");
+        };
+        let first_token = workspace.session.begin_detection(first).unwrap();
+        let second_token = workspace.session.begin_detection(second).unwrap();
+        for token in [&first_token, &second_token] {
+            workspace.session.mark_reading(token).unwrap();
+            workspace.session.mark_detect_queued(token).unwrap();
+            workspace.session.mark_detecting(token).unwrap();
+        }
+        workspace.active_detection_batch = Some(DetectionBatch {
+            id: 1,
+            total: 2,
+            completed: 0,
+            reserved_encoded_bytes: 0,
+            cancel_requested: false,
+            terminal_status: None,
+            cancellations: HashMap::new(),
+            active_remote_sources: HashMap::new(),
+        });
+        workspace.preview_mode = CalibrationPreviewMode::Overlay;
+
+        workspace.handle_detection_result(
+            &context,
+            DetectionStageResult {
+                batch_id: 1,
+                token: second_token,
+                reserved_bytes: 0,
+                result: Ok(DetectionProduct {
+                    source_version: version,
+                    outcome: found_detection(640, 480),
+                    preview: None,
+                }),
+            },
+        );
+        assert_eq!(workspace.session.selected(), Some(second));
+        assert_eq!(workspace.preview_mode, CalibrationPreviewMode::Overlay);
+
+        workspace.handle_detection_result(
+            &context,
+            DetectionStageResult {
+                batch_id: 1,
+                token: first_token,
+                reserved_bytes: 0,
+                result: Ok(DetectionProduct {
+                    source_version: version,
+                    outcome: found_detection(640, 480),
+                    preview: None,
+                }),
+            },
+        );
+        assert_eq!(workspace.session.selected(), Some(first));
+        assert_eq!(workspace.preview_mode, CalibrationPreviewMode::Overlay);
+    }
+
+    #[test]
+    fn oversized_import_fails_without_leaving_batch_active() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "camera-toolbox-calibration-oversized-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("oversized.png");
+        std::fs::write(&path, b"not-read").unwrap();
+        let source_id = FileSourceId::new("calibration-oversized-test").unwrap();
+        let file_system: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
+        let reference =
+            camera_toolbox_app::FileRef::new(source_id, SourcePath::new("oversized.png").unwrap());
+        let control = FsControl::with_timeout(Duration::from_secs(1));
+        let mut entry = file_system.stat(&reference, &control).unwrap();
+        entry.version.size = MAX_ENCODED_PNG_BYTES + 1;
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+
+        workspace.import(vec![CalibrationImportCandidate {
+            display_path: path,
+            file_system,
+            entry,
+            remote: false,
+        }]);
+
+        assert!(workspace.active_job.is_none());
+        assert!(workspace.pending_reads.is_empty());
+        assert!(workspace.pending_loaded.is_empty());
+        assert!(matches!(
+            &workspace.session.items()[0].status,
+            CalibrationItemStatus::Failed(message) if message.contains("limit")
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_detection_resets_results_for_enabled_and_disabled_items() {
+        let root = std::env::temp_dir().join(format!(
+            "camera-toolbox-calibration-reset-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let fixture = include_bytes!("../../../adapters/tests/data/chessboard_11x8_clean.png");
+        std::fs::write(root.join("enabled.png"), fixture).unwrap();
+        std::fs::write(root.join("disabled.png"), fixture).unwrap();
+        let source_id = FileSourceId::new("calibration-session-test").unwrap();
+        let file_system: Arc<dyn FileSystem> =
+            Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
+        let version_for = |name: &str| {
+            let reference =
+                camera_toolbox_app::FileRef::new(source_id.clone(), SourcePath::new(name).unwrap());
+            file_system
+                .stat(&reference, &FsControl::with_timeout(Duration::from_secs(1)))
+                .unwrap()
+                .version
+        };
+        let enabled_version = version_for("enabled.png");
+        let disabled_version = version_for("disabled.png");
+
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let enabled = install_detection_outcome_with_version(
+            &mut workspace,
+            "enabled.png",
+            enabled_version,
+            found_detection(640, 480),
+        );
+        let disabled = install_detection_outcome_with_version(
+            &mut workspace,
+            "disabled.png",
+            disabled_version,
+            found_detection(640, 480),
+        );
         workspace.session.set_enabled(disabled, false).unwrap();
+        workspace.sources.insert(
+            enabled,
+            CalibrationSource {
+                display_path: root.join("enabled.png"),
+                file_system: Arc::clone(&file_system),
+                remote: false,
+                preview: None,
+            },
+        );
+        workspace.sources.insert(
+            disabled,
+            CalibrationSource {
+                display_path: root.join("disabled.png"),
+                file_system,
+                remote: false,
+                preview: None,
+            },
+        );
         workspace.preview_mode = CalibrationPreviewMode::Heatmap;
 
         workspace.start_detection();
 
-        assert!(
-            workspace
-                .session
-                .items()
-                .iter()
-                .all(|item| matches!(item.status, CalibrationItemStatus::Pending))
-        );
+        assert!(matches!(
+            workspace.session.items().iter().find(|item| item.id == enabled),
+            Some(item)
+                if matches!(
+                    item.status,
+                    CalibrationItemStatus::ReadQueued
+                        | CalibrationItemStatus::Reading
+                        | CalibrationItemStatus::DetectQueued
+                        | CalibrationItemStatus::Detecting
+                )
+        ));
+        assert!(matches!(
+            workspace.session.items().iter().find(|item| item.id == disabled),
+            Some(item) if matches!(item.status, CalibrationItemStatus::Pending)
+        ));
         assert!(workspace.coverage.is_none());
         assert_eq!(workspace.preview_mode, CalibrationPreviewMode::Heatmap);
+
+        workspace.cancel_active_job();
+        drop(workspace);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     fn install_detection_outcome(
@@ -1860,10 +2403,23 @@ mod tests {
         name: &str,
         outcome: camera_toolbox_core::ChessboardDetectionOutcome,
     ) -> CalibrationItemId {
-        let version = camera_toolbox_app::FileVersion {
-            size: 128,
-            modified_millis: Some(1),
-        };
+        install_detection_outcome_with_version(
+            workspace,
+            name,
+            camera_toolbox_app::FileVersion {
+                size: 128,
+                modified_millis: Some(1),
+            },
+            outcome,
+        )
+    }
+
+    fn install_detection_outcome_with_version(
+        workspace: &mut CalibrationWorkspace,
+        name: &str,
+        version: camera_toolbox_app::FileVersion,
+        outcome: camera_toolbox_core::ChessboardDetectionOutcome,
+    ) -> CalibrationItemId {
         let reference = camera_toolbox_app::FileRef::new(
             FileSourceId::new("calibration-session-test").unwrap(),
             SourcePath::new(name).unwrap(),
@@ -1876,6 +2432,8 @@ mod tests {
             panic!("expected a new calibration item");
         };
         let token = workspace.session.begin_detection(id).unwrap();
+        workspace.session.mark_reading(&token).unwrap();
+        workspace.session.mark_detect_queued(&token).unwrap();
         workspace.session.mark_detecting(&token).unwrap();
         workspace
             .session
@@ -2161,6 +2719,15 @@ mod tests {
     }
 
     #[test]
+    fn status_labels_distinguish_queued_and_active_detection() {
+        assert_eq!(
+            status_label(&CalibrationItemStatus::DetectQueued),
+            "Detect queued"
+        );
+        assert_eq!(status_label(&CalibrationItemStatus::Detecting), "Detecting");
+    }
+
+    #[test]
     fn status_colors_distinguish_unprocessed_success_and_failure() {
         let camera_toolbox_core::ChessboardDetectionOutcome::Found(detection) =
             found_detection(640, 480)
@@ -2169,6 +2736,7 @@ mod tests {
         };
         assert_eq!(status_color(&CalibrationItemStatus::Pending), None);
         assert_eq!(status_color(&CalibrationItemStatus::Reading), None);
+        assert_eq!(status_color(&CalibrationItemStatus::DetectQueued), None);
         assert_eq!(
             status_color(&CalibrationItemStatus::Found(detection)),
             Some(OBSERVED_POINT_COLOR)
