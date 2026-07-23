@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Duration,
@@ -24,6 +24,7 @@ const MAX_LIST_PAGE_ENTRIES: usize = 1024;
 const MAX_RECURSIVE_DELETE_ENTRIES: usize = 16_384;
 const MAX_STAGING_NAME_ATTEMPTS: usize = 32;
 const EXPORT_PRODUCER_ABORT: &str = "export producer rejected the staging write sink";
+const SFTP_SESSION_POOL_SIZE: usize = 8;
 
 static NEXT_STAGING_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
@@ -31,6 +32,89 @@ static NEXT_STAGING_FILE_ID: AtomicU64 = AtomicU64::new(0);
 struct SftpConnectionState {
     session: Option<Box<dyn SshTransportSession>>,
     canonical_root: Option<String>,
+}
+
+struct SftpSessionPool {
+    available: Mutex<Vec<SftpConnectionState>>,
+    ready: Condvar,
+}
+
+impl SftpSessionPool {
+    fn new(capacity: usize) -> Self {
+        let mut available = Vec::with_capacity(capacity);
+        available.resize_with(capacity, SftpConnectionState::default);
+        Self {
+            available: Mutex::new(available),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn checkout(
+        self: &Arc<Self>,
+        control: &FsControl,
+    ) -> Result<SftpSessionLease, FileSystemError> {
+        let mut available = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            control.checkpoint()?;
+            if let Some(state) = available.pop() {
+                return Ok(SftpSessionLease {
+                    pool: Arc::clone(self),
+                    state: Some(state),
+                });
+            }
+            let remaining = control.remaining();
+            if remaining.is_zero() {
+                return Err(FileSystemError::TimedOut);
+            }
+            let (next, timeout) = self
+                .ready
+                .wait_timeout(available, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            available = next;
+            if timeout.timed_out() && available.is_empty() {
+                return Err(FileSystemError::TimedOut);
+            }
+        }
+    }
+
+    fn wake_waiters(&self) {
+        let guard = self
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(guard);
+        self.ready.notify_all();
+    }
+}
+
+struct SftpSessionLease {
+    pool: Arc<SftpSessionPool>,
+    state: Option<SftpConnectionState>,
+}
+
+impl SftpSessionLease {
+    fn state_mut(&mut self) -> &mut SftpConnectionState {
+        self.state.as_mut().expect("leased SFTP state is present")
+    }
+}
+
+impl Drop for SftpSessionLease {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let mut available = self
+            .pool
+            .available
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        available.push(state);
+        drop(available);
+        self.pool.ready.notify_one();
+    }
 }
 
 struct FsInterruptRegistration<'a>(&'a FsCancellation);
@@ -48,7 +132,8 @@ pub struct SftpFileSystem {
     credential_ref: String,
     credentials: Arc<dyn CredentialResolver>,
     transport: Arc<dyn SshTransportFactory>,
-    state: Mutex<SftpConnectionState>,
+    control_sessions: Arc<SftpSessionPool>,
+    read_sessions: Arc<SftpSessionPool>,
 }
 
 impl SftpFileSystem {
@@ -87,7 +172,8 @@ impl SftpFileSystem {
             credential_ref,
             credentials,
             transport,
-            state: Mutex::new(SftpConnectionState::default()),
+            control_sessions: Arc::new(SftpSessionPool::new(1)),
+            read_sessions: Arc::new(SftpSessionPool::new(SFTP_SESSION_POOL_SIZE)),
         })
     }
 
@@ -102,15 +188,10 @@ impl SftpFileSystem {
         }
     }
 
-    fn with_session<T>(
-        &self,
-        control: &FsControl,
-        operation: impl FnOnce(
-            &mut dyn SshTransportSession,
-            &str,
-            &RemoteOperationControl,
-        ) -> Result<T, SshTransportError>,
-    ) -> Result<T, FileSystemError> {
+    fn remote_control<'a>(
+        control: &'a FsControl,
+        wake_sessions: Option<Arc<SftpSessionPool>>,
+    ) -> Result<(RemoteOperationControl, FsInterruptRegistration<'a>), FileSystemError> {
         control.checkpoint()?;
         let remaining = control.remaining();
         if remaining.is_zero() {
@@ -118,10 +199,13 @@ impl SftpFileSystem {
         }
         let remote_cancel = DumpCancellation::default();
         let cancel_bridge = remote_cancel.clone();
-        control
-            .cancellation
-            .register_interrupt(Arc::new(move || cancel_bridge.cancel()));
-        let _interrupt_registration = FsInterruptRegistration(&control.cancellation);
+        control.cancellation.register_interrupt(Arc::new(move || {
+            cancel_bridge.cancel();
+            if let Some(sessions) = &wake_sessions {
+                sessions.wake_waiters();
+            }
+        }));
+        let interrupt_registration = FsInterruptRegistration(&control.cancellation);
         let remote_control = RemoteOperationControl::new(
             RemoteTimeouts {
                 connect: remaining.min(Duration::from_secs(10)),
@@ -131,11 +215,19 @@ impl SftpFileSystem {
             remote_cancel,
         )
         .map_err(|error| FileSystemError::Remote(error.to_string()))?;
+        Ok((remote_control, interrupt_registration))
+    }
 
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn operate_session<T>(
+        &self,
+        state: &mut SftpConnectionState,
+        remote_control: &RemoteOperationControl,
+        operation: impl FnOnce(
+            &mut dyn SshTransportSession,
+            &str,
+            &RemoteOperationControl,
+        ) -> Result<T, SshTransportError>,
+    ) -> Result<T, FileSystemError> {
         if state.session.is_none() {
             let credential = self
                 .credentials
@@ -143,23 +235,30 @@ impl SftpFileSystem {
                 .map_err(FileSystemError::Remote)?;
             state.session = Some(
                 self.transport
-                    .connect(&self.target, credential, &remote_control)
+                    .connect(&self.target, credential, remote_control)
                     .map_err(map_transport)?,
             );
             state.canonical_root = None;
         }
+        let session = state.session.as_mut().expect("session was installed");
+        session.prepare_operation(remote_control);
         if state.canonical_root.is_none() {
-            let root = state
-                .session
-                .as_mut()
-                .expect("session was installed")
-                .canonicalize(&self.configured_root, &remote_control)
-                .map_err(map_transport)?;
-            if !root.starts_with('/') {
-                state.session = None;
-                return Err(FileSystemError::PathEscapesRoot(root));
+            let root = session.canonicalize(&self.configured_root, remote_control);
+            match root {
+                Ok(root) if root.starts_with('/') => {
+                    state.canonical_root = Some(trim_remote_root(root));
+                }
+                Ok(root) => {
+                    state.session = None;
+                    return Err(FileSystemError::PathEscapesRoot(root));
+                }
+                Err(error) => {
+                    if transport_requires_reconnect(&error) {
+                        state.session = None;
+                    }
+                    return Err(map_transport(error));
+                }
             }
-            state.canonical_root = Some(trim_remote_root(root));
         }
         let root = state
             .canonical_root
@@ -173,13 +272,44 @@ impl SftpFileSystem {
                 .expect("session was installed")
                 .as_mut(),
             &root,
-            &remote_control,
+            remote_control,
         );
         if result.as_ref().is_err_and(transport_requires_reconnect) {
             state.session = None;
             state.canonical_root = None;
         }
         result.map_err(map_transport)
+    }
+
+    fn with_session<T>(
+        &self,
+        control: &FsControl,
+        operation: impl FnOnce(
+            &mut dyn SshTransportSession,
+            &str,
+            &RemoteOperationControl,
+        ) -> Result<T, SshTransportError>,
+    ) -> Result<T, FileSystemError> {
+        let control_sessions = Arc::clone(&self.control_sessions);
+        let (remote_control, _interrupt_registration) =
+            Self::remote_control(control, Some(control_sessions.clone()))?;
+        let mut lease = control_sessions.checkout(control)?;
+        self.operate_session(lease.state_mut(), &remote_control, operation)
+    }
+
+    fn with_read_session<T>(
+        &self,
+        control: &FsControl,
+        operation: impl FnOnce(
+            &mut dyn SshTransportSession,
+            &str,
+            &RemoteOperationControl,
+        ) -> Result<T, SshTransportError>,
+    ) -> Result<T, FileSystemError> {
+        let (remote_control, _interrupt_registration) =
+            Self::remote_control(control, Some(Arc::clone(&self.read_sessions)))?;
+        let mut lease = self.read_sessions.checkout(control)?;
+        self.operate_session(lease.state_mut(), &remote_control, operation)
     }
 
     fn canonical_directory(
@@ -345,7 +475,7 @@ impl FileSystem for SftpFileSystem {
             return Err(FileSystemError::Unsupported);
         }
         let mut callback_error = None;
-        let result = self.with_session(control, |session, root, remote_control| {
+        let result = self.with_read_session(control, |session, root, remote_control| {
             let lexical = join_remote(root, &reference.path);
             let path = session.canonicalize(&lexical, remote_control)?;
             if !is_within_remote_root(root, &path) {
@@ -621,7 +751,8 @@ fn map_kind(kind: TransportFileKind) -> FileKind {
 fn transport_requires_reconnect(error: &SshTransportError) -> bool {
     matches!(
         error,
-        SshTransportError::Disconnected(_)
+        SshTransportError::Cancelled
+            | SshTransportError::Disconnected(_)
             | SshTransportError::Transport(_)
             | SshTransportError::TimedOut
     )
@@ -655,12 +786,597 @@ fn map_transport(error: SshTransportError) -> FileSystemError {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, io::Write};
+    use std::{
+        collections::VecDeque,
+        io::Write,
+        sync::{
+            Arc, Condvar, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Instant,
+    };
 
     use super::*;
     use camera_toolbox_app::RemoteFileStat;
 
-    use crate::platforms::ssh_managed::{MemoryRemoteFile, MemorySshTransport};
+    use crate::platforms::ssh_managed::{
+        MemoryRemoteFile, MemorySshTransport, SshCredential, SshTransportFactory,
+        SshTransportSession, TransportCommandOutput, TransportDirEntry, TransportListPage,
+    };
+
+    struct BlockingReadProbe {
+        entered: AtomicUsize,
+        list_entered: AtomicUsize,
+        read_calls: AtomicUsize,
+        active: AtomicUsize,
+        max_active: AtomicUsize,
+        connections: AtomicUsize,
+        block_lists: AtomicBool,
+        block_second_read: AtomicBool,
+        second_read_entered: AtomicBool,
+        released: AtomicBool,
+        mutex: Mutex<()>,
+        changed: Condvar,
+    }
+
+    impl BlockingReadProbe {
+        fn new() -> Self {
+            Self {
+                entered: AtomicUsize::new(0),
+                list_entered: AtomicUsize::new(0),
+                read_calls: AtomicUsize::new(0),
+                active: AtomicUsize::new(0),
+                max_active: AtomicUsize::new(0),
+                connections: AtomicUsize::new(0),
+                block_lists: AtomicBool::new(false),
+                block_second_read: AtomicBool::new(false),
+                second_read_entered: AtomicBool::new(false),
+                released: AtomicBool::new(false),
+                mutex: Mutex::new(()),
+                changed: Condvar::new(),
+            }
+        }
+
+        fn wait_for_entered(&self, expected: usize) -> bool {
+            self.wait_for_counter(&self.entered, expected)
+        }
+
+        fn wait_for_list_entered(&self, expected: usize) -> bool {
+            self.wait_for_counter(&self.list_entered, expected)
+        }
+
+        fn wait_for_second_read(&self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut guard = self
+                .mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !self.second_read_entered.load(Ordering::Acquire) {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (next, timeout) = self.changed.wait_timeout(guard, remaining).unwrap();
+                guard = next;
+                if timeout.timed_out() {
+                    return self.second_read_entered.load(Ordering::Acquire);
+                }
+            }
+            true
+        }
+
+        fn wait_for_counter(&self, counter: &AtomicUsize, expected: usize) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut guard = self
+                .mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while counter.load(Ordering::Acquire) < expected {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    return false;
+                }
+                let (next, timeout) = self.changed.wait_timeout(guard, remaining).unwrap();
+                guard = next;
+                if timeout.timed_out() {
+                    return counter.load(Ordering::Acquire) >= expected;
+                }
+            }
+            true
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::Release);
+            self.changed.notify_all();
+        }
+    }
+
+    struct ActiveRead(Arc<BlockingReadProbe>);
+
+    impl Drop for ActiveRead {
+        fn drop(&mut self) {
+            self.0.active.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+
+    struct BlockingReadTransport {
+        probe: Arc<BlockingReadProbe>,
+    }
+
+    impl SshTransportFactory for BlockingReadTransport {
+        fn connect(
+            &self,
+            _target: &SshConnectionTarget,
+            _credential: SshCredential,
+            _control: &RemoteOperationControl,
+        ) -> Result<Box<dyn SshTransportSession>, SshTransportError> {
+            let session_id = self.probe.connections.fetch_add(1, Ordering::AcqRel);
+            Ok(Box::new(BlockingReadSession {
+                probe: Arc::clone(&self.probe),
+                session_id,
+                operation_cancellation: DumpCancellation::default(),
+            }))
+        }
+    }
+
+    struct BlockingReadSession {
+        probe: Arc<BlockingReadProbe>,
+        session_id: usize,
+        operation_cancellation: DumpCancellation,
+    }
+
+    impl SshTransportSession for BlockingReadSession {
+        fn prepare_operation(&mut self, control: &RemoteOperationControl) {
+            self.operation_cancellation = control.cancellation.clone();
+        }
+        fn execute_argv(
+            &mut self,
+            _argv: &[String],
+            _output_limit: usize,
+            _control: &RemoteOperationControl,
+        ) -> Result<TransportCommandOutput, SshTransportError> {
+            Err(SshTransportError::Unsupported)
+        }
+
+        fn canonicalize(
+            &mut self,
+            path: &str,
+            _control: &RemoteOperationControl,
+        ) -> Result<String, SshTransportError> {
+            Ok(path.to_owned())
+        }
+
+        fn stat(
+            &mut self,
+            path: &str,
+            _control: &RemoteOperationControl,
+        ) -> Result<RemoteFileStat, SshTransportError> {
+            Ok(RemoteFileStat {
+                path: path.to_owned(),
+                size: 1,
+                modified_seconds: 7,
+                producer_marker: None,
+                sha256: None,
+            })
+        }
+
+        fn read_dir(
+            &mut self,
+            _root: &str,
+            _control: &RemoteOperationControl,
+        ) -> Result<Vec<TransportDirEntry>, SshTransportError> {
+            Err(SshTransportError::Unsupported)
+        }
+        fn read_dir_page(
+            &mut self,
+            root: &str,
+            continuation: Option<&str>,
+            _limit: usize,
+            control: &RemoteOperationControl,
+        ) -> Result<TransportListPage, SshTransportError> {
+            if self.probe.block_lists.load(Ordering::Acquire) {
+                self.probe.list_entered.fetch_add(1, Ordering::AcqRel);
+                self.probe.changed.notify_all();
+                let mut guard = self
+                    .probe
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !self.probe.released.load(Ordering::Acquire) {
+                    if control.cancellation.is_cancelled() {
+                        return Err(SshTransportError::Cancelled);
+                    }
+                    if control.deadline_expired() {
+                        return Err(SshTransportError::TimedOut);
+                    }
+                    let (next, _) = self
+                        .probe
+                        .changed
+                        .wait_timeout(guard, Duration::from_millis(20))
+                        .unwrap();
+                    guard = next;
+                }
+            }
+            if control.cancellation.is_cancelled() {
+                return Err(SshTransportError::Cancelled);
+            }
+            let continuation_token = format!("blocking:{}:{root}", self.session_id);
+            let entry = |name: &str| TransportDirEntry {
+                path: format!("{root}/{name}"),
+                size: 1,
+                modified_seconds: 7,
+                kind: TransportFileKind::File,
+            };
+            match continuation {
+                None => Ok(TransportListPage {
+                    entries: vec![entry("a.raw")],
+                    continuation: Some(continuation_token),
+                }),
+                Some(token) if token == continuation_token => Ok(TransportListPage {
+                    entries: vec![entry("b.raw")],
+                    continuation: None,
+                }),
+                Some(_) => Err(SshTransportError::InvalidContinuation),
+            }
+        }
+
+        fn metadata(
+            &mut self,
+            _path: &str,
+            _control: &RemoteOperationControl,
+        ) -> Result<TransportDirEntry, SshTransportError> {
+            Err(SshTransportError::Unsupported)
+        }
+
+        fn event_paths(
+            &mut self,
+            _root: &str,
+            _glob: &str,
+            _control: &RemoteOperationControl,
+        ) -> Result<Vec<String>, SshTransportError> {
+            Err(SshTransportError::Unsupported)
+        }
+
+        fn read_file(
+            &mut self,
+            _path: &str,
+            control: &RemoteOperationControl,
+            consume: &mut dyn FnMut(&[u8]) -> Result<(), SshTransportError>,
+        ) -> Result<u64, SshTransportError> {
+            if control.cancellation.is_cancelled() {
+                return Err(SshTransportError::Cancelled);
+            }
+            let call = self.probe.read_calls.fetch_add(1, Ordering::AcqRel) + 1;
+            if self.probe.block_second_read.load(Ordering::Acquire) && call == 1 {
+                consume(&[7])?;
+                return Ok(1);
+            }
+            if self.probe.block_second_read.load(Ordering::Acquire) && call == 2 {
+                self.probe
+                    .second_read_entered
+                    .store(true, Ordering::Release);
+                self.probe.changed.notify_all();
+                let mut guard = self
+                    .probe
+                    .mutex
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                while !self.probe.released.load(Ordering::Acquire) {
+                    if self.operation_cancellation.is_cancelled() {
+                        return Err(SshTransportError::Cancelled);
+                    }
+                    if control.deadline_expired() {
+                        return Err(SshTransportError::TimedOut);
+                    }
+                    let (next, _) = self
+                        .probe
+                        .changed
+                        .wait_timeout(guard, Duration::from_millis(20))
+                        .unwrap();
+                    guard = next;
+                }
+                drop(guard);
+                consume(&[7])?;
+                return Ok(1);
+            }
+            let _active = ActiveRead(Arc::clone(&self.probe));
+            let active = self.probe.active.fetch_add(1, Ordering::AcqRel) + 1;
+            self.probe.max_active.fetch_max(active, Ordering::AcqRel);
+            self.probe.entered.fetch_add(1, Ordering::AcqRel);
+            self.probe.changed.notify_all();
+            let mut guard = self
+                .probe
+                .mutex
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while !self.probe.released.load(Ordering::Acquire) {
+                if control.cancellation.is_cancelled() {
+                    return Err(SshTransportError::Cancelled);
+                }
+                if control.deadline_expired() {
+                    return Err(SshTransportError::TimedOut);
+                }
+                let (next, _) = self
+                    .probe
+                    .changed
+                    .wait_timeout(guard, Duration::from_millis(20))
+                    .unwrap();
+                guard = next;
+            }
+            drop(guard);
+            consume(&[7])?;
+            Ok(1)
+        }
+    }
+
+    #[test]
+    fn reused_sftp_session_cancels_only_the_second_read() {
+        let probe = Arc::new(BlockingReadProbe::new());
+        probe.block_second_read.store(true, Ordering::Release);
+        let (fs, source_id) = blocking_filesystem(Arc::clone(&probe), "reuse-cancel-test");
+        let reference = FileRef::new(source_id, SourcePath::new("frame.png").unwrap());
+
+        let mut first_bytes = Vec::new();
+        assert!(
+            fs.read(
+                &reference,
+                ReadRequest {
+                    offset: 0,
+                    max_bytes: 16,
+                },
+                &control(),
+                &mut |chunk| {
+                    first_bytes.extend_from_slice(chunk);
+                    Ok(())
+                },
+            )
+            .is_ok()
+        );
+        assert_eq!(first_bytes, [7]);
+
+        let cancellation = FsCancellation::default();
+        let mut second_control = control();
+        second_control.cancellation = cancellation.clone();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let second_fs = Arc::clone(&fs);
+        let second_reference = reference.clone();
+        let second_handle = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let mut bytes = Vec::new();
+            let result = second_fs.read(
+                &second_reference,
+                ReadRequest {
+                    offset: 0,
+                    max_bytes: 16,
+                },
+                &second_control,
+                &mut |chunk| {
+                    bytes.extend_from_slice(chunk);
+                    Ok(())
+                },
+            );
+            result_sender.send(result).unwrap();
+        });
+        started_receiver.recv().unwrap();
+        assert!(probe.wait_for_second_read());
+
+        cancellation.cancel();
+        let second_result = result_receiver.recv_timeout(Duration::from_secs(1));
+        probe.release();
+        second_handle.join().unwrap();
+        assert!(matches!(
+            second_result.expect("second read did not return after cancellation"),
+            Err(FileSystemError::Cancelled)
+        ));
+        assert_eq!(probe.connections.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn same_source_reads_overlap_on_independent_sessions() {
+        let probe = Arc::new(BlockingReadProbe::new());
+        let credentials = Arc::new(MemorySshTransport::new(HOST_KEY));
+        credentials.allow_credential("session:test");
+        let transport = Arc::new(BlockingReadTransport {
+            probe: Arc::clone(&probe),
+        });
+        let source_id = FileSourceId::new("sftp-pool-test").unwrap();
+        let fs = Arc::new(
+            SftpFileSystem::new(
+                source_id.clone(),
+                "/opt",
+                SshConnectionTarget {
+                    host: "camera.test".to_owned(),
+                    port: 22,
+                    username: "root".to_owned(),
+                    expected_host_key: None,
+                    command_subsystem: None,
+                    remote_event_subsystem: None,
+                },
+                "session:test",
+                credentials,
+                transport,
+            )
+            .unwrap(),
+        );
+        let references = [
+            "a.png", "b.png", "c.png", "d.png", "e.png", "f.png", "g.png", "h.png", "i.png",
+        ]
+        .into_iter()
+        .map(|name| FileRef::new(source_id.clone(), SourcePath::new(name).unwrap()));
+        let handles: Vec<_> = references
+            .map(|reference| {
+                let fs = Arc::clone(&fs);
+                thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    fs.read(
+                        &reference,
+                        ReadRequest {
+                            offset: 0,
+                            max_bytes: 16,
+                        },
+                        &control(),
+                        &mut |chunk| {
+                            bytes.extend_from_slice(chunk);
+                            Ok(())
+                        },
+                    )
+                })
+            })
+            .collect();
+
+        let saturated = probe.wait_for_entered(SFTP_SESSION_POOL_SIZE);
+        assert!(saturated, "same-source reads did not fill the session pool");
+        assert_eq!(
+            probe.entered.load(Ordering::Acquire),
+            SFTP_SESSION_POOL_SIZE,
+            "the ninth read entered before a session slot was released"
+        );
+        probe.release();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
+        assert_eq!(
+            probe.max_active.load(Ordering::Acquire),
+            SFTP_SESSION_POOL_SIZE
+        );
+        assert_eq!(
+            probe.connections.load(Ordering::Acquire),
+            SFTP_SESSION_POOL_SIZE
+        );
+    }
+
+    fn blocking_filesystem(
+        probe: Arc<BlockingReadProbe>,
+        source_name: &str,
+    ) -> (Arc<SftpFileSystem>, FileSourceId) {
+        let credentials = Arc::new(MemorySshTransport::new(HOST_KEY));
+        credentials.allow_credential("session:test");
+        let transport = Arc::new(BlockingReadTransport { probe });
+        let source_id = FileSourceId::new(source_name).unwrap();
+        let fs = Arc::new(
+            SftpFileSystem::new(
+                source_id.clone(),
+                "/opt",
+                SshConnectionTarget {
+                    host: "camera.test".to_owned(),
+                    port: 22,
+                    username: "root".to_owned(),
+                    expected_host_key: None,
+                    command_subsystem: None,
+                    remote_event_subsystem: None,
+                },
+                "session:test",
+                credentials,
+                transport,
+            )
+            .unwrap(),
+        );
+        (fs, source_id)
+    }
+
+    #[test]
+    fn waiting_control_session_checkout_honors_cancellation() {
+        let probe = Arc::new(BlockingReadProbe::new());
+        probe.block_lists.store(true, Ordering::Release);
+        let (fs, source_id) = blocking_filesystem(Arc::clone(&probe), "control-wait-test");
+        let root = DirectoryRef::root(source_id.clone());
+        let first_fs = Arc::clone(&fs);
+        let first_root = root.clone();
+        let first_handle = thread::spawn(move || {
+            first_fs.list(&first_root, ListPageRequest::default(), &control())
+        });
+        assert!(probe.wait_for_list_entered(1));
+
+        let cancellation = FsCancellation::default();
+        let mut second_control = control();
+        second_control.cancellation = cancellation.clone();
+        let (started_sender, started_receiver) = mpsc::channel();
+        let second_fs = Arc::clone(&fs);
+        let second_root = root.clone();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let second_handle = thread::spawn(move || {
+            started_sender.send(()).unwrap();
+            let result = second_fs.list(&second_root, ListPageRequest::default(), &second_control);
+            result_sender.send(result).unwrap();
+        });
+        started_receiver.recv().unwrap();
+        thread::sleep(Duration::from_millis(50));
+        assert_eq!(probe.list_entered.load(Ordering::Acquire), 1);
+
+        cancellation.cancel();
+        let second_result = result_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("cancelled control checkout did not return");
+        probe.release();
+        assert!(first_handle.join().unwrap().is_ok());
+        second_handle.join().unwrap();
+        assert!(matches!(second_result, Err(FileSystemError::Cancelled)));
+    }
+
+    #[test]
+    fn control_session_keeps_directory_cursor_during_parallel_reads() {
+        let probe = Arc::new(BlockingReadProbe::new());
+        let (fs, source_id) = blocking_filesystem(Arc::clone(&probe), "cursor-affinity-test");
+        let root = DirectoryRef::root(source_id.clone());
+        let first = fs
+            .list(
+                &root,
+                ListPageRequest {
+                    continuation: None,
+                    limit: 1,
+                },
+                &control(),
+            )
+            .unwrap();
+        let continuation = first.next.clone();
+        assert!(continuation.is_some());
+
+        let handles: Vec<_> = ["a.png", "b.png"]
+            .into_iter()
+            .map(|name| {
+                let fs = Arc::clone(&fs);
+                let reference = FileRef::new(source_id.clone(), SourcePath::new(name).unwrap());
+                thread::spawn(move || {
+                    let mut bytes = Vec::new();
+                    fs.read(
+                        &reference,
+                        ReadRequest {
+                            offset: 0,
+                            max_bytes: 16,
+                        },
+                        &control(),
+                        &mut |chunk| {
+                            bytes.extend_from_slice(chunk);
+                            Ok(())
+                        },
+                    )
+                })
+            })
+            .collect();
+        assert!(probe.wait_for_entered(2));
+
+        let second = fs
+            .list(
+                &root,
+                ListPageRequest {
+                    continuation,
+                    limit: 1,
+                },
+                &control(),
+            )
+            .unwrap();
+        assert_eq!(second.entries.len(), 1);
+        assert!(second.next.is_none());
+
+        probe.release();
+        for handle in handles {
+            assert!(handle.join().unwrap().is_ok());
+        }
+        assert_eq!(probe.connections.load(Ordering::Acquire), 3);
+    }
 
     const HOST_KEY: &str = "ssh-ed25519 AAAATEST";
 

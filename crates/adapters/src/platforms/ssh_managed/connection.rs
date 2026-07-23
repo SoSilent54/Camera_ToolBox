@@ -21,8 +21,9 @@ use tokio_util::sync::CancellationToken;
 
 const ARGV_MAGIC: &[u8; 8] = b"CTARGV1\0";
 const WATCH_MAGIC: &[u8; 8] = b"CTWATCH1";
-const READ_CHUNK_BYTES: usize = 64 * 1024;
+const READ_CHUNK_BYTES: usize = 256 * 1024;
 const WRITE_CHUNK_BYTES: usize = 64 * 1024;
+const SFTP_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_EVENT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_CANDIDATES: usize = 4096;
 const MAX_DIRECTORY_METADATA_BYTES: usize = 1024 * 1024;
@@ -132,6 +133,8 @@ pub trait SshTransportFactory: Send + Sync {
 /// 所有 command API 保持 argv 边界；trait 中不存在 command string。
 #[allow(clippy::missing_errors_doc)]
 pub trait SshTransportSession: Send {
+    /// 为可复用 session 绑定当前 operation 的取消令牌。
+    fn prepare_operation(&mut self, _control: &RemoteOperationControl) {}
     fn execute_argv(
         &mut self,
         argv: &[String],
@@ -265,6 +268,7 @@ impl client::Handler for HostKeyVerifier {
 struct RusshTransportSession {
     runtime: tokio::runtime::Runtime,
     session: client::Handle<HostKeyVerifier>,
+    sftp: Option<Arc<SftpSession>>,
     command_subsystem: Option<String>,
     remote_event_subsystem: Option<String>,
     cancellation: CancellationToken,
@@ -279,6 +283,67 @@ struct TransportDirectoryCursor {
     handle: String,
     pending: VecDeque<TransportDirEntry>,
     last_used: TokioInstant,
+}
+fn operation_cancellation(control: &RemoteOperationControl) -> CancellationToken {
+    let cancellation = CancellationToken::new();
+    let bridge = cancellation.clone();
+    control
+        .cancellation
+        .register_interrupt(Arc::new(move || bridge.cancel()));
+    cancellation
+}
+
+/// 仅缓存成功初始化的共享对象；失败保持空槽，允许后续 operation 重试。
+fn get_or_try_init_shared<T, E>(
+    slot: &mut Option<Arc<T>>,
+    initialize: impl FnOnce() -> Result<T, E>,
+) -> Result<Arc<T>, E> {
+    if let Some(value) = slot {
+        return Ok(Arc::clone(value));
+    }
+    let value = Arc::new(initialize()?);
+    *slot = Some(Arc::clone(&value));
+    Ok(value)
+}
+
+/// 在 operation 剩余预算内关闭文件句柄；取消时立即交给 transport 废弃路径回收。
+async fn close_sftp_file(
+    file: &mut SftpFile,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+) -> Result<(), SshTransportError> {
+    if timeout.is_zero() {
+        return Err(SshTransportError::TimedOut);
+    }
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(SshTransportError::Cancelled),
+        result = tokio::time::timeout(timeout, file.shutdown()) => match result {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(SshTransportError::Transport(error.to_string())),
+            Err(_) => Err(SshTransportError::TimedOut),
+        }
+    }
+}
+
+fn read_error_discards_sftp(error: &SshTransportError) -> bool {
+    matches!(
+        error,
+        SshTransportError::Cancelled
+            | SshTransportError::TimedOut
+            | SshTransportError::Disconnected(_)
+            | SshTransportError::Transport(_)
+    )
+}
+
+fn finish_sftp_read<T>(
+    read_result: Result<T, SshTransportError>,
+    close_result: Result<(), SshTransportError>,
+) -> Result<T, SshTransportError> {
+    match read_result {
+        Err(error) => Err(error),
+        Ok(value) => close_result.map(|()| value),
+    }
 }
 
 struct BlockingSftpWriter<'a> {
@@ -369,6 +434,31 @@ impl io::Write for BlockingSftpWriter<'_> {
 }
 
 impl RusshTransportSession {
+    fn sftp_session(
+        &mut self,
+        cancellation: &CancellationToken,
+        deadline: TokioInstant,
+        idle: Duration,
+    ) -> Result<Arc<SftpSession>, SshTransportError> {
+        let runtime = &self.runtime;
+        let session = &self.session;
+        get_or_try_init_shared(&mut self.sftp, || {
+            runtime.block_on(open_sftp(session, cancellation, deadline, idle))
+        })
+    }
+
+    fn close_sftp_session(&mut self) {
+        let Some(sftp) = self.sftp.take() else {
+            return;
+        };
+        self.runtime.block_on(async {
+            let _ = tokio::time::timeout(SFTP_CLOSE_TIMEOUT, sftp.close()).await;
+        });
+    }
+    fn discard_sftp_session(&mut self) {
+        self.sftp.take();
+    }
+
     fn execute_argv_input(
         &mut self,
         argv: &[String],
@@ -470,6 +560,7 @@ impl Drop for RusshTransportSession {
         for cursor in cursors.into_values() {
             self.close_directory_cursor(cursor);
         }
+        self.close_sftp_session();
     }
 }
 
@@ -543,6 +634,7 @@ impl SshTransportFactory for RusshTransportFactory {
         Ok(Box::new(RusshTransportSession {
             runtime,
             session,
+            sftp: None,
             command_subsystem: target.command_subsystem.clone(),
             remote_event_subsystem: target.remote_event_subsystem.clone(),
             cancellation,
@@ -589,6 +681,9 @@ async fn authenticate(
 }
 
 impl SshTransportSession for RusshTransportSession {
+    fn prepare_operation(&mut self, control: &RemoteOperationControl) {
+        self.cancellation = operation_cancellation(control);
+    }
     fn execute_argv(
         &mut self,
         argv: &[String],
@@ -618,8 +713,8 @@ impl SshTransportSession for RusshTransportSession {
         let idle = control.timeouts.idle;
         let deadline = TokioInstant::now() + overall;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             cancellable_until(&cancellation, deadline, idle, sftp.canonicalize(path)).await
         })
     }
@@ -634,8 +729,8 @@ impl SshTransportSession for RusshTransportSession {
         let idle = control.timeouts.idle;
         let deadline = TokioInstant::now() + overall;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             let metadata =
                 cancellable_until(&cancellation, deadline, idle, sftp.metadata(path.clone()))
                     .await?;
@@ -659,8 +754,8 @@ impl SshTransportSession for RusshTransportSession {
         let idle = control.timeouts.idle;
         let deadline = TokioInstant::now() + overall;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             let metadata = cancellable_sftp_until(
                 &cancellation,
                 deadline,
@@ -870,25 +965,39 @@ impl SshTransportSession for RusshTransportSession {
         let idle = control.timeouts.idle;
         let deadline = TokioInstant::now() + overall;
         let path = path.to_owned();
-        self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
-            let mut file =
-                cancellable_until(&cancellation, deadline, idle, sftp.open(path)).await?;
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
+        let mut file = self.runtime.block_on(async {
+            cancellable_until(&cancellation, deadline, idle, sftp.open(path)).await
+        })?;
+        let read_result: Result<u64, SshTransportError> = self.runtime.block_on(async {
             let mut total = 0_u64;
             let mut chunk = vec![0_u8; READ_CHUNK_BYTES];
             loop {
                 let read =
                     cancellable_until(&cancellation, deadline, idle, file.read(&mut chunk)).await?;
                 if read == 0 {
-                    break;
+                    return Ok(total);
                 }
                 total = total.checked_add(read as u64).ok_or_else(|| {
                     SshTransportError::Transport("remote read byte count overflow".to_owned())
                 })?;
                 consume(&chunk[..read])?;
             }
-            Ok(total)
-        })
+        });
+        let discard_without_close = read_result.as_ref().is_err_and(read_error_discards_sftp);
+        let close_result = if discard_without_close {
+            Ok(())
+        } else {
+            let close_budget = control.remaining_overall().min(SFTP_CLOSE_TIMEOUT);
+            self.runtime
+                .block_on(close_sftp_file(&mut file, &cancellation, close_budget))
+        };
+        drop(file);
+        drop(sftp);
+        if discard_without_close || close_result.is_err() {
+            self.discard_sftp_session();
+        }
+        finish_sftp_read(read_result, close_result)
     }
 
     fn write_file_new(
@@ -902,8 +1011,8 @@ impl SshTransportSession for RusshTransportSession {
         let idle = control.timeouts.idle;
         let deadline = TokioInstant::now() + overall;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         let file = self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             cancellable_sftp_until(
                 &cancellation,
                 deadline,
@@ -915,6 +1024,7 @@ impl SshTransportSession for RusshTransportSession {
             )
             .await
         })?;
+        drop(sftp);
         let mut writer = BlockingSftpWriter {
             runtime: &self.runtime,
             file,
@@ -925,6 +1035,9 @@ impl SshTransportSession for RusshTransportSession {
         };
         let produce_result = produce(&mut writer);
         let finish_result = writer.finish();
+        if finish_result.is_err() {
+            self.close_sftp_session();
+        }
         finish_result?;
         produce_result
     }
@@ -938,8 +1051,8 @@ impl SshTransportSession for RusshTransportSession {
         let deadline = TokioInstant::now() + control.remaining_overall();
         let idle = control.timeouts.idle;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             cancellable_sftp_until(&cancellation, deadline, idle, sftp.create_dir(path)).await
         })
     }
@@ -955,8 +1068,8 @@ impl SshTransportSession for RusshTransportSession {
         let idle = control.timeouts.idle;
         let source = source.to_owned();
         let destination = destination.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             cancellable_sftp_until(
                 &cancellation,
                 deadline,
@@ -976,8 +1089,8 @@ impl SshTransportSession for RusshTransportSession {
         let deadline = TokioInstant::now() + control.remaining_overall();
         let idle = control.timeouts.idle;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             cancellable_sftp_until(&cancellation, deadline, idle, sftp.remove_file(path)).await
         })
     }
@@ -991,8 +1104,8 @@ impl SshTransportSession for RusshTransportSession {
         let deadline = TokioInstant::now() + control.remaining_overall();
         let idle = control.timeouts.idle;
         let path = path.to_owned();
+        let sftp = self.sftp_session(&cancellation, deadline, idle)?;
         self.runtime.block_on(async {
-            let sftp = open_sftp(&self.session, &cancellation, deadline, idle).await?;
             cancellable_sftp_until(&cancellation, deadline, idle, sftp.remove_dir(path)).await
         })
     }
@@ -1725,6 +1838,79 @@ mod tests {
             decode_path_frames(&bytes),
             Err(SshTransportError::HelperProtocol(_))
         ));
+    }
+
+    #[test]
+    fn shared_session_cache_initializes_once_and_retries_after_failure() {
+        let opens = RefCell::new(0_usize);
+        let mut cached = None;
+        let first = get_or_try_init_shared(&mut cached, || {
+            *opens.borrow_mut() += 1;
+            Ok::<_, &'static str>(7_usize)
+        })
+        .unwrap();
+        let second = get_or_try_init_shared(&mut cached, || -> Result<usize, &'static str> {
+            panic!("cached session must not be initialized twice")
+        })
+        .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(*opens.borrow(), 1);
+
+        let mut retry = None;
+        let error = get_or_try_init_shared(&mut retry, || Err::<usize, _>("injected")).unwrap_err();
+        assert_eq!(error, "injected");
+        assert!(retry.is_none());
+        assert_eq!(
+            *get_or_try_init_shared(&mut retry, || Ok::<_, &'static str>(9_usize)).unwrap(),
+            9
+        );
+    }
+
+    #[test]
+    fn read_cleanup_prioritizes_error_and_discards_fatal_transport() {
+        let read_error = SshTransportError::PermissionDenied("consumer rejected chunk".to_owned());
+        let close_error = SshTransportError::TimedOut;
+
+        assert_eq!(
+            finish_sftp_read::<u64>(Err(read_error.clone()), Err(close_error.clone())),
+            Err(read_error.clone())
+        );
+        assert_eq!(
+            finish_sftp_read(Ok(17_u64), Err(close_error.clone())),
+            Err(close_error)
+        );
+        assert_eq!(finish_sftp_read(Ok(17_u64), Ok(())), Ok(17));
+        assert!(!read_error_discards_sftp(&read_error));
+        assert!(read_error_discards_sftp(&SshTransportError::Cancelled));
+        assert!(read_error_discards_sftp(&SshTransportError::TimedOut));
+        assert!(read_error_discards_sftp(&SshTransportError::Disconnected(
+            "connection closed".to_owned()
+        )));
+        assert!(read_error_discards_sftp(&SshTransportError::Transport(
+            "broken subsystem".to_owned()
+        )));
+    }
+
+    #[test]
+    fn reused_session_binds_cancellation_to_second_operation() {
+        let timeouts = camera_toolbox_app::RemoteTimeouts {
+            connect: Duration::from_secs(1),
+            idle: Duration::from_secs(1),
+            overall: Duration::from_secs(1),
+        };
+        let first_control =
+            RemoteOperationControl::new(timeouts, camera_toolbox_app::DumpCancellation::default())
+                .unwrap();
+        let first_operation = operation_cancellation(&first_control);
+        let second_control =
+            RemoteOperationControl::new(timeouts, camera_toolbox_app::DumpCancellation::default())
+                .unwrap();
+        let second_operation = operation_cancellation(&second_control);
+
+        second_control.cancellation.cancel();
+        assert!(!first_operation.is_cancelled());
+        assert!(second_operation.is_cancelled());
     }
 
     #[test]
