@@ -283,9 +283,14 @@ jobs:
                      avutil_version() == 0 || swscale_version() == 0;
           }
           EOF
-          cl /nologo /I"$stage/include" "$scratch/smoke.c" /link \
-            /LIBPATH:"$stage/lib" avcodec.lib avformat.lib avutil.lib swscale.lib \
-            /OUT:"$scratch/ffmpeg-dependency-smoke.exe"
+          smoke_include="$(cygpath -w "$stage/include")"
+          smoke_source="$(cygpath -w "$scratch/smoke.c")"
+          smoke_library="$(cygpath -w "$stage/lib")"
+          smoke_output="$(cygpath -w "$scratch/ffmpeg-dependency-smoke.exe")"
+          # 禁止 MSYS 将 MSVC 的 /I、/link、/LIBPATH 和 /OUT 选项重写为 POSIX 路径。
+          MSYS2_ARG_CONV_EXCL='*' "$cl_path" /nologo "/I$smoke_include" "$smoke_source" /link \
+            "/LIBPATH:$smoke_library" avcodec.lib avformat.lib avutil.lib swscale.lib \
+            "/OUT:$smoke_output"
           PATH="$stage/runtime:$PATH" "$scratch/ffmpeg-dependency-smoke.exe"
           test -z "$(find "$stage" -type l -print -quit)"
           (cd "$scratch/stage" && zip -qr "$GITHUB_WORKSPACE/dist/$archive" ffmpeg)
