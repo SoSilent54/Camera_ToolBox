@@ -18,8 +18,51 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  build-eeprom-helper-linux-aarch64:
+    name: Build static Linux AArch64 EEPROM helper
+    runs-on: ubuntu-22.04-arm
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - name: Install helper build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            git \
+            pkg-config
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build static helper
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --locked --target aarch64-unknown-linux-gnu \
+            --package camera-toolbox-eeprom-helper \
+            --bin camera-toolbox-eeprom-helper
+          helper=target/aarch64-unknown-linux-gnu/release/camera-toolbox-eeprom-helper
+          file "$helper" | grep -Eq 'ELF 64-bit LSB.*ARM aarch64'
+          if readelf -l "$helper" | grep -q 'Requesting program interpreter'; then
+            echo 'EEPROM helper must be statically linked' >&2
+            exit 1
+          fi
+      - name: Upload Linux AArch64 helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: eeprom-helper-linux-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/camera-toolbox-eeprom-helper
+          if-no-files-found: error
+
   build-native:
     name: Build ${{ matrix.environment }}
+    needs: build-eeprom-helper-linux-aarch64
     runs-on: ${{ matrix.runner }}
 
     strategy:
@@ -37,6 +80,11 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+      - name: Download Linux AArch64 EEPROM helper
+        uses: actions/download-artifact@v4
+        with:
+          name: eeprom-helper-linux-aarch64
+          path: helper-sidecar
       - name: Install Python
         uses: actions/setup-python@v5
         with:
@@ -76,7 +124,8 @@ jobs:
           bundle="camera-toolbox-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
-          install -m 755 "target/release/camera-toolbox-eeprom-helper" "dist/${bundle}/"
+          install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
+            "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
@@ -92,7 +141,7 @@ jobs:
           $bundle = "camera-toolbox-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
-          Copy-Item "target/release/camera-toolbox-eeprom-helper.exe" "dist/$bundle/"
+          Copy-Item "helper-sidecar/camera-toolbox-eeprom-helper" "dist/$bundle/camera-toolbox-eeprom-helper-linux-aarch64"
           Copy-Item README.md "dist/$bundle/"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
@@ -109,6 +158,7 @@ jobs:
 
   build-linux:
     name: Build ${{ matrix.environment }}
+    needs: build-eeprom-helper-linux-aarch64
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:${{ matrix.ubuntu_version }}
@@ -162,6 +212,11 @@ jobs:
           python3 scripts/opencv5_dependency.py prepare
           --github-env "$GITHUB_ENV"
           --github-path "$GITHUB_PATH"
+      - name: Download Linux AArch64 EEPROM helper
+        uses: actions/download-artifact@v4
+        with:
+          name: eeprom-helper-linux-aarch64
+          path: helper-sidecar
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build unified release
@@ -173,7 +228,8 @@ jobs:
           bundle="camera-toolbox-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
-          install -m 755 "target/release/camera-toolbox-eeprom-helper" "dist/${bundle}/"
+          install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
+            "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null

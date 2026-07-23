@@ -112,6 +112,11 @@ if (( calibration_enabled )); then
     fi
     "$python_command" "$dependency_tool" run -- cargo "${cargo_args[@]}"
     cargo "${helper_args[@]}"
+    if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
+        install -m 755 \
+            "${target_dir}/${profile}/camera-toolbox-eeprom-helper" \
+            "${target_dir}/${profile}/camera-toolbox-eeprom-helper-linux-aarch64"
+    fi
     "$python_command" "$dependency_tool" bundle \
         --destination "${target_dir}/${profile}"
 else

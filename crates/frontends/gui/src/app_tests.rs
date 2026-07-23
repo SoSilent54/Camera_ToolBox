@@ -1509,7 +1509,11 @@ mod eeprom_operation_tests {
             .into_iter()
             .next()
             .unwrap();
-        fs::write(&helper_path, b"test-eeprom-helper").unwrap();
+        fs::write(
+            &helper_path,
+            b"\x7fELF\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xb7\x00",
+        )
+        .unwrap();
         let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
         memory.allow_credential("session:test");
         let credentials: Arc<dyn CredentialResolver> = memory.clone();
@@ -1545,6 +1549,14 @@ mod eeprom_operation_tests {
             .expect("EEPROM target configured");
         assert!(target.label.starts_with("root@camera.test:22 / i2c-7 @"));
         let _ = fs::remove_file(helper_path);
+    }
+
+    #[test]
+    fn rejects_non_linux_aarch64_eeprom_helper_payload() {
+        let path = PathBuf::from("wrong-helper");
+        let error =
+            CameraToolboxApp::validate_eeprom_helper_payload(b"not an ELF", &path).unwrap_err();
+        assert!(error.contains("not a Linux AArch64 ELF"));
     }
 
     #[test]

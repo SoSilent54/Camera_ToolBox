@@ -2505,11 +2505,8 @@ impl CameraToolboxApp {
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-    fn local_eeprom_helper_program_name() -> String {
-        format!(
-            "camera-toolbox-eeprom-helper{}",
-            std::env::consts::EXE_SUFFIX
-        )
+    fn local_eeprom_helper_program_name() -> &'static str {
+        "camera-toolbox-eeprom-helper-linux-aarch64"
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -2532,13 +2529,38 @@ impl CameraToolboxApp {
         Ok(candidates)
     }
 
+    /// 远端 EEPROM helper 固定为 Linux AArch64 ELF，避免将 GUI 宿主二进制上传后执行失败。
+    fn validate_eeprom_helper_payload(bytes: &[u8], candidate: &Path) -> Result<(), String> {
+        const ELF_HEADER_BYTES: usize = 20;
+        const ELF64_CLASS: u8 = 2;
+        const LITTLE_ENDIAN: u8 = 1;
+        const AARCH64_MACHINE: [u8; 2] = [0xb7, 0x00];
+
+        let valid = bytes.len() >= ELF_HEADER_BYTES
+            && bytes.starts_with(b"\x7fELF")
+            && bytes[4] == ELF64_CLASS
+            && bytes[5] == LITTLE_ENDIAN
+            && bytes[18..20] == AARCH64_MACHINE;
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "EEPROM helper {} is not a Linux AArch64 ELF binary",
+                candidate.display()
+            ))
+        }
+    }
+
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     fn read_local_eeprom_helper_payload() -> Result<Arc<[u8]>, String> {
         let candidates = Self::local_eeprom_helper_candidates()?;
         let mut missing = Vec::new();
         for candidate in &candidates {
             match fs::read(candidate) {
-                Ok(bytes) => return Ok(Arc::<[u8]>::from(bytes.into_boxed_slice())),
+                Ok(bytes) => {
+                    Self::validate_eeprom_helper_payload(&bytes, candidate)?;
+                    return Ok(Arc::<[u8]>::from(bytes.into_boxed_slice()));
+                }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     missing.push(candidate.display().to_string());
                 }

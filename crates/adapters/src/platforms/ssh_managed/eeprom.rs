@@ -19,6 +19,8 @@ pub const EEPROM_HELPER_PROGRAM: &str = "/usr/local/libexec/camera-toolbox-eepro
 const EEPROM_HELPER_INSTALL_PROGRAM: &str = "/bin/sh";
 const EEPROM_HELPER_INSTALL_SCRIPT: &str = concat!(
     "set -u; ",
+    "case \"$(uname -s):$(uname -m)\" in Linux:aarch64|Linux:arm64) ;; ",
+    "*) echo 'camera-toolbox EEPROM helper requires Linux AArch64' >&2; cat >/dev/null; exit 64;; esac; ",
     "umask 022; ",
     "helper=/usr/local/libexec/camera-toolbox-eeprom-helper; ",
     "if mkdir -p /usr/local/libexec; then ",
@@ -500,13 +502,14 @@ mod tests {
         assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("mkdir -p /usr/local/libexec"));
         assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("cat > \"$helper\""));
         assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("chmod 755 \"$helper\""));
+        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("Linux AArch64"));
         assert!(!EEPROM_HELPER_INSTALL_SCRIPT.contains("/tmp"));
         assert!(!EEPROM_HELPER_INSTALL_SCRIPT.contains("mv "));
         assert_eq!(
             EEPROM_HELPER_INSTALL_SCRIPT
                 .matches("cat >/dev/null")
                 .count(),
-            2
+            3
         );
     }
 
