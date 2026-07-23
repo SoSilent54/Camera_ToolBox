@@ -52,7 +52,7 @@ pub struct SftpFileSystem {
 }
 
 impl SftpFileSystem {
-    /// 创建 SFTP 挂载；未 pin 主机密钥的挂载仅允许浏览和读取。
+    /// host-key 是否校验由传入 target 决定；密码 GUI 连接不持久化 host-key。
     ///
     /// # Errors
     ///
@@ -60,7 +60,7 @@ impl SftpFileSystem {
     pub fn new(
         source_id: FileSourceId,
         configured_root: impl Into<String>,
-        mut target: SshConnectionTarget,
+        target: SshConnectionTarget,
         credential_ref: impl Into<String>,
         credentials: Arc<dyn CredentialResolver>,
         transport: Arc<dyn SshTransportFactory>,
@@ -80,7 +80,6 @@ impl SftpFileSystem {
                 "credential reference must not be empty".to_owned(),
             ));
         }
-        target.expected_host_key = None;
         Ok(Self {
             source_id,
             configured_root,
@@ -837,14 +836,12 @@ mod tests {
     }
 
     #[test]
-    fn stale_or_missing_host_key_pin_does_not_reduce_sftp_permissions() {
+    fn missing_host_key_pin_does_not_reduce_sftp_permissions() {
         let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
         memory.allow_credential("session:test");
         memory.insert_directory("/opt");
-        let stale = filesystem(memory.clone(), Some("stale-host-key"));
         let unpinned = filesystem(memory, None);
 
-        assert_eq!(stale.capabilities(), FileSystemCapabilities::READ_WRITE);
         assert_eq!(unpinned.capabilities(), FileSystemCapabilities::READ_WRITE);
     }
 
@@ -872,16 +869,18 @@ mod tests {
     }
 
     #[test]
-    fn changed_host_key_is_ignored() {
+    fn explicit_host_key_pin_is_enforced() {
         let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
         memory.allow_credential("session:test");
         memory.insert_directory("/opt");
         let fs = filesystem(memory, Some("ssh-ed25519 DIFFERENT"));
-        fs.list(
-            &DirectoryRef::root(FileSourceId::new("remote-test").unwrap()),
-            ListPageRequest::default(),
-            &control(),
-        )
-        .unwrap();
+        let error = fs
+            .list(
+                &DirectoryRef::root(FileSourceId::new("remote-test").unwrap()),
+                ListPageRequest::default(),
+                &control(),
+            )
+            .unwrap_err();
+        assert!(matches!(error, FileSystemError::PermissionDenied(_)));
     }
 }
