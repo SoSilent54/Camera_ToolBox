@@ -111,11 +111,14 @@ if (( calibration_enabled )); then
         exit 1
     fi
     "$python_command" "$dependency_tool" run -- cargo "${cargo_args[@]}"
-    cargo "${helper_args[@]}"
     if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
+        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
+            cargo "${helper_args[@]}" --target aarch64-unknown-linux-gnu
         install -m 755 \
-            "${target_dir}/${profile}/camera-toolbox-eeprom-helper" \
+            "${target_dir}/aarch64-unknown-linux-gnu/${profile}/camera-toolbox-eeprom-helper" \
             "${target_dir}/${profile}/camera-toolbox-eeprom-helper-linux-aarch64"
+    else
+        cargo "${helper_args[@]}"
     fi
     "$python_command" "$dependency_tool" bundle \
         --destination "${target_dir}/${profile}"
