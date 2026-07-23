@@ -25,8 +25,8 @@ DEPENDENCY_REVISION = 1
 RELEASE_TAG = f"ffmpeg-deps-v{FFMPEG_VERSION}-r{DEPENDENCY_REVISION}"
 CARGO_ENV_CONFIG = PROJECT_ROOT / ".cargo/ffmpeg.local.toml"
 CARGO_COMPILE_ENV_KEYS = ("FFMPEG_DIR", "PKG_CONFIG_PATH")
-UNIX_RUNTIME_LIBRARY_PREFIXES = ("libavcodec", "libavformat", "libavutil", "libswscale")
-WINDOWS_RUNTIME_LIBRARY_PREFIXES = ("avcodec", "avformat", "avutil", "swscale")
+UNIX_RUNTIME_LIBRARY_PREFIXES = ("libavcodec", "libavformat", "libavutil", "libswscale", "libswresample")
+WINDOWS_RUNTIME_LIBRARY_PREFIXES = ("avcodec", "avformat", "avutil", "swscale", "swresample")
 
 
 class DependencyError(RuntimeError):
