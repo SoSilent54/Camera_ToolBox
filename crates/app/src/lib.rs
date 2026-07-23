@@ -16,9 +16,10 @@ pub use asset::{
 };
 pub use calibration::{
     AddCalibrationItemOutcome, CalibrationDatasetItem, CalibrationEncodedPng,
-    CalibrationInputError, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
-    CalibrationSession, CalibrationSessionError, CalibrationSnapshot, InstalledCalibration,
-    MIN_CALIBRATION_VIEWS, read_calibration_png,
+    CalibrationInputError, CalibrationInputKey, CalibrationInputRevision, CalibrationItemId,
+    CalibrationItemStatus, CalibrationJobToken, CalibrationSession, CalibrationSessionError,
+    CalibrationSnapshot, InstalledCalibration, MIN_CALIBRATION_VIEWS, StreamCaptureId,
+    read_calibration_png,
 };
 pub use export::{ExportArtifact, ExportDestination, ExportReceipt, ExportService};
 pub use filesystem::*;

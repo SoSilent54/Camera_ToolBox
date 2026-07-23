@@ -43,6 +43,7 @@ pub enum MediaFormat {
     RawPacked { bit_depth: u8 },
     RawU16Le { bit_depth: u8 },
     Jpeg,
+    Png,
     Yuv420Sp { chroma_order: ChromaOrder },
     H264AnnexB,
     H265AnnexB,

@@ -3,7 +3,7 @@
 #[cfg(test)]
 use std::time::Duration;
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     io::Write,
     path::PathBuf,
     sync::{
@@ -13,17 +13,20 @@ use std::{
     thread,
 };
 
-use camera_toolbox_adapters::OpenCvCalibrationBackend;
+use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
-    AddCalibrationItemOutcome, CalibrationBackend, CalibrationCancellation, CalibrationItemId,
-    CalibrationItemStatus, CalibrationJobToken, CalibrationSession, CalibrationSnapshot,
+    AddCalibrationItemOutcome, CalibrationBackend, CalibrationCancellation, CalibrationEncodedPng,
+    CalibrationInputKey, CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus,
+    CalibrationJobToken, CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame,
     EepromDryRunResult, EepromInspectResult, EepromWriteResult, EntryName, ExportDestination,
     ExportReceipt, ExportService, FileSourceId, FileSystem, FileSystemError, FsCancellation,
-    FsControl,
+    FsControl, OperationId, RasterImageCodec, SnapshotHash, StreamCaptureId, StreamFrameIdentity,
 };
 use camera_toolbox_core::{
-    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution, FullEepromImage,
-    InitialIntrinsics, Rgba8Frame, ViewCalibrationResult, write_opencv_pinhole_radtan_yaml,
+    AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
+    CaptureMetadata, EphemeralAsset, FullEepromImage, InitialIntrinsics, IntegrityState,
+    MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult,
+    write_opencv_pinhole_radtan_yaml,
 };
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -110,10 +113,108 @@ impl CalibrationExport {
 }
 
 struct CalibrationSource {
-    display_path: PathBuf,
-    file_system: Arc<dyn FileSystem>,
-    remote: bool,
+    display_name: String,
+    kind: CalibrationSourceKind,
     preview: Option<CalibrationPreview>,
+}
+
+enum CalibrationSourceKind {
+    File {
+        file_system: Arc<dyn FileSystem>,
+        remote: bool,
+    },
+    Stream(StreamCalibrationSource),
+}
+
+struct StreamCalibrationSource {
+    store: CaptureStore,
+    asset: Option<Arc<EphemeralAsset>>,
+    identity: StreamFrameIdentity,
+    image_size: CalibrationImageSize,
+}
+
+impl CalibrationSource {
+    fn file(display_path: PathBuf, file_system: Arc<dyn FileSystem>, remote: bool) -> Self {
+        Self {
+            display_name: display_path.display().to_string(),
+            kind: CalibrationSourceKind::File {
+                file_system,
+                remote,
+            },
+            preview: None,
+        }
+    }
+
+    fn stream(
+        store: CaptureStore,
+        asset: Arc<EphemeralAsset>,
+        identity: StreamFrameIdentity,
+        image_size: CalibrationImageSize,
+    ) -> Self {
+        Self {
+            display_name: format!(
+                "RTSP ch{} frame {}",
+                identity.channel, identity.frame_sequence
+            ),
+            kind: CalibrationSourceKind::Stream(StreamCalibrationSource {
+                store,
+                asset: Some(asset),
+                identity,
+                image_size,
+            }),
+            preview: None,
+        }
+    }
+
+    fn remote(&self) -> bool {
+        matches!(self.kind, CalibrationSourceKind::File { remote: true, .. })
+    }
+
+    fn file_binding(&self) -> Option<(Arc<dyn FileSystem>, bool)> {
+        match &self.kind {
+            CalibrationSourceKind::File {
+                file_system,
+                remote,
+            } => Some((Arc::clone(file_system), *remote)),
+            CalibrationSourceKind::Stream(_) => None,
+        }
+    }
+
+    fn encoded_png(
+        &self,
+        source_revision: &CalibrationInputRevision,
+    ) -> Result<Option<CalibrationEncodedPng>, String> {
+        let CalibrationSourceKind::Stream(stream) = &self.kind else {
+            return Ok(None);
+        };
+        let Some(asset) = stream.asset.as_ref() else {
+            return Err("stream calibration asset was released".to_owned());
+        };
+        if asset.metadata.format != MediaFormat::Png {
+            return Err("stream calibration source is not a PNG asset".to_owned());
+        }
+        let OwnedMediaPayload::Bytes(bytes) = &asset.source else {
+            return Err("stream calibration PNG must use one contiguous payload".to_owned());
+        };
+        Ok(Some(CalibrationEncodedPng {
+            bytes: Arc::clone(bytes),
+            image_size: stream.image_size,
+            source_revision: source_revision.clone(),
+        }))
+    }
+}
+
+impl Drop for StreamCalibrationSource {
+    fn drop(&mut self) {
+        let Some(asset) = self.asset.take() else {
+            return;
+        };
+        let id = asset.id.clone();
+        drop(asset);
+        if let Err(error) = self.store.release(&id) {
+            tracing::warn!(asset_id = %id, %error, "stream calibration asset release deferred by external ownership");
+        }
+    }
 }
 
 struct CalibrationPreview {
@@ -332,6 +433,7 @@ pub(crate) struct CalibrationWorkspace {
     preview_mode: CalibrationPreviewMode,
     coverage: Option<CoverageVisualization>,
     coverage_dirty: bool,
+    auto_capture_enabled: bool,
 }
 
 impl CalibrationWorkspace {
@@ -365,6 +467,7 @@ impl CalibrationWorkspace {
             preview_mode: CalibrationPreviewMode::default(),
             coverage: None,
             coverage_dirty: true,
+            auto_capture_enabled: false,
         })
     }
 
@@ -416,12 +519,11 @@ impl CalibrationWorkspace {
             };
             self.sources.insert(
                 id,
-                CalibrationSource {
-                    display_path: candidate.display_path,
-                    file_system: candidate.file_system,
-                    remote: candidate.remote,
-                    preview: None,
-                },
+                CalibrationSource::file(
+                    candidate.display_path,
+                    candidate.file_system,
+                    candidate.remote,
+                ),
             );
             if auto_detect && !detection_ids.contains(&id) {
                 detection_ids.push(id);
@@ -442,6 +544,174 @@ impl CalibrationWorkspace {
             "Cannot add {}: PangbotCompatible calibration accepts original PNG files only.",
             display_path.display()
         );
+    }
+
+    /// 固化当前已展示的 RTSP 帧为会话内 PNG，并直接送入检测队列。
+    ///
+    /// 只接受 `LiveDocument::displayed_frame` 的不可变 frame，禁止回读 live slot，
+    /// 以免用户点击的画面与提交给标定的数据不一致。
+    pub(crate) fn capture_displayed_stream_frame(
+        &mut self,
+        frame: Arc<DecodedVideoFrame>,
+        store: CaptureStore,
+    ) {
+        if self.active_job.is_some() {
+            self.status =
+                "Wait for the active calibration operation before capturing a stream frame."
+                    .to_owned();
+            return;
+        }
+        if self.session.items().len() >= MAX_DATASET_ITEMS {
+            self.status = format!("Dataset is limited to {MAX_DATASET_ITEMS} images.");
+            return;
+        }
+
+        let capture_id = StreamCaptureId::from(&frame.identity);
+        let input = CalibrationInputKey::StreamCapture(capture_id);
+        if let Some(existing_id) = self
+            .session
+            .items()
+            .iter()
+            .find(|item| item.input == input)
+            .map(|item| item.id)
+        {
+            let _ = self.session.set_selected(existing_id);
+            self.status =
+                "This displayed stream frame is already in the calibration dataset.".to_owned();
+            return;
+        }
+
+        let rgba = match Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba)) {
+            Ok(rgba) => rgba,
+            Err(error) => {
+                self.status = format!("Cannot freeze displayed stream frame: {error}");
+                return;
+            }
+        };
+        let image_size = match CalibrationImageSize::new(frame.width, frame.height) {
+            Ok(image_size) => image_size,
+            Err(error) => {
+                self.status = format!("Cannot capture displayed stream frame: {error}");
+                return;
+            }
+        };
+        let mut encoded = Vec::new();
+        if let Err(error) = ImageRasterCodec.encode_png(&rgba, &mut encoded) {
+            self.status = format!("Cannot encode displayed stream frame as PNG: {error}");
+            return;
+        }
+        if encoded.len() > MAX_ENCODED_PNG_BYTES as usize {
+            self.status = format!(
+                "Encoded stream frame is {} bytes, limit is {} bytes.",
+                encoded.len(),
+                MAX_ENCODED_PNG_BYTES
+            );
+            return;
+        }
+
+        let content_sha256 = SnapshotHash::digest_bytes(&encoded).to_hex();
+        let asset_id = match AssetId::new(format!(
+            "calibration-stream-{}-{}-{}-{content_sha256}",
+            frame.identity.stream_id.as_str(),
+            frame.identity.channel,
+            frame.identity.frame_sequence,
+        )) {
+            Ok(asset_id) => asset_id,
+            Err(error) => {
+                self.status = format!("Cannot identify captured stream frame: {error}");
+                return;
+            }
+        };
+        let operation_id = match OperationId::new(format!("capture-{}", asset_id.as_str())) {
+            Ok(operation_id) => operation_id,
+            Err(error) => {
+                self.status = format!("Cannot reserve captured stream frame: {error}");
+                return;
+            }
+        };
+        let bytes: Arc<[u8]> = Arc::from(encoded);
+        let reservation = match store.reserve(operation_id, bytes.len()) {
+            Ok(reservation) => reservation,
+            Err(error) => {
+                self.status = format!("Cannot reserve memory for captured stream frame: {error}");
+                return;
+            }
+        };
+        let mut attributes = BTreeMap::new();
+        attributes.insert(
+            "stream_id".to_owned(),
+            frame.identity.stream_id.as_str().to_owned(),
+        );
+        attributes.insert("channel".to_owned(), frame.identity.channel.to_string());
+        attributes.insert(
+            "frame_sequence".to_owned(),
+            frame.identity.frame_sequence.to_string(),
+        );
+        attributes.insert(
+            "host_monotonic_time_ns".to_owned(),
+            frame.identity.host_monotonic_time_ns.to_string(),
+        );
+        attributes.insert(
+            "source_pts".to_owned(),
+            format!("{:?}", frame.identity.source_pts),
+        );
+        attributes.insert("width".to_owned(), frame.width.to_string());
+        attributes.insert("height".to_owned(), frame.height.to_string());
+        let asset = EphemeralAsset::new(
+            asset_id,
+            OwnedMediaPayload::Bytes(bytes),
+            CaptureMetadata {
+                format: MediaFormat::Png,
+                source_name: format!(
+                    "RTSP ch{} frame {}",
+                    frame.identity.channel, frame.identity.frame_sequence
+                ),
+                attributes,
+            },
+            IntegrityState::Verified {
+                algorithm: "sha256".to_owned(),
+                digest: content_sha256.clone(),
+            },
+        );
+        let asset = match store.publish_validated(reservation, asset) {
+            Ok(asset) => asset,
+            Err(error) => {
+                self.status = format!("Cannot publish captured stream frame: {error}");
+                return;
+            }
+        };
+        let revision = CalibrationInputRevision::EphemeralPng {
+            content_sha256,
+            encoded_bytes: asset.byte_len().unwrap_or_default() as u64,
+        };
+        let display_name = format!(
+            "RTSP ch{} frame {}",
+            frame.identity.channel, frame.identity.frame_sequence
+        );
+        let outcome = self.session.add_or_refresh(input, revision, display_name);
+        let id = match outcome {
+            AddCalibrationItemOutcome::Added(id) | AddCalibrationItemOutcome::SourceChanged(id) => {
+                id
+            }
+            AddCalibrationItemOutcome::AlreadyPresent(id) => {
+                let asset_id = asset.id.clone();
+                drop(asset);
+                let _ = store.release(&asset_id);
+                let _ = self.session.set_selected(id);
+                self.status =
+                    "This displayed stream frame is already in the calibration dataset.".to_owned();
+                return;
+            }
+        };
+        self.sources.insert(
+            id,
+            CalibrationSource::stream(store, asset, frame.identity.clone(), image_size),
+        );
+        let _ = self.session.set_selected(id);
+        self.coverage_dirty = true;
+        self.status =
+            "Captured displayed stream frame; submitting authoritative detection.".to_owned();
+        self.start_detection_items(vec![id]);
     }
 
     pub(crate) fn take_export(&mut self) -> Option<CalibrationExport> {
@@ -602,6 +872,18 @@ impl CalibrationWorkspace {
                     self.apply_board();
                 }
             });
+        });
+        ui.collapsing("Auto Capture", |ui| {
+            ui.add_enabled(
+                false,
+                egui::Checkbox::new(
+                    &mut self.auto_capture_enabled,
+                    "Admit RTSP frames automatically",
+                ),
+            );
+            ui.weak(
+                "Disabled in Phase 2 foundation: automatic quality, pose-diversity, and coverage admission is not yet qualified.",
+            );
         });
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(idle, |ui| {
@@ -806,12 +1088,15 @@ impl CalibrationWorkspace {
                         }
                     });
                     row.col(|ui| {
-                        let source = self.sources.get(&item.id);
-                        ui.label(if source.is_some_and(|source| source.remote) {
-                            "SFTP"
-                        } else {
-                            "Local"
-                        });
+                        let label = match &item.input {
+                            CalibrationInputKey::File(_) => {
+                                self.sources.get(&item.id).map_or("Local", |source| {
+                                    if source.remote() { "SFTP" } else { "Local" }
+                                })
+                            }
+                            CalibrationInputKey::StreamCapture(_) => "RTSP",
+                        };
+                        ui.label(label);
                     });
                     row.col(|ui| {
                         ui.monospace(detection_size(&item.status).map_or_else(
@@ -870,7 +1155,7 @@ impl CalibrationWorkspace {
         ui.heading("Preview and constraints");
         if let Some(id) = self.session.selected() {
             if let Some(source) = self.sources.get(&id) {
-                ui.monospace(source.display_path.display().to_string());
+                ui.monospace(&source.display_name);
             }
             ui.horizontal_wrapped(|ui| {
                 let has_heatmap = self.coverage.is_some();
@@ -1060,17 +1345,23 @@ impl CalibrationWorkspace {
         let mut seen = HashSet::new();
 
         for id in ids.into_iter().filter(|id| seen.insert(*id)) {
-            let reference = self
+            let input = self
                 .session
                 .items()
                 .iter()
                 .find(|item| item.id == id)
-                .map(|item| item.reference.clone());
+                .map(|item| item.input.clone());
+            let is_stream = matches!(input, Some(CalibrationInputKey::StreamCapture(_)));
+            let reference = input.and_then(|input| input.file_reference().cloned());
             let source = self
                 .sources
                 .get(&id)
-                .map(|source| (Arc::clone(&source.file_system), source.remote));
-            let token = match self.session.begin_detection(id) {
+                .and_then(CalibrationSource::file_binding);
+            let token = match if is_stream {
+                self.session.begin_encoded_detection(id)
+            } else {
+                self.session.begin_detection(id)
+            } {
                 Ok(token) => token,
                 Err(error) => {
                     self.status = error.to_string();
@@ -1078,10 +1369,10 @@ impl CalibrationWorkspace {
                 }
             };
             batch.total += 1;
-            if token.source_version().size > MAX_ENCODED_PNG_BYTES {
+            if token.source_revision().encoded_bytes() > MAX_ENCODED_PNG_BYTES {
                 let message = format!(
                     "Encoded calibration image is {} bytes, limit is {} bytes.",
-                    token.source_version().size,
+                    token.source_revision().encoded_bytes(),
                     MAX_ENCODED_PNG_BYTES
                 );
                 let _ = self.session.install_failure(&token, message.clone());
@@ -1089,13 +1380,6 @@ impl CalibrationWorkspace {
                 self.status = message;
                 continue;
             }
-            let (Some(reference), Some((file_system, remote))) = (reference, source) else {
-                let message = "Dataset source binding is unavailable.".to_owned();
-                let _ = self.session.install_failure(&token, message.clone());
-                batch.completed += 1;
-                self.status = message;
-                continue;
-            };
             let file_cancellation = FsCancellation::default();
             batch.cancellations.insert(
                 id,
@@ -1105,6 +1389,42 @@ impl CalibrationWorkspace {
                     calibration: calibration_cancellation.clone(),
                 },
             );
+            if is_stream {
+                let direct = self
+                    .sources
+                    .get(&id)
+                    .map(|source| source.encoded_png(token.source_revision()));
+                match direct {
+                    Some(Ok(Some(encoded))) => {
+                        self.pending_loaded
+                            .push_back(LoadedDetectionJob::from_encoded(
+                                batch_id,
+                                token,
+                                encoded,
+                                calibration_cancellation.clone(),
+                            ))
+                    }
+                    Some(Ok(None)) | None => {
+                        let message = "Stream dataset source binding is unavailable.".to_owned();
+                        let _ = self.session.install_failure(&token, message.clone());
+                        batch.completed += 1;
+                        self.status = message;
+                    }
+                    Some(Err(message)) => {
+                        let _ = self.session.install_failure(&token, message.clone());
+                        batch.completed += 1;
+                        self.status = message;
+                    }
+                }
+                continue;
+            }
+            let (Some(reference), Some((file_system, remote))) = (reference, source) else {
+                let message = "Dataset source binding is unavailable.".to_owned();
+                let _ = self.session.install_failure(&token, message.clone());
+                batch.completed += 1;
+                self.status = message;
+                continue;
+            };
             self.pending_reads.push_back(ReadJob::new(
                 batch_id,
                 token,
@@ -1200,8 +1520,22 @@ impl CalibrationWorkspace {
             let Some(job) = self.pending_loaded.pop_front() else {
                 break;
             };
+            let token = job.token.clone();
+            let direct_stream_input = self.session.items().iter().any(|item| {
+                item.id == token.item_id
+                    && matches!(item.input, CalibrationInputKey::StreamCapture(_))
+            });
             match self.detection_pipeline.try_submit_detection(job) {
-                Ok(()) => {}
+                Ok(()) => {
+                    if direct_stream_input {
+                        if let Err(error) = self.session.mark_encoded_detect_queued(&token) {
+                            self.abort_detection_batch(format!(
+                                "Could not commit stream detection queue admission: {error}"
+                            ));
+                            break;
+                        }
+                    }
+                }
                 Err(TrySendError::Full(job)) => {
                     self.pending_loaded.push_front(job);
                     break;
@@ -1365,7 +1699,7 @@ impl CalibrationWorkspace {
         } else {
             match result {
                 Ok(DetectionProduct {
-                    source_version,
+                    source_revision,
                     outcome,
                     preview,
                 }) => {
@@ -1375,7 +1709,7 @@ impl CalibrationWorkspace {
                     );
                     match self
                         .session
-                        .install_detection(&token, source_version, outcome)
+                        .install_detection(&token, source_revision, outcome)
                     {
                         Ok(()) => {
                             // 多 worker 的完成顺序不等于导入顺序；每个刚 Found 的图像立即成为预览目标。
@@ -1678,13 +2012,47 @@ impl CalibrationWorkspace {
                         ("failed", Some(reason.as_str()), None)
                     }
                 };
+                let input = match &item.input {
+                    CalibrationInputKey::File(reference) => serde_json::json!({
+                        "kind": "file",
+                        "source_id": reference.source_id,
+                        "source_path": reference.path,
+                    }),
+                    CalibrationInputKey::StreamCapture(capture) => serde_json::json!({
+                        "kind": "stream_capture",
+                        "stream_id": capture.stream_id.as_str(),
+                        "channel": capture.channel,
+                        "frame_sequence": capture.frame_sequence,
+                    }),
+                };
+                let revision = match &item.revision {
+                    CalibrationInputRevision::File(version) => serde_json::json!({
+                        "kind": "file",
+                        "value": version,
+                    }),
+                    CalibrationInputRevision::EphemeralPng {
+                        content_sha256,
+                        encoded_bytes,
+                    } => serde_json::json!({
+                        "kind": "ephemeral_png",
+                        "content_sha256": content_sha256,
+                        "encoded_bytes": encoded_bytes,
+                    }),
+                };
+                let stream_provenance = match &source.kind {
+                    CalibrationSourceKind::File { .. } => None,
+                    CalibrationSourceKind::Stream(stream) => Some(serde_json::json!({
+                        "source_pts": format!("{:?}", stream.identity.source_pts),
+                        "host_monotonic_time_ns": stream.identity.host_monotonic_time_ns,
+                    })),
+                };
                 Some(serde_json::json!({
                     "id": item.id.get(),
-                    "source_id": item.reference.source_id,
-                    "source_path": item.reference.path,
-                    "display_path": source.display_path.display().to_string(),
-                    "remote": source.remote,
-                    "version": item.version,
+                    "input": input,
+                    "display_path": source.display_name,
+                    "remote": source.remote(),
+                    "revision": revision,
+                    "stream_provenance": stream_provenance,
                     "enabled": item.enabled,
                     "used": installed.item_ids.contains(&item.id),
                     "status": status,
@@ -2243,7 +2611,7 @@ mod tests {
                 token: second_token,
                 reserved_bytes: 0,
                 result: Ok(DetectionProduct {
-                    source_version: version,
+                    source_revision: version.clone().into(),
                     outcome: found_detection(640, 480),
                     preview: None,
                 }),
@@ -2259,7 +2627,7 @@ mod tests {
                 token: first_token,
                 reserved_bytes: 0,
                 result: Ok(DetectionProduct {
-                    source_version: version,
+                    source_revision: version.into(),
                     outcome: found_detection(640, 480),
                     preview: None,
                 }),
@@ -2355,21 +2723,11 @@ mod tests {
         workspace.session.set_enabled(disabled, false).unwrap();
         workspace.sources.insert(
             enabled,
-            CalibrationSource {
-                display_path: root.join("enabled.png"),
-                file_system: Arc::clone(&file_system),
-                remote: false,
-                preview: None,
-            },
+            CalibrationSource::file(root.join("enabled.png"), Arc::clone(&file_system), false),
         );
         workspace.sources.insert(
             disabled,
-            CalibrationSource {
-                display_path: root.join("disabled.png"),
-                file_system,
-                remote: false,
-                preview: None,
-            },
+            CalibrationSource::file(root.join("disabled.png"), file_system, false),
         );
         workspace.preview_mode = CalibrationPreviewMode::Heatmap;
 

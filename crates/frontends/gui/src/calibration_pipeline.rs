@@ -13,8 +13,9 @@ use std::{
 use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
     CalibrationBackend, CalibrationBackendError, CalibrationCancellation, CalibrationEncodedPng,
-    CalibrationInputError, CalibrationJobToken, FileRef, FileSourceId, FileSystem, FileSystemError,
-    FileVersion, FsCancellation, FsControl, RasterFormat, RasterImageCodec, read_calibration_png,
+    CalibrationInputError, CalibrationInputRevision, CalibrationJobToken, FileRef, FileSourceId,
+    FileSystem, FileSystemError, FsCancellation, FsControl, RasterFormat, RasterImageCodec,
+    read_calibration_png,
 };
 use camera_toolbox_core::{ChessboardDetectionOutcome, Rgba8Frame};
 use eframe::egui;
@@ -60,7 +61,7 @@ impl ReadJob {
         file_cancellation: FsCancellation,
         calibration_cancellation: CalibrationCancellation,
     ) -> Self {
-        let reserved_bytes = token.source_version().size;
+        let reserved_bytes = token.source_revision().encoded_bytes();
         Self {
             batch_id,
             token,
@@ -84,6 +85,24 @@ pub(crate) struct LoadedDetectionJob {
     queued_at: Instant,
 }
 
+impl LoadedDetectionJob {
+    pub(crate) fn from_encoded(
+        batch_id: u64,
+        token: CalibrationJobToken,
+        encoded: CalibrationEncodedPng,
+        cancellation: CalibrationCancellation,
+    ) -> Self {
+        Self {
+            batch_id,
+            token,
+            encoded,
+            cancellation,
+            reserved_bytes: 0,
+            queued_at: Instant::now(),
+        }
+    }
+}
+
 pub(crate) struct ReadStageResult {
     pub batch_id: u64,
     pub token: CalibrationJobToken,
@@ -101,7 +120,7 @@ pub(crate) enum ReadStageEvent {
 }
 
 pub(crate) struct DetectionProduct {
-    pub source_version: FileVersion,
+    pub source_revision: CalibrationInputRevision,
     pub outcome: ChessboardDetectionOutcome,
     pub preview: Option<Arc<Rgba8Frame>>,
 }
@@ -329,22 +348,28 @@ fn run_read(job: ReadJob) -> ReadStageResult {
     let started = Instant::now();
     let mut control = FsControl::with_timeout(FILE_READ_TIMEOUT);
     control.cancellation = job.file_cancellation;
-    let result = read_calibration_png(
-        job.file_system.as_ref(),
-        &job.reference,
-        job.token.source_version(),
-        MAX_ENCODED_PNG_BYTES,
-        &control,
-    )
-    .map(|encoded| LoadedDetectionJob {
-        batch_id: job.batch_id,
-        token: job.token.clone(),
-        encoded,
-        cancellation: job.calibration_cancellation,
-        reserved_bytes: job.reserved_bytes,
-        queued_at: Instant::now(),
-    })
-    .map_err(input_error);
+    let result = match job.token.source_revision().file_version() {
+        Some(expected_version) => read_calibration_png(
+            job.file_system.as_ref(),
+            &job.reference,
+            expected_version,
+            MAX_ENCODED_PNG_BYTES,
+            &control,
+        )
+        .map(|encoded| LoadedDetectionJob {
+            batch_id: job.batch_id,
+            token: job.token.clone(),
+            encoded,
+            cancellation: job.calibration_cancellation,
+            reserved_bytes: job.reserved_bytes,
+            queued_at: Instant::now(),
+        })
+        .map_err(input_error),
+        None => Err(PipelineStageError {
+            message: "file read job received a non-file calibration input".to_owned(),
+            cancelled: false,
+        }),
+    };
     tracing::debug!(
         operation = "calibration_pipeline_read",
         batch_id = job.batch_id,
@@ -403,7 +428,7 @@ fn run_detection(
             "calibration detection stage finished"
         );
         DetectionProduct {
-            source_version: job.encoded.source_version,
+            source_revision: job.encoded.source_revision,
             outcome,
             preview,
         }
@@ -656,9 +681,9 @@ mod tests {
                     batch_id: 1,
                     token: a_token,
                     encoded: CalibrationEncodedPng {
-                        bytes: png.clone(),
+                        bytes: png.clone().into(),
                         image_size: CalibrationImageSize::new(1, 1).unwrap(),
-                        source_version: a_version,
+                        source_revision: a_version.clone().into(),
                     },
                     cancellation: CalibrationCancellation::default(),
                     reserved_bytes: a_version.size,
@@ -736,9 +761,9 @@ mod tests {
                     batch_id: 1,
                     token,
                     encoded: CalibrationEncodedPng {
-                        bytes: png,
+                        bytes: png.into(),
                         image_size: CalibrationImageSize::new(1, 1).unwrap(),
-                        source_version: version,
+                        source_revision: version.clone().into(),
                     },
                     cancellation,
                     reserved_bytes: version.size,

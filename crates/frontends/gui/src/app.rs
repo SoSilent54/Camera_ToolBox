@@ -60,9 +60,9 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
 use camera_toolbox_app::{
     AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
     FsCancellation, FsControl, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
-    ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterFormat,
-    RasterImageCodec, RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec,
-    RtspStreamConfig, RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
+    ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterImageCodec,
+    RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec, RtspStreamConfig,
+    RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
 };
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_app::{
@@ -83,6 +83,7 @@ const AUTO_OPEN_BACKGROUND_TAB_LIMIT: usize = 8;
 const RAW_SOURCE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const RAW_SOURCE_CACHE_ENTRIES: usize = 16;
 const RAW_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
+const CAPTURED_RASTER_DECODE_BYTES: usize = 256 * 1024 * 1024;
 
 struct OpenedRawDocument {
     report: LocalRawAnalyzeReport,
@@ -789,6 +790,10 @@ impl eframe::App for CameraToolboxApp {
         };
         let calibration_export_error = self.explorer.active_save_destination().err();
 
+        #[cfg(feature = "calibration-opencv")]
+        let mut calibration_capture_request: Option<
+            Arc<camera_toolbox_app::DecodedVideoFrame>,
+        > = None;
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
                 #[cfg(feature = "calibration-opencv")]
@@ -812,7 +817,18 @@ impl eframe::App for CameraToolboxApp {
                     };
                 }
                 if let Some(document) = self.workspace.active_live_mut() {
-                    let rect = Self::render_live_viewer(ui, document, &self.live_runtime);
+                    let (rect, capture_request) = Self::render_live_viewer(
+                        ui,
+                        document,
+                        &self.live_runtime,
+                        cfg!(feature = "calibration-opencv"),
+                    );
+                    #[cfg(feature = "calibration-opencv")]
+                    {
+                        calibration_capture_request = capture_request;
+                    }
+                    #[cfg(not(feature = "calibration-opencv"))]
+                    let _ = capture_request;
                     ViewerOutput { rect, action: None }
                 } else if let Some(document) = self.workspace.active_image_mut() {
                     let image = document.display.texture_id().map(|texture_id| {
@@ -852,6 +868,12 @@ impl eframe::App for CameraToolboxApp {
             .inner;
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
+        }
+        #[cfg(feature = "calibration-opencv")]
+        if let Some(frame) = calibration_capture_request {
+            self.calibration
+                .capture_displayed_stream_frame(frame, self.live_runtime.capture_store().clone());
+            self.product_workspace = ProductWorkspace::Calibration;
         }
         #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
         if let Some(intent) = self.calibration.take_provision_intent() {
@@ -3749,11 +3771,11 @@ impl CameraToolboxApp {
         let result = match asset.metadata.format {
             MediaFormat::RawPacked { bit_depth } => self
                 .open_packed_raw_asset(context, asset, snapshot, spec.bayer, bit_depth, foreground),
-            MediaFormat::Jpeg | MediaFormat::Yuv420Sp { .. } => {
+            MediaFormat::Jpeg | MediaFormat::Png | MediaFormat::Yuv420Sp { .. } => {
                 self.open_captured_raster_asset(asset, snapshot, foreground)
             }
             ref format => Err(format!(
-                "captured media format {format:?} cannot be opened as an image"
+                "captured asset format {format:?} cannot be opened as an image"
             )),
         };
         if let Err(error) = result {
@@ -3834,11 +3856,16 @@ impl CameraToolboxApp {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let (native, display) = match asset.metadata.format {
-            MediaFormat::Jpeg => {
+            MediaFormat::Jpeg | MediaFormat::Png => {
                 let bytes = asset_payload_bytes(&asset.source)?;
+                let format = if matches!(asset.metadata.format, MediaFormat::Png) {
+                    camera_toolbox_app::RasterFormat::Png
+                } else {
+                    camera_toolbox_app::RasterFormat::Jpeg
+                };
                 let frame = Arc::new(
                     ImageRasterCodec
-                        .decode_rgba8(RasterFormat::Jpeg, bytes, 256 * 1024 * 1024)
+                        .decode_rgba8(format, bytes, CAPTURED_RASTER_DECODE_BYTES)
                         .map_err(|error| error.to_string())?,
                 );
                 (NativeImage::Rgba8(Arc::clone(&frame)), frame)
@@ -4133,11 +4160,26 @@ impl CameraToolboxApp {
         ui: &mut egui::Ui,
         document: &mut LiveDocument,
         runtime: &LiveRuntime,
-    ) -> egui::Rect {
+        calibration_capture_enabled: bool,
+    ) -> (
+        egui::Rect,
+        Option<Arc<camera_toolbox_app::DecodedVideoFrame>>,
+    ) {
         let rect = ui.max_rect();
         let displayed_frame = document.displayed_frame().cloned();
+        let mut capture_request = None;
         ui.horizontal(|ui| {
             ui.heading(&document.title);
+            if calibration_capture_enabled
+                && ui
+                    .add_enabled(
+                        displayed_frame.is_some(),
+                        egui::Button::new("Capture → Calibration dataset"),
+                    )
+                    .clicked()
+            {
+                capture_request = displayed_frame.clone();
+            }
             if ui.button("Snapshot...").clicked()
                 && let Some(frame) = displayed_frame.as_ref()
                 && let Some(path) = rfd::FileDialog::new()
@@ -4290,7 +4332,7 @@ impl CameraToolboxApp {
                 ui.label("Waiting for decoded frame");
             });
         }
-        rect
+        (rect, capture_request)
     }
 
     fn forget_auto_open_document(&mut self, id: DocumentId) {
@@ -4559,6 +4601,7 @@ fn asset_extension(format: &MediaFormat) -> &'static str {
     match format {
         MediaFormat::RawPacked { .. } | MediaFormat::RawU16Le { .. } => "raw",
         MediaFormat::Jpeg => "jpg",
+        MediaFormat::Png => "png",
         MediaFormat::Yuv420Sp { .. } => "nv21",
         MediaFormat::H264AnnexB => "h264",
         MediaFormat::H265AnnexB => "h265",

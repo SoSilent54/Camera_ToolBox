@@ -1,6 +1,6 @@
 //! 标定数据集会话与结果安装事务。
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use camera_toolbox_core::{
     BoardSpec, CalibrationDataError, CalibrationImageSize, CalibrationRequest, CalibrationSolution,
@@ -8,16 +8,94 @@ use camera_toolbox_core::{
 };
 use thiserror::Error;
 
-use crate::{FileRef, FileSystem, FileSystemError, FileVersion, FsControl, ReadRequest};
+use crate::{
+    FileRef, FileSystem, FileSystemError, FileVersion, FsControl, ReadRequest, StreamFrameIdentity,
+    StreamSessionId,
+};
 
 /// `OpenCV` 标定至少需要多个不同姿态；UI readiness 使用这一保守下限。
 pub const MIN_CALIBRATION_VIEWS: usize = 3;
 
+/// 直播帧进入标定数据集时的稳定身份；时间戳只保留在 provenance，不能参与幂等键。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct StreamCaptureId {
+    pub stream_id: StreamSessionId,
+    pub channel: u16,
+    pub frame_sequence: u64,
+}
+
+impl From<&StreamFrameIdentity> for StreamCaptureId {
+    fn from(identity: &StreamFrameIdentity) -> Self {
+        Self {
+            stream_id: identity.stream_id.clone(),
+            channel: identity.channel,
+            frame_sequence: identity.frame_sequence,
+        }
+    }
+}
+
+/// 标定输入不等同于文件系统对象；直播快照不得伪造成 `FileRef`。
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum CalibrationInputKey {
+    File(FileRef),
+    StreamCapture(StreamCaptureId),
+}
+
+impl CalibrationInputKey {
+    #[must_use]
+    pub fn file_reference(&self) -> Option<&FileRef> {
+        match self {
+            Self::File(reference) => Some(reference),
+            Self::StreamCapture(_) => None,
+        }
+    }
+}
+
+impl From<FileRef> for CalibrationInputKey {
+    fn from(reference: FileRef) -> Self {
+        Self::File(reference)
+    }
+}
+
+/// 每次检测必须绑定不可变输入 revision，避免异步结果覆盖已替换的 source。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CalibrationInputRevision {
+    File(FileVersion),
+    EphemeralPng {
+        content_sha256: String,
+        encoded_bytes: u64,
+    },
+}
+
+impl CalibrationInputRevision {
+    #[must_use]
+    pub const fn encoded_bytes(&self) -> u64 {
+        match self {
+            Self::File(version) => version.size,
+            Self::EphemeralPng { encoded_bytes, .. } => *encoded_bytes,
+        }
+    }
+
+    #[must_use]
+    pub const fn file_version(&self) -> Option<FileVersion> {
+        match self {
+            Self::File(version) => Some(*version),
+            Self::EphemeralPng { .. } => None,
+        }
+    }
+}
+
+impl From<FileVersion> for CalibrationInputRevision {
+    fn from(version: FileVersion) -> Self {
+        Self::File(version)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationEncodedPng {
-    pub bytes: Vec<u8>,
+    pub bytes: Arc<[u8]>,
     pub image_size: CalibrationImageSize,
-    pub source_version: FileVersion,
+    pub source_revision: CalibrationInputRevision,
 }
 
 /// 通过统一文件端口有界读取 `PNG`，并在进入 `OpenCV` 前解析 `IHDR` 尺寸。
@@ -72,9 +150,9 @@ pub fn read_calibration_png(
     }
     let image_size = parse_png_dimensions(&bytes)?;
     Ok(CalibrationEncodedPng {
-        bytes,
+        bytes: Arc::from(bytes),
         image_size,
-        source_version: outcome.source_version,
+        source_revision: outcome.source_version.into(),
     })
 }
 
@@ -144,8 +222,8 @@ impl CalibrationItemStatus {
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationDatasetItem {
     pub id: CalibrationItemId,
-    pub reference: FileRef,
-    pub version: FileVersion,
+    pub input: CalibrationInputKey,
+    pub revision: CalibrationInputRevision,
     pub display_name: String,
     pub enabled: bool,
     pub status: CalibrationItemStatus,
@@ -156,7 +234,7 @@ pub struct CalibrationJobToken {
     pub item_id: CalibrationItemId,
     detection_epoch: u64,
     job_id: u64,
-    source_version: FileVersion,
+    source_revision: CalibrationInputRevision,
     board: BoardSpec,
 }
 
@@ -167,8 +245,8 @@ impl CalibrationJobToken {
     }
 
     #[must_use]
-    pub const fn source_version(&self) -> FileVersion {
-        self.source_version
+    pub fn source_revision(&self) -> &CalibrationInputRevision {
+        &self.source_revision
     }
 }
 
@@ -277,20 +355,18 @@ impl CalibrationSession {
 
     pub fn add_or_refresh(
         &mut self,
-        reference: FileRef,
-        version: FileVersion,
+        input: impl Into<CalibrationInputKey>,
+        revision: impl Into<CalibrationInputRevision>,
         display_name: String,
     ) -> AddCalibrationItemOutcome {
-        if let Some(index) = self
-            .items
-            .iter()
-            .position(|item| item.reference == reference)
-        {
+        let input = input.into();
+        let revision = revision.into();
+        if let Some(index) = self.items.iter().position(|item| item.input == input) {
             let item = &mut self.items[index];
-            if item.version == version {
+            if item.revision == revision {
                 return AddCalibrationItemOutcome::AlreadyPresent(item.id);
             }
-            item.version = version;
+            item.revision = revision;
             item.display_name = display_name;
             item.status = CalibrationItemStatus::Pending;
             let id = item.id;
@@ -302,8 +378,8 @@ impl CalibrationSession {
         self.next_id = self.next_id.wrapping_add(1).max(1);
         self.items.push(CalibrationDatasetItem {
             id,
-            reference,
-            version,
+            input,
+            revision,
             display_name,
             enabled: true,
             status: CalibrationItemStatus::Pending,
@@ -367,7 +443,7 @@ impl CalibrationSession {
         self.invalidate_detection_epoch();
     }
 
-    /// 创建绑定当前 board、source version、detection epoch 与唯一 job ID 的检测令牌。
+    /// 为文件输入创建检测令牌；读取 worker 取到任务后才转为 `Reading`。
     ///
     /// # Errors
     ///
@@ -376,14 +452,42 @@ impl CalibrationSession {
         &mut self,
         id: CalibrationItemId,
     ) -> Result<CalibrationJobToken, CalibrationSessionError> {
+        self.begin_detection_with_status(id, CalibrationItemStatus::ReadQueued)
+    }
+
+    /// 为已冻结、已预检的 encoded PNG 直接进入 detection queue 创建令牌。
+    ///
+    /// 调用方必须紧接着提交该 token；channel 拒绝时必须 `cancel_detection` 或
+    /// `install_failure` 回滚。worker 发送 `Started` 前状态始终为 `DetectQueued`。
+    ///
+    /// # Errors
+    ///
+    /// 数据项不存在或已有任务在途时返回错误。
+    /// 为内存 PNG 保留检测令牌；调用方必须在检测 channel 接受任务后调用
+    /// `mark_encoded_detect_queued`。
+    pub fn begin_encoded_detection(
+        &mut self,
+        id: CalibrationItemId,
+    ) -> Result<CalibrationJobToken, CalibrationSessionError> {
+        self.begin_detection_with_status(id, CalibrationItemStatus::Pending)
+    }
+
+    fn begin_detection_with_status(
+        &mut self,
+        id: CalibrationItemId,
+        initial_status: CalibrationItemStatus,
+    ) -> Result<CalibrationJobToken, CalibrationSessionError> {
+        if self.active_detection_jobs.contains_key(&id) {
+            return Err(CalibrationSessionError::ItemBusy(id));
+        }
         let board = self.board;
-        let source_version = {
+        let source_revision = {
             let item = self.item_mut(id)?;
             if item.status.is_busy() {
                 return Err(CalibrationSessionError::ItemBusy(id));
             }
-            item.status = CalibrationItemStatus::ReadQueued;
-            item.version
+            item.status = initial_status;
+            item.revision.clone()
         };
         let job_id = self.next_detection_job_id;
         self.next_detection_job_id = self.next_detection_job_id.wrapping_add(1).max(1);
@@ -393,7 +497,7 @@ impl CalibrationSession {
             item_id: id,
             detection_epoch: self.detection_epoch,
             job_id,
-            source_version,
+            source_revision,
             board,
         })
     }
@@ -427,11 +531,27 @@ impl CalibrationSession {
         &mut self,
         token: &CalibrationJobToken,
     ) -> Result<(), CalibrationSessionError> {
+        self.mark_detection_queued_from(token, CalibrationItemStatus::Reading)
+    }
+
+    /// 内存 PNG 被检测 channel 接收后标记为待检测。
+    ///
+    /// 该单独转换确保 channel 拒绝或仍在 GUI pending 队列中的 stream snapshot
+    /// 不会被错误展示为已经排队给 worker。
+    pub fn mark_encoded_detect_queued(
+        &mut self,
+        token: &CalibrationJobToken,
+    ) -> Result<(), CalibrationSessionError> {
+        self.mark_detection_queued_from(token, CalibrationItemStatus::Pending)
+    }
+
+    fn mark_detection_queued_from(
+        &mut self,
+        token: &CalibrationJobToken,
+        expected_status: CalibrationItemStatus,
+    ) -> Result<(), CalibrationSessionError> {
         self.validate_active_token(token)?;
-        if !matches!(
-            self.item(token.item_id)?.status,
-            CalibrationItemStatus::Reading
-        ) {
+        if self.item(token.item_id)?.status != expected_status {
             return Err(CalibrationSessionError::StaleResult);
         }
         self.item_mut(token.item_id)?.status = CalibrationItemStatus::DetectQueued;
@@ -466,11 +586,11 @@ impl CalibrationSession {
     pub fn install_detection(
         &mut self,
         token: &CalibrationJobToken,
-        observed_version: FileVersion,
+        observed_revision: impl Into<CalibrationInputRevision>,
         outcome: ChessboardDetectionOutcome,
     ) -> Result<(), CalibrationSessionError> {
         self.validate_active_token(token)?;
-        if observed_version != token.source_version {
+        if observed_revision.into() != token.source_revision {
             self.active_detection_jobs.remove(&token.item_id);
             self.item_mut(token.item_id)?.status = CalibrationItemStatus::Pending;
             self.invalidate_solution();
@@ -602,7 +722,7 @@ impl CalibrationSession {
             return Err(CalibrationSessionError::StaleResult);
         }
         let item = self.item(token.item_id)?;
-        if item.version != token.source_version {
+        if item.revision != token.source_revision {
             return Err(CalibrationSessionError::SourceChanged(token.item_id));
         }
         Ok(())
@@ -613,9 +733,7 @@ impl CalibrationSession {
         token: &CalibrationJobToken,
     ) -> Result<(), CalibrationSessionError> {
         self.validate_token(token)?;
-        if self.active_detection_jobs.get(&token.item_id) != Some(&token.job_id)
-            || !self.item(token.item_id)?.status.is_busy()
-        {
+        if self.active_detection_jobs.get(&token.item_id) != Some(&token.job_id) {
             return Err(CalibrationSessionError::StaleResult);
         }
         Ok(())
@@ -752,12 +870,52 @@ mod tests {
         };
         let token = session.begin_detection(id).unwrap();
         session.mark_reading(&token).unwrap();
+
         session.mark_detect_queued(&token).unwrap();
         session.mark_detecting(&token).unwrap();
         session
             .install_detection(&token, version(size), detection())
             .unwrap();
         id
+    }
+
+    #[test]
+    fn encoded_input_queues_directly_without_a_fake_read_stage() {
+        let mut session = CalibrationSession::new(board());
+        let input = CalibrationInputKey::StreamCapture(StreamCaptureId {
+            stream_id: StreamSessionId::new("stream-test").unwrap(),
+            channel: 0,
+            frame_sequence: 7,
+        });
+        let revision = CalibrationInputRevision::EphemeralPng {
+            content_sha256: "a".repeat(64),
+            encoded_bytes: 128,
+        };
+        let AddCalibrationItemOutcome::Added(id) =
+            session.add_or_refresh(input, revision, "RTSP ch0 #7".to_owned())
+        else {
+            panic!();
+        };
+
+        let token = session.begin_encoded_detection(id).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::Pending
+        ));
+        assert_eq!(
+            session.mark_detecting(&token),
+            Err(CalibrationSessionError::StaleResult)
+        );
+        session.mark_encoded_detect_queued(&token).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::DetectQueued
+        ));
+        session.mark_detecting(&token).unwrap();
+        assert!(matches!(
+            session.items()[0].status,
+            CalibrationItemStatus::Detecting
+        ));
     }
 
     #[test]

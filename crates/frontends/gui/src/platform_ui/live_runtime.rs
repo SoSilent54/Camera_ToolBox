@@ -202,6 +202,11 @@ impl LiveRuntime {
         }
         Ok(runtime)
     }
+    /// Stream snapshot 与平台 dump 共用同一会话级预算和资产所有权。
+    #[must_use]
+    pub(crate) fn capture_store(&self) -> &CaptureStore {
+        &self.capture_store
+    }
 
     #[cfg(feature = "platform-ssh")]
     pub(crate) fn ssh_credential_resolver(&self) -> Arc<ProductionCredentialResolver> {
