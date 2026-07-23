@@ -1,4 +1,4 @@
-//! SFTP 文件源实现；host-key pin 与凭据解析沿用生产 SSH transport。
+//! SFTP 文件源实现；连接不持久化也不校验 host-key，只依赖 SSH 认证与远端权限。
 
 use std::{
     sync::{
@@ -60,7 +60,7 @@ impl SftpFileSystem {
     pub fn new(
         source_id: FileSourceId,
         configured_root: impl Into<String>,
-        target: SshConnectionTarget,
+        mut target: SshConnectionTarget,
         credential_ref: impl Into<String>,
         credentials: Arc<dyn CredentialResolver>,
         transport: Arc<dyn SshTransportFactory>,
@@ -80,6 +80,7 @@ impl SftpFileSystem {
                 "credential reference must not be empty".to_owned(),
             ));
         }
+        target.expected_host_key = None;
         Ok(Self {
             source_id,
             configured_root,
@@ -99,23 +100,6 @@ impl SftpFileSystem {
                 expected: self.source_id.clone(),
                 actual: actual.clone(),
             })
-        }
-    }
-
-    fn has_pinned_host_key(&self) -> bool {
-        self.target
-            .expected_host_key
-            .as_deref()
-            .is_some_and(|key| !key.trim().is_empty())
-    }
-
-    fn ensure_mutation_allowed(&self) -> Result<(), FileSystemError> {
-        if self.has_pinned_host_key() {
-            Ok(())
-        } else {
-            Err(FileSystemError::PermissionDenied(
-                "remote changes require a host-key-pinned SSH profile".to_owned(),
-            ))
         }
     }
 
@@ -290,11 +274,7 @@ impl FileSystem for SftpFileSystem {
     }
 
     fn capabilities(&self) -> FileSystemCapabilities {
-        if self.has_pinned_host_key() {
-            FileSystemCapabilities::READ_WRITE
-        } else {
-            FileSystemCapabilities::READ_ONLY
-        }
+        FileSystemCapabilities::READ_WRITE
     }
 
     fn list(
@@ -422,7 +402,6 @@ impl FileSystem for SftpFileSystem {
         produce: &mut dyn FnMut(&mut dyn std::io::Write) -> Result<(), FileSystemError>,
     ) -> Result<FileRef, FileSystemError> {
         self.ensure_source(&parent.source_id)?;
-        self.ensure_mutation_allowed()?;
         let mut producer_error = None;
         let result = self.with_session(control, |session, root, remote_control| {
             let destination = Self::destination_path(session, root, parent, name, remote_control)?;
@@ -492,7 +471,6 @@ impl FileSystem for SftpFileSystem {
         control: &FsControl,
     ) -> Result<DirectoryRef, FileSystemError> {
         self.ensure_source(&parent.source_id)?;
-        self.ensure_mutation_allowed()?;
         self.with_session(control, |session, root, remote_control| {
             let path = Self::destination_path(session, root, parent, name, remote_control)?;
             ensure_remote_destination_absent(session, &path, remote_control)?;
@@ -508,7 +486,6 @@ impl FileSystem for SftpFileSystem {
         control: &FsControl,
     ) -> Result<FileRef, FileSystemError> {
         self.ensure_source(&reference.source_id)?;
-        self.ensure_mutation_allowed()?;
         let parent = reference.parent();
         self.with_session(control, |session, root, remote_control| {
             let source = Self::leaf_path(session, root, reference, remote_control)?;
@@ -531,7 +508,6 @@ impl FileSystem for SftpFileSystem {
     ) -> Result<FileRef, FileSystemError> {
         self.ensure_source(&reference.source_id)?;
         self.ensure_source(&destination.source_id)?;
-        self.ensure_mutation_allowed()?;
         let name = EntryName::new(reference.path.file_name().unwrap_or_default())
             .map_err(|error| FileSystemError::Remote(error.to_string()))?;
         self.with_session(control, |session, root, remote_control| {
@@ -553,7 +529,6 @@ impl FileSystem for SftpFileSystem {
         control: &FsControl,
     ) -> Result<(), FileSystemError> {
         self.ensure_source(&reference.source_id)?;
-        self.ensure_mutation_allowed()?;
         self.with_session(control, |session, root, remote_control| {
             let path = Self::leaf_path(session, root, reference, remote_control)?;
             let metadata = session.metadata(&path, remote_control)?;
@@ -707,7 +682,7 @@ mod tests {
         }
     }
 
-    fn filesystem(memory: Arc<MemorySshTransport>, expected_key: &str) -> SftpFileSystem {
+    fn filesystem(memory: Arc<MemorySshTransport>, stored_key: Option<&str>) -> SftpFileSystem {
         SftpFileSystem::new(
             FileSourceId::new("remote-test").unwrap(),
             "/opt",
@@ -715,7 +690,7 @@ mod tests {
                 host: "camera.test".to_owned(),
                 port: 22,
                 username: "root".to_owned(),
-                expected_host_key: Some(expected_key.to_owned()),
+                expected_host_key: stored_key.map(str::to_owned),
                 command_subsystem: None,
                 remote_event_subsystem: None,
             },
@@ -732,7 +707,7 @@ mod tests {
         memory.allow_credential("session:test");
         memory.insert_file("/opt/a.raw", remote_file("/opt/a.raw", &[1, 2, 3, 4]));
         memory.insert_file("/opt/b.raw", remote_file("/opt/b.raw", &[5, 6]));
-        let fs = filesystem(memory.clone(), HOST_KEY);
+        let fs = filesystem(memory.clone(), Some(HOST_KEY));
         let root = DirectoryRef::root(FileSourceId::new("remote-test").unwrap());
 
         let first = fs
@@ -813,11 +788,11 @@ mod tests {
     }
 
     #[test]
-    fn pinned_sftp_writes_new_artifacts_without_overwrite() {
+    fn unpinned_sftp_writes_new_artifacts_without_overwrite() {
         let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
         memory.allow_credential("session:test");
         memory.insert_directory("/opt");
-        let fs = filesystem(memory.clone(), HOST_KEY);
+        let fs = filesystem(memory.clone(), None);
         let root = DirectoryRef::root(FileSourceId::new("remote-test").unwrap());
         let name = EntryName::new("intrinsics.yaml").unwrap();
 
@@ -862,52 +837,15 @@ mod tests {
     }
 
     #[test]
-    fn browse_only_sftp_rejects_every_mutation_including_save() {
+    fn stale_or_missing_host_key_pin_does_not_reduce_sftp_permissions() {
         let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
         memory.allow_credential("session:test");
-        let fs = SftpFileSystem::new(
-            FileSourceId::new("browse-only-test").unwrap(),
-            "/opt",
-            SshConnectionTarget {
-                host: "camera.test".to_owned(),
-                port: 22,
-                username: "root".to_owned(),
-                expected_host_key: None,
-                command_subsystem: None,
-                remote_event_subsystem: None,
-            },
-            "session:test",
-            memory.clone(),
-            memory,
-        )
-        .unwrap();
-        let root = DirectoryRef::root(FileSourceId::new("browse-only-test").unwrap());
-        let file = FileRef::new(root.source_id.clone(), SourcePath::new("old.yaml").unwrap());
-        let name = EntryName::new("new.yaml").unwrap();
+        memory.insert_directory("/opt");
+        let stale = filesystem(memory.clone(), Some("stale-host-key"));
+        let unpinned = filesystem(memory, None);
 
-        assert_eq!(fs.capabilities(), FileSystemCapabilities::READ_ONLY);
-        let mut write_content =
-            |writer: &mut dyn Write| writer.write_all(b"content").map_err(FileSystemError::io);
-        assert!(matches!(
-            fs.write_new_atomic(&root, &name, &control(), &mut write_content),
-            Err(FileSystemError::PermissionDenied(_))
-        ));
-        assert!(matches!(
-            fs.mkdir(&root, &name, &control()),
-            Err(FileSystemError::PermissionDenied(_))
-        ));
-        assert!(matches!(
-            fs.rename(&file, &name, &control()),
-            Err(FileSystemError::PermissionDenied(_))
-        ));
-        assert!(matches!(
-            fs.move_entry(&file, &root, &control()),
-            Err(FileSystemError::PermissionDenied(_))
-        ));
-        assert!(matches!(
-            fs.delete(&file, false, &control()),
-            Err(FileSystemError::PermissionDenied(_))
-        ));
+        assert_eq!(stale.capabilities(), FileSystemCapabilities::READ_WRITE);
+        assert_eq!(unpinned.capabilities(), FileSystemCapabilities::READ_WRITE);
     }
 
     #[test]
@@ -916,7 +854,7 @@ mod tests {
         memory.allow_credential("session:test");
         memory.insert_directory("/opt");
         memory.set_canonical_path("/opt/link", "/etc");
-        let fs = filesystem(memory, HOST_KEY);
+        let fs = filesystem(memory, Some(HOST_KEY));
         let error = fs
             .list(
                 &DirectoryRef::new(
@@ -934,18 +872,16 @@ mod tests {
     }
 
     #[test]
-    fn changed_host_key_is_hard_blocked() {
+    fn changed_host_key_is_ignored() {
         let memory = Arc::new(MemorySshTransport::new(HOST_KEY));
         memory.allow_credential("session:test");
         memory.insert_directory("/opt");
-        let fs = filesystem(memory, "ssh-ed25519 DIFFERENT");
-        let error = fs
-            .list(
-                &DirectoryRef::root(FileSourceId::new("remote-test").unwrap()),
-                ListPageRequest::default(),
-                &control(),
-            )
-            .unwrap_err();
-        assert!(matches!(error, FileSystemError::PermissionDenied(_)));
+        let fs = filesystem(memory, Some("ssh-ed25519 DIFFERENT"));
+        fs.list(
+            &DirectoryRef::root(FileSourceId::new("remote-test").unwrap()),
+            ListPageRequest::default(),
+            &control(),
+        )
+        .unwrap();
     }
 }

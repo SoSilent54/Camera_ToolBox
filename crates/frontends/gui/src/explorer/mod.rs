@@ -29,7 +29,7 @@ use camera_toolbox_adapters::{
 };
 use camera_toolbox_app::{
     DirectoryChange, DirectoryRef, ExportDestination, FileEntry, FileKind, FileRef, FileSourceId,
-    FileSystem, FsCancellation, FsControl, MountedSourceConfig, SourcePath,
+    FileSystem, FileSystemCapabilities, FsCancellation, FsControl, MountedSourceConfig, SourcePath,
 };
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{RemoteAuthentication, RemoteConnectionConfig};
@@ -54,6 +54,19 @@ impl WorkspaceMode {
             #[cfg(feature = "platform-ssh")]
             Self::Sftp => "SFTP",
         }
+    }
+}
+fn remote_source_status(capabilities: FileSystemCapabilities) -> (egui::Color32, &'static str) {
+    if capabilities.write_new {
+        (
+            egui::Color32::GREEN,
+            "Writable SSH source: exports create new files in this directory.",
+        )
+    } else {
+        (
+            egui::Color32::YELLOW,
+            "Read-only SSH source: exports are unavailable for this directory.",
+        )
     }
 }
 
@@ -483,17 +496,8 @@ impl ExplorerState {
             );
         }
         if view.is_remote() {
-            if view.file_system.capabilities().write_new {
-                ui.colored_label(
-                    egui::Color32::GREEN,
-                    "Pinned SSH source: exports create new files in this directory.",
-                );
-            } else {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    "Browse-only SSH source: pin and remount a server host key before exporting.",
-                );
-            }
+            let (color, message) = remote_source_status(view.file_system.capabilities());
+            ui.colored_label(color, message);
         }
         if let Some(error) = &view.error {
             ui.colored_label(egui::Color32::RED, error);
@@ -956,14 +960,14 @@ impl ExplorerState {
 
     /// 返回当前 Explorer 目录的统一显式导出目标。
     ///
-    /// SFTP source 只有在 host-key-pinned 文件系统声明 `write_new` capability 时可导出。
+    /// SFTP source 只要文件系统声明 `write_new` capability 即可导出，不再要求 host-key pin。
     pub(crate) fn active_save_destination(&self) -> Result<ExportDestination, String> {
-        let view = self
-            .active_view()
-            .ok_or_else(|| "Select a local or pinned SSH directory before exporting.".to_owned())?;
+        let view = self.active_view().ok_or_else(|| {
+            "Select a local or writable SSH directory before exporting.".to_owned()
+        })?;
         if !view.file_system.capabilities().write_new {
             let reason = if view.is_remote() {
-                "SSH source is browse-only; pin and remount its host key before exporting."
+                "SSH source does not support creating export files."
             } else {
                 "Active file source does not support creating export files."
             };

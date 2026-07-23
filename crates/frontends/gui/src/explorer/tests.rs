@@ -12,7 +12,9 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     CredentialResolver, MemoryRemoteFile, MemorySshTransport, ProductionCredentialResolver,
     RusshTransportFactory, SshTransportFactory,
 };
-use camera_toolbox_app::{EntryName, FileEntry, FileKind, FileRef, FileVersion, SourcePath};
+use camera_toolbox_app::{
+    EntryName, FileEntry, FileKind, FileRef, FileSystemCapabilities, FileVersion, SourcePath,
+};
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{
     RawDecodeParams, RawOpenMode, RawOpenPipeline, RemoteAuthentication, RemoteConnectionConfig,
@@ -111,6 +113,25 @@ fn visible_text(output: egui::FullOutput) -> String {
         .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[test]
+fn ssh_source_status_text_has_no_host_key_pin_contract() {
+    let (_, writable) = remote_source_status(FileSystemCapabilities::READ_WRITE);
+    assert_eq!(
+        writable,
+        "Writable SSH source: exports create new files in this directory."
+    );
+    assert!(!writable.contains("Pinned"));
+    assert!(!writable.contains("pin"));
+
+    let (_, read_only) = remote_source_status(FileSystemCapabilities::READ_ONLY);
+    assert_eq!(
+        read_only,
+        "Read-only SSH source: exports are unavailable for this directory."
+    );
+    assert!(!read_only.contains("host-key"));
+    assert!(!read_only.contains("pin"));
 }
 
 fn button_center(output: &egui::FullOutput, label: &str) -> egui::Pos2 {
@@ -774,6 +795,12 @@ fn sftp_workspace_loads_and_polls_session_source() {
     for expected in ["Path", "Name", "Size", "[D] ..."] {
         assert!(text.contains(expected), "missing {expected:?}");
     }
+    assert!(
+        text.contains("Writable SSH source: exports create new files in this directory."),
+        "missing writable SSH status: {text}"
+    );
+    assert!(!text.contains("Pinned SSH source"));
+    assert!(!text.contains("pin and remount"));
     assert!(!text.contains("Root"));
     assert_eq!(
         explorer.sftp_view.as_ref().unwrap().navigation_path(),
