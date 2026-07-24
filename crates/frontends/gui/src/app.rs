@@ -766,7 +766,7 @@ impl eframe::App for CameraToolboxApp {
             self.start_direct_rtsp(config);
         }
         if let Some(action) = workspace_stream_action {
-            self.handle_stream_panel_action(action);
+            self.handle_workspace_stream_action(action);
         }
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             #[cfg(feature = "calibration-opencv")]
@@ -4070,10 +4070,15 @@ impl CameraToolboxApp {
         None
     }
 
-    fn render_workspace_stream_section(&mut self, ui: &mut egui::Ui) -> Option<StreamPanelAction> {
+    fn render_workspace_stream_section(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<WorkspaceStreamAction> {
+        use egui_extras::{Column, TableBuilder};
+
         ui.heading("Active Streams");
         let active = self.workspace.active_id();
-        let streams: Vec<_> = self
+        let items: Vec<_> = self
             .workspace
             .live_documents()
             .iter()
@@ -4082,36 +4087,70 @@ impl CameraToolboxApp {
                     document.id,
                     document.title.clone(),
                     document.source.detail(),
-                    document.status_label(),
+                    document.status_label().to_owned(),
                     format!("{:?}", document.stage),
+                    matches!(document.lifecycle, LiveDocumentLifecycle::Open),
                 )
             })
             .collect();
-        if streams.is_empty() {
+        if items.is_empty() {
             ui.weak("No active stream documents.");
             return None;
         }
-        let mut activate = None;
-        for (id, title, detail, status, stage) in streams {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                if ui.selectable_label(active == Some(id), title).clicked() {
-                    activate = Some(id);
-                }
-                ui.small(format!("{detail} · {stage} · {status}"));
+        let mut action = None;
+        egui::ScrollArea::horizontal()
+            .id_salt("stream_table_hscroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .id_salt("workspace_stream_table")
+                    .striped(true)
+                    .resizable(true)
+                    .auto_shrink([false, false])
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::remainder().at_least(80.0).clip(true))
+                    .column(Column::initial(80.0).at_least(60.0).clip(true))
+                    .column(Column::initial(32.0))
+                    .header(24.0, |mut header| {
+                        header.col(|ui| {
+                            ui.strong("Stream");
+                        });
+                        header.col(|ui| {
+                            ui.strong("Status");
+                        });
+                        header.col(|ui| {
+                            ui.strong("");
+                        });
+                    })
+                    .body(|body| {
+                        body.rows(26.0, items.len(), |mut row| {
+                            let (id, ref title, ref detail, ref status, ref stage, can_stop) =
+                                items[row.index()];
+                            let is_selected = active == Some(id);
+                            row.col(|ui| {
+                                if ui.selectable_label(is_selected, title).clicked() {
+                                    action = Some(WorkspaceStreamAction::Activate(id));
+                                }
+                                ui.add_space(4.0);
+                                ui.weak(detail);
+                            });
+                            row.col(|ui| {
+                                ui.label(format!("{stage} · {status}"));
+                            });
+                            row.col(|ui| {
+                                let label = if can_stop { "■" } else { "—" };
+                                if ui
+                                    .add_enabled(can_stop, egui::Button::new(label).small())
+                                    .on_hover_text(detail)
+                                    .clicked()
+                                {
+                                    action = Some(WorkspaceStreamAction::Stop(id));
+                                }
+                            });
+                        });
+                    });
             });
-        }
-        if let Some(id) = activate {
-            self.workspace.activate(id);
-        }
-        if self
-            .workspace
-            .active_live()
-            .is_some_and(|document| matches!(document.lifecycle, LiveDocumentLifecycle::Open))
-            && ui.button("Request stop active stream").clicked()
-        {
-            return Some(StreamPanelAction::RequestStop);
-        }
-        None
+        action
     }
 
     fn start_direct_rtsp(&mut self, config: RtspStreamConfig) {
@@ -4152,6 +4191,28 @@ impl CameraToolboxApp {
                     && let Some(document) = self.workspace.live_mut(id)
                     && matches!(document.lifecycle, LiveDocumentLifecycle::Open)
                 {
+                    if self.live_runtime.request_close(&document.session_id) {
+                        document.lifecycle = LiveDocumentLifecycle::Closing {
+                            stop_deadline: Instant::now() + LIVE_STOP_TIMEOUT,
+                        };
+                    } else {
+                        self.workspace.remove_live(id);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_workspace_stream_action(&mut self, action: WorkspaceStreamAction) {
+        match action {
+            WorkspaceStreamAction::Activate(id) => {
+                self.workspace.activate(id);
+            }
+            WorkspaceStreamAction::Stop(id) => {
+                let Some(document) = self.workspace.live_mut(id) else {
+                    return;
+                };
+                if matches!(document.lifecycle, LiveDocumentLifecycle::Open) {
                     if self.live_runtime.request_close(&document.session_id) {
                         document.lifecycle = LiveDocumentLifecycle::Closing {
                             stop_deadline: Instant::now() + LIVE_STOP_TIMEOUT,
@@ -4813,6 +4874,13 @@ fn write_live_snapshot(
     writer
         .write_image_data(&frame.rgba)
         .map_err(|error| error.to_string())
+}
+
+/// Actions from the left-sidebar RTSP stream table (distinct from platform StreamPanelAction).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceStreamAction {
+    Activate(DocumentId),
+    Stop(DocumentId),
 }
 
 #[cfg(test)]
