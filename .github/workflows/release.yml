@@ -109,6 +109,14 @@ jobs:
           "$python_command" scripts/opencv5_dependency.py prepare \
             --github-env "$GITHUB_ENV" \
             --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        shell: bash
+        run: |
+          python_command=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
+          "$python_command" scripts/ffmpeg_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Build unified release
@@ -128,6 +136,7 @@ jobs:
             "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
+          "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
             "dist/${bundle}/camera-toolbox" --help >/dev/null
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
@@ -144,6 +153,7 @@ jobs:
           Copy-Item "helper-sidecar/camera-toolbox-eeprom-helper" "dist/$bundle/camera-toolbox-eeprom-helper-linux-aarch64"
           Copy-Item README.md "dist/$bundle/"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
+          & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
           & "dist/$bundle/camera-toolbox.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged camera-toolbox smoke failed" }
@@ -212,6 +222,11 @@ jobs:
           python3 scripts/opencv5_dependency.py prepare
           --github-env "$GITHUB_ENV"
           --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        run: >-
+          python3 scripts/ffmpeg_dependency.py prepare
+          --github-env "$GITHUB_ENV"
+          --github-path "$GITHUB_PATH"
       - name: Download Linux AArch64 EEPROM helper
         uses: actions/download-artifact@v4
         with:
@@ -232,6 +247,7 @@ jobs:
             "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
+          "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
           tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
       - name: Upload release archive

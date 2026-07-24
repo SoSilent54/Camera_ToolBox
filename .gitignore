@@ -3,6 +3,7 @@
 /.deps/
 /.ai_doc/
 /.cargo/opencv5.local.toml
+/.cargo/ffmpeg.local.toml
 
 # Local project data and settings
 /local_data/

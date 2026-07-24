@@ -112,6 +112,14 @@ jobs:
           "$python_command" scripts/opencv5_dependency.py prepare \
             --github-env "$GITHUB_ENV" \
             --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        shell: bash
+        run: |
+          python_command=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
+          "$python_command" scripts/ffmpeg_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -119,14 +127,23 @@ jobs:
       - name: Build unified product
         shell: bash
         run: ./build.sh release
-      - name: Smoke unified product
+      - name: Smoke unified product on Unix
+        if: runner.os != 'Windows'
         shell: bash
         run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            target/release/camera-toolbox.exe --help >/dev/null
+          if [[ "$RUNNER_OS" == "macOS" ]]; then
+            env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
+              target/release/camera-toolbox --help >/dev/null
           else
-            target/release/camera-toolbox --help >/dev/null
+            env -u LD_LIBRARY_PATH target/release/camera-toolbox --help >/dev/null
           fi
+      - name: Smoke unified product on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          & target/release/camera-toolbox.exe --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged camera-toolbox smoke failed" }
       - name: Test all adapter implementations together
         if: runner.os == 'Linux'
         run: >-
@@ -205,6 +222,14 @@ jobs:
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
           "$python_command" scripts/opencv5_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        shell: bash
+        run: |
+          python_command=python3
+          if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
+          "$python_command" scripts/ffmpeg_dependency.py prepare \
             --github-env "$GITHUB_ENV" \
             --github-path "$GITHUB_PATH"
       - name: Install stable Rust

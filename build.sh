@@ -31,10 +31,10 @@ usage() {
 Usage: ./build.sh [profile]
 
 Builds one camera-toolbox executable for the current native host with Local,
-CV610, SSH-managed providers, and pinned OpenCV 5 calibration enabled together.
-The verified native dependency is cached under .deps/opencv5 and its runtime is
-copied beside the executable. Set CAMERA_TOOLBOX_CALIBRATION=0 to build without
-the OpenCV dependency.
+CV610, SSH-managed providers, pinned FFmpeg 8.1.2, and pinned OpenCV 5
+calibration enabled together. Verified native dependencies are cached under
+`.deps/ffmpeg` and `.deps/opencv5`; their runtime libraries are copied beside
+the executable. Set CAMERA_TOOLBOX_CALIBRATION=0 to omit only OpenCV.
 
 Profiles:
   debug    Cargo dev profile (default)
@@ -78,6 +78,21 @@ fi
 project_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 target_dir=${CARGO_TARGET_DIR:-"${project_root}/target"}
 export CARGO_TARGET_DIR="$target_dir"
+python_command=${PYTHON:-}
+if [[ -z $python_command ]]; then
+    if [[ ${OS:-} == "Windows_NT" ]]; then
+        python_command=python
+    else
+        python_command=python3
+    fi
+fi
+if ! command -v "$python_command" >/dev/null 2>&1; then
+    printf 'error: Python interpreter not found: %s\n' "$python_command" >&2
+    exit 1
+fi
+ffmpeg_dependency_tool="${project_root}/scripts/ffmpeg_dependency.py"
+opencv_dependency_tool="${project_root}/scripts/opencv5_dependency.py"
+
 configure_windows_msvc_linker
 
 printf 'Building camera-toolbox: features=%s profile=%s target_dir=%s\n' \
@@ -103,26 +118,25 @@ helper_args=(
     "${profile_args[@]}"
 )
 
+"$python_command" "$ffmpeg_dependency_tool" prepare
 if (( calibration_enabled )); then
-    python_command=${PYTHON:-python3}
-    dependency_tool="${project_root}/scripts/opencv5_dependency.py"
-    if ! command -v "$python_command" >/dev/null 2>&1; then
-        printf 'error: Python interpreter not found: %s\n' "$python_command" >&2
-        exit 1
-    fi
-    "$python_command" "$dependency_tool" run -- cargo "${cargo_args[@]}"
-    if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
-        CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
-            cargo "${helper_args[@]}" --target aarch64-unknown-linux-gnu
-        install -m 755 \
-            "${target_dir}/aarch64-unknown-linux-gnu/${profile}/camera-toolbox-eeprom-helper" \
-            "${target_dir}/${profile}/camera-toolbox-eeprom-helper-linux-aarch64"
-    else
-        cargo "${helper_args[@]}"
-    fi
-    "$python_command" "$dependency_tool" bundle \
-        --destination "${target_dir}/${profile}"
+    "$python_command" "$opencv_dependency_tool" prepare
+fi
+
+cargo "${cargo_args[@]}"
+if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
+    CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
+        cargo "${helper_args[@]}" --target aarch64-unknown-linux-gnu
+    install -m 755 \
+        "${target_dir}/aarch64-unknown-linux-gnu/${profile}/camera-toolbox-eeprom-helper" \
+        "${target_dir}/${profile}/camera-toolbox-eeprom-helper-linux-aarch64"
 else
-    cargo "${cargo_args[@]}"
     cargo "${helper_args[@]}"
+fi
+
+"$python_command" "$ffmpeg_dependency_tool" bundle \
+    --destination "${target_dir}/${profile}"
+if (( calibration_enabled )); then
+    "$python_command" "$opencv_dependency_tool" bundle \
+        --destination "${target_dir}/${profile}"
 fi

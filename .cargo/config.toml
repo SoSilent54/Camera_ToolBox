@@ -1,4 +1,7 @@
-include = [{ path = "opencv5.local.toml", optional = true }]
+include = [
+    { path = "opencv5.local.toml", optional = true },
+    { path = "ffmpeg.local.toml", optional = true },
+]
 
 [env]
 OPENCV_DISABLE_PROBES = { value = "pkg_config,cmake,vcpkg_cmake,vcpkg", force = true }
