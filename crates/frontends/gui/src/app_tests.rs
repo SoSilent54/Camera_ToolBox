@@ -1006,16 +1006,16 @@ fn unsaved_ephemeral_tab_is_retained_until_explicit_close_resolution() {
 }
 
 #[test]
-fn closing_inactive_live_tab_activates_its_confirmation() {
+fn closing_inactive_live_tab_requests_stop_and_removes_on_failure() {
     let context = egui::Context::default();
     let mut app = CameraToolboxApp::new(&context).unwrap();
     let first = app.workspace.open_live(
-        camera_toolbox_app::StreamSessionId::new("inactive-first").unwrap(),
+        camera_toolbox_app::StreamSessionId::new("live-close-a").unwrap(),
         Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default()),
         test_live_source(),
     );
     let second = app.workspace.open_live(
-        camera_toolbox_app::StreamSessionId::new("active-second").unwrap(),
+        camera_toolbox_app::StreamSessionId::new("live-close-b").unwrap(),
         Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default()),
         test_live_source(),
     );
@@ -1023,11 +1023,9 @@ fn closing_inactive_live_tab_activates_its_confirmation() {
 
     app.close_document(&context, first);
 
-    assert_eq!(app.workspace.active_live().unwrap().id, first);
-    assert!(matches!(
-        app.workspace.active_live().unwrap().lifecycle,
-        crate::workspace::LiveDocumentLifecycle::CloseRequested
-    ));
+    // request_close fails without a real RTSP connection → doc is removed
+    assert!(app.workspace.live_documents().len() == 1);
+    assert_eq!(app.workspace.live_documents()[0].id, second);
 }
 
 #[cfg(all(target_os = "linux", feature = "platform-cv610"))]

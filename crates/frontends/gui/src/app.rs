@@ -4152,8 +4152,13 @@ impl CameraToolboxApp {
                     && let Some(document) = self.workspace.live_mut(id)
                     && matches!(document.lifecycle, LiveDocumentLifecycle::Open)
                 {
-                    document.lifecycle = LiveDocumentLifecycle::CloseRequested;
-                    self.workspace.activate(id);
+                    if self.live_runtime.request_close(&document.session_id) {
+                        document.lifecycle = LiveDocumentLifecycle::Closing {
+                            stop_deadline: Instant::now() + LIVE_STOP_TIMEOUT,
+                        };
+                    } else {
+                        self.workspace.remove_live(id);
+                    }
                 }
             }
         }
@@ -4261,31 +4266,6 @@ impl CameraToolboxApp {
             ui.label(message);
         }
         match &document.lifecycle {
-            LiveDocumentLifecycle::CloseRequested => {
-                egui::Frame::group(ui.style()).show(ui, |ui| {
-                    ui.label(
-                        "Close this live session? The only stop action is closing its TCP socket.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Cancel").clicked() {
-                            document.lifecycle = LiveDocumentLifecycle::Open;
-                        }
-                        if ui.button("Close Stream").clicked() {
-                            if runtime.request_close(&document.session_id) {
-                                document.lifecycle = LiveDocumentLifecycle::Closing {
-                                    stop_deadline: Instant::now() + LIVE_STOP_TIMEOUT,
-                                };
-                            } else {
-                                document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
-                                    terminal: camera_toolbox_app::StreamTerminal::Forced {
-                                        remote_state_unknown: true,
-                                    },
-                                };
-                            }
-                        }
-                    });
-                });
-            }
             LiveDocumentLifecycle::Closing { .. } => {
                 ui.colored_label(egui::Color32::YELLOW, "Closing asynchronously...");
             }
@@ -4550,21 +4530,21 @@ impl CameraToolboxApp {
             return;
         }
         if let Some(document) = self.workspace.live_mut(id) {
-            let (remove, activate_confirmation) = match document.lifecycle {
+            match document.lifecycle {
                 LiveDocumentLifecycle::Open => {
-                    document.lifecycle = LiveDocumentLifecycle::CloseRequested;
-                    (false, true)
+                    if self.live_runtime.request_close(&document.session_id) {
+                        document.lifecycle = LiveDocumentLifecycle::Closing {
+                            stop_deadline: Instant::now() + LIVE_STOP_TIMEOUT,
+                        };
+                    } else {
+                        self.workspace.remove_live(id);
+                    }
                 }
+                LiveDocumentLifecycle::Closing { .. } => {}
                 LiveDocumentLifecycle::Terminal { .. }
-                | LiveDocumentLifecycle::ForcedCleanup { .. } => (true, false),
-                LiveDocumentLifecycle::CloseRequested | LiveDocumentLifecycle::Closing { .. } => {
-                    (false, false)
+                | LiveDocumentLifecycle::ForcedCleanup { .. } => {
+                    self.workspace.remove_live(id);
                 }
-            };
-            if remove {
-                self.workspace.remove_live(id);
-            } else if activate_confirmation {
-                self.workspace.activate(id);
             }
             return;
         }

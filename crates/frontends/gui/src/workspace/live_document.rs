@@ -61,7 +61,6 @@ impl LiveStreamSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum LiveDocumentLifecycle {
     Open,
-    CloseRequested,
     Closing { stop_deadline: Instant },
     ForcedCleanup { terminal: StreamTerminal },
     Terminal { terminal: StreamTerminal },
@@ -253,7 +252,6 @@ impl LiveDocument {
     pub(crate) fn status_label(&self) -> &'static str {
         match self.lifecycle {
             LiveDocumentLifecycle::Open => "Live",
-            LiveDocumentLifecycle::CloseRequested => "Close?",
             LiveDocumentLifecycle::Closing { .. } => "Closing",
             LiveDocumentLifecycle::ForcedCleanup { .. } => "Forced",
             LiveDocumentLifecycle::Terminal { .. } => "Stopped",
