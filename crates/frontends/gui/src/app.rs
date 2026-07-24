@@ -4431,33 +4431,49 @@ impl CameraToolboxApp {
         if let Some(texture) = document.texture() {
             let available = ui.available_size();
             let source = texture.size_vec2();
-            let scale = (available.x / source.x)
-                .min(available.y / source.y)
-                .min(1.0)
-                .max(0.01);
-            ui.centered_and_justified(|ui| {
-                #[cfg(feature = "calibration-opencv")]
-                {
-                    let response =
-                        ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
-                    if let Some(overlay) = calibration_overlay {
-                        Self::paint_live_calibration_overlay(
-                            &ui.painter_at(response.rect),
-                            response.rect,
-                            overlay,
-                            document.show_calibration_detection,
-                            document.show_calibration_coverage,
-                        );
-                    }
+            let finite_positive = |value: f32| {
+                if value.is_finite() && value > 0.0 {
+                    value
+                } else {
+                    1.0
                 }
-                #[cfg(not(feature = "calibration-opencv"))]
-                ui.add(egui::Image::new(texture).fit_to_exact_size(source * scale));
-            });
+            };
+            let scale = (finite_positive(available.x) / finite_positive(source.x))
+                .min(finite_positive(available.y) / finite_positive(source.y))
+                .max(0.01);
+            let fitted = source * scale;
+            let canvas_size = egui::vec2(available.x.max(fitted.x), fitted.y);
+            let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
+            let image_rect = egui::Rect::from_center_size(canvas_rect.center(), fitted);
+            let response = ui.put(
+                image_rect,
+                egui::Image::new(texture).fit_to_exact_size(fitted),
+            );
+            #[cfg(feature = "calibration-opencv")]
+            if let Some(overlay) = calibration_overlay {
+                Self::paint_live_calibration_overlay(
+                    &ui.painter_at(response.rect),
+                    response.rect,
+                    overlay,
+                    document.show_calibration_detection,
+                    document.show_calibration_coverage,
+                );
+            }
         } else {
-            ui.centered_and_justified(|ui| {
-                ui.spinner();
-                ui.label("Waiting for decoded frame");
-            });
+            let available = ui.available_size();
+            let placeholder = egui::vec2(16.0, 9.0);
+            let scale = (available.x.max(1.0) / placeholder.x)
+                .min(available.y.max(1.0) / placeholder.y)
+                .max(0.01);
+            let canvas_size = egui::vec2(available.x, placeholder.y * scale);
+            let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
+            ui.painter_at(canvas_rect).text(
+                canvas_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Waiting for decoded frame",
+                egui::FontId::proportional(14.0),
+                egui::Color32::GRAY,
+            );
         }
         (rect, capture_request)
     }

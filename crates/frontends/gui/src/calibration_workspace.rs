@@ -337,9 +337,8 @@ impl CalibrationPreviewViewport {
     }
 
     fn fit_to_rect(&mut self, rect: egui::Rect, image_size: egui::Vec2) {
-        self.zoom = (rect.width() / image_size.x.max(1.0))
-            .min(rect.height() / image_size.y.max(1.0))
-            .clamp(MIN_PREVIEW_ZOOM, MAX_PREVIEW_ZOOM);
+        self.zoom =
+            contain_fit_scale(rect.size(), image_size).clamp(MIN_PREVIEW_ZOOM, MAX_PREVIEW_ZOOM);
         self.pan = rect.center().to_vec2() - image_size * self.zoom * 0.5 - rect.min.to_vec2();
         self.fit_on_next_frame = false;
     }
@@ -1286,19 +1285,30 @@ impl CalibrationWorkspace {
             egui::Panel::right("calibration_dataset_sidebar_expanded")
                 .resizable(true)
                 .default_size(360.0)
-                .min_size(300.0)
-                .max_size(480.0),
+                .min_size(300.0),
             |ui, expanded| {
+                let idle = self.active_job.is_none();
+                let can_clear = idle && !self.session.items().is_empty();
                 if expanded {
                     ui.horizontal(|ui| {
                         ui.heading(format!("Dataset ({})", self.session.items().len()));
-                        if ui
-                            .small_button("»")
-                            .on_hover_text("Collapse Dataset")
-                            .clicked()
-                        {
-                            requested_sidebar_state = Some(false);
-                        }
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(can_clear, egui::Button::new("Clear"))
+                                .clicked()
+                            {
+                                self.session.clear();
+                                self.sources.clear();
+                                self.coverage_dirty = true;
+                            }
+                            if ui
+                                .small_button("»")
+                                .on_hover_text("Collapse Dataset")
+                                .clicked()
+                            {
+                                requested_sidebar_state = Some(false);
+                            }
+                        });
                     });
                     ui.separator();
                     egui::ScrollArea::vertical()
@@ -1356,15 +1366,18 @@ impl CalibrationWorkspace {
     }
 
     pub(crate) fn render_status(&self, ui: &mut egui::Ui) {
-        if self.active_job.is_some() || self.auto_capture.pending.is_some() {
-            ui.spinner();
-            ui.separator();
-        }
-        ui.label(&self.status);
-        if let Some(installed) = self.session.installed() {
-            ui.separator();
-            ui.monospace(format!("RMS {:.4} px", installed.solution.rms_error));
-        }
+        ui.set_min_height(22.0);
+        ui.horizontal(|ui| {
+            if self.active_job.is_some() || self.auto_capture.pending.is_some() {
+                ui.spinner();
+                ui.separator();
+            }
+            ui.label(&self.status);
+            if let Some(installed) = self.session.installed() {
+                ui.separator();
+                ui.monospace(format!("RMS {:.4} px", installed.solution.rms_error));
+            }
+        });
     }
 
     fn render_controls(
@@ -1682,17 +1695,6 @@ impl CalibrationWorkspace {
         if let Some(id) = select {
             let _ = self.session.set_selected(id);
         }
-        if ui
-            .add_enabled(
-                idle && !self.session.items().is_empty(),
-                egui::Button::new("Clear"),
-            )
-            .clicked()
-        {
-            self.session.clear();
-            self.sources.clear();
-            self.coverage_dirty = true;
-        }
     }
 
     fn render_inspection(&mut self, ui: &mut egui::Ui) {
@@ -1729,11 +1731,21 @@ impl CalibrationWorkspace {
                     self.preview_viewport.fit_on_next_frame = true;
                 }
             });
-            let max_preview_height = (ui.available_height() - 170.0).max(180.0);
-            let preview_height = (ui.available_width() * 9.0 / 16.0)
-                .min(max_preview_height)
-                .clamp(180.0, 520.0);
-            let preview_size = egui::vec2(ui.available_width(), preview_height);
+            let image_size = self
+                .sources
+                .get(&id)
+                .and_then(|source| source.preview.as_ref())
+                .map(|preview| egui::vec2(preview.frame.width as f32, preview.frame.height as f32))
+                .or_else(|| {
+                    self.session
+                        .items()
+                        .iter()
+                        .find(|item| item.id == id)
+                        .and_then(|item| detection_size(&item.status))
+                        .map(|size| egui::vec2(size.width as f32, size.height as f32))
+                })
+                .unwrap_or_else(|| egui::vec2(16.0, 9.0));
+            let preview_size = contain_fit_size(ui.available_size(), image_size);
             let (rect, response) =
                 ui.allocate_exact_size(preview_size, egui::Sense::click_and_drag());
             self.paint_preview(ui, &response, rect, id);
@@ -2693,6 +2705,28 @@ impl Drop for CalibrationWorkspace {
             );
         }
     }
+}
+
+/// 在给定可用区域内按图像宽高比做 contain-fit；允许放大，避免高度受限时破坏比例。
+pub(crate) fn contain_fit_scale(available: egui::Vec2, image_size: egui::Vec2) -> f32 {
+    let finite_positive = |value: f32| {
+        if value.is_finite() && value > 0.0 {
+            value
+        } else {
+            1.0
+        }
+    };
+    let available_width = finite_positive(available.x);
+    let available_height = finite_positive(available.y);
+    let image_width = finite_positive(image_size.x);
+    let image_height = finite_positive(image_size.y);
+    (available_width / image_width)
+        .min(available_height / image_height)
+        .max(0.01)
+}
+
+pub(crate) fn contain_fit_size(available: egui::Vec2, image_size: egui::Vec2) -> egui::Vec2 {
+    image_size * contain_fit_scale(available, image_size)
 }
 
 /// OpenCV 以整数坐标表示像素中心；egui 的 `[0, 1]` UV 则覆盖纹理边界。
