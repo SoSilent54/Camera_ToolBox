@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use camera_toolbox_core::{
     BoardSpec, CalibrationDataError, CalibrationImageSize, CalibrationRequest, CalibrationSolution,
-    ChessboardDetectionOutcome,
+    ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics, ViewCalibrationResult,
 };
 use thiserror::Error;
 
@@ -49,6 +49,19 @@ pub trait CalibrationBackend: Send + Sync {
         board: BoardSpec,
         cancellation: &CalibrationCancellation,
     ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError>;
+
+    /// 用当前初始内参对单张 authoritative 棋盘检测求解外参，用于自动采集约束收益评估。
+    ///
+    /// # Errors
+    ///
+    /// 输入不变量无效、PnP 无解、输出非有限或取消时返回错误。
+    fn estimate_pose(
+        &self,
+        detection: &ChessboardDetection,
+        initial_intrinsics: &InitialIntrinsics,
+        board: BoardSpec,
+        cancellation: &CalibrationCancellation,
+    ) -> Result<ViewCalibrationResult, CalibrationBackendError>;
 
     /// 使用固定 `Pangbot flags` 标定，并计算逐图投影点与误差。
     ///

@@ -543,7 +543,7 @@ mod tests {
     };
     use camera_toolbox_core::{
         BoardSpec, CalibrationDataError, CalibrationImageSize, CalibrationRequest,
-        CalibrationSolution,
+        CalibrationSolution, ChessboardDetection, InitialIntrinsics, ViewCalibrationResult,
     };
 
     use super::*;
@@ -646,6 +646,18 @@ mod tests {
             Ok(ChessboardDetectionOutcome::NotFound {
                 image_size: expected_size,
             })
+        }
+
+        fn estimate_pose(
+            &self,
+            _detection: &ChessboardDetection,
+            _initial_intrinsics: &InitialIntrinsics,
+            _board: BoardSpec,
+            _cancellation: &CalibrationCancellation,
+        ) -> Result<ViewCalibrationResult, CalibrationBackendError> {
+            Err(CalibrationBackendError::InvalidData(
+                CalibrationDataError::NoCalibrationViews,
+            ))
         }
 
         fn calibrate(

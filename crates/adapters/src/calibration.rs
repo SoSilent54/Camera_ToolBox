@@ -3,7 +3,7 @@
 use camera_toolbox_app::{CalibrationBackend, CalibrationBackendError, CalibrationCancellation};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
-    ChessboardDetection, ChessboardDetectionOutcome, PANGBOT_CALIBRATION_FLAGS,
+    ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics, PANGBOT_CALIBRATION_FLAGS,
     ViewCalibrationResult,
 };
 use opencv::calib;
@@ -113,6 +113,99 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
         };
         detection.validate(board)?;
         Ok(ChessboardDetectionOutcome::Found(detection))
+    }
+
+    fn estimate_pose(
+        &self,
+        detection: &ChessboardDetection,
+        initial_intrinsics: &InitialIntrinsics,
+        board: BoardSpec,
+        cancellation: &CalibrationCancellation,
+    ) -> Result<ViewCalibrationResult, CalibrationBackendError> {
+        checkpoint(cancellation)?;
+        board.validate()?;
+        initial_intrinsics.validate()?;
+        detection.validate(board)?;
+
+        let object_points_one_view = object_points(board)?;
+        let image_points = Vector::<Point2f>::from_iter(
+            detection
+                .corners
+                .iter()
+                .map(|point| Point2f::new(point.x, point.y)),
+        );
+        let matrix = &initial_intrinsics.camera_matrix;
+        let camera_matrix = Mat::from_slice_2d(&[&matrix[0..3], &matrix[3..6], &matrix[6..9]])
+            .map_err(|error| cv_error("camera matrix conversion", &error))?;
+        let distortion_coefficients =
+            Mat::from_slice_2d(&[initial_intrinsics.distortion_coefficients.as_slice()])
+                .map_err(|error| cv_error("distortion conversion", &error))?;
+        let mut rotation = Mat::default();
+        let mut translation = Mat::default();
+        let solved = geometry::solve_pnp(
+            &object_points_one_view,
+            &image_points,
+            &camera_matrix,
+            &distortion_coefficients,
+            &mut rotation,
+            &mut translation,
+            false,
+            geometry::SOLVEPNP_ITERATIVE,
+        )
+        .map_err(|error| cv_error("solvePnP", &error))?;
+        if !solved {
+            return Err(CalibrationBackendError::OpenCv {
+                operation: "solvePnP",
+                message: "no pose solution found".to_owned(),
+            });
+        }
+        checkpoint(cancellation)?;
+
+        let mut projected = Vector::<Point2f>::new();
+        geometry::project_points_def(
+            &object_points_one_view,
+            &rotation,
+            &translation,
+            &camera_matrix,
+            &distortion_coefficients,
+            &mut projected,
+        )
+        .map_err(|error| cv_error("projectPoints", &error))?;
+        let projected_points: Vec<_> = projected
+            .to_vec()
+            .into_iter()
+            .map(|point| CalibrationPoint::new(point.x, point.y))
+            .collect();
+        let (reprojection_rmse, max_reprojection_error) =
+            reprojection_metrics(&detection.corners, &projected_points)?;
+        let result = ViewCalibrationResult {
+            rotation_vector: vector3(&rotation, "rotation vector")?,
+            translation_vector: vector3(&translation, "translation vector")?,
+            projected_points,
+            reprojection_rmse,
+            max_reprojection_error,
+        };
+        if result
+            .rotation_vector
+            .iter()
+            .any(|value| !value.is_finite())
+            || result
+                .translation_vector
+                .iter()
+                .any(|value| !value.is_finite())
+            || result
+                .projected_points
+                .iter()
+                .any(|point| !point.is_finite())
+            || !result.reprojection_rmse.is_finite()
+            || !result.max_reprojection_error.is_finite()
+        {
+            return Err(CalibrationBackendError::OpenCv {
+                operation: "solvePnP",
+                message: "pose result contains non-finite values".to_owned(),
+            });
+        }
+        Ok(result)
     }
 
     #[allow(clippy::too_many_lines)] // 保持一次标定事务的输入转换、求解和结果校验连续可审计。

@@ -707,11 +707,27 @@ $$
 
 满足覆盖、协方差、残差和留出验证门槛后才停止，而不是达到固定张数后停止。
 
-### 15.1 规划中的 RTSP 输入与时间戳契约
+### 15.1 已实现的 RTSP Viewer 与手动快门链路
 
-以下能力处于规划阶段，当前软件尚未实现。RTSP 将作为 Local、SFTP 之外的第三种**通用图像输入源**，但不是伪装成 `FileSystem` 的文件源：实时流没有稳定路径或文件版本，其统一边界是 Viewer/Image input document。
+RTSP 已作为 Local、SFTP 之外的第三种输入入口接入 GUI：流帧先进入 Viewer，用户在 Calibration 工作区对当前显示帧显式按快门后，软件把同一不可变帧固化为会话内 PNG，再提交给现有权威检测流水线。它不是伪装成 `FileSystem` 的文件源：实时流没有稳定路径或文件版本，数据集项的统一边界是 Viewer 当前显示帧和 `StreamFrameIdentity`。
 
-每个解码帧必须从 Viewer 一直携带以下不可变来源信息，直到未来可能进入标定数据集：
+已实现的手动链路为：
+
+```text
+RTSP 解码帧 ──► Viewer displayed_frame
+        │
+        └─ 用户显式快门 ──► 会话内 PNG / CaptureStore
+                              │
+                              ▼
+                 CalibrationDetectionPipeline
+                              │
+                 Found ───────┴──── NotFound / error
+                   │
+                   ▼
+           Calibration Dataset item
+```
+
+Dataset 中的 RTSP 快门项保留 stream 来源，而不是本地或远端文件路径：
 
 ```text
 stream_id
@@ -722,60 +738,54 @@ host_monotonic_time_ns
 ```
 
 - `frame_sequence` 是单条 stream 内的解码输出序号，不是 RTP packet sequence。
-- `source_pts` 是 demux/decoder 输出的源帧时间戳，必须保留 tick 与 time base；不能用主机到达时间或推测值冒充 RTP PTS。
-- `host_monotonic_time_ns` 只用于同一 Camera Toolbox 进程的排序与延迟诊断，不能当作跨机器时钟。
-- 当前 `DecodedVideoFrame` 的 `source_rtp_pts` 固定为 `None`，且 rawvideo stdout 不保留 PTS；RTSP 实现必须提供经过测试的帧序号 metadata sidecar，或明确标记 `Unavailable`。
-- 在证实 CH0/CH3 共享 RTCP 或设备时钟之前，两路时间戳只允许标为 `ApproximateHostArrival` 或 `Unknown`，不能形成严格双目配对。严格配对需要后备的 `DEMO233` bridge 返回 sensor timestamp。
+- `source_pts` 是 demux/decoder 输出的源帧时间戳；未知时必须显式标为 `Unavailable`，不能用主机到达时间或推测值冒充源 PTS。
+- `host_monotonic_time_ns` 只用于同一 Camera Toolbox 进程内排序与延迟诊断，不能当作跨机器时钟。
+- 内存 PNG 由 `CaptureStore` 持有；Dataset 项存在期间资产不得释放。导出仍是显式用户动作，不会隐式在本机或 X5 落盘截图。
+- Viewer overlay 可显示棋盘检测结果和 coverage；权威 Dataset 状态以检测 worker 安装到 item 的 `Found` / `NotFound` / error 为准。
 
-首阶段只实现 RTSP Viewer 和上述 provenance；不会修改 `DEMO233`、部署 helper、在 X5 落盘 PNG，也不会把 RTSP 帧自动加入标定数据集。
+当前仍未修改 `DEMO233`、未部署端侧 helper，也未完成 CH0/CH3 共享 RTCP 或设备时钟证明。在证明双路共享时钟之前，两路时间戳只允许标为近似主机到达或未知，不能形成严格双目标定配对。
 
-### 15.2 规划中的自动数据集触发流程
+### 15.2 仍阻塞的 RTSP 自动准入
 
-第二阶段才会从 RTSP 还原标定图像。它采用两层门禁，避免“检测到棋盘就无脑入库”：
+自动准入目前是 observe-only：软件可以展示观察指标和拒绝原因，但缺少以下两个契约时不得把 RTSP 帧自动提交到 Dataset，也不得显示“自动收集完成”或“标定通过”：
+
+1. 带 schema/version 的 `AutoCaptureBaseline`：定义 field/depth/pose bin、目标计数、RMSE/间距/边距等阈值、近重复容差和来源数据集。
+2. source-bound `InitialIntrinsicsBinding`：绑定初始内参、参考分辨率、orientation、crop/ROI、像素坐标约定、采集几何 key 与 digest。
+
+缺少 baseline 或 binding 时的自动路径必须返回明确拒绝状态，例如 `RejectMissingBaseline` / `RejectMissingInitialIntrinsicsBinding`，并保持 Dataset 不变。显式预览和手动快门不受该自动准入阻塞影响：预览只更新 Viewer/候选观察结果；手动快门仍走 §15.1 的 Dataset 权威检测链路。
+
+未来自动准入恢复后，必须仍经过两层边界，避免“检测到棋盘就入库”：
 
 ```text
 最新 RTSP 解码帧
     │
-    ├─ 预览候选门禁（完整棋盘、清晰度、曝光、边距、姿态/尺度/空间新颖度）
+    ├─ 观察/候选门禁（完整棋盘、边距、角点间距、baseline 阈值、binding digest）
     │
     └─ 通过 ──► 固化同一帧为内存 PNG
                          │
                          ▼
-          现有 CalibrationDetectionPipeline 的 PNG preflight + 权威检测
+          CalibrationDetectionPipeline 的 PNG preflight + 权威检测
                          │
               Found ────┴──── NotFound / error / stale
                 │                         │
-                ▼                         └──► 释放内存资产，不改数据集
+                ▼                         └──► 释放候选资产，不改数据集
         提交 CalibrationSession
 ```
 
-只有第二层返回 `Found` 后，图片和完整 stream provenance 才成为数据集项。PNG 通过 `CaptureStore` 保持在有界内存中；不会创建隐式本地文件或远端截图，导出仍是显式用户动作。
+自动收集的分布标准沿用并强化第 11、12 节的人工规范，但阈值必须来自 `AutoCaptureBaseline`，不能在 GUI 中硬编码为通用产品规则。自动路径至少需要约束以下事实：完整棋盘、最小角点间距、图像边距、field coverage、当前内参下的 PnP depth span、互斥 pose bin、多样视图数量、近重复抑制、留出验证和产品误差预算。
 
-自动收集的分布标准沿用并强化第 11、12 节的人工规范：
+### 15.3 自动准入的可执行门禁契约
 
-- 必须完整检测 88 个内角点，最严重透视压缩方向仍满足当前约 `12 px` 角点间距门禁；
-- 角点需要覆盖中心、四边、四角和四个象限，候选帧必须填补欠覆盖的径向/扇区；
-- yaw 与 pitch 都需具备正反方向，roll 不能替代法向变化；初始目标仍以约 `20°–40°` 倾斜为主；
-- 至少存在两个明显投影尺度，外侧角点保留约 `3%–5%` 图像边距；
-- 连续近似同姿态、同尺度、同位置帧将因 cooldown 和新颖度门禁被拒绝；
-- `10` 个多样视图只是“可复核”门槛，工程数据集仍建议 `10–20` 张并留出独立验证图；在没有协方差、留出 PnP 和产品误差预算验证前，自动采集不得显示“标定通过”。
+自动入集不能使用“差异明显”“覆盖不足”等主观描述，也不能只依赖原始图像透视 proxy。计划中的准入计算以按行列排序的角点 $q_{r,c}=(u_{r,c},v_{r,c})$、当前 `InitialIntrinsicsBinding` 和 `AutoCaptureBaseline` 为输入，至少产出以下 observation feature：
 
-### 15.3 规划中的可执行分布门禁契约
+- `field_coverage`：由 refined corner footprint 落入固定图像网格得到；用于显示和候选补拍建议。
+- `pnp_depth_span`：使用当前绑定内参直接 PnP 后得到的归一化深度 bin；内参 digest 改变时必须 stale。
+- `pnp_pose_bin = (tilt_magnitude_bin, azimuth_sector)`：同一 observation 只能贡献一个互斥 pose bin；roll 不能伪装为法向 diversity。
+- `raw_perspective_descriptor`：只允许用于 preview、去重辅助或 bootstrap nomination，不能单独满足 `CollectionComplete`。
 
-自动入集不能只使用“差异明显”“覆盖不足”等主观描述。规划中的 Phase 2 将从按行列排序的角点 $q_{r,c}=(u_{r,c},v_{r,c})$ 计算以下确定性图像空间特征：
+所有距离、PnP 位姿、重投影误差和派生指标必须有限且在 baseline 允许范围内，否则候选帧只能被拒绝或保持 observe-only。某 candidate 只有在自身至少增加一个未满足的 baseline 目标时才有正增益；若它与已接受 observation 在所有绑定特征上低于 near-identical 容差，则必须拒绝。
 
-- `center_x`、`center_y`：全部角点均值除以图像宽、高；以 `min(2, floor(3 * center_axis))` 分到 $3\times3$ 空间 bin；
-- `area_fraction`：全部角点 convex hull 面积除以图像面积；
-- `scale`：所有水平、垂直相邻角点距离的中位数，除以 $\sqrt{WH}$；
-- `yaw_proxy`：左右三分之一列中水平边长中位数之比的对数；
-- `pitch_proxy`：上、下三分之一行中垂直边长中位数之比的对数；
-- `roll_proxy`：首行左右端角点连线的 `atan2` 角度，仅用于显示多样性，不能代替 yaw/pitch。
-
-所有距离必须有限且为正，否则候选帧因几何无效被拒绝。`yaw_proxy`、`pitch_proxy` 是投影不对称特征，不是未经验证的物理姿态角。
-
-每个已接受 observation 只增加一个空间、尺度、yaw-proxy、pitch-proxy bin。bin 的目标计数、尺度边界、proxy 边界以及中心/尺度/proxy/roll 的去重容差由带 schema 版本的 `AutoCaptureBaseline` 提供：只能从同一相机模式的人工 PNG 基线测量后冻结，不能现在伪造为通用数值。某 candidate 只有在自身至少一个 bin 的现有计数小于目标时才有正增益；若它与任一已接受 observation 在所有归一化特征距离上都不超过相应容差，则为 near-identical，必须拒绝。未安装基线时可以显示特征与补拍建议，但不得自动入集。
-
-对应的单元测试使用完整的合成 baseline fixture，并精确断言特征、bin、增益和去重结果；不会把“测得一组阈值”误写成通用测试契约。
+`CollectionComplete` 只能在以下条件同时成立时显示：安装了 active baseline；存在可信且 source-bound 的 `InitialIntrinsicsBinding`；baseline digest、binding digest、BoardSpec、图像尺寸、orientation、crop/ROI 与检测证据全部匹配；field/depth/pose 目标和留出验证均通过。对应单元测试必须使用完整 baseline fixture 精确断言 feature、bin、增益、stale/reject 状态和去重结果，不能把“临时测得一组阈值”误写成通用测试契约。
 
 ## 16. 参考资料
 
