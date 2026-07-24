@@ -270,6 +270,11 @@ jobs:
           mkdir -p "$stage/runtime" "$stage/licenses"
           cp -RL "$prefix/include" "$prefix/lib" "$stage/"
           cp -L "$prefix/bin"/av*.dll "$prefix/bin"/swscale*.dll "$prefix/bin"/swresample*.dll "$stage/runtime/"
+          # MSVC 的 import libraries 与 DLL 一起安装到 bin；consumer 统一从 lib 链接。
+          cp -L "$prefix/bin"/av*.lib "$prefix/bin"/swscale*.lib "$prefix/bin"/swresample*.lib "$stage/lib/"
+          for import_library in avcodec avformat avutil swscale swresample; do
+            test -f "$stage/lib/$import_library.lib"
+          done
           cp COPYING.LGPLv2.1 "$stage/licenses/FFMPEG-LICENSE"
           printf 'ffmpeg_version=%s\nffmpeg_commit=%s\nsource_sha256=%s\nrecipe_revision=%s\n' "$FFMPEG_VERSION" "$FFMPEG_COMMIT" "$FFMPEG_SOURCE_SHA256" "$revision" > "$stage/MANIFEST"
           archive="ffmpeg-${FFMPEG_VERSION}-r${revision}-${platform_id}.zip"

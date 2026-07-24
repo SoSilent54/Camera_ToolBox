@@ -186,6 +186,16 @@ def require_layout(root: Path, platform_id: str) -> tuple[Path, Path, Path, Path
     required_prefixes = runtime_library_prefixes(platform_id)
     if not all(any(path.name.startswith(prefix) for path in runtime_dir.iterdir()) for prefix in required_prefixes):
         raise DependencyError("FFmpeg runtime does not contain all required libav libraries")
+    if platform_id == "windows-x86_64-msvc":
+        required_import_libraries = (
+            "avcodec.lib",
+            "avformat.lib",
+            "avutil.lib",
+            "swscale.lib",
+            "swresample.lib",
+        )
+        if not all((lib_dir / name).is_file() for name in required_import_libraries):
+            raise DependencyError("FFmpeg Windows archive is missing required MSVC import libraries")
     return include_dir, lib_dir, runtime_dir, license_file
 
 
