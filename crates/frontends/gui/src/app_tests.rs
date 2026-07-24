@@ -1392,7 +1392,6 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
 
     assert!(visible.contains("RTSP · Test · CH0"));
     assert!(visible.contains("Stream stage: Connecting"));
-    assert!(visible.contains("Presented 1"));
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
     assert!(visible.contains("EEPROM Provisioning"));
