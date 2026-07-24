@@ -1319,6 +1319,50 @@ fn calibration_workspace_switch_preserves_viewer_documents() {
     assert!(visible.contains("Dataset (0)"));
 }
 
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn calibration_workspace_keeps_live_viewer_visible() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    latest.publish(camera_toolbox_app::DecodedVideoFrame {
+        width: 2,
+        height: 2,
+        rgba: Arc::from(vec![
+            255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            camera_toolbox_app::StreamSessionId::new("calibration-live-viewer-test").unwrap(),
+            0,
+            1,
+            "test frame has no source PTS",
+        ),
+    });
+    app.workspace.open_live(
+        camera_toolbox_app::StreamSessionId::new("calibration-live-viewer-test").unwrap(),
+        latest,
+        test_live_source(),
+    );
+    app.product_workspace = super::ProductWorkspace::Calibration;
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+    let visible = accessibility_text(&output);
+
+    assert!(visible.contains("RTSP · Test · CH0"));
+    assert!(visible.contains("Stream stage: Connecting"));
+    assert!(visible.contains("Presented 1"));
+    assert!(visible.contains("Intrinsic Calibration"));
+    assert!(visible.contains("Dataset (0)"));
+    let document = app.workspace.active_live().unwrap();
+    assert!(document.texture().is_some());
+    assert_eq!(
+        document.displayed_frame().unwrap().identity.frame_sequence,
+        1
+    );
+}
+
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 mod eeprom_operation_tests {
     use super::super::*;
