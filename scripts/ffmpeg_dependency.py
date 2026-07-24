@@ -104,6 +104,16 @@ def archive_name(platform_id: str) -> str:
     return f"ffmpeg-{FFMPEG_VERSION}-r{DEPENDENCY_REVISION}-{platform_id}.{suffix}"
 
 
+def dependency_cache_root(platform_id: str) -> Path:
+    return (
+        PROJECT_ROOT
+        / ".deps"
+        / "ffmpeg"
+        / platform_id
+        / f"{FFMPEG_VERSION}-r{DEPENDENCY_REVISION}"
+    )
+
+
 def release_asset_url(name: str) -> str:
     return f"https://github.com/{REPOSITORY}/releases/download/{RELEASE_TAG}/{name}"
 
@@ -202,7 +212,7 @@ def require_layout(root: Path, platform_id: str) -> tuple[Path, Path, Path, Path
 def prepare() -> tuple[Path, Path, Path, Path]:
     platform_id = detect_platform_id()
     asset = archive_name(platform_id)
-    cache = PROJECT_ROOT / ".deps" / "ffmpeg" / platform_id
+    cache = dependency_cache_root(platform_id)
     downloads = cache / "downloads"
     archive = downloads / asset
     checksums = downloads / "SHA256SUMS"
