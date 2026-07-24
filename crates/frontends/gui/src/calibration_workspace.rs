@@ -596,6 +596,7 @@ pub(crate) struct CalibrationWorkspace {
     coverage: Option<CoverageVisualization>,
     coverage_dirty: bool,
     auto_capture_enabled: bool,
+    dataset_sidebar_expanded: bool,
 }
 
 impl CalibrationWorkspace {
@@ -630,6 +631,7 @@ impl CalibrationWorkspace {
             coverage: None,
             coverage_dirty: true,
             auto_capture_enabled: false,
+            dataset_sidebar_expanded: true,
             auto_capture: AutoCaptureSession {
                 next_candidate_id: 1,
                 ..AutoCaptureSession::default()
@@ -1251,7 +1253,9 @@ impl CalibrationWorkspace {
         export_reason: Option<&str>,
         sftp_source: Result<&str, &str>,
         provision_target: Result<&str, &str>,
-    ) -> egui::Rect {
+        has_live_inspection: bool,
+        mut render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
+    ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
         self.sync_coverage(context);
         let rect = ui.available_rect_before_wrap();
         self.render_controls(
@@ -1263,11 +1267,48 @@ impl CalibrationWorkspace {
             provision_target,
         );
         ui.separator();
-        ui.columns(2, |columns| {
-            self.render_dataset(&mut columns[0]);
-            self.render_inspection(&mut columns[1]);
-        });
-        rect
+        let mut dataset_sidebar_expanded = self.dataset_sidebar_expanded;
+        let mut requested_sidebar_state = None;
+        egui::Panel::show_switched(
+            ui,
+            &mut dataset_sidebar_expanded,
+            egui::Panel::right("calibration_dataset_sidebar_collapsed")
+                .resizable(true)
+                .exact_size(32.0),
+            egui::Panel::right("calibration_dataset_sidebar_expanded")
+                .resizable(true)
+                .default_size(360.0)
+                .min_size(300.0)
+                .max_size(480.0),
+            |ui, expanded| {
+                if expanded {
+                    ui.horizontal(|ui| {
+                        ui.heading(format!("Dataset ({})", self.session.items().len()));
+                        if ui
+                            .small_button("»")
+                            .on_hover_text("Collapse Dataset")
+                            .clicked()
+                        {
+                            requested_sidebar_state = Some(false);
+                        }
+                    });
+                    ui.separator();
+                    egui::ScrollArea::vertical()
+                        .id_salt("calibration_dataset_sidebar")
+                        .show(ui, |ui| self.render_dataset(ui, false));
+                } else if ui.button("«").on_hover_text("Expand Dataset").clicked() {
+                    requested_sidebar_state = Some(true);
+                }
+            },
+        );
+        self.dataset_sidebar_expanded = requested_sidebar_state.unwrap_or(dataset_sidebar_expanded);
+        let capture_request = if has_live_inspection {
+            render_live_inspection(ui)
+        } else {
+            self.render_inspection(ui);
+            None
+        };
+        (rect, capture_request)
     }
 
     pub(crate) fn render_status(&self, ui: &mut egui::Ui) {
@@ -1386,15 +1427,6 @@ impl CalibrationWorkspace {
             }
         });
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label("EEPROM SN");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.serial_number)
-                    .desired_width(160.0)
-                    .hint_text("14 ASCII bytes"),
-            );
-            ui.weak("Required only for EEPROM BIN / direct provisioning.");
-        });
         let regular_export_enabled = idle && self.session.installed().is_some() && export_enabled;
         let eeprom_error = self.eeprom_image().err();
         ui.horizontal_wrapped(|ui| {
@@ -1414,45 +1446,61 @@ impl CalibrationWorkspace {
             {
                 self.pending_export = Some(CalibrationExport::Yaml(installed.solution.clone()));
             }
-            let eeprom_enabled = regular_export_enabled && eeprom_error.is_none();
-            if ui
-                .add_enabled(eeprom_enabled, egui::Button::new("Save EEPROM BIN"))
-                .on_disabled_hover_text(
-                    eeprom_error
-                        .as_deref()
-                        .unwrap_or("A calibration result and valid 14-byte ASCII SN are required."),
-                )
-                .clicked()
-                && let Ok(image) = self.eeprom_image()
-            {
-                self.pending_export = Some(CalibrationExport::EepromBin(image));
-            }
         });
-        if !export_enabled {
-            ui.colored_label(
-                egui::Color32::YELLOW,
-                export_reason.unwrap_or("Select a writable Explorer directory before exporting."),
+        ui.collapsing("EEPROM Provisioning", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("EEPROM SN");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.serial_number)
+                        .desired_width(160.0)
+                        .hint_text("14 ASCII bytes"),
+                );
+                ui.weak("Required only for EEPROM BIN / direct provisioning.");
+                let eeprom_enabled = regular_export_enabled && eeprom_error.is_none();
+                if ui
+                    .add_enabled(eeprom_enabled, egui::Button::new("Save EEPROM BIN"))
+                    .on_disabled_hover_text(
+                        eeprom_error.as_deref().unwrap_or(
+                            "A calibration result and valid 14-byte ASCII SN are required.",
+                        ),
+                    )
+                    .clicked()
+                    && let Ok(image) = self.eeprom_image()
+                {
+                    self.pending_export = Some(CalibrationExport::EepromBin(image));
+                }
+            });
+            if !export_enabled {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    export_reason
+                        .unwrap_or("Select a writable Explorer directory before exporting."),
+                );
+            }
+            let solution = self
+                .session
+                .installed()
+                .map(|installed| installed.solution.clone());
+            self.eeprom.render_body(
+                context,
+                ui,
+                solution.as_ref(),
+                &self.serial_number,
+                sftp_source,
+                provision_target,
+                (!export_enabled).then_some(
+                    export_reason
+                        .unwrap_or("Select a writable Explorer directory before exporting."),
+                ),
             );
-        }
-        let solution = self
-            .session
-            .installed()
-            .map(|installed| installed.solution.clone());
-        self.eeprom.render(
-            context,
-            ui,
-            solution.as_ref(),
-            &self.serial_number,
-            sftp_source,
-            provision_target,
-            (!export_enabled).then_some(
-                export_reason.unwrap_or("Select a writable Explorer directory before exporting."),
-            ),
-        );
+        });
+        self.eeprom.render_confirmation(context, provision_target);
     }
 
-    fn render_dataset(&mut self, ui: &mut egui::Ui) {
-        ui.heading(format!("Dataset ({})", self.session.items().len()));
+    fn render_dataset(&mut self, ui: &mut egui::Ui, show_heading: bool) {
+        if show_heading {
+            ui.heading(format!("Dataset ({})", self.session.items().len()));
+        }
         let mut toggle = None;
         let mut select = None;
         let installed = self.session.installed();
@@ -1471,106 +1519,115 @@ impl CalibrationWorkspace {
             .unwrap_or(0.0)
             .max(1e-9);
 
-        TableBuilder::new(ui)
-            .id_salt("calibration_dataset_table")
-            .striped(true)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .column(Column::initial(42.0).at_least(36.0).clip(true))
-            .column(Column::initial(70.0).at_least(52.0).clip(true))
-            .column(Column::initial(120.0).at_least(72.0).clip(true))
-            .column(Column::initial(58.0).at_least(48.0).clip(true))
-            .column(Column::initial(88.0).at_least(72.0).clip(true))
-            .column(Column::initial(62.0).at_least(52.0).clip(true))
-            .column(Column::initial(118.0).at_least(82.0).clip(true))
-            .column(Column::initial(140.0).at_least(80.0).clip(true))
-            .header(24.0, |mut header| {
-                for heading in [
-                    "Use",
-                    "Status",
-                    "Name",
-                    "Source",
-                    "Resolution",
-                    "Corners",
-                    "RMSE",
-                    "Reason",
-                ] {
-                    header.col(|ui| {
-                        ui.strong(heading);
-                    });
-                }
-            })
-            .body(|body| {
-                body.rows(26.0, items.len(), |mut row| {
-                    let item = &items[row.index()];
-                    row.col(|ui| {
-                        let mut enabled = item.enabled;
-                        if ui
-                            .add_enabled(idle, egui::Checkbox::new(&mut enabled, ""))
-                            .changed()
-                        {
-                            toggle = Some((item.id, enabled));
+        egui::ScrollArea::horizontal()
+            .id_salt("calibration_dataset_hscroll")
+            .auto_shrink([false, true])
+            .show(ui, |ui| {
+                TableBuilder::new(ui)
+                    .id_salt("calibration_dataset_table")
+                    .striped(true)
+                    .resizable(true)
+                    .auto_shrink([false, false])
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .column(Column::initial(42.0).at_least(36.0).clip(true))
+                    .column(Column::initial(70.0).at_least(52.0).clip(true))
+                    .column(Column::initial(120.0).at_least(72.0).clip(true))
+                    .column(Column::initial(58.0).at_least(48.0).clip(true))
+                    .column(Column::initial(88.0).at_least(72.0).clip(true))
+                    .column(Column::initial(62.0).at_least(52.0).clip(true))
+                    .column(Column::initial(80.0).at_least(54.0).clip(true))
+                    .column(Column::initial(140.0).at_least(80.0).clip(true))
+                    .header(24.0, |mut header| {
+                        for heading in [
+                            "Use",
+                            "Status",
+                            "Name",
+                            "Source",
+                            "Resolution",
+                            "Corners",
+                            "RMSE",
+                            "Reason",
+                        ] {
+                            header.col(|ui| {
+                                ui.strong(heading);
+                            });
                         }
-                    });
-                    row.col(|ui| {
-                        let mut label = egui::RichText::new(status_label(&item.status));
-                        if let Some(color) = status_color(&item.status) {
-                            label = label.color(color);
-                        }
-                        let mut response = ui.selectable_label(selected == Some(item.id), label);
-                        if let CalibrationItemStatus::Failed(reason) = &item.status {
-                            response = response.on_hover_text(reason);
-                        }
-                        if response.clicked() {
-                            select = Some(item.id);
-                        }
-                    });
-                    row.col(|ui| {
-                        if ui
-                            .selectable_label(selected == Some(item.id), &item.display_name)
-                            .clicked()
-                        {
-                            select = Some(item.id);
-                        }
-                    });
-                    row.col(|ui| {
-                        let label = match &item.input {
-                            CalibrationInputKey::File(_) => {
-                                self.sources.get(&item.id).map_or("Local", |source| {
-                                    if source.remote() { "SFTP" } else { "Local" }
-                                })
-                            }
-                            CalibrationInputKey::StreamCapture(_) => "RTSP",
-                        };
-                        ui.label(label);
-                    });
-                    row.col(|ui| {
-                        ui.monospace(detection_size(&item.status).map_or_else(
-                            || "—".to_owned(),
-                            |size| format!("{}×{}", size.width, size.height),
-                        ));
-                    });
-                    row.col(|ui| {
-                        ui.monospace(match &item.status {
-                            CalibrationItemStatus::Found(detection) => {
-                                detection.corners.len().to_string()
-                            }
-                            _ => "—".to_owned(),
+                    })
+                    .body(|body| {
+                        body.rows(26.0, items.len(), |mut row| {
+                            let item = &items[row.index()];
+                            row.col(|ui| {
+                                let mut enabled = item.enabled;
+                                if ui
+                                    .add_enabled(idle, egui::Checkbox::new(&mut enabled, ""))
+                                    .changed()
+                                {
+                                    toggle = Some((item.id, enabled));
+                                }
+                            });
+                            row.col(|ui| {
+                                let mut label = egui::RichText::new(status_label(&item.status));
+                                if let Some(color) = status_color(&item.status) {
+                                    label = label.color(color);
+                                }
+                                let mut response =
+                                    ui.selectable_label(selected == Some(item.id), label);
+                                if let CalibrationItemStatus::Failed(reason) = &item.status {
+                                    response = response.on_hover_text(reason);
+                                }
+                                if response.clicked() {
+                                    select = Some(item.id);
+                                }
+                            });
+                            row.col(|ui| {
+                                if ui
+                                    .selectable_label(selected == Some(item.id), &item.display_name)
+                                    .clicked()
+                                {
+                                    select = Some(item.id);
+                                }
+                            });
+                            row.col(|ui| {
+                                let label = match &item.input {
+                                    CalibrationInputKey::File(_) => {
+                                        self.sources.get(&item.id).map_or("Local", |source| {
+                                            if source.remote() { "SFTP" } else { "Local" }
+                                        })
+                                    }
+                                    CalibrationInputKey::StreamCapture(_) => "RTSP",
+                                };
+                                ui.label(label);
+                            });
+                            row.col(|ui| {
+                                ui.monospace(detection_size(&item.status).map_or_else(
+                                    || "—".to_owned(),
+                                    |size| format!("{}×{}", size.width, size.height),
+                                ));
+                            });
+                            row.col(|ui| {
+                                ui.monospace(match &item.status {
+                                    CalibrationItemStatus::Found(detection) => {
+                                        detection.corners.len().to_string()
+                                    }
+                                    _ => "—".to_owned(),
+                                });
+                            });
+                            row.col(|ui| {
+                                let metric = calibration_metric(installed, item.id);
+                                render_rmse_cell(ui, metric, max_rmse);
+                            });
+                            row.col(|ui| {
+                                let reason = match &item.status {
+                                    CalibrationItemStatus::Failed(reason) => reason.as_str(),
+                                    CalibrationItemStatus::NotFound { .. } => {
+                                        "Chessboard not found"
+                                    }
+                                    _ => "—",
+                                };
+                                ui.label(reason).on_hover_text(reason);
+                            });
                         });
                     });
-                    row.col(|ui| {
-                        let metric = calibration_metric(installed, item.id);
-                        render_rmse_cell(ui, metric, max_rmse);
-                    });
-                    row.col(|ui| {
-                        let reason = match &item.status {
-                            CalibrationItemStatus::Failed(reason) => reason.as_str(),
-                            CalibrationItemStatus::NotFound { .. } => "Chessboard not found",
-                            _ => "—",
-                        };
-                        ui.label(reason).on_hover_text(reason);
-                    });
-                });
             });
 
         if let Some((id, enabled)) = toggle {
@@ -1590,10 +1647,7 @@ impl CalibrationWorkspace {
         {
             self.session.clear();
             self.sources.clear();
-            self.coverage = None;
-            self.preview_mode = CalibrationPreviewMode::InputImage;
-            self.coverage_dirty = false;
-            self.status = "Dataset cleared.".to_owned();
+            self.coverage_dirty = true;
         }
     }
 
@@ -3557,6 +3611,8 @@ mod tests {
                 None,
                 Err("SFTP not connected"),
                 Err("EEPROM not configured"),
+                false,
+                |_| None,
             );
         });
         let text = output

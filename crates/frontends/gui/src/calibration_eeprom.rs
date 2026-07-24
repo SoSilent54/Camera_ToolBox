@@ -248,7 +248,7 @@ impl CalibrationEepromState {
         );
     }
 
-    pub(crate) fn render(
+    pub(crate) fn render_body(
         &mut self,
         context: &egui::Context,
         ui: &mut egui::Ui,
@@ -258,8 +258,6 @@ impl CalibrationEepromState {
         target: Result<&str, &str>,
         save_destination_error: Option<&str>,
     ) {
-        ui.separator();
-        ui.strong("EEPROM Provisioning");
         #[cfg(not(feature = "platform-ssh"))]
         let _ = sftp_source;
         #[cfg(feature = "platform-ssh")]
@@ -421,7 +419,15 @@ impl CalibrationEepromState {
             }
             None => {}
         }
-        self.render_confirmation(context, target_label);
+    }
+
+    /// 确认写入弹窗必须独立于折叠内容持续渲染，避免已打开的物理写入确认被隐藏。
+    pub(crate) fn render_confirmation(
+        &mut self,
+        context: &egui::Context,
+        target: Result<&str, &str>,
+    ) {
+        self.render_confirmation_modal(context, target.ok());
     }
 
     #[cfg(feature = "platform-ssh")]
@@ -467,7 +473,7 @@ impl CalibrationEepromState {
         })
     }
 
-    fn render_confirmation(&mut self, context: &egui::Context, target_label: Option<&str>) {
+    fn render_confirmation_modal(&mut self, context: &egui::Context, target_label: Option<&str>) {
         if !self.confirmation_open {
             return;
         }

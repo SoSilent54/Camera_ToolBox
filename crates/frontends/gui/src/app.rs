@@ -829,53 +829,37 @@ impl eframe::App for CameraToolboxApp {
             .show(ui, |ui| {
                 #[cfg(feature = "calibration-opencv")]
                 if self.is_calibration_workspace() {
-                    if self.workspace.active_live().is_some() {
-                        let rect = ui.available_rect_before_wrap();
-                        ui.columns(2, |columns| {
-                            if let Some(document) = self.workspace.active_live_mut() {
-                                let (_, capture_request) = Self::render_live_viewer(
-                                    &mut columns[0],
-                                    document,
-                                    &self.live_runtime,
-                                    true,
-                                    calibration_viewer_overlay.as_ref(),
-                                );
-                                calibration_capture_request = capture_request;
-                            }
-                            self.calibration.render(
-                                &context,
-                                &mut columns[1],
-                                calibration_export_error.is_none(),
-                                calibration_export_error.as_deref(),
-                                calibration_sftp_label
-                                    .as_ref()
-                                    .map(|label| label.as_str())
-                                    .map_err(|error| error.as_str()),
-                                calibration_provision_label
-                                    .as_ref()
-                                    .map(|label| label.as_str())
-                                    .map_err(|error| error.as_str()),
+                    let has_live_inspection = self.workspace.active_live().is_some();
+                    let workspace = &mut self.workspace;
+                    let runtime = &self.live_runtime;
+                    let (rect, capture_request) = self.calibration.render(
+                        &context,
+                        ui,
+                        calibration_export_error.is_none(),
+                        calibration_export_error.as_deref(),
+                        calibration_sftp_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
+                        calibration_provision_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
+                        has_live_inspection,
+                        |ui| {
+                            let document = workspace.active_live_mut()?;
+                            let (_, capture_request) = Self::render_live_viewer(
+                                ui,
+                                document,
+                                runtime,
+                                true,
+                                calibration_viewer_overlay.as_ref(),
                             );
-                        });
-                        return ViewerOutput { rect, action: None };
-                    }
-                    return ViewerOutput {
-                        rect: self.calibration.render(
-                            &context,
-                            ui,
-                            calibration_export_error.is_none(),
-                            calibration_export_error.as_deref(),
-                            calibration_sftp_label
-                                .as_ref()
-                                .map(|label| label.as_str())
-                                .map_err(|error| error.as_str()),
-                            calibration_provision_label
-                                .as_ref()
-                                .map(|label| label.as_str())
-                                .map_err(|error| error.as_str()),
-                        ),
-                        action: None,
-                    };
+                            capture_request
+                        },
+                    );
+                    calibration_capture_request = capture_request;
+                    return ViewerOutput { rect, action: None };
                 }
                 if let Some(document) = self.workspace.active_live_mut() {
                     let (rect, capture_request) = Self::render_live_viewer(

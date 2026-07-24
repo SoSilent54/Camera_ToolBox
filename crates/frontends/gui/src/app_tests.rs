@@ -51,6 +51,36 @@ fn run_app_frame(
     context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
 }
 
+fn run_app_frame_with_viewport(
+    context: &egui::Context,
+    app: &mut CameraToolboxApp,
+    frame: &mut eframe::Frame,
+    viewport: egui::Vec2,
+    events: Vec<egui::Event>,
+) -> egui::FullOutput {
+    let mut input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+        ..Default::default()
+    };
+    input.events = events;
+    context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
+}
+
+fn settle_app_frame_with_viewport(
+    context: &egui::Context,
+    app: &mut CameraToolboxApp,
+    frame: &mut eframe::Frame,
+    viewport: egui::Vec2,
+    time: f64,
+) -> egui::FullOutput {
+    let input = egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, viewport)),
+        time: Some(time),
+        ..Default::default()
+    };
+    context.run_ui(input, |ui| eframe::App::ui(app, ui, frame))
+}
+
 fn accessibility_text(output: &egui::FullOutput) -> String {
     output
         .platform_output
@@ -62,6 +92,22 @@ fn accessibility_text(output: &egui::FullOutput) -> String {
         .filter_map(|(_, node)| node.label().or_else(|| node.value()))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn accesskit_bounds(output: &egui::FullOutput, label: &str) -> egui::accesskit::Rect {
+    output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("accessibility tree is enabled")
+        .nodes
+        .iter()
+        .find_map(|(_, node)| {
+            (node.label() == Some(label))
+                .then(|| node.bounds())
+                .flatten()
+        })
+        .unwrap_or_else(|| panic!("accessibility node {label:?} is visible"))
 }
 
 fn test_export_destination() -> ExportDestination {
@@ -1321,7 +1367,7 @@ fn calibration_workspace_switch_preserves_viewer_documents() {
 
 #[cfg(feature = "calibration-opencv")]
 #[test]
-fn calibration_workspace_keeps_live_viewer_visible() {
+fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     let context = egui::Context::default();
     context.enable_accesskit();
     let mut app = CameraToolboxApp::new(&context).unwrap();
@@ -1347,7 +1393,9 @@ fn calibration_workspace_keeps_live_viewer_visible() {
     app.product_workspace = super::ProductWorkspace::Calibration;
     let mut frame = eframe::Frame::_new_kittest();
 
-    let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+    let viewport = egui::vec2(1568.0, 882.0);
+    let mut output =
+        run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
     let visible = accessibility_text(&output);
 
     assert!(visible.contains("RTSP · Test · CH0"));
@@ -1355,6 +1403,122 @@ fn calibration_workspace_keeps_live_viewer_visible() {
     assert!(visible.contains("Presented 1"));
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
+    assert!(visible.contains("EEPROM Provisioning"));
+    assert!(visible.contains("Capture → Calibration dataset"));
+    assert!(!visible.contains("Preview and constraints"));
+    let live_bounds = accesskit_bounds(&output, "Capture → Calibration dataset");
+    let dataset_bounds = accesskit_bounds(&output, "»");
+    assert!(
+        dataset_bounds.x0 > f64::from(viewport.x) * 0.6,
+        "dataset={dataset_bounds:?}, live={live_bounds:?}"
+    );
+    assert!(live_bounds.x1 < dataset_bounds.x0);
+    // 使用 viewport width 估算 sidebar 应占右侧区域（min_size 300px），
+    // dataset 收起按钮 `»` 的 x0 应 >= sidebar 的估算左边界。
+    let viewport_width = f64::from(viewport.x);
+    let sidebar_lx = viewport_width - 360.0; // default_size 360
+    assert!(
+        f64::from(dataset_bounds.x0) >= sidebar_lx - 10.0,
+        "dataset control at {dataset_bounds:?} should be right of estimated sidebar left {sidebar_lx}"
+    );
+
+    let collapse = accesskit_rect_center(accesskit_bounds(&output, "»"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(collapse),
+            egui::Event::PointerButton {
+                pos: collapse,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: collapse,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 1.0);
+    assert!(!accessibility_text(&output).contains("Dataset (0)"));
+    let expand = accesskit_rect_center(accesskit_bounds(&output, "«"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(expand),
+            egui::Event::PointerButton {
+                pos: expand,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: expand,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 2.0);
+    assert!(accessibility_text(&output).contains("Dataset (0)"));
+
+    let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(eeprom),
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 3.0);
+    assert!(accessibility_text(&output).contains("EEPROM SN"));
+    let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(eeprom),
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 4.0);
+    assert!(!accessibility_text(&output).contains("EEPROM SN"));
     let document = app.workspace.active_live().unwrap();
     assert!(document.texture().is_some());
     assert_eq!(
