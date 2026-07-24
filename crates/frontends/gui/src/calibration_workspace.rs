@@ -378,6 +378,12 @@ impl CalibrationPreviewViewport {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CalibrationDisplayLayer {
+    #[default]
+    LiveStream,
+    DatasetImage,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum CalibrationPreviewMode {
     Heatmap,
     Overlay,
@@ -590,6 +596,7 @@ pub(crate) struct CalibrationWorkspace {
     fx: f64,
     fy: f64,
     cx: f64,
+    display_layer: CalibrationDisplayLayer,
     cy: f64,
     preview_viewport: CalibrationPreviewViewport,
     preview_mode: CalibrationPreviewMode,
@@ -632,6 +639,7 @@ impl CalibrationWorkspace {
             coverage_dirty: true,
             auto_capture_enabled: false,
             dataset_sidebar_expanded: true,
+            display_layer: CalibrationDisplayLayer::default(),
             auto_capture: AutoCaptureSession {
                 next_candidate_id: 1,
                 ..AutoCaptureSession::default()
@@ -1302,12 +1310,32 @@ impl CalibrationWorkspace {
             },
         );
         self.dataset_sidebar_expanded = requested_sidebar_state.unwrap_or(dataset_sidebar_expanded);
-        let capture_request = if has_live_inspection {
-            render_live_inspection(ui)
-        } else {
-            self.render_inspection(ui);
-            None
-        };
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.display_layer,
+                CalibrationDisplayLayer::LiveStream,
+                "Live Stream",
+            );
+            ui.selectable_value(
+                &mut self.display_layer,
+                CalibrationDisplayLayer::DatasetImage,
+                "Dataset Image",
+            );
+        });
+        ui.separator();
+        let capture_request =
+            if has_live_inspection && self.display_layer == CalibrationDisplayLayer::LiveStream {
+                render_live_inspection(ui)
+            } else {
+                self.render_inspection(ui);
+                None
+            };
+        ui.add_space(8.0);
+        egui::ScrollArea::vertical()
+            .id_salt("calibration_metrics")
+            .show(ui, |ui| {
+                render_calibration_result(ui, self.session.installed());
+            });
         (rect, capture_request)
     }
 
@@ -1696,12 +1724,6 @@ impl CalibrationWorkspace {
         } else {
             ui.weak("Select a dataset item to inspect its image and residuals.");
         }
-        ui.add_space(8.0);
-        egui::ScrollArea::vertical()
-            .id_salt("calibration_metrics")
-            .show(ui, |ui| {
-                render_calibration_result(ui, self.session.installed());
-            });
     }
 
     fn paint_preview(
