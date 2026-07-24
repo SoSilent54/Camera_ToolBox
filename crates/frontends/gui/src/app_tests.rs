@@ -1211,14 +1211,8 @@ fn ignored_eof_sidecar_stays_closing_until_gui_deadline_then_is_forced() {
         *stop_deadline = Instant::now() - Duration::from_millis(1);
     }
     app.advance_live_close_deadlines();
-    assert!(matches!(
-        app.workspace.live_mut(document_id).unwrap().lifecycle,
-        crate::workspace::LiveDocumentLifecycle::ForcedCleanup {
-            terminal: camera_toolbox_app::StreamTerminal::Forced {
-                remote_state_unknown: true
-            }
-        }
-    ));
+    // doc is auto-removed by force_cleanup, not left as ForcedCleanup
+    assert!(app.workspace.live_mut(document_id).is_none());
 
     let process_path = PathBuf::from(format!("/proc/{pid}"));
     let reap_deadline = Instant::now() + Duration::from_secs(1);

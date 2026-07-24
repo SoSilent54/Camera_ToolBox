@@ -4243,7 +4243,15 @@ impl CameraToolboxApp {
                 self.calibration.stream_disconnected(&event.session_id);
             }
             if let Some(document) = self.workspace.live_by_session_mut(&event.session_id) {
+                let is_terminal = matches!(
+                    event.event,
+                    camera_toolbox_app::StreamServiceEvent::Terminal(_)
+                );
                 document.apply_event(event.event);
+                if is_terminal {
+                    let id = document.id;
+                    self.workspace.remove_live(id);
+                }
             }
         }
     }
@@ -4265,15 +4273,7 @@ impl CameraToolboxApp {
             if self.live_runtime.force_cleanup(&session_id) {
                 #[cfg(feature = "calibration-opencv")]
                 self.calibration.stream_disconnected(&session_id);
-                if let Some(document) = self.workspace.live_mut(id) {
-                    document.latest_frame.clear();
-                    document.release_texture();
-                    document.lifecycle = LiveDocumentLifecycle::ForcedCleanup {
-                        terminal: camera_toolbox_app::StreamTerminal::Forced {
-                            remote_state_unknown: true,
-                        },
-                    };
-                }
+                self.workspace.remove_live(id);
             }
         }
     }

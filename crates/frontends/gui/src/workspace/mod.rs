@@ -412,7 +412,8 @@ impl WorkspaceState {
                         .and_then(|index| self.live_documents.get(index))
                 })
                 .map(|document| document.id)
-                .or_else(|| self.documents.last().map(|document| document.id));
+                .or_else(|| self.documents.last().map(|document| document.id))
+                .or_else(|| self.image_documents.last().map(|document| document.id))
         }
         Some(removed)
     }
