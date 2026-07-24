@@ -1310,12 +1310,17 @@ impl CalibrationWorkspace {
             },
         );
         self.dataset_sidebar_expanded = requested_sidebar_state.unwrap_or(dataset_sidebar_expanded);
+        if !has_live_inspection && self.display_layer == CalibrationDisplayLayer::LiveStream {
+            self.display_layer = CalibrationDisplayLayer::DatasetImage;
+        }
         ui.horizontal(|ui| {
-            ui.selectable_value(
-                &mut self.display_layer,
-                CalibrationDisplayLayer::LiveStream,
-                "Live Stream",
-            );
+            ui.add_enabled_ui(has_live_inspection, |ui| {
+                ui.selectable_value(
+                    &mut self.display_layer,
+                    CalibrationDisplayLayer::LiveStream,
+                    "Live Stream",
+                );
+            });
             ui.selectable_value(
                 &mut self.display_layer,
                 CalibrationDisplayLayer::DatasetImage,
