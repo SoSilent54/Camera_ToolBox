@@ -103,7 +103,7 @@ fn accesskit_bounds(output: &egui::FullOutput, label: &str) -> egui::accesskit::
         .nodes
         .iter()
         .find_map(|(_, node)| {
-            (node.label() == Some(label))
+            (node.label() == Some(label) || node.value() == Some(label))
                 .then(|| node.bounds())
                 .flatten()
         })
@@ -1384,12 +1384,10 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     );
     app.product_workspace = super::ProductWorkspace::Calibration;
     let mut frame = eframe::Frame::_new_kittest();
-
     let viewport = egui::vec2(1568.0, 882.0);
     let mut output =
         run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
     let visible = accessibility_text(&output);
-
     assert!(visible.contains("RTSP · Test · CH0"));
     assert!(visible.contains("Stream stage: Connecting"));
     assert!(visible.contains("Intrinsic Calibration"));
@@ -1397,12 +1395,40 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     assert!(visible.contains("EEPROM Provisioning"));
     assert!(visible.contains("Capture → Calibration dataset"));
     assert!(!visible.contains("Preview and constraints"));
-    let live_bounds = accesskit_bounds(&output, "Capture → Calibration dataset");
-    let dataset_bounds = accesskit_bounds(&output, "»");
+    assert!(visible.contains("Live Stream"));
+    assert!(visible.contains("Dataset Image"));
+    assert!(visible.contains("Calibration result"));
+    let live_bounds = accesskit_bounds(&output, "Board detection");
     assert!(
-        dataset_bounds.x0 > f64::from(viewport.x) * 0.6,
-        "dataset={dataset_bounds:?}, live={live_bounds:?}"
+        f64::from(live_bounds.y1) < f64::from(viewport.y) * 0.75,
+        "live viewer {live_bounds:?} should be in top 75% of viewport {viewport:?}"
     );
+
+    let dataset_img_toggle = accesskit_rect_center(accesskit_bounds(&output, "Dataset Image"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(dataset_img_toggle),
+            egui::Event::PointerButton {
+                pos: dataset_img_toggle,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: dataset_img_toggle,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 5.0);
+    assert!(accessibility_text(&output).contains("Preview and constraints"));
+    let dataset_bounds = accesskit_bounds(&output, "»");
     assert!(live_bounds.x1 < dataset_bounds.x0);
     // 使用 viewport width 估算 sidebar 应占右侧区域（min_size 300px），
     // dataset 收起按钮 `»` 的 x0 应 >= sidebar 的估算左边界。
@@ -1435,7 +1461,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
             },
         ],
     );
-    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 1.0);
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 6.0);
     assert!(!accessibility_text(&output).contains("Dataset (0)"));
     let expand = accesskit_rect_center(accesskit_bounds(&output, "«"));
     output = run_app_frame_with_viewport(
@@ -1459,7 +1485,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
             },
         ],
     );
-    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 2.0);
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 7.0);
     assert!(accessibility_text(&output).contains("Dataset (0)"));
 
     let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
@@ -1484,7 +1510,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
             },
         ],
     );
-    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 3.0);
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 8.0);
     assert!(accessibility_text(&output).contains("EEPROM SN"));
     let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
     output = run_app_frame_with_viewport(
@@ -1508,7 +1534,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
             },
         ],
     );
-    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 4.0);
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 9.0);
     assert!(!accessibility_text(&output).contains("EEPROM SN"));
     let document = app.workspace.active_live().unwrap();
     assert!(document.texture().is_some());

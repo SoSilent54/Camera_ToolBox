@@ -1323,14 +1323,25 @@ impl CalibrationWorkspace {
             );
         });
         ui.separator();
-        let capture_request =
-            if has_live_inspection && self.display_layer == CalibrationDisplayLayer::LiveStream {
-                render_live_inspection(ui)
-            } else {
-                self.render_inspection(ui);
-                None
-            };
+        let available_height = ui.available_height();
+        // Reserve bottom portion for calibration result so it is never hidden.
+        let result_reserve = 148.0;
+        let viewer_height = (available_height - result_reserve - 16.0).max(200.0);
+        let mut capture_request = None;
+        ui.allocate_ui_with_layout(
+            egui::vec2(ui.available_width(), viewer_height),
+            egui::Layout::top_down(egui::Align::Min),
+            |ui| {
+                if has_live_inspection && self.display_layer == CalibrationDisplayLayer::LiveStream
+                {
+                    capture_request = render_live_inspection(ui);
+                } else {
+                    self.render_inspection(ui);
+                }
+            },
+        );
         ui.add_space(8.0);
+        ui.separator();
         egui::ScrollArea::vertical()
             .id_salt("calibration_metrics")
             .show(ui, |ui| {
