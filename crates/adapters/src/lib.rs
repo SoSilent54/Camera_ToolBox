@@ -5,7 +5,6 @@ pub mod calibration;
 pub mod filesystem;
 pub mod image_codec;
 pub mod local_raw;
-#[cfg(feature = "platform-cv610")]
 pub mod media;
 pub mod platform_registry;
 pub mod platforms {
