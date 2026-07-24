@@ -734,6 +734,7 @@ impl eframe::App for CameraToolboxApp {
                         let direct_rtsp_config = self.render_direct_rtsp_workspace(ui);
                         ui.separator();
                         let stream_action = self.render_workspace_stream_section(ui);
+                        self.render_stream_metrics(ui);
                         (direct_rtsp_config, stream_action)
                     } else {
                         (None, None)
@@ -4106,7 +4107,8 @@ impl CameraToolboxApp {
                     .id_salt("workspace_stream_table")
                     .striped(true)
                     .resizable(true)
-                    .auto_shrink([false, false])
+                    .max_scroll_height(200.0)
+                    .auto_shrink([false, true])
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::remainder().at_least(80.0).clip(true))
                     .column(Column::initial(80.0).at_least(60.0).clip(true))
@@ -4151,6 +4153,94 @@ impl CameraToolboxApp {
                     });
             });
         action
+    }
+
+    fn render_stream_metrics(&self, ui: &mut egui::Ui) {
+        let Some(document) = self.workspace.active_live() else {
+            return;
+        };
+        let displayed_frame = document.displayed_frame().cloned();
+        ui.separator();
+        egui::Grid::new("workspace_live_metrics")
+            .num_columns(2)
+            .show(ui, |ui| {
+                ui.label(format!("Network {} B", document.metrics.network_bytes));
+                ui.label(format!("RTP {}", document.metrics.rtp_packets));
+                ui.end_row();
+                ui.label(format!("Gaps {}", document.metrics.rtp_gaps));
+                ui.label(format!("Dropped {}", document.metrics.preview_dropped));
+                ui.end_row();
+                ui.label(format!("Decoded {}", document.metrics.decoded_frames));
+                ui.label(format!(
+                    "Decode {:.1} fps",
+                    document.metrics.decoded_fps_millihz as f64 / 1_000.0
+                ));
+                ui.end_row();
+                ui.label(format!(
+                    "Present {:.1} fps",
+                    document.presented_fps_millihz_at(camera_toolbox_app::host_monotonic_time_ns(),)
+                        as f64
+                        / 1_000.0
+                ));
+                ui.label(format!(
+                    "Host presentation {:.2} ms",
+                    document.metrics.host_presentation_delay_ns as f64 / 1_000_000.0
+                ));
+                ui.end_row();
+                ui.label(format!(
+                    "Decoder {}",
+                    document
+                        .metrics
+                        .decoder_backend
+                        .as_deref()
+                        .unwrap_or("Not reported")
+                ));
+                ui.label(format!("Presented {}", document.presented_frames));
+                ui.end_row();
+                ui.label(format!("Resync {}", document.metrics.decoder_resyncs));
+                ui.label(format!("Record {} B", document.metrics.record_bytes));
+                ui.end_row();
+                ui.label(format!(
+                    "Preview Q {}",
+                    document.metrics.preview_queue_depth
+                ));
+                ui.label(format!(
+                    "Decoder Q {}",
+                    document.metrics.decoder_queue_depth
+                ));
+                ui.end_row();
+                ui.label(format!(
+                    "Record Q {} B",
+                    document.metrics.recorder_queue_bytes
+                ));
+                let provenance = displayed_frame.as_ref().map_or_else(
+                    || "No displayed frame".to_owned(),
+                    |frame| match &frame.identity.source_pts {
+                        camera_toolbox_app::SourcePts::Known {
+                            ticks,
+                            time_base_numerator,
+                            time_base_denominator,
+                            provenance,
+                        } => format!(
+                            "{} ch{} seq{} PTS {} @ {}/{}\n({provenance:?})",
+                            frame.identity.stream_id.as_str(),
+                            frame.identity.channel,
+                            frame.identity.frame_sequence,
+                            ticks,
+                            time_base_numerator,
+                            time_base_denominator,
+                        ),
+                        camera_toolbox_app::SourcePts::Unavailable { reason } => format!(
+                            "{} ch{} seq{} PTS unavailable: {reason}",
+                            frame.identity.stream_id.as_str(),
+                            frame.identity.channel,
+                            frame.identity.frame_sequence,
+                        ),
+                    },
+                );
+                ui.label(provenance);
+                ui.end_row();
+            });
     }
 
     fn start_direct_rtsp(&mut self, config: RtspStreamConfig) {
