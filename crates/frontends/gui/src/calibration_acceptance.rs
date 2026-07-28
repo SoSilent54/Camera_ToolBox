@@ -5,7 +5,9 @@ use camera_toolbox_app::{
     AutoAdmissionPnpState, AutoCaptureAcceptanceCriteria, CalibrationItemId,
 };
 use eframe::egui;
-use egui_plot::{HoverPosition, Line, Plot, PlotPoint, PlotPoints, PlotUi, Text};
+use egui_plot::{
+    HoverPosition, Line, Plot, PlotBounds, PlotMemory, PlotPoint, PlotPoints, PlotUi, Text,
+};
 
 const DEFAULT_FIELD_COLUMNS: &str = "16";
 const DEFAULT_FIELD_ROWS: &str = "9";
@@ -25,8 +27,7 @@ const DEFAULT_PNP_MAX_ERROR_PX: &str = "4";
 const DEFAULT_MINIMUM_AUTO_GAIN: &str = "1";
 const DEPTH_RANGE_PLOT_HEIGHT: f32 = 96.0;
 const DEPTH_BIN_BASE_PLOT_HEIGHT: f32 = 56.0;
-const DEPTH_RANGE_DEFAULT_VISIBLE_ROWS: f64 = 4.0;
-const DEPTH_RANGE_CAP_HALF_HEIGHT: f64 = 0.26;
+const DEPTH_RANGE_CAP_HALF_HEIGHT: f64 = 0.38;
 const DEPTH_BIN_BASE_Y: f64 = 0.35;
 const DEPTH_BIN_LABEL_Y: f64 = -0.35;
 
@@ -808,12 +809,15 @@ fn render_depth_range_plot(
     axis: &DepthTimelineAxis,
     x_link: egui::Id,
 ) -> Option<CalibrationItemId> {
-    let visible_rows = (progress.depth_ranges.len().max(1) as f64)
-        .min(DEPTH_RANGE_DEFAULT_VISIBLE_ROWS)
-        .max(1.0);
-    let y_min = -0.5;
-    let y_max = visible_rows - 0.5;
+    let plot_id = ui.make_persistent_id(egui::Id::new("dataset_acceptance_depth_ranges"));
+    let state_id = plot_id.with("depth_range_view_state");
+    let mut state = ui.ctx().data_mut(|data| {
+        data.get_temp::<DepthRangePlotState>(state_id)
+            .unwrap_or_default()
+    });
+    let y_bounds = depth_timeline_y_bounds(progress);
     let plot = Plot::new("dataset_acceptance_depth_ranges")
+        .id(plot_id)
         .link_axis(x_link, [true, false])
         .height(DEPTH_RANGE_PLOT_HEIGHT)
         .allow_zoom([false, true])
@@ -823,7 +827,7 @@ fn render_depth_range_plot(
         .allow_boxed_zoom(false)
         .allow_double_click_reset(true)
         .auto_bounds([true, false])
-        .default_y_bounds(y_min, y_max)
+        .default_y_bounds(y_bounds.min, y_bounds.max)
         .include_x(axis.min)
         .include_x(axis.max)
         .invert_y(true)
@@ -833,10 +837,106 @@ fn render_depth_range_plot(
         .show_y(false)
         .set_margin_fraction(egui::vec2(0.02, 0.02))
         .label_formatter(depth_plot_label);
-    plot.show(ui, |plot_ui| {
+    let response = plot.show(ui, |plot_ui| {
+        apply_depth_timeline_y_bounds(plot_ui, y_bounds, state.user_y_bounds);
         render_depth_range_items(plot_ui, progress, axis)
-    })
-    .inner
+    });
+    if response.response.double_clicked() {
+        state.user_y_bounds = false;
+    } else if depth_timeline_y_interacted(ui, &response.response)
+        && (response.transform.bounds().height() < (y_bounds.max - y_bounds.min) - 1.0e-6
+            || state.user_y_bounds)
+    {
+        state.user_y_bounds = true;
+    }
+    clamp_depth_range_plot_memory(ui.ctx(), plot_id, y_bounds, state.user_y_bounds);
+    ui.ctx().data_mut(|data| data.insert_temp(state_id, state));
+    response.inner
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DepthRangePlotState {
+    user_y_bounds: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DepthTimelineYBounds {
+    min: f64,
+    max: f64,
+}
+
+fn depth_timeline_y_bounds(progress: &DatasetAcceptanceProgress) -> DepthTimelineYBounds {
+    let rows = progress.depth_ranges.len().max(1) as f64;
+    DepthTimelineYBounds {
+        min: -0.5,
+        max: rows - 0.5,
+    }
+}
+
+fn apply_depth_timeline_y_bounds(
+    plot_ui: &mut PlotUi<'_>,
+    full: DepthTimelineYBounds,
+    user_y_bounds: bool,
+) {
+    let (minimum, maximum) = if user_y_bounds {
+        let bounds = plot_ui.plot_bounds();
+        clamp_depth_timeline_y_bounds(bounds.min()[1], bounds.max()[1], full)
+    } else {
+        (full.min, full.max)
+    };
+    plot_ui.set_plot_bounds_y(minimum..=maximum);
+}
+
+fn depth_timeline_y_interacted(ui: &egui::Ui, response: &egui::Response) -> bool {
+    let y_zoomed = response.contains_pointer()
+        && ui.input(|input| (input.zoom_delta_2d().y - 1.0).abs() > f32::EPSILON);
+    response.dragged_by(egui::PointerButton::Primary) || y_zoomed
+}
+
+fn clamp_depth_range_plot_memory(
+    context: &egui::Context,
+    plot_id: egui::Id,
+    full: DepthTimelineYBounds,
+    user_y_bounds: bool,
+) {
+    let Some(mut memory) = PlotMemory::load(context, plot_id) else {
+        return;
+    };
+    let current = *memory.bounds();
+    let (minimum, maximum) = if user_y_bounds {
+        clamp_depth_timeline_y_bounds(current.min()[1], current.max()[1], full)
+    } else {
+        (full.min, full.max)
+    };
+    if (current.min()[1] - minimum).abs() <= f64::EPSILON
+        && (current.max()[1] - maximum).abs() <= f64::EPSILON
+    {
+        return;
+    }
+    memory.set_bounds(PlotBounds::from_min_max(
+        [current.min()[0], minimum],
+        [current.max()[0], maximum],
+    ));
+    memory.store(context, plot_id);
+}
+
+fn clamp_depth_timeline_y_bounds(
+    minimum: f64,
+    maximum: f64,
+    full: DepthTimelineYBounds,
+) -> (f64, f64) {
+    let full_height = (full.max - full.min).max(1.0e-6);
+    let height = (maximum - minimum).max(1.0e-6);
+    if !minimum.is_finite() || !maximum.is_finite() || height >= full_height {
+        return (full.min, full.max);
+    }
+    if minimum < full.min {
+        return (full.min, full.min + height);
+    }
+    if maximum > full.max {
+        return (full.max - height, full.max);
+    }
+    (minimum, maximum)
 }
 
 fn render_depth_range_items(
@@ -936,6 +1036,7 @@ fn render_depth_bin_base_plot(
         .show_crosshair(false)
         .show_y(false)
         .x_axis_formatter(|mark, _| format!("{:.0}", mark.value))
+        .set_margin_fraction(egui::vec2(0.02, 0.02))
         .label_formatter(depth_plot_label);
     plot.show(ui, |plot_ui| {
         let target = criteria.depth_target_per_bin;
@@ -1438,6 +1539,146 @@ mod tests {
         id
     }
 
+    fn depth_smoke_progress() -> (
+        AutoCaptureAcceptanceCriteria,
+        DatasetAcceptanceProgress,
+        Vec<CalibrationItemId>,
+    ) {
+        let mut criteria = DatasetAcceptanceDraft::default().parse().unwrap();
+        criteria.pnp_depth_min = 400.0;
+        criteria.pnp_depth_max = 700.0;
+        criteria.pnp_depth_bins = 3;
+        criteria.depth_target_per_bin = 2;
+
+        let mut progress = DatasetAcceptanceProgress::empty(&criteria);
+        progress.depth_bin_counts = vec![0, 2, 5];
+        let items = [
+            "range-a.png",
+            "range-b.png",
+            "range-c.png",
+            "range-d.png",
+            "range-e.png",
+        ]
+        .into_iter()
+        .map(test_item_id)
+        .collect::<Vec<_>>();
+        for (item_id, (minimum_depth, maximum_depth)) in items.iter().copied().zip([
+            (350.0, 420.0),
+            (390.0, 520.0),
+            (440.0, 610.0),
+            (610.0, 760.0),
+            (330.0, 790.0),
+        ]) {
+            progress.depth_ranges.push(AutoAdmissionDepthRange {
+                item_id,
+                minimum_depth,
+                maximum_depth,
+                pnp_state: AutoAdmissionPnpState::Valid,
+                reprojection_rmse: 0.2,
+                max_reprojection_error: 0.4,
+            });
+        }
+        progress.selected_item = Some(items[2]);
+        (criteria, progress, items)
+    }
+
+    fn depth_smoke_input(events: Vec<egui::Event>) -> egui::RawInput {
+        egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(720.0, 300.0),
+            )),
+            events,
+            ..Default::default()
+        }
+    }
+
+    fn pointer_button(position: egui::Pos2, pressed: bool) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    fn render_depth_smoke_frame(
+        context: &egui::Context,
+        progress: &DatasetAcceptanceProgress,
+        criteria: &AutoCaptureAcceptanceCriteria,
+        events: Vec<egui::Event>,
+    ) -> (Option<CalibrationItemId>, PlotMemory, PlotMemory) {
+        let mut selected = None;
+        let mut range_plot_id = None;
+        let mut base_plot_id = None;
+        let _ = context.run_ui(depth_smoke_input(events), |ui| {
+            ui.set_width(640.0);
+            range_plot_id =
+                Some(ui.make_persistent_id(egui::Id::new("dataset_acceptance_depth_ranges")));
+            base_plot_id =
+                Some(ui.make_persistent_id(egui::Id::new("dataset_acceptance_depth_bin_base")));
+            selected = render_depth_coverage(ui, progress, criteria);
+        });
+        let range_plot = PlotMemory::load(
+            context,
+            range_plot_id.expect("Depth range plot id captured"),
+        )
+        .expect("Depth range plot memory");
+        let base_plot = PlotMemory::load(
+            context,
+            base_plot_id.expect("Depth bin base plot id captured"),
+        )
+        .expect("Depth bin base plot memory");
+        (selected, range_plot, base_plot)
+    }
+
+    fn assert_x_bounds_aligned(range_plot: &PlotMemory, base_plot: &PlotMemory) {
+        let range_bounds = range_plot.bounds();
+        let base_bounds = base_plot.bounds();
+        assert!(
+            (range_bounds.min()[0] - base_bounds.min()[0]).abs() < 1.0e-6,
+            "range/base x-min diverged: {:?} vs {:?}",
+            range_bounds,
+            base_bounds
+        );
+        assert!(
+            (range_bounds.max()[0] - base_bounds.max()[0]).abs() < 1.0e-6,
+            "range/base x-max diverged: {:?} vs {:?}",
+            range_bounds,
+            base_bounds
+        );
+    }
+
+    fn assert_y_bounds(plot: &PlotMemory, expected_minimum: f64, expected_maximum: f64) {
+        let bounds = plot.bounds();
+        assert!(
+            (bounds.min()[1] - expected_minimum).abs() < 1.0e-6,
+            "unexpected y-min: {:?}",
+            bounds
+        );
+        assert!(
+            (bounds.max()[1] - expected_maximum).abs() < 1.0e-6,
+            "unexpected y-max: {:?}",
+            bounds
+        );
+    }
+
+    fn assert_y_bounds_inside(plot: &PlotMemory, full: DepthTimelineYBounds) {
+        let bounds = plot.bounds();
+        assert!(
+            bounds.min()[1] >= full.min - 1.0e-6,
+            "y-min escaped full range: {:?} not in {:?}",
+            bounds,
+            full
+        );
+        assert!(
+            bounds.max()[1] <= full.max + 1.0e-6,
+            "y-max escaped full range: {:?} not in {:?}",
+            bounds,
+            full
+        );
+    }
+
     #[test]
     fn acceptance_draft_parses_runtime_pnp_thresholds() {
         let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
@@ -1604,6 +1845,212 @@ mod tests {
         );
     }
 
+    #[test]
+    fn depth_timeline_default_y_bounds_follow_dataset_growth_until_user_zoom() {
+        let context = egui::Context::default();
+        let (criteria, mut progress, _) = depth_smoke_progress();
+        let all_ranges = progress.depth_ranges.clone();
+        progress.depth_ranges.truncate(2);
+
+        let (_, two_row_plot, _) =
+            render_depth_smoke_frame(&context, &progress, &criteria, Vec::new());
+        assert_y_bounds(&two_row_plot, -0.5, 1.5);
+
+        progress.depth_ranges = all_ranges;
+        let (_, grown_plot, _) =
+            render_depth_smoke_frame(&context, &progress, &criteria, Vec::new());
+        assert_y_bounds(&grown_plot, -0.5, 4.5);
+
+        let zoom_position = grown_plot
+            .transform()
+            .position_from_point(&PlotPoint::new(560.0, 1.5));
+        let (_, zoomed_plot, _) = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![
+                egui::Event::PointerMoved(zoom_position),
+                egui::Event::Zoom(1.2),
+            ],
+        );
+
+        let new_item = test_item_id("range-f.png");
+        progress.depth_ranges.push(AutoAdmissionDepthRange {
+            item_id: new_item,
+            minimum_depth: 500.0,
+            maximum_depth: 820.0,
+            pnp_state: AutoAdmissionPnpState::Valid,
+            reprojection_rmse: 0.2,
+            max_reprojection_error: 0.4,
+        });
+        let (_, manual_growth_plot, _) =
+            render_depth_smoke_frame(&context, &progress, &criteria, Vec::new());
+        let manual_full = depth_timeline_y_bounds(&progress);
+        assert!(manual_growth_plot.bounds().height() < manual_full.max - manual_full.min);
+        assert!(manual_growth_plot.bounds().height() <= zoomed_plot.bounds().height() + 1.0e-6);
+    }
+
+    #[test]
+    fn depth_timeline_smoke_drags_zooms_clicks_and_keeps_x_linked() {
+        let context = egui::Context::default();
+        let (criteria, progress, items) = depth_smoke_progress();
+        assert!(progress.depth_ranges.len() > 4);
+        let axis = depth_timeline_axis(&progress, &criteria);
+
+        let (selected, initial_range_plot, initial_base_plot) =
+            render_depth_smoke_frame(&context, &progress, &criteria, Vec::new());
+        assert_eq!(selected, None);
+        assert_x_bounds_aligned(&initial_range_plot, &initial_base_plot);
+        assert!(initial_range_plot.bounds().min()[0] <= axis.min + 1.0e-6);
+        assert!(initial_range_plot.bounds().max()[0] >= axis.max - 1.0e-6);
+        assert_y_bounds(&initial_range_plot, -0.5, 4.5);
+        assert!(DEPTH_RANGE_CAP_HALF_HEIGHT >= 0.38);
+
+        let zoom_position = initial_range_plot
+            .transform()
+            .position_from_point(&PlotPoint::new(560.0, 1.5));
+        let (_, zoomed_range_plot, zoomed_base_plot) = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![
+                egui::Event::PointerMoved(zoom_position),
+                egui::Event::Zoom(1.2),
+            ],
+        );
+        assert_x_bounds_aligned(&zoomed_range_plot, &zoomed_base_plot);
+        assert!(
+            (zoomed_range_plot.bounds().min()[0] - initial_range_plot.bounds().min()[0]).abs()
+                < 1.0e-6
+        );
+        assert!(
+            (zoomed_range_plot.bounds().max()[0] - initial_range_plot.bounds().max()[0]).abs()
+                < 1.0e-6
+        );
+        assert!(zoomed_range_plot.bounds().height() < initial_range_plot.bounds().height());
+
+        let drag_start = zoomed_range_plot
+            .transform()
+            .position_from_point(&PlotPoint::new(560.0, 1.5));
+        let drag_end = drag_start + egui::vec2(0.0, -32.0);
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![
+                egui::Event::PointerMoved(drag_start),
+                pointer_button(drag_start, true),
+            ],
+        );
+        let (_, dragged_range_plot, dragged_base_plot) = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![egui::Event::PointerMoved(drag_end)],
+        );
+        assert_x_bounds_aligned(&dragged_range_plot, &dragged_base_plot);
+        assert!(
+            (dragged_range_plot.bounds().min()[0] - zoomed_range_plot.bounds().min()[0]).abs()
+                < 1.0e-6
+        );
+        assert!(
+            (dragged_range_plot.bounds().max()[0] - zoomed_range_plot.bounds().max()[0]).abs()
+                < 1.0e-6
+        );
+        assert!(
+            (dragged_range_plot.bounds().min()[1] - zoomed_range_plot.bounds().min()[1]).abs()
+                > 1.0e-3
+        );
+        assert_y_bounds_inside(&dragged_range_plot, depth_timeline_y_bounds(&progress));
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![pointer_button(drag_end, false)],
+        );
+
+        let full_y_bounds = depth_timeline_y_bounds(&progress);
+        let far_drag_start = dragged_range_plot
+            .transform()
+            .position_from_point(&PlotPoint::new(560.0, 1.5));
+        let far_drag_down = far_drag_start + egui::vec2(0.0, 4096.0);
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![
+                egui::Event::PointerMoved(far_drag_start),
+                pointer_button(far_drag_start, true),
+            ],
+        );
+        let (_, clamped_down_plot, _) = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![egui::Event::PointerMoved(far_drag_down)],
+        );
+        assert_y_bounds_inside(&clamped_down_plot, full_y_bounds);
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![pointer_button(far_drag_down, false)],
+        );
+
+        let far_drag_up_start = clamped_down_plot
+            .transform()
+            .position_from_point(&PlotPoint::new(560.0, 1.5));
+        let far_drag_up = far_drag_up_start - egui::vec2(0.0, 4096.0);
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![
+                egui::Event::PointerMoved(far_drag_up_start),
+                pointer_button(far_drag_up_start, true),
+            ],
+        );
+        let (_, clamped_up_plot, _) = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![egui::Event::PointerMoved(far_drag_up)],
+        );
+        assert_y_bounds_inside(&clamped_up_plot, full_y_bounds);
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![pointer_button(far_drag_up, false)],
+        );
+
+        let click_position = dragged_range_plot
+            .transform()
+            .position_from_point(&PlotPoint::new(450.0, 1.0));
+        assert!(
+            dragged_range_plot
+                .transform()
+                .frame()
+                .contains(click_position)
+        );
+        let _ = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![
+                egui::Event::PointerMoved(click_position),
+                pointer_button(click_position, true),
+            ],
+        );
+        let (clicked, clicked_range_plot, clicked_base_plot) = render_depth_smoke_frame(
+            &context,
+            &progress,
+            &criteria,
+            vec![pointer_button(click_position, false)],
+        );
+        assert_eq!(clicked, Some(items[1]));
+        assert_x_bounds_aligned(&clicked_range_plot, &clicked_base_plot);
+    }
     #[test]
     fn selected_dataset_item_marks_field_cells_pose_bin_and_depth_range() {
         let item_id = test_item_id("selected.png");
