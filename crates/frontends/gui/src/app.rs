@@ -64,8 +64,8 @@ use camera_toolbox_app::{
     AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
     FsCancellation, FsControl, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
     ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterImageCodec,
-    RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec, RtspStreamConfig,
-    RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
+    RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec, RtspLatencyMode,
+    RtspStreamConfig, RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
 };
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_app::{
@@ -465,6 +465,7 @@ struct DirectRtspWorkspace {
     height: u32,
     codec: RtspCodec,
     transport: RtspTransport,
+    latency_mode: RtspLatencyMode,
     prefer_hardware_acceleration: bool,
     last_error: Option<String>,
 }
@@ -478,6 +479,7 @@ impl Default for DirectRtspWorkspace {
             height: 1080,
             codec: RtspCodec::H264,
             transport: RtspTransport::Tcp,
+            latency_mode: RtspLatencyMode::Low,
             prefer_hardware_acceleration: false,
             last_error: None,
         }
@@ -4010,6 +4012,19 @@ impl CameraToolboxApp {
             ui.radio_value(&mut self.direct_rtsp.transport, RtspTransport::Tcp, "TCP");
             ui.radio_value(&mut self.direct_rtsp.transport, RtspTransport::Udp, "UDP");
         });
+        ui.horizontal(|ui| {
+            ui.label("Latency");
+            ui.radio_value(
+                &mut self.direct_rtsp.latency_mode,
+                RtspLatencyMode::Low,
+                "Low",
+            );
+            ui.radio_value(
+                &mut self.direct_rtsp.latency_mode,
+                RtspLatencyMode::Stable,
+                "Stable",
+            );
+        });
         ui.checkbox(
             &mut self.direct_rtsp.prefer_hardware_acceleration,
             "Prefer hardware acceleration",
@@ -4026,6 +4041,7 @@ impl CameraToolboxApp {
                 height: self.direct_rtsp.height,
                 codec: self.direct_rtsp.codec,
                 transport: self.direct_rtsp.transport,
+                latency_mode: self.direct_rtsp.latency_mode,
             });
         }
         None

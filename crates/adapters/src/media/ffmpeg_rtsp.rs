@@ -10,8 +10,8 @@ use std::{
 };
 
 use camera_toolbox_app::{
-    DecodedVideoFrame, LatestDecodedFrameSlot, SourcePts, SourcePtsProvenance, StreamCancellation,
-    StreamFrameIdentity, StreamSessionId, host_monotonic_time_ns,
+    DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, SourcePts, SourcePtsProvenance,
+    StreamCancellation, StreamFrameIdentity, StreamSessionId, host_monotonic_time_ns,
 };
 use camera_toolbox_ffmpeg_bridge::input_with_dictionary_and_interrupt;
 use ffmpeg_next as ffmpeg;
@@ -89,6 +89,7 @@ impl FfmpegRtspDecoder {
     pub fn start(
         url: &str,
         transport: FfmpegRtspTransport,
+        latency_mode: RtspLatencyMode,
         width: u32,
         height: u32,
         session_id: StreamSessionId,
@@ -133,6 +134,7 @@ impl FfmpegRtspDecoder {
                 let result = decode_rtsp(
                     &worker_url,
                     transport,
+                    latency_mode,
                     width,
                     height,
                     frame_bytes,
@@ -195,6 +197,7 @@ impl FfmpegRtspDecoder {
 fn decode_rtsp(
     url: &str,
     transport: FfmpegRtspTransport,
+    latency_mode: RtspLatencyMode,
     output_width: u32,
     output_height: u32,
     frame_bytes: usize,
@@ -205,19 +208,7 @@ fn decode_rtsp(
     latest: &LatestDecodedFrameSlot,
     stats: &FfmpegRtspDecoderStats,
 ) -> Result<(), String> {
-    let mut options = ffmpeg::Dictionary::new();
-    options.set(
-        "rtsp_transport",
-        match transport {
-            FfmpegRtspTransport::Tcp => "tcp",
-            FfmpegRtspTransport::Udp => "udp",
-        },
-    );
-    options.set("fflags", "nobuffer");
-    options.set("max_delay", "0");
-    let timeout_micros = ffmpeg_socket_timeout_micros(io_timeout).to_string();
-    options.set("stimeout", &timeout_micros);
-    options.set("rw_timeout", &timeout_micros);
+    let options = rtsp_input_options(transport, latency_mode, io_timeout);
     let interrupt_state = Arc::clone(state);
     let mut input = input_with_dictionary_and_interrupt(url, options, move || {
         interrupt_state.shutdown_requested.load(Ordering::Acquire)
@@ -359,6 +350,29 @@ fn frame_byte_len(width: u32, height: u32) -> Result<usize, FfmpegRtspDecoderErr
         .ok_or(FfmpegRtspDecoderError::FrameSizeOverflow)
 }
 
+fn rtsp_input_options(
+    transport: FfmpegRtspTransport,
+    latency_mode: RtspLatencyMode,
+    io_timeout: Duration,
+) -> ffmpeg::Dictionary<'static> {
+    let mut options = ffmpeg::Dictionary::new();
+    options.set(
+        "rtsp_transport",
+        match transport {
+            FfmpegRtspTransport::Tcp => "tcp",
+            FfmpegRtspTransport::Udp => "udp",
+        },
+    );
+    if latency_mode == RtspLatencyMode::Low {
+        options.set("fflags", "nobuffer");
+        options.set("max_delay", "0");
+    }
+    let timeout_micros = ffmpeg_socket_timeout_micros(io_timeout).to_string();
+    options.set("stimeout", &timeout_micros);
+    options.set("rw_timeout", &timeout_micros);
+    options
+}
+
 fn ffmpeg_socket_timeout_micros(timeout: Duration) -> u64 {
     let micros = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
     micros.min(u64::try_from(i32::MAX).unwrap_or(u64::MAX))
@@ -420,6 +434,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn low_latency_rtsp_options_keep_nobuffer_and_zero_delay() {
+        let options = rtsp_input_options(
+            FfmpegRtspTransport::Tcp,
+            RtspLatencyMode::Low,
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(options.get("rtsp_transport"), Some("tcp"));
+        assert_eq!(options.get("fflags"), Some("nobuffer"));
+        assert_eq!(options.get("max_delay"), Some("0"));
+        assert_eq!(options.get("stimeout"), Some("2000000"));
+        assert_eq!(options.get("rw_timeout"), Some("2000000"));
+    }
+
+    #[test]
+    fn stable_rtsp_options_omit_low_latency_reorder_bypass() {
+        let options = rtsp_input_options(
+            FfmpegRtspTransport::Udp,
+            RtspLatencyMode::Stable,
+            Duration::from_secs(2),
+        );
+
+        assert_eq!(options.get("rtsp_transport"), Some("udp"));
+        assert_eq!(options.get("fflags"), None);
+        assert_eq!(options.get("max_delay"), None);
+        assert_eq!(options.get("stimeout"), Some("2000000"));
+        assert_eq!(options.get("rw_timeout"), Some("2000000"));
+    }
     #[test]
     fn packet_read_interrupt_is_normal_only_after_local_cancellation() {
         assert_eq!(packet_read_terminal(ffmpeg::Error::Exit, true), Ok(()));

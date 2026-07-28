@@ -161,6 +161,7 @@ impl PlatformConfig {
                     hash.u32(rtsp.height);
                     hash.u8(rtsp.codec.snapshot_tag());
                     hash.u8(rtsp.transport.snapshot_tag());
+                    hash.u8(rtsp.latency_mode.snapshot_tag());
                 }
             }
         }
@@ -270,6 +271,29 @@ impl RtspTransport {
     }
 }
 
+/// RTSP 解码的输入缓冲策略；Low 保留旧的最低延迟参数，Stable 交给 FFmpeg 正常重排/缓冲。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RtspLatencyMode {
+    Low,
+    Stable,
+}
+
+impl Default for RtspLatencyMode {
+    fn default() -> Self {
+        Self::Low
+    }
+}
+
+impl RtspLatencyMode {
+    const fn snapshot_tag(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Stable => 1,
+        }
+    }
+}
+
 /// Profile 声明的预期视频编码；实际会话不得在未完成协商时提升能力证据。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -305,6 +329,8 @@ pub struct RtspStreamConfig {
     pub codec: RtspCodec,
     #[serde(default)]
     pub transport: RtspTransport,
+    #[serde(default)]
+    pub latency_mode: RtspLatencyMode,
 }
 
 impl fmt::Debug for RtspStreamConfig {
@@ -316,6 +342,7 @@ impl fmt::Debug for RtspStreamConfig {
             .field("width", &self.width)
             .field("height", &self.height)
             .field("transport", &self.transport)
+            .field("latency_mode", &self.latency_mode)
             .field("codec", &self.codec)
             .finish()
     }
@@ -782,7 +809,36 @@ mod tests {
             height: 1080,
             codec: RtspCodec::H264,
             transport: RtspTransport::Tcp,
+            latency_mode: RtspLatencyMode::Low,
         }
+    }
+
+    #[test]
+    fn rtsp_latency_mode_changes_profile_snapshot_hash() {
+        let mut low_latency = PlatformProfile {
+            id: PlatformProfileId::new("camera-rtsp-low").unwrap(),
+            display_name: "Camera RTSP".to_owned(),
+            config: PlatformConfig::SshManaged(ssh_config("camera.local")),
+        };
+        let PlatformConfig::SshManaged(config) = &mut low_latency.config else {
+            panic!("expected SSH managed config");
+        };
+        config.rtsp = Some(rtsp_config("rtsp://camera.example/live/ch0"));
+
+        let mut stable_latency = low_latency.clone();
+        let PlatformConfig::SshManaged(config) = &mut stable_latency.config else {
+            panic!("expected SSH managed config");
+        };
+        config
+            .rtsp
+            .as_mut()
+            .expect("test profile carries RTSP config")
+            .latency_mode = RtspLatencyMode::Stable;
+
+        assert_ne!(
+            low_latency.snapshot_hash().unwrap(),
+            stable_latency.snapshot_hash().unwrap()
+        );
     }
 
     #[test]

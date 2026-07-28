@@ -6,8 +6,8 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     HostKeyAssessment, HostKeyTarget, ServerHostKey, discover_private_key_files,
 };
 use camera_toolbox_app::{
-    PlatformConfig, PlatformProfile, PlatformProfileId, RtspCodec, RtspStreamConfig, RtspTransport,
-    SshManagedConfig,
+    PlatformConfig, PlatformProfile, PlatformProfileId, RtspCodec, RtspLatencyMode,
+    RtspStreamConfig, RtspTransport, SshManagedConfig,
 };
 use eframe::egui::{self, TextBuffer};
 use secrecy::{ExposeSecret, ExposeSecretMut, SecretBox, SecretString, zeroize::Zeroize};
@@ -340,6 +340,7 @@ impl SshEditorState {
                 height: 1080,
                 codec: RtspCodec::H264,
                 transport: RtspTransport::Tcp,
+                latency_mode: RtspLatencyMode::Low,
             });
         }
         if let Some(rtsp) = config.rtsp.as_mut() {
@@ -370,6 +371,22 @@ impl SshEditorState {
                         .show_ui(ui, |ui| {
                             ui.selectable_value(&mut rtsp.transport, RtspTransport::Tcp, "TCP");
                             ui.selectable_value(&mut rtsp.transport, RtspTransport::Udp, "UDP");
+                        });
+                    ui.end_row();
+                    ui.label("Latency mode");
+                    egui::ComboBox::from_id_salt("ssh_rtsp_latency_mode")
+                        .selected_text(format!("{:?}", rtsp.latency_mode))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut rtsp.latency_mode,
+                                RtspLatencyMode::Low,
+                                "Low",
+                            );
+                            ui.selectable_value(
+                                &mut rtsp.latency_mode,
+                                RtspLatencyMode::Stable,
+                                "Stable",
+                            );
                         });
                     ui.end_row();
                 });

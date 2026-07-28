@@ -69,6 +69,7 @@ impl StreamService for FfmpegRtspStreamService {
                         RtspTransport::Tcp => FfmpegRtspTransport::Tcp,
                         RtspTransport::Udp => FfmpegRtspTransport::Udp,
                     },
+                    worker_config.latency_mode,
                     worker_config.width,
                     worker_config.height,
                     worker_session,
