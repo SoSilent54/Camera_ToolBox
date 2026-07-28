@@ -821,7 +821,7 @@ fn render_depth_range_plot(
         .link_axis(x_link, [true, false])
         .height(DEPTH_RANGE_PLOT_HEIGHT)
         .allow_zoom([false, true])
-        .allow_drag([false, true])
+        .allow_drag(false)
         .allow_scroll(false)
         .allow_axis_zoom_drag([false, true])
         .allow_boxed_zoom(false)
@@ -837,15 +837,31 @@ fn render_depth_range_plot(
         .show_y(false)
         .set_margin_fraction(egui::vec2(0.02, 0.02))
         .label_formatter(depth_plot_label);
+    let mut manual_y_dragged = false;
     let response = plot.show(ui, |plot_ui| {
-        apply_depth_timeline_y_bounds(plot_ui, y_bounds, state.user_y_bounds);
+        let current_y_bounds =
+            apply_depth_timeline_y_bounds(plot_ui, y_bounds, state.user_y_bounds);
+        if let Some((minimum, maximum)) =
+            manual_depth_timeline_y_drag(plot_ui, current_y_bounds, y_bounds)
+        {
+            plot_ui.set_plot_bounds_y(minimum..=maximum);
+            manual_y_dragged = true;
+        }
         render_depth_range_items(plot_ui, progress, axis)
+    });
+    #[cfg(test)]
+    ui.ctx().data_mut(|data| {
+        data.insert_temp(
+            egui::Id::new("dataset_acceptance_depth_ranges_last_frame_bounds"),
+            *response.transform.bounds(),
+        );
     });
     if response.response.double_clicked() {
         state.user_y_bounds = false;
-    } else if depth_timeline_y_interacted(ui, &response.response)
-        && (response.transform.bounds().height() < (y_bounds.max - y_bounds.min) - 1.0e-6
-            || state.user_y_bounds)
+    } else if manual_y_dragged
+        || (depth_timeline_y_zoomed(ui, &response.response)
+            && (response.transform.bounds().height() < (y_bounds.max - y_bounds.min) - 1.0e-6
+                || state.user_y_bounds))
     {
         state.user_y_bounds = true;
     }
@@ -877,20 +893,43 @@ fn apply_depth_timeline_y_bounds(
     plot_ui: &mut PlotUi<'_>,
     full: DepthTimelineYBounds,
     user_y_bounds: bool,
-) {
-    let (minimum, maximum) = if user_y_bounds {
+) -> (f64, f64) {
+    let bounds = if user_y_bounds {
         let bounds = plot_ui.plot_bounds();
         clamp_depth_timeline_y_bounds(bounds.min()[1], bounds.max()[1], full)
     } else {
         (full.min, full.max)
     };
-    plot_ui.set_plot_bounds_y(minimum..=maximum);
+    plot_ui.set_plot_bounds_y(bounds.0..=bounds.1);
+    bounds
 }
 
-fn depth_timeline_y_interacted(ui: &egui::Ui, response: &egui::Response) -> bool {
-    let y_zoomed = response.contains_pointer()
-        && ui.input(|input| (input.zoom_delta_2d().y - 1.0).abs() > f32::EPSILON);
-    response.dragged_by(egui::PointerButton::Primary) || y_zoomed
+fn manual_depth_timeline_y_drag(
+    plot_ui: &PlotUi<'_>,
+    current: (f64, f64),
+    full: DepthTimelineYBounds,
+) -> Option<(f64, f64)> {
+    if !plot_ui.response().dragged_by(egui::PointerButton::Primary) {
+        return None;
+    }
+    let delta = plot_ui.pointer_coordinate_drag_delta();
+    if !delta.y.is_finite() || delta.y.abs() <= f32::EPSILON {
+        return None;
+    }
+    let candidate =
+        clamp_depth_timeline_y_bounds(current.0 - delta.y as f64, current.1 - delta.y as f64, full);
+    if (candidate.0 - current.0).abs() <= f64::EPSILON
+        && (candidate.1 - current.1).abs() <= f64::EPSILON
+        && (current.1 - current.0) >= (full.max - full.min) - 1.0e-6
+    {
+        return None;
+    }
+    Some(candidate)
+}
+
+fn depth_timeline_y_zoomed(ui: &egui::Ui, response: &egui::Response) -> bool {
+    response.contains_pointer()
+        && ui.input(|input| (input.zoom_delta_2d().y - 1.0).abs() > f32::EPSILON)
 }
 
 fn clamp_depth_range_plot_memory(
@@ -1632,6 +1671,16 @@ mod tests {
         (selected, range_plot, base_plot)
     }
 
+    fn last_depth_range_frame_bounds(context: &egui::Context) -> PlotBounds {
+        context
+            .data_mut(|data| {
+                data.get_temp::<PlotBounds>(egui::Id::new(
+                    "dataset_acceptance_depth_ranges_last_frame_bounds",
+                ))
+            })
+            .expect("Depth range PlotResponse transform bounds")
+    }
+
     fn assert_x_bounds_aligned(range_plot: &PlotMemory, base_plot: &PlotMemory) {
         let range_bounds = range_plot.bounds();
         let base_bounds = base_plot.bounds();
@@ -1664,7 +1713,10 @@ mod tests {
     }
 
     fn assert_y_bounds_inside(plot: &PlotMemory, full: DepthTimelineYBounds) {
-        let bounds = plot.bounds();
+        assert_y_plot_bounds_inside(plot.bounds(), full);
+    }
+
+    fn assert_y_plot_bounds_inside(bounds: &PlotBounds, full: DepthTimelineYBounds) {
         assert!(
             bounds.min()[1] >= full.min - 1.0e-6,
             "y-min escaped full range: {:?} not in {:?}",
@@ -1962,6 +2014,8 @@ mod tests {
                 > 1.0e-3
         );
         assert_y_bounds_inside(&dragged_range_plot, depth_timeline_y_bounds(&progress));
+        let dragged_frame_bounds = last_depth_range_frame_bounds(&context);
+        assert_y_plot_bounds_inside(&dragged_frame_bounds, depth_timeline_y_bounds(&progress));
         let _ = render_depth_smoke_frame(
             &context,
             &progress,
@@ -1990,6 +2044,8 @@ mod tests {
             vec![egui::Event::PointerMoved(far_drag_down)],
         );
         assert_y_bounds_inside(&clamped_down_plot, full_y_bounds);
+        let clamped_down_frame_bounds = last_depth_range_frame_bounds(&context);
+        assert_y_plot_bounds_inside(&clamped_down_frame_bounds, full_y_bounds);
         let _ = render_depth_smoke_frame(
             &context,
             &progress,
@@ -2017,6 +2073,8 @@ mod tests {
             vec![egui::Event::PointerMoved(far_drag_up)],
         );
         assert_y_bounds_inside(&clamped_up_plot, full_y_bounds);
+        let clamped_up_frame_bounds = last_depth_range_frame_bounds(&context);
+        assert_y_plot_bounds_inside(&clamped_up_frame_bounds, full_y_bounds);
         let _ = render_depth_smoke_frame(
             &context,
             &progress,
