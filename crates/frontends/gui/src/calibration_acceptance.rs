@@ -6,19 +6,20 @@ use eframe::egui;
 const DEFAULT_REQUIRED_FOUND_VIEWS: &str = "3";
 const DEFAULT_FIELD_COLUMNS: &str = "16";
 const DEFAULT_FIELD_ROWS: &str = "9";
-const DEFAULT_REQUIRED_FIELD_CELLS: &str = "30";
+const DEFAULT_FIELD_TARGET_PER_CELL: &str = "1";
 const DEFAULT_MIN_ADJACENT_SPACING_PX: &str = "12";
 const DEFAULT_PNP_DEPTH_MIN: &str = "400";
 const DEFAULT_PNP_DEPTH_MAX: &str = "2400";
 const DEFAULT_PNP_DEPTH_BINS: &str = "4";
-const DEFAULT_REQUIRED_DEPTH_BINS: &str = "3";
+const DEFAULT_DEPTH_TARGET_PER_BIN: &str = "1";
 const DEFAULT_PNP_TILT_DEADBAND_DEG: &str = "5";
 const DEFAULT_PNP_TILT_MAX_DEG: &str = "65";
 const DEFAULT_PNP_TILT_BINS: &str = "3";
 const DEFAULT_PNP_AZIMUTH_SECTORS: &str = "8";
-const DEFAULT_REQUIRED_POSE_BINS: &str = "6";
+const DEFAULT_POSE_TARGET_PER_BIN: &str = "1";
 const DEFAULT_PNP_MAX_RMSE_PX: &str = "1.5";
 const DEFAULT_PNP_MAX_ERROR_PX: &str = "4";
+const DEFAULT_MINIMUM_AUTO_GAIN: &str = "1";
 
 /// 文本编辑状态必须保留中间输入；只有完整合法值才会被工作区自动安装。
 #[derive(Clone, Debug)]
@@ -26,19 +27,20 @@ pub(crate) struct DatasetAcceptanceDraft {
     pub(crate) required_found_views: String,
     pub(crate) field_columns: String,
     pub(crate) field_rows: String,
-    pub(crate) required_field_cells: String,
+    pub(crate) field_target_per_cell: String,
     pub(crate) min_adjacent_spacing_px: String,
     pub(crate) pnp_depth_min: String,
     pub(crate) pnp_depth_max: String,
     pub(crate) pnp_depth_bins: String,
-    pub(crate) required_depth_bins: String,
+    pub(crate) depth_target_per_bin: String,
     pub(crate) pnp_tilt_deadband_deg: String,
     pub(crate) pnp_tilt_max_deg: String,
     pub(crate) pnp_tilt_bins: String,
     pub(crate) pnp_azimuth_sectors: String,
-    pub(crate) required_pose_bins: String,
+    pub(crate) pose_target_per_bin: String,
     pub(crate) pnp_max_rmse_px: String,
     pub(crate) pnp_max_error_px: String,
+    pub(crate) minimum_auto_gain: String,
     pub(crate) error: Option<String>,
 }
 
@@ -48,19 +50,20 @@ impl Default for DatasetAcceptanceDraft {
             required_found_views: DEFAULT_REQUIRED_FOUND_VIEWS.to_owned(),
             field_columns: DEFAULT_FIELD_COLUMNS.to_owned(),
             field_rows: DEFAULT_FIELD_ROWS.to_owned(),
-            required_field_cells: DEFAULT_REQUIRED_FIELD_CELLS.to_owned(),
+            field_target_per_cell: DEFAULT_FIELD_TARGET_PER_CELL.to_owned(),
             min_adjacent_spacing_px: DEFAULT_MIN_ADJACENT_SPACING_PX.to_owned(),
             pnp_depth_min: DEFAULT_PNP_DEPTH_MIN.to_owned(),
             pnp_depth_max: DEFAULT_PNP_DEPTH_MAX.to_owned(),
             pnp_depth_bins: DEFAULT_PNP_DEPTH_BINS.to_owned(),
-            required_depth_bins: DEFAULT_REQUIRED_DEPTH_BINS.to_owned(),
+            depth_target_per_bin: DEFAULT_DEPTH_TARGET_PER_BIN.to_owned(),
             pnp_tilt_deadband_deg: DEFAULT_PNP_TILT_DEADBAND_DEG.to_owned(),
             pnp_tilt_max_deg: DEFAULT_PNP_TILT_MAX_DEG.to_owned(),
             pnp_tilt_bins: DEFAULT_PNP_TILT_BINS.to_owned(),
             pnp_azimuth_sectors: DEFAULT_PNP_AZIMUTH_SECTORS.to_owned(),
-            required_pose_bins: DEFAULT_REQUIRED_POSE_BINS.to_owned(),
+            pose_target_per_bin: DEFAULT_POSE_TARGET_PER_BIN.to_owned(),
             pnp_max_rmse_px: DEFAULT_PNP_MAX_RMSE_PX.to_owned(),
             pnp_max_error_px: DEFAULT_PNP_MAX_ERROR_PX.to_owned(),
+            minimum_auto_gain: DEFAULT_MINIMUM_AUTO_GAIN.to_owned(),
             error: None,
         }
     }
@@ -79,12 +82,15 @@ impl DatasetAcceptanceDraft {
         let field_capacity = field_columns
             .checked_mul(field_rows)
             .ok_or_else(|| "Field grid capacity overflows usize.".to_owned())?;
-        let required_field_cells = parse_usize(
-            "Required field cells",
-            &self.required_field_cells,
+        let field_target_per_cell = parse_usize(
+            "Field target per cell",
+            &self.field_target_per_cell,
             1,
-            field_capacity,
+            10_000,
         )?;
+        field_capacity
+            .checked_mul(field_target_per_cell)
+            .ok_or_else(|| "Field quota target overflows usize.".to_owned())?;
         let min_adjacent_spacing_px =
             parse_positive_f32("Minimum adjacent spacing", &self.min_adjacent_spacing_px)?;
         let pnp_depth_min = parse_positive_f64("PnP minimum depth", &self.pnp_depth_min)?;
@@ -93,12 +99,15 @@ impl DatasetAcceptanceDraft {
             return Err("PnP maximum depth must be greater than minimum depth.".to_owned());
         }
         let pnp_depth_bins = parse_usize("PnP depth bins", &self.pnp_depth_bins, 1, 32)?;
-        let required_depth_bins = parse_usize(
-            "Required depth bins",
-            &self.required_depth_bins,
+        let depth_target_per_bin = parse_usize(
+            "Depth target per bin",
+            &self.depth_target_per_bin,
             1,
-            pnp_depth_bins,
+            10_000,
         )?;
+        pnp_depth_bins
+            .checked_mul(depth_target_per_bin)
+            .ok_or_else(|| "Depth quota target overflows usize.".to_owned())?;
         let pnp_tilt_deadband_deg =
             parse_non_negative_f64("PnP tilt deadband", &self.pnp_tilt_deadband_deg)?;
         let pnp_tilt_max_deg = parse_non_negative_f64("PnP maximum tilt", &self.pnp_tilt_max_deg)?;
@@ -114,12 +123,11 @@ impl DatasetAcceptanceDraft {
         let pose_capacity =
             pose_bin_capacity_for_values(pnp_tilt_bins, pnp_azimuth_sectors, pnp_tilt_deadband_deg)
                 .ok_or_else(|| "PnP pose-bin capacity overflows usize.".to_owned())?;
-        let required_pose_bins = parse_usize(
-            "Required pose bins",
-            &self.required_pose_bins,
-            1,
-            pose_capacity,
-        )?;
+        let pose_target_per_bin =
+            parse_usize("Pose target per bin", &self.pose_target_per_bin, 1, 10_000)?;
+        pose_capacity
+            .checked_mul(pose_target_per_bin)
+            .ok_or_else(|| "Pose quota target overflows usize.".to_owned())?;
         let pnp_max_rmse_px = parse_non_negative_f64("PnP maximum RMSE", &self.pnp_max_rmse_px)?;
         let pnp_max_error_px =
             parse_non_negative_f64("PnP maximum reprojection error", &self.pnp_max_error_px)?;
@@ -128,23 +136,30 @@ impl DatasetAcceptanceDraft {
                 "PnP maximum reprojection error must be at least the RMSE limit.".to_owned(),
             );
         }
+        let minimum_auto_gain = parse_usize(
+            "Minimum automatic Gain",
+            &self.minimum_auto_gain,
+            1,
+            1_000_000,
+        )?;
         Ok(AutoCaptureAcceptanceCriteria {
             required_found_views,
             field_columns,
             field_rows,
-            required_field_cells,
+            field_target_per_cell,
             min_adjacent_spacing_px,
             pnp_depth_min,
             pnp_depth_max,
             pnp_depth_bins,
-            required_depth_bins,
+            depth_target_per_bin,
             pnp_tilt_deadband_deg,
             pnp_tilt_max_deg,
             pnp_tilt_bins,
             pnp_azimuth_sectors,
-            required_pose_bins,
+            pose_target_per_bin,
             pnp_max_rmse_px,
             pnp_max_error_px,
+            minimum_auto_gain,
         })
     }
 }
@@ -226,15 +241,21 @@ pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) required_found_views: usize,
     pub(crate) occupied_field_cells: usize,
     pub(crate) required_field_cells: usize,
+    pub(crate) field_quota_filled: usize,
+    pub(crate) required_field_quota: usize,
     pub(crate) field_counts: Vec<usize>,
     pub(crate) field_columns: usize,
     pub(crate) field_rows: usize,
     pub(crate) depth_bin_counts: Vec<usize>,
     pub(crate) occupied_depth_bins: usize,
     pub(crate) required_depth_bins: usize,
+    pub(crate) depth_quota_filled: usize,
+    pub(crate) required_depth_quota: usize,
     pub(crate) pose_bin_counts: Vec<usize>,
     pub(crate) occupied_pose_bins: usize,
     pub(crate) required_pose_bins: usize,
+    pub(crate) pose_quota_filled: usize,
+    pub(crate) required_pose_quota: usize,
     pub(crate) collection_target_met: bool,
     pub(crate) found_view_gain: usize,
     pub(crate) field_gain: usize,
@@ -251,15 +272,21 @@ impl DatasetAcceptanceProgress {
             required_found_views: assessment.required_found_views,
             occupied_field_cells: assessment.field_cells,
             required_field_cells: assessment.required_field_cells,
+            field_quota_filled: assessment.field_quota_filled,
+            required_field_quota: assessment.required_field_quota,
             field_counts: assessment.field_counts.clone(),
             field_columns: assessment.field_columns,
             field_rows: assessment.field_rows,
             depth_bin_counts: assessment.depth_bin_counts.clone(),
             occupied_depth_bins: assessment.depth_bins,
             required_depth_bins: assessment.required_depth_bins,
+            depth_quota_filled: assessment.depth_quota_filled,
+            required_depth_quota: assessment.required_depth_quota,
             pose_bin_counts: assessment.pose_bin_counts.clone(),
             occupied_pose_bins: assessment.pose_bins,
             required_pose_bins: assessment.required_pose_bins,
+            pose_quota_filled: assessment.pose_quota_filled,
+            required_pose_quota: assessment.required_pose_quota,
             collection_target_met: assessment.collection_target_met,
             found_view_gain: assessment.found_view_gain,
             field_gain: assessment.field_gain,
@@ -274,14 +301,22 @@ impl DatasetAcceptanceProgress {
         Self {
             active_criteria: Some(criteria.clone()),
             required_found_views: criteria.required_found_views,
-            required_field_cells: criteria.required_field_cells,
+            required_field_cells: criteria.field_columns.saturating_mul(criteria.field_rows),
+            required_field_quota: criteria
+                .field_columns
+                .saturating_mul(criteria.field_rows)
+                .saturating_mul(criteria.field_target_per_cell),
             field_counts: vec![0; criteria.field_columns.saturating_mul(criteria.field_rows)],
             field_columns: criteria.field_columns,
             field_rows: criteria.field_rows,
             depth_bin_counts: vec![0; criteria.pnp_depth_bins],
-            required_depth_bins: criteria.required_depth_bins,
+            required_depth_bins: criteria.pnp_depth_bins,
+            required_depth_quota: criteria
+                .pnp_depth_bins
+                .saturating_mul(criteria.depth_target_per_bin),
             pose_bin_counts: vec![0; pose_capacity],
-            required_pose_bins: criteria.required_pose_bins,
+            required_pose_bins: pose_capacity,
+            required_pose_quota: pose_capacity.saturating_mul(criteria.pose_target_per_bin),
             ..Self::default()
         }
     }
@@ -333,15 +368,15 @@ pub(crate) fn render_dataset_acceptance(
                     render_runtime_state(ui, &state);
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!(
-                            "Found {}/{} · Field {}/{} · Depth {}/{} · Pose {}/{} · Score {}",
+                            "Found {}/{} · Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{} · Score {}",
                             progress.enabled_found_views,
                             progress.required_found_views,
-                            progress.occupied_field_cells,
-                            progress.required_field_cells,
-                            progress.occupied_depth_bins,
-                            progress.required_depth_bins,
-                            progress.occupied_pose_bins,
-                            progress.required_pose_bins,
+                            progress.field_quota_filled,
+                            progress.required_field_quota,
+                            progress.depth_quota_filled,
+                            progress.required_depth_quota,
+                            progress.pose_quota_filled,
+                            progress.required_pose_quota,
                             progress.score,
                         ));
                         ui.monospace(format!(
@@ -380,10 +415,14 @@ pub(crate) fn render_dataset_acceptance(
                         ui.strong("Field coverage");
                         metric_row(
                             ui,
-                            "Occupied field cells",
-                            progress.occupied_field_cells,
-                            progress.required_field_cells,
+                            "Field quota",
+                            progress.field_quota_filled,
+                            progress.required_field_quota,
                         );
+                        ui.weak(format!(
+                            "Occupied field cells: {} / {}",
+                            progress.occupied_field_cells, progress.required_field_cells
+                        ));
                         render_field_grid(ui, progress);
                         egui::Grid::new("dataset_acceptance_field_editor")
                             .num_columns(2)
@@ -393,8 +432,8 @@ pub(crate) fn render_dataset_acceptance(
                                 acceptance_text_row(ui, "Field rows", &mut draft.field_rows, &mut changed, &mut editing);
                                 acceptance_text_row(
                                     ui,
-                                    "Field cell target",
-                                    &mut draft.required_field_cells,
+                                    "Field target / cell",
+                                    &mut draft.field_target_per_cell,
                                     &mut changed,
                                     &mut editing,
                                 );
@@ -412,10 +451,14 @@ pub(crate) fn render_dataset_acceptance(
                         ui.strong("Depth coverage");
                         metric_row(
                             ui,
-                            "Occupied depth bins",
-                            progress.occupied_depth_bins,
-                            progress.required_depth_bins,
+                            "Depth quota",
+                            progress.depth_quota_filled,
+                            progress.required_depth_quota,
                         );
+                        ui.weak(format!(
+                            "Occupied depth bins: {} / {}",
+                            progress.occupied_depth_bins, progress.required_depth_bins
+                        ));
                         if let Some(criteria) = progress.active_criteria.as_ref() {
                             render_depth_coverage(ui, progress, criteria);
                         } else {
@@ -430,8 +473,8 @@ pub(crate) fn render_dataset_acceptance(
                                 acceptance_text_row(ui, "PnP depth bins", &mut draft.pnp_depth_bins, &mut changed, &mut editing);
                                 acceptance_text_row(
                                     ui,
-                                    "Required depth bins",
-                                    &mut draft.required_depth_bins,
+                                    "Depth target / bin",
+                                    &mut draft.depth_target_per_bin,
                                     &mut changed,
                                     &mut editing,
                                 );
@@ -442,10 +485,14 @@ pub(crate) fn render_dataset_acceptance(
                         ui.strong("Pose coverage");
                         metric_row(
                             ui,
-                            "Occupied pose bins",
-                            progress.occupied_pose_bins,
-                            progress.required_pose_bins,
+                            "Pose quota",
+                            progress.pose_quota_filled,
+                            progress.required_pose_quota,
                         );
+                        ui.weak(format!(
+                            "Occupied pose bins: {} / {}",
+                            progress.occupied_pose_bins, progress.required_pose_bins
+                        ));
                         if let Some(criteria) = progress.active_criteria.as_ref() {
                             render_pose_coverage(ui, progress, criteria);
                         } else {
@@ -479,8 +526,8 @@ pub(crate) fn render_dataset_acceptance(
                                 );
                                 acceptance_text_row(
                                     ui,
-                                    "Required pose bins",
-                                    &mut draft.required_pose_bins,
+                                    "Pose target / bin",
+                                    &mut draft.pose_target_per_bin,
                                     &mut changed,
                                     &mut editing,
                                 );
@@ -507,6 +554,13 @@ pub(crate) fn render_dataset_acceptance(
                                     ui,
                                     "PnP max error (px)",
                                     &mut draft.pnp_max_error_px,
+                                    &mut changed,
+                                    &mut editing,
+                                );
+                                acceptance_text_row(
+                                    ui,
+                                    "Minimum auto Gain",
+                                    &mut draft.minimum_auto_gain,
                                     &mut changed,
                                     &mut editing,
                                 );
@@ -622,21 +676,22 @@ fn acceptance_text_row(
     ui.end_row();
 }
 
-fn coverage_color(count: usize, maximum: usize) -> egui::Color32 {
-    if count == 0 || maximum == 0 {
-        egui::Color32::from_gray(42)
-    } else {
-        let density = count as f32 / maximum as f32;
-        egui::Color32::from_rgb(
-            (50.0 + 35.0 * density) as u8,
-            (105.0 + 120.0 * density) as u8,
-            (85.0 + 45.0 * density) as u8,
-        )
+fn coverage_color(count: usize, target: usize) -> egui::Color32 {
+    if target == 0 {
+        return egui::Color32::from_gray(42);
     }
+    let ratio = (count as f32 / target as f32).clamp(0.0, 1.0);
+    let red = [130.0_f32, 54.0, 54.0];
+    let green = [58.0_f32, 174.0, 108.0];
+    egui::Color32::from_rgb(
+        (red[0] + (green[0] - red[0]) * ratio) as u8,
+        (red[1] + (green[1] - red[1]) * ratio) as u8,
+        (red[2] + (green[2] - red[2]) * ratio) as u8,
+    )
 }
 
-fn coverage_text_color(count: usize, maximum: usize) -> egui::Color32 {
-    if maximum != 0 && count as f32 / maximum as f32 > 0.6 {
+fn coverage_text_color(count: usize, target: usize) -> egui::Color32 {
+    if target != 0 && count as f32 / target as f32 > 0.58 {
         egui::Color32::from_rgb(12, 32, 45)
     } else {
         egui::Color32::WHITE
@@ -644,7 +699,9 @@ fn coverage_text_color(count: usize, maximum: usize) -> egui::Color32 {
 }
 
 fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
-    ui.label("Per-cell chessboard-corner count (shown in each cell)");
+    ui.label(
+        "Per-cell chessboard-corner count; green means the configured per-cell target is reached.",
+    );
     if progress.field_columns == 0 || progress.field_rows == 0 {
         return;
     }
@@ -658,8 +715,10 @@ fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
     let (rect, response) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, egui::Color32::from_gray(24));
-    let maximum = progress.field_counts.iter().copied().max().unwrap_or(0);
-    let mut missing = Vec::new();
+    let target = progress
+        .active_criteria
+        .as_ref()
+        .map_or(1, |criteria| criteria.field_target_per_cell);
     for row in 0..progress.field_rows {
         for column in 0..progress.field_columns {
             let cell = row * progress.field_columns + column;
@@ -671,24 +730,20 @@ fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
             let y1 = rect.top() + rect.height() * (row + 1) as f32 / progress.field_rows as f32;
             let cell_rect =
                 egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)).shrink(1.0);
-            painter.rect_filled(cell_rect, 1.5, coverage_color(count, maximum));
+            painter.rect_filled(cell_rect, 1.5, coverage_color(count, target));
             painter.text(
                 cell_rect.center(),
                 egui::Align2::CENTER_CENTER,
                 count.to_string(),
                 label_font.clone(),
-                coverage_text_color(count, maximum),
+                coverage_text_color(count, target),
             );
-            if count == 0 {
-                missing.push(format!("r{}c{}", row + 1, column + 1));
-            }
         }
     }
     response.on_hover_text(
         "Each cell displays the number of enabled Found chessboard corners in that image region.",
     );
-    render_missing_summary(ui, "Missing field cells", &missing);
-    ui.weak(format!("Legend: empty / occupied / max {maximum} corners"));
+    ui.weak(format!("Legend: red 0 → green {target}+ corners per cell"));
 }
 
 fn render_depth_coverage(
@@ -710,8 +765,7 @@ fn render_depth_coverage(
     let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 3.0, egui::Color32::from_gray(24));
-    let maximum = progress.depth_bin_counts.iter().copied().max().unwrap_or(0);
-    let mut missing = Vec::new();
+    let target = criteria.depth_target_per_bin;
     for index in 0..bin_count {
         let count = progress.depth_bin_counts.get(index).copied().unwrap_or(0);
         let row = index / columns;
@@ -723,20 +777,20 @@ fn render_depth_coverage(
         let cell_rect =
             egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)).shrink(1.0);
         let label = depth_interval_label(criteria, index);
-        painter.rect_filled(cell_rect, 1.5, coverage_color(count, maximum));
+        painter.rect_filled(cell_rect, 1.5, coverage_color(count, target));
         painter.text(
             egui::pos2(cell_rect.center().x, cell_rect.top() + 11.0),
             egui::Align2::CENTER_CENTER,
             label.clone(),
             egui::FontId::proportional(9.0),
-            coverage_text_color(count, maximum),
+            coverage_text_color(count, target),
         );
         painter.text(
             egui::pos2(cell_rect.center().x, cell_rect.bottom() - 11.0),
             egui::Align2::CENTER_CENTER,
             format!("{count} corners"),
             egui::FontId::proportional(10.0),
-            coverage_text_color(count, maximum),
+            coverage_text_color(count, target),
         );
         ui.interact(
             cell_rect,
@@ -746,11 +800,10 @@ fn render_depth_coverage(
         .on_hover_text(format!(
             "Depth {label}: {count} compatible chessboard-corner depths."
         ));
-        if count == 0 {
-            missing.push(label);
-        }
     }
-    render_missing_summary(ui, "Missing depth intervals", &missing);
+    ui.weak(format!(
+        "Legend: red 0 → green {target}+ corner depths per bin"
+    ));
 }
 
 fn depth_interval_label(criteria: &AutoCaptureAcceptanceCriteria, index: usize) -> String {
@@ -791,11 +844,6 @@ fn render_pose_coverage(
     } else {
         render_pose_polar_map(ui, progress, criteria);
     }
-    let missing = (0..pose_bin_capacity(criteria))
-        .filter(|index| progress.pose_bin_counts.get(*index).copied().unwrap_or(0) == 0)
-        .map(|index| pose_bin_label(criteria, index))
-        .collect::<Vec<_>>();
-    render_missing_summary(ui, "Missing pose regions", &missing);
 }
 
 // 最少八段使单扇区的每个弧段不超过 45°，即使只有一个 azimuth sector 也保持凸四边形。
@@ -818,7 +866,7 @@ fn render_pose_polar_map(
     } else {
         0.0
     };
-    let maximum = progress.pose_bin_counts.iter().copied().max().unwrap_or(0);
+    let target = criteria.pose_target_per_bin;
     let center_count = progress.pose_bin_counts.first().copied().unwrap_or(0);
     let sector_offset = usize::from(center_enabled);
     let sector_count = criteria
@@ -846,7 +894,7 @@ fn render_pose_polar_map(
                 ring_outer,
                 start,
                 end,
-                coverage_color(count, maximum),
+                coverage_color(count, target),
             );
         }
     }
@@ -880,20 +928,20 @@ fn render_pose_polar_map(
                 egui::Align2::CENTER_CENTER,
                 count.to_string(),
                 egui::FontId::proportional(8.0),
-                coverage_text_color(count, maximum),
+                coverage_text_color(count, target),
             );
         }
     }
     // 环带内弦会略微进入理论内圆；只有存在 deadband 时才绘制中心 bin 作为遮罩。
     if center_enabled {
-        painter.circle_filled(center, center_radius, coverage_color(center_count, maximum));
+        painter.circle_filled(center, center_radius, coverage_color(center_count, target));
         painter.circle_stroke(center, center_radius, border);
         painter.text(
             center,
             egui::Align2::CENTER_CENTER,
             center_count.to_string(),
             egui::FontId::proportional(10.0),
-            coverage_text_color(center_count, maximum),
+            coverage_text_color(center_count, target),
         );
     }
     if let Some(position) = response.hover_pos()
@@ -905,7 +953,9 @@ fn render_pose_polar_map(
             pose_bin_label(criteria, index)
         ));
     }
-    ui.weak("Each sector shows its count; hover a region for its tilt and azimuth interval.");
+    ui.weak(format!(
+        "Each sector shows its count; red 0 → green {target}+ views per pose bin."
+    ));
 }
 
 /// 将带内孔的环形扇区拆为凸四边形，避免 `convex_polygon` 的扇形三角化跨越中心孔。
@@ -1032,7 +1082,7 @@ fn render_pose_grid(
         "Using a labeled grid because this pose configuration has more than 32 annular sectors.",
     );
     let region_count = pose_bin_capacity(criteria);
-    let maximum = progress.pose_bin_counts.iter().copied().max().unwrap_or(0);
+    let target = criteria.pose_target_per_bin;
     egui::Grid::new("dataset_acceptance_pose_grid")
         .num_columns(8)
         .spacing([3.0, 3.0])
@@ -1041,7 +1091,7 @@ fn render_pose_grid(
                 let count = progress.pose_bin_counts.get(index).copied().unwrap_or(0);
                 ui.add(
                     egui::Button::new(format!("#{index} {count}"))
-                        .fill(coverage_color(count, maximum)),
+                        .fill(coverage_color(count, target)),
                 )
                 .on_hover_text(format!(
                     "{}: {count} compatible PnP observations.",
@@ -1086,17 +1136,6 @@ fn pose_bin_label(criteria: &AutoCaptureAcceptanceCriteria, index: usize) -> Str
     )
 }
 
-fn render_missing_summary(ui: &mut egui::Ui, label: &str, missing: &[String]) {
-    if missing.is_empty() {
-        ui.colored_label(egui::Color32::LIGHT_GREEN, format!("{label}: none"));
-    } else {
-        ui.horizontal_wrapped(|ui| {
-            ui.strong(format!("{label}:"));
-            ui.label(missing.join(" · "));
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1104,29 +1143,28 @@ mod tests {
     #[test]
     fn acceptance_draft_parses_runtime_pnp_thresholds() {
         let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
-        assert_eq!(criteria.required_found_views, 3);
-        assert_eq!((criteria.field_columns, criteria.field_rows), (16, 9));
-        assert_eq!(criteria.required_field_cells, 30);
+        assert_eq!(criteria.field_target_per_cell, 1);
+        assert_eq!(criteria.minimum_auto_gain, 1);
         assert_eq!(
             (criteria.pnp_depth_min, criteria.pnp_depth_max),
             (400.0, 2400.0)
         );
         assert_eq!(
-            (criteria.pnp_depth_bins, criteria.required_depth_bins),
-            (4, 3)
+            (criteria.pnp_depth_bins, criteria.depth_target_per_bin),
+            (4, 1)
         );
-        assert_eq!(criteria.required_pose_bins, 6);
+        assert_eq!(criteria.pose_target_per_bin, 1);
     }
 
     #[test]
     fn acceptance_draft_rejects_invalid_grid_and_pnp_ranges() {
         let mut draft = DatasetAcceptanceDraft {
-            required_field_cells: "145".to_owned(),
+            field_columns: "33".to_owned(),
             ..DatasetAcceptanceDraft::default()
         };
-        assert!(draft.parse().unwrap_err().contains("1..=144"));
+        assert!(draft.parse().unwrap_err().contains("1..=32"));
 
-        draft.required_field_cells = "30".to_owned();
+        draft.field_columns = "16".to_owned();
         draft.pnp_depth_max = "400".to_owned();
         assert!(draft.parse().unwrap_err().contains("greater than minimum"));
 
@@ -1245,7 +1283,7 @@ mod tests {
         criteria.pnp_tilt_deadband_deg = 0.0;
         criteria.pnp_tilt_bins = 1;
         criteria.pnp_azimuth_sectors = 4;
-        criteria.required_pose_bins = 4;
+        criteria.pose_target_per_bin = 1;
         let mut progress = DatasetAcceptanceProgress::empty(&criteria);
         progress.pose_bin_counts = vec![1, 2, 3, 4];
 
@@ -1473,5 +1511,19 @@ mod tests {
         assert!(last_boundary_index < center_fill_index);
         assert!(center_fill_index < center_stroke_index);
         assert!(center_stroke_index < center_text_index);
+    }
+
+    #[test]
+    fn coverage_color_reaches_green_at_configured_target() {
+        let red = coverage_color(0, 3);
+        let mid = coverage_color(1, 3);
+        let green = coverage_color(3, 3);
+        let above = coverage_color(7, 3);
+
+        assert!(red.r() > green.r());
+        assert!(green.g() > red.g());
+        assert!(mid.r() < red.r() && mid.r() > green.r());
+        assert!(mid.g() > red.g() && mid.g() < green.g());
+        assert_eq!(green, above);
     }
 }

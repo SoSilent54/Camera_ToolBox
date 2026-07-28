@@ -789,17 +789,17 @@ PnP 证据必须具有有限的位姿和重投影指标，棋盘所有角点在�
 `Dataset acceptance` 使用固定折叠标识；检测完成、进度变化或阈值编辑不会重置其展开状态。展开体位于独立垂直滚动区域内，视口最小约 96 px、最大约 420 px，并为下方 Dataset 表保留约 180 px 可操作高度，避免小窗口中验收控件把表格顶出侧栏。控件按指标与可视化就地分组：
 
 - Found views：当前值、目标和进度条；
-- field coverage：当前 occupied cell 值、目标、每个图像归一化网格单元中的棋盘角点数量，以及网格/目标/最小相邻角点间距；非零角点数的单元才算 occupied field cell；
-- depth coverage：当前 occupied depth bin 值、目标、连续深度区间图、每段棋盘内角点深度计数和直接列出的缺失区间，以及深度范围/bin/目标；最后一个区间包含上边界；
-- pose coverage：当前值、目标、中心 front-parallel bin 与 tilt $\times$ azimuth 环形扇区图、每区计数和直接列出的缺失区域，以及 deadband/最大 tilt/bin/sector/目标；显示方向对齐 OpenCV 图像坐标，$0^\circ$ 位于右侧 $+x$，$90^\circ$ 位于下方 $+y$。每段环弧以凸 mesh 四边形填充，并单独描绘内外弧与径向边框；当 deadband 大于 0 时，全部环带绘制完成后，中心 bin 的填充、边框和文字最后作为圆形遮罩绘制；当 deadband 为 0 时，不存在中心 bin，也不绘制中心完整圆，环形扇区从中心直接开始。
-- PnP quality gates：RMSE 和最大单点重投影误差阈值。只有同时满足有限值、正深度、当前 Dataset PnP binding 和这两个门限的证据，才能填充 depth 和 pose 覆盖。既有 Dataset 项在每次评估时也必须通过当前图像边界和最小相邻角点间距门限；提高 spacing 阈值会立刻将不满足项移出汇总与边际贡献。
+- field coverage：当前 field quota 进度、occupied cell 参考值、每个图像归一化网格单元中的棋盘角点数量，以及网格/每单元目标/最小相邻角点间距；非零角点数的单元才算 occupied field cell，但 Gain 在该单元达到 `Field target / cell` 前都会继续增加；
+- depth coverage：当前 depth quota 进度、occupied depth bin 参考值、连续深度区间图和每段棋盘内角点深度计数，以及深度范围/bin/每 bin 目标；最后一个区间包含上边界；不再单独列出缺失区间，红到绿的图形颜色直接表达未达标到达标；
+- pose coverage：当前 pose quota 进度、occupied pose bin 参考值、中心 front-parallel bin 与 tilt $\times$ azimuth 环形扇区图、每区 view 计数，以及 deadband/最大 tilt/bin/sector/每 bin 目标；显示方向对齐 OpenCV 图像坐标，$0^\circ$ 位于右侧 $+x$，$90^\circ$ 位于下方 $+y$。每段环弧以凸 mesh 四边形填充，并单独描绘内外弧与径向边框；当 deadband 大于 0 时，全部环带绘制完成后，中心 bin 的填充、边框和文字最后作为圆形遮罩绘制；当 deadband 为 0 时，不存在中心 bin，也不绘制中心完整圆，环形扇区从中心直接开始；
+- PnP quality gates：RMSE、最大单点重投影误差阈值和 `Minimum auto Gain`。只有同时满足有限值、正深度、当前 Dataset PnP binding 和这两个重投影门限的证据，才能填充 depth 和 pose 覆盖。既有 Dataset 项在每次评估时也必须通过当前图像边界和最小相邻角点间距门限；提高 spacing 阈值会立刻将不满足项移出汇总与边际贡献。
 
 默认值为：
 
-- Found views：3；field grid：$16\times9$，required occupied field cells：30，最小相邻角点间距：12 px；
-- PnP depth：400–2400（4 bins，目标 3）；深度单位是配置的 `BoardSpec::square_size` 单位，GUI 默认棋盘使用 mm；
-- PnP tilt：deadband $5^\circ$、最大 $65^\circ$（3 bins），azimuth：8 sectors，目标 pose bins：6；
-- PnP RMSE：最多 1.5 px；最大单点重投影误差：最多 4.0 px。
+- Found views：3；field grid：$16\times9$，`Field target / cell`：1，最小相邻角点间距：12 px；
+- PnP depth：400–2400（4 bins，`Depth target / bin`：1）；深度单位是配置的 `BoardSpec::square_size` 单位，GUI 默认棋盘使用 mm；
+- PnP tilt：deadband $5^\circ$、最大 $65^\circ$（3 bins），azimuth：8 sectors，`Pose target / bin`：1；
+- PnP RMSE：最多 1.5 px；最大单点重投影误差：最多 4.0 px；`Minimum auto Gain`：1。
 
 编辑 Dataset Acceptance 文本框时允许临时不完整输入；焦点仍在文本框内时不会弹出红色错误或替换当前 runtime admission，而是继续使用上一组完整合法门限。字段补全为合法值后立即安装；离开编辑焦点后仍非法才显示错误。
 
@@ -813,11 +813,11 @@ $$
 \mathrm{Gain}_i = G^{found}_i + G^{field}_i + G^{depth}_i + G^{pose}_i
 $$
 
-对每个指标，按稳定 Dataset 顺序扫描当前统一图像尺寸、已启用、`Found` 且通过当前几何门限的数据项；每个尚未归属的 Found view / occupied coverage bin 分配给第一个覆盖它的图像，直到对应目标 $T$ 填满。Dataset 总 `Score` 等于所有当前行 `Gain` 的和，也等于 $\min(C_{found},T_{found}) + \min(C_{field},T_{field}) + \min(C_{depth},T_{depth}) + \min(C_{pose},T_{pose})$。Field coverage 的单元数来自角点密度：每个网格单元累计其中的棋盘角点数量，计数非零才成为 occupied cell；`Field Δ` 表示归属给该项的目标截断 occupied field cell 数，只要求 Found 检测。Depth coverage 的 bin 计数来自该项所有棋盘内角点的相机 $Z$ 深度；`Depth Δ` 表示归属给该项的目标截断 occupied depth bin 数。Pose coverage 仍按单张 view 的棋盘法向 tilt/azimuth bin 计数；`Pose Δ` 表示归属给该项的目标截断 occupied pose bin 数。PnP quality gates 只决定 Depth/Pose 是否有资格贡献，不作为单独分数。禁用、图像尺寸不兼容、非 Found 或几何门限不兼容的项显示为不属于当前 Dataset Acceptance；缺失、过期或未通过当前门限的 PnP 会显示为 `PnP×`/`×0`，它表示 Depth/Pose 被 PnP 或对应门限阻断，区别于当前 PnP 有效但覆盖冗余的 `+0`。`No Gain Gap` 表示该行参与当前 Dataset Acceptance，但目标封顶归属后没有任何指标分配给它；多勾选一张冗余图片不会把既有图片的 `Gain` 全部清零。
+对每个指标，按稳定 Dataset 顺序扫描当前统一图像尺寸、已启用、`Found` 且通过当前几何门限的数据项；Found view 仍按视图数量封顶归属，Field/Depth/Pose 则按区域 quota 归属：每个区域累计 `min(count, target_per_region)`，在达到该区域目标前，新角点或新 view 都继续产生 Gain。Dataset 总 `Score` 等于所有当前行 `Gain` 的和，也等于 $\min(C_{found},T_{found}) + \sum_r \min(C^r_{field},Q_{field}) + \sum_r \min(C^r_{depth},Q_{depth}) + \sum_r \min(C^r_{pose},Q_{pose})$。Field coverage 的单元数来自角点密度：每个网格单元累计其中的棋盘角点数量，计数非零才成为 occupied cell；`Field Δ` 表示归属给该项的目标截断 per-cell 角点 quota。Depth coverage 的 bin 计数来自该项所有棋盘内角点的相机 $Z$ 深度；`Depth Δ` 表示归属给该项的目标截断 per-bin 角点深度 quota。Pose coverage 仍按单张 view 的棋盘法向 tilt/azimuth bin 计数；`Pose Δ` 表示归属给该项的目标截断 per-bin view quota。PnP quality gates 只决定 Depth/Pose 是否有资格贡献，不作为单独分数。禁用、图像尺寸不兼容、非 Found 或几何门限不兼容的项显示为不属于当前 Dataset Acceptance；缺失、过期或未通过当前门限的 PnP 会显示为 `PnP×`/`×0`，它表示 Depth/Pose 被 PnP 或对应门限阻断，区别于当前 PnP 有效但覆盖冗余的 `+0`。`No Gain Gap` 表示该行参与当前 Dataset Acceptance，但目标封顶归属后没有任何指标分配给它；多勾选一张冗余图片不会把既有图片的 `Gain` 全部清零。
 
 普通 PNG、本地/远端文件、手动 RTSP 快门和自动 RTSP 入库项在 Dataset Acceptance 中按同一规则统计；自动候选准入仍是另一条 source-bound 规则，继续使用精确 acquisition key、完整图像尺寸、棋盘和 source-bound $K+D12$ digest 过滤，不能被其他来源的 Dataset 项提高候选 gain。自动入库项同时保存来源无关 Dataset PnP 与 source-bound admission PnP，普通 PnP 刷新不会覆盖后者。Viewer 的 Live Stream coverage 同样保留精确 acquisition key 和图像尺寸过滤，但使用与 Dataset Image heatmap 相同的低到高调色板、$3\times3$ 引导线和 low/high 图例。
 
-Found views 是采集进度和总分的一部分；自动入库的决定量使用同一 source-bound assessment 中尚未满足目标的 Found、field、depth 和 pose bin 的确定性正增益之和。面板可能显示 collection milestones，但它只表示当前运行时阈值的覆盖状态，不是生产资格。
+Found views 是采集进度和总分的一部分；自动入库的决定量使用同一 source-bound assessment 中尚未满足目标的 Found、field、depth 和 pose quota 的确定性正增益之和。只有单张候选的 `constraint_gain` 达到可配置的 `Minimum auto Gain` 时才会自动入库；低于阈值会被拒绝且不改 Dataset。面板可能显示 collection milestones，但它只表示当前运行时阈值的覆盖状态，不是生产资格。
 
 ### 15.4 将已安装结果回写为初始 $K+D12$
 

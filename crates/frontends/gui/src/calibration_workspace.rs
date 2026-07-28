@@ -1741,15 +1741,19 @@ impl CalibrationWorkspace {
     fn render_dataset_assessment(&self, ui: &mut egui::Ui, assessment: &AutoAdmissionAssessment) {
         ui.horizontal_wrapped(|ui| {
             ui.monospace(format!(
-                "Found {}/{} · Field {}/{} · Depth {}/{} · Pose {}/{}",
+                "Found {}/{} · Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{}",
                 assessment.enabled_found_views,
                 assessment.required_found_views,
-                assessment.field_cells,
-                assessment.required_field_cells,
-                assessment.depth_bins,
-                assessment.required_depth_bins,
-                assessment.pose_bins,
-                assessment.required_pose_bins,
+                assessment.field_quota_filled,
+                assessment.required_field_quota,
+                assessment.depth_quota_filled,
+                assessment.required_depth_quota,
+                assessment.pose_quota_filled,
+                assessment.required_pose_quota,
+            ));
+            ui.monospace(format!(
+                "Occupied Field {} · Depth {} · Pose {}",
+                assessment.field_cells, assessment.depth_bins, assessment.pose_bins,
             ));
             ui.monospace(format!(
                 "Score {} · Gain Found {} Field {} Depth {} Pose {}",
@@ -5786,16 +5790,16 @@ mod tests {
         let displayed = chessboard_live_frame(3);
         workspace.acceptance_draft.field_columns = "1".to_owned();
         workspace.acceptance_draft.field_rows = "1".to_owned();
-        workspace.acceptance_draft.required_field_cells = "1".to_owned();
+        workspace.acceptance_draft.field_target_per_cell = "1".to_owned();
         workspace.acceptance_draft.pnp_depth_min = "0.001".to_owned();
         workspace.acceptance_draft.pnp_depth_max = "10000000".to_owned();
         workspace.acceptance_draft.pnp_depth_bins = "1".to_owned();
-        workspace.acceptance_draft.required_depth_bins = "1".to_owned();
+        workspace.acceptance_draft.depth_target_per_bin = "1".to_owned();
         workspace.acceptance_draft.pnp_tilt_deadband_deg = "0".to_owned();
         workspace.acceptance_draft.pnp_tilt_max_deg = "89".to_owned();
         workspace.acceptance_draft.pnp_tilt_bins = "1".to_owned();
         workspace.acceptance_draft.pnp_azimuth_sectors = "1".to_owned();
-        workspace.acceptance_draft.required_pose_bins = "1".to_owned();
+        workspace.acceptance_draft.pose_target_per_bin = "1".to_owned();
         workspace.acceptance_draft.pnp_max_rmse_px = "100".to_owned();
         workspace.acceptance_draft.pnp_max_error_px = "100".to_owned();
         workspace.auto_capture_enabled = true;
