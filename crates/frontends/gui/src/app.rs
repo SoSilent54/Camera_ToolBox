@@ -4182,6 +4182,18 @@ impl CameraToolboxApp {
                     document.metrics.host_presentation_delay_ns as f64 / 1_000_000.0
                 ));
                 ui.monospace(format!(
+                    "Stage codec {:.2} ms",
+                    document.metrics.decoder_codec_stage_ns as f64 / 1_000_000.0
+                ));
+                ui.monospace(format!(
+                    "Stage scale {:.2} ms",
+                    document.metrics.decoder_scale_stage_ns as f64 / 1_000_000.0
+                ));
+                ui.monospace(format!(
+                    "Stage copy {:.2} ms",
+                    document.metrics.decoder_copy_stage_ns as f64 / 1_000_000.0
+                ));
+                ui.monospace(format!(
                     "Decoder {}",
                     document
                         .metrics

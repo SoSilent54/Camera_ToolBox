@@ -6,7 +6,7 @@ use std::{
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use camera_toolbox_app::{
@@ -51,15 +51,51 @@ impl FfmpegDecoderBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FfmpegRtspDecoderStatsSnapshot {
+    pub decoded_frames: u64,
+    pub codec_stage_ns: u64,
+    pub scale_stage_ns: u64,
+    pub copy_stage_ns: u64,
+}
+
 #[derive(Default)]
 pub struct FfmpegRtspDecoderStats {
     decoded_frames: AtomicU64,
+    codec_stage_ns: AtomicU64,
+    scale_stage_ns: AtomicU64,
+    copy_stage_ns: AtomicU64,
 }
 
 impl FfmpegRtspDecoderStats {
     #[must_use]
     pub fn decoded_frames(&self) -> u64 {
         self.decoded_frames.load(Ordering::Acquire)
+    }
+
+    #[must_use]
+    pub fn snapshot(&self) -> FfmpegRtspDecoderStatsSnapshot {
+        FfmpegRtspDecoderStatsSnapshot {
+            decoded_frames: self.decoded_frames.load(Ordering::Acquire),
+            codec_stage_ns: self.codec_stage_ns.load(Ordering::Acquire),
+            scale_stage_ns: self.scale_stage_ns.load(Ordering::Acquire),
+            copy_stage_ns: self.copy_stage_ns.load(Ordering::Acquire),
+        }
+    }
+
+    fn record_codec_stage(&self, elapsed: Duration) {
+        self.codec_stage_ns
+            .fetch_add(duration_nanos(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_scale_stage(&self, elapsed: Duration) {
+        self.scale_stage_ns
+            .fetch_add(duration_nanos(elapsed), Ordering::Relaxed);
+    }
+
+    fn record_copy_stage(&self, elapsed: Duration) {
+        self.copy_stage_ns
+            .fetch_add(duration_nanos(elapsed), Ordering::Relaxed);
     }
 }
 
@@ -99,7 +135,7 @@ impl FfmpegRtspDecoder {
         prefer_hardware_acceleration: bool,
         cancellation: &StreamCancellation,
     ) -> Result<Self, FfmpegRtspDecoderError> {
-        let frame_bytes = frame_byte_len(width, height)?;
+        frame_byte_len(width, height)?;
         ffmpeg::init()
             .map_err(|error| FfmpegRtspDecoderError::Initialization(error.to_string()))?;
         ffmpeg::format::network::init();
@@ -137,7 +173,6 @@ impl FfmpegRtspDecoder {
                     latency_mode,
                     width,
                     height,
-                    frame_bytes,
                     session_id,
                     channel,
                     io_timeout,
@@ -200,7 +235,6 @@ fn decode_rtsp(
     latency_mode: RtspLatencyMode,
     output_width: u32,
     output_height: u32,
-    frame_bytes: usize,
     session_id: StreamSessionId,
     channel: u16,
     io_timeout: Duration,
@@ -227,6 +261,7 @@ fn decode_rtsp(
     // `avcodec_parameters_to_context` 不复制 pkt_timebase。best-effort PTS 的单位
     // 必须由 demuxed video stream 明确传入，才可按该 stream time base 对外报告。
     decoder.set_packet_time_base(time_base);
+    decoder.set_threading(rtsp_decoder_threading());
     let mut decoder = decoder
         .video()
         .map_err(|error| format!("video decoder open failed: {error}"))?;
@@ -261,18 +296,29 @@ fn decode_rtsp(
         if packet.stream() != stream_index {
             continue;
         }
+        let codec_start = Instant::now();
         decoder
             .send_packet(&packet)
             .map_err(|error| format!("packet submission failed: {error}"))?;
-        while decoder.receive_frame(&mut decoded).is_ok() {
+        stats.record_codec_stage(codec_start.elapsed());
+        loop {
+            let codec_start = Instant::now();
+            if decoder.receive_frame(&mut decoded).is_err() {
+                stats.record_codec_stage(codec_start.elapsed());
+                break;
+            }
+            stats.record_codec_stage(codec_start.elapsed());
             if state.shutdown_requested.load(Ordering::Acquire) {
                 return Ok(());
             }
+            let scale_start = Instant::now();
             scaler
                 .run(&decoded, &mut rgba)
                 .map_err(|error| format!("RGBA conversion failed: {error}"))?;
-            let mut bytes = vec![0_u8; frame_bytes];
-            copy_rgba_tight(&rgba, output_width, output_height, &mut bytes)?;
+            stats.record_scale_stage(scale_start.elapsed());
+            let copy_start = Instant::now();
+            let bytes = copy_rgba_tight(&rgba, output_width, output_height)?;
+            stats.record_copy_stage(copy_start.elapsed());
             let source_pts = match (decoded.timestamp(), rational_parts(time_base)) {
                 (Some(ticks), Some((numerator, denominator))) => SourcePts::Known {
                     ticks,
@@ -373,6 +419,31 @@ fn rtsp_input_options(
     options
 }
 
+fn rtsp_decoder_threading() -> ffmpeg::codec::threading::Config {
+    rtsp_decoder_threading_with_count(rtsp_decoder_thread_count())
+}
+
+fn rtsp_decoder_thread_count() -> usize {
+    std::env::var("CAMERA_TOOLBOX_RTSP_DECODER_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or_else(default_rtsp_decoder_thread_count)
+}
+
+fn default_rtsp_decoder_thread_count() -> usize {
+    std::thread::available_parallelism().map_or(2, |threads| threads.get().clamp(2, 4))
+}
+
+fn rtsp_decoder_threading_with_count(count: usize) -> ffmpeg::codec::threading::Config {
+    let mut config = ffmpeg::codec::threading::Config::kind(ffmpeg::codec::threading::Type::Frame);
+    config.count = count;
+    config
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
+}
+
 fn ffmpeg_socket_timeout_micros(timeout: Duration) -> u64 {
     let micros = u64::try_from(timeout.as_micros()).unwrap_or(u64::MAX);
     micros.min(u64::try_from(i32::MAX).unwrap_or(u64::MAX))
@@ -388,30 +459,28 @@ fn copy_rgba_tight(
     frame: &ffmpeg::util::frame::video::Video,
     width: u32,
     height: u32,
-    destination: &mut [u8],
-) -> Result<(), String> {
+) -> Result<Vec<u8>, String> {
     let row_bytes = usize::try_from(width)
         .ok()
         .and_then(|width| width.checked_mul(4))
         .ok_or_else(|| "RGBA row width overflowed host memory".to_owned())?;
     let rows = usize::try_from(height).map_err(|_| "RGBA height overflowed host memory")?;
+    let frame_bytes = row_bytes
+        .checked_mul(rows)
+        .ok_or_else(|| "RGBA frame size overflowed host memory".to_owned())?;
     let stride = frame.stride(0);
     let source = frame.data(0);
-    if stride < row_bytes
-        || source.len() < stride.saturating_mul(rows)
-        || destination.len() != row_bytes * rows
-    {
+    if stride < row_bytes || source.len() < stride.saturating_mul(rows) {
         return Err(
             "FFmpeg RGBA frame layout does not match the configured output extent".to_owned(),
         );
     }
+    let mut destination = Vec::with_capacity(frame_bytes);
     for row in 0..rows {
         let source_start = row * stride;
-        let destination_start = row * row_bytes;
-        destination[destination_start..destination_start + row_bytes]
-            .copy_from_slice(&source[source_start..source_start + row_bytes]);
+        destination.extend_from_slice(&source[source_start..source_start + row_bytes]);
     }
-    Ok(())
+    Ok(destination)
 }
 
 #[cfg(test)]
@@ -432,6 +501,14 @@ mod tests {
             FfmpegDecoderBackend::SoftwareFallback.label(),
             "Software fallback (hardware backend unavailable in this build)"
         );
+    }
+
+    #[test]
+    fn rtsp_decoder_uses_bounded_ffmpeg_frame_threading() {
+        let threading = rtsp_decoder_threading_with_count(2);
+
+        assert_eq!(threading.kind, ffmpeg::codec::threading::Type::Frame);
+        assert_eq!(threading.count, 2);
     }
 
     #[test]

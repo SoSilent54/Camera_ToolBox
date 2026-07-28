@@ -232,11 +232,15 @@ impl LiveDocument {
             return;
         }
         let image = egui::ColorImage::from_rgba_unmultiplied([width, height], &frame.rgba);
-        self.texture = Some(context.load_texture(
-            format!("live-{}-{}", self.id, frame.identity.frame_sequence),
-            image,
-            egui::TextureOptions::LINEAR,
-        ));
+        if let Some(texture) = &mut self.texture {
+            texture.set(image, egui::TextureOptions::LINEAR);
+        } else {
+            self.texture = Some(context.load_texture(
+                format!("live-{}", self.id),
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
         let installed_host_time_ns = host_monotonic_time_ns();
         let host_presentation_delay_ns =
             installed_host_time_ns.saturating_sub(frame.identity.host_monotonic_time_ns);
@@ -394,6 +398,39 @@ mod tests {
         );
         document.install_latest_texture(&egui::Context::default());
         assert!(document.texture().is_some());
+    }
+
+    #[test]
+    fn installing_next_live_frame_reuses_existing_texture_handle() {
+        let latest = Arc::new(LatestDecodedFrameSlot::default());
+        latest.publish(frame(1, 17));
+        let mut document = LiveDocument::new(
+            DocumentId::from_raw(1),
+            StreamSessionId::new("live-document-test").unwrap(),
+            Arc::clone(&latest),
+            source(),
+        );
+        document.install_latest_texture(&egui::Context::default());
+        let texture_id = document
+            .texture()
+            .expect("first frame creates texture")
+            .id();
+
+        latest.publish(frame(2, 34));
+        document.install_latest_texture(&egui::Context::default());
+
+        assert_eq!(
+            document.texture().expect("second frame keeps texture").id(),
+            texture_id
+        );
+        assert_eq!(
+            document
+                .displayed_frame()
+                .expect("second frame becomes displayed")
+                .identity
+                .frame_sequence,
+            2
+        );
     }
 
     #[test]

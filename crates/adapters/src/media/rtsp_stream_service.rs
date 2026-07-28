@@ -106,7 +106,7 @@ fn monitor_rtsp_decoder(
         ..StreamMetrics::default()
     }));
     let mut last_metric_at = started;
-    let mut last_metric_frames = 0_u64;
+    let mut last_metric = decoder.stats().snapshot();
     loop {
         if control.cancellation.is_cancelled() {
             decoder.shutdown();
@@ -125,17 +125,18 @@ fn monitor_rtsp_decoder(
                 ));
             }
         }
-        let decoded_frames = decoder.stats().decoded_frames();
+        let stats = decoder.stats().snapshot();
+        let decoded_frames = stats.decoded_frames;
         if now.saturating_duration_since(last_metric_at) >= Duration::from_millis(500) {
             let elapsed_ns =
                 u64::try_from(now.saturating_duration_since(last_metric_at).as_nanos())
                     .unwrap_or(u64::MAX);
+            let interval_frames = decoded_frames.saturating_sub(last_metric.decoded_frames);
             let decoded_fps_millihz = if elapsed_ns == 0 {
                 0
             } else {
                 u64::try_from(
-                    u128::from(decoded_frames.saturating_sub(last_metric_frames))
-                        .saturating_mul(1_000_000_000_000)
+                    u128::from(interval_frames).saturating_mul(1_000_000_000_000)
                         / u128::from(elapsed_ns),
                 )
                 .unwrap_or(u64::MAX)
@@ -143,11 +144,26 @@ fn monitor_rtsp_decoder(
             control.report(StreamServiceEvent::Metrics(StreamMetrics {
                 decoded_frames,
                 decoded_fps_millihz,
+                decoder_codec_stage_ns: average_stage_ns(
+                    stats.codec_stage_ns,
+                    last_metric.codec_stage_ns,
+                    interval_frames,
+                ),
+                decoder_scale_stage_ns: average_stage_ns(
+                    stats.scale_stage_ns,
+                    last_metric.scale_stage_ns,
+                    interval_frames,
+                ),
+                decoder_copy_stage_ns: average_stage_ns(
+                    stats.copy_stage_ns,
+                    last_metric.copy_stage_ns,
+                    interval_frames,
+                ),
                 decoder_backend: Some(decoder.backend().label().to_owned()),
                 ..StreamMetrics::default()
             }));
             last_metric_at = now;
-            last_metric_frames = decoded_frames;
+            last_metric = stats;
         }
         if let Some(completion) = decoder.completion() {
             let stage = if observed_sequence.is_some() {
@@ -186,6 +202,12 @@ fn monitor_rtsp_decoder(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+fn average_stage_ns(current: u64, previous: u64, frames: u64) -> u64 {
+    if frames == 0 {
+        return 0;
+    }
+    (current.saturating_sub(previous)) / frames
 }
 
 fn duration_millis(duration: Duration) -> u64 {

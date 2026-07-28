@@ -512,6 +512,12 @@ pub struct StreamMetrics {
     pub presented_fps_millihz: u64,
     /// decoder publish 到 GUI texture install 的本机单调时钟差；不是网络或源端延迟。
     pub host_presentation_delay_ns: u64,
+    /// 最近采样窗口内 codec send/receive 的平均耗时；按发布帧数摊销。
+    pub decoder_codec_stage_ns: u64,
+    /// 最近采样窗口内 swscale RGBA 转换的平均耗时。
+    pub decoder_scale_stage_ns: u64,
+    /// 最近采样窗口内 tight RGBA 拷贝/发布前封装的平均耗时。
+    pub decoder_copy_stage_ns: u64,
     /// 实际解码后端或明确的软件回退原因。
     pub decoder_backend: Option<String>,
     pub transport_queue_bytes: usize,
