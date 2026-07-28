@@ -64,6 +64,11 @@ const MIN_PREVIEW_ZOOM: f32 = 0.05;
 const MAX_PREVIEW_ZOOM: f32 = 64.0;
 const OBSERVED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(120, 230, 140);
 const REPROJECTED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 96, 96);
+const CURRENT_GUI_REPROJECTED_POINT_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 170, 255);
+const INITIAL_DISTORTION_NAMES: [&str; 12] = [
+    "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
+];
+const ZERO_DISTORTION_COEFFICIENTS: [f64; 12] = [0.0; 12];
 const RMSE_TEXT_ON_FILL: egui::Color32 = egui::Color32::from_rgb(12, 32, 45);
 const RMSE_TEXT_ON_TRACK: egui::Color32 = egui::Color32::WHITE;
 const REPROJECTION_ARROW_WIDTH: f32 = 1.25;
@@ -707,8 +712,9 @@ pub(crate) struct CalibrationWorkspace {
     fx: f64,
     fy: f64,
     cx: f64,
-    display_layer: CalibrationDisplayLayer,
     cy: f64,
+    initial_distortion_coefficients: [f64; 12],
+    display_layer: CalibrationDisplayLayer,
     preview_viewport: CalibrationPreviewViewport,
     preview_mode: CalibrationPreviewMode,
     coverage: Option<CoverageVisualization>,
@@ -752,6 +758,8 @@ impl CalibrationWorkspace {
             fy: 900.0,
             cx: 0.0,
             cy: 0.0,
+            initial_distortion_coefficients: ZERO_DISTORTION_COEFFICIENTS,
+            display_layer: CalibrationDisplayLayer::default(),
             preview_viewport: CalibrationPreviewViewport::default(),
             preview_mode: CalibrationPreviewMode::default(),
             coverage: None,
@@ -761,7 +769,6 @@ impl CalibrationWorkspace {
             acceptance_draft,
             acceptance_last_valid_criteria,
             live_admission_context: None,
-            display_layer: CalibrationDisplayLayer::default(),
             auto_capture: AutoCaptureSession {
                 next_candidate_id: 1,
                 ..AutoCaptureSession::default()
@@ -1184,7 +1191,7 @@ impl CalibrationWorkspace {
         }
         let initial_intrinsics = InitialIntrinsics {
             camera_matrix: [self.fx, 0.0, self.cx, 0.0, self.fy, self.cy, 0.0, 0.0, 1.0],
-            distortion_coefficients: vec![0.0; 12],
+            distortion_coefficients: self.initial_distortion_coefficients.to_vec(),
         };
         initial_intrinsics.validate().ok()?;
         Some(DatasetPoseEstimationSeed::Fixed(initial_intrinsics))
@@ -1614,14 +1621,7 @@ impl CalibrationWorkspace {
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
         self.sync_coverage(context);
         let rect = ui.available_rect_before_wrap();
-        self.render_controls(
-            context,
-            ui,
-            export_enabled,
-            export_reason,
-            sftp_source,
-            provision_target,
-        );
+        self.render_controls(ui);
         ui.separator();
         let mut dataset_sidebar_expanded = self.dataset_sidebar_expanded;
         let mut requested_sidebar_state = None;
@@ -1711,7 +1711,14 @@ impl CalibrationWorkspace {
         egui::ScrollArea::vertical()
             .id_salt("calibration_metrics")
             .show(ui, |ui| {
-                render_calibration_result(ui, self.session.installed());
+                self.render_calibration_result_panel(
+                    context,
+                    ui,
+                    export_enabled,
+                    export_reason,
+                    sftp_source,
+                    provision_target,
+                );
             });
         (rect, capture_request)
     }
@@ -1758,7 +1765,7 @@ impl CalibrationWorkspace {
         );
     }
 
-    fn render_controls(
+    fn render_calibration_result_panel(
         &mut self,
         context: &egui::Context,
         ui: &mut egui::Ui,
@@ -1767,6 +1774,106 @@ impl CalibrationWorkspace {
         sftp_source: Result<&str, &str>,
         provision_target: Result<&str, &str>,
     ) {
+        let idle = self.active_job.is_none();
+        let installed = self.session.installed().is_some();
+        let regular_export_enabled = idle && installed && export_enabled;
+
+        egui::CollapsingHeader::new("Calibration result")
+            .id_salt("calibration_result_foldout")
+            .default_open(true)
+            .show(ui, |ui| {
+                render_calibration_result(ui, self.session.installed());
+                ui.separator();
+                ui.horizontal_wrapped(|ui| {
+                    if ui
+                        .add_enabled(regular_export_enabled, egui::Button::new("Export JSON"))
+                        .on_disabled_hover_text(export_reason.unwrap_or(
+                            "A calibration result and writable Explorer directory are required.",
+                        ))
+                        .clicked()
+                    {
+                        self.pending_export = self.json_export();
+                    }
+                    let export_yaml = ui
+                        .add_enabled(
+                            regular_export_enabled,
+                            egui::Button::new("Export YAML Result"),
+                        )
+                        .on_disabled_hover_text(export_reason.unwrap_or(
+                            "A calibration result and writable Explorer directory are required.",
+                        ))
+                        .clicked()
+                        .then(|| {
+                            self.session
+                                .installed()
+                                .map(|installed| installed.solution.clone())
+                        })
+                        .flatten();
+                    if let Some(solution) = export_yaml {
+                        self.pending_export = Some(CalibrationExport::Yaml(solution));
+                    }
+                });
+                if installed && !export_enabled {
+                    ui.colored_label(
+                        egui::Color32::YELLOW,
+                        export_reason
+                            .unwrap_or("Select a writable Explorer directory before exporting."),
+                    );
+                }
+            });
+
+        let eeprom_error = self.eeprom_image().err();
+        ui.collapsing("EEPROM Provisioning", |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("EEPROM SN");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.serial_number)
+                        .desired_width(160.0)
+                        .hint_text("14 ASCII bytes"),
+                );
+                ui.weak("Required only for EEPROM BIN / direct provisioning.");
+                let eeprom_enabled = regular_export_enabled && eeprom_error.is_none();
+                if ui
+                    .add_enabled(eeprom_enabled, egui::Button::new("Save EEPROM BIN"))
+                    .on_disabled_hover_text(
+                        eeprom_error.as_deref().unwrap_or(
+                            "A calibration result and valid 14-byte ASCII SN are required.",
+                        ),
+                    )
+                    .clicked()
+                    && let Ok(image) = self.eeprom_image()
+                {
+                    self.pending_export = Some(CalibrationExport::EepromBin(image));
+                }
+            });
+            if !export_enabled {
+                ui.colored_label(
+                    egui::Color32::YELLOW,
+                    export_reason
+                        .unwrap_or("Select a writable Explorer directory before exporting."),
+                );
+            }
+            let solution = self
+                .session
+                .installed()
+                .map(|installed| installed.solution.clone());
+            self.eeprom.render_body(
+                context,
+                ui,
+                solution.as_ref(),
+                &self.serial_number,
+                sftp_source,
+                provision_target,
+                (!export_enabled).then_some(
+                    export_reason
+                        .unwrap_or("Select a writable Explorer directory before exporting."),
+                ),
+            );
+        });
+        self.eeprom.render_confirmation(context, provision_target);
+    }
+
+    fn render_controls(&mut self, ui: &mut egui::Ui) {
         self.refresh_auto_intrinsics_fields();
         let idle = self.active_job.is_none();
         ui.horizontal_wrapped(|ui| {
@@ -1831,7 +1938,7 @@ impl CalibrationWorkspace {
             ui.add_enabled_ui(idle, |ui| {
                 intrinsics_changed |= ui
                     .checkbox(&mut self.auto_intrinsics, "Auto initial intrinsics")
-                    .on_hover_text("Auto: fx=fy=900 px, cx=width/2, cy=height/2")
+                    .on_hover_text("Auto: fx=fy=900 px, cx=width/2, cy=height/2, D12=0")
                     .changed();
                 ui.label("fx");
                 intrinsics_changed |= ui
@@ -1888,7 +1995,7 @@ impl CalibrationWorkspace {
                 .add_enabled(
                     idle && self.auto_capture.pending.is_none()
                         && self.session.installed().is_some(),
-                    egui::Button::new("Use result as initial K"),
+                    egui::Button::new("Use result as initial K+D12"),
                 )
                 .on_disabled_hover_text(
                     "Requires an installed result and no active calibration or live candidate.",
@@ -1904,79 +2011,36 @@ impl CalibrationWorkspace {
                 self.cancel_active_job();
             }
         });
+        ui.collapsing("Initial distortion D12", |ui| {
+            ui.weak(
+                "Manual values seed Calibrate and Dataset PnP. Auto initial intrinsics uses D12=0.",
+            );
+            let distortion_enabled = idle && !self.auto_intrinsics;
+            egui::Grid::new("calibration_initial_distortion")
+                .num_columns(8)
+                .striped(true)
+                .show(ui, |ui| {
+                    for (index, name) in INITIAL_DISTORTION_NAMES.iter().enumerate() {
+                        ui.label(*name);
+                        intrinsics_changed |= ui
+                            .add_enabled(
+                                distortion_enabled,
+                                egui::DragValue::new(
+                                    &mut self.initial_distortion_coefficients[index],
+                                )
+                                .speed(0.0001),
+                            )
+                            .changed();
+                        if (index + 1) % 4 == 0 {
+                            ui.end_row();
+                        }
+                    }
+                });
+        });
         if intrinsics_changed {
             self.refresh_runtime_auto_admission();
             self.start_dataset_pnp_refresh();
         }
-
-        let regular_export_enabled = idle && self.session.installed().is_some() && export_enabled;
-        let eeprom_error = self.eeprom_image().err();
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(regular_export_enabled, egui::Button::new("Export JSON"))
-                .clicked()
-            {
-                self.pending_export = self.json_export();
-            }
-            if ui
-                .add_enabled(
-                    regular_export_enabled,
-                    egui::Button::new("Export YAML Result"),
-                )
-                .clicked()
-                && let Some(installed) = self.session.installed()
-            {
-                self.pending_export = Some(CalibrationExport::Yaml(installed.solution.clone()));
-            }
-        });
-        ui.collapsing("EEPROM Provisioning", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("EEPROM SN");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.serial_number)
-                        .desired_width(160.0)
-                        .hint_text("14 ASCII bytes"),
-                );
-                ui.weak("Required only for EEPROM BIN / direct provisioning.");
-                let eeprom_enabled = regular_export_enabled && eeprom_error.is_none();
-                if ui
-                    .add_enabled(eeprom_enabled, egui::Button::new("Save EEPROM BIN"))
-                    .on_disabled_hover_text(
-                        eeprom_error.as_deref().unwrap_or(
-                            "A calibration result and valid 14-byte ASCII SN are required.",
-                        ),
-                    )
-                    .clicked()
-                    && let Ok(image) = self.eeprom_image()
-                {
-                    self.pending_export = Some(CalibrationExport::EepromBin(image));
-                }
-            });
-            if !export_enabled {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    export_reason
-                        .unwrap_or("Select a writable Explorer directory before exporting."),
-                );
-            }
-            let solution = self
-                .session
-                .installed()
-                .map(|installed| installed.solution.clone());
-            self.eeprom.render_body(
-                context,
-                ui,
-                solution.as_ref(),
-                &self.serial_number,
-                sftp_source,
-                provision_target,
-                (!export_enabled).then_some(
-                    export_reason
-                        .unwrap_or("Select a writable Explorer directory before exporting."),
-                ),
-            );
-        });
-        self.eeprom.render_confirmation(context, provision_target);
     }
 
     // 为下方 Dataset 表保留可操作高度；小窗口仍保留最小的验收滚动视口。
@@ -2343,6 +2407,11 @@ impl CalibrationWorkspace {
                         "Mirror the Dataset preview image and all preview overlays horizontally.",
                     );
             });
+            if self.preview_mode != CalibrationPreviewMode::Heatmap {
+                ui.weak(
+                    "Overlay legend: green detected corners, red installed-result reprojection, blue current GUI K+D12 PnP reprojection.",
+                );
+            }
             let image_size = self
                 .sources
                 .get(&id)
@@ -2429,10 +2498,34 @@ impl CalibrationWorkspace {
         let map = |point| image_point_to_preview(point, image_rect, width, height, horizontal_flip);
         let projected = calibration_view(self.session.installed(), id)
             .map(|view| view.projected_points.as_slice());
+        let current_dataset_pnp = item.pnp_observation.as_ref().and_then(|observation| {
+            let binding = self.dataset_pnp_binding(detection.image_size)?;
+            (observation.binding_digest == binding.digest).then_some((observation, binding))
+        });
+        let current_gui_projected =
+            current_dataset_pnp
+                .as_ref()
+                .and_then(|(observation, binding)| {
+                    projected_board_corners_for_preview(
+                        observation,
+                        &binding.initial_intrinsics,
+                        self.session.board(),
+                        image_rect,
+                        width,
+                        height,
+                        horizontal_flip,
+                    )
+                });
         for (index, observed) in detection.corners.iter().copied().enumerate() {
             let observed_position = map(observed);
             if let Some(projected) = projected.and_then(|points| points.get(index)).copied() {
                 paint_reprojection_vector(&painter, observed_position, map(projected));
+            }
+            if let Some(Some(position)) = current_gui_projected
+                .as_ref()
+                .and_then(|points| points.get(index))
+            {
+                paint_current_gui_reprojection_point(&painter, *position);
             }
             painter.circle_stroke(
                 observed_position,
@@ -2440,9 +2533,7 @@ impl CalibrationWorkspace {
                 egui::Stroke::new(1.25, OBSERVED_POINT_COLOR),
             );
         }
-        if let Some(observation) = item.pnp_observation.as_ref()
-            && let Some(binding) = self.dataset_pnp_binding(detection.image_size)
-            && observation.binding_digest == binding.digest
+        if let Some((observation, binding)) = current_dataset_pnp.as_ref()
             && let Some(projection) = pose_axis_projection(
                 observation,
                 &binding.initial_intrinsics,
@@ -3321,9 +3412,11 @@ impl CalibrationWorkspace {
     }
 
     fn refresh_auto_intrinsics_fields(&mut self) {
-        if self.auto_intrinsics
-            && let Some((fx, fy, cx, cy)) = self.auto_intrinsics_values()
-        {
+        if !self.auto_intrinsics {
+            return;
+        }
+        self.initial_distortion_coefficients = ZERO_DISTORTION_COEFFICIENTS;
+        if let Some((fx, fy, cx, cy)) = self.auto_intrinsics_values() {
             self.fx = fx;
             self.fy = fy;
             self.cx = cx;
@@ -3364,7 +3457,7 @@ impl CalibrationWorkspace {
         };
         let initial = InitialIntrinsics {
             camera_matrix: [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0],
-            distortion_coefficients: vec![0.0; 12],
+            distortion_coefficients: self.active_initial_distortion_coefficients(),
         };
         initial.validate().map_err(|error| error.to_string())?;
         Ok(initial)
@@ -3386,20 +3479,21 @@ impl CalibrationWorkspace {
         };
         let initial = InitialIntrinsics {
             camera_matrix: [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0],
-            distortion_coefficients: vec![0.0; 12],
+            distortion_coefficients: self.active_initial_distortion_coefficients(),
         };
         initial.validate().map_err(|error| error.to_string())?;
         Ok(initial)
     }
 
     fn use_installed_result_as_initial_intrinsics(&mut self) {
-        let Some((fx, fy, cx, cy)) = self.session.installed().map(|installed| {
+        let Some((fx, fy, cx, cy, distortion)) = self.session.installed().map(|installed| {
             let camera_matrix = installed.solution.camera_matrix;
             (
                 camera_matrix[0],
                 camera_matrix[4],
                 camera_matrix[2],
                 camera_matrix[5],
+                distortion_coefficients_to_d12(&installed.solution.distortion_coefficients),
             )
         }) else {
             return;
@@ -3409,10 +3503,19 @@ impl CalibrationWorkspace {
         self.fy = fy;
         self.cx = cx;
         self.cy = cy;
+        self.initial_distortion_coefficients = distortion;
         self.refresh_runtime_auto_admission();
         self.status =
-            "Installed result K copied into editable initial-intrinsics controls.".to_owned();
+            "Installed result K+D12 copied into editable initial-intrinsics controls.".to_owned();
         self.start_dataset_pnp_refresh();
+    }
+
+    fn active_initial_distortion_coefficients(&self) -> Vec<f64> {
+        if self.auto_intrinsics {
+            ZERO_DISTORTION_COEFFICIENTS.to_vec()
+        } else {
+            self.initial_distortion_coefficients.to_vec()
+        }
     }
 
     fn json_export(&self) -> Option<CalibrationExport> {
@@ -3601,6 +3704,48 @@ fn paint_reprojection_vector(painter: &egui::Painter, observed: egui::Pos2, proj
         );
     }
     painter.circle_filled(projected, 2.0, REPROJECTED_POINT_COLOR);
+}
+
+fn paint_current_gui_reprojection_point(painter: &egui::Painter, projected: egui::Pos2) {
+    painter.circle_filled(projected, 2.75, CURRENT_GUI_REPROJECTED_POINT_COLOR);
+    painter.circle_stroke(
+        projected,
+        4.0,
+        egui::Stroke::new(1.0, CURRENT_GUI_REPROJECTED_POINT_COLOR),
+    );
+}
+
+fn projected_board_corners_for_preview(
+    observation: &PnPObservation,
+    intrinsics: &InitialIntrinsics,
+    board: BoardSpec,
+    image_rect: egui::Rect,
+    image_width: u32,
+    image_height: u32,
+    horizontal_flip: bool,
+) -> Option<Vec<Option<egui::Pos2>>> {
+    let rotation = rodrigues_matrix_for_preview(observation.rotation_vector)?;
+    let capacity = board.corner_count().ok()?;
+    let mut projected = Vec::with_capacity(capacity);
+    for row in 0..board.inner_rows {
+        for column in 0..board.inner_cols {
+            projected.push(project_board_point(
+                rotation,
+                observation.translation_vector,
+                [
+                    f64::from(column) * board.square_size,
+                    f64::from(row) * board.square_size,
+                    0.0,
+                ],
+                intrinsics,
+                image_rect,
+                image_width,
+                image_height,
+                horizontal_flip,
+            ));
+        }
+    }
+    Some(projected)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4339,11 +4484,18 @@ pub(crate) fn paint_heatmap_guides(painter: &egui::Painter, rect: egui::Rect) {
     );
 }
 
+fn distortion_coefficients_to_d12(values: &[f64]) -> [f64; 12] {
+    let mut distortion = ZERO_DISTORTION_COEFFICIENTS;
+    for (target, value) in distortion.iter_mut().zip(values.iter().copied()) {
+        *target = value;
+    }
+    distortion
+}
+
 fn render_calibration_result(
     ui: &mut egui::Ui,
     installed: Option<&camera_toolbox_app::InstalledCalibration>,
 ) {
-    ui.strong("Calibration result");
     let Some(installed) = installed else {
         ui.weak("Run Calibrate to display final intrinsics and distortion coefficients.");
         return;
@@ -4384,15 +4536,12 @@ fn render_calibration_result(
             }
         });
     ui.label("Distortion coefficients (OpenCV order)");
-    const NAMES: [&str; 12] = [
-        "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
-    ];
     egui::Grid::new("calibration_result_distortion")
         .num_columns(4)
         .striped(true)
         .show(ui, |ui| {
             for (index, value) in solution.distortion_coefficients.iter().enumerate() {
-                let name = NAMES.get(index).copied().unwrap_or("d");
+                let name = INITIAL_DISTORTION_NAMES.get(index).copied().unwrap_or("d");
                 ui.monospace(format!("{name}[{index}] = {value:.10}"));
                 if (index + 1) % 4 == 0 {
                     ui.end_row();
@@ -4842,6 +4991,112 @@ mod tests {
     }
 
     #[test]
+    fn initial_intrinsics_and_dataset_pnp_use_editable_d12() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_intrinsics = false;
+        workspace.fx = 810.0;
+        workspace.fy = 820.0;
+        workspace.cx = 320.0;
+        workspace.cy = 240.0;
+        workspace.initial_distortion_coefficients = [
+            0.11, -0.12, 0.001, -0.002, 0.03, 0.04, -0.05, 0.06, 0.0007, -0.0008, 0.0009, -0.001,
+        ];
+
+        let initial = workspace.initial_intrinsics().unwrap();
+        assert_eq!(
+            initial.distortion_coefficients,
+            workspace.initial_distortion_coefficients.to_vec()
+        );
+        let image_size = CalibrationImageSize::new(640, 480).unwrap();
+        let binding = workspace.dataset_pnp_binding(image_size).unwrap();
+        assert_eq!(
+            binding.initial_intrinsics.distortion_coefficients,
+            workspace.initial_distortion_coefficients.to_vec()
+        );
+        let request = workspace
+            .dataset_pose_request_for_image(image_size)
+            .unwrap();
+        assert_eq!(
+            request.initial_intrinsics.distortion_coefficients,
+            workspace.initial_distortion_coefficients.to_vec()
+        );
+
+        workspace.auto_intrinsics = true;
+        let auto_initial = workspace.initial_intrinsics_for_image(image_size).unwrap();
+        assert_eq!(
+            auto_initial.distortion_coefficients,
+            ZERO_DISTORTION_COEFFICIENTS.to_vec()
+        );
+        workspace.refresh_auto_intrinsics_fields();
+        assert_eq!(
+            workspace.initial_distortion_coefficients,
+            ZERO_DISTORTION_COEFFICIENTS
+        );
+    }
+
+    #[test]
+    fn use_result_as_initial_intrinsics_copies_k_and_d12() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        for index in 0..3 {
+            install_detection_outcome(
+                &mut workspace,
+                &format!("copy-{index}.png"),
+                found_detection(640, 480),
+            );
+        }
+        let snapshot = workspace
+            .session
+            .calibration_snapshot(workspace.initial_intrinsics().unwrap())
+            .unwrap();
+        let views = snapshot
+            .request
+            .image_points
+            .iter()
+            .map(|points| camera_toolbox_core::ViewCalibrationResult {
+                rotation_vector: [0.0; 3],
+                translation_vector: [0.0, 0.0, 1.0],
+                projected_points: points.clone(),
+                reprojection_rmse: 0.1,
+                max_reprojection_error: 0.2,
+            })
+            .collect();
+        let distortion = vec![
+            0.1, -0.2, 0.001, -0.002, 0.03, 0.01, -0.01, 0.005, 0.0001, -0.0001, 0.0002, -0.0002,
+        ];
+        let solution = CalibrationSolution {
+            image_size: snapshot.request.image_size,
+            camera_matrix: [620.0, 0.0, 318.0, 0.0, 621.0, 241.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: distortion.clone(),
+            rms_error: 0.15,
+            calibration_flags: camera_toolbox_core::PANGBOT_CALIBRATION_FLAGS,
+            views,
+        };
+        workspace
+            .session
+            .install_solution(snapshot, solution)
+            .unwrap();
+
+        workspace.use_installed_result_as_initial_intrinsics();
+
+        assert!(!workspace.auto_intrinsics);
+        assert_eq!((workspace.fx, workspace.fy), (620.0, 621.0));
+        assert_eq!((workspace.cx, workspace.cy), (318.0, 241.0));
+        assert_eq!(
+            workspace.initial_distortion_coefficients,
+            distortion_coefficients_to_d12(&distortion)
+        );
+        assert_eq!(
+            workspace
+                .initial_intrinsics()
+                .unwrap()
+                .distortion_coefficients,
+            distortion
+        );
+    }
+
+    #[test]
     fn coverage_heatmap_uses_enabled_found_views_only() {
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
@@ -4938,6 +5193,59 @@ mod tests {
         assert!((projection.y_axis.x - projection.origin.x).abs() < 1.0e-4);
         assert!(projection.z_axis.x < projection.origin.x);
         assert!(projection.z_axis.y < projection.origin.y);
+    }
+
+    #[test]
+    fn current_gui_projection_points_apply_d12_distortion() {
+        let image_size = CalibrationImageSize::new(640, 480).unwrap();
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let mut distorted = InitialIntrinsics {
+            camera_matrix: [500.0, 0.0, 320.0, 0.0, 500.0, 240.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        let zero = distorted.clone();
+        let binding =
+            InitialIntrinsicsBinding::dataset_full_frame(zero.clone(), image_size).unwrap();
+        let observation = PnPObservation::from_view_result(
+            binding.digest,
+            ViewCalibrationResult {
+                rotation_vector: [0.0, 0.0, 0.0],
+                translation_vector: [0.0, 0.0, 1000.0],
+                projected_points: Vec::new(),
+                reprojection_rmse: 0.1,
+                max_reprojection_error: 0.2,
+            },
+            board,
+        )
+        .unwrap();
+        distorted.distortion_coefficients[0] = 0.5;
+        let image_rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0));
+
+        let zero_points = projected_board_corners_for_preview(
+            &observation,
+            &zero,
+            board,
+            image_rect,
+            image_size.width,
+            image_size.height,
+            false,
+        )
+        .unwrap();
+        let distorted_points = projected_board_corners_for_preview(
+            &observation,
+            &distorted,
+            board,
+            image_rect,
+            image_size.width,
+            image_size.height,
+            false,
+        )
+        .unwrap();
+        let zero_last = zero_points.last().and_then(|point| *point).unwrap();
+        let distorted_last = distorted_points.last().and_then(|point| *point).unwrap();
+
+        assert!(distorted_last.x > zero_last.x);
+        assert!(distorted_last.y > zero_last.y);
     }
 
     #[test]

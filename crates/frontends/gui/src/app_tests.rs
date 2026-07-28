@@ -1389,6 +1389,30 @@ fn calibration_workspace_switch_preserves_viewer_documents() {
     assert!(!visible.contains("Observe-only"));
 }
 
+#[test]
+fn live_status_bar_reports_stream_stage_before_media_negotiation() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    app.workspace.open_live(
+        camera_toolbox_app::StreamSessionId::new("live-status-stage-test").unwrap(),
+        latest,
+        test_live_source(),
+    );
+    app.workspace
+        .active_live_mut()
+        .expect("live document is active")
+        .stage = camera_toolbox_app::StreamStage::ConfirmingRtp;
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+    let visible = accessibility_text(&output);
+    assert!(visible.contains("Stream stage: ConfirmingRtp"));
+    assert!(visible.contains("Stage: ConfirmingRtp"));
+    assert!(!visible.contains("Negotiating"));
+}
+
 #[cfg(feature = "calibration-opencv")]
 #[test]
 fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
@@ -1428,6 +1452,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     let visible = accessibility_text(&output);
     assert!(visible.contains("RTSP · Test · CH0"));
     assert!(visible.contains("Stream stage: Connecting"));
+    assert!(!visible.contains("Negotiating"));
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
     assert!(visible.contains("EEPROM Provisioning"));

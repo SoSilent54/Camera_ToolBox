@@ -1912,7 +1912,7 @@ impl CameraToolboxApp {
             }
             if let Some(document) = self.workspace.active_live() {
                 let media = document.media.as_ref().map_or_else(
-                    || "Negotiating".to_owned(),
+                    || format!("Stage: {:?}", document.stage),
                     |media| {
                         format!(
                             "{:?} {}×{} PT {} SSRC {:08x} {} fps",

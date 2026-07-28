@@ -350,7 +350,7 @@ CalibrationSession::calibration_snapshot
    ▼
 OpenCvCalibrationBackend::calibrate
    ├ object points = (column*d, row*d, 0)
-   ├ initial K + 12 zero distortion coefficients
+   ├ initial K + editable D12 seed（自动初始内参时 D12=0）
    ├ calibrateCamera(fixed Pangbot flags)
    ├ projectPoints per view
    └ per-view RMSE / max error
@@ -597,6 +597,8 @@ GUI 还能叠加：
 | `camera_intrinsics.yaml` | $f_x,f_y,c_x,c_y$、完整 $D12=[k_1,k_2,p_1,p_2,k_3,k_4,k_5,k_6,s_1,s_2,s_3,s_4]$、width、height | 当前 OpenCV rational + thin-prism 标定结果交换 | 固定文本布局；消费端必须支持完整 D12 及 OpenCV 系数顺序 |
 | `camera_eeprom.bin` | width/height、4 个内参、$k_1,k_2,p_1,p_2,k_3,k_4,k_5,k_6$，以及 4 个值为 0 的 `s1..s4` 槽位 | 当前 Yg Stereo EEPROM 流程 | 输入可以是 D8 或 D12，但 `validated_distortion()` 只复制前 8 项并强制清零 thin-prism；参数转为 `f32`，绑定具体 EEPROM map |
 
+导出入口位于 GUI 的 `Calibration result` 折叠区域末尾；`EEPROM Provisioning` 是其下方独立折叠区域，因此收起标定结果不会隐藏 EEPROM 写入状态与确认弹窗。
+
 JSON 与 YAML 保存相同的完整 D12，EEPROM 仍是独立的 D8 降阶协议：
 
 ```text
@@ -801,9 +803,9 @@ PnP 证据必须具有有限的位姿和重投影指标，棋盘所有角点在�
 
 编辑 Dataset Acceptance 文本框时允许临时不完整输入；焦点仍在文本框内时不会弹出红色错误或替换当前 runtime admission，而是继续使用上一组完整合法门限。字段补全为合法值后立即安装；离开编辑焦点后仍非法才显示错误。
 
-普通 Dataset 的 PnP binding 不依赖 live source。每次本地/SFTP PNG 读取完成或手动 RTSP 快门帧进入检测时，GUI 用当前可见的 $f_x/f_y/c_x/c_y$ 和 D12 seed 为该图片尺寸创建来源无关 binding；`auto_intrinsics` 打开时使用 `fx=fy=900`、`cx=w/2`、`cy=h/2`。如果检测期间 GUI K、图片尺寸或 binding digest 变化，返回的旧 PnP 会被丢弃；修改 $f_x/f_y/c_x/c_y$、D12 seed 或仅 square size 变化后，GUI 会对既有 `Found` Dataset 项异步刷新/补算来源无关 PnP，不需要重新点击 `Detect`。角点布局变化仍会使检测本身失效，必须重新 Detect。
+普通 Dataset 的 PnP binding 不依赖 live source。每次本地/SFTP PNG 读取完成或手动 RTSP 快门帧进入检测时，GUI 用当前可见的 $f_x/f_y/c_x/c_y$ 和可编辑 D12 seed 为该图片尺寸创建来源无关 binding；`auto_intrinsics` 打开时使用 `fx=fy=900`、`cx=w/2`、`cy=h/2`、`D12=0`。如果检测期间 GUI K/D12、图片尺寸或 binding digest 变化，返回的旧 PnP 会被丢弃；修改 $f_x/f_y/c_x/c_y$、D12 seed 或仅 square size 变化后，GUI 会对既有 `Found` Dataset 项异步刷新/补算来源无关 PnP，不需要重新点击 `Detect`。角点布局变化仍会使检测本身失效，必须重新 Detect。
 
-Overlay 与 Input image 预览模式会在当前 Dataset PnP binding 匹配时绘制棋盘姿态坐标轴：原点是标定板中心，+X/+Y/+Z 端点由当前 PnP 位姿和 GUI K/D12 投影到图像，再经过同一 preview/crop 映射显示；没有当前有效 PnP 时不绘制，Heatmap-only 模式不叠加输入图像标注。
+Overlay 与 Input image 预览模式会同时绘制三类图像空间标记：绿色为检测角点，红色为已安装完整标定解的逐点重投影残差向量，蓝色为当前 GUI $K+D12$ 下 Dataset PnP 的重投影点。棋盘姿态坐标轴也使用当前 Dataset PnP binding：原点是标定板中心，+X/+Y/+Z 端点由当前 PnP 位姿和 GUI K/D12 投影到图像，再经过同一 preview/crop 映射显示；没有当前有效 PnP 时不绘制蓝色点和姿态轴，Heatmap-only 模式不叠加输入图像标注。
 
 Dataset 表保留原 `Status` 作为读取/检测流水线状态，并新增 `Acceptance` 列单独显示当前验收状态，避免把 `Found` / `NotFound` 与 Dataset 门限混在一起。`Acceptance` 可显示 `Accepted`、`Depth Gap`、`Pose Gap`、`RMSE ReProj Gap`、`Max ReProj Gap`、`No Gain Gap`、`Geometry Gap`、`PnP Gap` 等。PnP 指标列拆成 `Depth`（棋盘中心深度）、`Angle dir`（棋盘法向 azimuth，OpenCV 图像轴，90° 向下）和 `Angle`（棋盘法向 tilt）；hover 可见 RMSE 和最大重投影误差。后续的 `Found Δ`、`Field Δ`、`Depth Δ`、`Pose Δ`、`Gain` 由当前完整有效 Dataset 的来源无关目标封顶归属计算，而不是记录自动入库瞬间的候选增益，也不是 leave-one-out 删除损失：
 
@@ -817,9 +819,10 @@ $$
 
 Found views 是采集进度和总分的一部分；自动入库的决定量使用同一 source-bound assessment 中尚未满足目标的 Found、field、depth 和 pose bin 的确定性正增益之和。面板可能显示 collection milestones，但它只表示当前运行时阈值的覆盖状态，不是生产资格。
 
-### 15.4 将已安装结果回写为初始 $K$
+### 15.4 将已安装结果回写为初始 $K+D12$
 
-`Use result as initial K` 紧邻 `Calibrate`。它仅在已安装标定解且没有活动标定或直播候选时可用；点击后将解矩阵的 `[0]`、`[4]`、`[2]`、`[5]` 分别复制到可编辑的 $f_x$、$f_y$、$c_x$、$c_y$，并关闭自动初始内参。该动作不会修改 D12、EEPROM、已安装解或导出结果；若存在直播上下文，会据此立即重建运行时自动准入绑定。
+`Use result as initial K+D12` 紧邻 `Calibrate`。它仅在已安装标定解且没有活动标定或直播候选时可用；点击后将解矩阵的 `[0]`、`[4]`、`[2]`、`[5]` 分别复制到可编辑的 $f_x$、$f_y$、$c_x$、$c_y$，并把当前 solution 的 OpenCV 畸变系数复制到 12 个初始畸变输入格（不足 12 项补 0），同时关闭自动初始内参。该动作不会修改 EEPROM、已安装解或导出结果；若存在直播上下文，会据此立即重建运行时自动准入绑定，并触发普通 Dataset PnP 异步刷新。
+
 ## 16. 参考资料
 
 - Zhengyou Zhang, [A Flexible New Technique for Camera Calibration](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr98-71.pdf)。平面单应约束、线性初始化和联合优化的基础。
