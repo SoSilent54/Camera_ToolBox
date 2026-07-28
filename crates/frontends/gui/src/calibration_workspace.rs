@@ -2129,10 +2129,11 @@ impl CalibrationWorkspace {
 
     fn render_dataset_acceptance_panel(&mut self, ui: &mut egui::Ui) {
         let fallback_criteria = self.acceptance_last_valid_criteria.clone();
-        let progress = self.dataset_acceptance_assessment().map_or_else(
+        let mut progress = self.dataset_acceptance_assessment().map_or_else(
             || DatasetAcceptanceProgress::empty(&fallback_criteria),
             |assessment| DatasetAcceptanceProgress::from_assessment(&assessment),
         );
+        progress.selected_item = self.session.selected();
         let state = DatasetAcceptancePanelState {
             has_live_context: self.live_admission_context.is_some(),
             admission_active: self.active_live_admission(),
@@ -2150,6 +2151,9 @@ impl CalibrationWorkspace {
             state,
             acceptance_viewport_height,
         );
+        if let Some(id) = render_result.selected_item {
+            let _ = self.session.set_selected(id);
+        }
         self.apply_acceptance_render_result(render_result.changed, render_result.editing);
     }
 

@@ -16,10 +16,11 @@ pub use asset::{
 };
 pub use calibration::{
     AUTO_CAPTURE_DETECTOR_FINGERPRINT, AUTO_CAPTURE_FEATURE_SCHEMA_VERSION,
-    AddCalibrationItemOutcome, AutoAdmissionAssessment, AutoAdmissionItemContribution,
-    AutoAdmissionPnpState, AutoCandidateAdmission, AutoCandidateCommit, AutoCandidateId,
-    AutoCandidateToken, AutoCaptureAcceptanceCriteria, AutoCaptureAcquisitionKey,
-    AutoCaptureBaseline, CalibrationDatasetItem, CalibrationEncodedPng, CalibrationImageCrop,
+    AddCalibrationItemOutcome, AutoAdmissionAssessment, AutoAdmissionDepthRange,
+    AutoAdmissionItemContribution, AutoAdmissionItemVisualization, AutoAdmissionPnpState,
+    AutoCandidateAdmission, AutoCandidateCommit, AutoCandidateId, AutoCandidateToken,
+    AutoCaptureAcceptanceCriteria, AutoCaptureAcquisitionKey, AutoCaptureBaseline,
+    CalibrationDatasetItem, CalibrationEncodedPng, CalibrationImageCrop,
     CalibrationImageOrientation, CalibrationInputError, CalibrationInputKey,
     CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
     CalibrationSession, CalibrationSessionError, CalibrationSnapshot, InitialIntrinsicsBinding,

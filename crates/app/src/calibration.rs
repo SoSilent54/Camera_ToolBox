@@ -275,6 +275,7 @@ pub struct PnPObservation {
     pub translation_vector: [f64; 3],
     pub depth: f64,
     pub minimum_board_depth: f64,
+    pub maximum_board_depth: f64,
     pub tilt_degrees: f64,
     pub azimuth_degrees: f64,
     pub reprojection_rmse: f64,
@@ -285,6 +286,7 @@ pub struct PnPObservation {
 struct PnPGeometry {
     depth: f64,
     minimum_board_depth: f64,
+    maximum_board_depth: f64,
     tilt_degrees: f64,
     azimuth_degrees: f64,
 }
@@ -305,6 +307,7 @@ impl PnPObservation {
             translation_vector: result.translation_vector,
             depth: geometry.depth,
             minimum_board_depth: geometry.minimum_board_depth,
+            maximum_board_depth: geometry.maximum_board_depth,
             tilt_degrees: geometry.tilt_degrees,
             azimuth_degrees: geometry.azimuth_degrees,
             reprojection_rmse: result.reprojection_rmse,
@@ -317,6 +320,7 @@ impl PnPObservation {
         validate_pnp_metrics(self.reprojection_rmse, self.max_reprojection_error)?;
         if !self.depth.is_finite()
             || !self.minimum_board_depth.is_finite()
+            || !self.maximum_board_depth.is_finite()
             || !self.tilt_degrees.is_finite()
             || !self.azimuth_degrees.is_finite()
         {
@@ -363,10 +367,13 @@ fn derive_pnp_geometry(
     // 平面棋盘上相机深度是 x/y 的线性函数；四个边界角即可覆盖全部内角点极值。
     let width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
     let height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
-    let minimum_board_depth = [[0.0, 0.0], [width, 0.0], [0.0, height], [width, height]]
+    let corner_depths = [[0.0, 0.0], [width, 0.0], [0.0, height], [width, height]]
         .into_iter()
-        .map(|[x, y]| rotation[2][0] * x + rotation[2][1] * y + translation_vector[2])
-        .fold(f64::INFINITY, f64::min);
+        .map(|[x, y]| rotation[2][0] * x + rotation[2][1] * y + translation_vector[2]);
+    let (minimum_board_depth, maximum_board_depth) = corner_depths.fold(
+        (f64::INFINITY, f64::NEG_INFINITY),
+        |(minimum, maximum), depth| (minimum.min(depth), maximum.max(depth)),
+    );
     if !minimum_board_depth.is_finite() || minimum_board_depth <= 0.0 {
         return Err(CalibrationSessionError::RejectInvalidPnP(format!(
             "all board points must have positive camera depth, minimum is {minimum_board_depth:.6}"
@@ -383,6 +390,7 @@ fn derive_pnp_geometry(
     Ok(PnPGeometry {
         depth: translation_vector[2],
         minimum_board_depth,
+        maximum_board_depth,
         tilt_degrees,
         azimuth_degrees,
     })
@@ -772,6 +780,26 @@ pub struct AutoAdmissionItemContribution {
     pub pose_covered: bool,
 }
 
+/// Dataset 单张图的棋盘角点深度范围；仅用于可视化，不参与 Gain 计算。
+#[derive(Clone, Debug, PartialEq)]
+pub struct AutoAdmissionDepthRange {
+    pub item_id: CalibrationItemId,
+    pub minimum_depth: f64,
+    pub maximum_depth: f64,
+    pub pnp_state: AutoAdmissionPnpState,
+    pub reprojection_rmse: f64,
+    pub max_reprojection_error: f64,
+}
+
+/// Dataset 单张图在 Field/Pose 可视化中的命中区域；用于表格选中高亮。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AutoAdmissionItemVisualization {
+    pub item_id: CalibrationItemId,
+    pub field_cells: Vec<usize>,
+    pub pose_bin: Option<usize>,
+    pub pnp_state: AutoAdmissionPnpState,
+}
+
 #[derive(Clone, Debug)]
 struct DatasetAdmissionItemCoverage {
     item_id: CalibrationItemId,
@@ -810,6 +838,8 @@ pub struct AutoAdmissionAssessment {
     pub pose_gain: usize,
     pub constraint_gain: usize,
     pub item_contributions: Vec<AutoAdmissionItemContribution>,
+    pub depth_ranges: Vec<AutoAdmissionDepthRange>,
+    pub item_visualizations: Vec<AutoAdmissionItemVisualization>,
     pub field_target_met: bool,
     pub depth_target_met: bool,
     pub pose_target_met: bool,
@@ -1314,6 +1344,8 @@ impl CalibrationSession {
         let mut depth_bin_counts = vec![0_usize; criteria.pnp_depth_bins];
         let mut pose_bin_counts = vec![0_usize; pose_capacity];
         let mut item_coverage = Vec::new();
+        let mut depth_ranges = Vec::new();
+        let mut item_visualizations = Vec::new();
 
         for item in self.items.iter().filter(|item| item.enabled) {
             let CalibrationItemStatus::Found(detection) = &item.status else {
@@ -1361,6 +1393,25 @@ impl CalibrationSession {
                         }
                     },
                 };
+            if let (Some(binding), Some(observation)) = (pnp_binding, item.pnp_observation.as_ref())
+                && let Ok((minimum_depth, maximum_depth)) =
+                    Self::pnp_depth_range_for_dataset(observation, binding, self.board)
+            {
+                depth_ranges.push(AutoAdmissionDepthRange {
+                    item_id: item.id,
+                    minimum_depth,
+                    maximum_depth,
+                    pnp_state: pnp_state.clone(),
+                    reprojection_rmse: observation.reprojection_rmse,
+                    max_reprojection_error: observation.max_reprojection_error,
+                });
+            }
+            item_visualizations.push(AutoAdmissionItemVisualization {
+                item_id: item.id,
+                field_cells: field_corner_counts.iter().map(|(cell, _)| *cell).collect(),
+                pose_bin,
+                pnp_state: pnp_state.clone(),
+            });
             for (depth_bin, count) in &depth_corner_counts {
                 depth_bin_counts[*depth_bin] = depth_bin_counts[*depth_bin].saturating_add(*count);
             }
@@ -1437,6 +1488,8 @@ impl CalibrationSession {
             pose_gain,
             constraint_gain: constraint_gain(field_gain, depth_gain, pose_gain),
             item_contributions,
+            depth_ranges,
+            item_visualizations,
             field_target_met,
             depth_target_met,
             pose_target_met,
@@ -2290,6 +2343,8 @@ impl CalibrationSession {
             pose_quota_filled,
             required_pose_quota,
             item_contributions,
+            depth_ranges: Vec::new(),
+            item_visualizations: Vec::new(),
             field_gain,
             depth_gain,
             pose_gain,
@@ -2341,6 +2396,21 @@ impl CalibrationSession {
         board: BoardSpec,
     ) -> Result<(Vec<(usize, usize)>, usize), CalibrationSessionError> {
         Self::pnp_coverage_for_criteria(observation, criteria, binding, board)
+    }
+
+    fn pnp_depth_range_for_dataset(
+        observation: &PnPObservation,
+        binding: &InitialIntrinsicsBinding,
+        board: BoardSpec,
+    ) -> Result<(f64, f64), CalibrationSessionError> {
+        if observation.binding_digest != binding.digest {
+            return Err(CalibrationSessionError::RejectAutoAdmissionBindingMismatch(
+                "PnP evidence InitialIntrinsicsBinding digest does not match the active K/D binding"
+                    .to_owned(),
+            ));
+        }
+        let geometry = observation.geometry(board)?;
+        Ok((geometry.minimum_board_depth, geometry.maximum_board_depth))
     }
 
     fn pnp_coverage_for_criteria(
@@ -3705,6 +3775,9 @@ mod tests {
             board(),
         )
         .unwrap();
+        assert!(observation.maximum_board_depth > observation.minimum_board_depth);
+        let observed_minimum_depth = observation.minimum_board_depth;
+        let observed_maximum_depth = observation.maximum_board_depth;
 
         let corner_counts =
             depth_corner_counts_for_criteria(&observation, &criteria, board()).unwrap();
@@ -3724,6 +3797,20 @@ mod tests {
             .unwrap();
         assert_eq!(assessment.depth_bins, 2);
         assert_eq!(assessment.depth_bin_counts.iter().sum::<usize>(), 8);
+        assert_eq!(assessment.depth_ranges.len(), 2);
+        assert_eq!(assessment.depth_ranges[0].item_id, first);
+        assert_eq!(
+            assessment.depth_ranges[0].minimum_depth,
+            observed_minimum_depth
+        );
+        assert_eq!(
+            assessment.depth_ranges[0].maximum_depth,
+            observed_maximum_depth
+        );
+        assert_eq!(assessment.item_visualizations.len(), 2);
+        assert_eq!(assessment.item_visualizations[0].item_id, first);
+        assert_eq!(assessment.item_visualizations[0].field_cells, vec![0]);
+        assert!(assessment.item_visualizations[0].pose_bin.is_some());
         let [first_contribution, second_contribution] = assessment.item_contributions.as_slice()
         else {
             panic!("expected two depth-compatible items");

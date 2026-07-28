@@ -1,7 +1,11 @@
 //! Dataset 验收阈值编辑与实时进度可视化；配置仅在当前进程内生效。
 
-use camera_toolbox_app::{AutoAdmissionAssessment, AutoCaptureAcceptanceCriteria};
+use camera_toolbox_app::{
+    AutoAdmissionAssessment, AutoAdmissionDepthRange, AutoAdmissionItemVisualization,
+    AutoAdmissionPnpState, AutoCaptureAcceptanceCriteria, CalibrationItemId,
+};
 use eframe::egui;
+use egui_plot::{HoverPosition, Line, Plot, PlotPoint, PlotPoints, PlotUi, Text};
 
 const DEFAULT_FIELD_COLUMNS: &str = "16";
 const DEFAULT_FIELD_ROWS: &str = "9";
@@ -19,6 +23,12 @@ const DEFAULT_POSE_TARGET_PER_BIN: &str = "1";
 const DEFAULT_PNP_MAX_RMSE_PX: &str = "1.5";
 const DEFAULT_PNP_MAX_ERROR_PX: &str = "4";
 const DEFAULT_MINIMUM_AUTO_GAIN: &str = "1";
+const DEPTH_RANGE_PLOT_HEIGHT: f32 = 96.0;
+const DEPTH_BIN_BASE_PLOT_HEIGHT: f32 = 56.0;
+const DEPTH_RANGE_DEFAULT_VISIBLE_ROWS: f64 = 4.0;
+const DEPTH_RANGE_CAP_HALF_HEIGHT: f64 = 0.26;
+const DEPTH_BIN_BASE_Y: f64 = 0.35;
+const DEPTH_BIN_LABEL_Y: f64 = -0.35;
 
 /// 文本编辑状态必须保留中间输入；只有完整合法值才会被工作区自动安装。
 #[derive(Clone, Debug)]
@@ -227,6 +237,7 @@ fn pose_bin_capacity(criteria: &AutoCaptureAcceptanceCriteria) -> usize {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) active_criteria: Option<AutoCaptureAcceptanceCriteria>,
+    pub(crate) selected_item: Option<CalibrationItemId>,
     pub(crate) occupied_field_cells: usize,
     pub(crate) required_field_cells: usize,
     pub(crate) field_quota_filled: usize,
@@ -235,6 +246,8 @@ pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) field_columns: usize,
     pub(crate) field_rows: usize,
     pub(crate) depth_bin_counts: Vec<usize>,
+    pub(crate) depth_ranges: Vec<AutoAdmissionDepthRange>,
+    pub(crate) item_visualizations: Vec<AutoAdmissionItemVisualization>,
     pub(crate) occupied_depth_bins: usize,
     pub(crate) required_depth_bins: usize,
     pub(crate) depth_quota_filled: usize,
@@ -255,6 +268,7 @@ impl DatasetAcceptanceProgress {
     pub(crate) fn from_assessment(assessment: &AutoAdmissionAssessment) -> Self {
         Self {
             active_criteria: assessment.active_criteria.clone(),
+            selected_item: None,
             occupied_field_cells: assessment.field_cells,
             required_field_cells: assessment.required_field_cells,
             field_quota_filled: assessment.field_quota_filled,
@@ -263,6 +277,8 @@ impl DatasetAcceptanceProgress {
             field_columns: assessment.field_columns,
             field_rows: assessment.field_rows,
             depth_bin_counts: assessment.depth_bin_counts.clone(),
+            depth_ranges: assessment.depth_ranges.clone(),
+            item_visualizations: assessment.item_visualizations.clone(),
             occupied_depth_bins: assessment.depth_bins,
             required_depth_bins: assessment.required_depth_bins,
             depth_quota_filled: assessment.depth_quota_filled,
@@ -327,6 +343,7 @@ pub(crate) struct DatasetAcceptanceRender {
     pub(crate) editing: bool,
     pub(crate) foldout_id: egui::Id,
     pub(crate) scroll_metrics: Option<DatasetAcceptanceScrollMetrics>,
+    pub(crate) selected_item: Option<CalibrationItemId>,
 }
 
 pub(crate) fn render_dataset_acceptance(
@@ -339,6 +356,7 @@ pub(crate) fn render_dataset_acceptance(
     let mut changed = false;
     let mut editing = false;
     let mut scroll_metrics = None;
+    let mut selected_depth_item = None;
     let foldout = egui::CollapsingHeader::new("Dataset acceptance")
         .id_salt("calibration_dataset_acceptance")
         .show(ui, |ui| {
@@ -418,7 +436,7 @@ pub(crate) fn render_dataset_acceptance(
                             progress.occupied_depth_bins, progress.required_depth_bins
                         ));
                         if let Some(criteria) = progress.active_criteria.as_ref() {
-                            render_depth_coverage(ui, progress, criteria);
+                            selected_depth_item = render_depth_coverage(ui, progress, criteria);
                         } else {
                             ui.weak("Valid Dataset Acceptance thresholds are required to label depth intervals.");
                         }
@@ -557,6 +575,7 @@ pub(crate) fn render_dataset_acceptance(
         editing,
         foldout_id: foldout.header_response.id,
         scroll_metrics,
+        selected_item: selected_depth_item,
     }
 }
 
@@ -656,6 +675,28 @@ fn coverage_text_color(count: usize, target: usize) -> egui::Color32 {
     }
 }
 
+fn selected_item_visualization(
+    progress: &DatasetAcceptanceProgress,
+) -> Option<&AutoAdmissionItemVisualization> {
+    let selected = progress.selected_item?;
+    progress
+        .item_visualizations
+        .iter()
+        .find(|item| item.item_id == selected)
+}
+
+fn selected_field_cell(progress: &DatasetAcceptanceProgress, cell: usize) -> bool {
+    selected_item_visualization(progress).is_some_and(|item| item.field_cells.contains(&cell))
+}
+
+fn selected_pose_bin(progress: &DatasetAcceptanceProgress) -> Option<usize> {
+    selected_item_visualization(progress).and_then(|item| item.pose_bin)
+}
+
+fn selected_highlight_stroke() -> egui::Stroke {
+    egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 170, 255))
+}
+
 fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
     ui.label(
         "Per-cell chessboard-corner count; green means the configured per-cell target is reached.",
@@ -689,6 +730,14 @@ fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
             let cell_rect =
                 egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)).shrink(1.0);
             painter.rect_filled(cell_rect, 1.5, coverage_color(count, target));
+            if selected_field_cell(progress, cell) {
+                painter.rect_stroke(
+                    cell_rect.expand(0.5),
+                    2.0,
+                    selected_highlight_stroke(),
+                    egui::StrokeKind::Inside,
+                );
+            }
             painter.text(
                 cell_rect.center(),
                 egui::Align2::CENTER_CENTER,
@@ -708,62 +757,315 @@ fn render_depth_coverage(
     ui: &mut egui::Ui,
     progress: &DatasetAcceptanceProgress,
     criteria: &AutoCaptureAcceptanceCriteria,
-) {
-    ui.label("Depth intervals (configured board units; each cell counts chessboard-corner depths; final interval includes its maximum)");
+) -> Option<CalibrationItemId> {
+    ui.label("Depth timeline: upper plot shows every image board-depth span; lower base keeps the configured corner-depth bins.");
     let bin_count = criteria.pnp_depth_bins;
     if bin_count == 0 {
-        return;
+        return None;
     }
-    let columns = bin_count.min(8).max(1);
-    let rows = (bin_count + columns - 1) / columns;
-    let size = egui::vec2(
-        ui.available_width().clamp(180.0, 460.0),
-        (46.0 * rows as f32).clamp(46.0, 184.0),
-    );
-    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 3.0, egui::Color32::from_gray(24));
-    let target = criteria.depth_target_per_bin;
-    for index in 0..bin_count {
-        let count = progress.depth_bin_counts.get(index).copied().unwrap_or(0);
-        let row = index / columns;
-        let column = index % columns;
-        let x0 = rect.left() + rect.width() * column as f32 / columns as f32;
-        let x1 = rect.left() + rect.width() * (column + 1) as f32 / columns as f32;
-        let y0 = rect.top() + rect.height() * row as f32 / rows as f32;
-        let y1 = rect.top() + rect.height() * (row + 1) as f32 / rows as f32;
-        let cell_rect =
-            egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)).shrink(1.0);
-        let label = depth_interval_label(criteria, index);
-        painter.rect_filled(cell_rect, 1.5, coverage_color(count, target));
-        painter.text(
-            egui::pos2(cell_rect.center().x, cell_rect.top() + 11.0),
-            egui::Align2::CENTER_CENTER,
-            label.clone(),
-            egui::FontId::proportional(9.0),
-            coverage_text_color(count, target),
-        );
-        painter.text(
-            egui::pos2(cell_rect.center().x, cell_rect.bottom() - 11.0),
-            egui::Align2::CENTER_CENTER,
-            format!("{count} corners"),
-            egui::FontId::proportional(10.0),
-            coverage_text_color(count, target),
-        );
-        ui.interact(
-            cell_rect,
-            ui.id().with(("dataset_acceptance_depth_bin", index)),
-            egui::Sense::hover(),
-        )
-        .on_hover_text(format!(
-            "Depth {label}: {count} compatible chessboard-corner depths."
-        ));
-    }
+    let axis = depth_timeline_axis(progress, criteria);
+    let x_link = ui.id().with("dataset_acceptance_depth_timeline_x");
+    let selected = render_depth_range_plot(ui, progress, &axis, x_link);
+    render_depth_bin_base_plot(ui, progress, criteria, &axis, x_link);
     ui.weak(format!(
-        "Legend: red 0 → green {target}+ corner depths per bin"
+        "Upper: white capped ranges are per-image min/max board depths; blue is the selected Dataset image. Lower: red 0 → green {target}+ corner depths per configured bin.",
+        target = criteria.depth_target_per_bin
     ));
+    selected
 }
 
+#[derive(Clone, Copy, Debug)]
+struct DepthTimelineAxis {
+    min: f64,
+    max: f64,
+}
+
+fn depth_timeline_axis(
+    progress: &DatasetAcceptanceProgress,
+    criteria: &AutoCaptureAcceptanceCriteria,
+) -> DepthTimelineAxis {
+    let mut minimum = criteria.pnp_depth_min;
+    let mut maximum = criteria.pnp_depth_max;
+    for range in &progress.depth_ranges {
+        if range.minimum_depth.is_finite() && range.maximum_depth.is_finite() {
+            minimum = minimum.min(range.minimum_depth.min(range.maximum_depth));
+            maximum = maximum.max(range.minimum_depth.max(range.maximum_depth));
+        }
+    }
+    if !minimum.is_finite() || !maximum.is_finite() || minimum >= maximum {
+        minimum = criteria.pnp_depth_min;
+        maximum = criteria.pnp_depth_max.max(criteria.pnp_depth_min + 1.0);
+    }
+    DepthTimelineAxis {
+        min: minimum,
+        max: maximum,
+    }
+}
+
+fn render_depth_range_plot(
+    ui: &mut egui::Ui,
+    progress: &DatasetAcceptanceProgress,
+    axis: &DepthTimelineAxis,
+    x_link: egui::Id,
+) -> Option<CalibrationItemId> {
+    let visible_rows = (progress.depth_ranges.len().max(1) as f64)
+        .min(DEPTH_RANGE_DEFAULT_VISIBLE_ROWS)
+        .max(1.0);
+    let y_min = -0.5;
+    let y_max = visible_rows - 0.5;
+    let plot = Plot::new("dataset_acceptance_depth_ranges")
+        .link_axis(x_link, [true, false])
+        .height(DEPTH_RANGE_PLOT_HEIGHT)
+        .allow_zoom([false, true])
+        .allow_drag([false, true])
+        .allow_scroll(false)
+        .allow_axis_zoom_drag([false, true])
+        .allow_boxed_zoom(false)
+        .allow_double_click_reset(true)
+        .auto_bounds([true, false])
+        .default_y_bounds(y_min, y_max)
+        .include_x(axis.min)
+        .include_x(axis.max)
+        .invert_y(true)
+        .show_axes([false, false])
+        .show_grid([true, false])
+        .show_crosshair(false)
+        .show_y(false)
+        .set_margin_fraction(egui::vec2(0.02, 0.02))
+        .label_formatter(depth_plot_label);
+    plot.show(ui, |plot_ui| {
+        render_depth_range_items(plot_ui, progress, axis)
+    })
+    .inner
+}
+
+fn render_depth_range_items(
+    plot_ui: &mut PlotUi<'_>,
+    progress: &DatasetAcceptanceProgress,
+    axis: &DepthTimelineAxis,
+) -> Option<CalibrationItemId> {
+    for (row, range) in progress.depth_ranges.iter().enumerate() {
+        if progress.selected_item == Some(range.item_id) {
+            continue;
+        }
+        draw_depth_range(plot_ui, range, row, false);
+    }
+    for (row, range) in progress.depth_ranges.iter().enumerate() {
+        if progress.selected_item == Some(range.item_id) {
+            draw_depth_range(plot_ui, range, row, true);
+        }
+    }
+    if plot_ui.response().clicked() {
+        plot_ui
+            .pointer_coordinate()
+            .and_then(|point| hit_depth_range(progress, axis, point))
+    } else {
+        None
+    }
+}
+
+fn draw_depth_range(
+    plot_ui: &mut PlotUi<'_>,
+    range: &AutoAdmissionDepthRange,
+    row: usize,
+    selected: bool,
+) {
+    let y = row as f64;
+    let (minimum, maximum) = ordered_depth_range(range.minimum_depth, range.maximum_depth);
+    let color = if selected {
+        egui::Color32::from_rgb(80, 170, 255)
+    } else {
+        egui::Color32::WHITE
+    };
+    let width = if selected { 2.6 } else { 1.6 };
+    let tooltip = depth_range_tooltip(range, row);
+    plot_ui.line(
+        Line::new(
+            tooltip.clone(),
+            PlotPoints::from(vec![[minimum, y], [maximum, y]]),
+        )
+        .id(egui::Id::new((
+            "dataset_depth_range_body",
+            range.item_id.get(),
+        )))
+        .color(color)
+        .width(width),
+    );
+    for (side, x) in [("min", minimum), ("max", maximum)] {
+        plot_ui.line(
+            Line::new(
+                tooltip.clone(),
+                PlotPoints::from(vec![
+                    [x, y - DEPTH_RANGE_CAP_HALF_HEIGHT],
+                    [x, y + DEPTH_RANGE_CAP_HALF_HEIGHT],
+                ]),
+            )
+            .id(egui::Id::new((
+                "dataset_depth_range_cap",
+                range.item_id.get(),
+                side,
+            )))
+            .color(color)
+            .width(width),
+        );
+    }
+}
+
+fn render_depth_bin_base_plot(
+    ui: &mut egui::Ui,
+    progress: &DatasetAcceptanceProgress,
+    criteria: &AutoCaptureAcceptanceCriteria,
+    axis: &DepthTimelineAxis,
+    x_link: egui::Id,
+) {
+    let plot = Plot::new("dataset_acceptance_depth_bin_base")
+        .link_axis(x_link, [true, false])
+        .height(DEPTH_BIN_BASE_PLOT_HEIGHT)
+        .allow_zoom(false)
+        .allow_drag(false)
+        .allow_scroll(false)
+        .allow_axis_zoom_drag(false)
+        .allow_boxed_zoom(false)
+        .allow_double_click_reset(false)
+        .auto_bounds([true, false])
+        .default_y_bounds(-1.0, 1.0)
+        .include_x(axis.min)
+        .include_x(axis.max)
+        .show_axes([true, false])
+        .show_grid([true, false])
+        .show_crosshair(false)
+        .show_y(false)
+        .x_axis_formatter(|mark, _| format!("{:.0}", mark.value))
+        .label_formatter(depth_plot_label);
+    plot.show(ui, |plot_ui| {
+        let target = criteria.depth_target_per_bin;
+        for index in 0..criteria.pnp_depth_bins {
+            let (lower, upper) = depth_interval_bounds(criteria, index);
+            let count = progress.depth_bin_counts.get(index).copied().unwrap_or(0);
+            let label = depth_interval_label(criteria, index);
+            let tooltip =
+                format!("Depth {label}: {count}/{target} compatible chessboard-corner depths.");
+            let color = coverage_color(count, target);
+            plot_ui.line(
+                Line::new(
+                    tooltip,
+                    PlotPoints::from(vec![[lower, DEPTH_BIN_BASE_Y], [upper, DEPTH_BIN_BASE_Y]]),
+                )
+                .id(egui::Id::new(("dataset_depth_bin_segment", index)))
+                .color(color)
+                .width(4.0),
+            );
+            plot_ui.text(
+                Text::new(
+                    format!("dataset_depth_bin_count_{index}"),
+                    PlotPoint::new((lower + upper) * 0.5, DEPTH_BIN_LABEL_Y),
+                    format!("{count} corners"),
+                )
+                .color(egui::Color32::WHITE)
+                .allow_hover(false),
+            );
+        }
+        for index in 0..=criteria.pnp_depth_bins {
+            let boundary = if index == criteria.pnp_depth_bins {
+                criteria.pnp_depth_max
+            } else {
+                depth_interval_bounds(criteria, index).0
+            };
+            plot_ui.line(
+                Line::new(
+                    "Configured depth-bin boundary",
+                    PlotPoints::from(vec![[boundary, 0.1], [boundary, 0.62]]),
+                )
+                .id(egui::Id::new(("dataset_depth_bin_boundary", index)))
+                .color(egui::Color32::from_rgb(236, 72, 45))
+                .width(1.8)
+                .allow_hover(false),
+            );
+        }
+    });
+}
+
+fn depth_plot_label(hover: &HoverPosition<'_>) -> Option<String> {
+    match hover {
+        HoverPosition::NearDataPoint { plot_name, .. } if !plot_name.is_empty() => {
+            Some((*plot_name).to_owned())
+        }
+        HoverPosition::Elsewhere { .. } | HoverPosition::NearDataPoint { .. } => None,
+    }
+}
+
+fn hit_depth_range(
+    progress: &DatasetAcceptanceProgress,
+    axis: &DepthTimelineAxis,
+    point: PlotPoint,
+) -> Option<CalibrationItemId> {
+    let x_tolerance = ((axis.max - axis.min).abs() * 0.006).max(1.0e-6);
+    progress
+        .depth_ranges
+        .iter()
+        .enumerate()
+        .filter_map(|(row, range)| {
+            let y_distance = (point.y - row as f64).abs();
+            if y_distance > 0.45 {
+                return None;
+            }
+            let (minimum, maximum) = ordered_depth_range(range.minimum_depth, range.maximum_depth);
+            if point.x < minimum - x_tolerance || point.x > maximum + x_tolerance {
+                return None;
+            }
+            Some((y_distance, range.item_id))
+        })
+        .min_by(|left, right| left.0.total_cmp(&right.0))
+        .map(|(_, item_id)| item_id)
+}
+
+fn depth_range_tooltip(range: &AutoAdmissionDepthRange, row: usize) -> String {
+    let (minimum, maximum) = ordered_depth_range(range.minimum_depth, range.maximum_depth);
+    format!(
+        "Dataset item #{} · row {}\nDepth span: {:.3} .. {:.3}\nWidth: {:.3}\nPnP state: {}\nRMSE: {:.4} px · Max error: {:.4} px",
+        range.item_id.get(),
+        row + 1,
+        minimum,
+        maximum,
+        maximum - minimum,
+        depth_range_state_label(&range.pnp_state),
+        range.reprojection_rmse,
+        range.max_reprojection_error,
+    )
+}
+
+fn depth_range_state_label(state: &AutoAdmissionPnpState) -> &'static str {
+    match state {
+        AutoAdmissionPnpState::Valid => "valid for Depth/Pose quota",
+        AutoAdmissionPnpState::MissingBinding => "missing K/D binding",
+        AutoAdmissionPnpState::MissingObservation => "missing PnP observation",
+        AutoAdmissionPnpState::BindingGap(_) => "binding mismatch",
+        AutoAdmissionPnpState::DepthGap(_) => "depth gate failed",
+        AutoAdmissionPnpState::PoseGap(_) => "pose gate failed",
+        AutoAdmissionPnpState::RmseReprojectionGap(_) => "RMSE gate failed",
+        AutoAdmissionPnpState::MaxReprojectionGap(_) => "max reprojection gate failed",
+        AutoAdmissionPnpState::Invalid(_) => "invalid PnP evidence",
+    }
+}
+
+fn ordered_depth_range(first: f64, second: f64) -> (f64, f64) {
+    if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    }
+}
+
+fn depth_interval_bounds(criteria: &AutoCaptureAcceptanceCriteria, index: usize) -> (f64, f64) {
+    let width = (criteria.pnp_depth_max - criteria.pnp_depth_min) / criteria.pnp_depth_bins as f64;
+    let lower = criteria.pnp_depth_min + width * index as f64;
+    let upper = if index + 1 == criteria.pnp_depth_bins {
+        criteria.pnp_depth_max
+    } else {
+        criteria.pnp_depth_min + width * (index + 1) as f64
+    };
+    (lower, upper)
+}
 fn depth_interval_label(criteria: &AutoCaptureAcceptanceCriteria, index: usize) -> String {
     let width = (criteria.pnp_depth_max - criteria.pnp_depth_min) / criteria.pnp_depth_bins as f64;
     let lower = criteria.pnp_depth_min + width * index as f64;
@@ -859,6 +1161,7 @@ fn render_pose_polar_map(
     painter.add(egui::Shape::mesh(fill_mesh));
 
     let border = egui::Stroke::new(0.5, egui::Color32::from_gray(24));
+    let selected_pose_bin = selected_pose_bin(progress);
     for tilt_bin in 0..criteria.pnp_tilt_bins {
         let inner_radius = center_radius
             + (outer_radius - center_radius) * tilt_bin as f32 / criteria.pnp_tilt_bins as f32;
@@ -871,6 +1174,11 @@ fn render_pose_polar_map(
             let start = sector as f32 / criteria.pnp_azimuth_sectors as f32 * std::f32::consts::TAU;
             let end =
                 (sector + 1) as f32 / criteria.pnp_azimuth_sectors as f32 * std::f32::consts::TAU;
+            let sector_stroke = if selected_pose_bin == Some(index) {
+                selected_highlight_stroke()
+            } else {
+                border
+            };
             paint_annular_sector_boundaries(
                 &painter,
                 center,
@@ -878,7 +1186,7 @@ fn render_pose_polar_map(
                 ring_outer,
                 start,
                 end,
-                border,
+                sector_stroke,
             );
             let label_radius = (inner_radius + ring_outer) * 0.5;
             painter.text(
@@ -894,6 +1202,9 @@ fn render_pose_polar_map(
     if center_enabled {
         painter.circle_filled(center, center_radius, coverage_color(center_count, target));
         painter.circle_stroke(center, center_radius, border);
+        if selected_pose_bin == Some(0) {
+            painter.circle_stroke(center, center_radius, selected_highlight_stroke());
+        }
         painter.text(
             center,
             egui::Align2::CENTER_CENTER,
@@ -1047,9 +1358,15 @@ fn render_pose_grid(
         .show(ui, |ui| {
             for index in 0..region_count {
                 let count = progress.pose_bin_counts.get(index).copied().unwrap_or(0);
+                let stroke = if selected_pose_bin(progress) == Some(index) {
+                    selected_highlight_stroke()
+                } else {
+                    egui::Stroke::new(0.0, egui::Color32::TRANSPARENT)
+                };
                 ui.add(
                     egui::Button::new(format!("#{index} {count}"))
-                        .fill(coverage_color(count, target)),
+                        .fill(coverage_color(count, target))
+                        .stroke(stroke),
                 )
                 .on_hover_text(format!(
                     "{}: {count} compatible PnP observations.",
@@ -1097,12 +1414,36 @@ fn pose_bin_label(criteria: &AutoCaptureAcceptanceCriteria, index: usize) -> Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camera_toolbox_app::{
+        AddCalibrationItemOutcome, CalibrationInputRevision, CalibrationSession, FileRef,
+        FileSourceId, FileVersion, SourcePath,
+    };
+    use camera_toolbox_core::BoardSpec;
+
+    fn test_item_id(name: &str) -> CalibrationItemId {
+        let mut session = CalibrationSession::new(BoardSpec::new(2, 2, 1.0).unwrap());
+        let AddCalibrationItemOutcome::Added(id) = session.add_or_refresh(
+            FileRef::new(
+                FileSourceId::new("dataset-acceptance-test").unwrap(),
+                SourcePath::new(name).unwrap(),
+            ),
+            CalibrationInputRevision::File(FileVersion {
+                size: 1,
+                modified_millis: None,
+            }),
+            name.to_owned(),
+        ) else {
+            panic!("expected added Dataset item");
+        };
+        id
+    }
 
     #[test]
     fn acceptance_draft_parses_runtime_pnp_thresholds() {
         let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
         assert_eq!(criteria.field_target_per_cell, 1);
         assert_eq!(criteria.minimum_auto_gain, 1);
+
         assert_eq!(
             (criteria.pnp_depth_min, criteria.pnp_depth_max),
             (400.0, 2400.0)
@@ -1232,6 +1573,56 @@ mod tests {
         assert_eq!(depth_interval_label(&criteria, 3), "[1900, 2400]");
         assert_eq!(pose_bin_label(&criteria, 0), "Center: tilt < 5.0°");
         assert!(pose_bin_label(&criteria, 1).contains("azimuth [0°, 45°)"));
+    }
+
+    #[test]
+    fn depth_timeline_axis_and_hit_testing_include_ranges_outside_configured_base() {
+        let item_id = test_item_id("range-a.png");
+        let mut criteria = DatasetAcceptanceDraft::default().parse().unwrap();
+        criteria.pnp_depth_min = 400.0;
+        criteria.pnp_depth_max = 700.0;
+        let mut progress = DatasetAcceptanceProgress::empty(&criteria);
+        progress.depth_ranges.push(AutoAdmissionDepthRange {
+            item_id,
+            minimum_depth: 350.0,
+            maximum_depth: 760.0,
+            pnp_state: AutoAdmissionPnpState::Valid,
+            reprojection_rmse: 0.2,
+            max_reprojection_error: 0.4,
+        });
+
+        let axis = depth_timeline_axis(&progress, &criteria);
+        assert_eq!(axis.min, 350.0);
+        assert_eq!(axis.max, 760.0);
+        assert_eq!(
+            hit_depth_range(&progress, &axis, PlotPoint::new(500.0, 0.0)),
+            Some(item_id)
+        );
+        assert_eq!(
+            hit_depth_range(&progress, &axis, PlotPoint::new(500.0, 1.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn selected_dataset_item_marks_field_cells_pose_bin_and_depth_range() {
+        let item_id = test_item_id("selected.png");
+        let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
+        let mut progress = DatasetAcceptanceProgress::empty(&criteria);
+        progress.selected_item = Some(item_id);
+        progress
+            .item_visualizations
+            .push(AutoAdmissionItemVisualization {
+                item_id,
+                field_cells: vec![0, 5],
+                pose_bin: Some(3),
+                pnp_state: AutoAdmissionPnpState::Valid,
+            });
+
+        assert!(selected_field_cell(&progress, 0));
+        assert!(selected_field_cell(&progress, 5));
+        assert!(!selected_field_cell(&progress, 6));
+        assert_eq!(selected_pose_bin(&progress), Some(3));
     }
 
     #[test]
