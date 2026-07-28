@@ -20,7 +20,7 @@
 | 输入格式 | 已实现 | PNG encoded bytes；其他图像格式不能直接进入当前标定后端 |
 | 角点检测 | 已实现 | `findChessboardCorners` + `cornerSubPix` |
 | 相机模型 | 已实现 | OpenCV pinhole + rational radial/tangential + thin-prism，共 12 个畸变参数 |
-| 初始内参 | 已实现 | 自动生成，也可由 GUI 手工填写 |
+| 初始内参 | 已实现 | 自动生成、GUI 手工填写，或从已安装标定解回写 $K$ |
 | 最少视图门禁 | 已实现 | 至少 3 张启用且成功检测、分辨率一致的图像 |
 | 重投影检查 | 已实现 | 全局 RMS、逐帧 RMSE、逐帧最大误差、观测点/投影点及残差向量 |
 | 空间覆盖热图 | 已实现 | 角点位置密度热图，不参与优化和自动验收 |
@@ -740,52 +740,86 @@ host_monotonic_time_ns
 - `source_pts` 是 demux/decoder 输出的源帧时间戳；未知时必须显式标为 `Unavailable`，不能用主机到达时间或推测值冒充源 PTS。
 - `host_monotonic_time_ns` 只用于同一 Camera Toolbox 进程内排序与延迟诊断，不能当作跨机器时钟。
 - 内存 PNG 由 `CaptureStore` 持有；Dataset 项存在期间资产不得释放。导出仍是显式用户动作，不会隐式在本机或 X5 落盘截图。
-- Viewer overlay 可显示棋盘检测结果和 coverage；权威 Dataset 状态以检测 worker 安装到 item 的 `Found` / `NotFound` / error 为准。
+- Viewer overlay 可显示棋盘检测结果和 coverage；`Fit` 右侧的 `Flip X` 只影响 Viewer 显示层，把图像、coverage、检测点、ROI/姿态轴等显示层一起水平镜像，不改变不可变帧、Dataset 图片、检测结果、PnP 或导出内容。权威 Dataset 检测状态以 worker 安装到 item 的 `Found` / `NotFound` / error 为准。
 
 当前仍未修改 `DEMO233`、未部署端侧 helper，也未完成 CH0/CH3 共享 RTCP 或设备时钟证明。在证明双路共享时钟之前，两路时间戳只允许标为近似主机到达或未知，不能形成严格双目标定配对。
 
-### 15.2 仍阻塞的 RTSP 自动准入
+### 15.2 已实现的运行时 RTSP 自动准入（非生产资格）
 
-自动准入目前是 observe-only：软件可以展示观察指标和拒绝原因，但缺少以下两个契约时不得把 RTSP 帧自动提交到 Dataset，也不得显示“自动收集完成”或“标定通过”：
+Auto Capture 不再依赖命名 Profile、保存/加载文件或 Apply 动作。每个已显示的直播上下文都在内存中由以下当前值即时构造一对不可变契约：
 
-1. 带 schema/version 的 `AutoCaptureBaseline`：定义 field/depth/pose bin、目标计数、RMSE/间距/边距等阈值、近重复容差和来源数据集。
-2. source-bound `InitialIntrinsicsBinding`：绑定初始内参、参考分辨率、orientation、crop/ROI、像素坐标约定、采集几何 key 与 digest。
+1. `AutoCaptureBaseline`：精确采集键、完整图像尺寸、`BoardSpec` 和当前 Dataset Acceptance 阈值；
+2. `InitialIntrinsicsBinding`：当前 GUI 初始 $K+D12$、完整帧尺寸、upright orientation、OpenCV 像素中心约定和同一采集键。
 
-缺少 baseline 或 binding 时的自动路径必须返回明确拒绝状态，例如 `RejectMissingBaseline` / `RejectMissingInitialIntrinsicsBinding`，并保持 Dataset 不变。显式预览和手动快门不受该自动准入阻塞影响：预览只更新 Viewer/候选观察结果；手动快门仍走 §15.1 的 Dataset 权威检测链路。
+合法阈值编辑立即替换当前上下文的契约；未完成或无效的临时文本只在同一 source/geometry/board/$K+D12$ 上保留最后一份合法契约。source、图像几何或棋盘变化会先取消在途候选并使旧契约失效，绝不跨上下文复用。旧的 profile 文件不会被读取或写入。
 
-未来自动准入恢复后，必须仍经过两层边界，避免“检测到棋盘就入库”：
+自动候选仍必须经过权威路径，不能因检测到棋盘直接入库：
 
 ```text
-最新 RTSP 解码帧
+Viewer displayed_frame
     │
-    ├─ 观察/候选门禁（完整棋盘、边距、角点间距、baseline 阈值、binding digest）
+    ▼
+冻结同一帧为会话内 PNG，并绑定 source / revision / board / admission revision
     │
-    └─ 通过 ──► 固化同一帧为内存 PNG
-                         │
-                         ▼
-          CalibrationDetectionPipeline 的 PNG preflight + 权威检测
-                         │
-              Found ────┴──── NotFound / error / stale
-                │                         │
-                ▼                         └──► 释放候选资产，不改数据集
-        提交 CalibrationSession
+    ▼
+CalibrationDetectionPipeline 权威棋盘检测
+    │
+    ├─ NotFound / error / stale ──► 释放候选资产，不改 Dataset
+    │
+    └─ Found
+         │
+         ▼
+后台 PnP（冻结的当前 K+D12 与 BoardSpec）
+         │
+         ▼
+重新校验 token、采集键、binding digest、图像尺寸和 admission revision
+         │
+         ├─ 无新 Found / field / depth / pose 目标截断增益 ──► 拒绝，不改 Dataset
+         └─ 正覆盖增益 ──► 原子提交 Dataset item、来源无关 PnP 证据与 source-bound PnP 证据
 ```
 
-自动收集的分布标准沿用并强化第 11、12 节的人工规范，但阈值必须来自 `AutoCaptureBaseline`，不能在 GUI 中硬编码为通用产品规则。自动路径至少需要约束以下事实：完整棋盘、最小角点间距、图像边距、field coverage、当前内参下的 PnP depth span、互斥 pose bin、多样视图数量、近重复抑制、留出验证和产品误差预算。
+PnP 证据必须具有有限的位姿和重投影指标，棋盘所有角点在相机坐标系中的深度必须严格为正，且 RMSE 与最大重投影误差必须不超过当前阈值。手动快门仍走 §15.1；关闭 Auto Capture 时，显式预览仍只更新 Viewer，不会自动入库。
 
-### 15.3 自动准入的可执行门禁契约
+这些阈值由当前操作员会话定义，因而仅支持临时采集，不构成产品资格、`CollectionComplete` 或标定通过声明。
 
-自动入集不能使用“差异明显”“覆盖不足”等主观描述，也不能只依赖原始图像透视 proxy。计划中的准入计算以按行列排序的角点 $q_{r,c}=(u_{r,c},v_{r,c})$、当前 `InitialIntrinsicsBinding` 和 `AutoCaptureBaseline` 为输入，至少产出以下 observation feature：
+### 15.3 Dataset Acceptance 控件与实时进度
 
-- `field_coverage`：由 refined corner footprint 落入固定图像网格得到；用于显示和候选补拍建议。
-- `pnp_depth_span`：使用当前绑定内参直接 PnP 后得到的归一化深度 bin；内参 digest 改变时必须 stale。
-- `pnp_pose_bin = (tilt_magnitude_bin, azimuth_sector)`：同一 observation 只能贡献一个互斥 pose bin；roll 不能伪装为法向 diversity。
-- `raw_perspective_descriptor`：只允许用于 preview、去重辅助或 bootstrap nomination，不能单独满足 `CollectionComplete`。
+`Dataset acceptance` 使用固定折叠标识；检测完成、进度变化或阈值编辑不会重置其展开状态。展开体位于独立垂直滚动区域内，视口最小约 96 px、最大约 420 px，并为下方 Dataset 表保留约 180 px 可操作高度，避免小窗口中验收控件把表格顶出侧栏。控件按指标与可视化就地分组：
 
-所有距离、PnP 位姿、重投影误差和派生指标必须有限且在 baseline 允许范围内，否则候选帧只能被拒绝或保持 observe-only。某 candidate 只有在自身至少增加一个未满足的 baseline 目标时才有正增益；若它与已接受 observation 在所有绑定特征上低于 near-identical 容差，则必须拒绝。
+- Found views：当前值、目标和进度条；
+- field coverage：当前 occupied cell 值、目标、每个图像归一化网格单元中的棋盘角点数量，以及网格/目标/最小相邻角点间距；非零角点数的单元才算 occupied field cell；
+- depth coverage：当前 occupied depth bin 值、目标、连续深度区间图、每段棋盘内角点深度计数和直接列出的缺失区间，以及深度范围/bin/目标；最后一个区间包含上边界；
+- pose coverage：当前值、目标、中心 front-parallel bin 与 tilt $\times$ azimuth 环形扇区图、每区计数和直接列出的缺失区域，以及 deadband/最大 tilt/bin/sector/目标；显示方向对齐 OpenCV 图像坐标，$0^\circ$ 位于右侧 $+x$，$90^\circ$ 位于下方 $+y$。每段环弧以凸 mesh 四边形填充，并单独描绘内外弧与径向边框；当 deadband 大于 0 时，全部环带绘制完成后，中心 bin 的填充、边框和文字最后作为圆形遮罩绘制；当 deadband 为 0 时，不存在中心 bin，也不绘制中心完整圆，环形扇区从中心直接开始。
+- PnP quality gates：RMSE 和最大单点重投影误差阈值。只有同时满足有限值、正深度、当前 Dataset PnP binding 和这两个门限的证据，才能填充 depth 和 pose 覆盖。既有 Dataset 项在每次评估时也必须通过当前图像边界和最小相邻角点间距门限；提高 spacing 阈值会立刻将不满足项移出汇总与边际贡献。
 
-`CollectionComplete` 只能在以下条件同时成立时显示：安装了 active baseline；存在可信且 source-bound 的 `InitialIntrinsicsBinding`；baseline digest、binding digest、BoardSpec、图像尺寸、orientation、crop/ROI 与检测证据全部匹配；field/depth/pose 目标和留出验证均通过。对应单元测试必须使用完整 baseline fixture 精确断言 feature、bin、增益、stale/reject 状态和去重结果，不能把“临时测得一组阈值”误写成通用测试契约。
+默认值为：
 
+- Found views：3；field grid：$16\times9$，required occupied field cells：30，最小相邻角点间距：12 px；
+- PnP depth：400–2400（4 bins，目标 3）；深度单位是配置的 `BoardSpec::square_size` 单位，GUI 默认棋盘使用 mm；
+- PnP tilt：deadband $5^\circ$、最大 $65^\circ$（3 bins），azimuth：8 sectors，目标 pose bins：6；
+- PnP RMSE：最多 1.5 px；最大单点重投影误差：最多 4.0 px。
+
+编辑 Dataset Acceptance 文本框时允许临时不完整输入；焦点仍在文本框内时不会弹出红色错误或替换当前 runtime admission，而是继续使用上一组完整合法门限。字段补全为合法值后立即安装；离开编辑焦点后仍非法才显示错误。
+
+普通 Dataset 的 PnP binding 不依赖 live source。每次本地/SFTP PNG 读取完成或手动 RTSP 快门帧进入检测时，GUI 用当前可见的 $f_x/f_y/c_x/c_y$ 和 D12 seed 为该图片尺寸创建来源无关 binding；`auto_intrinsics` 打开时使用 `fx=fy=900`、`cx=w/2`、`cy=h/2`。如果检测期间 GUI K、图片尺寸或 binding digest 变化，返回的旧 PnP 会被丢弃；修改 $f_x/f_y/c_x/c_y$、D12 seed 或仅 square size 变化后，GUI 会对既有 `Found` Dataset 项异步刷新/补算来源无关 PnP，不需要重新点击 `Detect`。角点布局变化仍会使检测本身失效，必须重新 Detect。
+
+Overlay 与 Input image 预览模式会在当前 Dataset PnP binding 匹配时绘制棋盘姿态坐标轴：原点是标定板中心，+X/+Y/+Z 端点由当前 PnP 位姿和 GUI K/D12 投影到图像，再经过同一 preview/crop 映射显示；没有当前有效 PnP 时不绘制，Heatmap-only 模式不叠加输入图像标注。
+
+Dataset 表保留原 `Status` 作为读取/检测流水线状态，并新增 `Acceptance` 列单独显示当前验收状态，避免把 `Found` / `NotFound` 与 Dataset 门限混在一起。`Acceptance` 可显示 `Accepted`、`Depth Gap`、`Pose Gap`、`RMSE ReProj Gap`、`Max ReProj Gap`、`No Gain Gap`、`Geometry Gap`、`PnP Gap` 等。PnP 指标列拆成 `Depth`（棋盘中心深度）、`Angle dir`（棋盘法向 azimuth，OpenCV 图像轴，90° 向下）和 `Angle`（棋盘法向 tilt）；hover 可见 RMSE 和最大重投影误差。后续的 `Found Δ`、`Field Δ`、`Depth Δ`、`Pose Δ`、`Gain` 由当前完整有效 Dataset 的来源无关目标封顶归属计算，而不是记录自动入库瞬间的候选增益，也不是 leave-one-out 删除损失：
+
+$$
+\mathrm{Gain}_i = G^{found}_i + G^{field}_i + G^{depth}_i + G^{pose}_i
+$$
+
+对每个指标，按稳定 Dataset 顺序扫描当前统一图像尺寸、已启用、`Found` 且通过当前几何门限的数据项；每个尚未归属的 Found view / occupied coverage bin 分配给第一个覆盖它的图像，直到对应目标 $T$ 填满。Dataset 总 `Score` 等于所有当前行 `Gain` 的和，也等于 $\min(C_{found},T_{found}) + \min(C_{field},T_{field}) + \min(C_{depth},T_{depth}) + \min(C_{pose},T_{pose})$。Field coverage 的单元数来自角点密度：每个网格单元累计其中的棋盘角点数量，计数非零才成为 occupied cell；`Field Δ` 表示归属给该项的目标截断 occupied field cell 数，只要求 Found 检测。Depth coverage 的 bin 计数来自该项所有棋盘内角点的相机 $Z$ 深度；`Depth Δ` 表示归属给该项的目标截断 occupied depth bin 数。Pose coverage 仍按单张 view 的棋盘法向 tilt/azimuth bin 计数；`Pose Δ` 表示归属给该项的目标截断 occupied pose bin 数。PnP quality gates 只决定 Depth/Pose 是否有资格贡献，不作为单独分数。禁用、图像尺寸不兼容、非 Found 或几何门限不兼容的项显示为不属于当前 Dataset Acceptance；缺失、过期或未通过当前门限的 PnP 会显示为 `PnP×`/`×0`，它表示 Depth/Pose 被 PnP 或对应门限阻断，区别于当前 PnP 有效但覆盖冗余的 `+0`。`No Gain Gap` 表示该行参与当前 Dataset Acceptance，但目标封顶归属后没有任何指标分配给它；多勾选一张冗余图片不会把既有图片的 `Gain` 全部清零。
+
+普通 PNG、本地/远端文件、手动 RTSP 快门和自动 RTSP 入库项在 Dataset Acceptance 中按同一规则统计；自动候选准入仍是另一条 source-bound 规则，继续使用精确 acquisition key、完整图像尺寸、棋盘和 source-bound $K+D12$ digest 过滤，不能被其他来源的 Dataset 项提高候选 gain。自动入库项同时保存来源无关 Dataset PnP 与 source-bound admission PnP，普通 PnP 刷新不会覆盖后者。Viewer 的 Live Stream coverage 同样保留精确 acquisition key 和图像尺寸过滤，但使用与 Dataset Image heatmap 相同的低到高调色板、$3\times3$ 引导线和 low/high 图例。
+
+Found views 是采集进度和总分的一部分；自动入库的决定量使用同一 source-bound assessment 中尚未满足目标的 Found、field、depth 和 pose bin 的确定性正增益之和。面板可能显示 collection milestones，但它只表示当前运行时阈值的覆盖状态，不是生产资格。
+
+### 15.4 将已安装结果回写为初始 $K$
+
+`Use result as initial K` 紧邻 `Calibrate`。它仅在已安装标定解且没有活动标定或直播候选时可用；点击后将解矩阵的 `[0]`、`[4]`、`[2]`、`[5]` 分别复制到可编辑的 $f_x$、$f_y$、$c_x$、$c_y$，并关闭自动初始内参。该动作不会修改 D12、EEPROM、已安装解或导出结果；若存在直播上下文，会据此立即重建运行时自动准入绑定。
 ## 16. 参考资料
 
 - Zhengyou Zhang, [A Flexible New Technique for Camera Calibration](https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/tr98-71.pdf)。平面单应约束、线性初始化和联合优化的基础。

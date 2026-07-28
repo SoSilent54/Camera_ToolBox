@@ -94,6 +94,18 @@ fn accessibility_text(output: &egui::FullOutput) -> String {
         .join("\n")
 }
 
+fn accessibility_exact_label_count(output: &egui::FullOutput, label: &str) -> usize {
+    output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("accessibility tree is enabled")
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.label().or_else(|| node.value()) == Some(label))
+        .count()
+}
+
 fn accesskit_bounds(output: &egui::FullOutput, label: &str) -> egui::accesskit::Rect {
     output
         .platform_output
@@ -110,6 +122,22 @@ fn accesskit_bounds(output: &egui::FullOutput, label: &str) -> egui::accesskit::
         .unwrap_or_else(|| panic!("accessibility node {label:?} is visible"))
 }
 
+fn accesskit_bounds_all(output: &egui::FullOutput, label: &str) -> Vec<egui::accesskit::Rect> {
+    output
+        .platform_output
+        .accesskit_update
+        .as_ref()
+        .expect("accessibility tree is enabled")
+        .nodes
+        .iter()
+        .filter_map(|(_, node)| {
+            (node.label() == Some(label) || node.value() == Some(label))
+                .then(|| node.bounds())
+                .flatten()
+        })
+        .collect()
+}
+
 fn test_export_destination() -> ExportDestination {
     let source_id = FileSourceId::new("gui-save-result-test").unwrap();
     let root = std::env::current_dir().unwrap();
@@ -123,6 +151,8 @@ fn test_live_source() -> crate::workspace::LiveStreamSource {
         label: "Test".to_owned(),
         channel: 0,
         transport: camera_toolbox_app::RtspTransport::Tcp,
+        source_fingerprint: "test-rtsp-source".to_owned(),
+        geometry_key: "test-rtsp-config".to_owned(),
     }
 }
 
@@ -1355,6 +1385,8 @@ fn calibration_workspace_switch_preserves_viewer_documents() {
     assert_eq!(app.workspace.active_id(), viewer_document);
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
+    assert!(visible.contains("Dataset acceptance"));
+    assert!(!visible.contains("Observe-only"));
 }
 
 #[cfg(feature = "calibration-opencv")]
@@ -1363,6 +1395,8 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     let context = egui::Context::default();
     context.enable_accesskit();
     let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
     let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
     latest.publish(camera_toolbox_app::DecodedVideoFrame {
         width: 2,
@@ -1382,6 +1416,10 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
         latest,
         test_live_source(),
     );
+    app.workspace
+        .active_live_mut()
+        .expect("live document is active")
+        .show_calibration_detection = false;
     app.product_workspace = super::ProductWorkspace::Calibration;
     let mut frame = eframe::Frame::_new_kittest();
     let viewport = egui::vec2(1568.0, 882.0);
@@ -1393,7 +1431,9 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
     assert!(visible.contains("EEPROM Provisioning"));
-    assert!(visible.contains("Capture → Calibration dataset"));
+    assert!(visible.contains("Capture"));
+    assert!(!visible.contains("Capture → Calibration dataset"));
+    assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
     assert!(!visible.contains("Preview and constraints"));
     assert!(visible.contains("Live Stream"));
     assert!(visible.contains("Dataset Image"));
@@ -1536,12 +1576,332 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     );
     output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 9.0);
     assert!(!accessibility_text(&output).contains("EEPROM SN"));
+    let capture = accesskit_rect_center(accesskit_bounds(&output, "Capture"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(capture),
+            egui::Event::PointerButton {
+                pos: capture,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: capture,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 10.0);
+    let visible = accessibility_text(&output);
+    assert!(visible.contains("Dataset (1)"));
+    assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
     let document = app.workspace.active_live().unwrap();
     assert!(document.texture().is_some());
     assert_eq!(
         document.displayed_frame().unwrap().identity.frame_sequence,
         1
     );
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn viewer_rtsp_sidebar_capture_adds_dataset_item() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
+    let session_id =
+        camera_toolbox_app::StreamSessionId::new("viewer-sidebar-capture-test").unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    latest.publish(camera_toolbox_app::DecodedVideoFrame {
+        width: 2,
+        height: 2,
+        rgba: Arc::from(vec![
+            255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            session_id.clone(),
+            0,
+            1,
+            "viewer sidebar capture test",
+        ),
+    });
+    app.workspace
+        .open_live(session_id, latest, test_live_source());
+    app.workspace
+        .active_live_mut()
+        .expect("live document is active")
+        .show_calibration_detection = false;
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let viewport = egui::vec2(1568.0, 882.0);
+    let mut output =
+        run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
+    let visible = accessibility_text(&output);
+    assert!(visible.contains("Capture"));
+    assert!(!visible.contains("Capture → Calibration dataset"));
+    assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
+
+    let capture = accesskit_rect_center(accesskit_bounds(&output, "Capture"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(capture),
+            egui::Event::PointerButton {
+                pos: capture,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: capture,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 11.0);
+    let visible = accessibility_text(&output);
+    assert!(app.is_calibration_workspace());
+    assert!(visible.contains("Dataset (1)"));
+    assert!(!visible.contains("Capture → Calibration dataset"));
+    assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn sidebar_capture_uses_displayed_frame_when_latest_slot_advances() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
+    let session_id =
+        camera_toolbox_app::StreamSessionId::new("displayed-frame-capture-test").unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    latest.publish(camera_toolbox_app::DecodedVideoFrame {
+        width: 2,
+        height: 2,
+        rgba: Arc::from(vec![
+            255_u8, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            session_id.clone(),
+            0,
+            1,
+            "displayed frame capture test",
+        ),
+    });
+    let live_id =
+        app.workspace
+            .open_live(session_id.clone(), Arc::clone(&latest), test_live_source());
+    app.workspace
+        .active_live_mut()
+        .expect("live document is active")
+        .show_calibration_detection = false;
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let viewport = egui::vec2(1568.0, 882.0);
+    let _ = run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
+    assert_eq!(
+        app.workspace
+            .live(live_id)
+            .and_then(|document| document.displayed_frame())
+            .map(|displayed| displayed.identity.frame_sequence),
+        Some(1)
+    );
+
+    latest.publish(camera_toolbox_app::DecodedVideoFrame {
+        width: 2,
+        height: 2,
+        rgba: Arc::from(vec![
+            0_u8, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255, 0, 0, 0, 255,
+        ]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            session_id,
+            0,
+            2,
+            "newer frame must not replace displayed capture",
+        ),
+    });
+    app.handle_workspace_stream_action(super::WorkspaceStreamAction::Capture(live_id));
+
+    let output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 12.0);
+    let visible = accessibility_text(&output);
+    assert!(visible.contains("Dataset (1)"));
+    assert!(visible.contains("RTSP ch0 frame 1"));
+    assert!(!visible.contains("RTSP ch0 frame 2"));
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn inactive_stream_capture_activates_clicked_row_and_uses_snapshot() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
+
+    let first_session = camera_toolbox_app::StreamSessionId::new("inactive-capture-first").unwrap();
+    let first_latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    first_latest.publish(camera_toolbox_app::DecodedVideoFrame {
+        width: 2,
+        height: 2,
+        rgba: Arc::from(vec![
+            255_u8, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255,
+        ]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            first_session.clone(),
+            0,
+            1,
+            "first displayed frame",
+        ),
+    });
+    let first_id = app.workspace.open_live(
+        first_session,
+        first_latest,
+        crate::workspace::LiveStreamSource::Rtsp {
+            label: "First".to_owned(),
+            channel: 0,
+            transport: camera_toolbox_app::RtspTransport::Tcp,
+            source_fingerprint: "test-rtsp-source-first".to_owned(),
+            geometry_key: "test-rtsp-config-first".to_owned(),
+        },
+    );
+    app.workspace
+        .live_mut(first_id)
+        .expect("first live document")
+        .show_calibration_detection = false;
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let viewport = egui::vec2(1568.0, 882.0);
+    let _ = run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
+    assert_eq!(
+        app.workspace
+            .live(first_id)
+            .and_then(|document| document.displayed_frame())
+            .map(|displayed| displayed.identity.frame_sequence),
+        Some(1)
+    );
+
+    let second_session =
+        camera_toolbox_app::StreamSessionId::new("inactive-capture-second").unwrap();
+    let second_latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    second_latest.publish(camera_toolbox_app::DecodedVideoFrame {
+        width: 2,
+        height: 2,
+        rgba: Arc::from(vec![
+            0_u8, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255, 0, 0, 255, 255,
+        ]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            second_session.clone(),
+            1,
+            7,
+            "second displayed frame",
+        ),
+    });
+    let second_id = app.workspace.open_live(
+        second_session,
+        second_latest,
+        crate::workspace::LiveStreamSource::Rtsp {
+            label: "Second".to_owned(),
+            channel: 1,
+            transport: camera_toolbox_app::RtspTransport::Tcp,
+            source_fingerprint: "test-rtsp-source-second".to_owned(),
+            geometry_key: "test-rtsp-config-second".to_owned(),
+        },
+    );
+    app.workspace
+        .live_mut(second_id)
+        .expect("second live document")
+        .show_calibration_detection = false;
+
+    let output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 13.0);
+    assert_eq!(app.workspace.active_id(), Some(second_id));
+    assert_eq!(
+        app.workspace
+            .live(first_id)
+            .and_then(|document| document.displayed_frame())
+            .map(|displayed| displayed.identity.frame_sequence),
+        Some(1),
+        "inactive row must retain its last displayed snapshot"
+    );
+    assert!(
+        app.workspace
+            .live(first_id)
+            .expect("first live document")
+            .texture()
+            .is_none(),
+        "inactive row should release only its GPU texture"
+    );
+    assert_eq!(
+        app.workspace
+            .live(second_id)
+            .and_then(|document| document.displayed_frame())
+            .map(|displayed| displayed.identity.frame_sequence),
+        Some(7)
+    );
+
+    let mut capture_bounds = accesskit_bounds_all(&output, "Capture");
+    capture_bounds.sort_by(|left, right| {
+        left.y0
+            .partial_cmp(&right.y0)
+            .expect("accessibility row bounds are finite")
+    });
+    assert_eq!(
+        capture_bounds.len(),
+        2,
+        "both stream rows must expose Capture"
+    );
+    let first_capture = accesskit_rect_center(capture_bounds[0]);
+    _ = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(first_capture),
+            egui::Event::PointerButton {
+                pos: first_capture,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: first_capture,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    let output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 14.0);
+    let visible = accessibility_text(&output);
+    assert_eq!(app.workspace.active_id(), Some(first_id));
+    assert!(
+        app.workspace
+            .live(first_id)
+            .expect("first live document")
+            .texture()
+            .is_some(),
+        "activating a captured inactive row must reinstall its texture"
+    );
+    assert!(app.is_calibration_workspace());
+    assert!(visible.contains("Dataset (1)"));
+    assert!(visible.contains("RTSP ch0 frame 1"));
+    assert!(!visible.contains("RTSP ch1 frame 7"));
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -1873,6 +2233,7 @@ fn live_overlay_maps_pixel_centers_and_rejects_out_of_bounds_points() {
             camera_toolbox_core::CalibrationPoint::new(0.0, 0.0),
             image_size,
             image_rect,
+            false,
         ),
         Some(egui::pos2(60.0, 45.0))
     );
@@ -1881,6 +2242,7 @@ fn live_overlay_maps_pixel_centers_and_rejects_out_of_bounds_points() {
             camera_toolbox_core::CalibrationPoint::new(1.0, 1.0),
             image_size,
             image_rect,
+            false,
         ),
         Some(egui::pos2(160.0, 95.0))
     );
@@ -1889,7 +2251,17 @@ fn live_overlay_maps_pixel_centers_and_rejects_out_of_bounds_points() {
             camera_toolbox_core::CalibrationPoint::new(-1.0, 0.0),
             image_size,
             image_rect,
+            false,
         ),
         None
+    );
+    assert_eq!(
+        CameraToolboxApp::live_overlay_point(
+            camera_toolbox_core::CalibrationPoint::new(0.0, 0.0),
+            image_size,
+            image_rect,
+            true,
+        ),
+        Some(egui::pos2(160.0, 45.0))
     );
 }

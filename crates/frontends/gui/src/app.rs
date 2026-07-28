@@ -17,7 +17,7 @@ use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvi
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{
     CalibrationExport, CalibrationViewerOverlay, CalibrationWorkspace, VIEWER_COVERAGE_COLUMNS,
-    VIEWER_COVERAGE_ROWS,
+    VIEWER_COVERAGE_ROWS, heatmap_color, paint_heatmap_guides,
 };
 
 #[cfg(feature = "platform-ssh")]
@@ -47,7 +47,7 @@ use crate::{
     raw_inspector::render_raw_inspector,
     viewer::{
         HoverNeighborhood, HoverViewSettings, ImageViewerState, LoadedRaw, ViewerAction,
-        ViewerImage, ViewerOutput, bayer_label, render_viewer,
+        ViewerImage, ViewerOutput, bayer_label, render_viewer, viewer_texture_uv,
     },
     workspace::{
         DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, TabBarAction,
@@ -657,10 +657,13 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         let displayed_live_frame = if let Some(document) = self.workspace.active_live_mut() {
             document.install_latest_texture(&context);
-            document
-                .displayed_frame()
-                .cloned()
-                .map(|frame| (frame, document.show_calibration_detection))
+            document.displayed_frame().cloned().map(|frame| {
+                (
+                    frame,
+                    document.source.clone(),
+                    document.show_calibration_detection,
+                )
+            })
         } else {
             None
         };
@@ -671,9 +674,10 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         {
             self.calibration.tick(&context);
-            if let Some((frame, preview_requested)) = displayed_live_frame {
+            if let Some((frame, source, preview_requested)) = displayed_live_frame {
                 self.calibration.observe_live_frame(
                     frame,
+                    source,
                     self.live_runtime.capture_store().clone(),
                     preview_requested,
                 );
@@ -817,23 +821,18 @@ impl eframe::App for CameraToolboxApp {
         let calibration_export_error = self.explorer.active_save_destination().err();
 
         #[cfg(feature = "calibration-opencv")]
-        let mut calibration_capture_request: Option<
-            Arc<camera_toolbox_app::DecodedVideoFrame>,
-        > = None;
-        #[cfg(feature = "calibration-opencv")]
-        let calibration_viewer_overlay = self
-            .workspace
-            .active_live()
-            .and_then(LiveDocument::displayed_frame)
-            .map(|frame| self.calibration.viewer_overlay(frame));
+        let calibration_viewer_overlay = self.workspace.active_live().and_then(|document| {
+            document
+                .displayed_frame()
+                .map(|frame| self.calibration.viewer_overlay(frame, &document.source))
+        });
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
                 #[cfg(feature = "calibration-opencv")]
                 if self.is_calibration_workspace() {
                     let has_live_inspection = self.workspace.active_live().is_some();
                     let workspace = &mut self.workspace;
-                    let runtime = &self.live_runtime;
-                    let (rect, capture_request) = self.calibration.render(
+                    let (rect, _) = self.calibration.render(
                         &context,
                         ui,
                         calibration_export_error.is_none(),
@@ -849,34 +848,25 @@ impl eframe::App for CameraToolboxApp {
                         has_live_inspection,
                         |ui| {
                             let document = workspace.active_live_mut()?;
-                            let (_, capture_request) = Self::render_live_viewer(
+                            let _ = Self::render_live_viewer(
                                 ui,
                                 document,
-                                runtime,
                                 true,
                                 calibration_viewer_overlay.as_ref(),
                             );
-                            capture_request
+                            None
                         },
                     );
-                    calibration_capture_request = capture_request;
                     return ViewerOutput { rect, action: None };
                 }
                 if let Some(document) = self.workspace.active_live_mut() {
-                    let (rect, capture_request) = Self::render_live_viewer(
+                    let (rect, _) = Self::render_live_viewer(
                         ui,
                         document,
-                        &self.live_runtime,
                         cfg!(feature = "calibration-opencv"),
                         #[cfg(feature = "calibration-opencv")]
                         calibration_viewer_overlay.as_ref(),
                     );
-                    #[cfg(feature = "calibration-opencv")]
-                    {
-                        calibration_capture_request = capture_request;
-                    }
-                    #[cfg(not(feature = "calibration-opencv"))]
-                    let _ = capture_request;
                     ViewerOutput { rect, action: None }
                 } else if let Some(document) = self.workspace.active_image_mut() {
                     let image = document.display.texture_id().map(|texture_id| {
@@ -916,12 +906,6 @@ impl eframe::App for CameraToolboxApp {
             .inner;
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
-        }
-        #[cfg(feature = "calibration-opencv")]
-        if let Some(frame) = calibration_capture_request {
-            self.calibration
-                .capture_displayed_stream_frame(frame, self.live_runtime.capture_store().clone());
-            self.product_workspace = ProductWorkspace::Calibration;
         }
         #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
         if let Some(intent) = self.calibration.take_provision_intent() {
@@ -4091,6 +4075,8 @@ impl CameraToolboxApp {
                     document.status_label().to_owned(),
                     format!("{:?}", document.stage),
                     matches!(document.lifecycle, LiveDocumentLifecycle::Open),
+                    matches!(document.lifecycle, LiveDocumentLifecycle::Open)
+                        && document.displayed_frame().is_some(),
                 )
             })
             .collect();
@@ -4112,7 +4098,7 @@ impl CameraToolboxApp {
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::remainder().at_least(80.0).clip(true))
                     .column(Column::initial(80.0).at_least(60.0).clip(true))
-                    .column(Column::initial(32.0))
+                    .column(Column::initial(112.0).at_least(80.0).clip(true))
                     .header(24.0, |mut header| {
                         header.col(|ui| {
                             ui.strong("Stream");
@@ -4121,13 +4107,20 @@ impl CameraToolboxApp {
                             ui.strong("Status");
                         });
                         header.col(|ui| {
-                            ui.strong("");
+                            ui.strong("Actions");
                         });
                     })
                     .body(|body| {
                         body.rows(26.0, items.len(), |mut row| {
-                            let (id, ref title, ref detail, ref status, ref stage, can_stop) =
-                                items[row.index()];
+                            let (
+                                id,
+                                ref title,
+                                ref detail,
+                                ref status,
+                                ref stage,
+                                can_stop,
+                                _can_capture,
+                            ) = items[row.index()];
                             let is_selected = active == Some(id);
                             row.col(|ui| {
                                 if ui.selectable_label(is_selected, title).clicked() {
@@ -4140,6 +4133,16 @@ impl CameraToolboxApp {
                                 ui.label(format!("{stage} · {status}"));
                             });
                             row.col(|ui| {
+                                #[cfg(feature = "calibration-opencv")]
+                                if ui
+                                    .add_enabled(_can_capture, egui::Button::new("Capture").small())
+                                    .on_hover_text(
+                                        "Capture the displayed frame into the Calibration dataset",
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(WorkspaceStreamAction::Capture(id));
+                                }
                                 let label = if can_stop { "■" } else { "—" };
                                 if ui
                                     .add_enabled(can_stop, egui::Button::new(label).small())
@@ -4307,6 +4310,24 @@ impl CameraToolboxApp {
                     }
                 }
             }
+            #[cfg(feature = "calibration-opencv")]
+            WorkspaceStreamAction::Capture(id) => {
+                self.workspace.activate(id);
+                let Some((frame, source)) = self.workspace.live(id).and_then(|document| {
+                    document
+                        .displayed_frame()
+                        .cloned()
+                        .map(|frame| (frame, document.source.clone()))
+                }) else {
+                    return;
+                };
+                self.calibration.capture_displayed_stream_frame(
+                    frame,
+                    source,
+                    self.live_runtime.capture_store().clone(),
+                );
+                self.product_workspace = ProductWorkspace::Calibration;
+            }
         }
     }
 
@@ -4366,7 +4387,6 @@ impl CameraToolboxApp {
     fn render_live_viewer(
         ui: &mut egui::Ui,
         document: &mut LiveDocument,
-        runtime: &LiveRuntime,
         calibration_capture_enabled: bool,
         #[cfg(feature = "calibration-opencv")] calibration_overlay: Option<
             &CalibrationViewerOverlay,
@@ -4377,23 +4397,16 @@ impl CameraToolboxApp {
     ) {
         let rect = ui.max_rect();
         let displayed_frame = document.displayed_frame().cloned();
-        let mut capture_request = None;
         ui.horizontal(|ui| {
             ui.heading(&document.title);
-            if calibration_capture_enabled
-                && ui
-                    .add_enabled(
-                        displayed_frame.is_some(),
-                        egui::Button::new("Capture → Calibration dataset"),
-                    )
-                    .clicked()
-            {
-                capture_request = displayed_frame.clone();
-            }
             if calibration_capture_enabled {
                 ui.checkbox(&mut document.show_calibration_detection, "Board detection");
                 ui.checkbox(&mut document.show_calibration_coverage, "Dataset coverage");
             }
+            ui.add_enabled(false, egui::Button::new("Fit"))
+                .on_hover_text("Live Stream is always fit to the Viewer window.");
+            ui.checkbox(&mut document.horizontal_flip, "Flip X")
+                .on_hover_text("Mirror the displayed image and all live overlays horizontally.");
             if ui.button("Snapshot...").clicked()
                 && let Some(frame) = displayed_frame.as_ref()
                 && let Some(path) = rfd::FileDialog::new()
@@ -4445,18 +4458,25 @@ impl CameraToolboxApp {
             let canvas_size = egui::vec2(available.x.max(fitted.x), fitted.y);
             let (canvas_rect, _) = ui.allocate_exact_size(canvas_size, egui::Sense::hover());
             let image_rect = egui::Rect::from_center_size(canvas_rect.center(), fitted);
-            let response = ui.put(
-                image_rect,
-                egui::Image::new(texture).fit_to_exact_size(fitted),
-            );
+            let response_rect = ui
+                .put(
+                    image_rect,
+                    egui::Image::new(texture)
+                        .fit_to_exact_size(fitted)
+                        .uv(viewer_texture_uv(document.horizontal_flip)),
+                )
+                .rect;
+            #[cfg(not(feature = "calibration-opencv"))]
+            let _ = response_rect;
             #[cfg(feature = "calibration-opencv")]
             if let Some(overlay) = calibration_overlay {
                 Self::paint_live_calibration_overlay(
-                    &ui.painter_at(response.rect),
-                    response.rect,
+                    &ui.painter_at(response_rect),
+                    response_rect,
                     overlay,
                     document.show_calibration_detection,
                     document.show_calibration_coverage,
+                    document.horizontal_flip,
                 );
             }
         } else {
@@ -4475,7 +4495,7 @@ impl CameraToolboxApp {
                 egui::Color32::GRAY,
             );
         }
-        (rect, capture_request)
+        (rect, None)
     }
 
     #[cfg(feature = "calibration-opencv")]
@@ -4485,30 +4505,39 @@ impl CameraToolboxApp {
         overlay: &CalibrationViewerOverlay,
         show_detection: bool,
         show_coverage: bool,
+        horizontal_flip: bool,
     ) {
         if show_coverage {
             for cell in &overlay.coverage {
+                let column = if horizontal_flip {
+                    VIEWER_COVERAGE_COLUMNS - 1 - cell.column
+                } else {
+                    cell.column
+                };
                 let x0 = image_rect.left()
-                    + cell.column as f32 / VIEWER_COVERAGE_COLUMNS as f32 * image_rect.width();
+                    + column as f32 / VIEWER_COVERAGE_COLUMNS as f32 * image_rect.width();
                 let x1 = image_rect.left()
-                    + (cell.column + 1) as f32 / VIEWER_COVERAGE_COLUMNS as f32
-                        * image_rect.width();
+                    + (column + 1) as f32 / VIEWER_COVERAGE_COLUMNS as f32 * image_rect.width();
                 let y0 = image_rect.top()
                     + cell.row as f32 / VIEWER_COVERAGE_ROWS as f32 * image_rect.height();
                 let y1 = image_rect.top()
                     + (cell.row + 1) as f32 / VIEWER_COVERAGE_ROWS as f32 * image_rect.height();
                 let density = cell.density.clamp(0.0, 1.0);
+                let palette = heatmap_color(density);
                 let color = egui::Color32::from_rgba_unmultiplied(
-                    (255.0 * density) as u8,
-                    (220.0 * (1.0 - (density * 2.0 - 1.0).abs())) as u8,
-                    (255.0 * (1.0 - density)) as u8,
-                    (36.0 + 84.0 * density) as u8,
+                    palette.r(),
+                    palette.g(),
+                    palette.b(),
+                    (40.0 + 112.0 * density).round() as u8,
                 );
                 painter.rect_filled(
                     egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
                     0.0,
                     color,
                 );
+            }
+            if !overlay.coverage.is_empty() {
+                paint_heatmap_guides(painter, image_rect);
             }
             if overlay.coverage_views > 0 {
                 painter.text(
@@ -4522,9 +4551,12 @@ impl CameraToolboxApp {
         }
         if show_detection && let Some(detection) = &overlay.detection {
             for point in &detection.corners {
-                if let Some(position) =
-                    Self::live_overlay_point(*point, detection.image_size, image_rect)
-                {
+                if let Some(position) = Self::live_overlay_point(
+                    *point,
+                    detection.image_size,
+                    image_rect,
+                    horizontal_flip,
+                ) {
                     painter.circle_filled(position, 3.5, egui::Color32::from_rgb(80, 255, 120));
                     painter.circle_stroke(
                         position,
@@ -4541,8 +4573,14 @@ impl CameraToolboxApp {
         point: camera_toolbox_core::CalibrationPoint,
         image_size: camera_toolbox_core::CalibrationImageSize,
         image_rect: egui::Rect,
+        horizontal_flip: bool,
     ) -> Option<egui::Pos2> {
         let normalized_x = (point.x + 0.5) / image_size.width as f32;
+        let normalized_x = if horizontal_flip {
+            1.0 - normalized_x
+        } else {
+            normalized_x
+        };
         let normalized_y = (point.y + 0.5) / image_size.height as f32;
         if !normalized_x.is_finite()
             || !normalized_y.is_finite()
@@ -4902,6 +4940,8 @@ fn write_live_snapshot(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceStreamAction {
     Activate(DocumentId),
+    #[cfg(feature = "calibration-opencv")]
+    Capture(DocumentId),
     Stop(DocumentId),
 }
 

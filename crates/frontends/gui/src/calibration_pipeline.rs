@@ -14,10 +14,13 @@ use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
     AutoCandidateToken, CalibrationBackend, CalibrationBackendError, CalibrationCancellation,
     CalibrationEncodedPng, CalibrationInputError, CalibrationInputRevision, CalibrationJobToken,
-    FileRef, FileSourceId, FileSystem, FileSystemError, FsCancellation, FsControl, RasterFormat,
-    RasterImageCodec, read_calibration_png,
+    FileRef, FileSourceId, FileSystem, FileSystemError, FsCancellation, FsControl,
+    InitialIntrinsicsBinding, PnPObservation, RasterFormat, RasterImageCodec, SnapshotHash,
+    read_calibration_png,
 };
-use camera_toolbox_core::{BoardSpec, ChessboardDetectionOutcome, Rgba8Frame};
+use camera_toolbox_core::{
+    BoardSpec, CalibrationImageSize, ChessboardDetectionOutcome, InitialIntrinsics, Rgba8Frame,
+};
 use eframe::egui;
 
 pub(crate) const IO_WORKERS: usize = 8;
@@ -46,6 +49,7 @@ pub(crate) struct ReadJob {
     pub reference: FileRef,
     pub file_cancellation: FsCancellation,
     pub calibration_cancellation: CalibrationCancellation,
+    pub dataset_pose_seed: Option<DatasetPoseEstimationSeed>,
     pub reserved_bytes: u64,
     queued_at: Instant,
 }
@@ -60,6 +64,7 @@ impl ReadJob {
         reference: FileRef,
         file_cancellation: FsCancellation,
         calibration_cancellation: CalibrationCancellation,
+        dataset_pose_seed: Option<DatasetPoseEstimationSeed>,
     ) -> Self {
         let reserved_bytes = token.source_revision().encoded_bytes();
         Self {
@@ -70,6 +75,7 @@ impl ReadJob {
             reference,
             file_cancellation,
             calibration_cancellation,
+            dataset_pose_seed,
             reserved_bytes,
             queued_at: Instant::now(),
         }
@@ -117,11 +123,59 @@ impl EncodedDetectionRequest {
     }
 }
 
+/// 与候选 token 同期冻结的 PnP 请求；绝不在 worker 内回读 GUI 状态。
+#[derive(Clone, Debug)]
+pub(crate) struct PoseEstimationRequest {
+    pub initial_intrinsics: InitialIntrinsics,
+    pub reference_image_size: CalibrationImageSize,
+    pub binding_digest: SnapshotHash,
+}
+
+/// 普通 Dataset PnP 使用当前 GUI 初始 K/D12，但绑定到各自图片尺寸，且不继承 live source key。
+#[derive(Clone, Debug)]
+pub(crate) enum DatasetPoseEstimationSeed {
+    AutoCentered,
+    Fixed(InitialIntrinsics),
+}
+
+impl DatasetPoseEstimationSeed {
+    pub(crate) fn resolve(
+        &self,
+        image_size: CalibrationImageSize,
+    ) -> Option<PoseEstimationRequest> {
+        let initial_intrinsics = match self {
+            Self::AutoCentered => InitialIntrinsics {
+                camera_matrix: [
+                    900.0,
+                    0.0,
+                    f64::from(image_size.width) * 0.5,
+                    0.0,
+                    900.0,
+                    f64::from(image_size.height) * 0.5,
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                distortion_coefficients: vec![0.0; 12],
+            },
+            Self::Fixed(initial_intrinsics) => initial_intrinsics.clone(),
+        };
+        let binding =
+            InitialIntrinsicsBinding::dataset_full_frame(initial_intrinsics, image_size).ok()?;
+        Some(PoseEstimationRequest {
+            initial_intrinsics: binding.initial_intrinsics,
+            reference_image_size: binding.reference_image_size,
+            binding_digest: binding.digest,
+        })
+    }
+}
+
 pub(crate) struct LoadedDetectionJob {
     pub batch_id: u64,
     pub request: EncodedDetectionRequest,
     pub encoded: CalibrationEncodedPng,
     pub cancellation: CalibrationCancellation,
+    pub pose_request: Option<PoseEstimationRequest>,
     pub reserved_bytes: u64,
     queued_at: Instant,
 }
@@ -132,12 +186,14 @@ impl LoadedDetectionJob {
         request: EncodedDetectionRequest,
         encoded: CalibrationEncodedPng,
         cancellation: CalibrationCancellation,
+        pose_request: Option<PoseEstimationRequest>,
     ) -> Self {
         Self {
             batch_id,
             request,
             encoded,
             cancellation,
+            pose_request,
             reserved_bytes: 0,
             queued_at: Instant::now(),
         }
@@ -163,6 +219,7 @@ pub(crate) enum ReadStageEvent {
 pub(crate) struct DetectionProduct {
     pub source_revision: CalibrationInputRevision,
     pub outcome: ChessboardDetectionOutcome,
+    pub pnp_observation: Option<PnPObservation>,
     pub preview: Option<Arc<Rgba8Frame>>,
 }
 
@@ -400,6 +457,10 @@ fn run_read(job: ReadJob) -> ReadStageResult {
         .map(|encoded| LoadedDetectionJob {
             batch_id: job.batch_id,
             request: EncodedDetectionRequest::Dataset(job.token.clone()),
+            pose_request: job
+                .dataset_pose_seed
+                .as_ref()
+                .and_then(|seed| seed.resolve(encoded.image_size)),
             encoded,
             cancellation: job.calibration_cancellation,
             reserved_bytes: job.reserved_bytes,
@@ -437,11 +498,20 @@ fn run_detection(
     preview_codec: &dyn RasterImageCodec,
     job: LoadedDetectionJob,
 ) -> DetectionStageResult {
-    let queue_wait = job.queued_at.elapsed();
+    let LoadedDetectionJob {
+        batch_id,
+        request,
+        encoded,
+        cancellation,
+        pose_request,
+        reserved_bytes,
+        queued_at,
+    } = job;
+    let queue_wait = queued_at.elapsed();
     let detection_started = Instant::now();
-    let request_kind = job.request.kind();
-    let request_id = job.request.id();
-    let detection = if job.encoded.source_revision != *job.request.source_revision() {
+    let request_kind = request.kind();
+    let request_id = request.id();
+    let detection = if encoded.source_revision != *request.source_revision() {
         Err(PipelineStageError {
             message: "encoded calibration PNG revision does not match its detection request"
                 .to_owned(),
@@ -450,47 +520,74 @@ fn run_detection(
     } else {
         backend
             .detect_png(
-                &job.encoded.bytes,
-                job.encoded.image_size,
+                &encoded.bytes,
+                encoded.image_size,
                 MAX_DECODED_PREVIEW_BYTES,
-                job.request.board(),
-                &job.cancellation,
+                request.board(),
+                &cancellation,
             )
             .map_err(backend_error)
     };
     let detection_elapsed = detection_started.elapsed();
-    let result = detection.map(|outcome| {
+    let result = detection.and_then(|outcome| {
+        let pose_started = Instant::now();
+        let pnp_observation = match (&outcome, pose_request.as_ref()) {
+            (ChessboardDetectionOutcome::Found(detection), Some(pose_request))
+                if detection.image_size == pose_request.reference_image_size =>
+            {
+                let pose = backend
+                    .estimate_pose(
+                        detection,
+                        &pose_request.initial_intrinsics,
+                        request.board(),
+                        &cancellation,
+                    )
+                    .map_err(backend_error)?;
+                Some(
+                    PnPObservation::from_view_result(
+                        pose_request.binding_digest.clone(),
+                        pose,
+                        request.board(),
+                    )
+                    .map_err(|error| PipelineStageError {
+                        message: error.to_string(),
+                        cancelled: false,
+                    })?,
+                )
+            }
+            _ => None,
+        };
+        let pose_elapsed = pose_started.elapsed();
         let preview_started = Instant::now();
         let preview = preview_codec
-            .decode_rgba8(
-                RasterFormat::Png,
-                &job.encoded.bytes,
-                MAX_DECODED_PREVIEW_BYTES,
-            )
+            .decode_rgba8(RasterFormat::Png, &encoded.bytes, MAX_DECODED_PREVIEW_BYTES)
             .ok()
             .map(Arc::new);
         let preview_elapsed = preview_started.elapsed();
         tracing::debug!(
             operation = "calibration_pipeline_detect",
-            batch_id = job.batch_id,
+            batch_id,
             request_kind,
             request_id,
             queue_wait_ms = queue_wait.as_secs_f64() * 1000.0,
             detect_ms = detection_elapsed.as_secs_f64() * 1000.0,
+            pose_ms = pose_elapsed.as_secs_f64() * 1000.0,
+            pose_computed = pnp_observation.is_some(),
             preview_ms = preview_elapsed.as_secs_f64() * 1000.0,
             preview_available = preview.is_some(),
             "calibration detection stage finished"
         );
-        DetectionProduct {
-            source_revision: job.encoded.source_revision,
+        Ok(DetectionProduct {
+            source_revision: encoded.source_revision,
             outcome,
+            pnp_observation,
             preview,
-        }
+        })
     });
     if let Err(error) = &result {
         tracing::debug!(
             operation = "calibration_pipeline_detect",
-            batch_id = job.batch_id,
+            batch_id,
             request_kind,
             request_id,
             queue_wait_ms = queue_wait.as_secs_f64() * 1000.0,
@@ -500,9 +597,9 @@ fn run_detection(
         );
     }
     DetectionStageResult {
-        batch_id: job.batch_id,
-        request: job.request,
-        reserved_bytes: job.reserved_bytes,
+        batch_id,
+        request,
+        reserved_bytes,
         result,
     }
 }
@@ -753,6 +850,7 @@ mod tests {
                         source_revision: a_version.clone().into(),
                     },
                     cancellation: CalibrationCancellation::default(),
+                    pose_request: None,
                     reserved_bytes: a_version.size,
                     queued_at: Instant::now(),
                 })
@@ -773,6 +871,7 @@ mod tests {
                     b_reference,
                     FsCancellation::default(),
                     CalibrationCancellation::default(),
+                    None,
                 ))
                 .is_ok()
         );
@@ -833,6 +932,7 @@ mod tests {
                         source_revision: version.clone().into(),
                     },
                     cancellation,
+                    pose_request: None,
                     reserved_bytes: version.size,
                     queued_at: Instant::now(),
                 })

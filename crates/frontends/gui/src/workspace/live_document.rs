@@ -3,10 +3,11 @@
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 
 use camera_toolbox_app::{
-    DecodedVideoFrame, LatestDecodedFrameSlot, PlatformProfileId, RecordingBranch, RecordingState,
-    RtspTransport, StreamMediaInfo, StreamMetrics, StreamServiceEvent, StreamSessionId,
-    StreamStage, StreamTerminal, host_monotonic_time_ns,
+    AutoCaptureAcquisitionKey, DecodedVideoFrame, LatestDecodedFrameSlot, PlatformProfileId,
+    RecordingBranch, RecordingState, RtspTransport, StreamMediaInfo, StreamMetrics,
+    StreamServiceEvent, StreamSessionId, StreamStage, StreamTerminal, host_monotonic_time_ns,
 };
+use camera_toolbox_core::CalibrationImageSize;
 use eframe::egui;
 
 use super::DocumentId;
@@ -18,11 +19,15 @@ pub(crate) enum LiveStreamSource {
         profile_id: PlatformProfileId,
         profile_label: String,
         channel: u16,
+        source_fingerprint: String,
+        geometry_key: String,
     },
     Rtsp {
         label: String,
         channel: u16,
         transport: RtspTransport,
+        source_fingerprint: String,
+        geometry_key: String,
     },
 }
 
@@ -56,6 +61,55 @@ impl LiveStreamSource {
             }
         }
     }
+
+    pub(crate) fn acquisition_key_for_frame(
+        &self,
+        frame: &DecodedVideoFrame,
+    ) -> Result<AutoCaptureAcquisitionKey, String> {
+        let source_channel = self.channel();
+        if source_channel != frame.identity.channel {
+            return Err(format!(
+                "stream source channel {source_channel} does not match frame channel {}",
+                frame.identity.channel
+            ));
+        }
+        let image_size = CalibrationImageSize::new(frame.width, frame.height)
+            .map_err(|error| error.to_string())?;
+        AutoCaptureAcquisitionKey::new(
+            self.source_fingerprint().to_owned(),
+            source_channel,
+            format!(
+                "{};full-frame={}x{};orientation=upright;pixel=opencv-centers",
+                self.geometry_key(),
+                image_size.width,
+                image_size.height
+            ),
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    fn channel(&self) -> u16 {
+        match self {
+            Self::Cv610 { channel, .. } | Self::Rtsp { channel, .. } => *channel,
+        }
+    }
+
+    fn source_fingerprint(&self) -> &str {
+        match self {
+            Self::Cv610 {
+                source_fingerprint, ..
+            }
+            | Self::Rtsp {
+                source_fingerprint, ..
+            } => source_fingerprint,
+        }
+    }
+
+    fn geometry_key(&self) -> &str {
+        match self {
+            Self::Cv610 { geometry_key, .. } | Self::Rtsp { geometry_key, .. } => geometry_key,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -83,6 +137,7 @@ pub(crate) struct LiveDocument {
     pub(crate) last_snapshot: Option<String>,
     pub(crate) show_calibration_detection: bool,
     pub(crate) show_calibration_coverage: bool,
+    pub(crate) horizontal_flip: bool,
     texture: Option<egui::TextureHandle>,
     displayed_frame: Option<Arc<DecodedVideoFrame>>,
     /// 最近一秒实际安装纹理的时刻；只计最新帧，不为预览建立队列。
@@ -113,6 +168,7 @@ impl LiveDocument {
             last_snapshot: None,
             show_calibration_detection: true,
             show_calibration_coverage: true,
+            horizontal_flip: false,
             texture: None,
             displayed_frame: None,
             presentation_samples_ns: VecDeque::new(),
@@ -139,6 +195,7 @@ impl LiveDocument {
             StreamServiceEvent::Terminal(terminal) => {
                 self.latest_frame.clear();
                 self.release_texture();
+                self.clear_displayed_frame();
                 self.lifecycle = if matches!(terminal, StreamTerminal::Forced { .. }) {
                     LiveDocumentLifecycle::ForcedCleanup { terminal }
                 } else {
@@ -155,9 +212,11 @@ impl LiveDocument {
         let Some(frame) = self.latest_frame.latest() else {
             return;
         };
-        if self.displayed_frame.as_ref().is_some_and(|displayed| {
-            displayed.identity.frame_sequence == frame.identity.frame_sequence
-        }) {
+        if self.texture.is_some()
+            && self.displayed_frame.as_ref().is_some_and(|displayed| {
+                displayed.identity.frame_sequence == frame.identity.frame_sequence
+            })
+        {
             return;
         }
         let Ok(width) = usize::try_from(frame.width) else {
@@ -238,14 +297,17 @@ impl LiveDocument {
         self.texture.as_ref()
     }
 
-    /// 当前纹理、provenance 与显式 Snapshot 共享同一个不可变帧对象。
+    /// 当前文档最近一次安装的不可变展示帧；释放非活动流 GPU texture 后仍保留，供侧栏 Capture。
     pub(crate) fn displayed_frame(&self) -> Option<&Arc<DecodedVideoFrame>> {
         self.displayed_frame.as_ref()
     }
 
-    /// inactive live Tab 不停止会话，只释放 GPU texture；latest slot 仍固定为单槽。
+    /// 非活动 live 文档只释放 GPU texture，保留每流展示快照。
     pub(crate) fn release_texture(&mut self) {
         self.texture = None;
+    }
+
+    fn clear_displayed_frame(&mut self) {
         self.displayed_frame = None;
     }
 
@@ -283,6 +345,8 @@ mod tests {
             label: "Test".to_owned(),
             channel: 0,
             transport: RtspTransport::Tcp,
+            source_fingerprint: "test-rtsp-source".to_owned(),
+            geometry_key: "test-rtsp-config".to_owned(),
         }
     }
 
@@ -304,6 +368,32 @@ mod tests {
             .expect("frame A must stay installed");
         assert_eq!(displayed.identity.frame_sequence, 1);
         assert_eq!(displayed.rgba[0], 17);
+    }
+
+    #[test]
+    fn releasing_texture_keeps_displayed_frame_for_inactive_capture() {
+        let latest = Arc::new(LatestDecodedFrameSlot::default());
+        latest.publish(frame(1, 17));
+        let mut document = LiveDocument::new(
+            DocumentId::from_raw(1),
+            StreamSessionId::new("live-document-test").unwrap(),
+            latest,
+            source(),
+        );
+        document.install_latest_texture(&egui::Context::default());
+        document.release_texture();
+
+        assert!(document.texture().is_none());
+        assert_eq!(
+            document
+                .displayed_frame()
+                .expect("inactive capture keeps the displayed snapshot")
+                .identity
+                .frame_sequence,
+            1
+        );
+        document.install_latest_texture(&egui::Context::default());
+        assert!(document.texture().is_some());
     }
 
     #[test]

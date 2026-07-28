@@ -15,13 +15,16 @@ use std::{
 
 use camera_toolbox_adapters::{ImageRasterCodec, OpenCvCalibrationBackend};
 use camera_toolbox_app::{
-    AddCalibrationItemOutcome, AutoCandidateId, AutoCandidateToken, CalibrationBackend,
-    CalibrationCancellation, CalibrationEncodedPng, CalibrationInputKey, CalibrationInputRevision,
-    CalibrationItemId, CalibrationItemStatus, CalibrationJobToken, CalibrationSession,
-    CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EepromDryRunResult, EepromInspectResult,
-    EepromWriteResult, EntryName, ExportDestination, ExportReceipt, ExportService, FileSourceId,
-    FileSystem, FileSystemError, FsCancellation, FsControl, OperationId, RasterImageCodec,
-    SnapshotHash, StreamCaptureId, StreamFrameIdentity, StreamSessionId, host_monotonic_time_ns,
+    AddCalibrationItemOutcome, AutoAdmissionAssessment, AutoAdmissionItemContribution,
+    AutoAdmissionPnpState, AutoCandidateCommit, AutoCandidateId, AutoCandidateToken,
+    AutoCaptureAcceptanceCriteria, AutoCaptureAcquisitionKey, AutoCaptureBaseline,
+    CalibrationBackend, CalibrationCancellation, CalibrationEncodedPng, CalibrationInputKey,
+    CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
+    CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EepromDryRunResult,
+    EepromInspectResult, EepromWriteResult, EntryName, ExportDestination, ExportReceipt,
+    ExportService, FileSourceId, FileSystem, FileSystemError, FsCancellation, FsControl,
+    InitialIntrinsicsBinding, OperationId, PnPObservation, RasterImageCodec, SnapshotHash,
+    StreamCaptureId, StreamFrameIdentity, StreamSessionId, host_monotonic_time_ns,
 };
 use camera_toolbox_core::{
     AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
@@ -32,20 +35,27 @@ use camera_toolbox_core::{
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
+use crate::calibration_acceptance::{
+    DatasetAcceptanceDraft, DatasetAcceptancePanelState, DatasetAcceptanceProgress,
+    render_dataset_acceptance,
+};
 use crate::calibration_eeprom::{CalibrationEepromState, CalibrationProvisionIntent};
 use crate::calibration_pipeline::{
-    CalibrationDetectionPipeline, DetectionProduct, DetectionStageEvent, DetectionStageResult,
-    EncodedDetectionRequest, LoadedDetectionJob, MAX_ENCODED_PNG_BYTES, MAX_INFLIGHT_ENCODED_BYTES,
-    PipelineStageError, ReadJob, ReadSource, ReadStageEvent, ReadStageResult,
+    CalibrationDetectionPipeline, DatasetPoseEstimationSeed, DetectionProduct, DetectionStageEvent,
+    DetectionStageResult, EncodedDetectionRequest, LoadedDetectionJob, MAX_ENCODED_PNG_BYTES,
+    MAX_INFLIGHT_ENCODED_BYTES, PipelineStageError, PoseEstimationRequest, ReadJob, ReadSource,
+    ReadStageEvent, ReadStageResult,
 };
-use crate::{explorer::CalibrationImportCandidate, viewer::pixel_inspection_texture_options};
+use crate::{
+    explorer::CalibrationImportCandidate,
+    viewer::{pixel_inspection_texture_options, viewer_texture_uv},
+    workspace::LiveStreamSource,
+};
 
 const MAX_DATASET_ITEMS: usize = 256;
 const REMOTE_READS_PER_SOURCE: usize = 8;
 const AUTO_CAPTURE_ANALYSIS_INTERVAL_NS: u64 = 200_000_000;
 const AUTO_CAPTURE_ACCEPT_COOLDOWN_NS: u64 = 750_000_000;
-const DATASET_FIELD_COLUMNS: usize = 4;
-const DATASET_FIELD_ROWS: usize = 3;
 const COVERAGE_WIDTH: usize = 192;
 const COVERAGE_GAUSSIAN_SIGMA: f32 = 42.0 / 1920.0 * COVERAGE_WIDTH as f32;
 pub(crate) const VIEWER_COVERAGE_COLUMNS: usize = 48;
@@ -59,11 +69,18 @@ const RMSE_TEXT_ON_TRACK: egui::Color32 = egui::Color32::WHITE;
 const REPROJECTION_ARROW_WIDTH: f32 = 1.25;
 const REPROJECTION_ARROW_HEAD_LENGTH: f32 = 5.0;
 const REPROJECTION_ARROW_HEAD_HALF_WIDTH: f32 = 2.5;
+const POSE_AXIS_STROKE_WIDTH: f32 = 2.25;
+const POSE_AXIS_ENDPOINT_RADIUS: f32 = 3.0;
+const POSE_AXIS_ORIGIN_RADIUS: f32 = 4.0;
+const POSE_AXIS_X_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 80, 80);
+const POSE_AXIS_Y_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 220, 120);
+const POSE_AXIS_Z_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 150, 255);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalibrationJobKind {
     Detect,
     Calibrate,
+    DatasetPnpRefresh,
 }
 
 /// 标定页面支持的格式化导出；所有变体都通过同一 Explorer destination 保存。
@@ -138,6 +155,7 @@ struct StreamCalibrationSource {
     asset: Option<Arc<EphemeralAsset>>,
     identity: StreamFrameIdentity,
     image_size: CalibrationImageSize,
+    acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
 }
 
 impl CalibrationSource {
@@ -157,6 +175,7 @@ impl CalibrationSource {
         asset: Arc<EphemeralAsset>,
         identity: StreamFrameIdentity,
         image_size: CalibrationImageSize,
+        acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
     ) -> Self {
         Self {
             display_name: format!(
@@ -168,6 +187,7 @@ impl CalibrationSource {
                 asset: Some(asset),
                 identity,
                 image_size,
+                acquisition_key,
             }),
             preview: None,
         }
@@ -194,6 +214,7 @@ impl CalibrationSource {
         let CalibrationSourceKind::Stream(stream) = &self.kind else {
             return Ok(None);
         };
+        let _retained_acquisition_key = &stream.acquisition_key;
         let Some(asset) = stream.asset.as_ref() else {
             return Err("stream calibration asset was released".to_owned());
         };
@@ -232,6 +253,7 @@ struct FrozenStreamInput {
 fn freeze_stream_input(
     frame: &Arc<DecodedVideoFrame>,
     store: CaptureStore,
+    acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
 ) -> Result<FrozenStreamInput, String> {
     let rgba = Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba))
         .map_err(|error| format!("Cannot freeze displayed stream frame: {error}"))?;
@@ -283,6 +305,14 @@ fn freeze_stream_input(
     );
     attributes.insert("width".to_owned(), frame.width.to_string());
     attributes.insert("height".to_owned(), frame.height.to_string());
+    attributes.insert(
+        "acquisition_source_fingerprint".to_owned(),
+        acquisition_key.source_fingerprint.clone(),
+    );
+    attributes.insert(
+        "acquisition_geometry_key".to_owned(),
+        acquisition_key.geometry_key.clone(),
+    );
     let asset = EphemeralAsset::new(
         asset_id,
         OwnedMediaPayload::Bytes(Arc::clone(&bytes)),
@@ -307,7 +337,13 @@ fn freeze_stream_input(
         encoded_bytes: asset.byte_len().unwrap_or_default() as u64,
     };
     Ok(FrozenStreamInput {
-        source: CalibrationSource::stream(store, asset, frame.identity.clone(), image_size),
+        source: CalibrationSource::stream(
+            store,
+            asset,
+            frame.identity.clone(),
+            image_size,
+            acquisition_key,
+        ),
         encoded: CalibrationEncodedPng {
             bytes,
             image_size,
@@ -327,6 +363,7 @@ struct CalibrationPreviewViewport {
     zoom: f32,
     pan: egui::Vec2,
     fit_on_next_frame: bool,
+    horizontal_flip: bool,
 }
 
 impl CalibrationPreviewViewport {
@@ -484,8 +521,10 @@ enum CandidateIntent {
 struct PendingCandidate {
     token: AutoCandidateToken,
     intent: CandidateIntent,
+    source: CalibrationSource,
     encoded: Option<CalibrationEncodedPng>,
     cancellation: CalibrationCancellation,
+    pose_request: Option<PoseEstimationRequest>,
     state: AutoCandidateState,
 }
 
@@ -497,14 +536,14 @@ struct AutoCaptureSession {
     latest_detection: Option<IdentityBoundDetection>,
     last_accepted_at_ns: u64,
     next_candidate_id: u64,
-    last_assessment: Option<DatasetAssessment>,
+    last_assessment: Option<AutoAdmissionAssessment>,
 }
-#[derive(Clone, Debug, Default)]
-struct DatasetAssessment {
-    enabled_found_views: usize,
-    field_cells: usize,
-    constraint_gain: usize,
-    message: String,
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveAdmissionContext {
+    source: LiveStreamSource,
+    acquisition_key: AutoCaptureAcquisitionKey,
+    image_size: CalibrationImageSize,
 }
 
 enum CandidateTerminal {
@@ -512,11 +551,36 @@ enum CandidateTerminal {
     Discard(String),
 }
 
+struct DatasetPnpRefreshItem {
+    item_id: CalibrationItemId,
+    detection: ChessboardDetection,
+    request: PoseEstimationRequest,
+}
+
+struct DatasetPnpRefreshBatch {
+    board: BoardSpec,
+    cancellation: CalibrationCancellation,
+    items: Vec<DatasetPnpRefreshItem>,
+}
+
+struct DatasetPnpRefreshItemResult {
+    item_id: CalibrationItemId,
+    detection: ChessboardDetection,
+    binding_digest: SnapshotHash,
+    result: Result<PnPObservation, String>,
+}
+
+struct DatasetPnpRefreshBatchResult {
+    board: BoardSpec,
+    results: Vec<DatasetPnpRefreshItemResult>,
+}
+
 enum WorkerCommand {
     Calibrate {
         snapshot: CalibrationSnapshot,
         cancellation: CalibrationCancellation,
     },
+    RefreshDatasetPnp(DatasetPnpRefreshBatch),
     Shutdown,
 }
 
@@ -525,6 +589,7 @@ enum WorkerEvent {
         snapshot: CalibrationSnapshot,
         result: Result<CalibrationSolution, String>,
     },
+    DatasetPnpRefresh(DatasetPnpRefreshBatchResult),
 }
 
 struct CalibrationWorker {
@@ -552,6 +617,9 @@ impl CalibrationWorker {
                                 .map_err(|error| error.to_string());
                             WorkerEvent::Calibration { snapshot, result }
                         }
+                        WorkerCommand::RefreshDatasetPnp(batch) => {
+                            WorkerEvent::DatasetPnpRefresh(run_dataset_pnp_refresh(&backend, batch))
+                        }
                         WorkerCommand::Shutdown => break,
                     };
                     if event_sender.send(event).is_err() {
@@ -577,6 +645,42 @@ impl Drop for CalibrationWorker {
     fn drop(&mut self) {
         let _ = self.sender.send(WorkerCommand::Shutdown);
     }
+}
+
+fn run_dataset_pnp_refresh(
+    backend: &dyn CalibrationBackend,
+    batch: DatasetPnpRefreshBatch,
+) -> DatasetPnpRefreshBatchResult {
+    let DatasetPnpRefreshBatch {
+        board,
+        cancellation,
+        items,
+    } = batch;
+    let results = items
+        .into_iter()
+        .map(|item| {
+            let binding_digest = item.request.binding_digest.clone();
+            let result = backend
+                .estimate_pose(
+                    &item.detection,
+                    &item.request.initial_intrinsics,
+                    board,
+                    &cancellation,
+                )
+                .map_err(|error| error.to_string())
+                .and_then(|pose| {
+                    PnPObservation::from_view_result(binding_digest.clone(), pose, board)
+                        .map_err(|error| error.to_string())
+                });
+            DatasetPnpRefreshItemResult {
+                item_id: item.item_id,
+                detection: item.detection,
+                binding_digest,
+                result,
+            }
+        })
+        .collect();
+    DatasetPnpRefreshBatchResult { board, results }
 }
 
 pub(crate) struct CalibrationWorkspace {
@@ -611,11 +715,19 @@ pub(crate) struct CalibrationWorkspace {
     coverage_dirty: bool,
     auto_capture_enabled: bool,
     dataset_sidebar_expanded: bool,
+    acceptance_draft: DatasetAcceptanceDraft,
+    acceptance_last_valid_criteria: AutoCaptureAcceptanceCriteria,
+    live_admission_context: Option<LiveAdmissionContext>,
 }
 
 impl CalibrationWorkspace {
     pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
         let board = BoardSpec::new(11, 8, 40.0).expect("default board is valid");
+        let acceptance_draft = DatasetAcceptanceDraft::default();
+        let acceptance_last_valid_criteria = acceptance_draft
+            .parse()
+            .expect("default Dataset Acceptance thresholds are valid");
+
         Ok(Self {
             session: CalibrationSession::new(board),
             sources: HashMap::new(),
@@ -636,8 +748,8 @@ impl CalibrationWorkspace {
             board_rows: board.inner_rows,
             square_size: board.square_size,
             auto_intrinsics: true,
-            fx: 1000.0,
-            fy: 1000.0,
+            fx: 900.0,
+            fy: 900.0,
             cx: 0.0,
             cy: 0.0,
             preview_viewport: CalibrationPreviewViewport::default(),
@@ -646,6 +758,9 @@ impl CalibrationWorkspace {
             coverage_dirty: true,
             auto_capture_enabled: false,
             dataset_sidebar_expanded: true,
+            acceptance_draft,
+            acceptance_last_valid_criteria,
+            live_admission_context: None,
             display_layer: CalibrationDisplayLayer::default(),
             auto_capture: AutoCaptureSession {
                 next_candidate_id: 1,
@@ -663,6 +778,9 @@ impl CalibrationWorkspace {
                 let queued = candidates.len();
                 self.pending_imports.extend(candidates);
                 self.status = format!("Queued {queued} image(s) for detection.");
+            }
+            Some(CalibrationJobKind::DatasetPnpRefresh) => {
+                self.status = "Wait for Dataset PnP refresh before importing files.".to_owned();
             }
             None => self.import_candidates(candidates, true),
         }
@@ -736,6 +854,7 @@ impl CalibrationWorkspace {
     pub(crate) fn capture_displayed_stream_frame(
         &mut self,
         frame: Arc<DecodedVideoFrame>,
+        live_source: LiveStreamSource,
         store: CaptureStore,
     ) {
         if self.active_job.is_some() {
@@ -773,17 +892,28 @@ impl CalibrationWorkspace {
             return;
         }
 
-        let FrozenStreamInput { source, encoded } = match freeze_stream_input(&frame, store) {
-            Ok(frozen) => frozen,
+        let source_acquisition_key = match live_source.acquisition_key_for_frame(&frame) {
+            Ok(key) => key,
             Err(error) => {
-                self.status = error;
+                self.status =
+                    format!("Cannot bind displayed stream frame to calibration source: {error}");
                 return;
             }
         };
-        let outcome = self.session.add_or_refresh(
+
+        let FrozenStreamInput { source, encoded } =
+            match freeze_stream_input(&frame, store, source_acquisition_key.clone()) {
+                Ok(frozen) => frozen,
+                Err(error) => {
+                    self.status = error;
+                    return;
+                }
+            };
+        let outcome = self.session.add_or_refresh_with_acquisition_key(
             input,
             encoded.source_revision,
             source.display_name.clone(),
+            Some(source_acquisition_key),
         );
         let id = match outcome {
             AddCalibrationItemOutcome::Added(id) | AddCalibrationItemOutcome::SourceChanged(id) => {
@@ -804,14 +934,24 @@ impl CalibrationWorkspace {
         self.start_detection_items(vec![id]);
     }
 
-    /// 观察 Viewer 已安装的不可变帧；预览检测与自动准入使用同一 worker，但终态互不混淆。
+    /// 观察 Viewer 已安装的不可变帧；预览和自动提交共用权威检测 worker。
     pub(crate) fn observe_live_frame(
         &mut self,
         frame: Arc<DecodedVideoFrame>,
+        live_source: LiveStreamSource,
         store: CaptureStore,
         preview_requested: bool,
     ) {
-        let intent = if preview_requested {
+        let source_acquisition_key = match self.sync_live_admission(frame.as_ref(), &live_source) {
+            Ok(key) => key,
+            Err(error) => {
+                self.status = format!("Cannot bind live frame to auto-capture admission: {error}");
+                return;
+            }
+        };
+        let intent = if self.auto_capture_enabled && self.active_live_admission() {
+            CandidateIntent::AutoCommit
+        } else if preview_requested {
             CandidateIntent::PreviewOnly
         } else {
             return;
@@ -843,20 +983,36 @@ impl CalibrationWorkspace {
         {
             return;
         }
+        let pose_request = match intent {
+            CandidateIntent::PreviewOnly => None,
+            CandidateIntent::AutoCommit => {
+                let Some(binding) = self.session.initial_intrinsics_binding() else {
+                    self.status =
+                        "Automatic capture waits for a valid current K/D12 binding.".to_owned();
+                    return;
+                };
+                Some(PoseEstimationRequest {
+                    initial_intrinsics: binding.initial_intrinsics.clone(),
+                    reference_image_size: binding.reference_image_size,
+                    binding_digest: binding.digest.clone(),
+                })
+            }
+        };
         self.auto_capture.last_observed = Some(capture_id);
         self.auto_capture.last_observed_at_ns = now_ns;
 
-        let FrozenStreamInput { source, encoded } = match freeze_stream_input(&frame, store) {
-            Ok(frozen) => frozen,
-            Err(error) => {
-                let operation = match intent {
-                    CandidateIntent::PreviewOnly => "Board preview",
-                    CandidateIntent::AutoCommit => "Automatic capture",
-                };
-                self.status = format!("{operation} rejected before detection: {error}");
-                return;
-            }
-        };
+        let FrozenStreamInput { source, encoded } =
+            match freeze_stream_input(&frame, store, source_acquisition_key.clone()) {
+                Ok(frozen) => frozen,
+                Err(error) => {
+                    let operation = match intent {
+                        CandidateIntent::PreviewOnly => "Board preview",
+                        CandidateIntent::AutoCommit => "Automatic capture",
+                    };
+                    self.status = format!("{operation} rejected before detection: {error}");
+                    return;
+                }
+            };
         let candidate_id = AutoCandidateId::new(self.auto_capture.next_candidate_id);
         self.auto_capture.next_candidate_id =
             self.auto_capture.next_candidate_id.wrapping_add(1).max(1);
@@ -865,6 +1021,7 @@ impl CalibrationWorkspace {
             frame.identity.clone(),
             encoded.source_revision.clone(),
             source.display_name.clone(),
+            Some(source_acquisition_key),
         ) {
             Ok(token) => token,
             Err(error) => {
@@ -879,8 +1036,10 @@ impl CalibrationWorkspace {
         self.auto_capture.pending = Some(PendingCandidate {
             token,
             intent,
+            source,
             encoded: Some(encoded),
             cancellation: CalibrationCancellation::default(),
+            pose_request,
             state: AutoCandidateState::Queued,
         });
         self.status = match intent {
@@ -889,10 +1048,166 @@ impl CalibrationWorkspace {
                 candidate_id.get()
             ),
             CandidateIntent::AutoCommit => format!(
-                "Automatic candidate {} queued for authoritative detection.",
+                "Automatic candidate {} queued for authoritative detection and PnP.",
                 candidate_id.get()
             ),
         };
+    }
+
+    /// 从当前显示帧刷新 source-bound runtime admission；不读取或写入 profile 文件。
+    fn sync_live_admission(
+        &mut self,
+        frame: &DecodedVideoFrame,
+        live_source: &LiveStreamSource,
+    ) -> Result<AutoCaptureAcquisitionKey, String> {
+        let image_size = CalibrationImageSize::new(frame.width, frame.height)
+            .map_err(|error| error.to_string())?;
+        let acquisition_key = if let Some(context) = self.live_admission_context.as_ref()
+            && context.source == *live_source
+            && context.image_size == image_size
+        {
+            context.acquisition_key.clone()
+        } else {
+            live_source.acquisition_key_for_frame(frame)?
+        };
+        let context_changed = self.live_admission_context.as_ref().is_none_or(|context| {
+            context.source != *live_source
+                || context.image_size != image_size
+                || context.acquisition_key != acquisition_key
+        });
+        if context_changed {
+            if self.auto_capture.pending.is_some() {
+                self.cancel_auto_candidate(
+                    "Live detection candidate cancelled because source or image geometry changed.",
+                );
+            }
+            self.session
+                .configure_auto_admission(None, None)
+                .map_err(|error| error.to_string())?;
+            self.live_admission_context = Some(LiveAdmissionContext {
+                source: live_source.clone(),
+                acquisition_key: acquisition_key.clone(),
+                image_size,
+            });
+            self.auto_capture.last_assessment = None;
+        }
+        self.refresh_runtime_auto_admission();
+        Ok(acquisition_key)
+    }
+
+    /// 仅在所有文本阈值和当前 K/D12 都有效时，替换当前 live context 的 admission。
+    fn refresh_runtime_auto_admission(&mut self) {
+        let criteria = match self.acceptance_draft.parse() {
+            Ok(criteria) => {
+                self.acceptance_last_valid_criteria = criteria.clone();
+                criteria
+            }
+            Err(error) => {
+                self.acceptance_draft.error = Some(error);
+                return;
+            }
+        };
+        let Some(context) = self.live_admission_context.clone() else {
+            self.acceptance_draft.error = None;
+            return;
+        };
+        self.refresh_auto_intrinsics_fields();
+        let initial_intrinsics = match self.initial_intrinsics_for_image(context.image_size) {
+            Ok(initial_intrinsics) => initial_intrinsics,
+            Err(error) => {
+                self.acceptance_draft.error = Some(error);
+                return;
+            }
+        };
+        let baseline = match AutoCaptureBaseline::new(
+            context.acquisition_key.clone(),
+            context.image_size,
+            self.session.board(),
+            criteria,
+        ) {
+            Ok(baseline) => baseline,
+            Err(error) => {
+                self.acceptance_draft.error = Some(error.to_string());
+                return;
+            }
+        };
+        let binding = match InitialIntrinsicsBinding::full_frame(
+            initial_intrinsics,
+            context.image_size,
+            context.acquisition_key,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                self.acceptance_draft.error = Some(error.to_string());
+                return;
+            }
+        };
+        let reconfigure = self.session.auto_capture_baseline() != Some(&baseline)
+            || self.session.initial_intrinsics_binding() != Some(&binding);
+        if reconfigure {
+            if self.auto_capture.pending.is_some() {
+                self.cancel_auto_candidate(
+                    "Live detection candidate cancelled because acceptance settings or K/D12 changed.",
+                );
+            }
+            if let Err(error) = self
+                .session
+                .configure_auto_admission(Some(baseline), Some(binding))
+            {
+                self.acceptance_draft.error = Some(error.to_string());
+                return;
+            }
+            self.auto_capture.last_assessment = self.session.assess_auto_admission(None).ok();
+        }
+        self.acceptance_draft.error = None;
+    }
+
+    fn active_live_admission(&self) -> bool {
+        let (Some(context), Some(baseline), Some(binding)) = (
+            self.live_admission_context.as_ref(),
+            self.session.auto_capture_baseline(),
+            self.session.initial_intrinsics_binding(),
+        ) else {
+            return false;
+        };
+        baseline.acquisition_key == context.acquisition_key
+            && baseline.image_size == context.image_size
+            && baseline.board == self.session.board()
+            && binding.acquisition_key == context.acquisition_key
+            && binding.reference_image_size == context.image_size
+    }
+
+    /// 普通 Dataset PnP 绑定当前 GUI K/D12 和各自图片尺寸，不继承 live source acquisition key。
+    fn dataset_pose_seed(&self) -> Option<DatasetPoseEstimationSeed> {
+        if self.auto_intrinsics {
+            return Some(DatasetPoseEstimationSeed::AutoCentered);
+        }
+        let initial_intrinsics = InitialIntrinsics {
+            camera_matrix: [self.fx, 0.0, self.cx, 0.0, self.fy, self.cy, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        initial_intrinsics.validate().ok()?;
+        Some(DatasetPoseEstimationSeed::Fixed(initial_intrinsics))
+    }
+
+    fn dataset_pnp_binding(
+        &self,
+        image_size: CalibrationImageSize,
+    ) -> Option<InitialIntrinsicsBinding> {
+        let initial_intrinsics = self.initial_intrinsics_for_image(image_size).ok()?;
+        InitialIntrinsicsBinding::dataset_full_frame(initial_intrinsics, image_size).ok()
+    }
+
+    fn dataset_pose_request_for_image(
+        &self,
+        image_size: CalibrationImageSize,
+    ) -> Option<PoseEstimationRequest> {
+        let binding = self.dataset_pnp_binding(image_size)?;
+        Some(PoseEstimationRequest {
+            initial_intrinsics: binding.initial_intrinsics,
+            reference_image_size: binding.reference_image_size,
+            binding_digest: binding.digest,
+        })
     }
 
     pub(crate) fn stream_disconnected(&mut self, session_id: &StreamSessionId) {
@@ -933,6 +1248,7 @@ impl CalibrationWorkspace {
             EncodedDetectionRequest::Candidate(candidate.token.clone()),
             encoded,
             candidate.cancellation.clone(),
+            candidate.pose_request.clone(),
         );
         match self.detection_pipeline.try_submit_detection(job) {
             Ok(()) => candidate.state = AutoCandidateState::Submitted,
@@ -963,6 +1279,7 @@ impl CalibrationWorkspace {
         let PendingCandidate {
             token,
             intent,
+            source,
             cancellation,
             ..
         } = candidate;
@@ -971,6 +1288,7 @@ impl CalibrationWorkspace {
             CandidateTerminal::Detection(Ok(DetectionProduct {
                 source_revision,
                 outcome: camera_toolbox_core::ChessboardDetectionOutcome::Found(detection),
+                pnp_observation,
                 preview: _,
             })) => {
                 if source_revision != *token.source_revision() {
@@ -982,27 +1300,56 @@ impl CalibrationWorkspace {
                     identity: token.frame_identity().clone(),
                     detection: detection.clone(),
                 });
-                let candidate_assessment = self.assess_candidate_observe_only(&detection);
                 match intent {
                     CandidateIntent::PreviewOnly => {
-                        self.status = match candidate_assessment {
-                            Ok(assessment) => {
-                                self.auto_capture.last_assessment = Some(assessment.clone());
-                                format!(
-                                    "Board preview detected on stream frame {}; observed field gain {}. {}",
-                                    token.frame_identity().frame_sequence,
-                                    assessment.constraint_gain,
-                                    assessment.message
-                                )
-                            }
-                            Err(error) => format!(
-                                "Board preview detected on stream frame {}, but observe-only gate rejected it: {error}",
-                                token.frame_identity().frame_sequence
-                            ),
-                        };
+                        self.auto_capture.last_assessment =
+                            self.session.assess_auto_admission(None).ok();
+                        self.status = format!(
+                            "Board preview detected on stream frame {}.",
+                            token.frame_identity().frame_sequence
+                        );
                     }
                     CandidateIntent::AutoCommit => {
-                        self.status = "Automatic candidate rejected: RejectMissingBaseline / RejectMissingInitialIntrinsicsBinding; Dataset unchanged.".to_owned();
+                        let Some(pnp_observation) = pnp_observation else {
+                            self.status =
+                                "Automatic candidate rejected: PnP evidence was not produced."
+                                    .to_owned();
+                            return;
+                        };
+                        let assessment = match self
+                            .session
+                            .assess_auto_admission(Some((&detection, &pnp_observation)))
+                        {
+                            Ok(assessment) => assessment,
+                            Err(error) => {
+                                self.status = format!("Automatic candidate rejected: {error}");
+                                return;
+                            }
+                        };
+                        let gain = assessment.constraint_gain;
+                        self.auto_capture.last_assessment = Some(assessment);
+                        let commit = AutoCandidateCommit::new(
+                            token,
+                            source_revision,
+                            detection,
+                            pnp_observation,
+                        );
+                        match self.session.commit_auto_candidate(commit) {
+                            Ok(item_id) => {
+                                self.sources.insert(item_id, source);
+                                self.auto_capture.last_accepted_at_ns = host_monotonic_time_ns();
+                                self.coverage_dirty = true;
+                                self.status = format!(
+                                    "Automatic capture committed as dataset item {} (coverage gain {}).",
+                                    item_id.get(),
+                                    gain
+                                );
+                            }
+                            Err(error) => {
+                                self.status =
+                                    format!("Automatic candidate commit rejected: {error}");
+                            }
+                        }
                     }
                 }
             }
@@ -1033,7 +1380,7 @@ impl CalibrationWorkspace {
                         "Automatic candidate cancelled.".to_owned()
                     }
                     (CandidateIntent::AutoCommit, false) => {
-                        format!("Automatic candidate detection failed: {error}")
+                        format!("Automatic candidate detection or PnP failed: {error}")
                     }
                 };
             }
@@ -1175,7 +1522,11 @@ impl CalibrationWorkspace {
     }
 
     /// 为当前 live frame 生成 identity-safe 检测点和同采集组的归一化 coverage。
-    pub(crate) fn viewer_overlay(&self, frame: &DecodedVideoFrame) -> CalibrationViewerOverlay {
+    pub(crate) fn viewer_overlay(
+        &self,
+        frame: &DecodedVideoFrame,
+        live_source: &LiveStreamSource,
+    ) -> CalibrationViewerOverlay {
         let Ok(image_size) = CalibrationImageSize::new(frame.width, frame.height) else {
             return CalibrationViewerOverlay::default();
         };
@@ -1190,6 +1541,7 @@ impl CalibrationWorkspace {
                 image_size,
                 corners: latest.detection.corners.clone(),
             });
+        let current_acquisition_key = live_source.acquisition_key_for_frame(frame).ok();
 
         let mut counts = vec![0_u32; VIEWER_COVERAGE_COLUMNS * VIEWER_COVERAGE_ROWS];
         let mut coverage_views = 0_usize;
@@ -1206,9 +1558,8 @@ impl CalibrationWorkspace {
             let CalibrationSourceKind::Stream(stream) = &source.kind else {
                 continue;
             };
-            if stream.identity.stream_id != frame.identity.stream_id
-                || stream.identity.channel != frame.identity.channel
-                || stream.image_size != image_size
+            if stream.image_size != image_size
+                || item.acquisition_key.as_ref() != current_acquisition_key.as_ref()
             {
                 continue;
             }
@@ -1282,7 +1633,7 @@ impl CalibrationWorkspace {
                 .exact_size(32.0),
             egui::Panel::right("calibration_dataset_sidebar_expanded")
                 .resizable(true)
-                .default_size(360.0)
+                .default_size(440.0)
                 .min_size(300.0),
             |ui, expanded| {
                 let idle = self.active_job.is_none();
@@ -1308,6 +1659,8 @@ impl CalibrationWorkspace {
                             }
                         });
                     });
+                    ui.separator();
+                    self.render_dataset_acceptance_panel(ui);
                     ui.separator();
                     egui::ScrollArea::vertical()
                         .id_salt("calibration_dataset_sidebar")
@@ -1378,14 +1731,31 @@ impl CalibrationWorkspace {
         });
     }
 
-    fn render_dataset_assessment(&self, ui: &mut egui::Ui, assessment: &DatasetAssessment) {
+    fn render_dataset_assessment(&self, ui: &mut egui::Ui, assessment: &AutoAdmissionAssessment) {
         ui.horizontal_wrapped(|ui| {
             ui.monospace(format!(
-                "Dataset observe-only: views {}, field cells {}, last candidate field gain {}",
-                assessment.enabled_found_views, assessment.field_cells, assessment.constraint_gain
+                "Found {}/{} · Field {}/{} · Depth {}/{} · Pose {}/{}",
+                assessment.enabled_found_views,
+                assessment.required_found_views,
+                assessment.field_cells,
+                assessment.required_field_cells,
+                assessment.depth_bins,
+                assessment.required_depth_bins,
+                assessment.pose_bins,
+                assessment.required_pose_bins,
+            ));
+            ui.monospace(format!(
+                "Score {} · Gain Found {} Field {} Depth {} Pose {}",
+                assessment.constraint_gain,
+                assessment.found_view_gain,
+                assessment.field_gain,
+                assessment.depth_gain,
+                assessment.pose_gain
             ));
         });
-        ui.weak(&assessment.message);
+        ui.weak(
+            "Runtime source-bound collection state; it is not persisted or production-qualified.",
+        );
     }
 
     fn render_controls(
@@ -1414,26 +1784,39 @@ impl CalibrationWorkspace {
                         .range(0.001..=1.0e6),
                 );
                 if ui.button("Apply board").clicked() {
-                    self.apply_board();
+                    let previous = self.session.board();
+                    if self.apply_board() {
+                        let current = self.session.board();
+                        let corner_layout_changed = previous.inner_cols != current.inner_cols
+                            || previous.inner_rows != current.inner_rows;
+                        if previous != current && !corner_layout_changed {
+                            self.start_dataset_pnp_refresh();
+                        }
+                    }
                 }
             });
         });
         ui.collapsing("Auto Capture", |ui| {
-            let auto_capture_response = ui
+            let auto_capture_changed = ui
                 .checkbox(&mut self.auto_capture_enabled, "Request RTSP auto capture")
                 .on_hover_text(
-                    "Observe-only until a versioned AutoCaptureBaseline and source-bound InitialIntrinsicsBinding are installed.",
-                );
-            if auto_capture_response.changed() && self.auto_capture_enabled {
-                self.status = "Automatic RTSP admission is observe-only: RejectMissingBaseline / RejectMissingInitialIntrinsicsBinding.".to_owned();
+                    "Uses the current displayed source, valid Dataset Acceptance thresholds, and the current K/D12 seed.",
+                )
+                .changed();
+            if auto_capture_changed {
+                self.refresh_runtime_auto_admission();
+                if self.auto_capture_enabled && !self.active_live_admission() {
+                    self.status = "Auto Capture waits for one displayed frame and complete valid acceptance inputs."
+                        .to_owned();
+                }
             }
             ui.weak(
-                "Production auto-admission is blocked: RejectMissingBaseline / RejectMissingInitialIntrinsicsBinding. Rendering reads cached metrics only; it does not run OpenCV or PNG encoding.",
+                "Admission is in-memory and source-bound. Valid threshold and K edits take effect immediately.",
             );
             if let Some(assessment) = self.auto_capture.last_assessment.as_ref() {
                 self.render_dataset_assessment(ui, assessment);
             } else {
-                ui.weak("Dataset assessment cache is pending.");
+                ui.weak("Display a live frame to initialize runtime Dataset Acceptance.");
             }
             if let Some(candidate) = self.auto_capture.pending.as_ref() {
                 ui.monospace(format!(
@@ -1443,30 +1826,41 @@ impl CalibrationWorkspace {
                 ));
             }
         });
+        let mut intrinsics_changed = false;
         ui.horizontal_wrapped(|ui| {
             ui.add_enabled_ui(idle, |ui| {
-                ui.checkbox(&mut self.auto_intrinsics, "Auto initial intrinsics")
-                    .on_hover_text("Auto: fx=fy=max(width,height), cx=width/2, cy=height/2");
+                intrinsics_changed |= ui
+                    .checkbox(&mut self.auto_intrinsics, "Auto initial intrinsics")
+                    .on_hover_text("Auto: fx=fy=900 px, cx=width/2, cy=height/2")
+                    .changed();
                 ui.label("fx");
-                ui.add_enabled(
-                    !self.auto_intrinsics,
-                    egui::DragValue::new(&mut self.fx).speed(1.0),
-                );
+                intrinsics_changed |= ui
+                    .add_enabled(
+                        !self.auto_intrinsics,
+                        egui::DragValue::new(&mut self.fx).speed(1.0),
+                    )
+                    .changed();
                 ui.label("fy");
-                ui.add_enabled(
-                    !self.auto_intrinsics,
-                    egui::DragValue::new(&mut self.fy).speed(1.0),
-                );
+                intrinsics_changed |= ui
+                    .add_enabled(
+                        !self.auto_intrinsics,
+                        egui::DragValue::new(&mut self.fy).speed(1.0),
+                    )
+                    .changed();
                 ui.label("cx");
-                ui.add_enabled(
-                    !self.auto_intrinsics,
-                    egui::DragValue::new(&mut self.cx).speed(1.0),
-                );
+                intrinsics_changed |= ui
+                    .add_enabled(
+                        !self.auto_intrinsics,
+                        egui::DragValue::new(&mut self.cx).speed(1.0),
+                    )
+                    .changed();
                 ui.label("cy");
-                ui.add_enabled(
-                    !self.auto_intrinsics,
-                    egui::DragValue::new(&mut self.cy).speed(1.0),
-                );
+                intrinsics_changed |= ui
+                    .add_enabled(
+                        !self.auto_intrinsics,
+                        egui::DragValue::new(&mut self.cy).speed(1.0),
+                    )
+                    .changed();
             });
             ui.separator();
             if ui
@@ -1491,12 +1885,29 @@ impl CalibrationWorkspace {
                 self.start_calibration();
             }
             if ui
+                .add_enabled(
+                    idle && self.auto_capture.pending.is_none()
+                        && self.session.installed().is_some(),
+                    egui::Button::new("Use result as initial K"),
+                )
+                .on_disabled_hover_text(
+                    "Requires an installed result and no active calibration or live candidate.",
+                )
+                .clicked()
+            {
+                self.use_installed_result_as_initial_intrinsics();
+            }
+            if ui
                 .add_enabled(self.active_job.is_some(), egui::Button::new("Cancel"))
                 .clicked()
             {
                 self.cancel_active_job();
             }
         });
+        if intrinsics_changed {
+            self.refresh_runtime_auto_admission();
+            self.start_dataset_pnp_refresh();
+        }
 
         let regular_export_enabled = idle && self.session.installed().is_some() && export_enabled;
         let eeprom_error = self.eeprom_image().err();
@@ -1568,6 +1979,86 @@ impl CalibrationWorkspace {
         self.eeprom.render_confirmation(context, provision_target);
     }
 
+    // 为下方 Dataset 表保留可操作高度；小窗口仍保留最小的验收滚动视口。
+    const DATASET_ACCEPTANCE_MIN_VIEWPORT_HEIGHT: f32 = 96.0;
+    const DATASET_ACCEPTANCE_MAX_VIEWPORT_HEIGHT: f32 = 420.0;
+    const DATASET_TABLE_RESERVED_HEIGHT: f32 = 180.0;
+
+    /// 选择当前统一标定几何：优先 Dataset 中首个启用 Found 项，空 Dataset 再退回 live binding。
+    fn dataset_acceptance_image_size(&self) -> Option<CalibrationImageSize> {
+        self.session
+            .items()
+            .iter()
+            .filter(|item| item.enabled)
+            .find_map(|item| match &item.status {
+                CalibrationItemStatus::Found(detection) => Some(detection.image_size),
+                _ => None,
+            })
+            .or_else(|| {
+                self.session
+                    .initial_intrinsics_binding()
+                    .map(|binding| binding.reference_image_size)
+            })
+    }
+
+    /// Dataset 进度不按 provenance 筛选；只有 PnP 仍要求当前 K/D 与统一图像尺寸一致。
+    fn dataset_acceptance_assessment(&self) -> Option<AutoAdmissionAssessment> {
+        let criteria = self
+            .acceptance_draft
+            .parse()
+            .unwrap_or_else(|_| self.acceptance_last_valid_criteria.clone());
+        let image_size = self.dataset_acceptance_image_size()?;
+        let pnp_binding = self.dataset_pnp_binding(image_size);
+        self.session
+            .assess_dataset_acceptance(image_size, &criteria, pnp_binding.as_ref())
+            .ok()
+    }
+
+    fn render_dataset_acceptance_panel(&mut self, ui: &mut egui::Ui) {
+        let fallback_criteria = self.acceptance_last_valid_criteria.clone();
+        let progress = self.dataset_acceptance_assessment().map_or_else(
+            || DatasetAcceptanceProgress::empty(&fallback_criteria),
+            |assessment| DatasetAcceptanceProgress::from_assessment(&assessment),
+        );
+        let state = DatasetAcceptancePanelState {
+            has_live_context: self.live_admission_context.is_some(),
+            admission_active: self.active_live_admission(),
+            auto_capture_enabled: self.auto_capture_enabled,
+        };
+        let acceptance_viewport_height =
+            (ui.available_height() - Self::DATASET_TABLE_RESERVED_HEIGHT).clamp(
+                Self::DATASET_ACCEPTANCE_MIN_VIEWPORT_HEIGHT,
+                Self::DATASET_ACCEPTANCE_MAX_VIEWPORT_HEIGHT,
+            );
+        let render_result = render_dataset_acceptance(
+            ui,
+            &mut self.acceptance_draft,
+            &progress,
+            state,
+            acceptance_viewport_height,
+        );
+        self.apply_acceptance_render_result(render_result.changed, render_result.editing);
+    }
+
+    fn apply_acceptance_render_result(&mut self, changed: bool, editing: bool) {
+        if changed {
+            match self.acceptance_draft.parse() {
+                Ok(criteria) => {
+                    self.acceptance_last_valid_criteria = criteria;
+                    self.refresh_runtime_auto_admission();
+                }
+                Err(error) if !editing => {
+                    self.acceptance_draft.error = Some(error);
+                }
+                Err(_) => {}
+            }
+        } else if !editing && self.acceptance_draft.error.is_none() {
+            if let Err(error) = self.acceptance_draft.parse() {
+                self.acceptance_draft.error = Some(error);
+            }
+        }
+    }
+
     fn render_dataset(&mut self, ui: &mut egui::Ui, show_heading: bool) {
         if show_heading {
             ui.heading(format!("Dataset ({})", self.session.items().len()));
@@ -1577,6 +2068,17 @@ impl CalibrationWorkspace {
         let installed = self.session.installed();
         let selected = self.session.selected();
         let items = self.session.items();
+        let assessment = self.dataset_acceptance_assessment();
+        let contributions = assessment
+            .as_ref()
+            .map(|assessment| {
+                assessment
+                    .item_contributions
+                    .iter()
+                    .map(|contribution| (contribution.item_id, contribution))
+                    .collect::<HashMap<_, _>>()
+            })
+            .unwrap_or_default();
         let idle = self.active_job.is_none();
         let max_rmse = installed
             .map(|installed| {
@@ -1602,21 +2104,39 @@ impl CalibrationWorkspace {
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .column(Column::initial(42.0).at_least(36.0).clip(true))
                     .column(Column::initial(70.0).at_least(52.0).clip(true))
+                    .column(Column::initial(118.0).at_least(96.0).clip(true))
                     .column(Column::initial(120.0).at_least(72.0).clip(true))
                     .column(Column::initial(58.0).at_least(48.0).clip(true))
                     .column(Column::initial(88.0).at_least(72.0).clip(true))
                     .column(Column::initial(62.0).at_least(52.0).clip(true))
                     .column(Column::initial(80.0).at_least(54.0).clip(true))
+                    .column(Column::initial(76.0).at_least(58.0).clip(true))
+                    .column(Column::initial(76.0).at_least(58.0).clip(true))
+                    .column(Column::initial(70.0).at_least(54.0).clip(true))
+                    .column(Column::initial(58.0).at_least(48.0).clip(true))
+                    .column(Column::initial(58.0).at_least(48.0).clip(true))
+                    .column(Column::initial(58.0).at_least(48.0).clip(true))
+                    .column(Column::initial(58.0).at_least(48.0).clip(true))
+                    .column(Column::initial(58.0).at_least(48.0).clip(true))
                     .column(Column::initial(140.0).at_least(80.0).clip(true))
                     .header(24.0, |mut header| {
                         for heading in [
                             "Use",
                             "Status",
+                            "Acceptance",
                             "Name",
                             "Source",
                             "Resolution",
                             "Corners",
                             "RMSE",
+                            "Depth",
+                            "Angle dir",
+                            "Angle",
+                            "Found Δ",
+                            "Field Δ",
+                            "Depth Δ",
+                            "Pose Δ",
+                            "Gain",
                             "Reason",
                         ] {
                             header.col(|ui| {
@@ -1627,6 +2147,7 @@ impl CalibrationWorkspace {
                     .body(|body| {
                         body.rows(26.0, items.len(), |mut row| {
                             let item = &items[row.index()];
+                            let contribution = contributions.get(&item.id).copied();
                             row.col(|ui| {
                                 let mut enabled = item.enabled;
                                 if ui
@@ -1649,6 +2170,15 @@ impl CalibrationWorkspace {
                                 if response.clicked() {
                                     select = Some(item.id);
                                 }
+                            });
+                            row.col(|ui| {
+                                render_acceptance_status_cell(
+                                    ui,
+                                    &item.status,
+                                    item.enabled,
+                                    contribution,
+                                    assessment.is_some(),
+                                );
                             });
                             row.col(|ui| {
                                 if ui
@@ -1686,6 +2216,70 @@ impl CalibrationWorkspace {
                             row.col(|ui| {
                                 let metric = calibration_metric(installed, item.id);
                                 render_rmse_cell(ui, metric, max_rmse);
+                            });
+                            row.col(|ui| {
+                                render_pnp_depth_cell(
+                                    ui,
+                                    item.pnp_observation.as_ref(),
+                                    contribution.map(|value| &value.pnp_state),
+                                );
+                            });
+                            row.col(|ui| {
+                                render_pnp_direction_cell(
+                                    ui,
+                                    item.pnp_observation.as_ref(),
+                                    contribution.map(|value| &value.pnp_state),
+                                );
+                            });
+                            row.col(|ui| {
+                                render_pnp_angle_cell(
+                                    ui,
+                                    item.pnp_observation.as_ref(),
+                                    contribution.map(|value| &value.pnp_state),
+                                );
+                            });
+                            row.col(|ui| {
+                                render_admission_delta_cell(
+                                    ui,
+                                    contribution,
+                                    item.enabled,
+                                    "found views",
+                                    |_| false,
+                                    |value| value.found_view_gain,
+                                );
+                            });
+                            row.col(|ui| {
+                                render_admission_delta_cell(
+                                    ui,
+                                    contribution,
+                                    item.enabled,
+                                    "field cells",
+                                    |_| false,
+                                    |value| value.field_gain,
+                                );
+                            });
+                            row.col(|ui| {
+                                render_admission_delta_cell(
+                                    ui,
+                                    contribution,
+                                    item.enabled,
+                                    "depth bins",
+                                    |value| value.pnp_state.is_blocked() || !value.depth_covered,
+                                    |value| value.depth_gain,
+                                );
+                            });
+                            row.col(|ui| {
+                                render_admission_delta_cell(
+                                    ui,
+                                    contribution,
+                                    item.enabled,
+                                    "pose bins",
+                                    |value| value.pnp_state.is_blocked() || !value.pose_covered,
+                                    |value| value.pose_gain,
+                                );
+                            });
+                            row.col(|ui| {
+                                render_total_gain_cell(ui, contribution, item.enabled);
                             });
                             row.col(|ui| {
                                 let reason = match &item.status {
@@ -1744,6 +2338,10 @@ impl CalibrationWorkspace {
                 if ui.small_button("Fit").clicked() {
                     self.preview_viewport.fit_on_next_frame = true;
                 }
+                ui.checkbox(&mut self.preview_viewport.horizontal_flip, "Flip X")
+                    .on_hover_text(
+                        "Mirror the Dataset preview image and all preview overlays horizontally.",
+                    );
             });
             let image_size = self
                 .sources
@@ -1799,16 +2397,21 @@ impl CalibrationWorkspace {
         let image_rect = self
             .preview_viewport
             .interact(ui, response, rect, image_size);
-        let unit_uv = egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+        let texture_uv = viewer_texture_uv(self.preview_viewport.horizontal_flip);
         let layers = preview_layers(self.preview_mode, heatmap_texture_id.is_some());
         if layers.input {
-            painter.image(input_texture_id, image_rect, unit_uv, egui::Color32::WHITE);
+            painter.image(
+                input_texture_id,
+                image_rect,
+                texture_uv,
+                egui::Color32::WHITE,
+            );
         }
         if let (Some(texture_id), Some(alpha)) = (heatmap_texture_id, layers.heatmap_alpha) {
             painter.image(
                 texture_id,
                 image_rect,
-                unit_uv,
+                texture_uv,
                 egui::Color32::from_white_alpha(alpha),
             );
             paint_heatmap_guides(&painter, image_rect);
@@ -1822,7 +2425,8 @@ impl CalibrationWorkspace {
         let CalibrationItemStatus::Found(detection) = &item.status else {
             return;
         };
-        let map = |point| image_point_to_preview(point, image_rect, width, height);
+        let horizontal_flip = self.preview_viewport.horizontal_flip;
+        let map = |point| image_point_to_preview(point, image_rect, width, height, horizontal_flip);
         let projected = calibration_view(self.session.installed(), id)
             .map(|view| view.projected_points.as_slice());
         for (index, observed) in detection.corners.iter().copied().enumerate() {
@@ -1835,6 +2439,21 @@ impl CalibrationWorkspace {
                 3.0,
                 egui::Stroke::new(1.25, OBSERVED_POINT_COLOR),
             );
+        }
+        if let Some(observation) = item.pnp_observation.as_ref()
+            && let Some(binding) = self.dataset_pnp_binding(detection.image_size)
+            && observation.binding_digest == binding.digest
+            && let Some(projection) = pose_axis_projection(
+                observation,
+                &binding.initial_intrinsics,
+                self.session.board(),
+                image_rect,
+                width,
+                height,
+                horizontal_flip,
+            )
+        {
+            paint_pose_axis_overlay(&painter, projection);
         }
     }
 
@@ -1854,12 +2473,12 @@ impl CalibrationWorkspace {
             return false;
         }
         if previous != board {
-            self.session.invalidate_auto_admission();
             if self.auto_capture.pending.is_some() {
                 self.cancel_auto_candidate(
                     "Live detection candidate cancelled because the board specification changed.",
                 );
             }
+            self.refresh_runtime_auto_admission();
         }
         if corner_layout_changed {
             self.coverage_dirty = true;
@@ -1904,6 +2523,7 @@ impl CalibrationWorkspace {
         let batch_id = self.next_detection_batch_id;
         self.next_detection_batch_id = self.next_detection_batch_id.wrapping_add(1).max(1);
         let calibration_cancellation = CalibrationCancellation::default();
+        let dataset_pose_seed = self.dataset_pose_seed();
         let mut batch = DetectionBatch {
             id: batch_id,
             total: 0,
@@ -1968,12 +2588,14 @@ impl CalibrationWorkspace {
                     .map(|source| source.encoded_png(token.source_revision()));
                 match direct {
                     Some(Ok(Some(encoded))) => {
+                        let pose_request = self.dataset_pose_request_for_image(encoded.image_size);
                         self.pending_dataset_loaded
                             .push_back(LoadedDetectionJob::from_encoded(
                                 batch_id,
                                 EncodedDetectionRequest::Dataset(token),
                                 encoded,
                                 calibration_cancellation.clone(),
+                                pose_request,
                             ))
                     }
                     Some(Ok(None)) | None => {
@@ -2008,6 +2630,7 @@ impl CalibrationWorkspace {
                 reference,
                 file_cancellation,
                 calibration_cancellation.clone(),
+                dataset_pose_seed.clone(),
             ));
         }
 
@@ -2313,17 +2936,29 @@ impl CalibrationWorkspace {
                 Ok(DetectionProduct {
                     source_revision,
                     outcome,
+                    pnp_observation,
                     preview,
                 }) => {
                     let found = matches!(
                         &outcome,
                         camera_toolbox_core::ChessboardDetectionOutcome::Found(_)
                     );
+                    let pnp_observation = pnp_observation.filter(|observation| {
+                        matches!(
+                            &outcome,
+                            camera_toolbox_core::ChessboardDetectionOutcome::Found(detection)
+                                if self
+                                    .dataset_pnp_binding(detection.image_size)
+                                    .is_some_and(|binding| observation.binding_digest == binding.digest)
+                        )
+                    });
                     self.remember_stream_detection(token.item_id, &outcome);
-                    match self
-                        .session
-                        .install_detection(&token, source_revision, outcome)
-                    {
+                    match self.session.install_detection_with_pnp(
+                        &token,
+                        source_revision,
+                        outcome,
+                        pnp_observation,
+                    ) {
                         Ok(()) => {
                             // 多 worker 的完成顺序不等于导入顺序；每个刚 Found 的图像立即成为预览目标。
                             if found {
@@ -2383,6 +3018,14 @@ impl CalibrationWorkspace {
                 }
                 self.status =
                     "Cancel requested; waiting for the current OpenCV call boundary.".to_owned();
+            }
+            Some(CalibrationJobKind::DatasetPnpRefresh) => {
+                if let Some(cancellation) = &self.calibration_cancellation {
+                    cancellation.cancel();
+                }
+                self.status =
+                    "Cancel requested; waiting for the current Dataset PnP refresh boundary."
+                        .to_owned();
             }
             None => {}
         }
@@ -2492,6 +3135,118 @@ impl CalibrationWorkspace {
         self.status = "Running Pangbot-compatible calibration…".to_owned();
     }
 
+    fn start_dataset_pnp_refresh(&mut self) {
+        if self.active_job.is_some() {
+            return;
+        }
+        let items =
+            self.session
+                .items()
+                .iter()
+                .filter_map(|item| {
+                    let CalibrationItemStatus::Found(detection) = &item.status else {
+                        return None;
+                    };
+                    let request = self.dataset_pose_request_for_image(detection.image_size)?;
+                    if item.pnp_observation.as_ref().is_some_and(|observation| {
+                        observation.binding_digest == request.binding_digest
+                    }) {
+                        return None;
+                    }
+                    Some(DatasetPnpRefreshItem {
+                        item_id: item.id,
+                        detection: detection.clone(),
+                        request,
+                    })
+                })
+                .collect::<Vec<_>>();
+        if items.is_empty() {
+            return;
+        }
+        for item in &items {
+            let _ = self
+                .session
+                .install_dataset_pnp_observation(item.item_id, None);
+        }
+        let cancellation = CalibrationCancellation::default();
+        let count = items.len();
+        let batch = DatasetPnpRefreshBatch {
+            board: self.session.board(),
+            cancellation: cancellation.clone(),
+            items,
+        };
+        if let Err(error) = self.worker.send(WorkerCommand::RefreshDatasetPnp(batch)) {
+            self.status = error;
+            return;
+        }
+        self.active_job = Some(CalibrationJobKind::DatasetPnpRefresh);
+        self.calibration_cancellation = Some(cancellation);
+        self.status = format!("Refreshing Dataset PnP for {count} Found image(s)…");
+    }
+
+    fn handle_dataset_pnp_refresh_result(&mut self, batch: DatasetPnpRefreshBatchResult) {
+        if batch.board != self.session.board() {
+            self.status = "Dataset PnP refresh ignored because the board changed.".to_owned();
+            return;
+        }
+        let mut installed = 0_usize;
+        let mut failed = 0_usize;
+        let mut skipped = 0_usize;
+        for result in batch.results {
+            let Some(detection) = self
+                .session
+                .items()
+                .iter()
+                .find(|item| item.id == result.item_id)
+                .and_then(|item| match &item.status {
+                    CalibrationItemStatus::Found(detection) => Some(detection.clone()),
+                    _ => None,
+                })
+            else {
+                skipped = skipped.saturating_add(1);
+                continue;
+            };
+            if detection != result.detection {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            let Some(binding) = self.dataset_pnp_binding(detection.image_size) else {
+                let _ = self
+                    .session
+                    .install_dataset_pnp_observation(result.item_id, None);
+                failed = failed.saturating_add(1);
+                continue;
+            };
+            if binding.digest != result.binding_digest {
+                skipped = skipped.saturating_add(1);
+                continue;
+            }
+            match result.result {
+                Ok(observation) if observation.binding_digest == binding.digest => {
+                    if self
+                        .session
+                        .install_dataset_pnp_observation(result.item_id, Some(observation))
+                        .is_ok()
+                    {
+                        installed = installed.saturating_add(1);
+                    } else {
+                        failed = failed.saturating_add(1);
+                    }
+                }
+                Ok(_) => skipped = skipped.saturating_add(1),
+                Err(_) => {
+                    let _ = self
+                        .session
+                        .install_dataset_pnp_observation(result.item_id, None);
+                    failed = failed.saturating_add(1);
+                }
+            }
+        }
+        self.status = format!(
+            "Dataset PnP refresh finished: {installed} installed, {failed} failed, {skipped} skipped."
+        );
+    }
+
     fn poll_worker(&mut self, context: &egui::Context) {
         self.poll_detection_pipeline(context);
         loop {
@@ -2499,7 +3254,10 @@ impl CalibrationWorkspace {
                 Ok(event) => event,
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    if matches!(self.active_job, Some(CalibrationJobKind::Calibrate)) {
+                    if matches!(
+                        self.active_job,
+                        Some(CalibrationJobKind::Calibrate | CalibrationJobKind::DatasetPnpRefresh)
+                    ) {
                         self.active_job = None;
                         self.calibration_cancellation = None;
                         self.status = "Calibration worker stopped unexpectedly.".to_owned();
@@ -2520,6 +3278,9 @@ impl CalibrationWorkspace {
                     },
                     Err(error) => self.status = error,
                 },
+                WorkerEvent::DatasetPnpRefresh(result) => {
+                    self.handle_dataset_pnp_refresh_result(result);
+                }
             }
         }
     }
@@ -2556,8 +3317,9 @@ impl CalibrationWorkspace {
                 ),
                 enabled_views: image.enabled_views,
             });
-        self.auto_capture.last_assessment = Some(self.assess_dataset_observe_only());
+        self.auto_capture.last_assessment = self.session.assess_auto_admission(None).ok();
     }
+
     fn refresh_auto_intrinsics_fields(&mut self) {
         if self.auto_intrinsics
             && let Some((fx, fy, cx, cy)) = self.auto_intrinsics_values()
@@ -2571,18 +3333,22 @@ impl CalibrationWorkspace {
 
     fn auto_intrinsics_values(&self) -> Option<(f64, f64, f64, f64)> {
         let size = self
-            .session
-            .items()
-            .iter()
-            .filter(|item| item.enabled)
-            .find_map(|item| match &item.status {
-                CalibrationItemStatus::Found(detection) => Some(detection.image_size),
-                _ => None,
+            .live_admission_context
+            .as_ref()
+            .map(|context| context.image_size)
+            .or_else(|| {
+                self.session
+                    .items()
+                    .iter()
+                    .filter(|item| item.enabled)
+                    .find_map(|item| match &item.status {
+                        CalibrationItemStatus::Found(detection) => Some(detection.image_size),
+                        _ => None,
+                    })
             })?;
-        let focal = f64::from(size.width.max(size.height));
         Some((
-            focal,
-            focal,
+            900.0,
+            900.0,
             f64::from(size.width) * 0.5,
             f64::from(size.height) * 0.5,
         ))
@@ -2590,8 +3356,9 @@ impl CalibrationWorkspace {
 
     fn initial_intrinsics(&self) -> Result<InitialIntrinsics, String> {
         let (fx, fy, cx, cy) = if self.auto_intrinsics {
-            self.auto_intrinsics_values()
-                .ok_or_else(|| "Detect at least one enabled image first".to_owned())?
+            self.auto_intrinsics_values().ok_or_else(|| {
+                "Display a live frame or detect one enabled image first".to_owned()
+            })?
         } else {
             (self.fx, self.fy, self.cx, self.cy)
         };
@@ -2603,77 +3370,49 @@ impl CalibrationWorkspace {
         Ok(initial)
     }
 
-    fn assess_dataset_observe_only(&self) -> DatasetAssessment {
-        let mut occupied_field = HashSet::new();
-        let mut enabled_found_views = 0_usize;
-        let mut expected_size = None;
-        let mut mismatch = None;
-        for item in self.session.items().iter().filter(|item| item.enabled) {
-            let CalibrationItemStatus::Found(detection) = &item.status else {
-                continue;
-            };
-            enabled_found_views = enabled_found_views.saturating_add(1);
-            match expected_size {
-                Some(size) if size != detection.image_size => {
-                    mismatch = Some((size, detection.image_size))
-                }
-                None => expected_size = Some(detection.image_size),
-                _ => {}
-            }
-            occupied_field.extend(field_coverage_cells(detection));
-        }
-        let message = if let Some((expected, actual)) = mismatch {
-            format!(
-                "Observe-only: Dataset image size mismatch: expected {:?}, got {:?}. PnP/depth/pose readiness requires a future AutoCaptureBaseline + InitialIntrinsicsBinding.",
-                expected, actual
+    fn initial_intrinsics_for_image(
+        &self,
+        image_size: CalibrationImageSize,
+    ) -> Result<InitialIntrinsics, String> {
+        let (fx, fy, cx, cy) = if self.auto_intrinsics {
+            (
+                900.0,
+                900.0,
+                f64::from(image_size.width) * 0.5,
+                f64::from(image_size.height) * 0.5,
             )
-        } else if enabled_found_views == 0 {
-            "Observe-only: Dataset empty; automatic admission waits for AutoCaptureBaseline + InitialIntrinsicsBinding.".to_owned()
         } else {
-            "Observe-only: field coverage is displayed; PnP depth/pose readiness is disabled until baseline and binding exist.".to_owned()
+            (self.fx, self.fy, self.cx, self.cy)
         };
-        DatasetAssessment {
-            enabled_found_views,
-            field_cells: occupied_field.len(),
-            constraint_gain: 0,
-            message,
-        }
+        let initial = InitialIntrinsics {
+            camera_matrix: [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        initial.validate().map_err(|error| error.to_string())?;
+        Ok(initial)
     }
 
-    fn assess_candidate_observe_only(
-        &self,
-        candidate: &ChessboardDetection,
-    ) -> Result<DatasetAssessment, String> {
-        candidate
-            .validate(self.session.board())
-            .map_err(|error| error.to_string())?;
-        ensure_detection_inside_image(candidate)?;
-        ensure_min_adjacent_spacing(candidate, self.session.board())?;
-        let mut assessment = self.assess_dataset_observe_only();
-        let existing = self
-            .session
-            .items()
-            .iter()
-            .filter(|item| item.enabled)
-            .filter_map(|item| match &item.status {
-                CalibrationItemStatus::Found(detection)
-                    if detection.image_size == candidate.image_size =>
-                {
-                    Some(detection)
-                }
-                _ => None,
-            })
-            .flat_map(field_coverage_cells)
-            .collect::<HashSet<_>>();
-        let candidate_cells = field_coverage_cells(candidate);
-        assessment.constraint_gain = candidate_cells
-            .iter()
-            .filter(|cell| !existing.contains(cell))
-            .count();
-        assessment.field_cells = existing.union(&candidate_cells).count();
-        assessment.enabled_found_views = assessment.enabled_found_views.saturating_add(1);
-        assessment.message = "Observe-only: candidate was not committed because AutoCaptureBaseline and source-bound InitialIntrinsicsBinding are missing.".to_owned();
-        Ok(assessment)
+    fn use_installed_result_as_initial_intrinsics(&mut self) {
+        let Some((fx, fy, cx, cy)) = self.session.installed().map(|installed| {
+            let camera_matrix = installed.solution.camera_matrix;
+            (
+                camera_matrix[0],
+                camera_matrix[4],
+                camera_matrix[2],
+                camera_matrix[5],
+            )
+        }) else {
+            return;
+        };
+        self.auto_intrinsics = false;
+        self.fx = fx;
+        self.fy = fy;
+        self.cx = cx;
+        self.cy = cy;
+        self.refresh_runtime_auto_admission();
+        self.status =
+            "Installed result K copied into editable initial-intrinsics controls.".to_owned();
+        self.start_dataset_pnp_refresh();
     }
 
     fn json_export(&self) -> Option<CalibrationExport> {
@@ -2722,6 +3461,7 @@ impl CalibrationWorkspace {
                         content_sha256,
                         encoded_bytes,
                     } => serde_json::json!({
+
                         "kind": "ephemeral_png",
                         "content_sha256": content_sha256,
                         "encoded_bytes": encoded_bytes,
@@ -2816,63 +3556,6 @@ pub(crate) fn contain_fit_size(available: egui::Vec2, image_size: egui::Vec2) ->
     image_size * contain_fit_scale(available, image_size)
 }
 
-fn ensure_detection_inside_image(detection: &ChessboardDetection) -> Result<(), String> {
-    let width = detection.image_size.width as f32;
-    let height = detection.image_size.height as f32;
-    for point in &detection.corners {
-        if !(0.0..width).contains(&point.x) || !(0.0..height).contains(&point.y) {
-            return Err("candidate corners must lie inside the image".to_owned());
-        }
-    }
-    Ok(())
-}
-
-fn ensure_min_adjacent_spacing(
-    detection: &ChessboardDetection,
-    board: BoardSpec,
-) -> Result<(), String> {
-    let columns = usize::from(board.inner_cols);
-    let rows = usize::from(board.inner_rows);
-    let mut min_spacing = f32::INFINITY;
-    let mut collect = |a: CalibrationPoint, b: CalibrationPoint| {
-        let dx = a.x - b.x;
-        let dy = a.y - b.y;
-        min_spacing = min_spacing.min(dx.hypot(dy));
-    };
-    for row in 0..rows {
-        for column in 0..columns.saturating_sub(1) {
-            let index = row * columns + column;
-            collect(detection.corners[index], detection.corners[index + 1]);
-        }
-    }
-    for row in 0..rows.saturating_sub(1) {
-        for column in 0..columns {
-            let index = row * columns + column;
-            collect(detection.corners[index], detection.corners[index + columns]);
-        }
-    }
-    if min_spacing.is_finite() && min_spacing >= 12.0 {
-        Ok(())
-    } else {
-        Err(format!(
-            "candidate corner spacing {min_spacing:.2} px is below the 12 px gate"
-        ))
-    }
-}
-
-fn field_coverage_cells(detection: &ChessboardDetection) -> HashSet<usize> {
-    let mut cells = HashSet::new();
-    for point in &detection.corners {
-        let normalized_x = ((point.x + 0.5) / detection.image_size.width as f32).clamp(0.0, 1.0);
-        let normalized_y = ((point.y + 0.5) / detection.image_size.height as f32).clamp(0.0, 1.0);
-        let column =
-            ((normalized_x * DATASET_FIELD_COLUMNS as f32) as usize).min(DATASET_FIELD_COLUMNS - 1);
-        let row = ((normalized_y * DATASET_FIELD_ROWS as f32) as usize).min(DATASET_FIELD_ROWS - 1);
-        cells.insert(row * DATASET_FIELD_COLUMNS + column);
-    }
-    cells
-}
-
 /// OpenCV 以整数坐标表示像素中心；egui 的 `[0, 1]` UV 则覆盖纹理边界。
 /// 因此先加半个像素，才能把检测点准确落到纹理中的连续图像坐标。
 fn image_point_to_preview(
@@ -2880,9 +3563,16 @@ fn image_point_to_preview(
     image_rect: egui::Rect,
     image_width: u32,
     image_height: u32,
+    horizontal_flip: bool,
 ) -> egui::Pos2 {
+    let normalized_x = (point.x + 0.5) / image_width as f32;
+    let normalized_x = if horizontal_flip {
+        1.0 - normalized_x
+    } else {
+        normalized_x
+    };
     egui::pos2(
-        image_rect.left() + (point.x + 0.5) / image_width as f32 * image_rect.width(),
+        image_rect.left() + normalized_x * image_rect.width(),
         image_rect.top() + (point.y + 0.5) / image_height as f32 * image_rect.height(),
     )
 }
@@ -2913,6 +3603,200 @@ fn paint_reprojection_vector(painter: &egui::Painter, observed: egui::Pos2, proj
     painter.circle_filled(projected, 2.0, REPROJECTED_POINT_COLOR);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PoseAxisProjection {
+    origin: egui::Pos2,
+    x_axis: egui::Pos2,
+    y_axis: egui::Pos2,
+    z_axis: egui::Pos2,
+}
+
+fn paint_pose_axis_overlay(painter: &egui::Painter, projection: PoseAxisProjection) {
+    painter.circle_filled(
+        projection.origin,
+        POSE_AXIS_ORIGIN_RADIUS,
+        egui::Color32::WHITE,
+    );
+    paint_pose_axis(
+        painter,
+        projection.origin,
+        projection.x_axis,
+        POSE_AXIS_X_COLOR,
+        "X",
+    );
+    paint_pose_axis(
+        painter,
+        projection.origin,
+        projection.y_axis,
+        POSE_AXIS_Y_COLOR,
+        "Y",
+    );
+    paint_pose_axis(
+        painter,
+        projection.origin,
+        projection.z_axis,
+        POSE_AXIS_Z_COLOR,
+        "Z",
+    );
+}
+
+fn paint_pose_axis(
+    painter: &egui::Painter,
+    origin: egui::Pos2,
+    endpoint: egui::Pos2,
+    color: egui::Color32,
+    label: &'static str,
+) {
+    let stroke = egui::Stroke::new(POSE_AXIS_STROKE_WIDTH, color);
+    painter.line_segment([origin, endpoint], stroke);
+    painter.circle_filled(endpoint, POSE_AXIS_ENDPOINT_RADIUS, color);
+    painter.text(
+        endpoint + egui::vec2(5.0, -5.0),
+        egui::Align2::LEFT_BOTTOM,
+        label,
+        egui::FontId::monospace(12.0),
+        color,
+    );
+}
+
+fn pose_axis_projection(
+    observation: &PnPObservation,
+    intrinsics: &InitialIntrinsics,
+    board: BoardSpec,
+    image_rect: egui::Rect,
+    image_width: u32,
+    image_height: u32,
+    horizontal_flip: bool,
+) -> Option<PoseAxisProjection> {
+    let rotation = rodrigues_matrix_for_preview(observation.rotation_vector)?;
+    let board_width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
+    let board_height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
+    let axis_length = board_width.max(board_height).max(board.square_size) * 0.25;
+    let origin = [board_width * 0.5, board_height * 0.5, 0.0];
+    let project = |point: [f64; 3]| {
+        project_board_point(
+            rotation,
+            observation.translation_vector,
+            point,
+            intrinsics,
+            image_rect,
+            image_width,
+            image_height,
+            horizontal_flip,
+        )
+    };
+    Some(PoseAxisProjection {
+        origin: project(origin)?,
+        x_axis: project([origin[0] + axis_length, origin[1], origin[2]])?,
+        y_axis: project([origin[0], origin[1] + axis_length, origin[2]])?,
+        z_axis: project([origin[0], origin[1], origin[2] + axis_length])?,
+    })
+}
+
+fn project_board_point(
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    point: [f64; 3],
+    intrinsics: &InitialIntrinsics,
+    image_rect: egui::Rect,
+    image_width: u32,
+    image_height: u32,
+    horizontal_flip: bool,
+) -> Option<egui::Pos2> {
+    let camera = [
+        rotation[0][0] * point[0]
+            + rotation[0][1] * point[1]
+            + rotation[0][2] * point[2]
+            + translation[0],
+        rotation[1][0] * point[0]
+            + rotation[1][1] * point[1]
+            + rotation[1][2] * point[2]
+            + translation[1],
+        rotation[2][0] * point[0]
+            + rotation[2][1] * point[1]
+            + rotation[2][2] * point[2]
+            + translation[2],
+    ];
+    if camera.iter().any(|value| !value.is_finite()) || camera[2] <= 0.0 {
+        return None;
+    }
+    let x = camera[0] / camera[2];
+    let y = camera[1] / camera[2];
+    let distortion = &intrinsics.distortion_coefficients;
+    let coefficient = |index: usize| distortion.get(index).copied().unwrap_or(0.0);
+    let r2 = x * x + y * y;
+    let r4 = r2 * r2;
+    let r6 = r4 * r2;
+    let numerator = 1.0 + coefficient(0) * r2 + coefficient(1) * r4 + coefficient(4) * r6;
+    let denominator = 1.0 + coefficient(5) * r2 + coefficient(6) * r4 + coefficient(7) * r6;
+    if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
+        return None;
+    }
+    let radial = numerator / denominator;
+    let x_distorted = x * radial
+        + 2.0 * coefficient(2) * x * y
+        + coefficient(3) * (r2 + 2.0 * x * x)
+        + coefficient(8) * r2
+        + coefficient(9) * r4;
+    let y_distorted = y * radial
+        + coefficient(2) * (r2 + 2.0 * y * y)
+        + 2.0 * coefficient(3) * x * y
+        + coefficient(10) * r2
+        + coefficient(11) * r4;
+    let matrix = intrinsics.camera_matrix;
+    let image_x = matrix[0] * x_distorted + matrix[2];
+    let image_y = matrix[4] * y_distorted + matrix[5];
+    if !image_x.is_finite() || !image_y.is_finite() {
+        return None;
+    }
+    Some(image_point_to_preview(
+        CalibrationPoint {
+            x: image_x as f32,
+            y: image_y as f32,
+        },
+        image_rect,
+        image_width,
+        image_height,
+        horizontal_flip,
+    ))
+}
+
+fn rodrigues_matrix_for_preview(rotation_vector: [f64; 3]) -> Option<[[f64; 3]; 3]> {
+    if rotation_vector.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let theta = rotation_vector[0]
+        .hypot(rotation_vector[1])
+        .hypot(rotation_vector[2]);
+    if theta <= f64::EPSILON {
+        return Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    }
+    let axis = [
+        rotation_vector[0] / theta,
+        rotation_vector[1] / theta,
+        rotation_vector[2] / theta,
+    ];
+    let (sin_theta, cos_theta) = theta.sin_cos();
+    let one_minus_cos = 1.0 - cos_theta;
+    let [x, y, z] = axis;
+    Some([
+        [
+            cos_theta + x * x * one_minus_cos,
+            x * y * one_minus_cos - z * sin_theta,
+            x * z * one_minus_cos + y * sin_theta,
+        ],
+        [
+            y * x * one_minus_cos + z * sin_theta,
+            cos_theta + y * y * one_minus_cos,
+            y * z * one_minus_cos - x * sin_theta,
+        ],
+        [
+            z * x * one_minus_cos - y * sin_theta,
+            z * y * one_minus_cos + x * sin_theta,
+            cos_theta + z * z * one_minus_cos,
+        ],
+    ])
+}
 fn status_label(status: &CalibrationItemStatus) -> &'static str {
     match status {
         CalibrationItemStatus::Pending => "Pending",
@@ -2996,6 +3880,274 @@ fn render_rmse_cell(ui: &mut egui::Ui, metric: Option<f64>, max_metric: f64) {
         .with_clip_rect(track_rect)
         .galley_with_override_text_color(text_position, galley, RMSE_TEXT_ON_TRACK);
     response.on_hover_text(format!("Reprojection RMSE: {metric:.6} px"));
+}
+
+fn render_pnp_depth_cell(
+    ui: &mut egui::Ui,
+    observation: Option<&PnPObservation>,
+    pnp_state: Option<&AutoAdmissionPnpState>,
+) {
+    render_pnp_metric_cell(ui, observation, pnp_state, "Depth", |observation| {
+        format!("Z {:.1}", observation.depth)
+    });
+}
+
+fn render_pnp_direction_cell(
+    ui: &mut egui::Ui,
+    observation: Option<&PnPObservation>,
+    pnp_state: Option<&AutoAdmissionPnpState>,
+) {
+    render_pnp_metric_cell(
+        ui,
+        observation,
+        pnp_state,
+        "Angle direction",
+        |observation| format!("az {:.0}°", observation.azimuth_degrees),
+    );
+}
+
+fn render_pnp_angle_cell(
+    ui: &mut egui::Ui,
+    observation: Option<&PnPObservation>,
+    pnp_state: Option<&AutoAdmissionPnpState>,
+) {
+    render_pnp_metric_cell(ui, observation, pnp_state, "Angle", |observation| {
+        format!("θ {:.1}°", observation.tilt_degrees)
+    });
+}
+
+fn render_pnp_metric_cell(
+    ui: &mut egui::Ui,
+    observation: Option<&PnPObservation>,
+    pnp_state: Option<&AutoAdmissionPnpState>,
+    metric: &str,
+    value: impl FnOnce(&PnPObservation) -> String,
+) {
+    let blocked = pnp_state.is_some_and(AutoAdmissionPnpState::is_blocked);
+    let Some(observation) = observation else {
+        if let Some(state) = pnp_state.filter(|state| state.is_blocked()) {
+            render_pnp_blocked_cell(ui, state, metric);
+        } else {
+            ui.weak("—")
+                .on_hover_text(format!("No current Dataset PnP observation for {metric}."));
+        }
+        return;
+    };
+    let label = value(observation);
+    let mut response = if blocked {
+        ui.colored_label(egui::Color32::LIGHT_RED, label)
+    } else {
+        ui.monospace(label)
+    };
+    let mut hover = format!(
+        "Depth: {:.3} configured board units\nTilt: {:.3}°\nAzimuth: {:.3}°\nPnP RMSE: {:.4} px\nPnP max error: {:.4} px",
+        observation.depth,
+        observation.tilt_degrees,
+        observation.azimuth_degrees,
+        observation.reprojection_rmse,
+        observation.max_reprojection_error,
+    );
+    if let Some(state) = pnp_state.filter(|state| state.is_blocked()) {
+        hover.push_str("\n\nAcceptance gap: ");
+        hover.push_str(&pnp_state_reason(state));
+    }
+    response = response.on_hover_text(hover);
+    let _ = response;
+}
+
+fn render_pnp_blocked_cell(ui: &mut egui::Ui, state: &AutoAdmissionPnpState, metric: &str) {
+    ui.colored_label(egui::Color32::LIGHT_RED, "PnP×")
+        .on_hover_text(format!(
+            "{metric} is unavailable because current Dataset PnP is not valid.\n{}",
+            pnp_state_reason(state)
+        ));
+}
+
+fn pnp_state_reason(state: &AutoAdmissionPnpState) -> String {
+    match state {
+        AutoAdmissionPnpState::Valid => "PnP is valid for current Dataset Acceptance.".to_owned(),
+        AutoAdmissionPnpState::MissingBinding => {
+            "Current GUI K/D12 cannot create a Dataset PnP binding.".to_owned()
+        }
+        AutoAdmissionPnpState::MissingObservation => {
+            "This Found item has no current Dataset PnP observation yet.".to_owned()
+        }
+        AutoAdmissionPnpState::BindingGap(reason) => format!("PnP binding gap: {reason}"),
+        AutoAdmissionPnpState::DepthGap(reason) => format!("Depth gap: {reason}"),
+        AutoAdmissionPnpState::PoseGap(reason) => format!("Pose gap: {reason}"),
+        AutoAdmissionPnpState::RmseReprojectionGap(reason) => {
+            format!("RMSE reprojection gap: {reason}")
+        }
+        AutoAdmissionPnpState::MaxReprojectionGap(reason) => {
+            format!("Max reprojection gap: {reason}")
+        }
+        AutoAdmissionPnpState::Invalid(reason) => format!("PnP evidence was rejected: {reason}"),
+    }
+}
+
+fn pnp_state_gap_label(state: &AutoAdmissionPnpState) -> Option<&'static str> {
+    match state {
+        AutoAdmissionPnpState::Valid => None,
+        AutoAdmissionPnpState::MissingBinding => Some("K/D Gap"),
+        AutoAdmissionPnpState::MissingObservation => Some("PnP Gap"),
+        AutoAdmissionPnpState::BindingGap(_) => Some("PnP Binding Gap"),
+        AutoAdmissionPnpState::DepthGap(_) => Some("Depth Gap"),
+        AutoAdmissionPnpState::PoseGap(_) => Some("Pose Gap"),
+        AutoAdmissionPnpState::RmseReprojectionGap(_) => Some("RMSE ReProj Gap"),
+        AutoAdmissionPnpState::MaxReprojectionGap(_) => Some("Max ReProj Gap"),
+        AutoAdmissionPnpState::Invalid(_) => Some("PnP Gap"),
+    }
+}
+
+fn render_acceptance_status_cell(
+    ui: &mut egui::Ui,
+    status: &CalibrationItemStatus,
+    enabled: bool,
+    contribution: Option<&AutoAdmissionItemContribution>,
+    assessment_active: bool,
+) {
+    if !enabled {
+        ui.weak("Off")
+            .on_hover_text("Disabled item: not part of current Dataset Acceptance.");
+        return;
+    }
+    if !assessment_active {
+        ui.weak("No criteria").on_hover_text(
+            "Dataset Acceptance criteria are invalid or no compatible image size is available.",
+        );
+        return;
+    }
+    if !matches!(status, CalibrationItemStatus::Found(_)) {
+        ui.weak("No Found").on_hover_text(
+            "Only enabled Found Dataset items can participate in Dataset Acceptance.",
+        );
+        return;
+    }
+    let Some(contribution) = contribution else {
+        ui.colored_label(egui::Color32::YELLOW, "Geometry Gap")
+            .on_hover_text("Found item is outside current Dataset Acceptance because image size, image bounds, or minimum-spacing geometry gates are incompatible.");
+        return;
+    };
+    if let Some(label) = pnp_state_gap_label(&contribution.pnp_state) {
+        ui.colored_label(egui::Color32::LIGHT_RED, label)
+            .on_hover_text(pnp_state_reason(&contribution.pnp_state));
+    } else if !contribution.depth_covered {
+        ui.colored_label(egui::Color32::YELLOW, "Depth Gap")
+            .on_hover_text("PnP is valid, but no chessboard corner depth occupies the current Dataset depth bins.");
+    } else if !contribution.pose_covered {
+        ui.colored_label(egui::Color32::YELLOW, "Pose Gap")
+            .on_hover_text(
+                "PnP is valid, but this board normal occupies no current Dataset pose bin.",
+            );
+    } else if contribution.constraint_gain == 0 {
+        ui.weak("No Gain Gap").on_hover_text(
+            "Valid item with zero target-capped attributed Gain; required coverage is already owned by earlier compatible Dataset rows or above target.",
+        );
+    } else {
+        ui.colored_label(egui::Color32::LIGHT_GREEN, "Accepted")
+            .on_hover_text("Item participates in current Dataset Acceptance and has positive target-capped Gain.");
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AdmissionDeltaCellState {
+    Contribution(usize),
+    PnpBlocked,
+    Disabled,
+    OutsideActiveAdmission,
+}
+
+fn admission_delta_cell_state(
+    contribution: Option<&AutoAdmissionItemContribution>,
+    enabled: bool,
+    metric_blocked: impl FnOnce(&AutoAdmissionItemContribution) -> bool,
+    value: impl FnOnce(&AutoAdmissionItemContribution) -> usize,
+) -> AdmissionDeltaCellState {
+    match contribution {
+        Some(contribution) if metric_blocked(contribution) => AdmissionDeltaCellState::PnpBlocked,
+        Some(contribution) => AdmissionDeltaCellState::Contribution(value(contribution)),
+        None if enabled => AdmissionDeltaCellState::OutsideActiveAdmission,
+        None => AdmissionDeltaCellState::Disabled,
+    }
+}
+
+fn metric_delta_gap_reason(contribution: &AutoAdmissionItemContribution, metric: &str) -> String {
+    if contribution.pnp_state.is_blocked() {
+        return pnp_state_reason(&contribution.pnp_state);
+    }
+    format!(
+        "{metric} has no occupied bin under current Dataset thresholds; this is a gap, not redundant +0 gain."
+    )
+}
+
+fn render_admission_delta_cell(
+    ui: &mut egui::Ui,
+    contribution: Option<&AutoAdmissionItemContribution>,
+    enabled: bool,
+    metric: &str,
+    metric_blocked: impl FnOnce(&AutoAdmissionItemContribution) -> bool,
+    value: impl FnOnce(&AutoAdmissionItemContribution) -> usize,
+) {
+    match admission_delta_cell_state(contribution, enabled, metric_blocked, value) {
+        AdmissionDeltaCellState::Contribution(delta) => {
+            ui.monospace(format!("+{delta}")).on_hover_text(format!(
+                "Target-capped {metric} Gain attributed to this item in the current Dataset. +0 means valid but redundant after required coverage is already assigned."
+            ));
+        }
+        AdmissionDeltaCellState::PnpBlocked => {
+            let reason = contribution
+                .map(|contribution| metric_delta_gap_reason(contribution, metric))
+                .unwrap_or_else(|| "Metric is not part of the current active Dataset.".to_owned());
+            ui.colored_label(egui::Color32::LIGHT_RED, "×0")
+                .on_hover_text(format!(
+                    "{metric} delta is blocked by PnP, not a valid zero-gain result.\n{reason}"
+                ));
+        }
+        AdmissionDeltaCellState::Disabled => {
+            ui.weak("off")
+                .on_hover_text("Disabled items are outside the active admission set.");
+        }
+        AdmissionDeltaCellState::OutsideActiveAdmission => {
+            ui.weak("—").on_hover_text(
+                "Outside current Dataset Acceptance: image size, detection state, or current geometry gates are incompatible. Local, SFTP, and RTSP provenance is not filtered."
+            );
+        }
+    }
+}
+
+fn render_total_gain_cell(
+    ui: &mut egui::Ui,
+    contribution: Option<&AutoAdmissionItemContribution>,
+    enabled: bool,
+) {
+    match contribution {
+        Some(contribution) if contribution.pnp_state.is_blocked() => {
+            let label = if contribution.constraint_gain == 0 {
+                "×0".to_owned()
+            } else {
+                format!("+{}*", contribution.constraint_gain)
+            };
+            ui.colored_label(egui::Color32::LIGHT_RED, label)
+                .on_hover_text(format!(
+                    "Total Gain includes valid Found/Field contributions only; Depth/Pose are blocked by PnP.\n{}",
+                    pnp_state_reason(&contribution.pnp_state)
+                ));
+        }
+        Some(contribution) => {
+            ui.monospace(format!("+{}", contribution.constraint_gain)).on_hover_text(
+                "Total target-capped row Gain. +0 means the row is valid but redundant under current targets.",
+            );
+        }
+        None if enabled => {
+            ui.weak("—").on_hover_text(
+                "Outside current Dataset Acceptance: image size, detection state, or current geometry gates are incompatible.",
+            );
+        }
+        None => {
+            ui.weak("off")
+                .on_hover_text("Disabled items are outside the active admission set.");
+        }
+    }
 }
 
 struct CoverageImage {
@@ -3110,7 +4262,7 @@ fn colorize_heatmap(values: &[f32], width: usize, height: usize) -> egui::ColorI
     egui::ColorImage::from_rgba_unmultiplied([width, height], &rgba)
 }
 
-fn heatmap_color(value: f32) -> egui::Color32 {
+pub(crate) fn heatmap_color(value: f32) -> egui::Color32 {
     const STOPS: [(f32, [u8; 3]); 6] = [
         (0.0, [48, 18, 59]),
         (0.2, [50, 92, 210]),
@@ -3135,7 +4287,7 @@ fn heatmap_color(value: f32) -> egui::Color32 {
     egui::Color32::from_rgb(channel(0), channel(1), channel(2))
 }
 
-fn paint_heatmap_guides(painter: &egui::Painter, rect: egui::Rect) {
+pub(crate) fn paint_heatmap_guides(painter: &egui::Painter, rect: egui::Rect) {
     for index in 1..3 {
         let x = egui::lerp(rect.x_range(), index as f32 / 3.0);
         let y = egui::lerp(rect.y_range(), index as f32 / 3.0);
@@ -3262,6 +4414,19 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn enabled_row_without_admission_contribution_is_outside_active_set() {
+        assert_eq!(
+            admission_delta_cell_state(
+                None::<&AutoAdmissionItemContribution>,
+                true,
+                |_| false,
+                |contribution| contribution.field_gain,
+            ),
+            AdmissionDeltaCellState::OutsideActiveAdmission
+        );
+    }
+
+    #[test]
     fn opened_pngs_produce_preview_with_mode_unchanged() {
         let root = std::env::temp_dir().join(format!(
             "camera-toolbox-calibration-{}-{}",
@@ -3280,6 +4445,15 @@ mod tests {
             Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_intrinsics = false;
+        workspace.fx = 850.0;
+        workspace.fy = 875.0;
+        workspace.cx = 321.0;
+        workspace.cy = 239.0;
+        assert!(
+            workspace.session.initial_intrinsics_binding().is_none(),
+            "local Dataset PnP must not require a live source-bound binding"
+        );
         let candidate = |name: &str, display_path: PathBuf| {
             let reference =
                 camera_toolbox_app::FileRef::new(source_id.clone(), SourcePath::new(name).unwrap());
@@ -3316,6 +4490,47 @@ mod tests {
                 .iter()
                 .all(|item| matches!(item.status, CalibrationItemStatus::Found(_)))
         );
+        let pnp_binding = workspace
+            .dataset_pnp_binding(match &workspace.session.items()[0].status {
+                CalibrationItemStatus::Found(detection) => detection.image_size,
+                _ => panic!("fixture must be Found"),
+            })
+            .expect("current GUI K must create a source-independent Dataset PnP binding");
+        assert_eq!(pnp_binding.initial_intrinsics.camera_matrix[0], 850.0);
+        assert_eq!(pnp_binding.initial_intrinsics.camera_matrix[4], 875.0);
+        assert_eq!(pnp_binding.initial_intrinsics.camera_matrix[2], 321.0);
+        assert_eq!(pnp_binding.initial_intrinsics.camera_matrix[5], 239.0);
+        let pnp_binding = pnp_binding.digest;
+        assert!(workspace.session.items().iter().all(|item| {
+            item.pnp_observation
+                .as_ref()
+                .is_some_and(|observation| observation.binding_digest == pnp_binding)
+        }));
+        workspace.fx = 925.0;
+        let refreshed_binding = workspace
+            .dataset_pnp_binding(match &workspace.session.items()[0].status {
+                CalibrationItemStatus::Found(detection) => detection.image_size,
+                _ => panic!("fixture must be Found"),
+            })
+            .expect("edited GUI K must create a refreshed Dataset PnP binding")
+            .digest;
+        assert_ne!(refreshed_binding, pnp_binding);
+        workspace.start_dataset_pnp_refresh();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while workspace.active_job.is_some() && Instant::now() < deadline {
+            workspace.poll_worker(&context);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            workspace.active_job.is_none(),
+            "PnP refresh did not finish: {}",
+            workspace.status
+        );
+        assert!(workspace.session.items().iter().all(|item| {
+            item.pnp_observation
+                .as_ref()
+                .is_some_and(|observation| observation.binding_digest == refreshed_binding)
+        }));
         workspace.sync_coverage(&context);
         assert_eq!(workspace.preview_mode, CalibrationPreviewMode::Overlay);
         let selected_id = workspace
@@ -3394,6 +4609,7 @@ mod tests {
                 result: Ok(DetectionProduct {
                     source_revision: version.clone().into(),
                     outcome: found_detection(640, 480),
+                    pnp_observation: None,
                     preview: None,
                 }),
             },
@@ -3410,6 +4626,7 @@ mod tests {
                 result: Ok(DetectionProduct {
                     source_revision: version.into(),
                     outcome: found_detection(640, 480),
+                    pnp_observation: None,
                     preview: None,
                 }),
             },
@@ -3599,24 +4816,6 @@ mod tests {
     }
 
     #[test]
-    fn field_coverage_uses_corner_footprint_without_center_metric() {
-        let camera_toolbox_core::ChessboardDetectionOutcome::Found(detection) =
-            found_detection(640, 480)
-        else {
-            panic!("expected found fixture");
-        };
-
-        let cells = field_coverage_cells(&detection);
-
-        assert!(cells.len() >= 2);
-        assert!(
-            cells
-                .iter()
-                .all(|cell| *cell < DATASET_FIELD_COLUMNS * DATASET_FIELD_ROWS)
-        );
-    }
-
-    #[test]
     fn automatic_intrinsics_use_first_enabled_found_view() {
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
@@ -3633,12 +4832,12 @@ mod tests {
         install_detection_outcome(&mut workspace, "found.png", found_detection(640, 480));
 
         workspace.refresh_auto_intrinsics_fields();
-        assert_eq!((workspace.fx, workspace.fy), (640.0, 640.0));
+        assert_eq!((workspace.fx, workspace.fy), (900.0, 900.0));
         assert_eq!((workspace.cx, workspace.cy), (320.0, 240.0));
         let initial = workspace.initial_intrinsics().unwrap();
         assert_eq!(
             initial.camera_matrix,
-            [640.0, 0.0, 320.0, 0.0, 640.0, 240.0, 0.0, 0.0, 1.0]
+            [900.0, 0.0, 320.0, 0.0, 900.0, 240.0, 0.0, 0.0, 1.0]
         );
     }
 
@@ -3699,6 +4898,49 @@ mod tests {
     }
 
     #[test]
+    fn pose_axis_projection_uses_board_center_origin() {
+        let image_size = CalibrationImageSize::new(640, 480).unwrap();
+        let initial = InitialIntrinsics {
+            camera_matrix: [500.0, 0.0, 320.0, 0.0, 500.0, 240.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        let binding =
+            InitialIntrinsicsBinding::dataset_full_frame(initial.clone(), image_size).unwrap();
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let observation = PnPObservation::from_view_result(
+            binding.digest,
+            ViewCalibrationResult {
+                rotation_vector: [0.0, 0.0, 0.0],
+                translation_vector: [0.0, 0.0, 1000.0],
+                projected_points: Vec::new(),
+                reprojection_rmse: 0.1,
+                max_reprojection_error: 0.2,
+            },
+            board,
+        )
+        .unwrap();
+        let projection = pose_axis_projection(
+            &observation,
+            &initial,
+            board,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0)),
+            image_size.width,
+            image_size.height,
+            false,
+        )
+        .unwrap();
+
+        assert!((projection.origin.x - 420.5).abs() < 1.0e-4);
+        assert!((projection.origin.y - 310.5).abs() < 1.0e-4);
+        assert!(projection.x_axis.x > projection.origin.x);
+        assert!((projection.x_axis.y - projection.origin.y).abs() < 1.0e-4);
+        assert!(projection.y_axis.y > projection.origin.y);
+        assert!((projection.y_axis.x - projection.origin.x).abs() < 1.0e-4);
+        assert!(projection.z_axis.x < projection.origin.x);
+        assert!(projection.z_axis.y < projection.origin.y);
+    }
+
+    #[test]
     fn preview_zoom_keeps_anchor_image_position_stable() {
         let viewport = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(200.0, 200.0));
         let image_size = egui::vec2(400.0, 200.0);
@@ -3720,16 +4962,35 @@ mod tests {
         );
 
         assert_eq!(
-            image_point_to_preview(CalibrationPoint::new(0.0, 0.0), image_rect, 640, 480),
+            image_point_to_preview(CalibrationPoint::new(0.0, 0.0), image_rect, 640, 480, false),
             image_rect.min + egui::vec2(0.5 * scale, 0.5 * scale)
         );
         assert_eq!(
-            image_point_to_preview(CalibrationPoint::new(119.5, 99.5), image_rect, 640, 480,),
+            image_point_to_preview(
+                CalibrationPoint::new(119.5, 99.5),
+                image_rect,
+                640,
+                480,
+                false,
+            ),
             image_rect.min + egui::vec2(120.0 * scale, 100.0 * scale)
         );
         assert_eq!(
-            image_point_to_preview(CalibrationPoint::new(639.0, 479.0), image_rect, 640, 480,),
+            image_point_to_preview(
+                CalibrationPoint::new(639.0, 479.0),
+                image_rect,
+                640,
+                480,
+                false,
+            ),
             image_rect.max - egui::vec2(0.5 * scale, 0.5 * scale)
+        );
+        assert_eq!(
+            image_point_to_preview(CalibrationPoint::new(0.0, 0.0), image_rect, 640, 480, true),
+            egui::pos2(
+                image_rect.right() - 0.5 * scale,
+                image_rect.top() + 0.5 * scale
+            )
         );
     }
 
@@ -3915,6 +5176,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn runtime_admission_snapshots_900px_intrinsics_for_live_geometry() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let displayed = live_frame(1);
+        let source = test_live_source();
+        let key = source.acquisition_key_for_frame(&displayed).unwrap();
+
+        workspace.observe_live_frame(Arc::clone(&displayed), source, store, false);
+
+        let binding = workspace.session.initial_intrinsics_binding().unwrap();
+        assert_eq!(binding.initial_intrinsics.camera_matrix[0], 900.0);
+        assert_eq!(binding.initial_intrinsics.camera_matrix[4], 900.0);
+        assert_eq!(binding.initial_intrinsics.camera_matrix[2], 320.0);
+        assert_eq!(binding.initial_intrinsics.camera_matrix[5], 240.0);
+        assert_eq!(
+            binding.initial_intrinsics.distortion_coefficients,
+            vec![0.0; 12]
+        );
+        assert_eq!(binding.acquisition_key, key);
+        assert_eq!(
+            workspace
+                .session
+                .auto_capture_baseline()
+                .map(|baseline| &baseline.acquisition_key),
+            Some(&key)
+        );
+    }
+
+    #[test]
+    fn source_or_geometry_change_rebuilds_runtime_auto_admission() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let displayed = live_frame(1);
+        let source = test_live_source();
+        let key = source.acquisition_key_for_frame(&displayed).unwrap();
+
+        workspace.observe_live_frame(Arc::clone(&displayed), source, store.clone(), false);
+        assert_eq!(
+            workspace
+                .session
+                .auto_capture_baseline()
+                .map(|baseline| &baseline.acquisition_key),
+            Some(&key)
+        );
+
+        let mismatched_source = LiveStreamSource::Rtsp {
+            label: "Other".to_owned(),
+            channel: 0,
+            transport: camera_toolbox_app::RtspTransport::Tcp,
+            source_fingerprint: "other-rtsp-source".to_owned(),
+            geometry_key: "other-rtsp-config".to_owned(),
+        };
+        let mismatched_key = mismatched_source
+            .acquisition_key_for_frame(&live_frame(2))
+            .unwrap();
+        workspace.observe_live_frame(live_frame(2), mismatched_source, store, false);
+
+        assert_eq!(
+            workspace
+                .session
+                .auto_capture_baseline()
+                .map(|baseline| &baseline.acquisition_key),
+            Some(&mismatched_key)
+        );
+        assert_eq!(
+            workspace
+                .session
+                .initial_intrinsics_binding()
+                .map(|binding| &binding.acquisition_key),
+            Some(&mismatched_key)
+        );
+        assert_ne!(mismatched_key, key);
+    }
+
+    fn test_live_source() -> LiveStreamSource {
+        LiveStreamSource::Rtsp {
+            label: "Test".to_owned(),
+            channel: 0,
+            transport: camera_toolbox_app::RtspTransport::Tcp,
+            source_fingerprint: "test-rtsp-source".to_owned(),
+            geometry_key: "test-rtsp-config".to_owned(),
+        }
+    }
+
     fn auto_capture_store() -> CaptureStore {
         CaptureStore::new(CaptureStoreLimits::new(4 * 1024 * 1024, 8 * 1024 * 1024).unwrap())
     }
@@ -3952,6 +5300,28 @@ mod tests {
         })
     }
 
+    fn chessboard_live_frame_for_session(
+        session_id: &str,
+        sequence: u64,
+    ) -> Arc<DecodedVideoFrame> {
+        let rgba = image::load_from_memory(include_bytes!(
+            "../../../adapters/tests/data/chessboard_11x8_clean.png"
+        ))
+        .unwrap()
+        .to_rgba8();
+        Arc::new(DecodedVideoFrame {
+            width: rgba.width(),
+            height: rgba.height(),
+            rgba: Arc::from(rgba.into_raw()),
+            identity: StreamFrameIdentity::unavailable(
+                StreamSessionId::new(session_id).unwrap(),
+                0,
+                sequence,
+                "test fixture",
+            ),
+        })
+    }
+
     #[test]
     fn board_preview_detects_corners_by_default_without_mutating_dataset() {
         let context = egui::Context::default();
@@ -3960,11 +5330,21 @@ mod tests {
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         assert!(!workspace.auto_capture_enabled);
         let displayed = chessboard_live_frame(1);
-        workspace.observe_live_frame(Arc::clone(&displayed), store.clone(), false);
+        workspace.observe_live_frame(
+            Arc::clone(&displayed),
+            test_live_source(),
+            store.clone(),
+            false,
+        );
         assert!(workspace.auto_capture.pending.is_none());
         assert_eq!(store.stats().unwrap(), baseline);
 
-        workspace.observe_live_frame(Arc::clone(&displayed), store.clone(), true);
+        workspace.observe_live_frame(
+            Arc::clone(&displayed),
+            test_live_source(),
+            store.clone(),
+            true,
+        );
 
         assert_eq!(
             workspace.auto_capture.pending.as_ref().unwrap().intent,
@@ -3984,7 +5364,7 @@ mod tests {
         assert!(workspace.session.items().is_empty());
         assert!(workspace.sources.is_empty());
         assert_eq!(store.stats().unwrap(), baseline);
-        let overlay = workspace.viewer_overlay(&displayed);
+        let overlay = workspace.viewer_overlay(&displayed, &test_live_source());
         assert_eq!(overlay.detection.unwrap().corners.len(), 88);
         assert_eq!(overlay.coverage_views, 0);
         assert!(overlay.coverage.is_empty());
@@ -3996,8 +5376,16 @@ mod tests {
         let store = auto_capture_store();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         let displayed = chessboard_live_frame(7);
+        assert!(
+            workspace.session.initial_intrinsics_binding().is_none(),
+            "manual shutter Dataset PnP must not require a live source-bound binding"
+        );
 
-        workspace.capture_displayed_stream_frame(Arc::clone(&displayed), store.clone());
+        workspace.capture_displayed_stream_frame(
+            Arc::clone(&displayed),
+            test_live_source(),
+            store.clone(),
+        );
 
         assert_eq!(workspace.session.items().len(), 1);
         let item_id = workspace.session.items()[0].id;
@@ -4035,6 +5423,15 @@ mod tests {
             );
         };
         assert_eq!(detection.corners.len(), 88);
+        let pnp_binding = workspace
+            .dataset_pnp_binding(detection.image_size)
+            .expect("current GUI K must create a source-independent Dataset PnP binding")
+            .digest;
+        assert!(
+            item.pnp_observation
+                .as_ref()
+                .is_some_and(|observation| observation.binding_digest == pnp_binding)
+        );
         let CalibrationSourceKind::Stream(stream) = &workspace.sources[&item_id].kind else {
             panic!("detected stream item must retain its stream source");
         };
@@ -4044,35 +5441,225 @@ mod tests {
     }
 
     #[test]
-    fn automatic_capture_is_observe_only_without_baseline_or_intrinsics_binding() {
+    fn viewer_overlay_keeps_same_acquisition_group_across_stream_reconnect() {
         let context = egui::Context::default();
         let store = auto_capture_store();
-        let baseline = store.stats().unwrap();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        workspace.auto_capture_enabled = true;
-        workspace.status = "Manual calibration completed.".to_owned();
+        let captured = chessboard_live_frame_for_session("overlay-source-session-a", 1);
 
-        workspace.observe_live_frame(live_frame(1), store.clone(), false);
+        workspace.capture_displayed_stream_frame(
+            Arc::clone(&captured),
+            test_live_source(),
+            store.clone(),
+        );
 
-        assert!(workspace.auto_capture.pending.is_none());
-        assert!(workspace.session.items().is_empty());
-        assert!(workspace.sources.is_empty());
-        assert_eq!(store.stats().unwrap(), baseline);
-        assert_eq!(workspace.status, "Manual calibration completed.");
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !matches!(
+            workspace.session.items()[0].status,
+            CalibrationItemStatus::Found(_)
+        ) && Instant::now() < deadline
+        {
+            workspace.tick(&context);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let reconnected = chessboard_live_frame_for_session("overlay-source-session-b", 2);
+        let overlay = workspace.viewer_overlay(&reconnected, &test_live_source());
+
+        assert_eq!(overlay.coverage_views, 1);
+        assert!(!overlay.coverage.is_empty());
     }
 
     #[test]
-    fn explicit_preview_still_runs_when_auto_capture_is_observe_only() {
+    fn transient_auto_capture_commits_chessboard_frame_to_dataset() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let displayed = chessboard_live_frame(3);
+        workspace.acceptance_draft.field_columns = "1".to_owned();
+        workspace.acceptance_draft.field_rows = "1".to_owned();
+        workspace.acceptance_draft.required_field_cells = "1".to_owned();
+        workspace.acceptance_draft.pnp_depth_min = "0.001".to_owned();
+        workspace.acceptance_draft.pnp_depth_max = "10000000".to_owned();
+        workspace.acceptance_draft.pnp_depth_bins = "1".to_owned();
+        workspace.acceptance_draft.required_depth_bins = "1".to_owned();
+        workspace.acceptance_draft.pnp_tilt_deadband_deg = "0".to_owned();
+        workspace.acceptance_draft.pnp_tilt_max_deg = "89".to_owned();
+        workspace.acceptance_draft.pnp_tilt_bins = "1".to_owned();
+        workspace.acceptance_draft.pnp_azimuth_sectors = "1".to_owned();
+        workspace.acceptance_draft.required_pose_bins = "1".to_owned();
+        workspace.acceptance_draft.pnp_max_rmse_px = "100".to_owned();
+        workspace.acceptance_draft.pnp_max_error_px = "100".to_owned();
+        workspace.auto_capture_enabled = true;
+
+        workspace.observe_live_frame(
+            Arc::clone(&displayed),
+            test_live_source(),
+            store.clone(),
+            true,
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+            workspace.tick(&context);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            workspace.auto_capture.pending.is_none(),
+            "auto worker did not finish: {}",
+            workspace.status
+        );
+        assert_eq!(workspace.session.items().len(), 1, "{}", workspace.status);
+        let item = &workspace.session.items()[0];
+        let CalibrationItemStatus::Found(detection) = &item.status else {
+            panic!("auto capture did not commit Found item: {:?}", item.status);
+        };
+        assert_eq!(detection.corners.len(), 88);
+        assert!(item.pnp_observation.is_some());
+        let CalibrationSourceKind::Stream(stream) = &workspace.sources[&item.id].kind else {
+            panic!("auto capture must retain stream source");
+        };
+        assert_eq!(stream.identity, displayed.identity);
+        assert!(
+            stream
+                .asset
+                .as_ref()
+                .is_some_and(|asset| store.get(&asset.id).unwrap().is_some())
+        );
+        let assessment = workspace.auto_capture.last_assessment.as_ref().unwrap();
+        assert!(assessment.field_target_met);
+        assert!(assessment.depth_target_met);
+        assert!(assessment.pose_target_met);
+        assert!(!assessment.collection_target_met);
+    }
+
+    #[test]
+    fn automatic_capture_uses_transient_admission_without_saved_profile() {
         let context = egui::Context::default();
         let store = auto_capture_store();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         workspace.auto_capture_enabled = true;
 
-        workspace.observe_live_frame(chessboard_live_frame(2), store, true);
+        workspace.observe_live_frame(live_frame(1), test_live_source(), store, false);
 
+        assert!(workspace.session.auto_capture_baseline().is_some());
+        assert!(workspace.session.initial_intrinsics_binding().is_some());
         assert_eq!(
-            workspace.auto_capture.pending.as_ref().unwrap().intent,
-            CandidateIntent::PreviewOnly
+            workspace
+                .auto_capture
+                .pending
+                .as_ref()
+                .map(|candidate| candidate.intent),
+            Some(CandidateIntent::AutoCommit)
         );
+    }
+
+    #[test]
+    fn invalid_acceptance_edit_defers_error_until_edit_finishes() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.observe_live_frame(live_frame(1), test_live_source(), store, false);
+        let baseline_digest = workspace
+            .session
+            .auto_capture_baseline()
+            .unwrap()
+            .digest
+            .clone();
+
+        workspace.acceptance_draft.pnp_depth_max = "partial".to_owned();
+        workspace.apply_acceptance_render_result(true, true);
+
+        assert!(workspace.acceptance_draft.error.is_none());
+        assert_eq!(
+            workspace.session.auto_capture_baseline().unwrap().digest,
+            baseline_digest
+        );
+        assert_eq!(
+            workspace.acceptance_last_valid_criteria.pnp_depth_max,
+            2400.0
+        );
+
+        workspace.apply_acceptance_render_result(false, false);
+
+        assert!(
+            workspace
+                .acceptance_draft
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("PnP maximum depth"))
+        );
+        assert_eq!(
+            workspace.session.auto_capture_baseline().unwrap().digest,
+            baseline_digest
+        );
+
+        workspace.acceptance_draft.pnp_depth_max = "2600".to_owned();
+        workspace.apply_acceptance_render_result(true, true);
+
+        assert!(workspace.acceptance_draft.error.is_none());
+        assert_eq!(
+            workspace.acceptance_last_valid_criteria.pnp_depth_max,
+            2600.0
+        );
+        assert_ne!(
+            workspace.session.auto_capture_baseline().unwrap().digest,
+            baseline_digest
+        );
+    }
+    #[test]
+    fn invalid_draft_retains_last_valid_admission_only_for_current_context() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let displayed = live_frame(1);
+        workspace.observe_live_frame(
+            Arc::clone(&displayed),
+            test_live_source(),
+            store.clone(),
+            false,
+        );
+        let baseline_digest = workspace
+            .session
+            .auto_capture_baseline()
+            .unwrap()
+            .digest
+            .clone();
+        let binding_digest = workspace
+            .session
+            .initial_intrinsics_binding()
+            .unwrap()
+            .digest
+            .clone();
+
+        workspace.acceptance_draft.pnp_depth_max = "partial".to_owned();
+        workspace.refresh_runtime_auto_admission();
+
+        assert!(workspace.acceptance_draft.error.is_some());
+        assert_eq!(
+            workspace.session.auto_capture_baseline().unwrap().digest,
+            baseline_digest
+        );
+        assert_eq!(
+            workspace
+                .session
+                .initial_intrinsics_binding()
+                .unwrap()
+                .digest,
+            binding_digest
+        );
+
+        let changed_source = LiveStreamSource::Rtsp {
+            label: "Changed".to_owned(),
+            channel: 0,
+            transport: camera_toolbox_app::RtspTransport::Tcp,
+            source_fingerprint: "changed-rtsp-source".to_owned(),
+            geometry_key: "changed-rtsp-config".to_owned(),
+        };
+        workspace.observe_live_frame(live_frame(2), changed_source, store, false);
+
+        assert!(workspace.session.auto_capture_baseline().is_none());
+        assert!(workspace.session.initial_intrinsics_binding().is_none());
     }
 }

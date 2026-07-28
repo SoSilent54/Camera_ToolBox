@@ -18,7 +18,7 @@ use camera_toolbox_app::ResolvedTargetBindings;
 use camera_toolbox_app::{
     CaptureStore, CaptureStoreLimits, LatestDecodedFrameSlot, OperationId, PlatformBindings,
     PlatformConfig, PlatformController, PlatformProfileId, ProfileStore, RtspStreamConfig,
-    SensorSelection, StreamOpenRequest, StreamRecordingRequest, StreamSessionEvent,
+    SensorSelection, SnapshotHash, StreamOpenRequest, StreamRecordingRequest, StreamSessionEvent,
     StreamSessionId, StreamTimeouts, TargetResolutionSnapshot,
 };
 #[cfg(feature = "platform-ssh")]
@@ -143,6 +143,21 @@ pub(crate) struct LiveRuntime {
     next_asset: u64,
     bind_count: u64,
     startup_message: Option<String>,
+}
+
+fn rtsp_source_fingerprint(config: &RtspStreamConfig) -> String {
+    let material = format!(
+        "camera-toolbox/rtsp-source-fingerprint/v1\0{}\0{:?}\0{:?}",
+        config.url, config.codec, config.transport
+    );
+    format!("rtsp:{}", SnapshotHash::digest_bytes(material.as_bytes()))
+}
+
+fn rtsp_geometry_key(config: &RtspStreamConfig) -> String {
+    format!(
+        "rtsp-fixed-config:{}x{};codec={:?};transport={:?}",
+        config.width, config.height, config.codec, config.transport
+    )
 }
 
 impl LiveRuntime {
@@ -1021,6 +1036,10 @@ impl LiveRuntime {
             .ok_or_else(|| "selected profile no longer exists".to_owned())?;
         let profile_id = profile.id.clone();
         let profile_label = profile.display_name.clone();
+        let profile_fingerprint = format!(
+            "profile:{}",
+            profile.snapshot_hash().map_err(|error| error.to_string())?
+        );
         let (request, source) = match &profile.config {
             PlatformConfig::HisiliconCv610(config) => (
                 self.panel
@@ -1029,6 +1048,8 @@ impl LiveRuntime {
                     profile_id,
                     profile_label,
                     channel: config.stream.channel,
+                    source_fingerprint: profile_fingerprint,
+                    geometry_key: format!("target-resolution:{}", snapshot.aggregate_hash),
                 },
             ),
             PlatformConfig::SshManaged(config) => {
@@ -1048,6 +1069,8 @@ impl LiveRuntime {
                         label: profile_label,
                         channel: rtsp.channel,
                         transport: rtsp.transport,
+                        source_fingerprint: profile_fingerprint,
+                        geometry_key: rtsp_geometry_key(rtsp),
                     },
                 )
             }
@@ -1109,6 +1132,8 @@ impl LiveRuntime {
                 label: "Direct URL".to_owned(),
                 channel: config.channel,
                 transport: config.transport,
+                source_fingerprint: rtsp_source_fingerprint(&config),
+                geometry_key: rtsp_geometry_key(&config),
             },
         ))
     }

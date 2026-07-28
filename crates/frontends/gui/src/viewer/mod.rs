@@ -109,6 +109,7 @@ pub(crate) struct ImageViewerState {
     pan: egui::Vec2,
     pub(crate) fit_on_next_frame: bool,
     pub(crate) cursor: Option<CursorPixel>,
+    pub(crate) horizontal_flip: bool,
     roi_gesture: Option<RoiGesture>,
     geometry: Option<ViewerGeometry>,
     spatial_overlay: Option<SpatialOverlayTexture>,
@@ -121,6 +122,7 @@ impl Default for ImageViewerState {
             pan: egui::Vec2::ZERO,
             fit_on_next_frame: true,
             cursor: None,
+            horizontal_flip: false,
             roi_gesture: None,
             geometry: None,
             spatial_overlay: None,
@@ -172,7 +174,9 @@ impl ImageViewerState {
         self.cursor = self.geometry.and_then(|geometry| {
             position
                 .filter(|position| geometry.viewer_rect.contains(*position))
-                .and_then(|position| hover_pixel(geometry.image_rect, position, image))
+                .and_then(|position| {
+                    hover_pixel(geometry.image_rect, position, image, self.horizontal_flip)
+                })
         });
     }
 
@@ -221,6 +225,29 @@ impl ImageViewerState {
     }
 }
 
+pub(crate) fn viewer_texture_uv(horizontal_flip: bool) -> egui::Rect {
+    if horizontal_flip {
+        egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
+    } else {
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+    }
+}
+
+fn render_viewer_toolbar(ui: &mut egui::Ui, viewer: &mut ImageViewerState, image_available: bool) {
+    ui.horizontal_wrapped(|ui| {
+        ui.monospace(format!("{:.0}%", viewer.zoom * 100.0));
+        if ui
+            .add_enabled(image_available, egui::Button::new("Fit"))
+            .on_hover_text("Fit image to the Viewer window.")
+            .clicked()
+        {
+            viewer.fit_on_next_frame = true;
+        }
+        ui.checkbox(&mut viewer.horizontal_flip, "Flip X")
+            .on_hover_text("Mirror the displayed image and all Viewer overlays horizontally.");
+    });
+}
+
 pub(crate) fn render_viewer(
     ui: &mut egui::Ui,
     image: Option<ViewerImage<'_>>,
@@ -228,6 +255,7 @@ pub(crate) fn render_viewer(
     hover_settings: HoverViewSettings,
     spatial_highlight: Option<&SpatialHighlight>,
 ) -> ViewerOutput {
+    render_viewer_toolbar(ui, viewer, image.is_some());
     let available = ui.available_size().max(egui::vec2(1.0, 1.0));
     let (viewer_rect, response) = ui.allocate_exact_size(available, egui::Sense::click_and_drag());
     let painter = ui.painter_at(viewer_rect);
@@ -284,19 +312,15 @@ pub(crate) fn render_viewer(
     let action = update_roi_interaction(ui, &response, image_rect, viewer, dimensions);
     let spatial_texture_id =
         viewer.sync_spatial_overlay(ui.ctx(), image.generation, dimensions, spatial_highlight);
+    let texture_uv = viewer_texture_uv(viewer.horizontal_flip);
     painter.image(
         image.texture_id,
         image_rect,
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
+        texture_uv,
         egui::Color32::WHITE,
     );
     if let Some(texture_id) = spatial_texture_id {
-        painter.image(
-            texture_id,
-            image_rect,
-            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
+        painter.image(texture_id, image_rect, texture_uv, egui::Color32::WHITE);
     }
     draw_roi_overlay(
         &painter,
@@ -311,9 +335,16 @@ pub(crate) fn render_viewer(
         } else {
             egui::Color32::GREEN
         },
+        viewer.horizontal_flip,
     );
     if let Some(gesture) = viewer.roi_gesture.filter(|gesture| gesture.drag_started) {
-        draw_roi_draft(&painter, image_rect, dimensions, gesture);
+        draw_roi_draft(
+            &painter,
+            image_rect,
+            dimensions,
+            gesture,
+            viewer.horizontal_flip,
+        );
     }
     draw_minimap(
         &painter,
@@ -321,11 +352,13 @@ pub(crate) fn render_viewer(
         image_rect,
         dimensions,
         image.texture_id,
+        viewer.horizontal_flip,
     );
 
     let hover_position = response.hover_pos();
-    viewer.cursor =
-        hover_position.and_then(|position| hover_pixel(image_rect, position, &image.native));
+    viewer.cursor = hover_position.and_then(|position| {
+        hover_pixel(image_rect, position, &image.native, viewer.horizontal_flip)
+    });
     if hover_settings.enabled
         && !viewer
             .roi_gesture
@@ -443,20 +476,36 @@ mod tests {
     fn screen_pixel_mapping_handles_zoom_pan_edges_and_clamping() {
         let rect = egui::Rect::from_min_max(egui::pos2(100.0, 50.0), egui::pos2(500.0, 250.0));
         assert_eq!(
-            image_pixel_from_screen(rect, egui::pos2(100.0, 50.0), 4, 2, false),
+            image_pixel_from_screen(rect, egui::pos2(100.0, 50.0), 4, 2, false, false),
             Some(ImagePixel { x: 0, y: 0 })
         );
         assert_eq!(
-            image_pixel_from_screen(rect, egui::pos2(499.9, 249.9), 4, 2, false),
+            image_pixel_from_screen(rect, egui::pos2(499.9, 249.9), 4, 2, false, false),
             Some(ImagePixel { x: 3, y: 1 })
         );
         assert_eq!(
-            image_pixel_from_screen(rect, egui::pos2(600.0, 300.0), 4, 2, false),
+            image_pixel_from_screen(rect, egui::pos2(600.0, 300.0), 4, 2, false, false),
             None
         );
         assert_eq!(
-            image_pixel_from_screen(rect, egui::pos2(600.0, 300.0), 4, 2, true),
+            image_pixel_from_screen(rect, egui::pos2(600.0, 300.0), 4, 2, true, false),
             Some(ImagePixel { x: 3, y: 1 })
+        );
+        assert_eq!(
+            image_pixel_from_screen(rect, egui::pos2(100.0, 50.0), 4, 2, false, true),
+            Some(ImagePixel { x: 3, y: 0 })
+        );
+        assert_eq!(
+            image_pixel_from_screen(rect, egui::pos2(499.9, 249.9), 4, 2, false, true),
+            Some(ImagePixel { x: 0, y: 1 })
+        );
+        assert_eq!(
+            viewer_texture_uv(false),
+            egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
+        );
+        assert_eq!(
+            viewer_texture_uv(true),
+            egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
         );
     }
 
@@ -467,7 +516,7 @@ mod tests {
 
         assert_eq!(
             roi_drag_pointer_position(None, Some(latest))
-                .and_then(|position| image_pixel_from_screen(rect, position, 4, 2, true)),
+                .and_then(|position| image_pixel_from_screen(rect, position, 4, 2, true, false)),
             Some(ImagePixel { x: 3, y: 1 })
         );
     }
@@ -611,9 +660,11 @@ mod tests {
     fn hover_reads_original_tightly_packed_pixel() {
         let rect = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(20.0, 20.0));
         let image = NativeImage::Raw(Arc::new(test_frame()));
-        let hovered = hover_pixel(rect, egui::pos2(15.0, 15.0), &image).unwrap();
+        let hovered = hover_pixel(rect, egui::pos2(15.0, 15.0), &image, false).unwrap();
 
         assert_eq!((hovered.x, hovered.y, hovered.raw_value), (1, 1, Some(256)));
+        let flipped = hover_pixel(rect, egui::pos2(15.0, 15.0), &image, true).unwrap();
+        assert_eq!((flipped.x, flipped.y, flipped.raw_value), (0, 1, Some(512)));
     }
 
     #[test]

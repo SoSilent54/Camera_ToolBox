@@ -15,11 +15,16 @@ pub use asset::{
     AssetReservation, CaptureStore, CaptureStoreError, CaptureStoreLimits, CaptureStoreStats,
 };
 pub use calibration::{
-    AddCalibrationItemOutcome, AutoCandidateCommit, AutoCandidateId, AutoCandidateToken,
-    CalibrationDatasetItem, CalibrationEncodedPng, CalibrationInputError, CalibrationInputKey,
+    AUTO_CAPTURE_DETECTOR_FINGERPRINT, AUTO_CAPTURE_FEATURE_SCHEMA_VERSION,
+    AddCalibrationItemOutcome, AutoAdmissionAssessment, AutoAdmissionItemContribution,
+    AutoAdmissionPnpState, AutoCandidateAdmission, AutoCandidateCommit, AutoCandidateId,
+    AutoCandidateToken, AutoCaptureAcceptanceCriteria, AutoCaptureAcquisitionKey,
+    AutoCaptureBaseline, CalibrationDatasetItem, CalibrationEncodedPng, CalibrationImageCrop,
+    CalibrationImageOrientation, CalibrationInputError, CalibrationInputKey,
     CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
-    CalibrationSession, CalibrationSessionError, CalibrationSnapshot, InstalledCalibration,
-    MIN_CALIBRATION_VIEWS, StreamCaptureId, read_calibration_png,
+    CalibrationSession, CalibrationSessionError, CalibrationSnapshot, InitialIntrinsicsBinding,
+    InstalledCalibration, MIN_CALIBRATION_VIEWS, PixelCoordinateConvention, PnPObservation,
+    StreamCaptureId, read_calibration_png,
 };
 pub use export::{ExportArtifact, ExportDestination, ExportReceipt, ExportService};
 pub use filesystem::*;

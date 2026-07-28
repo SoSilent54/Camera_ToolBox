@@ -48,7 +48,14 @@ pub(super) fn update_roi_interaction(
     if secondary_pressed
         && response.hovered()
         && let Some(position) = pointer_position
-        && let Some(pixel) = image_pixel_from_screen(image_rect, position, width, height, false)
+        && let Some(pixel) = image_pixel_from_screen(
+            image_rect,
+            position,
+            width,
+            height,
+            false,
+            viewer.horizontal_flip,
+        )
     {
         viewer.roi_gesture = Some(RoiGesture {
             anchor: pixel,
@@ -63,7 +70,14 @@ pub(super) fn update_roi_interaction(
         gesture.drag_started = true;
     }
     if let (Some(gesture), Some(position)) = (&mut viewer.roi_gesture, pointer_position)
-        && let Some(pixel) = image_pixel_from_screen(image_rect, position, width, height, true)
+        && let Some(pixel) = image_pixel_from_screen(
+            image_rect,
+            position,
+            width,
+            height,
+            true,
+            viewer.horizontal_flip,
+        )
     {
         gesture.current = pixel;
     }
@@ -111,6 +125,7 @@ pub(super) fn image_pixel_from_screen(
     image_width: u32,
     image_height: u32,
     clamp: bool,
+    horizontal_flip: bool,
 ) -> Option<ImagePixel> {
     if image_width == 0
         || image_height == 0
@@ -121,6 +136,11 @@ pub(super) fn image_pixel_from_screen(
         return None;
     }
     let normalized_x = ((position.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+    let normalized_x = if horizontal_flip {
+        1.0 - normalized_x
+    } else {
+        normalized_x
+    };
     let normalized_y = ((position.y - image_rect.top()) / image_rect.height()).clamp(0.0, 1.0);
     let x = normalized_to_pixel(normalized_x, image_width);
     let y = normalized_to_pixel(normalized_y, image_height);
@@ -160,9 +180,11 @@ pub(super) fn hover_pixel(
     image_rect: egui::Rect,
     position: egui::Pos2,
     image: &NativeImage,
+    horizontal_flip: bool,
 ) -> Option<CursorPixel> {
     let [width, height] = image.dimensions();
-    let pixel = image_pixel_from_screen(image_rect, position, width, height, false)?;
+    let pixel =
+        image_pixel_from_screen(image_rect, position, width, height, false, horizontal_flip)?;
     let raw_value = match image.sample_at(pixel.x, pixel.y)? {
         NativePixelSample::Raw { value, .. } => Some(value),
         NativePixelSample::Rgba { .. } | NativePixelSample::Yuv { .. } => None,
@@ -174,18 +196,27 @@ pub(super) fn hover_pixel(
     })
 }
 
-fn roi_screen_rect(image_rect: egui::Rect, dimensions: [u32; 2], roi: Roi) -> Option<egui::Rect> {
+fn roi_screen_rect(
+    image_rect: egui::Rect,
+    dimensions: [u32; 2],
+    roi: Roi,
+    horizontal_flip: bool,
+) -> Option<egui::Rect> {
     let [width, height] = dimensions;
     let roi = roi.clamped_to(width, height)?;
     let scale_x = image_rect.width() / image_extent_f32(width);
     let scale_y = image_rect.height() / image_extent_f32(height);
+    let x0 = image_extent_f32(roi.x) * scale_x;
+    let x1 = image_extent_f32(roi.x.saturating_add(roi.width)) * scale_x;
+    let (left, right) = if horizontal_flip {
+        (image_rect.right() - x1, image_rect.right() - x0)
+    } else {
+        (image_rect.left() + x0, image_rect.left() + x1)
+    };
     Some(egui::Rect::from_min_max(
+        egui::pos2(left, image_rect.top() + image_extent_f32(roi.y) * scale_y),
         egui::pos2(
-            image_rect.left() + image_extent_f32(roi.x) * scale_x,
-            image_rect.top() + image_extent_f32(roi.y) * scale_y,
-        ),
-        egui::pos2(
-            image_rect.left() + image_extent_f32(roi.x.saturating_add(roi.width)) * scale_x,
+            right,
             image_rect.top() + image_extent_f32(roi.y.saturating_add(roi.height)) * scale_y,
         ),
     ))
@@ -197,8 +228,9 @@ pub(super) fn draw_roi_overlay(
     dimensions: [u32; 2],
     roi: Roi,
     color: egui::Color32,
+    horizontal_flip: bool,
 ) {
-    let Some(rect) = roi_screen_rect(image_rect, dimensions, roi) else {
+    let Some(rect) = roi_screen_rect(image_rect, dimensions, roi, horizontal_flip) else {
         return;
     };
     painter.rect_stroke(
@@ -214,9 +246,10 @@ pub(super) fn draw_roi_draft(
     image_rect: egui::Rect,
     dimensions: [u32; 2],
     gesture: RoiGesture,
+    horizontal_flip: bool,
 ) {
     let roi = roi_from_inclusive_pixels(gesture.anchor, gesture.current);
-    let Some(rect) = roi_screen_rect(image_rect, dimensions, roi) else {
+    let Some(rect) = roi_screen_rect(image_rect, dimensions, roi, horizontal_flip) else {
         return;
     };
     painter.rect_filled(
@@ -245,6 +278,7 @@ pub(super) fn draw_minimap(
     image_rect: egui::Rect,
     dimensions: [u32; 2],
     texture_id: TextureId,
+    horizontal_flip: bool,
 ) {
     let image_width = image_extent_f32(dimensions[0]);
     let image_height = image_extent_f32(dimensions[1]);
@@ -269,23 +303,40 @@ pub(super) fn draw_minimap(
         2.0,
         egui::Color32::from_black_alpha(180),
     );
-    painter.image(
-        texture_id,
-        minimap_rect,
-        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0)),
-        egui::Color32::WHITE,
-    );
+    let texture_uv = crate::viewer::viewer_texture_uv(horizontal_flip);
+    painter.image(texture_id, minimap_rect, texture_uv, egui::Color32::WHITE);
 
-    let visible_min = screen_to_image(viewer_rect.min, image_rect, image_width, image_height);
-    let visible_max = screen_to_image(viewer_rect.max, image_rect, image_width, image_height);
-    let min = egui::pos2(
-        minimap_rect.left() + visible_min.x * fit,
-        minimap_rect.top() + visible_min.y * fit,
+    let visible_min = screen_to_image(
+        viewer_rect.min,
+        image_rect,
+        image_width,
+        image_height,
+        horizontal_flip,
     );
-    let max = egui::pos2(
-        minimap_rect.left() + visible_max.x * fit,
-        minimap_rect.top() + visible_max.y * fit,
+    let visible_max = screen_to_image(
+        viewer_rect.max,
+        image_rect,
+        image_width,
+        image_height,
+        horizontal_flip,
     );
+    let min_x = visible_min.x.min(visible_max.x);
+    let max_x = visible_min.x.max(visible_max.x);
+    let min_y = visible_min.y.min(visible_max.y);
+    let max_y = visible_min.y.max(visible_max.y);
+    let (left, right) = if horizontal_flip {
+        (
+            minimap_rect.right() - max_x * fit,
+            minimap_rect.right() - min_x * fit,
+        )
+    } else {
+        (
+            minimap_rect.left() + min_x * fit,
+            minimap_rect.left() + max_x * fit,
+        )
+    };
+    let min = egui::pos2(left, minimap_rect.top() + min_y * fit);
+    let max = egui::pos2(right, minimap_rect.top() + max_y * fit);
     painter.rect_stroke(
         egui::Rect::from_min_max(min, max),
         0.0,
@@ -299,9 +350,15 @@ fn screen_to_image(
     image_rect: egui::Rect,
     image_width: f32,
     image_height: f32,
+    horizontal_flip: bool,
 ) -> egui::Pos2 {
-    let x = (((position.x - image_rect.left()) / image_rect.width()) * image_width)
-        .clamp(0.0, image_width);
+    let normalized_x = ((position.x - image_rect.left()) / image_rect.width()).clamp(0.0, 1.0);
+    let normalized_x = if horizontal_flip {
+        1.0 - normalized_x
+    } else {
+        normalized_x
+    };
+    let x = (normalized_x * image_width).clamp(0.0, image_width);
     let y = (((position.y - image_rect.top()) / image_rect.height()) * image_height)
         .clamp(0.0, image_height);
     egui::pos2(x, y)

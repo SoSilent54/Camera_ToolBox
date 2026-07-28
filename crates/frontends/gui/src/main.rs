@@ -3,6 +3,8 @@ mod analysis_worker;
 mod app;
 mod auto_open;
 #[cfg(feature = "calibration-opencv")]
+mod calibration_acceptance;
+#[cfg(feature = "calibration-opencv")]
 mod calibration_eeprom;
 #[cfg(feature = "calibration-opencv")]
 mod calibration_pipeline;

@@ -450,6 +450,7 @@ impl WorkspaceState {
             .find(|document| document.session_id == *session_id)
     }
 
+    /// 释放非活动流的 GPU texture，但保留每流最近展示快照供侧栏 Capture。
     pub(crate) fn release_inactive_live_textures(&mut self) {
         let active = self.active;
         for document in &mut self.live_documents {
