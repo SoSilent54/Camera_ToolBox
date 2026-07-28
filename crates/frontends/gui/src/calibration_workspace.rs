@@ -88,6 +88,17 @@ enum CalibrationJobKind {
     DatasetPnpRefresh,
 }
 
+/// 手工内参的数值输入只在提交后触发重算，避免键入过程中抢占焦点。
+fn observe_intrinsics_value_response(
+    response: egui::Response,
+    changed: &mut bool,
+    editing: &mut bool,
+) {
+    let has_focus = response.has_focus();
+    *editing |= has_focus;
+    *changed |= response.changed() && !has_focus;
+}
+
 /// 标定页面支持的格式化导出；所有变体都通过同一 Explorer destination 保存。
 pub(crate) enum CalibrationExport {
     Json(serde_json::Value),
@@ -714,6 +725,8 @@ pub(crate) struct CalibrationWorkspace {
     cx: f64,
     cy: f64,
     initial_distortion_coefficients: [f64; 12],
+    intrinsics_value_editing: bool,
+    pending_dataset_pnp_refresh: bool,
     display_layer: CalibrationDisplayLayer,
     preview_viewport: CalibrationPreviewViewport,
     preview_mode: CalibrationPreviewMode,
@@ -759,6 +772,8 @@ impl CalibrationWorkspace {
             cx: 0.0,
             cy: 0.0,
             initial_distortion_coefficients: ZERO_DISTORTION_COEFFICIENTS,
+            intrinsics_value_editing: false,
+            pending_dataset_pnp_refresh: false,
             display_layer: CalibrationDisplayLayer::default(),
             preview_viewport: CalibrationPreviewViewport::default(),
             preview_mode: CalibrationPreviewMode::default(),
@@ -1334,7 +1349,6 @@ impl CalibrationWorkspace {
                             }
                         };
                         let gain = assessment.constraint_gain;
-                        self.auto_capture.last_assessment = Some(assessment);
                         let commit = AutoCandidateCommit::new(
                             token,
                             source_revision,
@@ -1344,15 +1358,19 @@ impl CalibrationWorkspace {
                         match self.session.commit_auto_candidate(commit) {
                             Ok(item_id) => {
                                 self.sources.insert(item_id, source);
+                                self.auto_capture.last_assessment =
+                                    self.session.assess_auto_admission(None).ok();
                                 self.auto_capture.last_accepted_at_ns = host_monotonic_time_ns();
                                 self.coverage_dirty = true;
                                 self.status = format!(
-                                    "Automatic capture committed as dataset item {} (coverage gain {}).",
+                                    "Automatic capture committed as dataset item {} (candidate gain {}).",
                                     item_id.get(),
                                     gain
                                 );
                             }
                             Err(error) => {
+                                self.auto_capture.last_assessment =
+                                    self.session.assess_auto_admission(None).ok();
                                 self.status =
                                     format!("Automatic candidate commit rejected: {error}");
                             }
@@ -1878,11 +1896,17 @@ impl CalibrationWorkspace {
     }
 
     fn render_controls(&mut self, ui: &mut egui::Ui) {
-        self.refresh_auto_intrinsics_fields();
+        if !self.intrinsics_value_editing {
+            self.refresh_auto_intrinsics_fields();
+        }
         let idle = self.active_job.is_none();
+        let setup_editable = !matches!(
+            self.active_job,
+            Some(CalibrationJobKind::Detect | CalibrationJobKind::Calibrate)
+        );
         ui.horizontal_wrapped(|ui| {
             ui.heading("Intrinsic Calibration");
-            ui.add_enabled_ui(idle, |ui| {
+            ui.add_enabled_ui(setup_editable, |ui| {
                 ui.separator();
                 ui.label("Inner corners");
                 ui.add(egui::DragValue::new(&mut self.board_cols).range(2..=256));
@@ -1901,7 +1925,7 @@ impl CalibrationWorkspace {
                         let corner_layout_changed = previous.inner_cols != current.inner_cols
                             || previous.inner_rows != current.inner_rows;
                         if previous != current && !corner_layout_changed {
-                            self.start_dataset_pnp_refresh();
+                            self.request_dataset_pnp_refresh();
                         }
                     }
                 }
@@ -1938,40 +1962,61 @@ impl CalibrationWorkspace {
             }
         });
         let mut intrinsics_changed = false;
+        let mut intrinsics_editing = false;
         ui.horizontal_wrapped(|ui| {
-            ui.add_enabled_ui(idle, |ui| {
+            ui.add_enabled_ui(setup_editable, |ui| {
                 intrinsics_changed |= ui
                     .checkbox(&mut self.auto_intrinsics, "Auto initial intrinsics")
                     .on_hover_text("Auto: fx=fy=900 px, cx=width/2, cy=height/2, D12=0")
                     .changed();
                 ui.label("fx");
-                intrinsics_changed |= ui
-                    .add_enabled(
-                        !self.auto_intrinsics,
-                        egui::DragValue::new(&mut self.fx).speed(1.0),
-                    )
-                    .changed();
+                let response = ui.add_enabled(
+                    !self.auto_intrinsics,
+                    egui::DragValue::new(&mut self.fx)
+                        .speed(1.0)
+                        .update_while_editing(false),
+                );
+                observe_intrinsics_value_response(
+                    response,
+                    &mut intrinsics_changed,
+                    &mut intrinsics_editing,
+                );
                 ui.label("fy");
-                intrinsics_changed |= ui
-                    .add_enabled(
-                        !self.auto_intrinsics,
-                        egui::DragValue::new(&mut self.fy).speed(1.0),
-                    )
-                    .changed();
+                let response = ui.add_enabled(
+                    !self.auto_intrinsics,
+                    egui::DragValue::new(&mut self.fy)
+                        .speed(1.0)
+                        .update_while_editing(false),
+                );
+                observe_intrinsics_value_response(
+                    response,
+                    &mut intrinsics_changed,
+                    &mut intrinsics_editing,
+                );
                 ui.label("cx");
-                intrinsics_changed |= ui
-                    .add_enabled(
-                        !self.auto_intrinsics,
-                        egui::DragValue::new(&mut self.cx).speed(1.0),
-                    )
-                    .changed();
+                let response = ui.add_enabled(
+                    !self.auto_intrinsics,
+                    egui::DragValue::new(&mut self.cx)
+                        .speed(1.0)
+                        .update_while_editing(false),
+                );
+                observe_intrinsics_value_response(
+                    response,
+                    &mut intrinsics_changed,
+                    &mut intrinsics_editing,
+                );
                 ui.label("cy");
-                intrinsics_changed |= ui
-                    .add_enabled(
-                        !self.auto_intrinsics,
-                        egui::DragValue::new(&mut self.cy).speed(1.0),
-                    )
-                    .changed();
+                let response = ui.add_enabled(
+                    !self.auto_intrinsics,
+                    egui::DragValue::new(&mut self.cy)
+                        .speed(1.0)
+                        .update_while_editing(false),
+                );
+                observe_intrinsics_value_response(
+                    response,
+                    &mut intrinsics_changed,
+                    &mut intrinsics_editing,
+                );
             });
             ui.separator();
             if ui
@@ -2019,31 +2064,34 @@ impl CalibrationWorkspace {
             ui.weak(
                 "Manual values seed Calibrate and Dataset PnP. Auto initial intrinsics uses D12=0.",
             );
-            let distortion_enabled = idle && !self.auto_intrinsics;
+            let distortion_enabled = setup_editable && !self.auto_intrinsics;
             egui::Grid::new("calibration_initial_distortion")
                 .num_columns(8)
                 .striped(true)
                 .show(ui, |ui| {
                     for (index, name) in INITIAL_DISTORTION_NAMES.iter().enumerate() {
                         ui.label(*name);
-                        intrinsics_changed |= ui
-                            .add_enabled(
-                                distortion_enabled,
-                                egui::DragValue::new(
-                                    &mut self.initial_distortion_coefficients[index],
-                                )
-                                .speed(0.0001),
-                            )
-                            .changed();
+                        let response = ui.add_enabled(
+                            distortion_enabled,
+                            egui::DragValue::new(&mut self.initial_distortion_coefficients[index])
+                                .speed(0.0001)
+                                .update_while_editing(false),
+                        );
+                        observe_intrinsics_value_response(
+                            response,
+                            &mut intrinsics_changed,
+                            &mut intrinsics_editing,
+                        );
                         if (index + 1) % 4 == 0 {
                             ui.end_row();
                         }
                     }
                 });
         });
+        self.intrinsics_value_editing = intrinsics_editing;
         if intrinsics_changed {
             self.refresh_runtime_auto_admission();
-            self.start_dataset_pnp_refresh();
+            self.request_dataset_pnp_refresh();
         }
     }
 
@@ -3230,6 +3278,23 @@ impl CalibrationWorkspace {
         self.status = "Running Pangbot-compatible calibration…".to_owned();
     }
 
+    fn request_dataset_pnp_refresh(&mut self) {
+        if self.active_job.is_some() {
+            self.pending_dataset_pnp_refresh = true;
+            return;
+        }
+        self.pending_dataset_pnp_refresh = false;
+        self.start_dataset_pnp_refresh();
+    }
+
+    fn drain_pending_dataset_pnp_refresh(&mut self) {
+        if !self.pending_dataset_pnp_refresh || self.active_job.is_some() {
+            return;
+        }
+        self.pending_dataset_pnp_refresh = false;
+        self.start_dataset_pnp_refresh();
+    }
+
     fn start_dataset_pnp_refresh(&mut self) {
         if self.active_job.is_some() {
             return;
@@ -3360,6 +3425,7 @@ impl CalibrationWorkspace {
                     break;
                 }
             };
+            let finished_job = self.active_job;
             self.active_job = None;
             self.calibration_cancellation = None;
             match event {
@@ -3376,6 +3442,9 @@ impl CalibrationWorkspace {
                 WorkerEvent::DatasetPnpRefresh(result) => {
                     self.handle_dataset_pnp_refresh_result(result);
                 }
+            }
+            if matches!(finished_job, Some(CalibrationJobKind::DatasetPnpRefresh)) {
+                self.drain_pending_dataset_pnp_refresh();
             }
         }
     }
@@ -3511,7 +3580,7 @@ impl CalibrationWorkspace {
         self.refresh_runtime_auto_admission();
         self.status =
             "Installed result K+D12 copied into editable initial-intrinsics controls.".to_owned();
-        self.start_dataset_pnp_refresh();
+        self.request_dataset_pnp_refresh();
     }
 
     fn active_initial_distortion_coefficients(&self) -> Vec<f64> {
@@ -4968,6 +5037,146 @@ mod tests {
         )
     }
 
+    fn render_controls_frame(
+        context: &egui::Context,
+        workspace: &mut CalibrationWorkspace,
+        time: f64,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 360.0),
+            )),
+            time: Some(time),
+            ..Default::default()
+        };
+        input.events = events;
+        context.run_ui(input, |ui| {
+            workspace.render_controls(ui);
+        })
+    }
+
+    fn spin_button_center_by_value(output: &egui::FullOutput, value: &str) -> egui::Pos2 {
+        let bounds = output
+            .platform_output
+            .accesskit_update
+            .as_ref()
+            .expect("accessibility tree is enabled")
+            .nodes
+            .iter()
+            .find_map(|(_, node)| {
+                (node.role() == egui::accesskit::Role::SpinButton
+                    && node
+                        .value()
+                        .is_some_and(|node_value| node_value.contains(value)))
+                .then(|| node.bounds())
+                .flatten()
+            })
+            .unwrap_or_else(|| panic!("spin button with value {value:?} is visible"));
+        #[allow(clippy::cast_possible_truncation)]
+        egui::pos2(
+            ((bounds.x0 + bounds.x1) * 0.5) as f32,
+            ((bounds.y0 + bounds.y1) * 0.5) as f32,
+        )
+    }
+
+    fn pointer_button(
+        position: egui::Pos2,
+        button: egui::PointerButton,
+        pressed: bool,
+    ) -> egui::Event {
+        egui::Event::PointerButton {
+            pos: position,
+            button,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        }
+    }
+
+    #[test]
+    fn intrinsics_text_entry_keeps_focus_until_commit() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_intrinsics = false;
+        workspace.fx = 812.0;
+        workspace.fy = 823.0;
+        workspace.cx = 334.0;
+        workspace.cy = 245.0;
+        install_detection_outcome(&mut workspace, "view.png", found_detection(640, 480));
+
+        let output = render_controls_frame(
+            &context,
+            &mut workspace,
+            0.0,
+            vec![egui::Event::WindowFocused(true)],
+        );
+        let fx_position = spin_button_center_by_value(&output, "812");
+        render_controls_frame(
+            &context,
+            &mut workspace,
+            0.1,
+            vec![
+                egui::Event::PointerMoved(fx_position),
+                pointer_button(fx_position, egui::PointerButton::Primary, true),
+            ],
+        );
+        render_controls_frame(
+            &context,
+            &mut workspace,
+            0.2,
+            vec![pointer_button(
+                fx_position,
+                egui::PointerButton::Primary,
+                false,
+            )],
+        );
+        let focused_id = context
+            .memory(|memory| memory.focused())
+            .expect("fx DragValue should be focused for text input");
+
+        render_controls_frame(
+            &context,
+            &mut workspace,
+            0.3,
+            vec![egui::Event::Text("1".to_owned())],
+        );
+        assert_eq!(context.memory(|memory| memory.focused()), Some(focused_id));
+        assert_eq!(workspace.active_job, None);
+        assert_eq!(workspace.fx, 812.0);
+
+        render_controls_frame(
+            &context,
+            &mut workspace,
+            0.4,
+            vec![egui::Event::Text("2".to_owned())],
+        );
+        assert_eq!(context.memory(|memory| memory.focused()), Some(focused_id));
+        assert_eq!(workspace.active_job, None);
+        assert_eq!(workspace.fx, 812.0);
+    }
+
+    #[test]
+    fn intrinsics_edits_during_pnp_refresh_queue_followup_without_disabling_controls() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.auto_intrinsics = false;
+        workspace.active_job = Some(CalibrationJobKind::DatasetPnpRefresh);
+
+        workspace.request_dataset_pnp_refresh();
+
+        assert!(workspace.pending_dataset_pnp_refresh);
+        assert_eq!(
+            workspace.active_job,
+            Some(CalibrationJobKind::DatasetPnpRefresh)
+        );
+        workspace.active_job = None;
+        workspace.drain_pending_dataset_pnp_refresh();
+        assert!(!workspace.pending_dataset_pnp_refresh);
+        assert_eq!(workspace.active_job, None);
+    }
+
     #[test]
     fn automatic_intrinsics_use_first_enabled_found_view() {
         let context = egui::Context::default();
@@ -5844,6 +6053,59 @@ mod tests {
         assert!(assessment.depth_target_met);
         assert!(assessment.pose_target_met);
         assert!(!assessment.collection_target_met);
+    }
+
+    #[test]
+    fn rejected_auto_candidate_keeps_displayed_assessment_on_baseline_score() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let displayed = chessboard_live_frame(5);
+        workspace.acceptance_draft.field_columns = "1".to_owned();
+        workspace.acceptance_draft.field_rows = "1".to_owned();
+        workspace.acceptance_draft.field_target_per_cell = "1".to_owned();
+        workspace.acceptance_draft.pnp_depth_min = "0.001".to_owned();
+        workspace.acceptance_draft.pnp_depth_max = "10000000".to_owned();
+        workspace.acceptance_draft.pnp_depth_bins = "1".to_owned();
+        workspace.acceptance_draft.depth_target_per_bin = "1".to_owned();
+        workspace.acceptance_draft.pnp_tilt_deadband_deg = "0".to_owned();
+        workspace.acceptance_draft.pnp_tilt_max_deg = "89".to_owned();
+        workspace.acceptance_draft.pnp_tilt_bins = "1".to_owned();
+        workspace.acceptance_draft.pnp_azimuth_sectors = "1".to_owned();
+        workspace.acceptance_draft.pose_target_per_bin = "1".to_owned();
+        workspace.acceptance_draft.pnp_max_rmse_px = "100".to_owned();
+        workspace.acceptance_draft.pnp_max_error_px = "100".to_owned();
+        workspace.acceptance_draft.minimum_auto_gain = "999".to_owned();
+        workspace.auto_capture_enabled = true;
+
+        workspace.observe_live_frame(
+            Arc::clone(&displayed),
+            test_live_source(),
+            store.clone(),
+            true,
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+            workspace.tick(&context);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            workspace.auto_capture.pending.is_none(),
+            "auto worker did not finish: {}",
+            workspace.status
+        );
+        assert_eq!(workspace.session.items().len(), 0, "{}", workspace.status);
+        assert!(
+            workspace.status.contains("below minimum"),
+            "{}",
+            workspace.status
+        );
+        let assessment = workspace.auto_capture.last_assessment.as_ref().unwrap();
+        assert_eq!(assessment.enabled_found_views, 0);
+        assert_eq!(assessment.constraint_gain, 0);
+        assert_eq!(assessment.found_view_gain, 0);
     }
 
     #[test]
