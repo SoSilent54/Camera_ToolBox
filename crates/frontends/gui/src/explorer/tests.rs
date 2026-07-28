@@ -13,7 +13,8 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     RusshTransportFactory, SshTransportFactory,
 };
 use camera_toolbox_app::{
-    EntryName, FileEntry, FileKind, FileRef, FileSystemCapabilities, FileVersion, SourcePath,
+    EntryName, ExportService, FileEntry, FileKind, FileRef, FileSystemCapabilities, FileVersion,
+    FsControl, SourcePath,
 };
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{
@@ -568,6 +569,42 @@ fn applying_local_path_populates_browser_from_monitor_baseline() {
 }
 
 #[test]
+fn export_destination_resolves_edited_local_path_independent_of_current_directory() {
+    let current = temp_directory();
+    let target = temp_directory();
+    let context = egui::Context::default();
+    let mut explorer = explorer_state();
+    explorer
+        .activate_local_path(current.clone(), &context)
+        .unwrap();
+
+    let resolved = explorer
+        .export_destination_for(
+            crate::export_dialog::ExportPathSource::Local,
+            &target.display().to_string(),
+        )
+        .unwrap();
+    let name = EntryName::new("edited-local-path.bin").unwrap();
+    ExportService
+        .save_new_with(
+            &resolved.destination,
+            &name,
+            &FsControl::with_timeout(Duration::from_secs(5)),
+            &mut |writer| {
+                std::io::Write::write_all(writer, b"local-target")
+                    .map_err(|error| camera_toolbox_app::FileSystemError::Io(error.to_string()))
+            },
+        )
+        .unwrap();
+
+    assert_eq!(resolved.directory_label, target.display().to_string());
+    assert!(target.join("edited-local-path.bin").exists());
+    assert!(!current.join("edited-local-path.bin").exists());
+    fs::remove_dir_all(current).unwrap();
+    fs::remove_dir_all(target).unwrap();
+}
+
+#[test]
 fn local_absolute_path_navigation_is_unrestricted_and_synchronized() {
     let directory = temp_directory();
     let sibling = temp_directory();
@@ -998,6 +1035,59 @@ fn sftp_workspace_loads_and_polls_session_source() {
     let reinterpreted = pipeline.reinterpret(source, params, 9, &control).unwrap();
     assert_eq!(reinterpreted.generation, Some(9));
     assert_eq!(reinterpreted.frame.pixels(), &[1, 2, 3, 4]);
+}
+
+#[cfg(feature = "platform-ssh")]
+#[test]
+fn export_destination_resolves_edited_sftp_path_to_connected_remote_source() {
+    let memory = Arc::new(MemorySshTransport::new("memory-host-key"));
+    memory.allow_credential("session:test");
+    memory.insert_directory("/opt/export");
+    let credentials: Arc<dyn CredentialResolver> = memory.clone();
+    let transport: Arc<dyn SshTransportFactory> = memory.clone();
+    let context = egui::Context::default();
+    let mut explorer = ExplorerState::new(credentials, transport);
+    explorer
+        .finish_sftp_connection(
+            RemoteConnectionConfig {
+                id: RemoteConnectionId::new("memory-export").unwrap(),
+                display_name: "memory".to_owned(),
+                host: "camera.test".to_owned(),
+                port: 22,
+                username: "root".to_owned(),
+                expected_host_key: Some("memory-host-key".to_owned()),
+                authentication: RemoteAuthentication::Password {
+                    slot_id: "test".to_owned(),
+                },
+            },
+            &context,
+        )
+        .unwrap();
+
+    let resolved = explorer
+        .export_destination_for(crate::export_dialog::ExportPathSource::Sftp, "/opt/export")
+        .unwrap();
+    let name = EntryName::new("edited-sftp-path.bin").unwrap();
+    ExportService
+        .save_new_with(
+            &resolved.destination,
+            &name,
+            &FsControl::with_timeout(Duration::from_secs(5)),
+            &mut |writer| {
+                std::io::Write::write_all(writer, b"sftp-target")
+                    .map_err(|error| camera_toolbox_app::FileSystemError::Io(error.to_string()))
+            },
+        )
+        .unwrap();
+
+    assert_eq!(
+        resolved.directory_label,
+        "sftp://root@camera.test:22/opt/export"
+    );
+    assert_eq!(
+        memory.file_bytes("/opt/export/edited-sftp-path.bin"),
+        Some(b"sftp-target".to_vec())
+    );
 }
 
 #[test]

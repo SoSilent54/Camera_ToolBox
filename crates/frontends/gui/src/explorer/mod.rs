@@ -17,6 +17,7 @@ use std::{
     time::Duration,
 };
 
+use crate::export_dialog::{ExportPathDialogPrefill, ExportPathSource};
 use browser::{BrowserCommand, BrowserSelection, BrowserState, MutationRequest};
 use camera_toolbox_adapters::filesystem::{
     DirectoryMonitorConfig, DirectoryMonitorEvent, DirectoryMonitorHandle, DirectoryMonitorState,
@@ -97,6 +98,10 @@ pub(crate) enum ExplorerAction {
 pub(crate) struct MountBinding {
     pub(crate) config: MountedSourceConfig,
     pub(crate) file_system: Arc<dyn FileSystem>,
+}
+pub(crate) struct ResolvedExportDestination {
+    pub(crate) destination: ExportDestination,
+    pub(crate) directory_label: String,
 }
 
 struct SourceView {
@@ -336,11 +341,29 @@ fn source_path_from_native(path: &Path) -> Result<SourcePath, String> {
 }
 
 fn source_path_from_remote(value: &str) -> Result<SourcePath, String> {
+    source_path_from_remote_root("/", value)
+}
+
+fn source_path_from_remote_root(remote_root: &str, value: &str) -> Result<SourcePath, String> {
     let value = value.trim();
     if !value.starts_with('/') {
         return Err("SFTP Path must be an absolute path".to_owned());
     }
-    SourcePath::directory(value.trim_start_matches('/')).map_err(|error| error.to_string())
+    let root = if remote_root == "/" {
+        "/"
+    } else {
+        remote_root.trim_end_matches('/')
+    };
+    let relative = if root == "/" {
+        value.trim_start_matches('/')
+    } else if value == root {
+        ""
+    } else if let Some(relative) = value.strip_prefix(&format!("{root}/")) {
+        relative
+    } else {
+        return Err(format!("SFTP Path must stay under mounted root {root}"));
+    };
+    SourcePath::directory(relative).map_err(|error| error.to_string())
 }
 
 struct ActiveDirectoryMonitor {
@@ -986,6 +1009,117 @@ impl ExplorerState {
     pub(crate) fn connected_sftp_label(&self) -> Option<&str> {
         self.connected_sftp_connection()
             .map(|connection| connection.display_name.as_str())
+    }
+
+    pub(crate) fn export_dialog_prefill(
+        &mut self,
+        context: &egui::Context,
+    ) -> Result<ExportPathDialogPrefill, String> {
+        self.ensure_local_workspace(context);
+        let local_directory = self
+            .local_view
+            .as_ref()
+            .filter(|view| view.file_system.capabilities().write_new)
+            .map(SourceView::navigation_path);
+        #[cfg(feature = "platform-ssh")]
+        let sftp_directory = self
+            .sftp_view
+            .as_ref()
+            .filter(|view| view.file_system.capabilities().write_new)
+            .map(SourceView::navigation_path);
+
+        let source = match self.mode {
+            WorkspaceMode::Local if local_directory.is_some() => ExportPathSource::Local,
+            #[cfg(feature = "platform-ssh")]
+            WorkspaceMode::Sftp if sftp_directory.is_some() => ExportPathSource::Sftp,
+            _ if local_directory.is_some() => ExportPathSource::Local,
+            #[cfg(feature = "platform-ssh")]
+            _ if sftp_directory.is_some() => ExportPathSource::Sftp,
+            _ => return Err("No writable Local or SFTP export directory is available.".to_owned()),
+        };
+
+        Ok(ExportPathDialogPrefill {
+            source,
+            local_directory,
+            #[cfg(feature = "platform-ssh")]
+            sftp_directory,
+        })
+    }
+
+    pub(crate) fn export_destination_for(
+        &self,
+        source: ExportPathSource,
+        directory_path: &str,
+    ) -> Result<ResolvedExportDestination, String> {
+        match source {
+            ExportPathSource::Local => self.local_export_destination_for(directory_path),
+            #[cfg(feature = "platform-ssh")]
+            ExportPathSource::Sftp => self.sftp_export_destination_for(directory_path),
+        }
+    }
+
+    fn local_export_destination_for(
+        &self,
+        directory_path: &str,
+    ) -> Result<ResolvedExportDestination, String> {
+        let view = self
+            .local_view
+            .as_ref()
+            .ok_or_else(|| "Local export source is not available.".to_owned())?;
+        if !view.file_system.capabilities().write_new {
+            return Err("Local export source does not support creating files.".to_owned());
+        }
+        let path = local_path_from_native(directory_path)?;
+        let canonical = std::fs::canonicalize(&path)
+            .map_err(|error| format!("Local export directory is unavailable: {error}"))?;
+        if !canonical.is_dir() {
+            return Err(format!(
+                "Local export path is not a directory: {}",
+                canonical.display()
+            ));
+        }
+        let MountedSourceConfig::Local { root, .. } = &view.config else {
+            return Err("Local export source is misconfigured.".to_owned());
+        };
+        let relative = canonical.strip_prefix(root).map_err(|_| {
+            format!(
+                "Local export path is outside mounted namespace: {}",
+                root.display()
+            )
+        })?;
+        let source_path = source_path_from_native(relative)?;
+        let directory = DirectoryRef::new(view.source_id().clone(), source_path.clone());
+        let destination = ExportDestination::new(directory, Arc::clone(&view.file_system))
+            .map_err(|error| error.to_string())?;
+        Ok(ResolvedExportDestination {
+            destination,
+            directory_label: view.display_path(&source_path).display().to_string(),
+        })
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn sftp_export_destination_for(
+        &self,
+        directory_path: &str,
+    ) -> Result<ResolvedExportDestination, String> {
+        let view = self
+            .sftp_view
+            .as_ref()
+            .ok_or_else(|| "Connected SFTP export source is not available.".to_owned())?;
+        if !view.file_system.capabilities().write_new {
+            return Err("SFTP export source does not support creating files.".to_owned());
+        }
+        let MountedSourceConfig::Sftp { remote_root, .. } = &view.config else {
+            return Err("SFTP export source is misconfigured.".to_owned());
+        };
+        let source_path = source_path_from_remote_root(remote_root, directory_path)?;
+        let directory = DirectoryRef::new(view.source_id().clone(), source_path.clone());
+        let destination = ExportDestination::new(directory, Arc::clone(&view.file_system))
+            .map_err(|error| error.to_string())?;
+        Ok(ResolvedExportDestination {
+            destination,
+            directory_label: view.display_path(&source_path).display().to_string(),
+        })
     }
 
     /// 返回当前 Explorer 目录的统一显式导出目标。

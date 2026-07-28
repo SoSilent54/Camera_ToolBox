@@ -1759,9 +1759,7 @@ impl CalibrationWorkspace {
     fn render_dataset_assessment(&self, ui: &mut egui::Ui, assessment: &AutoAdmissionAssessment) {
         ui.horizontal_wrapped(|ui| {
             ui.monospace(format!(
-                "Found {}/{} · Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{}",
-                assessment.enabled_found_views,
-                assessment.required_found_views,
+                "Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{}",
                 assessment.field_quota_filled,
                 assessment.required_field_quota,
                 assessment.depth_quota_filled,
@@ -1774,9 +1772,8 @@ impl CalibrationWorkspace {
                 assessment.field_cells, assessment.depth_bins, assessment.pose_bins,
             ));
             ui.monospace(format!(
-                "Score {} · Gain Found {} Field {} Depth {} Pose {}",
+                "Score {} · Gain Field {} Depth {} Pose {}",
                 assessment.constraint_gain,
-                assessment.found_view_gain,
                 assessment.field_gain,
                 assessment.depth_gain,
                 assessment.pose_gain
@@ -2228,7 +2225,6 @@ impl CalibrationWorkspace {
                     .column(Column::initial(80.0).at_least(54.0).clip(true))
                     .column(Column::initial(76.0).at_least(58.0).clip(true))
                     .column(Column::initial(76.0).at_least(58.0).clip(true))
-                    .column(Column::initial(70.0).at_least(54.0).clip(true))
                     .column(Column::initial(58.0).at_least(48.0).clip(true))
                     .column(Column::initial(58.0).at_least(48.0).clip(true))
                     .column(Column::initial(58.0).at_least(48.0).clip(true))
@@ -2248,7 +2244,6 @@ impl CalibrationWorkspace {
                             "Depth",
                             "Angle dir",
                             "Angle",
-                            "Found Δ",
                             "Field Δ",
                             "Depth Δ",
                             "Pose Δ",
@@ -2352,16 +2347,6 @@ impl CalibrationWorkspace {
                                     ui,
                                     item.pnp_observation.as_ref(),
                                     contribution.map(|value| &value.pnp_state),
-                                );
-                            });
-                            row.col(|ui| {
-                                render_admission_delta_cell(
-                                    ui,
-                                    contribution,
-                                    item.enabled,
-                                    "found views",
-                                    |_| false,
-                                    |value| value.found_view_gain,
                                 );
                             });
                             row.col(|ui| {
@@ -5158,11 +5143,13 @@ mod tests {
     }
 
     #[test]
-    fn intrinsics_edits_during_pnp_refresh_queue_followup_without_disabling_controls() {
+    fn intrinsics_edits_during_pnp_refresh_queue_followup_worker() {
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         workspace.auto_intrinsics = false;
         workspace.active_job = Some(CalibrationJobKind::DatasetPnpRefresh);
+        install_detection_outcome(&mut workspace, "queued.png", found_detection(640, 480));
+        let item_id = workspace.session.items()[0].id;
 
         workspace.request_dataset_pnp_refresh();
 
@@ -5174,7 +5161,28 @@ mod tests {
         workspace.active_job = None;
         workspace.drain_pending_dataset_pnp_refresh();
         assert!(!workspace.pending_dataset_pnp_refresh);
-        assert_eq!(workspace.active_job, None);
+        assert_eq!(
+            workspace.active_job,
+            Some(CalibrationJobKind::DatasetPnpRefresh)
+        );
+
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while workspace.active_job.is_some() && Instant::now() < deadline {
+            workspace.tick(&context);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(workspace.active_job, None, "{}", workspace.status);
+        assert!(
+            workspace
+                .session
+                .items()
+                .iter()
+                .find(|item| item.id == item_id)
+                .and_then(|item| item.pnp_observation.as_ref())
+                .is_some(),
+            "{}",
+            workspace.status
+        );
     }
 
     #[test]
@@ -5310,7 +5318,7 @@ mod tests {
     }
 
     #[test]
-    fn coverage_heatmap_uses_enabled_found_views_only() {
+    fn coverage_heatmap_uses_enabled_found_items_only() {
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
         install_detection_outcome(
@@ -6052,7 +6060,7 @@ mod tests {
         assert!(assessment.field_target_met);
         assert!(assessment.depth_target_met);
         assert!(assessment.pose_target_met);
-        assert!(!assessment.collection_target_met);
+        assert!(assessment.collection_target_met);
     }
 
     #[test]
@@ -6103,9 +6111,7 @@ mod tests {
             workspace.status
         );
         let assessment = workspace.auto_capture.last_assessment.as_ref().unwrap();
-        assert_eq!(assessment.enabled_found_views, 0);
         assert_eq!(assessment.constraint_gain, 0);
-        assert_eq!(assessment.found_view_gain, 0);
     }
 
     #[test]

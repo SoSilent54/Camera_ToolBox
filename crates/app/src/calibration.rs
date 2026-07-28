@@ -426,7 +426,6 @@ fn rodrigues_matrix(rotation_vector: [f64; 3]) -> Result<[[f64; 3]; 3], Calibrat
 /// 非持久化 Dataset Acceptance 阈值；仅从当前 GUI 控件构造。
 #[derive(Clone, Debug, PartialEq)]
 pub struct AutoCaptureAcceptanceCriteria {
-    pub required_found_views: usize,
     pub field_columns: usize,
     pub field_rows: usize,
     /// 每个 Field cell 需要累计的棋盘角点数；达到前每个角点都提供 Gain。
@@ -451,11 +450,6 @@ pub struct AutoCaptureAcceptanceCriteria {
 
 impl AutoCaptureAcceptanceCriteria {
     fn validate(&self) -> Result<(), CalibrationSessionError> {
-        if self.required_found_views < MIN_CALIBRATION_VIEWS {
-            return Err(CalibrationSessionError::InvalidAutoCaptureBaseline(
-                format!("required Found views must be at least {MIN_CALIBRATION_VIEWS}"),
-            ));
-        }
         if self.field_columns == 0
             || self.field_rows == 0
             || self.field_columns > 32
@@ -607,7 +601,6 @@ impl AutoCaptureBaseline {
         hash.u16(self.board.inner_cols);
         hash.u16(self.board.inner_rows);
         hash.bytes(&self.board.square_size.to_bits().to_be_bytes());
-        hash.u64(self.criteria.required_found_views as u64);
         hash.u64(self.criteria.field_columns as u64);
         hash.u64(self.criteria.field_rows as u64);
         hash.u64(self.criteria.field_target_per_cell as u64);
@@ -770,7 +763,6 @@ impl AutoAdmissionPnpState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AutoAdmissionItemContribution {
     pub item_id: CalibrationItemId,
-    pub found_view_gain: usize,
     pub field_gain: usize,
     pub depth_gain: usize,
     pub pose_gain: usize,
@@ -795,8 +787,6 @@ struct DatasetAdmissionItemCoverage {
 pub struct AutoAdmissionAssessment {
     /// 生成本评估的有效 runtime 门限；无 active admission 时默认值为 `None`。
     pub active_criteria: Option<AutoCaptureAcceptanceCriteria>,
-    pub enabled_found_views: usize,
-    pub required_found_views: usize,
     pub field_columns: usize,
     pub field_rows: usize,
     /// 每个 Field 网格单元内的兼容棋盘角点数量；非零单元仍表示 occupied field cell。
@@ -815,7 +805,6 @@ pub struct AutoAdmissionAssessment {
     pub required_pose_bins: usize,
     pub pose_quota_filled: usize,
     pub required_pose_quota: usize,
-    pub found_view_gain: usize,
     pub field_gain: usize,
     pub depth_gain: usize,
     pub pose_gain: usize,
@@ -833,7 +822,6 @@ fn target_capped_item_contributions(
     criteria: &AutoCaptureAcceptanceCriteria,
     pose_capacity: usize,
 ) -> Vec<AutoAdmissionItemContribution> {
-    let mut found_views_seen = 0_usize;
     let mut field_counts = vec![0_usize; criteria.field_columns * criteria.field_rows];
     let mut depth_counts = vec![0_usize; criteria.pnp_depth_bins];
     let mut pose_counts = vec![0_usize; pose_capacity];
@@ -841,8 +829,6 @@ fn target_capped_item_contributions(
     item_coverage
         .iter()
         .map(|coverage| {
-            let found_view_gain = usize::from(found_views_seen < criteria.required_found_views);
-            found_views_seen = found_views_seen.saturating_add(1);
             let field_gain = target_capped_region_gain(
                 &mut field_counts,
                 criteria.field_target_per_cell,
@@ -862,16 +848,10 @@ fn target_capped_item_contributions(
             });
             AutoAdmissionItemContribution {
                 item_id: coverage.item_id,
-                found_view_gain,
                 field_gain,
                 depth_gain,
                 pose_gain,
-                constraint_gain: constraint_gain(
-                    found_view_gain,
-                    field_gain,
-                    depth_gain,
-                    pose_gain,
-                ),
+                constraint_gain: constraint_gain(field_gain, depth_gain, pose_gain),
                 pnp_state: coverage.pnp_state.clone(),
                 depth_covered: coverage.depth_covered,
                 pose_covered: coverage.pose_covered,
@@ -890,13 +870,8 @@ fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
         .fold(0_usize, |total, value| total.saturating_add(value))
 }
 
-fn constraint_gain(
-    found_view_gain: usize,
-    field_gain: usize,
-    depth_gain: usize,
-    pose_gain: usize,
-) -> usize {
-    saturating_sum([found_view_gain, field_gain, depth_gain, pose_gain])
+fn constraint_gain(field_gain: usize, depth_gain: usize, pose_gain: usize) -> usize {
+    saturating_sum([field_gain, depth_gain, pose_gain])
 }
 
 fn capped_region_target(region_count: usize, target_per_region: usize) -> usize {
@@ -1338,7 +1313,6 @@ impl CalibrationSession {
         let mut field_counts = vec![0_usize; criteria.field_columns * criteria.field_rows];
         let mut depth_bin_counts = vec![0_usize; criteria.pnp_depth_bins];
         let mut pose_bin_counts = vec![0_usize; pose_capacity];
-        let mut enabled_found_views = 0_usize;
         let mut item_coverage = Vec::new();
 
         for item in self.items.iter().filter(|item| item.enabled) {
@@ -1358,7 +1332,6 @@ impl CalibrationSession {
                 continue;
             }
 
-            enabled_found_views = enabled_found_views.saturating_add(1);
             let field_corner_counts = Self::field_corner_counts(detection, criteria);
             for (cell, count) in &field_corner_counts {
                 field_counts[*cell] = field_counts[*cell].saturating_add(*count);
@@ -1422,11 +1395,6 @@ impl CalibrationSession {
             capped_region_target(pose_bin_counts.len(), criteria.pose_target_per_bin);
         let item_contributions =
             target_capped_item_contributions(&item_coverage, criteria, pose_capacity);
-        let found_view_gain = saturating_sum(
-            item_contributions
-                .iter()
-                .map(|contribution| contribution.found_view_gain),
-        );
         let field_gain = saturating_sum(
             item_contributions
                 .iter()
@@ -1447,8 +1415,6 @@ impl CalibrationSession {
         let pose_target_met = pose_quota_filled >= required_pose_quota;
         Ok(AutoAdmissionAssessment {
             active_criteria: Some(criteria.clone()),
-            enabled_found_views,
-            required_found_views: criteria.required_found_views,
             field_columns: criteria.field_columns,
             field_rows: criteria.field_rows,
             field_counts,
@@ -1466,19 +1432,15 @@ impl CalibrationSession {
             required_pose_bins: pose_capacity,
             pose_quota_filled,
             required_pose_quota,
-            found_view_gain,
             field_gain,
             depth_gain,
             pose_gain,
-            constraint_gain: constraint_gain(found_view_gain, field_gain, depth_gain, pose_gain),
+            constraint_gain: constraint_gain(field_gain, depth_gain, pose_gain),
             item_contributions,
             field_target_met,
             depth_target_met,
             pose_target_met,
-            collection_target_met: enabled_found_views >= criteria.required_found_views
-                && field_target_met
-                && depth_target_met
-                && pose_target_met,
+            collection_target_met: field_target_met && depth_target_met && pose_target_met,
         })
     }
 
@@ -2184,7 +2146,6 @@ impl CalibrationSession {
         let mut field_counts = vec![0_usize; criteria.field_columns * criteria.field_rows];
         let mut depth_bin_counts = vec![0_usize; criteria.pnp_depth_bins];
         let mut pose_bin_counts = vec![0_usize; pose_capacity];
-        let mut enabled_found_views = 0_usize;
 
         let mut item_coverage = Vec::new();
         for item in self.items.iter().filter(|item| {
@@ -2217,7 +2178,6 @@ impl CalibrationSession {
             else {
                 continue;
             };
-            enabled_found_views = enabled_found_views.saturating_add(1);
             let field_corner_counts = Self::field_corner_counts(detection, criteria);
             for (cell, count) in &field_corner_counts {
                 field_counts[*cell] = field_counts[*cell].saturating_add(*count);
@@ -2240,11 +2200,6 @@ impl CalibrationSession {
 
         let item_contributions =
             target_capped_item_contributions(&item_coverage, criteria, pose_capacity);
-        let existing_found_view_gain = saturating_sum(
-            item_contributions
-                .iter()
-                .map(|contribution| contribution.found_view_gain),
-        );
         let existing_field_gain = saturating_sum(
             item_contributions
                 .iter()
@@ -2261,51 +2216,43 @@ impl CalibrationSession {
                 .map(|contribution| contribution.pose_gain),
         );
 
-        let (found_view_gain, field_gain, depth_gain, pose_gain) =
-            if let Some((candidate, observation)) = candidate {
-                candidate.validate(self.board)?;
-                if candidate.image_size != binding.reference_image_size {
-                    return Err(CalibrationSessionError::RejectIncompatibleImageSize {
-                        expected: binding.reference_image_size,
-                        actual: candidate.image_size,
-                    });
-                }
-                Self::ensure_detection_inside_image(candidate)?;
-                Self::ensure_min_adjacent_spacing(
-                    candidate,
-                    self.board,
-                    criteria.min_adjacent_spacing_px,
-                )?;
-                let (candidate_depth, pose_bin) =
-                    Self::pnp_coverage_for_admission(observation, baseline, binding)?;
-                let candidate_field = Self::field_corner_counts(candidate, criteria);
-                let field_gain = target_capped_region_gain(
-                    &mut field_counts,
-                    criteria.field_target_per_cell,
-                    candidate_field.iter().copied(),
-                );
-                let found_view_gain =
-                    usize::from(enabled_found_views < criteria.required_found_views);
-                enabled_found_views = enabled_found_views.saturating_add(1);
-                let depth_gain = target_capped_region_gain(
-                    &mut depth_bin_counts,
-                    criteria.depth_target_per_bin,
-                    candidate_depth.iter().copied(),
-                );
-                let pose_gain = target_capped_region_gain(
-                    &mut pose_bin_counts,
-                    criteria.pose_target_per_bin,
-                    std::iter::once((pose_bin, 1)),
-                );
-                (found_view_gain, field_gain, depth_gain, pose_gain)
-            } else {
-                (
-                    existing_found_view_gain,
-                    existing_field_gain,
-                    existing_depth_gain,
-                    existing_pose_gain,
-                )
-            };
+        let (field_gain, depth_gain, pose_gain) = if let Some((candidate, observation)) = candidate
+        {
+            candidate.validate(self.board)?;
+            if candidate.image_size != binding.reference_image_size {
+                return Err(CalibrationSessionError::RejectIncompatibleImageSize {
+                    expected: binding.reference_image_size,
+                    actual: candidate.image_size,
+                });
+            }
+            Self::ensure_detection_inside_image(candidate)?;
+            Self::ensure_min_adjacent_spacing(
+                candidate,
+                self.board,
+                criteria.min_adjacent_spacing_px,
+            )?;
+            let (candidate_depth, pose_bin) =
+                Self::pnp_coverage_for_admission(observation, baseline, binding)?;
+            let candidate_field = Self::field_corner_counts(candidate, criteria);
+            let field_gain = target_capped_region_gain(
+                &mut field_counts,
+                criteria.field_target_per_cell,
+                candidate_field.iter().copied(),
+            );
+            let depth_gain = target_capped_region_gain(
+                &mut depth_bin_counts,
+                criteria.depth_target_per_bin,
+                candidate_depth.iter().copied(),
+            );
+            let pose_gain = target_capped_region_gain(
+                &mut pose_bin_counts,
+                criteria.pose_target_per_bin,
+                std::iter::once((pose_bin, 1)),
+            );
+            (field_gain, depth_gain, pose_gain)
+        } else {
+            (existing_field_gain, existing_depth_gain, existing_pose_gain)
+        };
 
         let field_cells = field_counts.iter().filter(|count| **count != 0).count();
         let depth_bins = depth_bin_counts.iter().filter(|count| **count != 0).count();
@@ -2325,8 +2272,6 @@ impl CalibrationSession {
         let pose_target_met = pose_quota_filled >= required_pose_quota;
         Ok(AutoAdmissionAssessment {
             active_criteria: Some(criteria.clone()),
-            enabled_found_views,
-            required_found_views: criteria.required_found_views,
             field_columns: criteria.field_columns,
             field_rows: criteria.field_rows,
             field_counts,
@@ -2345,18 +2290,14 @@ impl CalibrationSession {
             pose_quota_filled,
             required_pose_quota,
             item_contributions,
-            found_view_gain,
             field_gain,
             depth_gain,
             pose_gain,
-            constraint_gain: constraint_gain(found_view_gain, field_gain, depth_gain, pose_gain),
+            constraint_gain: constraint_gain(field_gain, depth_gain, pose_gain),
             field_target_met,
             depth_target_met,
             pose_target_met,
-            collection_target_met: enabled_found_views >= criteria.required_found_views
-                && field_target_met
-                && depth_target_met
-                && pose_target_met,
+            collection_target_met: field_target_met && depth_target_met && pose_target_met,
         })
     }
 
@@ -2640,7 +2581,6 @@ mod tests {
 
     fn test_criteria() -> AutoCaptureAcceptanceCriteria {
         AutoCaptureAcceptanceCriteria {
-            required_found_views: MIN_CALIBRATION_VIEWS,
             field_columns: 2,
             field_rows: 2,
             field_target_per_cell: 1,
@@ -3275,7 +3215,6 @@ mod tests {
         configure_test_auto_admission(&mut session);
 
         let assessment = session.assess_auto_admission(None).unwrap();
-        assert_eq!(assessment.enabled_found_views, 0);
         assert_eq!(assessment.field_cells, 0);
         assert!(assessment.item_contributions.is_empty());
     }
@@ -3305,7 +3244,6 @@ mod tests {
         let dataset = session
             .assess_dataset_acceptance(binding.reference_image_size, &criteria, Some(&binding))
             .unwrap();
-        assert_eq!(dataset.enabled_found_views, 3);
         assert_eq!(dataset.item_contributions.len(), 3);
         assert_eq!(dataset.depth_bins, 1);
         assert_eq!(dataset.pose_bins, 1);
@@ -3313,7 +3251,6 @@ mod tests {
             && matches!(item.input, CalibrationInputKey::StreamCapture(_))));
 
         let automatic = session.assess_auto_admission(None).unwrap();
-        assert_eq!(automatic.enabled_found_views, 1);
         assert_eq!(automatic.item_contributions.len(), 1);
         assert_eq!(automatic.item_contributions[0].item_id, auto_item);
     }
@@ -3329,7 +3266,6 @@ mod tests {
         let assessment = session
             .assess_dataset_acceptance(binding.reference_image_size, &criteria, Some(&binding))
             .unwrap();
-        assert_eq!(assessment.enabled_found_views, 1);
         assert_eq!(assessment.field_cells, 1);
         assert_eq!(assessment.depth_bins, 0);
         assert_eq!(assessment.pose_bins, 0);
@@ -3337,7 +3273,6 @@ mod tests {
             panic!("expected field-only contribution");
         };
         assert_eq!(contribution.item_id, local_file);
-        assert_eq!(contribution.found_view_gain, 1);
         assert_eq!(contribution.depth_gain, 0);
         assert_eq!(contribution.pose_gain, 0);
         assert_eq!(
@@ -3345,6 +3280,7 @@ mod tests {
             AutoAdmissionPnpState::MissingObservation
         );
         assert_eq!(contribution.field_gain, 1);
+        assert_eq!(contribution.constraint_gain, 1);
     }
 
     #[test]
@@ -3410,7 +3346,7 @@ mod tests {
 
         let mut redundant_session = CalibrationSession::new(board());
         let criteria = test_criteria();
-        for index in 0..=criteria.required_found_views {
+        for index in 0..4 {
             let item = add_found(
                 &mut redundant_session,
                 &format!("redundant-{index}.png"),
@@ -3430,8 +3366,7 @@ mod tests {
         assert_eq!(redundant_assessment.constraint_gain, total_gain);
         assert_eq!(
             redundant_assessment.constraint_gain,
-            redundant_assessment.found_view_gain
-                + redundant_assessment.field_quota_filled
+            redundant_assessment.field_quota_filled
                 + redundant_assessment.depth_quota_filled
                 + redundant_assessment.pose_quota_filled
         );
@@ -3441,7 +3376,7 @@ mod tests {
                 .iter()
                 .filter(|contribution| contribution.constraint_gain == 0)
                 .count(),
-            1
+            3
         );
         assert!(
             redundant_assessment
@@ -3511,18 +3446,16 @@ mod tests {
             panic!("expected two source-bound items");
         };
         assert_eq!(first_contribution.item_id, first);
-        assert_eq!(first_contribution.found_view_gain, 1);
         assert_eq!(first_contribution.field_gain, 1);
         assert_eq!(first_contribution.depth_gain, 1);
         assert_eq!(first_contribution.pose_gain, 1);
-        assert_eq!(first_contribution.constraint_gain, 4);
+        assert_eq!(first_contribution.constraint_gain, 3);
         assert_eq!(second_contribution.item_id, second);
-        assert_eq!(second_contribution.found_view_gain, 1);
         assert_eq!(second_contribution.field_gain, 0);
         assert_eq!(second_contribution.depth_gain, 0);
         assert_eq!(second_contribution.pose_gain, 0);
-        assert_eq!(second_contribution.constraint_gain, 1);
-        assert_eq!(assessment.constraint_gain, 5);
+        assert_eq!(second_contribution.constraint_gain, 0);
+        assert_eq!(assessment.constraint_gain, 3);
 
         session.set_enabled(second, false).unwrap();
         let assessment = session.assess_auto_admission(None).unwrap();
@@ -3530,11 +3463,10 @@ mod tests {
             panic!("expected the only enabled compatible item");
         };
         assert_eq!(contribution.item_id, first);
-        assert_eq!(contribution.found_view_gain, 1);
         assert_eq!(contribution.field_gain, 1);
         assert_eq!(contribution.depth_gain, 1);
         assert_eq!(contribution.pose_gain, 1);
-        assert_eq!(contribution.constraint_gain, 4);
+        assert_eq!(contribution.constraint_gain, 3);
 
         session.set_enabled(first, false).unwrap();
         assert!(
@@ -3578,7 +3510,6 @@ mod tests {
         configure_test_auto_admission(&mut session);
 
         let assessment = session.assess_auto_admission(None).unwrap();
-        assert_eq!(assessment.enabled_found_views, 0);
         assert_eq!(assessment.field_cells, 0);
         assert_eq!(assessment.depth_bins, 0);
         assert_eq!(assessment.pose_bins, 0);
@@ -3597,7 +3528,6 @@ mod tests {
         session.item_mut(item).unwrap().admission_pnp_observation = Some(test_pnp_observation());
         configure_test_auto_admission(&mut session);
         let before = session.assess_auto_admission(None).unwrap();
-        assert_eq!(before.enabled_found_views, 1);
         assert_eq!(before.item_contributions.len(), 1);
 
         let mut tightened_criteria = test_criteria();
@@ -3613,7 +3543,6 @@ mod tests {
             .configure_auto_admission(Some(tightened_baseline), Some(test_binding()))
             .unwrap();
         let after = session.assess_auto_admission(None).unwrap();
-        assert_eq!(after.enabled_found_views, 0);
         assert_eq!(after.field_cells, 0);
         assert_eq!(after.depth_bins, 0);
         assert_eq!(after.pose_bins, 0);
@@ -3708,7 +3637,7 @@ mod tests {
         assert!(matches!(
             result,
             Err(CalibrationSessionError::RejectInsufficientConstraintGain {
-                actual: 4,
+                actual: 3,
                 minimum: 5,
             })
         ));
@@ -3822,10 +3751,7 @@ mod tests {
         assert_eq!(assessment.constraint_gain, contribution.constraint_gain);
         assert_eq!(
             assessment.constraint_gain,
-            assessment.found_view_gain
-                + assessment.field_gain
-                + assessment.depth_gain
-                + assessment.pose_gain
+            assessment.field_gain + assessment.depth_gain + assessment.pose_gain
         );
     }
 
@@ -3936,11 +3862,10 @@ mod tests {
         let first_assessment = session
             .assess_auto_admission(Some((&found, &first_pnp)))
             .unwrap();
-        assert_eq!(first_assessment.found_view_gain, 1);
         assert_eq!(first_assessment.field_gain, 1);
         assert_eq!(first_assessment.depth_gain, 1);
         assert_eq!(first_assessment.pose_gain, 1);
-        assert_eq!(first_assessment.constraint_gain, 4);
+        assert_eq!(first_assessment.constraint_gain, 3);
         session
             .commit_auto_candidate(AutoCandidateCommit::new(
                 first_token,
@@ -3955,11 +3880,10 @@ mod tests {
         let second_assessment = session
             .assess_auto_admission(Some((&found, &second_pnp)))
             .unwrap();
-        assert_eq!(second_assessment.found_view_gain, 1);
         assert_eq!(second_assessment.field_gain, 0);
         assert_eq!(second_assessment.depth_gain, 1);
         assert_eq!(second_assessment.pose_gain, 1);
-        assert_eq!(second_assessment.constraint_gain, 3);
+        assert_eq!(second_assessment.constraint_gain, 2);
         assert_eq!(second_assessment.depth_bins, 2);
         assert_eq!(second_assessment.pose_bins, 2);
         session

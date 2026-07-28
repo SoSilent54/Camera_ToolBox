@@ -3,7 +3,6 @@
 use camera_toolbox_app::{AutoAdmissionAssessment, AutoCaptureAcceptanceCriteria};
 use eframe::egui;
 
-const DEFAULT_REQUIRED_FOUND_VIEWS: &str = "3";
 const DEFAULT_FIELD_COLUMNS: &str = "16";
 const DEFAULT_FIELD_ROWS: &str = "9";
 const DEFAULT_FIELD_TARGET_PER_CELL: &str = "1";
@@ -24,7 +23,6 @@ const DEFAULT_MINIMUM_AUTO_GAIN: &str = "1";
 /// 文本编辑状态必须保留中间输入；只有完整合法值才会被工作区自动安装。
 #[derive(Clone, Debug)]
 pub(crate) struct DatasetAcceptanceDraft {
-    pub(crate) required_found_views: String,
     pub(crate) field_columns: String,
     pub(crate) field_rows: String,
     pub(crate) field_target_per_cell: String,
@@ -47,7 +45,6 @@ pub(crate) struct DatasetAcceptanceDraft {
 impl Default for DatasetAcceptanceDraft {
     fn default() -> Self {
         Self {
-            required_found_views: DEFAULT_REQUIRED_FOUND_VIEWS.to_owned(),
             field_columns: DEFAULT_FIELD_COLUMNS.to_owned(),
             field_rows: DEFAULT_FIELD_ROWS.to_owned(),
             field_target_per_cell: DEFAULT_FIELD_TARGET_PER_CELL.to_owned(),
@@ -71,12 +68,6 @@ impl Default for DatasetAcceptanceDraft {
 
 impl DatasetAcceptanceDraft {
     pub(crate) fn parse(&self) -> Result<AutoCaptureAcceptanceCriteria, String> {
-        let required_found_views = parse_usize(
-            "Required Found views",
-            &self.required_found_views,
-            3,
-            10_000,
-        )?;
         let field_columns = parse_usize("Field columns", &self.field_columns, 1, 32)?;
         let field_rows = parse_usize("Field rows", &self.field_rows, 1, 32)?;
         let field_capacity = field_columns
@@ -143,7 +134,6 @@ impl DatasetAcceptanceDraft {
             1_000_000,
         )?;
         Ok(AutoCaptureAcceptanceCriteria {
-            required_found_views,
             field_columns,
             field_rows,
             field_target_per_cell,
@@ -237,8 +227,6 @@ fn pose_bin_capacity(criteria: &AutoCaptureAcceptanceCriteria) -> usize {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) active_criteria: Option<AutoCaptureAcceptanceCriteria>,
-    pub(crate) enabled_found_views: usize,
-    pub(crate) required_found_views: usize,
     pub(crate) occupied_field_cells: usize,
     pub(crate) required_field_cells: usize,
     pub(crate) field_quota_filled: usize,
@@ -257,7 +245,6 @@ pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) pose_quota_filled: usize,
     pub(crate) required_pose_quota: usize,
     pub(crate) collection_target_met: bool,
-    pub(crate) found_view_gain: usize,
     pub(crate) field_gain: usize,
     pub(crate) depth_gain: usize,
     pub(crate) pose_gain: usize,
@@ -268,8 +255,6 @@ impl DatasetAcceptanceProgress {
     pub(crate) fn from_assessment(assessment: &AutoAdmissionAssessment) -> Self {
         Self {
             active_criteria: assessment.active_criteria.clone(),
-            enabled_found_views: assessment.enabled_found_views,
-            required_found_views: assessment.required_found_views,
             occupied_field_cells: assessment.field_cells,
             required_field_cells: assessment.required_field_cells,
             field_quota_filled: assessment.field_quota_filled,
@@ -288,7 +273,6 @@ impl DatasetAcceptanceProgress {
             pose_quota_filled: assessment.pose_quota_filled,
             required_pose_quota: assessment.required_pose_quota,
             collection_target_met: assessment.collection_target_met,
-            found_view_gain: assessment.found_view_gain,
             field_gain: assessment.field_gain,
             depth_gain: assessment.depth_gain,
             pose_gain: assessment.pose_gain,
@@ -300,7 +284,6 @@ impl DatasetAcceptanceProgress {
         let pose_capacity = pose_bin_capacity(criteria);
         Self {
             active_criteria: Some(criteria.clone()),
-            required_found_views: criteria.required_found_views,
             required_field_cells: criteria.field_columns.saturating_mul(criteria.field_rows),
             required_field_quota: criteria
                 .field_columns
@@ -368,9 +351,7 @@ pub(crate) fn render_dataset_acceptance(
                     render_runtime_state(ui, &state);
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!(
-                            "Found {}/{} · Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{} · Score {}",
-                            progress.enabled_found_views,
-                            progress.required_found_views,
+                            "Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{} · Score {}",
                             progress.field_quota_filled,
                             progress.required_field_quota,
                             progress.depth_quota_filled,
@@ -380,36 +361,13 @@ pub(crate) fn render_dataset_acceptance(
                             progress.score,
                         ));
                         ui.monospace(format!(
-                            "Δ Found {} · Field {} · Depth {} · Pose {}",
-                            progress.found_view_gain,
+                            "Δ Field {} · Depth {} · Pose {}",
                             progress.field_gain,
                             progress.depth_gain,
                             progress.pose_gain,
                         ));
                     });
 
-                    ui.add_space(4.0);
-                    ui.group(|ui| {
-                        ui.strong("Found views");
-                        metric_row(
-                            ui,
-                            "Enabled Found views",
-                            progress.enabled_found_views,
-                            progress.required_found_views,
-                        );
-                        egui::Grid::new("dataset_acceptance_found_editor")
-                            .num_columns(2)
-                            .spacing([8.0, 4.0])
-                            .show(ui, |ui| {
-                                acceptance_text_row(
-                                    ui,
-                                    "Found view target",
-                                    &mut draft.required_found_views,
-                                    &mut changed,
-                                    &mut editing,
-                                );
-                            });
-                    });
 
                     ui.group(|ui| {
                         ui.strong("Field coverage");
@@ -1199,7 +1157,7 @@ mod tests {
         progress.occupied_field_cells = 1;
         progress.occupied_depth_bins = 1;
         progress.occupied_pose_bins = 1;
-        draft.required_found_views = "4".to_owned();
+        draft.field_target_per_cell = "2".to_owned();
         let _ = context.run_ui(egui::RawInput::default(), |ui| {
             let _ = render_dataset_acceptance(ui, &mut draft, &progress, state, 160.0);
         });

@@ -171,14 +171,10 @@ struct ImageExportSnapshot {
 
 enum PendingNamedExport {
     Image {
-        destination: ExportDestination,
-        directory_label: String,
         snapshot: ImageExportSnapshot,
     },
     #[cfg(feature = "calibration-opencv")]
     Calibration {
-        destination: ExportDestination,
-        directory_label: String,
         export: CalibrationExport,
     },
 }
@@ -818,7 +814,7 @@ impl eframe::App for CameraToolboxApp {
                 Err("This build does not include SSH EEPROM provisioning.".to_owned())
             }
         };
-        let calibration_export_error = self.explorer.active_save_destination().err();
+        let calibration_export_error = self.explorer.export_dialog_prefill(&context).err();
 
         #[cfg(feature = "calibration-opencv")]
         let calibration_viewer_overlay = self.workspace.active_live().and_then(|document| {
@@ -913,7 +909,7 @@ impl eframe::App for CameraToolboxApp {
         }
         #[cfg(feature = "calibration-opencv")]
         if let Some(export) = self.calibration.take_export() {
-            self.begin_calibration_export(export);
+            self.begin_calibration_export(&context, export);
         }
         self.render_named_export_dialog(&context);
         self.render_yuv_save_dialog(&context);
@@ -2272,57 +2268,53 @@ impl CameraToolboxApp {
     }
 
     fn render_named_export_dialog(&mut self, context: &egui::Context) {
-        let Some(pending) = self.pending_named_export.as_ref() else {
+        let Some(selection) = self.export_name_dialog.show(context) else {
+            if !self.export_name_dialog.is_open() {
+                self.pending_named_export = None;
+            }
             return;
         };
-        let directory_label = match pending {
-            PendingNamedExport::Image {
-                directory_label, ..
-            } => directory_label.clone(),
-            #[cfg(feature = "calibration-opencv")]
-            PendingNamedExport::Calibration {
-                directory_label, ..
-            } => directory_label.clone(),
-        };
-        let accepted = self.export_name_dialog.show(context, &directory_label);
-        if let Some(file_name) = accepted {
-            let pending = self
-                .pending_named_export
-                .take()
-                .expect("an open export dialog has a pending export");
-            match pending {
-                PendingNamedExport::Image {
-                    destination,
-                    directory_label,
-                    snapshot,
-                } => self.route_image_export(destination, directory_label, file_name, snapshot),
-                #[cfg(feature = "calibration-opencv")]
-                PendingNamedExport::Calibration {
-                    destination,
-                    directory_label,
-                    export,
-                } => self.submit_calibration_export(
-                    context,
-                    destination,
-                    directory_label,
-                    file_name,
-                    export,
-                ),
+        let resolved = match self
+            .explorer
+            .export_destination_for(selection.source, &selection.directory_path)
+        {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.export_name_dialog.reject(error);
+                return;
             }
-        } else if !self.export_name_dialog.is_open() {
-            self.pending_named_export = None;
+        };
+        let pending = self
+            .pending_named_export
+            .take()
+            .expect("an open export dialog has a pending export");
+        match pending {
+            PendingNamedExport::Image { snapshot } => self.route_image_export(
+                resolved.destination,
+                resolved.directory_label,
+                selection.file_name,
+                snapshot,
+            ),
+            #[cfg(feature = "calibration-opencv")]
+            PendingNamedExport::Calibration { export } => self.submit_calibration_export(
+                context,
+                resolved.destination,
+                resolved.directory_label,
+                selection.file_name,
+                export,
+            ),
         }
     }
 
-    fn start_save_active_image(&mut self, _context: &egui::Context) -> bool {
+    fn start_save_active_image(&mut self, context: &egui::Context) -> bool {
         let Some(default_name) = self.active_save_default_name() else {
             return false;
         };
         let Some(snapshot) = self.active_image_export_snapshot() else {
             return false;
         };
-        let destination = match self.explorer.active_save_destination() {
-            Ok(destination) => destination,
+        let prefill = match self.explorer.export_dialog_prefill(context) {
+            Ok(prefill) => prefill,
             Err(error) => {
                 if let Some(key) = Self::snapshot_key(&snapshot) {
                     self.notify_save_error(key, error);
@@ -2330,17 +2322,9 @@ impl CameraToolboxApp {
                 return false;
             }
         };
-        let directory_label = self
-            .explorer
-            .active_save_target_label()
-            .unwrap_or_else(|| "Workspace".to_owned());
-        self.pending_named_export = Some(PendingNamedExport::Image {
-            destination,
-            directory_label,
-            snapshot,
-        });
+        self.pending_named_export = Some(PendingNamedExport::Image { snapshot });
         self.export_name_dialog
-            .open("Save image to Workspace", default_name);
+            .open("Save image", default_name, prefill);
         true
     }
 
@@ -2505,27 +2489,19 @@ impl CameraToolboxApp {
     }
 
     #[cfg(feature = "calibration-opencv")]
-    fn begin_calibration_export(&mut self, export: CalibrationExport) {
-        let destination = match self.explorer.active_save_destination() {
-            Ok(destination) => destination,
+    fn begin_calibration_export(&mut self, context: &egui::Context, export: CalibrationExport) {
+        let prefill = match self.explorer.export_dialog_prefill(context) {
+            Ok(prefill) => prefill,
             Err(error) => {
                 self.calibration
                     .report_export_finished(export.label(), "Workspace", Err(&error));
                 return;
             }
         };
-        let directory_label = self
-            .explorer
-            .active_save_target_label()
-            .unwrap_or_else(|| "Workspace".to_owned());
         let suggested_name = export.suggested_name();
-        self.pending_named_export = Some(PendingNamedExport::Calibration {
-            destination,
-            directory_label,
-            export,
-        });
+        self.pending_named_export = Some(PendingNamedExport::Calibration { export });
         self.export_name_dialog
-            .open("Export calibration to Workspace", suggested_name);
+            .open("Export calibration", suggested_name, prefill);
     }
 
     #[cfg(feature = "calibration-opencv")]
