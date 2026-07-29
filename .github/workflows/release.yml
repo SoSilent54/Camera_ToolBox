@@ -18,8 +18,26 @@ env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
 
 jobs:
+  validate-release:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+    steps:
+      - name: Validate release tag
+        id: version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG}"
+          if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Release tag must be a safe semantic version like v0.1.0 or v0.1.0-rc.1: ${version}" >&2
+            exit 1
+          fi
+          echo "release_version=${version}" >> "${GITHUB_OUTPUT}"
+
   build-eeprom-helper-linux-aarch64:
     name: Build static Linux AArch64 EEPROM helper
+    needs: validate-release
     runs-on: ubuntu-22.04-arm
     container:
       image: ubuntu:20.04
@@ -62,8 +80,12 @@ jobs:
 
   build-native:
     name: Build ${{ matrix.environment }}
-    needs: build-eeprom-helper-linux-aarch64
+    needs:
+      - validate-release
+      - build-eeprom-helper-linux-aarch64
     runs-on: ${{ matrix.runner }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
 
     strategy:
       fail-fast: false
@@ -130,6 +152,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           bundle="camera-toolbox-${ENVIRONMENT}"
+          archive="camera-toolbox-${RELEASE_VERSION}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
           install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
@@ -139,7 +162,7 @@ jobs:
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
             "dist/${bundle}/camera-toolbox" --help >/dev/null
-          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
 
       - name: Package Windows release
         if: runner.os == 'Windows'
@@ -148,6 +171,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           $bundle = "camera-toolbox-$env:ENVIRONMENT"
+          $archive = "camera-toolbox-$env:RELEASE_VERSION-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
           Copy-Item "helper-sidecar/camera-toolbox-eeprom-helper" "dist/$bundle/camera-toolbox-eeprom-helper-linux-aarch64"
@@ -157,21 +181,25 @@ jobs:
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
           & "dist/$bundle/camera-toolbox.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged camera-toolbox smoke failed" }
-          Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$bundle.zip" -Force
+          Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$archive.zip" -Force
 
       - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.environment }}
-          path: dist/camera-toolbox-${{ matrix.environment }}.*
+          path: dist/camera-toolbox-${{ env.RELEASE_VERSION }}-${{ matrix.environment }}.*
           if-no-files-found: error
 
   build-linux:
     name: Build ${{ matrix.environment }}
-    needs: build-eeprom-helper-linux-aarch64
+    needs:
+      - validate-release
+      - build-eeprom-helper-linux-aarch64
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:${{ matrix.ubuntu_version }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
 
     strategy:
       fail-fast: false
@@ -241,6 +269,7 @@ jobs:
           ENVIRONMENT: ${{ matrix.environment }}
         run: |
           bundle="camera-toolbox-${ENVIRONMENT}"
+          archive="camera-toolbox-${RELEASE_VERSION}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
           install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
@@ -249,20 +278,23 @@ jobs:
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
-          tar -C dist -czf "dist/${bundle}.tar.gz" "${bundle}"
+          tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
       - name: Upload release archive
         uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.environment }}
-          path: dist/camera-toolbox-${{ matrix.environment }}.tar.gz
+          path: dist/camera-toolbox-${{ env.RELEASE_VERSION }}-${{ matrix.environment }}.tar.gz
           if-no-files-found: error
 
   publish:
     name: Publish GitHub Release
     needs:
+      - validate-release
       - build-native
       - build-linux
     runs-on: ubuntu-22.04
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
     permissions:
       contents: write
 
@@ -275,12 +307,12 @@ jobs:
           merge-multiple: true
       - name: Verify release archives
         run: |
-          test -f "dist/camera-toolbox-macos-aarch64.tar.gz"
-          test -f "dist/camera-toolbox-windows-x86_64.zip"
-          test -f "dist/camera-toolbox-linux-x86_64-ubuntu20.tar.gz"
-          test -f "dist/camera-toolbox-linux-x86_64-ubuntu22.tar.gz"
-          test -f "dist/camera-toolbox-linux-aarch64-ubuntu20.tar.gz"
-          test -f "dist/camera-toolbox-linux-aarch64-ubuntu22.tar.gz"
+          test -f "dist/camera-toolbox-${RELEASE_VERSION}-macos-aarch64.tar.gz"
+          test -f "dist/camera-toolbox-${RELEASE_VERSION}-windows-x86_64.zip"
+          test -f "dist/camera-toolbox-${RELEASE_VERSION}-linux-x86_64-ubuntu20.tar.gz"
+          test -f "dist/camera-toolbox-${RELEASE_VERSION}-linux-x86_64-ubuntu22.tar.gz"
+          test -f "dist/camera-toolbox-${RELEASE_VERSION}-linux-aarch64-ubuntu20.tar.gz"
+          test -f "dist/camera-toolbox-${RELEASE_VERSION}-linux-aarch64-ubuntu22.tar.gz"
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:
