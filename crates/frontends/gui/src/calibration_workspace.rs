@@ -1365,7 +1365,7 @@ impl CalibrationWorkspace {
                                 self.status = format!(
                                     "Automatic capture committed as dataset item {} (candidate gain {}).",
                                     item_id.get(),
-                                    gain
+                                    format_gain(gain)
                                 );
                             }
                             Err(error) => {
@@ -1773,10 +1773,10 @@ impl CalibrationWorkspace {
             ));
             ui.monospace(format!(
                 "Score {} · Gain Field {} Depth {} Pose {}",
-                assessment.constraint_gain,
-                assessment.field_gain,
-                assessment.depth_gain,
-                assessment.pose_gain
+                format_gain(assessment.constraint_gain),
+                format_gain(assessment.field_gain),
+                format_gain(assessment.depth_gain),
+                format_gain(assessment.pose_gain)
             ));
         });
         ui.weak(
@@ -4206,6 +4206,10 @@ fn pnp_state_gap_label(state: &AutoAdmissionPnpState) -> Option<&'static str> {
     }
 }
 
+fn format_gain(value: f64) -> String {
+    format!("{value:.3}")
+}
+
 fn render_acceptance_status_cell(
     ui: &mut egui::Ui,
     status: &CalibrationItemStatus,
@@ -4246,7 +4250,7 @@ fn render_acceptance_status_cell(
             .on_hover_text(
                 "PnP is valid, but this board normal occupies no current Dataset pose bin.",
             );
-    } else if contribution.constraint_gain == 0 {
+    } else if contribution.constraint_gain == 0.0 {
         ui.weak("No Gain Gap").on_hover_text(
             "Valid item with zero target-capped attributed Gain; required coverage is already owned by earlier compatible Dataset rows or above target.",
         );
@@ -4256,9 +4260,9 @@ fn render_acceptance_status_cell(
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum AdmissionDeltaCellState {
-    Contribution(usize),
+    Contribution(f64),
     PnpBlocked,
     Disabled,
     OutsideActiveAdmission,
@@ -4268,7 +4272,7 @@ fn admission_delta_cell_state(
     contribution: Option<&AutoAdmissionItemContribution>,
     enabled: bool,
     metric_blocked: impl FnOnce(&AutoAdmissionItemContribution) -> bool,
-    value: impl FnOnce(&AutoAdmissionItemContribution) -> usize,
+    value: impl FnOnce(&AutoAdmissionItemContribution) -> f64,
 ) -> AdmissionDeltaCellState {
     match contribution {
         Some(contribution) if metric_blocked(contribution) => AdmissionDeltaCellState::PnpBlocked,
@@ -4293,11 +4297,11 @@ fn render_admission_delta_cell(
     enabled: bool,
     metric: &str,
     metric_blocked: impl FnOnce(&AutoAdmissionItemContribution) -> bool,
-    value: impl FnOnce(&AutoAdmissionItemContribution) -> usize,
+    value: impl FnOnce(&AutoAdmissionItemContribution) -> f64,
 ) {
     match admission_delta_cell_state(contribution, enabled, metric_blocked, value) {
         AdmissionDeltaCellState::Contribution(delta) => {
-            ui.monospace(format!("+{delta}")).on_hover_text(format!(
+            ui.monospace(format!("+{}", format_gain(delta))).on_hover_text(format!(
                 "Target-capped {metric} Gain attributed to this item in the current Dataset. +0 means valid but redundant after required coverage is already assigned."
             ));
         }
@@ -4329,10 +4333,10 @@ fn render_total_gain_cell(
 ) {
     match contribution {
         Some(contribution) if contribution.pnp_state.is_blocked() => {
-            let label = if contribution.constraint_gain == 0 {
+            let label = if contribution.constraint_gain == 0.0 {
                 "×0".to_owned()
             } else {
-                format!("+{}*", contribution.constraint_gain)
+                format!("+{}*", format_gain(contribution.constraint_gain))
             };
             ui.colored_label(egui::Color32::LIGHT_RED, label)
                 .on_hover_text(format!(
@@ -4341,7 +4345,7 @@ fn render_total_gain_cell(
                 ));
         }
         Some(contribution) => {
-            ui.monospace(format!("+{}", contribution.constraint_gain)).on_hover_text(
+            ui.monospace(format!("+{}", format_gain(contribution.constraint_gain))).on_hover_text(
                 "Total target-capped row Gain. +0 means the row is valid but redundant under current targets.",
             );
         }
@@ -6087,7 +6091,7 @@ mod tests {
         workspace.acceptance_draft.pose_target_per_bin = "1".to_owned();
         workspace.acceptance_draft.pnp_max_rmse_px = "100".to_owned();
         workspace.acceptance_draft.pnp_max_error_px = "100".to_owned();
-        workspace.acceptance_draft.minimum_auto_gain = "999".to_owned();
+        workspace.acceptance_draft.minimum_auto_gain = "0.75".to_owned();
         workspace.auto_capture_enabled = true;
 
         workspace.observe_live_frame(
@@ -6115,7 +6119,7 @@ mod tests {
             workspace.status
         );
         let assessment = workspace.auto_capture.last_assessment.as_ref().unwrap();
-        assert_eq!(assessment.constraint_gain, 0);
+        assert!(assessment.constraint_gain.abs() < f64::EPSILON);
     }
 
     #[test]

@@ -452,8 +452,8 @@ pub struct AutoCaptureAcceptanceCriteria {
     pub pose_target_per_bin: usize,
     pub pnp_max_rmse_px: f64,
     pub pnp_max_error_px: f64,
-    /// 自动候选单张图的最小总 Gain；低于该值不允许入库。
-    pub minimum_auto_gain: usize,
+    /// 自动候选单张图的最小归一化总 Gain；低于该值不允许入库。
+    pub minimum_auto_gain: f64,
 }
 
 impl AutoCaptureAcceptanceCriteria {
@@ -544,9 +544,12 @@ impl AutoCaptureAcceptanceCriteria {
                 "PnP reprojection gates are invalid".to_owned(),
             ));
         }
-        if self.minimum_auto_gain == 0 {
+        if !self.minimum_auto_gain.is_finite()
+            || self.minimum_auto_gain <= 0.0
+            || self.minimum_auto_gain > 1.0
+        {
             return Err(CalibrationSessionError::InvalidAutoCaptureBaseline(
-                "minimum automatic Gain must be at least 1".to_owned(),
+                "minimum automatic Gain must be finite in (0, 1]".to_owned(),
             ));
         }
         Ok(())
@@ -597,7 +600,7 @@ impl AutoCaptureBaseline {
     }
 
     fn compute_digest(&self) -> SnapshotHash {
-        let mut hash = SnapshotHash::builder("camera-toolbox/runtime-auto-capture-baseline/v3");
+        let mut hash = SnapshotHash::builder("camera-toolbox/runtime-auto-capture-baseline/v4");
         hash.string(AUTO_CAPTURE_DETECTOR_FINGERPRINT);
         hash.bytes(&PANGBOT_CALIBRATION_FLAGS.to_be_bytes());
         hash.string(AUTO_CAPTURE_FEATURE_SCHEMA_VERSION);
@@ -624,7 +627,7 @@ impl AutoCaptureBaseline {
         hash.u64(self.criteria.pose_target_per_bin as u64);
         hash.bytes(&self.criteria.pnp_max_rmse_px.to_bits().to_be_bytes());
         hash.bytes(&self.criteria.pnp_max_error_px.to_bits().to_be_bytes());
-        hash.u64(self.criteria.minimum_auto_gain as u64);
+        hash.bytes(&self.criteria.minimum_auto_gain.to_bits().to_be_bytes());
         hash.finish()
     }
 }
@@ -768,13 +771,13 @@ impl AutoAdmissionPnpState {
 }
 
 /// Dataset 内单项对当前目标封顶覆盖的归属贡献。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AutoAdmissionItemContribution {
     pub item_id: CalibrationItemId,
-    pub field_gain: usize,
-    pub depth_gain: usize,
-    pub pose_gain: usize,
-    pub constraint_gain: usize,
+    pub field_gain: f64,
+    pub depth_gain: f64,
+    pub pose_gain: f64,
+    pub constraint_gain: f64,
     pub pnp_state: AutoAdmissionPnpState,
     pub depth_covered: bool,
     pub pose_covered: bool,
@@ -833,10 +836,10 @@ pub struct AutoAdmissionAssessment {
     pub required_pose_bins: usize,
     pub pose_quota_filled: usize,
     pub required_pose_quota: usize,
-    pub field_gain: usize,
-    pub depth_gain: usize,
-    pub pose_gain: usize,
-    pub constraint_gain: usize,
+    pub field_gain: f64,
+    pub depth_gain: f64,
+    pub pose_gain: f64,
+    pub constraint_gain: f64,
     pub item_contributions: Vec<AutoAdmissionItemContribution>,
     pub depth_ranges: Vec<AutoAdmissionDepthRange>,
     pub item_visualizations: Vec<AutoAdmissionItemVisualization>,
@@ -846,36 +849,41 @@ pub struct AutoAdmissionAssessment {
     pub collection_target_met: bool,
 }
 
-/// 当前 Dataset Score 使用区域 quota 贡献：同一区域达到 quota 前，后续合格角点/视图继续提供 Gain。
+/// 当前 Dataset Score 使用归一化区域 quota 贡献：Field/Depth 按棋盘角点总数归一化，Pose 按单张 view 归一化。
 fn target_capped_item_contributions(
     item_coverage: &[DatasetAdmissionItemCoverage],
     criteria: &AutoCaptureAcceptanceCriteria,
     pose_capacity: usize,
-) -> Vec<AutoAdmissionItemContribution> {
+    board: BoardSpec,
+) -> Result<Vec<AutoAdmissionItemContribution>, CalibrationSessionError> {
+    let corner_count = board.corner_count()? as f64;
     let mut field_counts = vec![0_usize; criteria.field_columns * criteria.field_rows];
     let mut depth_counts = vec![0_usize; criteria.pnp_depth_bins];
     let mut pose_counts = vec![0_usize; pose_capacity];
 
-    item_coverage
+    Ok(item_coverage
         .iter()
         .map(|coverage| {
-            let field_gain = target_capped_region_gain(
+            let raw_field_gain = target_capped_region_gain(
                 &mut field_counts,
                 criteria.field_target_per_cell,
                 coverage.field_corner_counts.iter().copied(),
             );
-            let depth_gain = target_capped_region_gain(
+            let raw_depth_gain = target_capped_region_gain(
                 &mut depth_counts,
                 criteria.depth_target_per_bin,
                 coverage.depth_corner_counts.iter().copied(),
             );
-            let pose_gain = coverage.pose_bin.map_or(0, |pose_bin| {
+            let raw_pose_gain = coverage.pose_bin.map_or(0, |pose_bin| {
                 target_capped_region_gain(
                     &mut pose_counts,
                     criteria.pose_target_per_bin,
                     std::iter::once((pose_bin, 1)),
                 )
             });
+            let field_gain = corner_gain(raw_field_gain, corner_count);
+            let depth_gain = corner_gain(raw_depth_gain, corner_count);
+            let pose_gain = pose_gain(raw_pose_gain);
             AutoAdmissionItemContribution {
                 item_id: coverage.item_id,
                 field_gain,
@@ -887,7 +895,7 @@ fn target_capped_item_contributions(
                 pose_covered: coverage.pose_covered,
             }
         })
-        .collect()
+        .collect())
 }
 
 fn capped_region_score(counts: &[usize], target_per_region: usize) -> usize {
@@ -900,8 +908,20 @@ fn saturating_sum(values: impl IntoIterator<Item = usize>) -> usize {
         .fold(0_usize, |total, value| total.saturating_add(value))
 }
 
-fn constraint_gain(field_gain: usize, depth_gain: usize, pose_gain: usize) -> usize {
-    saturating_sum([field_gain, depth_gain, pose_gain])
+fn corner_gain(raw_gain: usize, corner_count: f64) -> f64 {
+    raw_gain as f64 / corner_count
+}
+
+fn pose_gain(raw_gain: usize) -> f64 {
+    raw_gain as f64
+}
+
+fn sum_gain(values: impl IntoIterator<Item = f64>) -> f64 {
+    values.into_iter().sum()
+}
+
+fn constraint_gain(field_gain: f64, depth_gain: f64, pose_gain: f64) -> f64 {
+    (field_gain + depth_gain + pose_gain) / 3.0
 }
 
 fn capped_region_target(region_count: usize, target_per_region: usize) -> usize {
@@ -1445,18 +1465,18 @@ impl CalibrationSession {
         let required_pose_quota =
             capped_region_target(pose_bin_counts.len(), criteria.pose_target_per_bin);
         let item_contributions =
-            target_capped_item_contributions(&item_coverage, criteria, pose_capacity);
-        let field_gain = saturating_sum(
+            target_capped_item_contributions(&item_coverage, criteria, pose_capacity, self.board)?;
+        let field_gain = sum_gain(
             item_contributions
                 .iter()
                 .map(|contribution| contribution.field_gain),
         );
-        let depth_gain = saturating_sum(
+        let depth_gain = sum_gain(
             item_contributions
                 .iter()
                 .map(|contribution| contribution.depth_gain),
         );
-        let pose_gain = saturating_sum(
+        let pose_gain = sum_gain(
             item_contributions
                 .iter()
                 .map(|contribution| contribution.pose_gain),
@@ -2251,23 +2271,28 @@ impl CalibrationSession {
             });
         }
 
-        let item_contributions =
-            target_capped_item_contributions(&item_coverage, criteria, pose_capacity);
-        let existing_field_gain = saturating_sum(
+        let item_contributions = target_capped_item_contributions(
+            &item_coverage,
+            criteria,
+            pose_capacity,
+            baseline.board,
+        )?;
+        let existing_field_gain = sum_gain(
             item_contributions
                 .iter()
                 .map(|contribution| contribution.field_gain),
         );
-        let existing_depth_gain = saturating_sum(
+        let existing_depth_gain = sum_gain(
             item_contributions
                 .iter()
                 .map(|contribution| contribution.depth_gain),
         );
-        let existing_pose_gain = saturating_sum(
+        let existing_pose_gain = sum_gain(
             item_contributions
                 .iter()
                 .map(|contribution| contribution.pose_gain),
         );
+        let corner_count = baseline.board.corner_count()? as f64;
 
         let (field_gain, depth_gain, pose_gain) = if let Some((candidate, observation)) = candidate
         {
@@ -2287,21 +2312,24 @@ impl CalibrationSession {
             let (candidate_depth, pose_bin) =
                 Self::pnp_coverage_for_admission(observation, baseline, binding)?;
             let candidate_field = Self::field_corner_counts(candidate, criteria);
-            let field_gain = target_capped_region_gain(
+            let raw_field_gain = target_capped_region_gain(
                 &mut field_counts,
                 criteria.field_target_per_cell,
                 candidate_field.iter().copied(),
             );
-            let depth_gain = target_capped_region_gain(
+            let raw_depth_gain = target_capped_region_gain(
                 &mut depth_bin_counts,
                 criteria.depth_target_per_bin,
                 candidate_depth.iter().copied(),
             );
-            let pose_gain = target_capped_region_gain(
+            let raw_pose_gain = target_capped_region_gain(
                 &mut pose_bin_counts,
                 criteria.pose_target_per_bin,
                 std::iter::once((pose_bin, 1)),
             );
+            let field_gain = corner_gain(raw_field_gain, corner_count);
+            let depth_gain = corner_gain(raw_depth_gain, corner_count);
+            let pose_gain = pose_gain(raw_pose_gain);
             (field_gain, depth_gain, pose_gain)
         } else {
             (existing_field_gain, existing_depth_gain, existing_pose_gain)
@@ -2526,6 +2554,18 @@ impl CalibrationSession {
         (a.x - b.x).hypot(a.y - b.y)
     }
 
+    /// 将一帧已检测到的棋盘角点映射到 Field coverage 单元；只返回有角点的单元索引。
+    #[must_use]
+    pub fn detection_field_cells(
+        detection: &ChessboardDetection,
+        criteria: &AutoCaptureAcceptanceCriteria,
+    ) -> Vec<usize> {
+        Self::field_corner_counts(detection, criteria)
+            .into_iter()
+            .map(|(cell, _)| cell)
+            .collect()
+    }
+
     fn field_corner_counts(
         detection: &ChessboardDetection,
         criteria: &AutoCaptureAcceptanceCriteria,
@@ -2581,8 +2621,8 @@ pub enum CalibrationSessionError {
         expected: CalibrationImageSize,
         actual: CalibrationImageSize,
     },
-    #[error("automatic candidate Gain {actual} is below minimum {minimum}")]
-    RejectInsufficientConstraintGain { actual: usize, minimum: usize },
+    #[error("automatic candidate Gain {actual:.3} is below minimum {minimum:.3}")]
+    RejectInsufficientConstraintGain { actual: f64, minimum: f64 },
     #[error("automatic candidate geometry is invalid: {0}")]
     RejectInvalidCandidateGeometry(String),
     #[error("automatic candidate PnP evidence is invalid: {0}")]
@@ -2666,7 +2706,7 @@ mod tests {
             pose_target_per_bin: 1,
             pnp_max_rmse_px: 1.5,
             pnp_max_error_px: 4.0,
-            minimum_auto_gain: 1,
+            minimum_auto_gain: 0.3,
         }
     }
 
@@ -2702,6 +2742,13 @@ mod tests {
             board(),
         )
         .unwrap()
+    }
+
+    fn assert_gain_eq(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() < 1.0e-12,
+            "expected gain {expected}, got {actual}"
+        );
     }
 
     fn configure_test_auto_admission(session: &mut CalibrationSession) {
@@ -3343,14 +3390,14 @@ mod tests {
             panic!("expected field-only contribution");
         };
         assert_eq!(contribution.item_id, local_file);
-        assert_eq!(contribution.depth_gain, 0);
-        assert_eq!(contribution.pose_gain, 0);
+        assert_gain_eq(contribution.depth_gain, 0.0);
+        assert_gain_eq(contribution.pose_gain, 0.0);
         assert_eq!(
             contribution.pnp_state,
             AutoAdmissionPnpState::MissingObservation
         );
-        assert_eq!(contribution.field_gain, 1);
-        assert_eq!(contribution.constraint_gain, 1);
+        assert_gain_eq(contribution.field_gain, 0.25);
+        assert_gain_eq(contribution.constraint_gain, 0.25 / 3.0);
     }
 
     #[test]
@@ -3412,7 +3459,7 @@ mod tests {
         assert_eq!(depth_contribution.pnp_state, AutoAdmissionPnpState::Valid);
         assert!(!depth_contribution.depth_covered);
         assert!(depth_contribution.pose_covered);
-        assert_eq!(depth_contribution.depth_gain, 0);
+        assert_gain_eq(depth_contribution.depth_gain, 0.0);
 
         let mut redundant_session = CalibrationSession::new(board());
         let criteria = test_criteria();
@@ -3432,19 +3479,21 @@ mod tests {
             .item_contributions
             .iter()
             .map(|contribution| contribution.constraint_gain)
-            .sum::<usize>();
-        assert_eq!(redundant_assessment.constraint_gain, total_gain);
-        assert_eq!(
+            .sum::<f64>();
+        assert_gain_eq(redundant_assessment.constraint_gain, total_gain);
+        assert_gain_eq(
             redundant_assessment.constraint_gain,
-            redundant_assessment.field_quota_filled
-                + redundant_assessment.depth_quota_filled
-                + redundant_assessment.pose_quota_filled
+            constraint_gain(
+                redundant_assessment.field_gain,
+                redundant_assessment.depth_gain,
+                redundant_assessment.pose_gain,
+            ),
         );
         assert_eq!(
             redundant_assessment
                 .item_contributions
                 .iter()
-                .filter(|contribution| contribution.constraint_gain == 0)
+                .filter(|contribution| contribution.constraint_gain == 0.0)
                 .count(),
             3
         );
@@ -3456,7 +3505,7 @@ mod tests {
                     contribution.pnp_state == AutoAdmissionPnpState::Valid
                         && contribution.depth_covered
                         && contribution.pose_covered
-                        && contribution.constraint_gain > 0
+                        && contribution.constraint_gain > 0.0
                 })
         );
     }
@@ -3481,9 +3530,9 @@ mod tests {
             panic!("expected two compatible field items");
         };
         assert_eq!(first_contribution.item_id, first);
-        assert_eq!(first_contribution.field_gain, 1);
+        assert_gain_eq(first_contribution.field_gain, 0.25);
         assert_eq!(second_contribution.item_id, second);
-        assert_eq!(second_contribution.field_gain, 0);
+        assert_gain_eq(second_contribution.field_gain, 0.0);
 
         session.set_enabled(second, false).unwrap();
         let assessment = session
@@ -3495,7 +3544,7 @@ mod tests {
             panic!("expected the only enabled compatible item");
         };
         assert_eq!(contribution.item_id, first);
-        assert_eq!(contribution.field_gain, 1);
+        assert_gain_eq(contribution.field_gain, 0.25);
     }
 
     #[test]
@@ -3516,16 +3565,16 @@ mod tests {
             panic!("expected two source-bound items");
         };
         assert_eq!(first_contribution.item_id, first);
-        assert_eq!(first_contribution.field_gain, 1);
-        assert_eq!(first_contribution.depth_gain, 1);
-        assert_eq!(first_contribution.pose_gain, 1);
-        assert_eq!(first_contribution.constraint_gain, 3);
+        assert_gain_eq(first_contribution.field_gain, 0.25);
+        assert_gain_eq(first_contribution.depth_gain, 0.25);
+        assert_gain_eq(first_contribution.pose_gain, 1.0);
+        assert_gain_eq(first_contribution.constraint_gain, 0.5);
         assert_eq!(second_contribution.item_id, second);
-        assert_eq!(second_contribution.field_gain, 0);
-        assert_eq!(second_contribution.depth_gain, 0);
-        assert_eq!(second_contribution.pose_gain, 0);
-        assert_eq!(second_contribution.constraint_gain, 0);
-        assert_eq!(assessment.constraint_gain, 3);
+        assert_gain_eq(second_contribution.field_gain, 0.0);
+        assert_gain_eq(second_contribution.depth_gain, 0.0);
+        assert_gain_eq(second_contribution.pose_gain, 0.0);
+        assert_gain_eq(second_contribution.constraint_gain, 0.0);
+        assert_gain_eq(assessment.constraint_gain, 0.5);
 
         session.set_enabled(second, false).unwrap();
         let assessment = session.assess_auto_admission(None).unwrap();
@@ -3533,10 +3582,10 @@ mod tests {
             panic!("expected the only enabled compatible item");
         };
         assert_eq!(contribution.item_id, first);
-        assert_eq!(contribution.field_gain, 1);
-        assert_eq!(contribution.depth_gain, 1);
-        assert_eq!(contribution.pose_gain, 1);
-        assert_eq!(contribution.constraint_gain, 3);
+        assert_gain_eq(contribution.field_gain, 0.25);
+        assert_gain_eq(contribution.depth_gain, 0.25);
+        assert_gain_eq(contribution.pose_gain, 1.0);
+        assert_gain_eq(contribution.constraint_gain, 0.5);
 
         session.set_enabled(first, false).unwrap();
         assert!(
@@ -3681,7 +3730,7 @@ mod tests {
     fn minimum_auto_gain_rejects_candidate_below_threshold() {
         let mut session = CalibrationSession::new(board());
         let mut criteria = test_criteria();
-        criteria.minimum_auto_gain = 5;
+        criteria.minimum_auto_gain = 0.75;
         let baseline = AutoCaptureBaseline::new(
             test_acquisition_key(0),
             CalibrationImageSize::new(640, 480).unwrap(),
@@ -3704,13 +3753,13 @@ mod tests {
             test_pnp_observation(),
         ));
 
-        assert!(matches!(
-            result,
-            Err(CalibrationSessionError::RejectInsufficientConstraintGain {
-                actual: 3,
-                minimum: 5,
-            })
-        ));
+        match result {
+            Err(CalibrationSessionError::RejectInsufficientConstraintGain { actual, minimum }) => {
+                assert_gain_eq(actual, 0.5);
+                assert_gain_eq(minimum, 0.75);
+            }
+            other => panic!("expected insufficient gain rejection, got {other:?}"),
+        }
         assert!(session.items().is_empty());
     }
 
@@ -3731,7 +3780,7 @@ mod tests {
         assert_ne!(base.digest, field_digest);
 
         let mut criteria = test_criteria();
-        criteria.minimum_auto_gain = 2;
+        criteria.minimum_auto_gain = 0.6;
         let threshold_digest = AutoCaptureBaseline::new(
             test_acquisition_key(0),
             CalibrationImageSize::new(640, 480).unwrap(),
@@ -3816,9 +3865,9 @@ mod tests {
             panic!("expected two depth-compatible items");
         };
         assert_eq!(first_contribution.item_id, first);
-        assert_eq!(first_contribution.depth_gain, 2);
+        assert_gain_eq(first_contribution.depth_gain, 0.5);
         assert_eq!(second_contribution.item_id, second);
-        assert_eq!(second_contribution.depth_gain, 0);
+        assert_gain_eq(second_contribution.depth_gain, 0.0);
         assert!(
             assessment
                 .item_contributions
@@ -3834,11 +3883,15 @@ mod tests {
             panic!("expected one enabled compatible item");
         };
         assert_eq!(assessment.depth_bin_counts.iter().sum::<usize>(), 4);
-        assert_eq!(contribution.depth_gain, 2);
-        assert_eq!(assessment.constraint_gain, contribution.constraint_gain);
-        assert_eq!(
+        assert_gain_eq(contribution.depth_gain, 0.5);
+        assert_gain_eq(assessment.constraint_gain, contribution.constraint_gain);
+        assert_gain_eq(
             assessment.constraint_gain,
-            assessment.field_gain + assessment.depth_gain + assessment.pose_gain
+            constraint_gain(
+                assessment.field_gain,
+                assessment.depth_gain,
+                assessment.pose_gain,
+            ),
         );
     }
 
@@ -3949,10 +4002,10 @@ mod tests {
         let first_assessment = session
             .assess_auto_admission(Some((&found, &first_pnp)))
             .unwrap();
-        assert_eq!(first_assessment.field_gain, 1);
-        assert_eq!(first_assessment.depth_gain, 1);
-        assert_eq!(first_assessment.pose_gain, 1);
-        assert_eq!(first_assessment.constraint_gain, 3);
+        assert_gain_eq(first_assessment.field_gain, 0.25);
+        assert_gain_eq(first_assessment.depth_gain, 0.25);
+        assert_gain_eq(first_assessment.pose_gain, 1.0);
+        assert_gain_eq(first_assessment.constraint_gain, 0.5);
         session
             .commit_auto_candidate(AutoCandidateCommit::new(
                 first_token,
@@ -3967,10 +4020,10 @@ mod tests {
         let second_assessment = session
             .assess_auto_admission(Some((&found, &second_pnp)))
             .unwrap();
-        assert_eq!(second_assessment.field_gain, 0);
-        assert_eq!(second_assessment.depth_gain, 1);
-        assert_eq!(second_assessment.pose_gain, 1);
-        assert_eq!(second_assessment.constraint_gain, 2);
+        assert_gain_eq(second_assessment.field_gain, 0.0);
+        assert_gain_eq(second_assessment.depth_gain, 0.25);
+        assert_gain_eq(second_assessment.pose_gain, 1.0);
+        assert_gain_eq(second_assessment.constraint_gain, 1.25 / 3.0);
         assert_eq!(second_assessment.depth_bins, 2);
         assert_eq!(second_assessment.pose_bins, 2);
         session

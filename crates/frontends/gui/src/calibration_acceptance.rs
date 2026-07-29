@@ -24,7 +24,7 @@ const DEFAULT_PNP_AZIMUTH_SECTORS: &str = "8";
 const DEFAULT_POSE_TARGET_PER_BIN: &str = "1";
 const DEFAULT_PNP_MAX_RMSE_PX: &str = "1.5";
 const DEFAULT_PNP_MAX_ERROR_PX: &str = "4";
-const DEFAULT_MINIMUM_AUTO_GAIN: &str = "1";
+const DEFAULT_MINIMUM_AUTO_GAIN: &str = "0.3";
 const DEPTH_RANGE_PLOT_HEIGHT: f32 = 96.0;
 const DEPTH_BIN_BASE_PLOT_HEIGHT: f32 = 56.0;
 const DEPTH_RANGE_CAP_HALF_HEIGHT: f64 = 0.38;
@@ -138,12 +138,8 @@ impl DatasetAcceptanceDraft {
                 "PnP maximum reprojection error must be at least the RMSE limit.".to_owned(),
             );
         }
-        let minimum_auto_gain = parse_usize(
-            "Minimum automatic Gain",
-            &self.minimum_auto_gain,
-            1,
-            1_000_000,
-        )?;
+        let minimum_auto_gain =
+            parse_normalized_gain("Minimum automatic Gain", &self.minimum_auto_gain)?;
         Ok(AutoCaptureAcceptanceCriteria {
             field_columns,
             field_rows,
@@ -213,6 +209,22 @@ fn parse_non_negative_f64(label: &str, value: &str) -> Result<f64, String> {
     }
 }
 
+fn parse_normalized_gain(label: &str, value: &str) -> Result<f64, String> {
+    let parsed = value
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| format!("{label} must be a number."))?;
+    if parsed.is_finite() && parsed > 0.0 && parsed <= 1.0 {
+        Ok(parsed)
+    } else {
+        Err(format!("{label} must be finite in (0, 1]."))
+    }
+}
+
+fn format_gain(value: f64) -> String {
+    format!("{value:.3}")
+}
+
 fn pose_center_bin_enabled(criteria: &AutoCaptureAcceptanceCriteria) -> bool {
     criteria.pnp_tilt_deadband_deg > 0.0
 }
@@ -259,10 +271,10 @@ pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) pose_quota_filled: usize,
     pub(crate) required_pose_quota: usize,
     pub(crate) collection_target_met: bool,
-    pub(crate) field_gain: usize,
-    pub(crate) depth_gain: usize,
-    pub(crate) pose_gain: usize,
-    pub(crate) score: usize,
+    pub(crate) field_gain: f64,
+    pub(crate) depth_gain: f64,
+    pub(crate) pose_gain: f64,
+    pub(crate) score: f64,
 }
 
 impl DatasetAcceptanceProgress {
@@ -377,13 +389,13 @@ pub(crate) fn render_dataset_acceptance(
                             progress.required_depth_quota,
                             progress.pose_quota_filled,
                             progress.required_pose_quota,
-                            progress.score,
+                            format_gain(progress.score),
                         ));
                         ui.monospace(format!(
                             "Δ Field {} · Depth {} · Pose {}",
-                            progress.field_gain,
-                            progress.depth_gain,
-                            progress.pose_gain,
+                            format_gain(progress.field_gain),
+                            format_gain(progress.depth_gain),
+                            format_gain(progress.pose_gain),
                         ));
                     });
 
@@ -1735,7 +1747,7 @@ mod tests {
     fn acceptance_draft_parses_runtime_pnp_thresholds() {
         let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
         assert_eq!(criteria.field_target_per_cell, 1);
-        assert_eq!(criteria.minimum_auto_gain, 1);
+        assert!((criteria.minimum_auto_gain - 0.3).abs() < f64::EPSILON);
 
         assert_eq!(
             (criteria.pnp_depth_min, criteria.pnp_depth_max),

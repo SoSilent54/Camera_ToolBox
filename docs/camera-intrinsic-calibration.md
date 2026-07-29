@@ -776,8 +776,8 @@ CalibrationDetectionPipeline 权威棋盘检测
          ▼
 重新校验 token、采集键、binding digest、图像尺寸和 admission revision
          │
-         ├─ 无新 field / depth / pose 目标截断增益 ──► 拒绝，不改 Dataset
-         └─ 正覆盖增益 ──► 原子提交 Dataset item、来源无关 PnP 证据与 source-bound PnP 证据
+         ├─ 归一化 field / depth / pose 均值增益低于门限 ──► 拒绝，不改 Dataset
+         └─ 达到门限 ──► 原子提交 Dataset item、来源无关 PnP 证据与 source-bound PnP 证据
 ```
 
 PnP 证据必须具有有限的位姿和重投影指标，棋盘所有角点在相机坐标系中的深度必须严格为正，且 RMSE 与最大重投影误差必须不超过当前阈值。手动快门仍走 §15.1；关闭 Auto Capture 时，显式预览仍只更新 Viewer，不会自动入库。
@@ -798,7 +798,7 @@ PnP 证据必须具有有限的位姿和重投影指标，棋盘所有角点在�
 - field grid：$16\times9$，`Field target / cell`：1，最小相邻角点间距：12 px；
 - PnP depth：400–2400（4 bins，`Depth target / bin`：1）；深度单位是配置的 `BoardSpec::square_size` 单位，GUI 默认棋盘使用 mm；
 - PnP tilt：deadband $5^\circ$、最大 $65^\circ$（3 bins），azimuth：8 sectors，`Pose target / bin`：1；
-- PnP RMSE：最多 1.5 px；最大单点重投影误差：最多 4.0 px；`Minimum auto Gain`：1。
+- PnP RMSE：最多 1.5 px；最大单点重投影误差：最多 4.0 px；`Minimum auto Gain`：0.3。
 
 编辑 Dataset Acceptance 文本框时允许临时不完整输入；焦点仍在文本框内时不会弹出红色错误或替换当前 runtime admission，而是继续使用上一组完整合法门限。字段补全为合法值后立即安装；离开编辑焦点后仍非法才显示错误。
 
@@ -809,16 +809,16 @@ Overlay 与 Input image 预览模式会同时绘制三类图像空间标记：�
 Dataset 表保留原 `Status` 作为读取/检测流水线状态，并新增 `Acceptance` 列单独显示当前验收状态，避免把 `Found` / `NotFound` 与 Dataset 门限混在一起。`Acceptance` 可显示 `Accepted`、`Depth Gap`、`Pose Gap`、`RMSE ReProj Gap`、`Max ReProj Gap`、`No Gain Gap`、`Geometry Gap`、`PnP Gap` 等。PnP 指标列拆成 `Depth`（棋盘中心深度）、`Angle dir`（棋盘法向 azimuth，OpenCV 图像轴，90° 向下）和 `Angle`（棋盘法向 tilt）；hover 可见 RMSE 和最大重投影误差。后续的 `Field Δ`、`Depth Δ`、`Pose Δ`、`Gain` 由当前完整有效 Dataset 的来源无关目标封顶归属计算，而不是记录自动入库瞬间的候选增益，也不是 leave-one-out 删除损失：
 
 $$
-\mathrm{Gain}_i = G^{field}_i + G^{depth}_i + G^{pose}_i
+\mathrm{Gain}_i = \frac{G^{field}_i / N_{corner} + G^{depth}_i / N_{corner} + G^{pose}_i}{3}
 $$
 
 Dataset 表选中状态会同步到 Dataset Acceptance 可视化：Field 网格高亮该图像命中的 cell，Depth timeline 高亮该图像的 min/max depth range，Pose 图高亮该图像命中的 pose bin；在 Depth timeline 中点击某条区间也会反选对应 Dataset 行。
 
-对每个指标，按稳定 Dataset 顺序扫描当前统一图像尺寸、已启用、`Found` 且通过当前几何门限的数据项；Field/Depth/Pose 按区域 quota 归属：每个区域累计 `min(count, target_per_region)`，在达到该区域目标前，新角点或新 view 都继续产生 Gain。Dataset 总 `Score` 等于所有当前行 `Gain` 的和，也等于 $\sum_r \min(C^r_{field},Q_{field}) + \sum_r \min(C^r_{depth},Q_{depth}) + \sum_r \min(C^r_{pose},Q_{pose})$。Field coverage 的单元数来自角点密度：每个网格单元累计其中的棋盘角点数量，计数非零才成为 occupied cell；`Field Δ` 表示归属给该项的目标截断 per-cell 角点 quota。Depth coverage 的 bin 计数来自该项所有棋盘内角点的相机 $Z$ 深度；`Depth Δ` 表示归属给该项的目标截断 per-bin 角点深度 quota。Pose coverage 仍按单张 view 的棋盘法向 tilt/azimuth bin 计数；`Pose Δ` 表示归属给该项的目标截断 per-bin view quota。PnP quality gates 只决定 Depth/Pose 是否有资格贡献，不作为单独分数。禁用、图像尺寸不兼容、非 Found 或几何门限不兼容的项显示为不属于当前 Dataset Acceptance；缺失、过期或未通过当前门限的 PnP 只阻止 Depth/Pose 贡献，仍允许 Field 贡献。
+对每个指标，按稳定 Dataset 顺序扫描当前统一图像尺寸、已启用、`Found` 且通过当前几何门限的数据项；Field/Depth/Pose 按区域 quota 归属：每个区域累计 `min(count, target_per_region)`，在达到该区域目标前，新角点或新 view 都继续产生原始增益。Field coverage 的单元数来自角点密度：每个网格单元累计其中的棋盘角点数量，计数非零才成为 occupied cell；`Field Δ` 表示归属给该项的目标截断 per-cell 角点 quota 除以棋盘内角点总数 $N_{corner}$。Depth coverage 的 bin 计数来自该项所有棋盘内角点的相机 $Z$ 深度；`Depth Δ` 表示归属给该项的目标截断 per-bin 角点深度 quota 除以 $N_{corner}$。Pose coverage 仍按单张 view 的棋盘法向 tilt/azimuth bin 计数；`Pose Δ` 表示归属给该项的目标截断 per-bin view quota。Dataset 总 `Score` 等于所有当前行 `Gain` 的和，也等于三项归一化总增益的均值：$(\sum_i Field\Delta_i + \sum_i Depth\Delta_i + \sum_i Pose\Delta_i) / 3$。PnP quality gates 只决定 Depth/Pose 是否有资格贡献，不作为单独分数。禁用、图像尺寸不兼容、非 Found 或几何门限不兼容的项显示为不属于当前 Dataset Acceptance；缺失、过期或未通过当前门限的 PnP 只阻止 Depth/Pose 贡献，仍允许 Field 贡献。
 
 普通 PNG、本地/远端文件、手动 RTSP 快门和自动 RTSP 入库项在 Dataset Acceptance 中按同一规则统计；自动候选准入仍是另一条 source-bound 规则，继续使用精确 acquisition key、完整图像尺寸、棋盘和 source-bound $K+D12$ digest 过滤，不能被其他来源的 Dataset 项提高候选 gain。自动入库项同时保存来源无关 Dataset PnP 与 source-bound admission PnP，普通 PnP 刷新不会覆盖后者。Viewer 的 Live Stream coverage 同样保留精确 acquisition key 和图像尺寸过滤，但使用与 Dataset Image heatmap 相同的低到高调色板、$3\times3$ 引导线和 low/high 图例。
 
-自动入库的决定量使用同一 source-bound assessment 中尚未满足目标的 field、depth 和 pose quota 的确定性正增益之和。只有单张候选的 `constraint_gain` 达到可配置的 `Minimum auto Gain` 时才会自动入库；低于阈值会被拒绝且不改 Dataset。面板可能显示 collection milestones，但它只表示当前运行时阈值的覆盖状态，不是生产资格。
+自动入库的决定量使用同一 source-bound assessment 中单张候选尚未满足目标的 field、depth 和 pose 归一化增益均值。Field 与 Depth 分别按候选棋盘角点数归一化，Pose 按单张 view 目标截断增益计入；只有单张候选的 `constraint_gain` 达到可配置的 `Minimum auto Gain` 时才会自动入库；低于阈值会被拒绝且不改 Dataset。面板可能显示 collection milestones，但它只表示当前运行时阈值的覆盖状态，不是生产资格。
 
 ### 15.4 将已安装结果回写为初始 $K+D12$
 
