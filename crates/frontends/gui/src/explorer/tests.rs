@@ -605,6 +605,59 @@ fn export_destination_resolves_edited_local_path_independent_of_current_director
 }
 
 #[test]
+fn export_destination_accepts_canonicalizable_local_parent_components() {
+    let current = temp_directory();
+    let target = temp_directory();
+    let nested = target.join("nested");
+    fs::create_dir(&nested).unwrap();
+    let context = egui::Context::default();
+    let mut explorer = explorer_state();
+    explorer
+        .activate_local_path(current.clone(), &context)
+        .unwrap();
+
+    let edited_path = nested.join("..");
+    let resolved = explorer
+        .export_destination_for(
+            crate::export_dialog::ExportPathSource::Local,
+            &edited_path.display().to_string(),
+        )
+        .unwrap();
+    let name = EntryName::new("canonicalized-local-path.bin").unwrap();
+    ExportService
+        .save_new_with(
+            &resolved.destination,
+            &name,
+            &FsControl::with_timeout(Duration::from_secs(5)),
+            &mut |writer| {
+                std::io::Write::write_all(writer, b"canonical-target")
+                    .map_err(|error| camera_toolbox_app::FileSystemError::Io(error.to_string()))
+            },
+        )
+        .unwrap();
+
+    assert_eq!(resolved.directory_label, target.display().to_string());
+    assert!(target.join("canonicalized-local-path.bin").exists());
+    fs::remove_dir_all(current).unwrap();
+    fs::remove_dir_all(target).unwrap();
+}
+
+#[test]
+fn windows_verbatim_prefix_formatter_hides_internal_namespace() {
+    assert_eq!(
+        strip_windows_verbatim_prefix(r"\\?\D:\camera\raw"),
+        r"D:\camera\raw"
+    );
+    assert_eq!(
+        strip_windows_verbatim_prefix(r"\\?\UNC\server\share\raw"),
+        r"\\server\share\raw"
+    );
+    assert_eq!(
+        strip_windows_verbatim_prefix(r"D:\camera\raw"),
+        r"D:\camera\raw"
+    );
+}
+#[test]
 fn local_absolute_path_navigation_is_unrestricted_and_synchronized() {
     let directory = temp_directory();
     let sibling = temp_directory();

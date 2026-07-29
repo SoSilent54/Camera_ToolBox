@@ -578,6 +578,7 @@ fn report_metrics(
     let decoder_stats = decoder.map(FfmpegDecoder::stats).unwrap_or_default();
     control.report(StreamServiceEvent::Metrics(StreamMetrics {
         network_bytes: counters.network_bytes.load(Ordering::Relaxed),
+        network_bytes_available: true,
         rtp_packets: counters.rtp_packets.load(Ordering::Relaxed),
         rtp_gaps: counters.rtp_gaps.load(Ordering::Relaxed),
         preview_dropped: counters.preview_dropped.load(Ordering::Relaxed),

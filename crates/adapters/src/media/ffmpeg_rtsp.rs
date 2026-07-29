@@ -54,6 +54,9 @@ impl FfmpegDecoderBackend {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FfmpegRtspDecoderStatsSnapshot {
     pub decoded_frames: u64,
+    pub io_bytes_available: bool,
+    pub io_bytes: u64,
+    pub media_packet_bytes: u64,
     pub codec_stage_ns: u64,
     pub scale_stage_ns: u64,
     pub copy_stage_ns: u64,
@@ -62,6 +65,9 @@ pub struct FfmpegRtspDecoderStatsSnapshot {
 #[derive(Default)]
 pub struct FfmpegRtspDecoderStats {
     decoded_frames: AtomicU64,
+    io_bytes_available: AtomicBool,
+    io_bytes: AtomicU64,
+    media_packet_bytes: AtomicU64,
     codec_stage_ns: AtomicU64,
     scale_stage_ns: AtomicU64,
     copy_stage_ns: AtomicU64,
@@ -77,10 +83,26 @@ impl FfmpegRtspDecoderStats {
     pub fn snapshot(&self) -> FfmpegRtspDecoderStatsSnapshot {
         FfmpegRtspDecoderStatsSnapshot {
             decoded_frames: self.decoded_frames.load(Ordering::Acquire),
+            io_bytes_available: self.io_bytes_available.load(Ordering::Acquire),
+            io_bytes: self.io_bytes.load(Ordering::Acquire),
+            media_packet_bytes: self.media_packet_bytes.load(Ordering::Acquire),
             codec_stage_ns: self.codec_stage_ns.load(Ordering::Acquire),
             scale_stage_ns: self.scale_stage_ns.load(Ordering::Acquire),
             copy_stage_ns: self.copy_stage_ns.load(Ordering::Acquire),
         }
+    }
+
+    fn record_io_bytes(&self, bytes: Option<u64>) {
+        let Some(bytes) = bytes else {
+            return;
+        };
+        self.io_bytes.store(bytes, Ordering::Release);
+        self.io_bytes_available.store(true, Ordering::Release);
+    }
+
+    fn record_media_packet_bytes(&self, bytes: usize) {
+        self.media_packet_bytes
+            .fetch_add(u64::try_from(bytes).unwrap_or(u64::MAX), Ordering::Relaxed);
     }
 
     fn record_codec_stage(&self, elapsed: Duration) {
@@ -248,6 +270,7 @@ fn decode_rtsp(
         interrupt_state.shutdown_requested.load(Ordering::Acquire)
     })
     .map_err(|error| format!("RTSP open failed: {error}"))?;
+    stats.record_io_bytes(input.io_bytes());
     let (stream_index, time_base, parameters) = {
         let stream = input
             .streams()
@@ -285,7 +308,7 @@ fn decode_rtsp(
         }
         let mut packet = ffmpeg::Packet::empty();
         match packet.read(&mut input) {
-            Ok(()) => {}
+            Ok(()) => stats.record_io_bytes(input.io_bytes()),
             Err(error) => {
                 return packet_read_terminal(
                     error,
@@ -293,6 +316,7 @@ fn decode_rtsp(
                 );
             }
         }
+        stats.record_media_packet_bytes(packet.size());
         if packet.stream() != stream_index {
             continue;
         }
@@ -509,6 +533,26 @@ mod tests {
 
         assert_eq!(threading.kind, ffmpeg::codec::threading::Type::Frame);
         assert_eq!(threading.count, 2);
+    }
+
+    #[test]
+    fn rtsp_decoder_stats_publish_ffmpeg_io_bytes() {
+        let stats = FfmpegRtspDecoderStats::default();
+
+        stats.record_io_bytes(Some(12_345));
+
+        assert_eq!(stats.snapshot().io_bytes, 12_345);
+        assert!(stats.snapshot().io_bytes_available);
+    }
+
+    #[test]
+    fn rtsp_decoder_stats_publish_media_packet_bytes() {
+        let stats = FfmpegRtspDecoderStats::default();
+
+        stats.record_media_packet_bytes(123);
+        stats.record_media_packet_bytes(456);
+
+        assert_eq!(stats.snapshot().media_packet_bytes, 579);
     }
 
     #[test]

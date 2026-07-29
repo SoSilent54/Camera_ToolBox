@@ -105,7 +105,7 @@ fn main() {
     let stats = decoder.stats().snapshot();
     let decoded_frames = stats.decoded_frames;
     println!(
-        "url={} width={} height={} duration_s={:.3} decoded_frames={} decoded_fps={:.3} observed_frames={} observed_fps={:.3} skipped_frames={} backend={} codec_avg_ms={:.3} scale_avg_ms={:.3} copy_avg_ms={:.3}",
+        "url={} width={} height={} duration_s={:.3} decoded_frames={} decoded_fps={:.3} observed_frames={} observed_fps={:.3} skipped_frames={} backend={} ffmpeg_io_available={} ffmpeg_io_bytes={} ffmpeg_io_mib_s={:.3} ffmpeg_media_bytes={} ffmpeg_media_mib_s={:.3} codec_avg_ms={:.3} scale_avg_ms={:.3} copy_avg_ms={:.3}",
         url,
         width,
         height,
@@ -116,6 +116,11 @@ fn main() {
         observed_frames as f64 / elapsed,
         skipped_frames,
         decoder.backend().label(),
+        stats.io_bytes_available,
+        stats.io_bytes,
+        stats.io_bytes as f64 / elapsed / (1024.0 * 1024.0),
+        stats.media_packet_bytes,
+        stats.media_packet_bytes as f64 / elapsed / (1024.0 * 1024.0),
         stats.codec_stage_ns as f64 / decoded_frames.max(1) as f64 / 1_000_000.0,
         stats.scale_stage_ns as f64 / decoded_frames.max(1) as f64 / 1_000_000.0,
         stats.copy_stage_ns as f64 / decoded_frames.max(1) as f64 / 1_000_000.0,

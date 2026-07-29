@@ -23,6 +23,33 @@ where
     callback: *mut F,
 }
 
+impl<F> InterruptedInput<F>
+where
+    F: FnMut() -> bool + 'static,
+{
+    /// 返回当前 `AVIOContext.bytes_read` 口径的累计输入字节。
+    ///
+    /// 调用方应在持有该输入上下文的 FFmpeg worker 线程内采样。返回 `None` 表示
+    /// 当前 demuxer 没有公开的 `AVIOContext`；RTSP demuxer 可能自己管理 socket，
+    /// 因而无法通过该字段得到媒体 I/O 字节。
+    #[must_use]
+    pub fn io_bytes(&self) -> Option<u64> {
+        // SAFETY: 本 crate 是唯一接触 `AVFormatContext` 原始指针的边界；这里只读取
+        // FFmpeg 维护的只读统计字段，不改变输入上下文所有权。
+        unsafe {
+            let context = self.input.as_ptr();
+            if context.is_null() {
+                return None;
+            }
+            let io = (*context).pb;
+            if io.is_null() {
+                return None;
+            }
+            u64::try_from((*io).bytes_read).ok()
+        }
+    }
+}
+
 impl<F> Deref for InterruptedInput<F>
 where
     F: FnMut() -> bool + 'static,
@@ -165,6 +192,10 @@ mod tests {
             },
         )
         .expect("open minimal WAV fixture");
+        assert!(
+            input.io_bytes().is_some_and(|bytes| bytes > 0),
+            "FFmpeg should report fixture read bytes"
+        );
         invoked.store(false, Ordering::Release);
         requested.store(true, Ordering::Release);
         unsafe {

@@ -498,7 +498,16 @@ pub struct StreamMediaInfo {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StreamMetrics {
+    /// 服务口径的累计输入字节；Direct FFmpeg RTSP 可用时来自 AVIOContext bytes_read，不等价于网卡线速。
     pub network_bytes: u64,
+    /// 当前服务是否能提供 `network_bytes` 口径；Direct RTSP 的 RTSP demuxer 可能不公开 AVIOContext。
+    pub network_bytes_available: bool,
+    /// 最近采样窗口内按同一输入字节口径换算的速率。
+    pub network_bytes_per_second: u64,
+    /// Direct FFmpeg RTSP 解复用后的媒体 packet 字节；不是网络 I/O 字节，也不是 RTP 包统计。
+    pub ffmpeg_media_bytes: u64,
+    /// 最近采样窗口内按 `ffmpeg_media_bytes` 口径换算的速率。
+    pub ffmpeg_media_bytes_per_second: u64,
     pub rtp_packets: u64,
     pub rtp_gaps: u64,
     pub preview_dropped: u64,

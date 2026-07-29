@@ -156,6 +156,97 @@ fn test_live_source() -> crate::workspace::LiveStreamSource {
     }
 }
 
+#[cfg(feature = "calibration-opencv")]
+fn test_calibration_item_id() -> camera_toolbox_app::CalibrationItemId {
+    let mut session = camera_toolbox_app::CalibrationSession::new(
+        camera_toolbox_core::BoardSpec::new(2, 2, 1.0).unwrap(),
+    );
+    let outcome = session.add_or_refresh(
+        FileRef::new(
+            FileSourceId::new("live-viewer-presentation-test").unwrap(),
+            SourcePath::new("dataset.png").unwrap(),
+        ),
+        camera_toolbox_app::FileVersion {
+            size: 1,
+            modified_millis: None,
+        },
+        "dataset.png".to_owned(),
+    );
+    let camera_toolbox_app::AddCalibrationItemOutcome::Added(id) = outcome else {
+        panic!("expected added test item");
+    };
+    id
+}
+
+#[cfg(feature = "calibration-opencv")]
+fn test_decoded_frame(
+    session_id: &camera_toolbox_app::StreamSessionId,
+    sequence: u64,
+    value: u8,
+) -> camera_toolbox_app::DecodedVideoFrame {
+    camera_toolbox_app::DecodedVideoFrame {
+        width: 1,
+        height: 1,
+        rgba: Arc::from(vec![value, value, value, 255]),
+        identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+            session_id.clone(),
+            0,
+            sequence,
+            "test frame has no source PTS",
+        ),
+    }
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn live_viewer_texture_stays_live_when_dataset_overlay_exists() {
+    let context = egui::Context::default();
+    let session_id = camera_toolbox_app::StreamSessionId::new("viewer-texture-test").unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    latest.publish(test_decoded_frame(&session_id, 1, 17));
+    let mut document = crate::workspace::LiveDocument::new(
+        crate::workspace::DocumentId::from_raw(42),
+        session_id.clone(),
+        Arc::clone(&latest),
+        test_live_source(),
+    );
+    document.install_latest_texture(&context);
+    let live_texture_id = document.texture().unwrap().id();
+    let presentation = crate::calibration_workspace::CalibrationViewerPresentation {
+        item_id: test_calibration_item_id(),
+        overlay: crate::calibration_workspace::CalibrationViewerOverlay::default(),
+    };
+
+    assert_eq!(
+        CameraToolboxApp::live_viewer_render_texture(&document, Some(&presentation))
+            .unwrap()
+            .id(),
+        live_texture_id
+    );
+
+    latest.publish(test_decoded_frame(&session_id, 2, 34));
+    document.install_latest_texture(&context);
+    assert_eq!(
+        document.displayed_frame().unwrap().identity.frame_sequence,
+        2
+    );
+    assert_eq!(
+        CameraToolboxApp::live_viewer_render_texture(&document, Some(&presentation))
+            .unwrap()
+            .id(),
+        live_texture_id
+    );
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn live_viewer_dataset_overlay_style_is_yellow() {
+    assert_eq!(
+        super::LIVE_VIEWER_DATASET_OVERLAY_COLOR,
+        egui::Color32::from_rgb(255, 190, 64)
+    );
+}
+
 #[test]
 fn workspace_source_modes_render_rtsp_controls_exclusively() {
     let context = egui::Context::default();
@@ -185,6 +276,118 @@ fn workspace_source_modes_render_rtsp_controls_exclusively() {
     assert!(rtsp.contains("Connect RTSP"));
     assert!(rtsp.contains("Prefer hardware acceleration"));
     assert!(!rtsp.contains("Name"));
+}
+
+#[test]
+fn direct_rtsp_defaults_to_tcp_stable_baseline() {
+    let context = egui::Context::default();
+    let app = CameraToolboxApp::new(&context).unwrap();
+
+    assert_eq!(
+        app.direct_rtsp.transport,
+        camera_toolbox_app::RtspTransport::Tcp
+    );
+    assert_eq!(
+        app.direct_rtsp.latency_mode,
+        camera_toolbox_app::RtspLatencyMode::Stable
+    );
+}
+
+#[test]
+fn rtsp_metrics_show_ffmpeg_io_without_rtp_counters() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    app.workspace.open_live(
+        camera_toolbox_app::StreamSessionId::new("rtsp-io-metrics-test").unwrap(),
+        latest,
+        test_live_source(),
+    );
+    app.workspace
+        .active_live_mut()
+        .expect("live document is active")
+        .metrics = camera_toolbox_app::StreamMetrics {
+        network_bytes: 123_456,
+        network_bytes_available: true,
+        network_bytes_per_second: 1_048_576,
+        ffmpeg_media_bytes: 65_536,
+        ffmpeg_media_bytes_per_second: 524_288,
+        rtp_packets: 999,
+        rtp_gaps: 888,
+        preview_dropped: 7,
+        decoder_resyncs: 2,
+        ..Default::default()
+    };
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        egui::vec2(1568.0, 882.0),
+        Vec::new(),
+    );
+    let visible = accessibility_text(&output);
+
+    assert!(visible.contains("FFmpeg I/O 123456 B"));
+    assert!(visible.contains("FFmpeg I/O rate 1.00 MiB/s"));
+    assert!(visible.contains("FFmpeg media 65536 B"));
+    assert!(visible.contains("FFmpeg media rate 0.50 MiB/s"));
+    assert!(visible.contains("media 65536 B · preview dropped 7 · resync 2"));
+    assert!(!visible.contains("RTP gaps"));
+    assert!(!visible.contains("RTP 999"));
+    assert!(!visible.contains("Gaps 888"));
+}
+
+#[test]
+fn cv610_metrics_keep_rtp_counters_visible() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    app.workspace.open_live(
+        camera_toolbox_app::StreamSessionId::new("cv610-rtp-metrics-test").unwrap(),
+        latest,
+        crate::workspace::LiveStreamSource::Cv610 {
+            profile_id: camera_toolbox_app::PlatformProfileId::new("cv610-test").unwrap(),
+            profile_label: "CV610".to_owned(),
+            channel: 0,
+            source_fingerprint: "cv610-source".to_owned(),
+            geometry_key: "cv610-geometry".to_owned(),
+        },
+    );
+    app.workspace
+        .active_live_mut()
+        .expect("live document is active")
+        .metrics = camera_toolbox_app::StreamMetrics {
+        network_bytes: 65_536,
+        network_bytes_available: true,
+        rtp_packets: 99,
+        rtp_gaps: 3,
+        preview_dropped: 2,
+        decoder_resyncs: 1,
+        ..Default::default()
+    };
+
+    let mut frame = eframe::Frame::_new_kittest();
+    let output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        egui::vec2(1568.0, 882.0),
+        Vec::new(),
+    );
+    let visible = accessibility_text(&output);
+
+    assert!(visible.contains("Network 65536 B"));
+    assert!(visible.contains("RTP 99"));
+    assert!(visible.contains("Gaps 3"));
+    assert!(visible.contains("RTP 99 · gaps 3 · preview dropped 2 · resync 1"));
 }
 
 fn loaded_raw(context: &egui::Context, name: &str, generation: u64) -> LoadedRaw {
@@ -1460,6 +1663,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     assert!(!visible.contains("Capture → Calibration dataset"));
     assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
     assert!(!visible.contains("Preview and constraints"));
+    assert!(!visible.contains("Dataset coverage"));
     assert!(visible.contains("Live Stream"));
     assert!(visible.contains("Dataset Image"));
     assert!(visible.contains("Calibration result"));

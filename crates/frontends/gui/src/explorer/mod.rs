@@ -121,7 +121,7 @@ impl SourceView {
     fn try_local(path: PathBuf) -> Result<Self, String> {
         let path = std::fs::canonicalize(path).map_err(|error| error.to_string())?;
         if !path.is_dir() {
-            return Err(format!("{} is not a directory", path.display()));
+            return Err(format!("{} is not a directory", local_display_path(&path)));
         }
         let namespace_root = local_namespace_root(&path)?;
         let source_id = local_source_id_for_root(&namespace_root)?;
@@ -134,7 +134,7 @@ impl SourceView {
             source_path_from_native(path.strip_prefix(&root).map_err(|_| {
                 format!(
                     "Path is outside its filesystem namespace: {}",
-                    path.display()
+                    local_display_path(&path)
                 )
             })?)?;
         Ok(Self {
@@ -142,7 +142,7 @@ impl SourceView {
                 source_id,
                 root: root.clone(),
             },
-            display_base: root.display().to_string(),
+            display_base: local_display_path(&root),
             file_system,
             current_directory,
             selection: BrowserSelection::default(),
@@ -226,13 +226,17 @@ impl SourceView {
     }
 
     fn display_path(&self, path: &SourcePath) -> PathBuf {
-        if path.is_root() {
-            return PathBuf::from(&self.display_base);
-        }
-        if self.display_base.ends_with('/') {
-            PathBuf::from(format!("{}{}", self.display_base, path.as_str()))
-        } else {
-            PathBuf::from(format!("{}/{}", self.display_base, path.as_str()))
+        match &self.config {
+            MountedSourceConfig::Local { .. } => {
+                PathBuf::from(navigation_path_for(&self.config, path))
+            }
+            MountedSourceConfig::Sftp { .. } if path.is_root() => PathBuf::from(&self.display_base),
+            MountedSourceConfig::Sftp { .. } if self.display_base.ends_with('/') => {
+                PathBuf::from(format!("{}{}", self.display_base, path.as_str()))
+            }
+            MountedSourceConfig::Sftp { .. } => {
+                PathBuf::from(format!("{}/{}", self.display_base, path.as_str()))
+            }
         }
     }
 
@@ -244,24 +248,50 @@ impl SourceView {
         let MountedSourceConfig::Local { root, .. } = &self.config else {
             return None;
         };
-        Some(if self.current_directory.is_root() {
-            root.clone()
-        } else {
-            root.join(self.current_directory.as_str())
-        })
+        Some(local_native_path_from_source(root, &self.current_directory))
     }
 }
 
 fn navigation_path_for(config: &MountedSourceConfig, path: &SourcePath) -> String {
     match config {
         MountedSourceConfig::Local { root, .. } => {
-            if path.is_root() {
-                root.display().to_string()
-            } else {
-                root.join(path.as_str()).display().to_string()
-            }
+            let native = local_native_path_from_source(root, path);
+            local_display_path(&native)
         }
         MountedSourceConfig::Sftp { remote_root, .. } => join_remote_path(remote_root, path),
+    }
+}
+
+fn local_native_path_from_source(root: &Path, path: &SourcePath) -> PathBuf {
+    let mut output = root.to_path_buf();
+    for component in path
+        .as_str()
+        .split('/')
+        .filter(|component| !component.is_empty())
+    {
+        output.push(component);
+    }
+    output
+}
+
+#[cfg(windows)]
+fn local_display_path(path: &Path) -> String {
+    strip_windows_verbatim_prefix(&path.display().to_string())
+}
+
+#[cfg(not(windows))]
+fn local_display_path(path: &Path) -> String {
+    path.display().to_string()
+}
+
+#[cfg(any(windows, test))]
+fn strip_windows_verbatim_prefix(value: &str) -> String {
+    if let Some(rest) = value.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{rest}")
+    } else if let Some(rest) = value.strip_prefix(r"\\?\") {
+        rest.to_owned()
+    } else {
+        value.to_owned()
     }
 }
 
@@ -300,9 +330,7 @@ fn local_path_from_native(value: &str) -> Result<PathBuf, String> {
                     return Err("Path contains control characters".to_owned());
                 }
             }
-            std::path::Component::ParentDir => {
-                return Err("Local Path must not contain parent traversal".to_owned());
-            }
+            std::path::Component::ParentDir => {}
             std::path::Component::CurDir
             | std::path::Component::RootDir
             | std::path::Component::Prefix(_) => {}
@@ -333,7 +361,7 @@ fn source_path_from_native(path: &Path) -> Result<SourcePath, String> {
             std::path::Component::ParentDir
             | std::path::Component::RootDir
             | std::path::Component::Prefix(_) => {
-                return Err("Path must stay within the active workspace root".to_owned());
+                return Err("Resolved local path is not source-relative".to_owned());
             }
         }
     }
@@ -1075,25 +1103,38 @@ impl ExplorerState {
         if !canonical.is_dir() {
             return Err(format!(
                 "Local export path is not a directory: {}",
-                canonical.display()
+                local_display_path(&canonical)
             ));
         }
-        let MountedSourceConfig::Local { root, .. } = &view.config else {
-            return Err("Local export source is misconfigured.".to_owned());
+
+        // 本地显式导出按目标目录重新映射 namespace root，不要求落在当前浏览目录所在卷。
+        let namespace_root = local_namespace_root(&canonical)?;
+        let source_id = local_source_id_for_root(&namespace_root)?;
+        let (file_system, root): (Arc<dyn FileSystem>, PathBuf) = if view.source_id() == &source_id
+        {
+            let MountedSourceConfig::Local { root, .. } = &view.config else {
+                return Err("Local export source is misconfigured.".to_owned());
+            };
+            (Arc::clone(&view.file_system), root.clone())
+        } else {
+            let file_system = LocalFileSystem::new(source_id.clone(), &namespace_root)
+                .map_err(|error| error.to_string())?;
+            let root = file_system.root().to_path_buf();
+            (Arc::new(file_system), root)
         };
-        let relative = canonical.strip_prefix(root).map_err(|_| {
+        let relative = canonical.strip_prefix(&root).map_err(|_| {
             format!(
-                "Local export path is outside mounted namespace: {}",
-                root.display()
+                "Local export path is outside filesystem namespace: {}",
+                local_display_path(&root)
             )
         })?;
         let source_path = source_path_from_native(relative)?;
-        let directory = DirectoryRef::new(view.source_id().clone(), source_path.clone());
-        let destination = ExportDestination::new(directory, Arc::clone(&view.file_system))
-            .map_err(|error| error.to_string())?;
+        let directory = DirectoryRef::new(source_id, source_path);
+        let destination =
+            ExportDestination::new(directory, file_system).map_err(|error| error.to_string())?;
         Ok(ResolvedExportDestination {
             destination,
-            directory_label: view.display_path(&source_path).display().to_string(),
+            directory_label: local_display_path(&canonical),
         })
     }
 

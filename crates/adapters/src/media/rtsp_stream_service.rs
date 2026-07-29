@@ -142,6 +142,19 @@ fn monitor_rtsp_decoder(
                 .unwrap_or(u64::MAX)
             };
             control.report(StreamServiceEvent::Metrics(StreamMetrics {
+                network_bytes: stats.io_bytes,
+                network_bytes_available: stats.io_bytes_available,
+                network_bytes_per_second: average_rate_per_second(
+                    stats.io_bytes,
+                    last_metric.io_bytes,
+                    elapsed_ns,
+                ),
+                ffmpeg_media_bytes: stats.media_packet_bytes,
+                ffmpeg_media_bytes_per_second: average_rate_per_second(
+                    stats.media_packet_bytes,
+                    last_metric.media_packet_bytes,
+                    elapsed_ns,
+                ),
                 decoded_frames,
                 decoded_fps_millihz,
                 decoder_codec_stage_ns: average_stage_ns(
@@ -203,6 +216,17 @@ fn monitor_rtsp_decoder(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+fn average_rate_per_second(current: u64, previous: u64, elapsed_ns: u64) -> u64 {
+    if elapsed_ns == 0 {
+        return 0;
+    }
+    u64::try_from(
+        u128::from(current.saturating_sub(previous)).saturating_mul(1_000_000_000)
+            / u128::from(elapsed_ns),
+    )
+    .unwrap_or(u64::MAX)
+}
+
 fn average_stage_ns(current: u64, previous: u64, frames: u64) -> u64 {
     if frames == 0 {
         return 0;
@@ -221,5 +245,20 @@ fn decoder_error(error: FfmpegRtspDecoderError) -> StreamServiceError {
         }
         FfmpegRtspDecoderError::Initialization(reason)
         | FfmpegRtspDecoderError::WorkerStart(reason) => StreamServiceError::WorkerStart(reason),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn average_rate_per_second_uses_metric_delta() {
+        assert_eq!(average_rate_per_second(3_000, 1_000, 500_000_000), 4_000);
+    }
+
+    #[test]
+    fn average_rate_per_second_handles_zero_elapsed() {
+        assert_eq!(average_rate_per_second(3_000, 1_000, 0), 0);
     }
 }

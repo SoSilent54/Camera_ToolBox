@@ -31,6 +31,7 @@ const DEPTH_RANGE_CAP_HALF_HEIGHT: f64 = 0.38;
 const DEPTH_BIN_BASE_Y: f64 = 0.35;
 const DEPTH_BIN_LABEL_Y: f64 = -0.35;
 
+const LIVE_MARKER_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 64);
 /// 文本编辑状态必须保留中间输入；只有完整合法值才会被工作区自动安装。
 #[derive(Clone, Debug)]
 pub(crate) struct DatasetAcceptanceDraft {
@@ -251,6 +252,9 @@ fn pose_bin_capacity(criteria: &AutoCaptureAcceptanceCriteria) -> usize {
 pub(crate) struct DatasetAcceptanceProgress {
     pub(crate) active_criteria: Option<AutoCaptureAcceptanceCriteria>,
     pub(crate) selected_item: Option<CalibrationItemId>,
+    pub(crate) live_depth_range: Option<(f64, f64)>,
+    pub(crate) live_pose_angles: Option<(f64, f64)>,
+    pub(crate) live_field_cells: Vec<usize>,
     pub(crate) occupied_field_cells: usize,
     pub(crate) required_field_cells: usize,
     pub(crate) field_quota_filled: usize,
@@ -282,6 +286,9 @@ impl DatasetAcceptanceProgress {
         Self {
             active_criteria: assessment.active_criteria.clone(),
             selected_item: None,
+            live_depth_range: None,
+            live_pose_angles: None,
+            live_field_cells: Vec::new(),
             occupied_field_cells: assessment.field_cells,
             required_field_cells: assessment.required_field_cells,
             field_quota_filled: assessment.field_quota_filled,
@@ -357,6 +364,7 @@ pub(crate) struct DatasetAcceptanceRender {
     pub(crate) foldout_id: egui::Id,
     pub(crate) scroll_metrics: Option<DatasetAcceptanceScrollMetrics>,
     pub(crate) selected_item: Option<CalibrationItemId>,
+    pub(crate) expanded: bool,
 }
 
 pub(crate) fn render_dataset_acceptance(
@@ -372,6 +380,7 @@ pub(crate) fn render_dataset_acceptance(
     let mut selected_depth_item = None;
     let foldout = egui::CollapsingHeader::new("Dataset acceptance")
         .id_salt("calibration_dataset_acceptance")
+        .default_open(true)
         .show(ui, |ui| {
             let scroll_output = egui::ScrollArea::vertical()
                 .id_salt("calibration_dataset_acceptance_scroll")
@@ -589,6 +598,7 @@ pub(crate) fn render_dataset_acceptance(
         foldout_id: foldout.header_response.id,
         scroll_metrics,
         selected_item: selected_depth_item,
+        expanded: !foldout.fully_closed(),
     }
 }
 
@@ -702,12 +712,58 @@ fn selected_field_cell(progress: &DatasetAcceptanceProgress, cell: usize) -> boo
     selected_item_visualization(progress).is_some_and(|item| item.field_cells.contains(&cell))
 }
 
+fn live_field_cell(progress: &DatasetAcceptanceProgress, cell: usize) -> bool {
+    progress.live_field_cells.contains(&cell)
+}
+
 fn selected_pose_bin(progress: &DatasetAcceptanceProgress) -> Option<usize> {
     selected_item_visualization(progress).and_then(|item| item.pose_bin)
 }
 
+fn live_pose_bin(
+    progress: &DatasetAcceptanceProgress,
+    criteria: &AutoCaptureAcceptanceCriteria,
+) -> Option<usize> {
+    let (tilt, azimuth) = progress.live_pose_angles?;
+    pose_bin_for_angles(criteria, tilt, azimuth)
+}
+
+fn pose_bin_for_angles(
+    criteria: &AutoCaptureAcceptanceCriteria,
+    tilt: f64,
+    azimuth: f64,
+) -> Option<usize> {
+    if !tilt.is_finite() || !azimuth.is_finite() || tilt < 0.0 || tilt > criteria.pnp_tilt_max_deg {
+        return None;
+    }
+    if pose_center_bin_enabled(criteria) && tilt < criteria.pnp_tilt_deadband_deg {
+        return Some(0);
+    }
+    let offset = usize::from(pose_center_bin_enabled(criteria));
+    let effective_min_tilt = if pose_center_bin_enabled(criteria) {
+        criteria.pnp_tilt_deadband_deg
+    } else {
+        0.0
+    };
+    let normalized_tilt =
+        (tilt - effective_min_tilt) / (criteria.pnp_tilt_max_deg - effective_min_tilt);
+    if !normalized_tilt.is_finite() || normalized_tilt < 0.0 {
+        return None;
+    }
+    let tilt_bin = ((normalized_tilt * criteria.pnp_tilt_bins as f64) as usize)
+        .min(criteria.pnp_tilt_bins - 1);
+    let sector = ((azimuth.rem_euclid(360.0) / 360.0 * criteria.pnp_azimuth_sectors as f64)
+        as usize)
+        .min(criteria.pnp_azimuth_sectors - 1);
+    Some(offset + tilt_bin * criteria.pnp_azimuth_sectors + sector)
+}
+
 fn selected_highlight_stroke() -> egui::Stroke {
     egui::Stroke::new(2.0, egui::Color32::from_rgb(80, 170, 255))
+}
+
+fn live_marker_stroke() -> egui::Stroke {
+    egui::Stroke::new(2.4, LIVE_MARKER_COLOR)
 }
 
 fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
@@ -748,6 +804,14 @@ fn render_field_grid(ui: &mut egui::Ui, progress: &DatasetAcceptanceProgress) {
                     cell_rect.expand(0.5),
                     2.0,
                     selected_highlight_stroke(),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if live_field_cell(progress, cell) {
+                painter.rect_stroke(
+                    cell_rect.expand(1.0),
+                    2.0,
+                    live_marker_stroke(),
                     egui::StrokeKind::Inside,
                 );
             }
@@ -803,6 +867,12 @@ fn depth_timeline_axis(
         if range.minimum_depth.is_finite() && range.maximum_depth.is_finite() {
             minimum = minimum.min(range.minimum_depth.min(range.maximum_depth));
             maximum = maximum.max(range.minimum_depth.max(range.maximum_depth));
+        }
+    }
+    if let Some((minimum_depth, maximum_depth)) = progress.live_depth_range {
+        if minimum_depth.is_finite() && maximum_depth.is_finite() {
+            minimum = minimum.min(minimum_depth.min(maximum_depth));
+            maximum = maximum.max(minimum_depth.max(maximum_depth));
         }
     }
     if !minimum.is_finite() || !maximum.is_finite() || minimum >= maximum {
@@ -896,7 +966,11 @@ struct DepthTimelineYBounds {
 fn depth_timeline_y_bounds(progress: &DatasetAcceptanceProgress) -> DepthTimelineYBounds {
     let rows = progress.depth_ranges.len().max(1) as f64;
     DepthTimelineYBounds {
-        min: -0.5,
+        min: if progress.live_depth_range.is_some() {
+            -1.0
+        } else {
+            -0.5
+        },
         max: rows - 0.5,
     }
 }
@@ -1006,6 +1080,9 @@ fn render_depth_range_items(
             draw_depth_range(plot_ui, range, row, true);
         }
     }
+    if let Some((minimum_depth, maximum_depth)) = progress.live_depth_range {
+        draw_live_depth_range(plot_ui, minimum_depth, maximum_depth);
+    }
     if plot_ui.response().clicked() {
         plot_ui
             .pointer_coordinate()
@@ -1058,6 +1135,41 @@ fn draw_depth_range(
             )))
             .color(color)
             .width(width),
+        );
+    }
+}
+
+fn draw_live_depth_range(plot_ui: &mut PlotUi<'_>, minimum_depth: f64, maximum_depth: f64) {
+    if !minimum_depth.is_finite() || !maximum_depth.is_finite() {
+        return;
+    }
+    let (minimum, maximum) = ordered_depth_range(minimum_depth, maximum_depth);
+    let y = -0.75;
+    let tooltip = format!(
+        "Live detection depth span\nDepth span: {minimum:.3} .. {maximum:.3}\nWidth: {:.3}",
+        maximum - minimum,
+    );
+    plot_ui.line(
+        Line::new(
+            tooltip.clone(),
+            PlotPoints::from(vec![[minimum, y], [maximum, y]]),
+        )
+        .id(egui::Id::new("dataset_live_depth_range_body"))
+        .color(LIVE_MARKER_COLOR)
+        .width(2.8),
+    );
+    for (side, x) in [("min", minimum), ("max", maximum)] {
+        plot_ui.line(
+            Line::new(
+                tooltip.clone(),
+                PlotPoints::from(vec![
+                    [x, y - DEPTH_RANGE_CAP_HALF_HEIGHT],
+                    [x, y + DEPTH_RANGE_CAP_HALF_HEIGHT],
+                ]),
+            )
+            .id(egui::Id::new(("dataset_live_depth_range_cap", side)))
+            .color(LIVE_MARKER_COLOR)
+            .width(2.8),
         );
     }
 }
@@ -1365,14 +1477,38 @@ fn render_pose_polar_map(
             coverage_text_color(center_count, target),
         );
     }
-    if let Some(position) = response.hover_pos()
+    let mut hover_text = None;
+    if let Some((position, label)) =
+        live_pose_marker(progress, center, center_radius, outer_radius, criteria)
+    {
+        painter.circle_filled(position, 5.0, LIVE_MARKER_COLOR);
+        painter.circle_stroke(position, 6.0, egui::Stroke::new(1.0, egui::Color32::BLACK));
+        painter.text(
+            position + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            label.as_str(),
+            egui::FontId::proportional(9.0),
+            LIVE_MARKER_COLOR,
+        );
+        if response
+            .hover_pos()
+            .is_some_and(|hover| (hover - position).length() <= 8.0)
+        {
+            hover_text = Some(label);
+        }
+    }
+    if hover_text.is_none()
+        && let Some(position) = response.hover_pos()
         && let Some(index) = pose_bin_at(position, center, center_radius, outer_radius, criteria)
     {
         let count = progress.pose_bin_counts.get(index).copied().unwrap_or(0);
-        response.on_hover_text(format!(
+        hover_text = Some(format!(
             "{}: {count} compatible PnP observations.",
             pose_bin_label(criteria, index)
         ));
+    }
+    if let Some(text) = hover_text {
+        response.on_hover_text(text);
     }
     ui.weak(format!(
         "Each sector shows its count; red 0 → green {target}+ views per pose bin."
@@ -1494,6 +1630,85 @@ fn pose_bin_at(
     )
 }
 
+fn live_pose_marker(
+    progress: &DatasetAcceptanceProgress,
+    center: egui::Pos2,
+    center_radius: f32,
+    outer_radius: f32,
+    criteria: &AutoCaptureAcceptanceCriteria,
+) -> Option<(egui::Pos2, String)> {
+    let (tilt, azimuth) = progress.live_pose_angles?;
+    let position = pose_marker_position_for_angles(
+        tilt,
+        azimuth,
+        center,
+        center_radius,
+        outer_radius,
+        criteria,
+    )?;
+    Some((position, live_pose_label(criteria, tilt, azimuth)))
+}
+
+fn live_pose_summary(
+    progress: &DatasetAcceptanceProgress,
+    criteria: &AutoCaptureAcceptanceCriteria,
+) -> Option<String> {
+    let (tilt, azimuth) = progress.live_pose_angles?;
+    pose_bin_for_angles(criteria, tilt, azimuth)?;
+    Some(live_pose_label(criteria, tilt, azimuth))
+}
+
+fn live_pose_label(criteria: &AutoCaptureAcceptanceCriteria, tilt: f64, azimuth: f64) -> String {
+    match pose_bin_for_angles(criteria, tilt, azimuth) {
+        Some(index) => format!(
+            "Live pose: tilt {:.1}° · azimuth {:.1}° · bin #{index}",
+            tilt,
+            azimuth.rem_euclid(360.0),
+        ),
+        None => format!(
+            "Live pose: tilt {:.1}° · azimuth {:.1}°",
+            tilt,
+            azimuth.rem_euclid(360.0),
+        ),
+    }
+}
+
+fn pose_marker_position_for_angles(
+    tilt: f64,
+    azimuth: f64,
+    center: egui::Pos2,
+    center_radius: f32,
+    outer_radius: f32,
+    criteria: &AutoCaptureAcceptanceCriteria,
+) -> Option<egui::Pos2> {
+    if !tilt.is_finite() || !azimuth.is_finite() || tilt < 0.0 || tilt > criteria.pnp_tilt_max_deg {
+        return None;
+    }
+    let radius = if pose_center_bin_enabled(criteria) {
+        if tilt < criteria.pnp_tilt_deadband_deg {
+            center_radius * (tilt / criteria.pnp_tilt_deadband_deg).clamp(0.0, 1.0) as f32
+        } else {
+            let span = criteria.pnp_tilt_max_deg - criteria.pnp_tilt_deadband_deg;
+            if span <= f64::EPSILON {
+                return None;
+            }
+            center_radius
+                + (outer_radius - center_radius)
+                    * ((tilt - criteria.pnp_tilt_deadband_deg) / span).clamp(0.0, 1.0) as f32
+        }
+    } else {
+        if criteria.pnp_tilt_max_deg <= f64::EPSILON {
+            return None;
+        }
+        outer_radius * (tilt / criteria.pnp_tilt_max_deg).clamp(0.0, 1.0) as f32
+    };
+    Some(polar_point(
+        center,
+        radius,
+        azimuth.rem_euclid(360.0).to_radians() as f32,
+    ))
+}
+
 fn render_pose_grid(
     ui: &mut egui::Ui,
     progress: &DatasetAcceptanceProgress,
@@ -1502,6 +1717,11 @@ fn render_pose_grid(
     ui.weak(
         "Using a labeled grid because this pose configuration has more than 32 annular sectors.",
     );
+    let live_bin = live_pose_bin(progress, criteria);
+    let live_summary = live_pose_summary(progress, criteria);
+    if let Some(summary) = live_summary.as_deref() {
+        ui.weak(summary);
+    }
     let region_count = pose_bin_capacity(criteria);
     let target = criteria.pose_target_per_bin;
     egui::Grid::new("dataset_acceptance_pose_grid")
@@ -1510,20 +1730,45 @@ fn render_pose_grid(
         .show(ui, |ui| {
             for index in 0..region_count {
                 let count = progress.pose_bin_counts.get(index).copied().unwrap_or(0);
-                let stroke = if selected_pose_bin(progress) == Some(index) {
+                let live = live_bin == Some(index);
+                let stroke = if live {
+                    egui::Stroke::new(2.0, LIVE_MARKER_COLOR)
+                } else if selected_pose_bin(progress) == Some(index) {
                     selected_highlight_stroke()
                 } else {
                     egui::Stroke::new(0.0, egui::Color32::TRANSPARENT)
                 };
+                let label = if live {
+                    if let Some((tilt, azimuth)) = progress.live_pose_angles {
+                        format!(
+                            "● #{index} {count}\n{:.1}° / {:.1}°",
+                            tilt,
+                            azimuth.rem_euclid(360.0),
+                        )
+                    } else {
+                        format!("● #{index} {count}")
+                    }
+                } else {
+                    format!("#{index} {count}")
+                };
+                let tooltip = if live {
+                    format!(
+                        "{}: {count} compatible PnP observations.\n{}",
+                        pose_bin_label(criteria, index),
+                        live_summary.as_deref().unwrap_or("Live pose"),
+                    )
+                } else {
+                    format!(
+                        "{}: {count} compatible PnP observations.",
+                        pose_bin_label(criteria, index)
+                    )
+                };
                 ui.add(
-                    egui::Button::new(format!("#{index} {count}"))
+                    egui::Button::new(label)
                         .fill(coverage_color(count, target))
                         .stroke(stroke),
                 )
-                .on_hover_text(format!(
-                    "{}: {count} compatible PnP observations.",
-                    pose_bin_label(criteria, index)
-                ));
+                .on_hover_text(tooltip);
                 if (index + 1) % 8 == 0 {
                     ui.end_row();
                 }
@@ -2252,6 +2497,165 @@ mod tests {
             ),
             Some(4)
         );
+    }
+
+    #[test]
+    fn live_pose_marker_uses_continuous_angles_inside_same_bin() {
+        let mut criteria = DatasetAcceptanceDraft::default().parse().unwrap();
+        criteria.pnp_tilt_deadband_deg = 0.0;
+        criteria.pnp_tilt_max_deg = 90.0;
+        criteria.pnp_tilt_bins = 2;
+        criteria.pnp_azimuth_sectors = 4;
+        let center = egui::pos2(100.0, 100.0);
+        let center_radius = 0.0;
+        let outer_radius = 90.0;
+
+        assert_eq!(pose_bin_for_angles(&criteria, 10.0, 10.0), Some(0));
+        assert_eq!(pose_bin_for_angles(&criteria, 20.0, 20.0), Some(0));
+        let first = pose_marker_position_for_angles(
+            10.0,
+            10.0,
+            center,
+            center_radius,
+            outer_radius,
+            &criteria,
+        )
+        .unwrap();
+        let second = pose_marker_position_for_angles(
+            20.0,
+            20.0,
+            center,
+            center_radius,
+            outer_radius,
+            &criteria,
+        )
+        .unwrap();
+
+        assert!((first - second).length() > 1.0);
+    }
+
+    #[test]
+    fn live_pose_marker_handles_deadband_wrap_and_invalid_angles() {
+        let mut criteria = DatasetAcceptanceDraft::default().parse().unwrap();
+        criteria.pnp_tilt_deadband_deg = 20.0;
+        criteria.pnp_tilt_max_deg = 80.0;
+        criteria.pnp_tilt_bins = 2;
+        criteria.pnp_azimuth_sectors = 4;
+        let center = egui::pos2(100.0, 100.0);
+        let center_radius = 12.0;
+        let outer_radius = 60.0;
+        let assert_pos_close = |actual: egui::Pos2, expected: egui::Pos2| {
+            assert!(
+                (actual.x - expected.x).abs() < 1.0e-4,
+                "x: {actual:?} != {expected:?}"
+            );
+            assert!(
+                (actual.y - expected.y).abs() < 1.0e-4,
+                "y: {actual:?} != {expected:?}"
+            );
+        };
+
+        assert_pos_close(
+            pose_marker_position_for_angles(
+                0.0,
+                90.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria,
+            )
+            .unwrap(),
+            center,
+        );
+        assert_pos_close(
+            pose_marker_position_for_angles(
+                10.0,
+                0.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria,
+            )
+            .unwrap(),
+            egui::pos2(106.0, 100.0),
+        );
+        assert_pos_close(
+            pose_marker_position_for_angles(
+                45.0,
+                0.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria,
+            )
+            .unwrap(),
+            pose_marker_position_for_angles(
+                45.0,
+                720.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria,
+            )
+            .unwrap(),
+        );
+        assert!(
+            pose_marker_position_for_angles(
+                -1.0,
+                0.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria
+            )
+            .is_none()
+        );
+        assert!(
+            pose_marker_position_for_angles(
+                81.0,
+                0.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria
+            )
+            .is_none()
+        );
+        assert!(
+            pose_marker_position_for_angles(
+                f64::NAN,
+                0.0,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria
+            )
+            .is_none()
+        );
+        assert!(
+            pose_marker_position_for_angles(
+                10.0,
+                f64::NAN,
+                center,
+                center_radius,
+                outer_radius,
+                &criteria
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn pose_grid_live_summary_reports_actual_angles_for_large_region_count() {
+        let mut criteria = DatasetAcceptanceDraft::default().parse().unwrap();
+        criteria.pnp_tilt_bins = 5;
+        criteria.pnp_azimuth_sectors = 8;
+        let mut progress = DatasetAcceptanceProgress::empty(&criteria);
+        progress.live_pose_angles = Some((12.3, 725.6));
+
+        let summary = live_pose_summary(&progress, &criteria).unwrap();
+        assert!(summary.contains("tilt 12.3°"));
+        assert!(summary.contains("azimuth 5.6°"));
     }
 
     #[test]

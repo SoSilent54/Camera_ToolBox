@@ -16,8 +16,8 @@ use std::{
 use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvisionIntent};
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{
-    CalibrationExport, CalibrationViewerOverlay, CalibrationWorkspace, VIEWER_COVERAGE_COLUMNS,
-    VIEWER_COVERAGE_ROWS, heatmap_color, paint_heatmap_guides,
+    CalibrationExport, CalibrationViewerOverlay, CalibrationViewerPresentation,
+    CalibrationWorkspace, ViewerDetectionOverlay, ViewerPoseAxisOverlay,
 };
 
 #[cfg(feature = "platform-ssh")]
@@ -50,8 +50,8 @@ use crate::{
         ViewerImage, ViewerOutput, bayer_label, render_viewer, viewer_texture_uv,
     },
     workspace::{
-        DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, TabBarAction,
-        WorkspaceState, render_tab_bar,
+        DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, LiveStreamSource,
+        TabBarAction, WorkspaceState, render_tab_bar,
     },
     yuv_inspector::render_yuv_inspector,
 };
@@ -87,6 +87,8 @@ const RAW_SOURCE_CACHE_BYTES: u64 = 512 * 1024 * 1024;
 const RAW_SOURCE_CACHE_ENTRIES: usize = 16;
 const RAW_PROGRESS_REPAINT_INTERVAL: Duration = Duration::from_millis(100);
 const CAPTURED_RASTER_DECODE_BYTES: usize = 256 * 1024 * 1024;
+#[cfg(feature = "calibration-opencv")]
+const LIVE_VIEWER_DATASET_OVERLAY_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 190, 64);
 
 struct OpenedRawDocument {
     report: LocalRawAnalyzeReport,
@@ -479,7 +481,7 @@ impl Default for DirectRtspWorkspace {
             height: 1080,
             codec: RtspCodec::H264,
             transport: RtspTransport::Tcp,
-            latency_mode: RtspLatencyMode::Low,
+            latency_mode: RtspLatencyMode::Stable,
             prefer_hardware_acceleration: false,
             last_error: None,
         }
@@ -732,12 +734,18 @@ impl eframe::App for CameraToolboxApp {
                     ui.separator();
                     let explorer_action = self.explorer.render(&context, ui, calibration_workspace);
                     let (direct_rtsp_config, stream_action) = if self.explorer.is_rtsp_mode() {
-                        ui.separator();
-                        let direct_rtsp_config = self.render_direct_rtsp_workspace(ui);
-                        ui.separator();
-                        let stream_action = self.render_workspace_stream_section(ui);
-                        self.render_stream_metrics(ui);
-                        (direct_rtsp_config, stream_action)
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace_rtsp_sidebar_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.separator();
+                                let direct_rtsp_config = self.render_direct_rtsp_workspace(ui);
+                                ui.separator();
+                                let stream_action = self.render_workspace_stream_section(ui);
+                                self.render_stream_metrics(ui);
+                                (direct_rtsp_config, stream_action)
+                            })
+                            .inner
                     } else {
                         (None, None)
                     };
@@ -819,10 +827,11 @@ impl eframe::App for CameraToolboxApp {
         let calibration_export_error = self.explorer.export_dialog_prefill(&context).err();
 
         #[cfg(feature = "calibration-opencv")]
-        let calibration_viewer_overlay = self.workspace.active_live().and_then(|document| {
-            document
-                .displayed_frame()
-                .map(|frame| self.calibration.viewer_overlay(frame, &document.source))
+        let calibration_viewer_presentation = self.workspace.active_live().and_then(|document| {
+            self.calibration.live_viewer_presentation(
+                document.displayed_frame().map(Arc::as_ref),
+                Some(&document.source),
+            )
         });
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
@@ -850,7 +859,7 @@ impl eframe::App for CameraToolboxApp {
                                 ui,
                                 document,
                                 true,
-                                calibration_viewer_overlay.as_ref(),
+                                calibration_viewer_presentation.as_ref(),
                             );
                             None
                         },
@@ -863,7 +872,7 @@ impl eframe::App for CameraToolboxApp {
                         document,
                         cfg!(feature = "calibration-opencv"),
                         #[cfg(feature = "calibration-opencv")]
-                        calibration_viewer_overlay.as_ref(),
+                        calibration_viewer_presentation.as_ref(),
                     );
                     ViewerOutput { rect, action: None }
                 } else if let Some(document) = self.workspace.active_image_mut() {
@@ -1927,12 +1936,30 @@ impl CameraToolboxApp {
                 ui.separator();
                 ui.label(media);
                 ui.separator();
-                ui.label(format!(
-                    "RTP gaps {} · preview dropped {} · resync {}",
-                    document.metrics.rtp_gaps,
-                    document.metrics.preview_dropped,
-                    document.metrics.decoder_resyncs
-                ));
+                let counters = match &document.source {
+                    LiveStreamSource::Rtsp { .. } => {
+                        let io = if document.metrics.network_bytes_available {
+                            format!("FFmpeg I/O {} B", document.metrics.network_bytes)
+                        } else {
+                            "FFmpeg I/O N/A".to_owned()
+                        };
+                        format!(
+                            "{io} · media {} B · preview dropped {} · resync {}",
+                            document.metrics.ffmpeg_media_bytes,
+                            document.metrics.preview_dropped,
+                            document.metrics.decoder_resyncs
+                        )
+                    }
+                    LiveStreamSource::Cv610 { .. } => format!(
+                        "Network {} B · RTP {} · gaps {} · preview dropped {} · resync {}",
+                        document.metrics.network_bytes,
+                        document.metrics.rtp_packets,
+                        document.metrics.rtp_gaps,
+                        document.metrics.preview_dropped,
+                        document.metrics.decoder_resyncs
+                    ),
+                };
+                ui.label(counters);
                 return;
             }
             if let Some(document) = self.workspace.active_image() {
@@ -4156,93 +4183,112 @@ impl CameraToolboxApp {
         };
         let displayed_frame = document.displayed_frame().cloned();
         ui.separator();
-        egui::ScrollArea::vertical()
-            .id_salt("workspace_metrics_scroll")
-            .max_height(200.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                ui.monospace(format!("Network {} B", document.metrics.network_bytes));
-                ui.monospace(format!("RTP {}", document.metrics.rtp_packets));
-                ui.monospace(format!("Gaps {}", document.metrics.rtp_gaps));
-                ui.monospace(format!("Dropped {}", document.metrics.preview_dropped));
-                ui.monospace(format!("Decoded {}", document.metrics.decoded_frames));
-                ui.monospace(format!(
-                    "Dec {:.1} fps",
-                    document.metrics.decoded_fps_millihz as f64 / 1_000.0
-                ));
-                ui.monospace(format!(
-                    "Pres {:.1} fps",
-                    document.presented_fps_millihz_at(camera_toolbox_app::host_monotonic_time_ns(),)
-                        as f64
-                        / 1_000.0
-                ));
-                ui.monospace(format!(
-                    "Host pres {:.2} ms",
-                    document.metrics.host_presentation_delay_ns as f64 / 1_000_000.0
-                ));
-                ui.monospace(format!(
-                    "Stage codec {:.2} ms",
-                    document.metrics.decoder_codec_stage_ns as f64 / 1_000_000.0
-                ));
-                ui.monospace(format!(
-                    "Stage scale {:.2} ms",
-                    document.metrics.decoder_scale_stage_ns as f64 / 1_000_000.0
-                ));
-                ui.monospace(format!(
-                    "Stage copy {:.2} ms",
-                    document.metrics.decoder_copy_stage_ns as f64 / 1_000_000.0
-                ));
-                ui.monospace(format!(
-                    "Decoder {}",
-                    document
-                        .metrics
-                        .decoder_backend
-                        .as_deref()
-                        .unwrap_or("Not reported")
-                ));
-                ui.monospace(format!("Presented {}", document.presented_frames));
-                ui.monospace(format!("Resync {}", document.metrics.decoder_resyncs));
-                ui.monospace(format!("Record {} B", document.metrics.record_bytes));
-                ui.monospace(format!(
-                    "Preview Q {}",
-                    document.metrics.preview_queue_depth
-                ));
-                ui.monospace(format!(
-                    "Decoder Q {}",
-                    document.metrics.decoder_queue_depth
-                ));
-                ui.monospace(format!(
-                    "Record Q {} B",
-                    document.metrics.recorder_queue_bytes
-                ));
-                let provenance = displayed_frame.as_ref().map_or_else(
-                    || "No displayed frame".to_owned(),
-                    |frame| match &frame.identity.source_pts {
-                        camera_toolbox_app::SourcePts::Known {
-                            ticks,
-                            time_base_numerator,
-                            time_base_denominator,
-                            provenance,
-                        } => format!(
-                            "{} ch{} seq{} PTS {} @ {}/{} ({provenance:?})",
-                            frame.identity.stream_id.as_str(),
-                            frame.identity.channel,
-                            frame.identity.frame_sequence,
-                            ticks,
-                            time_base_numerator,
-                            time_base_denominator,
-                        ),
-                        camera_toolbox_app::SourcePts::Unavailable { reason } => format!(
-                            "{} ch{} seq{} PTS unavailable: {reason}",
-                            frame.identity.stream_id.as_str(),
-                            frame.identity.channel,
-                            frame.identity.frame_sequence,
-                        ),
-                    },
-                );
-                ui.monospace(provenance);
-            });
+        ui.scope(|ui| {
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            match &document.source {
+                LiveStreamSource::Rtsp { .. } => {
+                    if document.metrics.network_bytes_available {
+                        ui.monospace(format!("FFmpeg I/O {} B", document.metrics.network_bytes));
+                        ui.monospace(format!(
+                            "FFmpeg I/O rate {:.2} MiB/s",
+                            document.metrics.network_bytes_per_second as f64 / (1024.0 * 1024.0)
+                        ));
+                    } else {
+                        ui.monospace("FFmpeg I/O N/A");
+                    }
+                    ui.monospace(format!(
+                        "FFmpeg media {} B",
+                        document.metrics.ffmpeg_media_bytes
+                    ));
+                    ui.monospace(format!(
+                        "FFmpeg media rate {:.2} MiB/s",
+                        document.metrics.ffmpeg_media_bytes_per_second as f64 / (1024.0 * 1024.0)
+                    ));
+                }
+                LiveStreamSource::Cv610 { .. } => {
+                    ui.monospace(format!("Network {} B", document.metrics.network_bytes));
+                    ui.monospace(format!("RTP {}", document.metrics.rtp_packets));
+                    ui.monospace(format!("Gaps {}", document.metrics.rtp_gaps));
+                }
+            }
+            ui.monospace(format!("Dropped {}", document.metrics.preview_dropped));
+            ui.monospace(format!("Decoded {}", document.metrics.decoded_frames));
+            ui.monospace(format!(
+                "Dec {:.1} fps",
+                document.metrics.decoded_fps_millihz as f64 / 1_000.0
+            ));
+            ui.monospace(format!(
+                "Pres {:.1} fps",
+                document.presented_fps_millihz_at(camera_toolbox_app::host_monotonic_time_ns(),)
+                    as f64
+                    / 1_000.0
+            ));
+            ui.monospace(format!(
+                "Host pres {:.2} ms",
+                document.metrics.host_presentation_delay_ns as f64 / 1_000_000.0
+            ));
+            ui.monospace(format!(
+                "Stage codec {:.2} ms",
+                document.metrics.decoder_codec_stage_ns as f64 / 1_000_000.0
+            ));
+            ui.monospace(format!(
+                "Stage scale {:.2} ms",
+                document.metrics.decoder_scale_stage_ns as f64 / 1_000_000.0
+            ));
+            ui.monospace(format!(
+                "Stage copy {:.2} ms",
+                document.metrics.decoder_copy_stage_ns as f64 / 1_000_000.0
+            ));
+            ui.monospace(format!(
+                "Decoder {}",
+                document
+                    .metrics
+                    .decoder_backend
+                    .as_deref()
+                    .unwrap_or("Not reported")
+            ));
+            ui.monospace(format!("Presented {}", document.presented_frames));
+            ui.monospace(format!("Resync {}", document.metrics.decoder_resyncs));
+            ui.monospace(format!("Record {} B", document.metrics.record_bytes));
+            ui.monospace(format!(
+                "Preview Q {}",
+                document.metrics.preview_queue_depth
+            ));
+            ui.monospace(format!(
+                "Decoder Q {}",
+                document.metrics.decoder_queue_depth
+            ));
+            ui.monospace(format!(
+                "Record Q {} B",
+                document.metrics.recorder_queue_bytes
+            ));
+            let provenance = displayed_frame.as_ref().map_or_else(
+                || "No displayed frame".to_owned(),
+                |frame| match &frame.identity.source_pts {
+                    camera_toolbox_app::SourcePts::Known {
+                        ticks,
+                        time_base_numerator,
+                        time_base_denominator,
+                        provenance,
+                    } => format!(
+                        "{} ch{} seq{} PTS {} @ {}/{} ({provenance:?})",
+                        frame.identity.stream_id.as_str(),
+                        frame.identity.channel,
+                        frame.identity.frame_sequence,
+                        ticks,
+                        time_base_numerator,
+                        time_base_denominator,
+                    ),
+                    camera_toolbox_app::SourcePts::Unavailable { reason } => format!(
+                        "{} ch{} seq{} PTS unavailable: {reason}",
+                        frame.identity.stream_id.as_str(),
+                        frame.identity.channel,
+                        frame.identity.frame_sequence,
+                    ),
+                },
+            );
+            ui.monospace(provenance);
+        });
     }
 
     fn start_direct_rtsp(&mut self, config: RtspStreamConfig) {
@@ -4388,12 +4434,20 @@ impl CameraToolboxApp {
         }
     }
 
+    #[cfg(feature = "calibration-opencv")]
+    fn live_viewer_render_texture<'a>(
+        document: &'a LiveDocument,
+        _calibration_presentation: Option<&'a CalibrationViewerPresentation>,
+    ) -> Option<&'a egui::TextureHandle> {
+        document.texture()
+    }
+
     fn render_live_viewer(
         ui: &mut egui::Ui,
         document: &mut LiveDocument,
         calibration_capture_enabled: bool,
-        #[cfg(feature = "calibration-opencv")] calibration_overlay: Option<
-            &CalibrationViewerOverlay,
+        #[cfg(feature = "calibration-opencv")] calibration_presentation: Option<
+            &CalibrationViewerPresentation,
         >,
     ) -> (
         egui::Rect,
@@ -4405,7 +4459,6 @@ impl CameraToolboxApp {
             ui.heading(&document.title);
             if calibration_capture_enabled {
                 ui.checkbox(&mut document.show_calibration_detection, "Board detection");
-                ui.checkbox(&mut document.show_calibration_coverage, "Dataset coverage");
             }
             ui.add_enabled(false, egui::Button::new("Fit"))
                 .on_hover_text("Live Stream is always fit to the Viewer window.");
@@ -4445,7 +4498,11 @@ impl CameraToolboxApp {
             );
         }
         ui.separator();
-        if let Some(texture) = document.texture() {
+        #[cfg(feature = "calibration-opencv")]
+        let render_texture = Self::live_viewer_render_texture(document, calibration_presentation);
+        #[cfg(not(feature = "calibration-opencv"))]
+        let render_texture = document.texture();
+        if let Some(texture) = render_texture {
             let available = ui.available_size();
             let source = texture.size_vec2();
             let finite_positive = |value: f32| {
@@ -4473,13 +4530,14 @@ impl CameraToolboxApp {
             #[cfg(not(feature = "calibration-opencv"))]
             let _ = response_rect;
             #[cfg(feature = "calibration-opencv")]
-            if let Some(overlay) = calibration_overlay {
+            if let Some(overlay) =
+                calibration_presentation.map(|presentation| &presentation.overlay)
+            {
                 Self::paint_live_calibration_overlay(
                     &ui.painter_at(response_rect),
                     response_rect,
                     overlay,
                     document.show_calibration_detection,
-                    document.show_calibration_coverage,
                     document.horizontal_flip,
                 );
             }
@@ -4508,68 +4566,124 @@ impl CameraToolboxApp {
         image_rect: egui::Rect,
         overlay: &CalibrationViewerOverlay,
         show_detection: bool,
-        show_coverage: bool,
         horizontal_flip: bool,
     ) {
-        if show_coverage {
-            for cell in &overlay.coverage {
-                let column = if horizontal_flip {
-                    VIEWER_COVERAGE_COLUMNS - 1 - cell.column
-                } else {
-                    cell.column
-                };
-                let x0 = image_rect.left()
-                    + column as f32 / VIEWER_COVERAGE_COLUMNS as f32 * image_rect.width();
-                let x1 = image_rect.left()
-                    + (column + 1) as f32 / VIEWER_COVERAGE_COLUMNS as f32 * image_rect.width();
-                let y0 = image_rect.top()
-                    + cell.row as f32 / VIEWER_COVERAGE_ROWS as f32 * image_rect.height();
-                let y1 = image_rect.top()
-                    + (cell.row + 1) as f32 / VIEWER_COVERAGE_ROWS as f32 * image_rect.height();
-                let density = cell.density.clamp(0.0, 1.0);
-                let palette = heatmap_color(density);
-                let color = egui::Color32::from_rgba_unmultiplied(
-                    palette.r(),
-                    palette.g(),
-                    palette.b(),
-                    (40.0 + 112.0 * density).round() as u8,
-                );
-                painter.rect_filled(
-                    egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1)),
-                    0.0,
-                    color,
-                );
-            }
-            if !overlay.coverage.is_empty() {
-                paint_heatmap_guides(painter, image_rect);
-            }
-            if overlay.coverage_views > 0 {
-                painter.text(
-                    image_rect.left_top() + egui::vec2(8.0, 8.0),
-                    egui::Align2::LEFT_TOP,
-                    format!("Coverage: {} views", overlay.coverage_views),
-                    egui::FontId::monospace(12.0),
-                    egui::Color32::WHITE,
-                );
+        if !show_detection {
+            return;
+        }
+        if let Some(persistent) = &overlay.persistent {
+            Self::paint_live_detection_overlay(
+                painter,
+                image_rect,
+                persistent,
+                horizontal_flip,
+                LIVE_VIEWER_DATASET_OVERLAY_COLOR,
+                egui::Stroke::new(1.4, egui::Color32::WHITE),
+                3.0,
+            );
+        }
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_detection_overlay(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        detection: &ViewerDetectionOverlay,
+        horizontal_flip: bool,
+        point_color: egui::Color32,
+        point_stroke: egui::Stroke,
+        point_radius: f32,
+    ) {
+        for point in &detection.corners {
+            if let Some(position) =
+                Self::live_overlay_point(*point, detection.image_size, image_rect, horizontal_flip)
+            {
+                painter.circle_filled(position, point_radius, point_color);
+                painter.circle_stroke(position, point_radius + 1.0, point_stroke);
             }
         }
-        if show_detection && let Some(detection) = &overlay.detection {
-            for point in &detection.corners {
-                if let Some(position) = Self::live_overlay_point(
-                    *point,
-                    detection.image_size,
-                    image_rect,
-                    horizontal_flip,
-                ) {
-                    painter.circle_filled(position, 3.5, egui::Color32::from_rgb(80, 255, 120));
-                    painter.circle_stroke(
-                        position,
-                        4.5,
-                        egui::Stroke::new(1.0, egui::Color32::BLACK),
-                    );
-                }
-            }
+        if let Some(axis) = &detection.pose_axis {
+            Self::paint_live_pose_axis_overlay(
+                painter,
+                image_rect,
+                detection.image_size,
+                axis,
+                horizontal_flip,
+            );
         }
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_pose_axis_overlay(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        image_size: camera_toolbox_core::CalibrationImageSize,
+        axis: &ViewerPoseAxisOverlay,
+        horizontal_flip: bool,
+    ) {
+        let Some(origin) =
+            Self::live_overlay_point(axis.origin, image_size, image_rect, horizontal_flip)
+        else {
+            return;
+        };
+        painter.circle_filled(origin, 4.0, egui::Color32::WHITE);
+        Self::paint_live_pose_axis(
+            painter,
+            origin,
+            axis.x_axis,
+            image_size,
+            image_rect,
+            horizontal_flip,
+            egui::Color32::from_rgb(255, 80, 80),
+            "X",
+        );
+        Self::paint_live_pose_axis(
+            painter,
+            origin,
+            axis.y_axis,
+            image_size,
+            image_rect,
+            horizontal_flip,
+            egui::Color32::from_rgb(80, 220, 80),
+            "Y",
+        );
+        Self::paint_live_pose_axis(
+            painter,
+            origin,
+            axis.z_axis,
+            image_size,
+            image_rect,
+            horizontal_flip,
+            egui::Color32::from_rgb(80, 140, 255),
+            "Z",
+        );
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_pose_axis(
+        painter: &egui::Painter,
+        origin: egui::Pos2,
+        endpoint: camera_toolbox_core::CalibrationPoint,
+        image_size: camera_toolbox_core::CalibrationImageSize,
+        image_rect: egui::Rect,
+        horizontal_flip: bool,
+        color: egui::Color32,
+        label: &'static str,
+    ) {
+        let Some(endpoint) =
+            Self::live_overlay_point(endpoint, image_size, image_rect, horizontal_flip)
+        else {
+            return;
+        };
+        painter.line_segment([origin, endpoint], egui::Stroke::new(2.0, color));
+        painter.circle_filled(endpoint, 4.0, color);
+        painter.text(
+            endpoint + egui::vec2(5.0, -5.0),
+            egui::Align2::LEFT_BOTTOM,
+            label,
+            egui::FontId::monospace(12.0),
+            color,
+        );
     }
 
     #[cfg(feature = "calibration-opencv")]
