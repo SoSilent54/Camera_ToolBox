@@ -431,8 +431,9 @@ fn rodrigues_matrix(rotation_vector: [f64; 3]) -> Result<[[f64; 3]; 3], Calibrat
     ])
 }
 
-/// 非持久化 Dataset Acceptance 阈值；仅从当前 GUI 控件构造。
-#[derive(Clone, Debug, PartialEq)]
+/// Dataset Acceptance 阈值；GUI 可从 YAML 配置安装，运行时基线仍持有不可变快照。
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AutoCaptureAcceptanceCriteria {
     pub field_columns: usize,
     pub field_rows: usize,

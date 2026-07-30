@@ -36,8 +36,9 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder};
 
 use crate::calibration_acceptance::{
-    DatasetAcceptanceDraft, DatasetAcceptancePanelState, DatasetAcceptanceProgress,
-    render_dataset_acceptance,
+    DEFAULT_DATASET_ACCEPTANCE_CONFIG, DEFAULT_DATASET_ACCEPTANCE_CONFIG_FILE_NAME,
+    DatasetAcceptanceConfigAction, DatasetAcceptanceDraft, DatasetAcceptancePanelState,
+    DatasetAcceptanceProgress, render_dataset_acceptance,
 };
 use crate::calibration_eeprom::{CalibrationEepromState, CalibrationProvisionIntent};
 use crate::calibration_pipeline::{
@@ -2060,13 +2061,6 @@ impl CalibrationWorkspace {
             } else {
                 ui.weak("Display a live frame to initialize runtime Dataset Acceptance.");
             }
-            if let Some(candidate) = self.auto_capture.pending.as_ref() {
-                ui.monospace(format!(
-                    "Candidate {}: {:?}",
-                    candidate.token.id().get(),
-                    candidate.state
-                ));
-            }
         });
         let mut intrinsics_changed = false;
         let mut intrinsics_editing = false;
@@ -2272,6 +2266,9 @@ impl CalibrationWorkspace {
             state,
             acceptance_viewport_height,
         );
+        if let Some(action) = render_result.config_action {
+            self.handle_acceptance_config_action(action);
+        }
         if let Some(id) = render_result.selected_item {
             self.select_dataset_item_for_preview(id);
         }
@@ -2344,6 +2341,82 @@ impl CalibrationWorkspace {
                 self.acceptance_draft.error = Some(error);
             }
         }
+    }
+
+    fn handle_acceptance_config_action(&mut self, action: DatasetAcceptanceConfigAction) {
+        match action {
+            DatasetAcceptanceConfigAction::LoadYaml => {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Dataset Acceptance YAML", &["yaml", "yml"])
+                    .pick_file()
+                else {
+                    return;
+                };
+                match std::fs::read_to_string(&path) {
+                    Ok(yaml) => {
+                        let source = path.display().to_string();
+                        self.load_acceptance_config_from_str(&yaml, &source);
+                    }
+                    Err(error) => self.report_acceptance_config_error(format!(
+                        "Failed to read Dataset Acceptance YAML from {}: {error}",
+                        path.display()
+                    )),
+                }
+            }
+            DatasetAcceptanceConfigAction::SaveYaml => {
+                let Some(path) = rfd::FileDialog::new()
+                    .add_filter("Dataset Acceptance YAML", &["yaml", "yml"])
+                    .set_file_name(DEFAULT_DATASET_ACCEPTANCE_CONFIG_FILE_NAME)
+                    .save_file()
+                else {
+                    return;
+                };
+                self.save_acceptance_config_to_path(&path);
+            }
+            DatasetAcceptanceConfigAction::LoadDefault => {
+                self.load_acceptance_config_from_str(
+                    DEFAULT_DATASET_ACCEPTANCE_CONFIG,
+                    "packaged default",
+                );
+            }
+        }
+    }
+
+    fn load_acceptance_config_from_str(&mut self, yaml: &str, source: &str) {
+        match DatasetAcceptanceDraft::from_yaml_str(yaml) {
+            Ok(draft) => {
+                let criteria = draft
+                    .parse()
+                    .expect("validated Dataset Acceptance YAML draft must parse");
+                self.acceptance_draft = draft;
+                self.acceptance_last_valid_criteria = criteria;
+                self.refresh_runtime_auto_admission();
+                self.status = format!("Loaded Dataset Acceptance YAML from {source}.");
+            }
+            Err(error) => self.report_acceptance_config_error(error),
+        }
+    }
+
+    fn save_acceptance_config_to_path(&mut self, path: &std::path::Path) {
+        match self.acceptance_draft.to_yaml_string() {
+            Ok(yaml) => match std::fs::write(path, yaml) {
+                Ok(()) => {
+                    self.acceptance_draft.error = None;
+                    self.status = format!("Saved Dataset Acceptance YAML to {}.", path.display());
+                }
+                Err(error) => self.report_acceptance_config_error(format!(
+                    "Failed to save Dataset Acceptance YAML to {}: {error}",
+                    path.display()
+                )),
+            },
+            Err(error) => self.report_acceptance_config_error(error),
+        }
+    }
+
+    fn report_acceptance_config_error(&mut self, message: impl Into<String>) {
+        let message = message.into();
+        self.acceptance_draft.error = Some(message.clone());
+        self.status = message;
     }
 
     fn render_dataset(&mut self, ui: &mut egui::Ui, show_heading: bool) {

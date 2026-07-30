@@ -46,6 +46,7 @@ image.workspace = true
 secrecy = { workspace = true, optional = true }
 serde_json.workspace = true
 tracing.workspace = true
+serde_yaml.workspace = true
 
 [lints]
 workspace = true

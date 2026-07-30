@@ -44,7 +44,7 @@ cargo fmt --all -- --check
 
 - 每个分支 push 会在 Linux x86_64、macOS aarch64、Windows x86_64 runner 上使用固定 OpenCV 5 资产分别编译同一个完整产品；标定算法测试、完整产品测试与 Clippy 在 Linux job 执行，macOS/Windows 验证原生 release 编译和启动。Clippy 仅报告 warning，不以 `-D warnings` 阻断。
 - 也可在 GitHub `Actions -> CI -> Run workflow` 中手动执行同一套检查。
-- 推送 `v*` Git tag 会生成 6 个带版本号的归档；每个归档都包含全 provider 的 `camera-toolbox` 可执行文件、对应平台的 `opencv_world` 运行库、OpenCV 许可证和 README：
+- 推送 `v*` Git tag 会生成 6 个带版本号的归档；每个归档都包含全 provider 的 `camera-toolbox` 可执行文件、`config/dataset-acceptance.yaml` 默认验收阈值、对应平台的 `opencv_world` 运行库、OpenCV 许可证和 README：
   - `camera-toolbox-${RELEASE_TAG}-macos-aarch64.tar.gz`
   - `camera-toolbox-${RELEASE_TAG}-windows-x86_64.zip`
   - `camera-toolbox-${RELEASE_TAG}-linux-{x86_64|aarch64}-ubuntu{20|22}.tar.gz`

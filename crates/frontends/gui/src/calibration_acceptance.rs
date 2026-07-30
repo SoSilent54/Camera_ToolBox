@@ -1,4 +1,4 @@
-//! Dataset 验收阈值编辑与实时进度可视化；配置仅在当前进程内生效。
+//! Dataset 验收阈值编辑、YAML 配置读写与实时进度可视化。
 
 use camera_toolbox_app::{
     AutoAdmissionAssessment, AutoAdmissionDepthRange, AutoAdmissionItemVisualization,
@@ -9,22 +9,9 @@ use egui_plot::{
     HoverPosition, Line, Plot, PlotBounds, PlotMemory, PlotPoint, PlotPoints, PlotUi, Text,
 };
 
-const DEFAULT_FIELD_COLUMNS: &str = "16";
-const DEFAULT_FIELD_ROWS: &str = "9";
-const DEFAULT_FIELD_TARGET_PER_CELL: &str = "1";
-const DEFAULT_MIN_ADJACENT_SPACING_PX: &str = "12";
-const DEFAULT_PNP_DEPTH_MIN: &str = "400";
-const DEFAULT_PNP_DEPTH_MAX: &str = "2400";
-const DEFAULT_PNP_DEPTH_BINS: &str = "4";
-const DEFAULT_DEPTH_TARGET_PER_BIN: &str = "1";
-const DEFAULT_PNP_TILT_DEADBAND_DEG: &str = "5";
-const DEFAULT_PNP_TILT_MAX_DEG: &str = "65";
-const DEFAULT_PNP_TILT_BINS: &str = "3";
-const DEFAULT_PNP_AZIMUTH_SECTORS: &str = "8";
-const DEFAULT_POSE_TARGET_PER_BIN: &str = "1";
-const DEFAULT_PNP_MAX_RMSE_PX: &str = "1.5";
-const DEFAULT_PNP_MAX_ERROR_PX: &str = "4";
-const DEFAULT_MINIMUM_AUTO_GAIN: &str = "0.3";
+pub(crate) const DEFAULT_DATASET_ACCEPTANCE_CONFIG: &str =
+    include_str!("../assets/config/dataset_acceptance_default.yaml");
+pub(crate) const DEFAULT_DATASET_ACCEPTANCE_CONFIG_FILE_NAME: &str = "dataset-acceptance.yaml";
 const DEPTH_RANGE_PLOT_HEIGHT: f32 = 96.0;
 const DEPTH_BIN_BASE_PLOT_HEIGHT: f32 = 56.0;
 const DEPTH_RANGE_CAP_HALF_HEIGHT: f64 = 0.38;
@@ -56,29 +43,50 @@ pub(crate) struct DatasetAcceptanceDraft {
 
 impl Default for DatasetAcceptanceDraft {
     fn default() -> Self {
-        Self {
-            field_columns: DEFAULT_FIELD_COLUMNS.to_owned(),
-            field_rows: DEFAULT_FIELD_ROWS.to_owned(),
-            field_target_per_cell: DEFAULT_FIELD_TARGET_PER_CELL.to_owned(),
-            min_adjacent_spacing_px: DEFAULT_MIN_ADJACENT_SPACING_PX.to_owned(),
-            pnp_depth_min: DEFAULT_PNP_DEPTH_MIN.to_owned(),
-            pnp_depth_max: DEFAULT_PNP_DEPTH_MAX.to_owned(),
-            pnp_depth_bins: DEFAULT_PNP_DEPTH_BINS.to_owned(),
-            depth_target_per_bin: DEFAULT_DEPTH_TARGET_PER_BIN.to_owned(),
-            pnp_tilt_deadband_deg: DEFAULT_PNP_TILT_DEADBAND_DEG.to_owned(),
-            pnp_tilt_max_deg: DEFAULT_PNP_TILT_MAX_DEG.to_owned(),
-            pnp_tilt_bins: DEFAULT_PNP_TILT_BINS.to_owned(),
-            pnp_azimuth_sectors: DEFAULT_PNP_AZIMUTH_SECTORS.to_owned(),
-            pose_target_per_bin: DEFAULT_POSE_TARGET_PER_BIN.to_owned(),
-            pnp_max_rmse_px: DEFAULT_PNP_MAX_RMSE_PX.to_owned(),
-            pnp_max_error_px: DEFAULT_PNP_MAX_ERROR_PX.to_owned(),
-            minimum_auto_gain: DEFAULT_MINIMUM_AUTO_GAIN.to_owned(),
-            error: None,
-        }
+        Self::from_yaml_str(DEFAULT_DATASET_ACCEPTANCE_CONFIG)
+            .expect("packaged Dataset Acceptance YAML must be valid")
     }
 }
 
 impl DatasetAcceptanceDraft {
+    pub(crate) fn from_criteria(criteria: &AutoCaptureAcceptanceCriteria) -> Self {
+        Self {
+            field_columns: criteria.field_columns.to_string(),
+            field_rows: criteria.field_rows.to_string(),
+            field_target_per_cell: criteria.field_target_per_cell.to_string(),
+            min_adjacent_spacing_px: criteria.min_adjacent_spacing_px.to_string(),
+            pnp_depth_min: criteria.pnp_depth_min.to_string(),
+            pnp_depth_max: criteria.pnp_depth_max.to_string(),
+            pnp_depth_bins: criteria.pnp_depth_bins.to_string(),
+            depth_target_per_bin: criteria.depth_target_per_bin.to_string(),
+            pnp_tilt_deadband_deg: criteria.pnp_tilt_deadband_deg.to_string(),
+            pnp_tilt_max_deg: criteria.pnp_tilt_max_deg.to_string(),
+            pnp_tilt_bins: criteria.pnp_tilt_bins.to_string(),
+            pnp_azimuth_sectors: criteria.pnp_azimuth_sectors.to_string(),
+            pose_target_per_bin: criteria.pose_target_per_bin.to_string(),
+            pnp_max_rmse_px: criteria.pnp_max_rmse_px.to_string(),
+            pnp_max_error_px: criteria.pnp_max_error_px.to_string(),
+            minimum_auto_gain: criteria.minimum_auto_gain.to_string(),
+            error: None,
+        }
+    }
+
+    pub(crate) fn from_yaml_str(yaml: &str) -> Result<Self, String> {
+        let criteria = serde_yaml::from_str::<AutoCaptureAcceptanceCriteria>(yaml)
+            .map_err(|error| format!("Dataset Acceptance YAML is invalid: {error}"))?;
+        let draft = Self::from_criteria(&criteria);
+        draft
+            .parse()
+            .map(|_| draft)
+            .map_err(|error| format!("Dataset Acceptance YAML is invalid: {error}"))
+    }
+
+    pub(crate) fn to_yaml_string(&self) -> Result<String, String> {
+        let criteria = self.parse()?;
+        serde_yaml::to_string(&criteria)
+            .map_err(|error| format!("Failed to encode Dataset Acceptance YAML: {error}"))
+    }
+
     pub(crate) fn parse(&self) -> Result<AutoCaptureAcceptanceCriteria, String> {
         let field_columns = parse_usize("Field columns", &self.field_columns, 1, 32)?;
         let field_rows = parse_usize("Field rows", &self.field_rows, 1, 32)?;
@@ -356,6 +364,13 @@ pub(crate) struct DatasetAcceptanceScrollMetrics {
     pub(crate) viewport: egui::Rect,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DatasetAcceptanceConfigAction {
+    LoadYaml,
+    SaveYaml,
+    LoadDefault,
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct DatasetAcceptanceRender {
@@ -365,6 +380,7 @@ pub(crate) struct DatasetAcceptanceRender {
     pub(crate) scroll_metrics: Option<DatasetAcceptanceScrollMetrics>,
     pub(crate) selected_item: Option<CalibrationItemId>,
     pub(crate) expanded: bool,
+    pub(crate) config_action: Option<DatasetAcceptanceConfigAction>,
 }
 
 pub(crate) fn render_dataset_acceptance(
@@ -378,6 +394,7 @@ pub(crate) fn render_dataset_acceptance(
     let mut editing = false;
     let mut scroll_metrics = None;
     let mut selected_depth_item = None;
+    let mut config_action = None;
     let foldout = egui::CollapsingHeader::new("Dataset acceptance")
         .id_salt("calibration_dataset_acceptance")
         .default_open(true)
@@ -389,6 +406,30 @@ pub(crate) fn render_dataset_acceptance(
                 .scroll_bar_visibility(egui::scroll_area::ScrollBarVisibility::VisibleWhenNeeded)
                 .show(ui, |ui| {
                     render_runtime_state(ui, &state);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label("Config");
+                        if ui
+                            .small_button("Load YAML…")
+                            .on_hover_text("Load Dataset Acceptance thresholds from a YAML file.")
+                            .clicked()
+                        {
+                            config_action = Some(DatasetAcceptanceConfigAction::LoadYaml);
+                        }
+                        if ui
+                            .small_button("Save YAML…")
+                            .on_hover_text("Save the current complete Dataset Acceptance thresholds as YAML.")
+                            .clicked()
+                        {
+                            config_action = Some(DatasetAcceptanceConfigAction::SaveYaml);
+                        }
+                        if ui
+                            .small_button("Load default")
+                            .on_hover_text("Restore the packaged default Dataset Acceptance YAML.")
+                            .clicked()
+                        {
+                            config_action = Some(DatasetAcceptanceConfigAction::LoadDefault);
+                        }
+                    });
                     ui.horizontal_wrapped(|ui| {
                         ui.monospace(format!(
                             "Field quota {}/{} · Depth quota {}/{} · Pose quota {}/{} · Score {}",
@@ -583,7 +624,7 @@ pub(crate) fn render_dataset_acceptance(
                             ui.colored_label(egui::Color32::LIGHT_RED, error);
                         }
                     } else {
-                        ui.weak("Valid complete changes take effect immediately and are not saved to disk.");
+                        ui.weak("Valid complete changes take effect immediately and can be saved as YAML.");
                     }
                     ui.weak("PnP for any Dataset source uses the current GUI K and D12 seed; an incomplete edit retains the last valid live binding.");
                 });
@@ -598,6 +639,7 @@ pub(crate) fn render_dataset_acceptance(
         foldout_id: foldout.header_response.id,
         scroll_metrics,
         selected_item: selected_depth_item,
+        config_action,
         expanded: !foldout.fully_closed(),
     }
 }
@@ -2003,6 +2045,31 @@ mod tests {
             (4, 1)
         );
         assert_eq!(criteria.pose_target_per_bin, 1);
+    }
+
+    #[test]
+    fn acceptance_draft_loads_packaged_yaml_and_roundtrips() {
+        let draft =
+            DatasetAcceptanceDraft::from_yaml_str(DEFAULT_DATASET_ACCEPTANCE_CONFIG).unwrap();
+        let criteria = draft.parse().unwrap();
+        assert_eq!(criteria.field_columns, 16);
+        assert_eq!(criteria.field_rows, 9);
+
+        let yaml = draft.to_yaml_string().unwrap();
+        assert!(yaml.contains("field_columns: 16"));
+        let roundtrip = DatasetAcceptanceDraft::from_yaml_str(&yaml).unwrap();
+        assert_eq!(roundtrip.parse().unwrap(), criteria);
+    }
+
+    #[test]
+    fn acceptance_draft_rejects_invalid_yaml_thresholds() {
+        let yaml = DEFAULT_DATASET_ACCEPTANCE_CONFIG
+            .replace("pnp_depth_max: 2400.0", "pnp_depth_max: 400.0");
+        assert!(
+            DatasetAcceptanceDraft::from_yaml_str(&yaml)
+                .unwrap_err()
+                .contains("greater than minimum")
+        );
     }
 
     #[test]

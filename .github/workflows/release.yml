@@ -158,6 +158,9 @@ jobs:
           install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
             "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
+          install -d "dist/${bundle}/config"
+          install -m 644 "crates/frontends/gui/assets/config/dataset_acceptance_default.yaml" \
+            "dist/${bundle}/config/dataset-acceptance.yaml"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
@@ -176,6 +179,8 @@ jobs:
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
           Copy-Item "helper-sidecar/camera-toolbox-eeprom-helper" "dist/$bundle/camera-toolbox-eeprom-helper-linux-aarch64"
           Copy-Item README.md "dist/$bundle/"
+          New-Item -ItemType Directory -Force -Path "dist/$bundle/config" | Out-Null
+          Copy-Item "crates/frontends/gui/assets/config/dataset_acceptance_default.yaml" "dist/$bundle/config/dataset-acceptance.yaml"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
@@ -275,6 +280,9 @@ jobs:
           install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
             "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
+          install -d "dist/${bundle}/config"
+          install -m 644 "crates/frontends/gui/assets/config/dataset_acceptance_default.yaml" \
+            "dist/${bundle}/config/dataset-acceptance.yaml"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
