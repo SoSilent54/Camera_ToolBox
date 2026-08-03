@@ -163,22 +163,6 @@ impl I2cToolsWorkspace {
                         self.result = None;
                         self.status = "Added a manual I²C row.".to_owned();
                     }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Read template"))
-                        .clicked()
-                    {
-                        self.entries = vec![RowDraft::read_template(self.default_bus(), 0x50)];
-                        self.result = None;
-                        self.status = "Loaded a single-row read template.".to_owned();
-                    }
-                    if ui
-                        .add_enabled(!self.busy, egui::Button::new("Write template"))
-                        .clicked()
-                    {
-                        self.entries = vec![RowDraft::write_template(self.default_bus(), 0x50)];
-                        self.result = None;
-                        self.status = "Loaded a single-row write template.".to_owned();
-                    }
                     let all_read_response = ui
                         .add_enabled(
                             !self.busy && sftp_source.is_ok() && !self.entries.is_empty(),
