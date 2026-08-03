@@ -28,9 +28,9 @@ use camera_toolbox_app::{
 };
 use camera_toolbox_core::{
     AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
-    CaptureMetadata, ChessboardDetection, EphemeralAsset, FullEepromImage, InitialIntrinsics,
-    IntegrityState, MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult,
-    write_opencv_pinhole_radtan_yaml,
+    CaptureMetadata, ChessboardDetection, EphemeralAsset, InitialIntrinsics, IntegrityState,
+    MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult, YgStereoModuleCode,
+    YgStereoSerialIdInput, parse_opencv_pinhole_radtan_yaml, write_opencv_pinhole_radtan_yaml,
 };
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -82,6 +82,7 @@ const POSE_AXIS_ORIGIN_RADIUS: f32 = 4.0;
 const POSE_AXIS_X_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 80, 80);
 const POSE_AXIS_Y_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 220, 120);
 const POSE_AXIS_Z_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 150, 255);
+const STALE_CALIBRATION_RESULT_REASON: &str = "Dataset selection changed after this result; re-run Calibrate before export or EEPROM provisioning.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalibrationJobKind {
@@ -105,7 +106,6 @@ fn observe_intrinsics_value_response(
 pub(crate) enum CalibrationExport {
     Json(serde_json::Value),
     Yaml(CalibrationSolution),
-    EepromBin(FullEepromImage),
 }
 
 impl CalibrationExport {
@@ -114,7 +114,6 @@ impl CalibrationExport {
         match self {
             Self::Json(_) => "camera_intrinsics.json",
             Self::Yaml(_) => "camera_intrinsics.yaml",
-            Self::EepromBin(_) => "camera_eeprom.bin",
         }
     }
 
@@ -123,7 +122,6 @@ impl CalibrationExport {
         match self {
             Self::Json(_) => "calibration JSON",
             Self::Yaml(_) => "calibration YAML",
-            Self::EepromBin(_) => "EEPROM BIN",
         }
     }
 
@@ -147,11 +145,14 @@ impl CalibrationExport {
             }
             Self::Yaml(solution) => write_opencv_pinhole_radtan_yaml(writer, solution)
                 .map_err(|error| FileSystemError::Io(error.to_string())),
-            Self::EepromBin(image) => writer
-                .write_all(image.as_bytes())
-                .map_err(FileSystemError::io),
         }
     }
+}
+
+/// 外部 YAML 标定结果只携带 EEPROM 写入所需的 K/D12/尺寸，不绑定当前 Dataset。
+struct LoadedCalibrationResult {
+    source: String,
+    solution: CalibrationSolution,
 }
 
 struct CalibrationSource {
@@ -721,6 +722,81 @@ fn run_dataset_pnp_refresh(
     DatasetPnpRefreshBatchResult { board, results }
 }
 
+#[derive(Clone, Debug)]
+struct CalibrationSnidDraft {
+    module: YgStereoModuleCode,
+    year: String,
+    month: String,
+    day: String,
+    optical_axis_class: u8,
+    sequence: String,
+}
+
+impl Default for CalibrationSnidDraft {
+    fn default() -> Self {
+        Self {
+            module: YgStereoModuleCode::Model233,
+            year: String::new(),
+            month: String::new(),
+            day: String::new(),
+            optical_axis_class: 0,
+            sequence: "1".to_owned(),
+        }
+    }
+}
+
+impl CalibrationSnidDraft {
+    /// 将 GUI 文本字段转换为 EEPROM SNID；错误直接作为写入禁用原因展示。
+    fn serial_number(&self) -> Result<String, String> {
+        let input = YgStereoSerialIdInput::new(
+            self.module,
+            parse_two_digit_year(&self.year)?,
+            parse_decimal_field("Month", &self.month)?,
+            parse_decimal_field("Day", &self.day)?,
+            self.optical_axis_class,
+            parse_decimal_field("Sequence", &self.sequence)?,
+        );
+        input.serial_number().map_err(|error| error.to_string())
+    }
+}
+
+fn parse_two_digit_year(text: &str) -> Result<u16, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err("Year is required for SNID generation.".to_owned());
+    }
+    if trimmed.len() != 2 || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("Year must be exactly two decimal digits, e.g. 26.".to_owned());
+    }
+    trimmed
+        .parse::<u16>()
+        .map_err(|_| "Year must be exactly two decimal digits, e.g. 26.".to_owned())
+}
+
+fn parse_decimal_field<T>(label: &str, text: &str) -> Result<T, String>
+where
+    T: std::str::FromStr,
+{
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label} is required for SNID generation."));
+    }
+    trimmed
+        .parse::<T>()
+        .map_err(|_| format!("{label} must be a decimal number."))
+}
+
+fn optical_axis_class_label(value: u8) -> &'static str {
+    match value {
+        0 => "0 - unclassified",
+        1 => "1 - L0",
+        2 => "2 - L1",
+        3 => "3 - R0",
+        4 => "4 - R1",
+        _ => "invalid",
+    }
+}
+
 pub(crate) struct CalibrationWorkspace {
     session: CalibrationSession,
     sources: HashMap<CalibrationItemId, CalibrationSource>,
@@ -735,8 +811,9 @@ pub(crate) struct CalibrationWorkspace {
     auto_capture: AutoCaptureSession,
     next_detection_batch_id: u64,
     status: String,
-    serial_number: String,
+    snid_draft: CalibrationSnidDraft,
     pending_export: Option<CalibrationExport>,
+    loaded_result: Option<LoadedCalibrationResult>,
     eeprom: CalibrationEepromState,
     board_cols: u16,
     board_rows: u16,
@@ -785,8 +862,9 @@ impl CalibrationWorkspace {
             calibration_cancellation: None,
             next_detection_batch_id: 1,
             status: "Add original PNG calibration images from Workspace Explorer.".to_owned(),
-            serial_number: String::new(),
+            snid_draft: CalibrationSnidDraft::default(),
             pending_export: None,
+            loaded_result: None,
             eeprom: CalibrationEepromState::default(),
             board_cols: board.inner_cols,
             board_rows: board.inner_rows,
@@ -817,6 +895,55 @@ impl CalibrationWorkspace {
                 ..AutoCaptureSession::default()
             },
         })
+    }
+
+    fn load_calibration_result_from_dialog(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("Calibration Result YAML", &["yaml", "yml"])
+            .pick_file()
+        else {
+            return;
+        };
+        let source = path.display().to_string();
+        match std::fs::read_to_string(&path) {
+            Ok(yaml) => self.load_calibration_result_from_yaml_str(&yaml, &source),
+            Err(error) => {
+                self.loaded_result = None;
+                self.status =
+                    format!("Failed to read Calibration Result YAML from {source}: {error}");
+            }
+        }
+    }
+
+    fn load_calibration_result_from_yaml_str(&mut self, yaml: &str, source: &str) {
+        match parse_opencv_pinhole_radtan_yaml(yaml) {
+            Ok(solution) => {
+                let width = solution.image_size.width;
+                let height = solution.image_size.height;
+                self.loaded_result = Some(LoadedCalibrationResult {
+                    source: source.to_owned(),
+                    solution,
+                });
+                self.status = format!(
+                    "Loaded Calibration Result YAML from {source} ({width}×{height}); EEPROM writes can use it without Calibrate."
+                );
+            }
+            Err(error) => {
+                self.loaded_result = None;
+                self.status = format!("Calibration Result YAML from {source} is invalid: {error}");
+            }
+        }
+    }
+
+    fn active_calibration_solution(&self) -> Option<&CalibrationSolution> {
+        self.loaded_result
+            .as_ref()
+            .map(|loaded| &loaded.solution)
+            .or_else(|| {
+                self.session
+                    .installed()
+                    .map(|installed| &installed.solution)
+            })
     }
 
     pub(crate) fn import(&mut self, candidates: Vec<CalibrationImportCandidate>) {
@@ -1550,6 +1677,16 @@ impl CalibrationWorkspace {
         self.eeprom.report_target_invalidated(message);
     }
 
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_bus_discovery_failed(&mut self, message: impl Into<String>) {
+        self.eeprom.report_bus_discovery_failed(message);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_bus_discovery(&mut self, buses: Vec<camera_toolbox_app::I2cBusInfo>) {
+        self.eeprom.report_bus_discovery(buses);
+    }
+
     pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
         self.eeprom.report_error(message);
     }
@@ -1860,9 +1997,13 @@ impl CalibrationWorkspace {
                 ui.separator();
             }
             ui.label(&self.status);
-            if let Some(installed) = self.session.installed() {
+            if let Some(installed) = self.session.latest_installed() {
                 ui.separator();
-                ui.monospace(format!("RMS {:.4} px", installed.solution.rms_error));
+                let response = ui.monospace(format!("RMS {:.4} px", installed.solution.rms_error));
+                if !self.session.latest_installed_is_current() {
+                    response.on_hover_text(STALE_CALIBRATION_RESULT_REASON);
+                    ui.weak("stale");
+                }
             }
         });
     }
@@ -1895,6 +2036,103 @@ impl CalibrationWorkspace {
         );
     }
 
+    fn render_eeprom_snid_editor(
+        &mut self,
+        ui: &mut egui::Ui,
+        snid_preview: Result<&str, &String>,
+    ) {
+        ui.label("YgStereo SNID");
+        ui.horizontal_wrapped(|ui| {
+            ui.weak("Fixed: resolution=2/FHD, vendor=T/SmartSens, algorithm=0, reserved=0");
+        });
+        egui::Grid::new("calibration_eeprom_snid_grid")
+            .num_columns(2)
+            .spacing(egui::vec2(12.0, 6.0))
+            .show(ui, |ui| {
+                ui.label("Module");
+                egui::ComboBox::from_id_salt("calibration_eeprom_snid_module")
+                    .selected_text(self.snid_draft.module.label())
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.snid_draft.module,
+                            YgStereoModuleCode::Model233,
+                            "233",
+                        );
+                        ui.selectable_value(
+                            &mut self.snid_draft.module,
+                            YgStereoModuleCode::Model235,
+                            "235",
+                        );
+                    });
+                ui.end_row();
+
+                ui.label("Ship date");
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Year");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.snid_draft.year)
+                            .desired_width(56.0)
+                            .hint_text("26"),
+                    );
+                    ui.label("Month");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.snid_draft.month)
+                            .desired_width(36.0)
+                            .hint_text("1-12"),
+                    );
+                    ui.label("Day");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.snid_draft.day)
+                            .desired_width(36.0)
+                            .hint_text("1-31"),
+                    );
+                });
+                ui.end_row();
+
+                ui.label("Optical axis class");
+                egui::ComboBox::from_id_salt("calibration_eeprom_snid_axis_class")
+                    .selected_text(optical_axis_class_label(self.snid_draft.optical_axis_class))
+                    .show_ui(ui, |ui| {
+                        for (value, label) in [
+                            (0, "0 - unclassified"),
+                            (1, "1 - L0"),
+                            (2, "2 - L1"),
+                            (3, "3 - R0"),
+                            (4, "4 - R1"),
+                        ] {
+                            ui.selectable_value(
+                                &mut self.snid_draft.optical_axis_class,
+                                value,
+                                label,
+                            );
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Sequence");
+                ui.horizontal_wrapped(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.snid_draft.sequence)
+                            .desired_width(72.0)
+                            .hint_text("1-3844"),
+                    );
+                    ui.weak("decimal input; encoded as base-62 high/low bytes");
+                });
+                ui.end_row();
+            });
+        match snid_preview {
+            Ok(value) => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Converted SNID");
+                    ui.monospace(value);
+                });
+            }
+            Err(error) => {
+                ui.colored_label(egui::Color32::YELLOW, format!("SNID incomplete: {error}"));
+            }
+        }
+    }
+
     fn render_calibration_result_panel(
         &mut self,
         context: &egui::Context,
@@ -1905,45 +2143,67 @@ impl CalibrationWorkspace {
         provision_target: Result<&str, &str>,
     ) {
         let idle = self.active_job.is_none();
-        let installed = self.session.installed().is_some();
-        let regular_export_enabled = idle && installed && export_enabled;
+        let current_result_installed = self.session.installed().is_some();
+        let loaded_result_installed = self.loaded_result.is_some();
+        let active_result_available = current_result_installed || loaded_result_installed;
+        let latest_result_installed = self.session.latest_installed().is_some();
+        let latest_result_current = self.session.latest_installed_is_current();
+        let stale_result =
+            latest_result_installed && !latest_result_current && !loaded_result_installed;
+        let json_export_enabled =
+            idle && current_result_installed && !loaded_result_installed && export_enabled;
+        let yaml_export_enabled =
+            idle && active_result_available && !stale_result && export_enabled;
+        let export_disabled_reason = if stale_result {
+            STALE_CALIBRATION_RESULT_REASON
+        } else {
+            export_reason.unwrap_or(
+                "A current or loaded calibration result and writable Explorer directory are required.",
+            )
+        };
+        let json_disabled_reason = if loaded_result_installed {
+            "Loaded YAML result is active and has no Dataset provenance; export YAML instead."
+        } else {
+            export_disabled_reason
+        };
+        let result_source_label = self
+            .loaded_result
+            .as_ref()
+            .map(|loaded| format!("Loaded YAML: {}", loaded.source));
+        let snid_result = self.snid_draft.serial_number();
+        let serial_number = snid_result.as_deref().unwrap_or("");
 
+        let mut load_clicked = false;
+        let mut json_export_clicked = false;
+        let mut yaml_export_clicked = false;
         egui::CollapsingHeader::new("Calibration result")
             .id_salt("calibration_result_foldout")
             .default_open(true)
             .show(ui, |ui| {
-                render_calibration_result(ui, self.session.installed());
+                render_calibration_result(
+                    ui,
+                    self.active_calibration_solution().or_else(|| {
+                        self.session
+                            .latest_installed()
+                            .map(|installed| &installed.solution)
+                    }),
+                    stale_result,
+                    result_source_label.as_deref(),
+                    loaded_result_installed,
+                );
                 ui.separator();
                 ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(regular_export_enabled, egui::Button::new("Export JSON"))
-                        .on_disabled_hover_text(export_reason.unwrap_or(
-                            "A calibration result and writable Explorer directory are required.",
-                        ))
-                        .clicked()
-                    {
-                        self.pending_export = self.json_export();
-                    }
-                    let export_yaml = ui
-                        .add_enabled(
-                            regular_export_enabled,
-                            egui::Button::new("Export YAML Result"),
-                        )
-                        .on_disabled_hover_text(export_reason.unwrap_or(
-                            "A calibration result and writable Explorer directory are required.",
-                        ))
-                        .clicked()
-                        .then(|| {
-                            self.session
-                                .installed()
-                                .map(|installed| installed.solution.clone())
-                        })
-                        .flatten();
-                    if let Some(solution) = export_yaml {
-                        self.pending_export = Some(CalibrationExport::Yaml(solution));
-                    }
+                    load_clicked = ui.button("Load Result").clicked();
+                    json_export_clicked = ui
+                        .add_enabled(json_export_enabled, egui::Button::new("Export JSON"))
+                        .on_disabled_hover_text(json_disabled_reason)
+                        .clicked();
+                    yaml_export_clicked = ui
+                        .add_enabled(yaml_export_enabled, egui::Button::new("Export YAML Result"))
+                        .on_disabled_hover_text(export_disabled_reason)
+                        .clicked();
                 });
-                if installed && !export_enabled {
+                if active_result_available && !export_enabled {
                     ui.colored_label(
                         egui::Color32::YELLOW,
                         export_reason
@@ -1952,55 +2212,47 @@ impl CalibrationWorkspace {
                 }
             });
 
-        let eeprom_error = self.eeprom_image().err();
+        if load_clicked {
+            self.load_calibration_result_from_dialog();
+        }
+        if json_export_clicked {
+            self.pending_export = self.json_export();
+        }
+        if yaml_export_clicked && let Some(solution) = self.active_calibration_solution().cloned() {
+            self.pending_export = Some(CalibrationExport::Yaml(solution));
+        }
+
+        let eeprom_solution = self.active_calibration_solution().cloned();
+        let eeprom_stale_result =
+            latest_result_installed && !latest_result_current && eeprom_solution.is_none();
+        let snid_error = snid_result.as_ref().err().map(String::as_str);
+        let eeprom_disabled_reason = if eeprom_stale_result {
+            Some(STALE_CALIBRATION_RESULT_REASON)
+        } else {
+            snid_error
+        };
+
         ui.collapsing("EEPROM Provisioning", |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("EEPROM SN");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.serial_number)
-                        .desired_width(160.0)
-                        .hint_text("14 ASCII bytes"),
-                );
-                ui.weak("Required only for EEPROM BIN / direct provisioning.");
-                let eeprom_enabled = regular_export_enabled && eeprom_error.is_none();
-                if ui
-                    .add_enabled(eeprom_enabled, egui::Button::new("Save EEPROM BIN"))
-                    .on_disabled_hover_text(
-                        eeprom_error.as_deref().unwrap_or(
-                            "A calibration result and valid 14-byte ASCII SN are required.",
-                        ),
-                    )
-                    .clicked()
-                    && let Ok(image) = self.eeprom_image()
-                {
-                    self.pending_export = Some(CalibrationExport::EepromBin(image));
-                }
-            });
-            if !export_enabled {
-                ui.colored_label(
-                    egui::Color32::YELLOW,
-                    export_reason
-                        .unwrap_or("Select a writable Explorer directory before exporting."),
-                );
+            self.render_eeprom_snid_editor(ui, snid_result.as_ref().map(String::as_str));
+            if let Some(reason) = eeprom_disabled_reason {
+                ui.colored_label(egui::Color32::YELLOW, reason);
             }
-            let solution = self
-                .session
-                .installed()
-                .map(|installed| installed.solution.clone());
             self.eeprom.render_body(
                 context,
                 ui,
-                solution.as_ref(),
-                &self.serial_number,
+                eeprom_solution.as_ref(),
+                serial_number,
                 sftp_source,
                 provision_target,
-                (!export_enabled).then_some(
-                    export_reason
-                        .unwrap_or("Select a writable Explorer directory before exporting."),
-                ),
+                eeprom_disabled_reason,
             );
         });
-        self.eeprom.render_confirmation(context, provision_target);
+        self.eeprom.render_confirmation(
+            context,
+            provision_target,
+            eeprom_solution.as_ref(),
+            serial_number,
+        );
     }
 
     fn render_controls(&mut self, ui: &mut egui::Ui) {
@@ -2008,6 +2260,9 @@ impl CalibrationWorkspace {
             self.refresh_auto_intrinsics_fields();
         }
         let idle = self.active_job.is_none();
+        let current_result_available = self.session.installed().is_some();
+        let latest_result_stale =
+            self.session.latest_installed().is_some() && !current_result_available;
         let setup_editable = !matches!(
             self.active_job,
             Some(CalibrationJobKind::Detect | CalibrationJobKind::Calibrate)
@@ -2143,13 +2398,14 @@ impl CalibrationWorkspace {
             }
             if ui
                 .add_enabled(
-                    idle && self.auto_capture.pending.is_none()
-                        && self.session.installed().is_some(),
+                    idle && self.auto_capture.pending.is_none() && current_result_available,
                     egui::Button::new("Use result as initial K+D12"),
                 )
-                .on_disabled_hover_text(
-                    "Requires an installed result and no active calibration or live candidate.",
-                )
+                .on_disabled_hover_text(if latest_result_stale {
+                    STALE_CALIBRATION_RESULT_REASON
+                } else {
+                    "Requires an installed result and no active calibration or live candidate."
+                })
                 .clicked()
             {
                 self.use_installed_result_as_initial_intrinsics();
@@ -2425,7 +2681,7 @@ impl CalibrationWorkspace {
         }
         let mut toggle = None;
         let mut select = None;
-        let installed = self.session.installed();
+        let installed = self.session.latest_installed();
         let selected = self.session.selected();
         let items = self.session.items();
         let assessment = self.dataset_acceptance_assessment();
@@ -2627,6 +2883,9 @@ impl CalibrationWorkspace {
                                 );
                             });
                             row.col(|ui| {
+                                render_total_gain_cell(ui, contribution, item.enabled);
+                            });
+                            row.col(|ui| {
                                 let reason = match &item.status {
                                     CalibrationItemStatus::Failed(reason) => reason.as_str(),
                                     CalibrationItemStatus::NotFound { .. } => {
@@ -2777,7 +3036,7 @@ impl CalibrationWorkspace {
         };
         let horizontal_flip = self.preview_viewport.horizontal_flip;
         let map = |point| image_point_to_preview(point, image_rect, width, height, horizontal_flip);
-        let projected = calibration_view(self.session.installed(), id)
+        let projected = calibration_view(self.session.latest_installed(), id)
             .map(|view| view.projected_points.as_slice());
         let current_dataset_pnp = item.pnp_observation.as_ref().and_then(|observation| {
             let binding = self.dataset_pnp_binding(detection.image_size)?;
@@ -3665,6 +3924,7 @@ impl CalibrationWorkspace {
                 WorkerEvent::Calibration { snapshot, result } => match result {
                     Ok(solution) => match self.session.install_solution(snapshot, solution) {
                         Ok(()) => {
+                            self.loaded_result = None;
                             self.status = "Calibration completed; result installed transactionally."
                                 .to_owned()
                         }
@@ -3906,15 +4166,6 @@ impl CalibrationWorkspace {
             "items": items,
             "solution": installed.solution,
         })))
-    }
-
-    fn eeprom_image(&self) -> Result<FullEepromImage, String> {
-        let installed = self
-            .session
-            .installed()
-            .ok_or_else(|| "Calibrate successfully before exporting EEPROM data.".to_owned())?;
-        FullEepromImage::from_solution(&installed.solution, &self.serial_number)
-            .map_err(|error| error.to_string())
     }
 }
 
@@ -4830,13 +5081,21 @@ fn distortion_coefficients_to_d12(values: &[f64]) -> [f64; 12] {
 
 fn render_calibration_result(
     ui: &mut egui::Ui,
-    installed: Option<&camera_toolbox_app::InstalledCalibration>,
+    solution: Option<&CalibrationSolution>,
+    stale: bool,
+    source_label: Option<&str>,
+    imported_metrics_missing: bool,
 ) {
-    let Some(installed) = installed else {
-        ui.weak("Run Calibrate to display final intrinsics and distortion coefficients.");
+    let Some(solution) = solution else {
+        ui.weak("Run Calibrate or Load Result YAML to display final intrinsics and distortion coefficients.");
         return;
     };
-    let solution = &installed.solution;
+    if let Some(source_label) = source_label {
+        ui.weak(source_label);
+    }
+    if stale {
+        ui.colored_label(egui::Color32::YELLOW, STALE_CALIBRATION_RESULT_REASON);
+    }
     let matrix = solution.camera_matrix;
     ui.horizontal_wrapped(|ui| {
         for (name, value) in [
@@ -4852,13 +5111,20 @@ fn render_calibration_result(
         }
     });
     ui.horizontal_wrapped(|ui| {
-        ui.monospace(format!(
-            "{}×{} · RMS {:.6} px · flags {}",
-            solution.image_size.width,
-            solution.image_size.height,
-            solution.rms_error,
-            solution.calibration_flags
-        ));
+        if imported_metrics_missing {
+            ui.monospace(format!(
+                "{}×{} · RMS N/A (not provided) · flags N/A (not provided)",
+                solution.image_size.width, solution.image_size.height
+            ));
+        } else {
+            ui.monospace(format!(
+                "{}×{} · RMS {:.6} px · flags {}",
+                solution.image_size.width,
+                solution.image_size.height,
+                solution.rms_error,
+                solution.calibration_flags
+            ));
+        }
     });
     ui.label("Camera matrix (row-major)");
     egui::Grid::new("calibration_result_matrix")
@@ -4899,6 +5165,147 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn loaded_yaml_result_becomes_active_without_dataset_calibration() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let yaml = "%YAML:1.0\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
+
+        workspace.load_calibration_result_from_yaml_str(yaml, "fixture.yaml");
+
+        let solution = workspace
+            .active_calibration_solution()
+            .expect("loaded YAML result must become the active result");
+        assert!(workspace.session.installed().is_none());
+        assert_eq!(
+            solution.image_size,
+            CalibrationImageSize::new(1920, 1080).unwrap()
+        );
+        assert_eq!(solution.camera_matrix[0], 878.7023);
+        assert_eq!(solution.distortion_coefficients.len(), 12);
+    }
+
+    #[test]
+    fn loaded_yaml_result_renders_missing_quality_metrics_as_not_provided() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let yaml = "%YAML:1.0\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
+        workspace.load_calibration_result_from_yaml_str(yaml, "fixture.yaml");
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            render_calibration_result(
+                ui,
+                workspace.active_calibration_solution(),
+                false,
+                Some("Loaded YAML: fixture.yaml"),
+                true,
+            );
+        });
+        let text = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Loaded YAML: fixture.yaml"), "{text}");
+        assert!(text.contains("RMS N/A (not provided)"), "{text}");
+        assert!(text.contains("flags N/A (not provided)"), "{text}");
+        assert!(!text.contains("RMS 0.000000"), "{text}");
+    }
+
+    #[test]
+    fn loaded_yaml_result_builds_eeprom_update_request() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let yaml = "%YAML:1.0\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
+
+        workspace.load_calibration_result_from_yaml_str(yaml, "fixture.yaml");
+
+        let image = camera_toolbox_core::FullEepromImage::from_solution(
+            workspace.active_calibration_solution().unwrap(),
+            "2T02D2567K0042",
+        )
+        .expect("loaded YAML result must encode to EEPROM image");
+        let request = image.update_calibration_request();
+        assert_eq!(
+            request.mode,
+            camera_toolbox_core::EepromProvisioningMode::UpdateCalibration
+        );
+        assert_eq!(request.serial_number, "2T02D2567K0042");
+        assert_eq!(request.segments.len(), 1);
+    }
+
+    #[test]
+    fn loaded_yaml_result_overrides_installed_solution_for_eeprom_image() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        for index in 0..3 {
+            install_detection_outcome(
+                &mut workspace,
+                &format!("installed-{index}.png"),
+                found_detection(640, 480),
+            );
+        }
+        let snapshot = workspace
+            .session
+            .calibration_snapshot(workspace.initial_intrinsics().unwrap())
+            .unwrap();
+        let views = snapshot
+            .request
+            .image_points
+            .iter()
+            .map(|points| camera_toolbox_core::ViewCalibrationResult {
+                rotation_vector: [0.0; 3],
+                translation_vector: [0.0, 0.0, 1.0],
+                projected_points: points.clone(),
+                reprojection_rmse: 0.1,
+                max_reprojection_error: 0.2,
+            })
+            .collect();
+        let installed_solution = CalibrationSolution {
+            image_size: snapshot.request.image_size,
+            camera_matrix: [620.0, 0.0, 318.0, 0.0, 621.0, 241.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+            rms_error: 0.15,
+            calibration_flags: camera_toolbox_core::PANGBOT_CALIBRATION_FLAGS,
+            views,
+        };
+        workspace
+            .session
+            .install_solution(snapshot, installed_solution)
+            .unwrap();
+        assert_eq!(
+            workspace
+                .active_calibration_solution()
+                .unwrap()
+                .camera_matrix[0],
+            620.0
+        );
+
+        let yaml = "%YAML:1.0\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
+        workspace.load_calibration_result_from_yaml_str(yaml, "fixture.yaml");
+
+        let image = camera_toolbox_core::FullEepromImage::from_solution(
+            workspace.active_calibration_solution().unwrap(),
+            "2T02D2567K0042",
+        )
+        .expect("loaded YAML result must encode to EEPROM image");
+        let eeprom_fx = f32::from_le_bytes(image.as_bytes()[0x18..0x1c].try_into().unwrap());
+        assert!((eeprom_fx - 878.7023_f32).abs() < 0.0001, "fx={eeprom_fx}");
+    }
+
+    #[test]
     fn enabled_row_without_admission_contribution_is_outside_active_set() {
         assert_eq!(
             admission_delta_cell_state(
@@ -4908,6 +5315,49 @@ mod tests {
                 |contribution| contribution.field_gain,
             ),
             AdmissionDeltaCellState::OutsideActiveAdmission
+        );
+    }
+
+    #[test]
+    fn dataset_table_renders_total_gain_cell() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        install_detection_outcome(&mut workspace, "view.png", found_detection(640, 480));
+        let assessment = workspace
+            .dataset_acceptance_assessment()
+            .expect("Found item should produce Dataset Acceptance assessment");
+        let [contribution] = assessment.item_contributions.as_slice() else {
+            panic!("expected one Dataset contribution");
+        };
+        assert!(contribution.pnp_state.is_blocked());
+        assert!(contribution.constraint_gain > 0.0);
+        let expected_gain = format!("+{}*", format_gain(contribution.constraint_gain));
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1600.0, 600.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            workspace.render_dataset(ui, true);
+        });
+        let text = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree is enabled")
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("Gain"), "missing Gain header in {text}");
+        assert!(
+            text.contains(&expected_gain),
+            "missing total gain cell {expected_gain:?} in {text}"
         );
     }
 
@@ -5851,6 +6301,71 @@ mod tests {
     }
 
     #[test]
+    fn eeprom_snid_editor_renders_converted_preview() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        workspace.snid_draft = CalibrationSnidDraft {
+            module: YgStereoModuleCode::Model235,
+            year: "26".to_owned(),
+            month: "1".to_owned(),
+            day: "9".to_owned(),
+            optical_axis_class: 0,
+            sequence: "1".to_owned(),
+        };
+        let snid = workspace.snid_draft.serial_number().unwrap();
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(900.0, 480.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            workspace.render_eeprom_snid_editor(ui, Ok(&snid));
+        });
+        let text = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        for expected in [
+            "YgStereo SNID",
+            "Fixed: resolution=2/FHD, vendor=T/SmartSens, algorithm=0, reserved=0",
+            "Converted SNID",
+            "2T235261900000",
+        ] {
+            assert!(text.contains(expected), "missing {expected:?} in {text}");
+        }
+    }
+
+    #[test]
+    fn eeprom_snid_year_requires_two_decimal_digits() {
+        assert_eq!(parse_two_digit_year("26").unwrap(), 26);
+        assert!(
+            parse_two_digit_year("6")
+                .unwrap_err()
+                .contains("two decimal digits")
+        );
+        assert!(
+            parse_two_digit_year("2026")
+                .unwrap_err()
+                .contains("two decimal digits")
+        );
+        assert!(
+            parse_two_digit_year("2A")
+                .unwrap_err()
+                .contains("two decimal digits")
+        );
+    }
+
+    #[test]
     fn installed_solution_renders_intrinsics_distortion_and_inline_rmse() {
         let context = egui::Context::default();
         context.enable_accesskit();
@@ -5943,6 +6458,52 @@ mod tests {
         assert!(!text.contains("Reprojection RMSE"));
         assert!(!text.contains("Wheel: zoom"));
         assert!(!text.contains("Remove selected"));
+
+        let toggled_item_id = workspace.session.latest_installed().unwrap().item_ids[0];
+        workspace
+            .session
+            .set_enabled(toggled_item_id, false)
+            .unwrap();
+        assert!(workspace.session.installed().is_none());
+        assert!(calibration_view(workspace.session.latest_installed(), toggled_item_id).is_some());
+        let stale_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let stale_output = context.run_ui(stale_input, |ui| {
+            workspace.render(
+                &context,
+                ui,
+                true,
+                None,
+                Err("SFTP not connected"),
+                Err("EEPROM not configured"),
+                false,
+                |_| None,
+            );
+        });
+        let stale_text = stale_output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+        for expected in [
+            STALE_CALIBRATION_RESULT_REASON,
+            "620.00000000",
+            "k1[0] = 0.1000000000",
+        ] {
+            assert!(
+                stale_text.contains(expected),
+                "missing retained stale result field {expected:?} in {stale_text}"
+            );
+        }
     }
 
     #[test]

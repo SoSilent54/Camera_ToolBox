@@ -7,9 +7,34 @@ use std::io::Write;
 
 use thiserror::Error;
 
-use crate::calibration::CalibrationSolution;
+use crate::calibration::{
+    CalibrationDataError, CalibrationImageSize, CalibrationSolution, InitialIntrinsics,
+    PANGBOT_CALIBRATION_FLAGS,
+};
 
 const OPENCV_D12_COEFFICIENT_COUNT: usize = 12;
+
+#[derive(Default)]
+struct OpenCvPinholeRadtanYamlFields {
+    fx: Option<f64>,
+    fy: Option<f64>,
+    cx: Option<f64>,
+    cy: Option<f64>,
+    k1: Option<f64>,
+    k2: Option<f64>,
+    p1: Option<f64>,
+    p2: Option<f64>,
+    k3: Option<f64>,
+    k4: Option<f64>,
+    k5: Option<f64>,
+    k6: Option<f64>,
+    s1: Option<f64>,
+    s2: Option<f64>,
+    s3: Option<f64>,
+    s4: Option<f64>,
+    width: Option<u32>,
+    height: Option<u32>,
+}
 
 /// 将完整 D12 标定结果按固定 OpenCV YAML 文本布局写入输出流。
 ///
@@ -81,12 +106,161 @@ pub fn encode_opencv_pinhole_radtan_yaml(
     Ok(bytes)
 }
 
+/// 从固定 OpenCV Pinhole Rational + Thin-Prism D12 YAML 文本恢复 EEPROM 所需标定结果。
+///
+/// 该导入路径只恢复内参、D12 畸变和图像尺寸；逐图外参/重投影统计不在导出 YAML 中，
+/// 因此以空 `views` 和 0 RMS 安装为外部结果，专供复用与 EEPROM 写入。
+pub fn parse_opencv_pinhole_radtan_yaml(
+    input: &str,
+) -> Result<CalibrationSolution, CalibrationYamlError> {
+    let mut fields = OpenCvPinholeRadtanYamlFields::default();
+    for (line_index, raw_line) in input.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty()
+            || trimmed.starts_with('#')
+            || trimmed.starts_with('%')
+            || trimmed == "---"
+            || trimmed == "..."
+        {
+            continue;
+        }
+        let content = trimmed
+            .split_once('#')
+            .map_or(trimmed, |(before, _)| before.trim());
+        if content.is_empty() {
+            continue;
+        }
+        let Some((key, raw_value)) = content.split_once(':') else {
+            return Err(CalibrationYamlError::InvalidLine {
+                line: line_index + 1,
+            });
+        };
+        let key = key.trim();
+        let raw_value = raw_value.trim();
+        match key {
+            "fx" => set_f64_field(&mut fields.fx, "fx", raw_value)?,
+            "fy" => set_f64_field(&mut fields.fy, "fy", raw_value)?,
+            "cx" => set_f64_field(&mut fields.cx, "cx", raw_value)?,
+            "cy" => set_f64_field(&mut fields.cy, "cy", raw_value)?,
+            "k1" => set_f64_field(&mut fields.k1, "k1", raw_value)?,
+            "k2" => set_f64_field(&mut fields.k2, "k2", raw_value)?,
+            "p1" => set_f64_field(&mut fields.p1, "p1", raw_value)?,
+            "p2" => set_f64_field(&mut fields.p2, "p2", raw_value)?,
+            "k3" => set_f64_field(&mut fields.k3, "k3", raw_value)?,
+            "k4" => set_f64_field(&mut fields.k4, "k4", raw_value)?,
+            "k5" => set_f64_field(&mut fields.k5, "k5", raw_value)?,
+            "k6" => set_f64_field(&mut fields.k6, "k6", raw_value)?,
+            "s1" => set_f64_field(&mut fields.s1, "s1", raw_value)?,
+            "s2" => set_f64_field(&mut fields.s2, "s2", raw_value)?,
+            "s3" => set_f64_field(&mut fields.s3, "s3", raw_value)?,
+            "s4" => set_f64_field(&mut fields.s4, "s4", raw_value)?,
+            "width" => set_u32_field(&mut fields.width, "width", raw_value)?,
+            "height" => set_u32_field(&mut fields.height, "height", raw_value)?,
+            _ => {}
+        }
+    }
+
+    let fx = required_field(fields.fx, "fx")?;
+    let fy = required_field(fields.fy, "fy")?;
+    let cx = required_field(fields.cx, "cx")?;
+    let cy = required_field(fields.cy, "cy")?;
+    let distortion_coefficients = vec![
+        required_field(fields.k1, "k1")?,
+        required_field(fields.k2, "k2")?,
+        required_field(fields.p1, "p1")?,
+        required_field(fields.p2, "p2")?,
+        required_field(fields.k3, "k3")?,
+        required_field(fields.k4, "k4")?,
+        required_field(fields.k5, "k5")?,
+        required_field(fields.k6, "k6")?,
+        required_field(fields.s1, "s1")?,
+        required_field(fields.s2, "s2")?,
+        required_field(fields.s3, "s3")?,
+        required_field(fields.s4, "s4")?,
+    ];
+    let image_size = CalibrationImageSize::new(
+        required_field(fields.width, "width")?,
+        required_field(fields.height, "height")?,
+    )?;
+    let camera_matrix = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0];
+    InitialIntrinsics {
+        camera_matrix,
+        distortion_coefficients: distortion_coefficients.clone(),
+    }
+    .validate()?;
+
+    Ok(CalibrationSolution {
+        image_size,
+        camera_matrix,
+        distortion_coefficients,
+        rms_error: 0.0,
+        calibration_flags: PANGBOT_CALIBRATION_FLAGS,
+        views: Vec::new(),
+    })
+}
+
+fn set_f64_field(
+    slot: &mut Option<f64>,
+    field: &'static str,
+    raw_value: &str,
+) -> Result<(), CalibrationYamlError> {
+    let value = raw_value
+        .parse::<f64>()
+        .map_err(|_| CalibrationYamlError::InvalidField {
+            field,
+            value: raw_value.to_owned(),
+        })?;
+    if !value.is_finite() {
+        return Err(CalibrationYamlError::NonFiniteField { field });
+    }
+    set_field(slot, field, value)
+}
+
+fn set_u32_field(
+    slot: &mut Option<u32>,
+    field: &'static str,
+    raw_value: &str,
+) -> Result<(), CalibrationYamlError> {
+    let value = raw_value
+        .parse::<u32>()
+        .map_err(|_| CalibrationYamlError::InvalidField {
+            field,
+            value: raw_value.to_owned(),
+        })?;
+    set_field(slot, field, value)
+}
+
+fn set_field<T>(
+    slot: &mut Option<T>,
+    field: &'static str,
+    value: T,
+) -> Result<(), CalibrationYamlError> {
+    if slot.replace(value).is_some() {
+        return Err(CalibrationYamlError::DuplicateField { field });
+    }
+    Ok(())
+}
+
+fn required_field<T>(value: Option<T>, field: &'static str) -> Result<T, CalibrationYamlError> {
+    value.ok_or(CalibrationYamlError::MissingField { field })
+}
+
 #[derive(Debug, Error)]
 pub enum CalibrationYamlError {
     #[error("Pinhole-Radtan D12 YAML requires {required} distortion coefficients, got {actual}")]
     MissingDistortionCoefficients { required: usize, actual: usize },
+    #[error("Pinhole-Radtan D12 YAML line {line} is not a key-value field")]
+    InvalidLine { line: usize },
+    #[error("Pinhole-Radtan D12 YAML field {field} is duplicated")]
+    DuplicateField { field: &'static str },
+    #[error("Pinhole-Radtan D12 YAML field {field} is missing")]
+    MissingField { field: &'static str },
+    #[error("Pinhole-Radtan D12 YAML field {field} has invalid value {value:?}")]
+    InvalidField { field: &'static str, value: String },
     #[error("Pinhole-Radtan D12 YAML field {field} is NaN or infinity")]
     NonFiniteField { field: &'static str },
+    #[error("Pinhole-Radtan D12 YAML data is invalid: {0}")]
+    InvalidData(#[from] CalibrationDataError),
     #[error("Pinhole-Radtan D12 YAML write failed: {0}")]
     Write(#[from] std::io::Error),
 }
@@ -128,6 +302,45 @@ mod tests {
             String::from_utf8(encode_opencv_pinhole_radtan_yaml(&solution).unwrap()).unwrap();
         let expected = "%YAML:1.0\n# Pinhole-Radtan intrinsics\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn parses_d12_yaml_text_layout() {
+        let yaml = "%YAML:1.0\n# Pinhole-Radtan intrinsics\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
+
+        let solution = parse_opencv_pinhole_radtan_yaml(yaml).unwrap();
+
+        assert_eq!(
+            solution.image_size,
+            CalibrationImageSize::new(1920, 1080).unwrap()
+        );
+        assert_eq!(
+            solution.camera_matrix,
+            [
+                878.7023, 0.0, 955.6284, 0.0, 878.5325, 533.1718, 0.0, 0.0, 1.0
+            ]
+        );
+        assert_eq!(solution.distortion_coefficients.len(), 12);
+        assert_eq!(solution.distortion_coefficients[8], 0.000_011_11);
+        assert_eq!(solution.rms_error, 0.0);
+        assert_eq!(solution.calibration_flags, PANGBOT_CALIBRATION_FLAGS);
+        assert!(solution.views.is_empty());
+    }
+
+    #[test]
+    fn rejects_missing_duplicate_or_nonfinite_yaml_fields() {
+        assert!(matches!(
+            parse_opencv_pinhole_radtan_yaml("fx: 1\n"),
+            Err(CalibrationYamlError::MissingField { field: "fy" })
+        ));
+        assert!(matches!(
+            parse_opencv_pinhole_radtan_yaml("fx: 1\nfx: 2\n"),
+            Err(CalibrationYamlError::DuplicateField { field: "fx" })
+        ));
+        assert!(matches!(
+            parse_opencv_pinhole_radtan_yaml("fx: NaN\n"),
+            Err(CalibrationYamlError::NonFiniteField { field: "fx" })
+        ));
     }
 
     #[test]

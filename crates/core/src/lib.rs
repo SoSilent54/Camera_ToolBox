@@ -8,6 +8,7 @@ pub mod calibration;
 pub mod calibration_eeprom;
 pub mod calibration_yaml;
 pub mod color;
+pub mod eeprom_map_config;
 pub mod image;
 pub mod image_analysis;
 pub mod raw;
@@ -30,19 +31,30 @@ pub use calibration::{
     PANGBOT_CALIBRATION_FLAGS, ViewCalibrationResult,
 };
 pub use calibration_eeprom::{
-    CalibrationStorageMap, EepromImageError, EepromProvisionRequest, EepromProvisionRequestError,
-    EepromProvisioningMode, EepromTransportSpec, EepromWriteSegment, FullEepromImage,
-    StorageEncoding, StorageField, YG_STEREO_P24C64G_FLAG, YG_STEREO_P24C64G_IMAGE_BYTES,
-    YG_STEREO_P24C64G_INTRINSICS_BYTES, YG_STEREO_P24C64G_V1_MAP_ID, serial_checksum,
+    BATON_PARAM_RW_IMAGE_BYTES, BATON_PARAM_RW_NATIVE_LP64_LE_V1_MAP_ID, CalibrationStorageMap,
+    EepromImageError, EepromProvisionRequest, EepromProvisionRequestError, EepromProvisioningMode,
+    EepromTransportSpec, EepromWriteSegment, FullEepromImage, PUEO_EDU_DF9_40_IMAGE_BYTES,
+    PUEO_EDU_DF9_40_NATIVE_LP64_LE_V1_MAP_ID, StorageEncoding, StorageField,
+    YG_STEREO_P24C64G_FLAG, YG_STEREO_P24C64G_IMAGE_BYTES, YG_STEREO_P24C64G_INTRINSICS_BYTES,
+    YG_STEREO_P24C64G_V1_MAP_ID, YgStereoModuleCode, YgStereoSerialIdError, YgStereoSerialIdInput,
+    baton_param_rw_native_lp64_le_v1, pueo_edu_df9_40_native_lp64_le_v1, serial_checksum,
     yg_stereo_p24c64g_v1,
 };
 pub use calibration_yaml::{
-    CalibrationYamlError, encode_opencv_pinhole_radtan_yaml, write_opencv_pinhole_radtan_yaml,
+    CalibrationYamlError, encode_opencv_pinhole_radtan_yaml, parse_opencv_pinhole_radtan_yaml,
+    write_opencv_pinhole_radtan_yaml,
 };
 pub use color::{
     BayerPrepareDiagnostics, CfaQuad, CfaSite, ColorPipelineParams, ColorPixel,
     ColorRenderDiagnostics, ColorRenderError, DEFAULT_DISPLAY_GAMMA, DisplayTransform, LinearRgb,
     PreparedBayer, Rgb8, render_pixel_at,
+};
+pub use eeprom_map_config::{
+    BuiltInEepromMapConfig, CompiledEepromMapConfig, CompiledEepromMapField, EepromMapConfigError,
+    IMX219_EEPROM_CALIBRATION_CONFIG_NAME, PUEO_EDU_DF9_40_PINOUT_CONFIG_NAME,
+    builtin_eeprom_map_config_text, canonical_text_from_storage_map,
+    compile_builtin_eeprom_map_config, compile_eeprom_map_config_text,
+    dump_builtin_eeprom_map_config, list_builtin_eeprom_map_configs,
 };
 pub use image::{
     ImageFrameError, ImagePlane, NativeImage, NativePixelSample, Rgba8Frame, Yuv420SpFrame,
