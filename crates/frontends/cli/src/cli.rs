@@ -2,22 +2,32 @@
 use std::num::NonZeroU64;
 use std::path::PathBuf;
 
-#[cfg(feature = "platform-cv610")]
-use clap::ArgGroup;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Debug, Parser)]
 #[command(name = "camera-toolbox")]
 #[command(about = "Rust-only ISP calibration toolbox CLI")]
 pub struct Cli {
+    /// List built-in EEPROM map configs.
+    #[arg(long)]
+    pub(crate) list_configs: bool,
+    /// Dump one built-in EEPROM map config as canonical text.
+    #[arg(long, value_name = "NAME")]
+    pub(crate) dump_config: Option<String>,
     #[command(subcommand)]
-    pub(crate) command: Command,
+    pub(crate) command: Option<Command>,
 }
 
 impl Cli {
     #[must_use]
-    pub const fn command_name(&self) -> &'static str {
-        self.command.name()
+    pub fn command_name(&self) -> &'static str {
+        if self.list_configs {
+            "eeprom_config_list"
+        } else if self.dump_config.is_some() {
+            "eeprom_config_dump"
+        } else {
+            self.command.as_ref().map_or("none", Command::name)
+        }
     }
 }
 
@@ -27,6 +37,8 @@ pub(crate) enum Command {
     Smoke,
     /// Analyze a local unpacked u16le RAW file with an explicit spec.
     AnalyzeRaw(AnalyzeRawArgs),
+    /// Import and validate a canonical EEPROM map config.
+    ImportEepromMap(ImportEepromMapArgs),
     /// Inspect or validate the versioned platform profile store.
     Profile {
         #[command(subcommand)]
@@ -59,6 +71,7 @@ impl Command {
         match self {
             Self::Smoke => "smoke",
             Self::AnalyzeRaw(_) => "analyze_raw",
+            Self::ImportEepromMap(_) => "import_eeprom_map",
             Self::Profile { command } => command.name(),
             Self::Platform { command } => command.name(),
             #[cfg(feature = "platform-cv610")]
@@ -135,6 +148,21 @@ impl SshCommand {
             Self::Fetch(_) => "ssh_fetch",
         }
     }
+}
+
+#[derive(Debug, Clone, Args)]
+#[command(group(
+    ArgGroup::new("config_source")
+        .required(true)
+        .args(["config_file", "config_text"])
+))]
+pub struct ImportEepromMapArgs {
+    /// Canonical EEPROM map config file to validate/import.
+    #[arg(long, value_name = "PATH")]
+    pub config_file: Option<PathBuf>,
+    /// Canonical EEPROM map config text to validate/import.
+    #[arg(long, value_name = "TEXT")]
+    pub config_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -307,7 +335,7 @@ mod tests {
             Cli::try_parse_from(["camera-toolbox", "smoke"])
                 .unwrap()
                 .command,
-            Command::Smoke
+            Some(Command::Smoke)
         ));
         assert!(matches!(
             Cli::try_parse_from([
@@ -324,13 +352,13 @@ mod tests {
             ])
             .unwrap()
             .command,
-            Command::AnalyzeRaw(_)
+            Some(Command::AnalyzeRaw(_))
         ));
         assert!(matches!(
             Cli::try_parse_from(["camera-toolbox", "platform", "probe", "--platform", "lab"])
                 .unwrap()
                 .command,
-            Command::Platform { .. }
+            Some(Command::Platform { .. })
         ));
         #[cfg(feature = "platform-cv610")]
         {
@@ -346,9 +374,9 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 parsed.command,
-                Command::Cv610 {
+                Some(Command::Cv610 {
                     command: Cv610Command::Dump(_)
-                }
+                })
             ));
         }
         #[cfg(feature = "platform-ssh")]
@@ -363,12 +391,48 @@ mod tests {
                 "raw12",
             ])
             .unwrap();
-            assert!(matches!(parsed.command, Command::Ssh { .. }));
+            assert!(matches!(parsed.command, Some(Command::Ssh { .. })));
         }
         #[cfg(not(feature = "platform-cv610"))]
         assert!(Cli::try_parse_from(["camera-toolbox", "cv610", "dump"]).is_err());
         #[cfg(not(feature = "platform-ssh"))]
         assert!(Cli::try_parse_from(["camera-toolbox", "ssh", "capture"]).is_err());
+    }
+
+    #[test]
+    fn parses_eeprom_map_config_entrypoints() {
+        let parsed = Cli::try_parse_from(["camera-toolbox", "--list-configs"]).unwrap();
+        assert!(parsed.list_configs);
+        assert!(parsed.command.is_none());
+
+        let parsed =
+            Cli::try_parse_from(["camera-toolbox", "--dump-config", "pueo-edu-df9-40-pinout"])
+                .unwrap();
+        assert_eq!(
+            parsed.dump_config.as_deref(),
+            Some("pueo-edu-df9-40-pinout")
+        );
+
+        let parsed = Cli::try_parse_from([
+            "camera-toolbox",
+            "import-eeprom-map",
+            "--config-text",
+            "PUEO-EDU DF9-40, I2C0, 0x50, Addr16, Page16, Size1\nRemark / Offset / Size / Type\nA / 0x0000 / 1 / U8\n",
+        ])
+        .unwrap();
+        assert!(matches!(parsed.command, Some(Command::ImportEepromMap(_))));
+
+        assert!(
+            Cli::try_parse_from([
+                "camera-toolbox",
+                "import-eeprom-map",
+                "--config-file",
+                "a.txt",
+                "--config-text",
+                "text",
+            ])
+            .is_err()
+        );
     }
 
     #[test]

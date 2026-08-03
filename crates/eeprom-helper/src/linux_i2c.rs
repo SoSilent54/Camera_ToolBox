@@ -3,12 +3,17 @@
 use std::{thread, time::Duration};
 
 use camera_toolbox_core::CalibrationStorageMap;
-use i2cdev::{core::I2CDevice, linux::LinuxI2CDevice};
+use i2cdev::{
+    core::{I2CMessage, I2CTransfer},
+    linux::{LinuxI2CBus, LinuxI2CMessage},
+};
 
 use crate::engine::EepromDevice;
 
 pub(crate) struct LinuxEepromDevice {
-    device: LinuxI2CDevice,
+    bus: LinuxI2CBus,
+    bus_number: u32,
+    address: u16,
     page_size: usize,
     write_cycle: Duration,
 }
@@ -22,18 +27,26 @@ impl LinuxEepromDevice {
             ));
         }
         let path = format!("/dev/i2c-{bus}");
-        let device =
-            LinuxI2CDevice::new(&path, u16::from(map.transport.i2c_address)).map_err(|error| {
-                format!(
-                    "open {path} address 0x{:02x}: {error}",
-                    map.transport.i2c_address
-                )
-            })?;
+        let bus_device = LinuxI2CBus::new(&path).map_err(|error| {
+            format!(
+                "open {path} address 0x{:02x}: {error}",
+                map.transport.i2c_address
+            )
+        })?;
         Ok(Self {
-            device,
+            bus: bus_device,
+            bus_number: bus,
+            address: u16::from(map.transport.i2c_address),
             page_size: usize::from(map.transport.page_size_bytes),
             write_cycle: Duration::from_millis(u64::from(map.transport.write_cycle_ms)),
         })
+    }
+
+    fn transfer(&mut self, messages: &mut [LinuxI2CMessage<'_>]) -> Result<(), String> {
+        self.bus
+            .transfer(messages)
+            .map(|_| ())
+            .map_err(|error| format!("I2C_RDWR on /dev/i2c-{} failed: {error}", self.bus_number))
     }
 }
 
@@ -46,12 +59,19 @@ impl EepromDevice for LinuxEepromDevice {
                 .checked_add(consumed)
                 .and_then(|value| u16::try_from(value).ok())
                 .ok_or_else(|| "EEPROM read offset overflow".to_owned())?;
-            self.device
-                .write(&current.to_be_bytes())
-                .map_err(|error| format!("set EEPROM read offset 0x{current:04x}: {error}"))?;
-            self.device
-                .read(&mut bytes[consumed..consumed + count])
-                .map_err(|error| format!("read EEPROM at 0x{current:04x}: {error}"))?;
+            let offset_bytes = current.to_be_bytes();
+            let mut read_buffer = vec![0_u8; count];
+            let mut messages = [
+                LinuxI2CMessage::write(&offset_bytes).with_address(self.address),
+                LinuxI2CMessage::read(read_buffer.as_mut_slice()).with_address(self.address),
+            ];
+            self.transfer(&mut messages).map_err(|error| {
+                format!(
+                    "set EEPROM read offset 0x{current:04x} via I2C_RDWR on /dev/i2c-{}: {error}",
+                    self.bus_number
+                )
+            })?;
+            bytes[consumed..consumed + count].copy_from_slice(&read_buffer);
             consumed += count;
         }
         Ok(())
@@ -77,9 +97,13 @@ impl EepromDevice for LinuxEepromDevice {
         let mut frame = Vec::with_capacity(bytes.len() + 2);
         frame.extend_from_slice(&offset.to_be_bytes());
         frame.extend_from_slice(bytes);
-        self.device
-            .write(&frame)
-            .map_err(|error| format!("write EEPROM page at 0x{offset:04x}: {error}"))?;
+        let mut messages = [LinuxI2CMessage::write(&frame).with_address(self.address)];
+        self.transfer(&mut messages).map_err(|error| {
+            format!(
+                "write EEPROM page at 0x{offset:04x} via I2C_RDWR on /dev/i2c-{}: {error}",
+                self.bus_number
+            )
+        })?;
         thread::sleep(self.write_cycle);
         Ok(())
     }

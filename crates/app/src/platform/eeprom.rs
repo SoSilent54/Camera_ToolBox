@@ -24,13 +24,9 @@ pub struct EepromHelperTarget {
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EepromHelperAction {
     Inspect,
-    DryRun {
-        request: EepromProvisionRequest,
-    },
     Provision {
         request: EepromProvisionRequest,
         expected_before_sha256: String,
-        dry_run_token: String,
     },
 }
 
@@ -86,15 +82,6 @@ pub struct EepromInspectResult {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct EepromDryRunResult {
-    pub state: EepromDeviceState,
-    pub backup: Vec<u8>,
-    pub page_plan: Vec<EepromPageWritePlan>,
-    pub dry_run_token: String,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EepromWriteResult {
     pub before: EepromDeviceState,
     pub after: EepromDeviceState,
@@ -108,7 +95,6 @@ pub struct EepromWriteResult {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum EepromHelperResult {
     Inspect(EepromInspectResult),
-    DryRun(EepromDryRunResult),
     Provision(EepromWriteResult),
 }
 

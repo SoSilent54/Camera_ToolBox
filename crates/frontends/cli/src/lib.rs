@@ -2,15 +2,18 @@ mod cli;
 mod json;
 mod platform;
 
-use std::str::FromStr;
+use std::{fs, str::FromStr};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use camera_toolbox_adapters::{LocalRawLoader, MemoryArtifactStore, SyntheticCaptureAdapter};
 use camera_toolbox_app::{CaptureAndAnalyzeRequest, LocalRawAnalyzeRequest, Workflow};
-use camera_toolbox_core::{BayerPattern, RawEncoding, RawSpec, Roi, sensor::CaptureRequest};
+use camera_toolbox_core::{
+    BayerPattern, RawEncoding, RawSpec, Roi, compile_eeprom_map_config_text,
+    dump_builtin_eeprom_map_config, list_builtin_eeprom_map_configs, sensor::CaptureRequest,
+};
 
 pub use cli::Cli;
-use cli::{AnalyzeRawArgs, BayerArg, Command, EncodingArg};
+use cli::{AnalyzeRawArgs, BayerArg, Command, EncodingArg, ImportEepromMapArgs};
 
 /// Execute one already-parsed CLI command.
 ///
@@ -19,9 +22,25 @@ use cli::{AnalyzeRawArgs, BayerArg, Command, EncodingArg};
 /// Returns profile, binding, resolution, submission, terminal-job, persistence, or workflow
 /// failures so the process entrypoint exits nonzero.
 pub fn run(cli: Cli) -> Result<()> {
-    match cli.command {
+    if cli.list_configs {
+        if cli.command.is_some() || cli.dump_config.is_some() {
+            bail!("--list-configs cannot be combined with another command or --dump-config");
+        }
+        return list_eeprom_map_configs();
+    }
+    if let Some(name) = cli.dump_config {
+        if cli.command.is_some() {
+            bail!("--dump-config cannot be combined with a subcommand");
+        }
+        return dump_eeprom_map_config(&name);
+    }
+    let Some(command) = cli.command else {
+        bail!("missing CLI command")
+    };
+    match command {
         Command::Smoke => run_smoke(),
         Command::AnalyzeRaw(args) => analyze_raw(args),
+        Command::ImportEepromMap(args) => import_eeprom_map(args),
         Command::Profile { command } => platform::run_profile(command),
         Command::Platform { command } => platform::run_platform(command),
         #[cfg(feature = "platform-cv610")]
@@ -31,6 +50,55 @@ pub fn run(cli: Cli) -> Result<()> {
         #[cfg(feature = "platform-ssh")]
         Command::Ssh { command } => platform::run_ssh(command),
     }
+}
+
+fn list_eeprom_map_configs() -> Result<()> {
+    let configs = list_builtin_eeprom_map_configs()
+        .iter()
+        .map(|config| {
+            json::json!({
+                "name": config.name,
+                "display_name": config.display_name,
+                "source_map_id": config.source_map_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    println!("{}", json::json!({"configs": configs}));
+    Ok(())
+}
+
+fn dump_eeprom_map_config(name: &str) -> Result<()> {
+    let text = dump_builtin_eeprom_map_config(name)?;
+    print!("{text}");
+    Ok(())
+}
+
+fn import_eeprom_map(args: ImportEepromMapArgs) -> Result<()> {
+    let text = match (args.config_file, args.config_text) {
+        (Some(path), None) => fs::read_to_string(&path)
+            .map_err(|error| anyhow!("failed to read {}: {error}", path.display()))?,
+        (None, Some(text)) => text,
+        (Some(_), Some(_)) => bail!("--config-file and --config-text are mutually exclusive"),
+        (None, None) => bail!("import-eeprom-map requires --config-file or --config-text"),
+    };
+    let compiled =
+        compile_eeprom_map_config_text("imported-eeprom-map", "Imported EEPROM map", &text)?;
+    println!(
+        "{}",
+        json::json!({
+            "id": compiled.id,
+            "display_name": compiled.display_name,
+            "header_name": compiled.header_name,
+            "bus_label": compiled.bus_label,
+            "total_bytes": compiled.total_bytes,
+            "field_count": compiled.fields.len(),
+            "i2c_address": compiled.transport.i2c_address,
+            "address_width_bits": compiled.transport.address_width_bits,
+            "page_size_bytes": compiled.transport.page_size_bytes,
+            "write_cycle_ms": compiled.transport.write_cycle_ms,
+        })
+    );
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy)]

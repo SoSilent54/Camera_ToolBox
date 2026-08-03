@@ -20,11 +20,11 @@ use camera_toolbox_app::{
     AutoCaptureAcceptanceCriteria, AutoCaptureAcquisitionKey, AutoCaptureBaseline,
     CalibrationBackend, CalibrationCancellation, CalibrationEncodedPng, CalibrationInputKey,
     CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
-    CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EepromDryRunResult,
-    EepromInspectResult, EepromWriteResult, EntryName, ExportDestination, ExportReceipt,
-    ExportService, FileSourceId, FileSystem, FileSystemError, FsCancellation, FsControl,
-    InitialIntrinsicsBinding, OperationId, PnPObservation, RasterImageCodec, SnapshotHash,
-    StreamCaptureId, StreamFrameIdentity, StreamSessionId, host_monotonic_time_ns,
+    CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EepromInspectResult,
+    EepromWriteResult, EntryName, ExportDestination, ExportReceipt, ExportService, FileSourceId,
+    FileSystem, FileSystemError, FsCancellation, FsControl, InitialIntrinsicsBinding, OperationId,
+    PnPObservation, RasterImageCodec, SnapshotHash, StreamCaptureId, StreamFrameIdentity,
+    StreamSessionId, host_monotonic_time_ns,
 };
 use camera_toolbox_core::{
     AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
@@ -1703,18 +1703,6 @@ impl CalibrationWorkspace {
         self.eeprom.report_inspect(target_label, result);
     }
 
-    pub(crate) fn report_eeprom_dry_run(
-        &mut self,
-        target_label: String,
-        request: camera_toolbox_core::EepromProvisionRequest,
-        result: EepromDryRunResult,
-        backup_file: String,
-        manifest_file: String,
-    ) {
-        self.eeprom
-            .report_dry_run(target_label, request, result, backup_file, manifest_file);
-    }
-
     pub(crate) fn report_eeprom_provision(
         &mut self,
         target_label: String,
@@ -2031,9 +2019,6 @@ impl CalibrationWorkspace {
                 format_gain(assessment.pose_gain)
             ));
         });
-        ui.weak(
-            "Runtime source-bound collection state; it is not persisted or production-qualified.",
-        );
     }
 
     fn render_eeprom_snid_editor(

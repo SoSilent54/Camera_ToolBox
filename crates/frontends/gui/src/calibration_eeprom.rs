@@ -1,9 +1,8 @@
 //! 标定 EEPROM 的 GUI 安全状态机；SSH 登录复用 Explorer SFTP，仅选择 I²C bus。
 
 use camera_toolbox_app::{
-    EEPROM_EXPERIMENTAL_PROVISION_WARNING, EepromDeviceState, EepromDryRunResult,
-    EepromHelperAction, EepromInspectResult, EepromPageWritePlan, EepromSerialState,
-    EepromWriteResult, I2cBusInfo, SnapshotHash,
+    EEPROM_EXPERIMENTAL_PROVISION_WARNING, EepromDeviceState, EepromHelperAction,
+    EepromInspectResult, EepromSerialState, EepromWriteResult, I2cBusInfo,
 };
 use camera_toolbox_core::{
     CalibrationSolution, EepromProvisionRequest, EepromProvisioningMode, FullEepromImage,
@@ -25,13 +24,9 @@ pub(crate) enum CalibrationProvisionIntent {
     #[cfg(feature = "platform-ssh")]
     DiscoverBuses,
     Inspect,
-    DryRun {
-        request: EepromProvisionRequest,
-    },
     Provision {
         request: EepromProvisionRequest,
         expected_before_sha256: String,
-        dry_run_token: String,
     },
 }
 
@@ -44,17 +39,12 @@ impl CalibrationProvisionIntent {
             #[cfg(feature = "platform-ssh")]
             Self::DiscoverBuses => None,
             Self::Inspect => Some(EepromHelperAction::Inspect),
-            Self::DryRun { request } => Some(EepromHelperAction::DryRun {
-                request: request.clone(),
-            }),
             Self::Provision {
                 request,
                 expected_before_sha256,
-                dry_run_token,
             } => Some(EepromHelperAction::Provision {
                 request: request.clone(),
                 expected_before_sha256: expected_before_sha256.clone(),
-                dry_run_token: dry_run_token.clone(),
             }),
         }
     }
@@ -65,16 +55,6 @@ enum ActiveEepromOperation {
     ReadOnly,
     Discovery,
     Provision,
-}
-
-#[derive(Clone, Debug)]
-struct PreparedProvision {
-    request: EepromProvisionRequest,
-    result: EepromDryRunResult,
-    target_label: String,
-    request_hash: String,
-    backup_file: String,
-    manifest_file: String,
 }
 
 pub(crate) struct CalibrationEepromState {
@@ -90,7 +70,6 @@ pub(crate) struct CalibrationEepromState {
     #[cfg(feature = "platform-ssh")]
     bus_discovery_error: Option<String>,
     inspected_target: Option<String>,
-    prepared: Option<PreparedProvision>,
     overwrite_existing_serial: bool,
     confirmation_open: bool,
     busy: bool,
@@ -115,7 +94,6 @@ impl Default for CalibrationEepromState {
             #[cfg(feature = "platform-ssh")]
             bus_discovery_error: None,
             inspected_target: None,
-            prepared: None,
             overwrite_existing_serial: false,
             confirmation_open: false,
             busy: false,
@@ -221,7 +199,6 @@ impl CalibrationEepromState {
         self.device = None;
         self.device_backup = None;
         self.inspected_target = None;
-        self.prepared = None;
         self.overwrite_existing_serial = false;
         self.pending = None;
     }
@@ -246,11 +223,10 @@ impl CalibrationEepromState {
         self.device = None;
         self.device_backup = None;
         self.inspected_target = None;
-        self.prepared = None;
         self.overwrite_existing_serial = false;
         self.pending = None;
         self.status = format!(
-            "EEPROM state is UNKNOWN after the write attempt. Do not retry. Re-inspect the device and use the saved backup if required. {}",
+            "EEPROM state is UNKNOWN after the write attempt. Do not retry. Re-inspect the device before any recovery action. {}",
             message.into()
         );
     }
@@ -270,37 +246,8 @@ impl CalibrationEepromState {
         self.device = Some(result.state);
         self.device_backup = Some(result.backup);
         self.inspected_target = Some(target_label);
-        self.prepared = None;
         self.overwrite_existing_serial = false;
         self.status = "EEPROM read completed. Review the current state before writing.".to_owned();
-    }
-
-    pub(crate) fn report_dry_run(
-        &mut self,
-        target_label: String,
-        request: EepromProvisionRequest,
-        result: EepromDryRunResult,
-        backup_file: String,
-        manifest_file: String,
-    ) {
-        self.busy = false;
-        self.active_operation = None;
-        self.cancel_requested = false;
-        self.device = Some(result.state.clone());
-        self.device_backup = Some(result.backup.clone());
-        self.inspected_target = Some(target_label.clone());
-        let request_hash = eeprom_request_hash(&request);
-        self.prepared = Some(PreparedProvision {
-            request,
-            result,
-            target_label,
-            request_hash,
-            backup_file,
-            manifest_file,
-        });
-        self.confirmation_open = true;
-        self.status =
-            "Write preflight completed; review the generated plan before confirming.".to_owned();
     }
 
     pub(crate) fn report_provision(
@@ -313,7 +260,6 @@ impl CalibrationEepromState {
         self.device = Some(result.after.clone());
         self.device_backup = None;
         self.inspected_target = Some(target_label);
-        self.prepared = None;
         self.active_operation = None;
         self.cancel_requested = false;
         self.confirmation_open = false;
@@ -322,7 +268,6 @@ impl CalibrationEepromState {
             "EEPROM write and bytewise verification succeeded; write history saved as {audit_file}."
         );
     }
-
     pub(crate) fn report_provision_audit_error(
         &mut self,
         target_label: String,
@@ -333,16 +278,14 @@ impl CalibrationEepromState {
         self.device = Some(result.after.clone());
         self.device_backup = None;
         self.inspected_target = Some(target_label);
-        self.prepared = None;
         self.active_operation = None;
         self.cancel_requested = false;
         self.confirmation_open = false;
         self.overwrite_existing_serial = false;
         self.status = format!(
-            "EEPROM write and bytewise verification succeeded, but final audit save failed: {error}. The pre-write preflight manifest remains authoritative."
+            "EEPROM write and bytewise verification succeeded, but final audit save failed: {error}. Re-read the EEPROM before any recovery action."
         );
     }
-
     pub(crate) fn render_body(
         &mut self,
         _context: &egui::Context,
@@ -369,7 +312,6 @@ impl CalibrationEepromState {
         {
             self.device = None;
             self.inspected_target = None;
-            self.prepared = None;
             self.overwrite_existing_serial = false;
             self.status = "Target changed; inspect the newly selected EEPROM.".to_owned();
         }
@@ -385,7 +327,6 @@ impl CalibrationEepromState {
                 self.busy = true;
                 self.active_operation = Some(ActiveEepromOperation::ReadOnly);
                 self.cancel_requested = false;
-                self.prepared = None;
                 self.pending = Some(CalibrationProvisionIntent::Inspect);
                 self.status = "Reading EEPROM...".to_owned();
             }
@@ -432,43 +373,22 @@ impl CalibrationEepromState {
             self.overwrite_existing_serial = false;
         }
 
-        let mut request = self.current_request(solution, serial_number);
+        let request = self.current_request(solution, serial_number);
         let inspected_current =
             self.inspected_target.as_deref() == target_label && self.device.is_some();
-        self.invalidate_prepared_if_mismatch(target_label, request.as_ref());
-        let write_preflight_enabled = !self.busy
+        let write_enabled = !self.busy
             && target_label.is_some()
             && inspected_current
             && request.is_some()
             && (!requires_override || self.overwrite_existing_serial);
-        let prepared_current = self.prepared_matches(target_label, request.as_ref());
         if ui
             .add_enabled(
-                write_preflight_enabled || (!self.busy && prepared_current),
+                write_enabled,
                 egui::Button::new("Write...").fill(egui::Color32::DARK_RED),
             )
             .clicked()
         {
-            if prepared_current {
-                self.confirmation_open = true;
-            } else {
-                self.busy = true;
-                self.active_operation = Some(ActiveEepromOperation::ReadOnly);
-                self.cancel_requested = false;
-                self.prepared = None;
-                self.pending = Some(CalibrationProvisionIntent::DryRun {
-                    request: request.take().expect("enabled only with a valid request"),
-                });
-                self.status = "Preparing EEPROM write plan...".to_owned();
-            }
-        }
-
-        if let Some(prepared) = &self.prepared {
-            ui.label(format!(
-                "Token: {}...",
-                &prepared.result.dry_run_token[..prepared.result.dry_run_token.len().min(12)]
-            ));
-            render_page_plan(ui, &prepared.result.page_plan);
+            self.confirmation_open = true;
         }
 
         ui.label(&self.status);
@@ -480,7 +400,7 @@ impl CalibrationEepromState {
                 if ui
                     .add_enabled(
                         !self.cancel_requested,
-                        egui::Button::new("Cancel read/preflight operation"),
+                        egui::Button::new("Cancel read operation"),
                     )
                     .clicked()
                 {
@@ -518,7 +438,6 @@ impl CalibrationEepromState {
         serial_number: &str,
     ) {
         let request = self.current_request(solution, serial_number);
-        self.invalidate_prepared_if_mismatch(target.ok(), request.as_ref());
         self.render_confirmation_modal(context, target.ok(), request.as_ref());
     }
 
@@ -622,44 +541,19 @@ impl CalibrationEepromState {
         }
     }
 
-    fn prepared_matches(
-        &self,
-        target_label: Option<&str>,
-        request: Option<&EepromProvisionRequest>,
-    ) -> bool {
-        self.prepared.as_ref().is_some_and(|prepared| {
-            Some(prepared.target_label.as_str()) == target_label
-                && request == Some(&prepared.request)
-                && request.map(eeprom_request_hash).as_deref()
-                    == Some(prepared.request_hash.as_str())
-        })
-    }
-
-    fn invalidate_prepared_if_mismatch(
-        &mut self,
-        target_label: Option<&str>,
-        request: Option<&EepromProvisionRequest>,
-    ) {
-        if self.prepared.is_some() && !self.prepared_matches(target_label, request) {
-            self.prepared = None;
-            self.confirmation_open = false;
-            self.status = "EEPROM write preflight is stale; prepare a fresh write plan.".to_owned();
-        }
-    }
-
     fn confirmed_provision_intent(
         &self,
         target_label: Option<&str>,
         request: Option<&EepromProvisionRequest>,
     ) -> Option<CalibrationProvisionIntent> {
-        if self.busy || !self.prepared_matches(target_label, request) {
+        if self.busy || self.inspected_target.as_deref() != target_label {
             return None;
         }
-        let prepared = self.prepared.as_ref()?;
+        let request = request?;
+        let device = self.device.as_ref()?;
         Some(CalibrationProvisionIntent::Provision {
-            request: prepared.request.clone(),
-            expected_before_sha256: prepared.result.state.image_sha256.clone(),
-            dry_run_token: prepared.result.dry_run_token.clone(),
+            request: request.clone(),
+            expected_before_sha256: device.image_sha256.clone(),
         })
     }
 
@@ -681,22 +575,16 @@ impl CalibrationEepromState {
             .show(context, |ui| {
                 ui.colored_label(
                     egui::Color32::RED,
-                    "This modifies the physical module. The saved backup is required for recovery.",
+                    "This modifies the physical module. Confirm the current read state before writing.",
                 );
                 if let Some(label) = target_label {
                     ui.label(format!("Target: {label}"));
                 }
                 ui.colored_label(egui::Color32::YELLOW, EEPROM_EXPERIMENTAL_PROVISION_WARNING);
-                if let Some(prepared) = &self.prepared {
-                    ui.label(format!("Mode: {:?}", prepared.request.mode));
-                    ui.label(format!("Serial: {}", prepared.request.serial_number));
-                    ui.label(format!(
-                        "Expected before: {}",
-                        prepared.result.state.image_sha256
-                    ));
-                    ui.monospace(format!("Recovery backup: {}", prepared.backup_file));
-                    ui.monospace(format!("Preflight manifest: {}", prepared.manifest_file));
-                    render_page_plan(ui, &prepared.result.page_plan);
+                if let (Some(request), Some(device)) = (request, &self.device) {
+                    ui.label(format!("Mode: {:?}", request.mode));
+                    ui.label(format!("Serial: {}", request.serial_number));
+                    ui.label(format!("Expected before: {}", device.image_sha256));
                     if ui
                         .add_enabled(
                             confirmed_intent.is_some(),
@@ -715,11 +603,6 @@ impl CalibrationEepromState {
             });
         self.confirmation_open &= open;
     }
-}
-
-fn eeprom_request_hash(request: &EepromProvisionRequest) -> String {
-    let bytes = serde_json::to_vec(request).expect("EEPROM provision request is serializable");
-    SnapshotHash::digest_bytes(&bytes).to_hex()
 }
 
 fn serial_override_required(device: &EepromDeviceState, desired: &str) -> bool {
@@ -992,23 +875,6 @@ fn format_i2c_bus_label(bus: &I2cBusInfo) -> String {
         format!("i2c-{} — {} (missing)", bus.bus, detail)
     }
 }
-fn render_page_plan(ui: &mut egui::Ui, page_plan: &[EepromPageWritePlan]) {
-    egui::Grid::new("eeprom_page_plan")
-        .striped(true)
-        .show(ui, |ui| {
-            ui.strong("Stage");
-            ui.strong("Offset");
-            ui.strong("Bytes");
-            ui.end_row();
-            for page in page_plan {
-                ui.label(&page.stage);
-                ui.monospace(format!("0x{:04x}", page.offset));
-                ui.label(page.byte_len.to_string());
-                ui.end_row();
-            }
-        });
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1032,25 +898,6 @@ mod tests {
             serial_number: "2T02D2567K0042".to_owned(),
             overwrite_existing_serial: false,
             segments: Vec::new(),
-        }
-    }
-
-    fn prepared_provision(
-        target_label: &str,
-        request: EepromProvisionRequest,
-    ) -> PreparedProvision {
-        PreparedProvision {
-            request_hash: eeprom_request_hash(&request),
-            request,
-            result: EepromDryRunResult {
-                state: device_state(),
-                backup: vec![0; 308],
-                page_plan: Vec::new(),
-                dry_run_token: "b".repeat(64),
-            },
-            target_label: target_label.to_owned(),
-            backup_file: "write_history/test-preflight/backup.bin".to_owned(),
-            manifest_file: "write_history/test-preflight/manifest.json".to_owned(),
         }
     }
 
@@ -1173,13 +1020,9 @@ mod tests {
     #[test]
     fn provision_transport_unknown_forces_fresh_inspection_before_retry() {
         let mut state = CalibrationEepromState::default();
-        state.device = Some(device_state());
-        state.inspected_target = Some("root@camera / i2c-7".to_owned());
-        state.prepared = Some(prepared_provision("root@camera / i2c-7", request()));
         state.pending = Some(CalibrationProvisionIntent::Provision {
             request: request(),
             expected_before_sha256: "a".repeat(64),
-            dry_run_token: "b".repeat(64),
         });
         state.busy = true;
         state.active_operation = Some(ActiveEepromOperation::Provision);
@@ -1188,7 +1031,6 @@ mod tests {
 
         assert!(state.device.is_none());
         assert!(state.inspected_target.is_none());
-        assert!(state.prepared.is_none());
         assert!(state.pending.is_none());
         assert!(!state.busy);
         assert!(state.status.contains("UNKNOWN"));
@@ -1196,13 +1038,11 @@ mod tests {
     }
 
     #[test]
-    fn final_write_intent_requires_prepared_idle_state() {
+    fn final_write_intent_requires_current_read_idle_state() {
         let mut state = CalibrationEepromState::default();
         let current_request = request();
-        state.prepared = Some(prepared_provision(
-            "root@camera / i2c-7",
-            current_request.clone(),
-        ));
+        state.device = Some(device_state());
+        state.inspected_target = Some("root@camera / i2c-7".to_owned());
 
         assert!(matches!(
             state.confirmed_provision_intent(Some("root@camera / i2c-7"), Some(&current_request)),
@@ -1216,42 +1056,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_after_preflight_invalidates_confirmation_authorization() {
-        let mut state = CalibrationEepromState::default();
-        let current_request = request();
-        state.prepared = Some(prepared_provision(
-            "root@camera / i2c-7",
-            current_request.clone(),
-        ));
-        state.confirmation_open = true;
-
-        assert!(
-            state
-                .confirmed_provision_intent(Some("root@camera / i2c-7"), Some(&current_request))
-                .is_some()
-        );
-
-        state.invalidate_prepared_if_mismatch(Some("root@camera / i2c-7"), None);
-
-        assert!(state.prepared.is_none());
-        assert!(!state.confirmation_open);
-        assert!(
-            state
-                .confirmed_provision_intent(Some("root@camera / i2c-7"), Some(&current_request))
-                .is_none()
-        );
-    }
-
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn failed_reconfiguration_invalidates_existing_prepared_provision() {
+    fn failed_reconfiguration_invalidates_existing_read_authorization() {
         let mut state = CalibrationEepromState::default();
         let old_request = request();
-        state.prepared = Some(prepared_provision(
-            "root@old-camera / i2c-7",
-            old_request.clone(),
-        ));
         state.device = Some(device_state());
         state.inspected_target = Some("root@old-camera / i2c-7".to_owned());
         assert!(
@@ -1269,7 +1078,6 @@ mod tests {
 
         assert!(state.device.is_none());
         assert!(state.inspected_target.is_none());
-        assert!(state.prepared.is_none());
         assert!(
             state
                 .confirmed_provision_intent(Some("root@old-camera / i2c-7"), Some(&old_request))

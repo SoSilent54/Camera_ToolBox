@@ -10,7 +10,10 @@ use std::{
 use camera_toolbox_app::{RemoteFileStat, RemoteOperationControl};
 use russh::{ChannelMsg, client};
 use russh_sftp::{
-    client::{RawSftpSession, SftpSession, error::Error as SftpError, fs::File as SftpFile},
+    client::{
+        Config as SftpConfig, RawSftpSession, SftpSession, error::Error as SftpError,
+        fs::File as SftpFile,
+    },
     protocol::{OpenFlags, StatusCode},
 };
 use secrecy::{ExposeSecret, SecretString};
@@ -22,7 +25,10 @@ use tokio_util::sync::CancellationToken;
 const ARGV_MAGIC: &[u8; 8] = b"CTARGV1\0";
 const WATCH_MAGIC: &[u8; 8] = b"CTWATCH1";
 const READ_CHUNK_BYTES: usize = 256 * 1024;
-const WRITE_CHUNK_BYTES: usize = 64 * 1024;
+// 部分嵌入式 SSH/SFTP server 会在大包或多并发写入下不回 ACK；helper 上传走保守单包。
+const SFTP_SAFE_PACKET_BYTES: u32 = 32 * 1024;
+const SFTP_MAX_CONCURRENT_WRITES: usize = 1;
+const WRITE_CHUNK_BYTES: usize = 16 * 1024;
 const SFTP_CLOSE_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_EVENT_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_DIRECTORY_CANDIDATES: usize = 4096;
@@ -1246,11 +1252,16 @@ async fn open_sftp(
         channel.request_subsystem(true, "sftp"),
     )
     .await?;
+    let sftp_config = SftpConfig {
+        max_packet_len: SFTP_SAFE_PACKET_BYTES,
+        max_concurrent_writes: SFTP_MAX_CONCURRENT_WRITES,
+        request_timeout_secs: idle.as_secs().max(1),
+    };
     cancellable_until(
         cancellation,
         deadline,
         idle,
-        SftpSession::new(channel.into_stream()),
+        SftpSession::new_with_config(channel.into_stream(), sftp_config),
     )
     .await
 }

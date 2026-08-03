@@ -38,6 +38,9 @@ struct MemoryTransportState {
     read_chunk_bytes: usize,
     read_delay: Duration,
     cancel_after_bytes: Option<usize>,
+    write_file_new_error_after_create: Option<SshTransportError>,
+    remove_file_errors: BTreeMap<String, VecDeque<SshTransportError>>,
+    rename_error: Option<SshTransportError>,
 }
 
 #[derive(Debug, Clone)]
@@ -70,6 +73,9 @@ impl MemorySshTransport {
                 read_chunk_bytes: 64 * 1024,
                 read_delay: Duration::ZERO,
                 cancel_after_bytes: None,
+                write_file_new_error_after_create: None,
+                remove_file_errors: BTreeMap::new(),
+                rename_error: None,
             })),
         }
     }
@@ -101,6 +107,32 @@ impl MemorySshTransport {
     #[must_use]
     pub fn file_bytes(&self, path: &str) -> Option<Vec<u8>> {
         self.lock().files.get(path).map(|file| file.bytes.clone())
+    }
+
+    #[must_use]
+    pub fn file_paths_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.lock()
+            .files
+            .keys()
+            .filter(|path| path.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    pub fn fail_next_write_file_new_after_create(&self, error: SshTransportError) {
+        self.lock().write_file_new_error_after_create = Some(error);
+    }
+
+    pub fn fail_remove_file(&self, path: impl Into<String>, error: SshTransportError) {
+        self.lock()
+            .remove_file_errors
+            .entry(path.into())
+            .or_default()
+            .push_back(error);
+    }
+
+    pub fn fail_next_rename(&self, error: SshTransportError) {
+        self.lock().rename_error = Some(error);
     }
 
     pub fn set_canonical_path(&self, path: impl Into<String>, canonical: impl Into<String>) {
@@ -526,6 +558,22 @@ impl SshTransportSession for MemorySshSession {
         if !state.directories.contains(parent) {
             return Err(SshTransportError::NotFound(parent.to_owned()));
         }
+        if let Some(error) = state.write_file_new_error_after_create.take() {
+            state.files.insert(
+                path.to_owned(),
+                MemoryRemoteFile {
+                    bytes: Vec::new(),
+                    stats: VecDeque::from([RemoteFileStat {
+                        path: path.to_owned(),
+                        size: 0,
+                        modified_seconds: 0,
+                        producer_marker: None,
+                        sha256: None,
+                    }]),
+                },
+            );
+            return Err(error);
+        }
         state.files.insert(
             path.to_owned(),
             MemoryRemoteFile {
@@ -568,6 +616,9 @@ impl SshTransportSession for MemorySshSession {
     ) -> Result<(), SshTransportError> {
         check_control(control)?;
         let mut state = self.lock();
+        if let Some(error) = state.rename_error.take() {
+            return Err(error);
+        }
         if state.files.contains_key(destination) || state.directories.contains(destination) {
             return Err(SshTransportError::AlreadyExists(destination.to_owned()));
         }
@@ -617,7 +668,13 @@ impl SshTransportSession for MemorySshSession {
         control: &RemoteOperationControl,
     ) -> Result<(), SshTransportError> {
         check_control(control)?;
-        self.lock()
+        let mut state = self.lock();
+        if let Some(errors) = state.remove_file_errors.get_mut(path)
+            && let Some(error) = errors.pop_front()
+        {
+            return Err(error);
+        }
+        state
             .files
             .remove(path)
             .map(|_| ())

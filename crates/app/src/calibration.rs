@@ -1211,6 +1211,7 @@ pub struct CalibrationSession {
     items: Vec<CalibrationDatasetItem>,
     selected: Option<CalibrationItemId>,
     installed: Option<InstalledCalibration>,
+    installed_solution_revision: Option<u64>,
     active_auto_baseline: Option<AutoCaptureBaseline>,
     active_initial_intrinsics_binding: Option<InitialIntrinsicsBinding>,
     solution_revision: u64,
@@ -1229,6 +1230,7 @@ impl CalibrationSession {
             items: Vec::new(),
             selected: None,
             installed: None,
+            installed_solution_revision: None,
             active_auto_baseline: None,
             active_initial_intrinsics_binding: None,
             solution_revision: 1,
@@ -1257,7 +1259,21 @@ impl CalibrationSession {
 
     #[must_use]
     pub fn installed(&self) -> Option<&InstalledCalibration> {
+        if self.latest_installed_is_current() {
+            self.installed.as_ref()
+        } else {
+            None
+        }
+    }
+
+    #[must_use]
+    pub fn latest_installed(&self) -> Option<&InstalledCalibration> {
         self.installed.as_ref()
+    }
+
+    #[must_use]
+    pub fn latest_installed_is_current(&self) -> bool {
+        self.installed.is_some() && self.installed_solution_revision == Some(self.solution_revision)
     }
 
     /// 安装或清除运行时自动准入。相同的精确配置不推进 admission revision。
@@ -1547,6 +1563,9 @@ impl CalibrationSession {
             item.admission_pnp_observation = None;
         }
         self.invalidate_detection_epoch();
+        if corner_layout_changed {
+            self.discard_installed_solution();
+        }
         Ok(())
     }
 
@@ -1558,6 +1577,7 @@ impl CalibrationSession {
             item.admission_pnp_observation = None;
         }
         self.invalidate_detection_epoch();
+        self.discard_installed_solution();
     }
 
     pub fn add_or_refresh(
@@ -1803,6 +1823,7 @@ impl CalibrationSession {
         self.items.clear();
         self.selected = None;
         self.invalidate_detection_epoch();
+        self.discard_installed_solution();
     }
 
     /// 为文件输入创建检测令牌；读取 worker 取到任务后才转为 `Reading`。
@@ -2118,11 +2139,13 @@ impl CalibrationSession {
             return Err(CalibrationSessionError::StaleResult);
         }
         solution.validate_against(&snapshot.request)?;
+        let solution_revision = snapshot.solution_revision;
         self.installed = Some(InstalledCalibration {
             item_ids: snapshot.item_ids,
             request: snapshot.request,
             solution,
         });
+        self.installed_solution_revision = Some(solution_revision);
         Ok(())
     }
 
@@ -2475,8 +2498,13 @@ impl CalibrationSession {
     }
 
     fn invalidate_solution(&mut self) {
-        self.solution_revision = self.solution_revision.wrapping_add(1);
+        self.solution_revision = self.solution_revision.wrapping_add(1).max(1);
+        self.installed_solution_revision = None;
+    }
+
+    fn discard_installed_solution(&mut self) {
         self.installed = None;
+        self.installed_solution_revision = None;
     }
 
     fn invalidate_detection_epoch(&mut self) {
@@ -3125,9 +3153,16 @@ mod tests {
         let snapshot = session.calibration_snapshot(intrinsics()).unwrap();
         let solution = solution(&snapshot);
         session.install_solution(snapshot, solution).unwrap();
-        assert!(session.installed().is_some());
+        let installed_item_ids = session.installed().unwrap().item_ids.clone();
         session.set_enabled(session.items()[0].id, false).unwrap();
         assert!(session.installed().is_none());
+        assert!(!session.latest_installed_is_current());
+        assert_eq!(
+            session
+                .latest_installed()
+                .map(|installed| &installed.item_ids),
+            Some(&installed_item_ids)
+        );
     }
 
     fn auto_candidate_fixture_with_source(

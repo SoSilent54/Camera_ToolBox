@@ -210,6 +210,30 @@ impl WorkspaceState {
         Ok(id)
     }
 
+    pub(crate) fn open_generated_capture(
+        &mut self,
+        generation: u64,
+        source_name: String,
+        display: Arc<camera_toolbox_core::Rgba8Frame>,
+        foreground: bool,
+    ) -> DocumentId {
+        let id = DocumentId(self.next_document_id);
+        self.next_document_id = self.next_document_id.saturating_add(1);
+        self.access_clock = self.access_clock.saturating_add(1);
+        let document = ImageDocument::from_generated_capture(
+            id,
+            generation,
+            source_name,
+            display,
+            self.access_clock,
+        );
+        self.image_documents.push(document);
+        if foreground {
+            self.active = Some(id);
+        }
+        id
+    }
+
     pub(crate) const fn active_id(&self) -> Option<DocumentId> {
         self.active
     }

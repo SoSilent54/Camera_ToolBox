@@ -29,19 +29,28 @@ const SERIAL_OFFSET: usize = 0x0125;
 const SERIAL_BYTES: usize = 14;
 const SERIAL_CHECKSUM_OFFSET: usize = 0x0133;
 
-/// EEPROM 字段的编码方式。
+/// EEPROM 字段的基础解析方式；固定宽度类型的 byte_len 必须等于类型宽度。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StorageEncoding {
     Ascii,
+    AsciiNulTerminated,
+    Raw,
+    Reserved,
+    U8,
+    U16Le,
+    I16Le,
     U32Le,
+    I32Le,
     F32Le,
+    F64Le,
     SerialChecksum,
 }
 
-/// 一个可审计的 EEPROM 字段范围。
+/// 一个可审计的 EEPROM 字段范围；`remark` 是 UI 表格里的短名称，不是长描述。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageField {
     pub name: &'static str,
+    pub remark: &'static str,
     pub offset: u16,
     pub byte_len: u16,
     pub encoding: StorageEncoding,
@@ -70,6 +79,7 @@ pub struct CalibrationStorageMap {
 const YG_STEREO_FIELDS: [StorageField; 6] = [
     StorageField {
         name: "flag",
+        remark: "FLAG",
         offset: FLAG_OFFSET as u16,
         byte_len: YG_STEREO_P24C64G_FLAG.len() as u16,
         encoding: StorageEncoding::Ascii,
@@ -78,6 +88,7 @@ const YG_STEREO_FIELDS: [StorageField; 6] = [
     },
     StorageField {
         name: "image_size",
+        remark: "width/height",
         offset: WIDTH_OFFSET as u16,
         byte_len: 8,
         encoding: StorageEncoding::U32Le,
@@ -86,6 +97,7 @@ const YG_STEREO_FIELDS: [StorageField; 6] = [
     },
     StorageField {
         name: "camera_matrix",
+        remark: "fx/fy/cx/cy",
         offset: FX_OFFSET as u16,
         byte_len: 16,
         encoding: StorageEncoding::F32Le,
@@ -94,6 +106,7 @@ const YG_STEREO_FIELDS: [StorageField; 6] = [
     },
     StorageField {
         name: "distortion",
+        remark: "k1..s4",
         offset: DISTORTION_OFFSET as u16,
         byte_len: 48,
         encoding: StorageEncoding::F32Le,
@@ -102,6 +115,7 @@ const YG_STEREO_FIELDS: [StorageField; 6] = [
     },
     StorageField {
         name: "serial_number",
+        remark: "SNID",
         offset: SERIAL_OFFSET as u16,
         byte_len: SERIAL_BYTES as u16,
         encoding: StorageEncoding::Ascii,
@@ -110,6 +124,7 @@ const YG_STEREO_FIELDS: [StorageField; 6] = [
     },
     StorageField {
         name: "serial_checksum",
+        remark: "SNCHK",
         offset: SERIAL_CHECKSUM_OFFSET as u16,
         byte_len: 1,
         encoding: StorageEncoding::SerialChecksum,
@@ -134,6 +149,1086 @@ const YG_STEREO_MAP: CalibrationStorageMap = CalibrationStorageMap {
 #[must_use]
 pub const fn yg_stereo_p24c64g_v1() -> &'static CalibrationStorageMap {
     &YG_STEREO_MAP
+}
+
+/// Baton `param_rw` native ABI EEPROM 映射；该布局依赖 AArch64/LP64/little-endian `double` ABI。
+pub const BATON_PARAM_RW_NATIVE_LP64_LE_V1_MAP_ID: &str = "baton-param-rw-native-lp64-le-v1";
+/// Baton `param_rw` 当前 `sizeof(eeprom_data)`，未 packed，包含 ABI padding。
+pub const BATON_PARAM_RW_IMAGE_BYTES: usize = 1008;
+
+macro_rules! storage_field {
+    ($name:literal, $remark:literal, $offset:expr, $encoding:ident, $byte_len:expr, $writable:expr) => {
+        StorageField {
+            name: $name,
+            remark: $remark,
+            offset: $offset,
+            byte_len: $byte_len,
+            encoding: StorageEncoding::$encoding,
+            full_provision_writable: $writable,
+            update_writable: $writable,
+        }
+    };
+}
+
+const BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT: usize = 79;
+const BATON_PARAM_RW_LEGACY_SUFFIX_FIELD_COUNT: usize = 52;
+const BATON_PARAM_RW_FIELD_COUNT: usize =
+    BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT + BATON_PARAM_RW_LEGACY_SUFFIX_FIELD_COUNT;
+
+const BATON_PARAM_RW_SHARED_PREFIX_FIELDS: [StorageField;
+    BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT] = [
+    storage_field!(
+        "fish_param.left_cam.fx",
+        "FISH.L.fx",
+        0x0000,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.left_cam.fy",
+        "FISH.L.fy",
+        0x0008,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.left_cam.cx",
+        "FISH.L.cx",
+        0x0010,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.left_cam.cy",
+        "FISH.L.cy",
+        0x0018,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.left_cam.xi",
+        "FISH.L.xi",
+        0x0020,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.left_cam.alpha",
+        "FISH.L.alpha",
+        0x0028,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.right_cam.fx",
+        "FISH.R.fx",
+        0x0030,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.right_cam.fy",
+        "FISH.R.fy",
+        0x0038,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.right_cam.cx",
+        "FISH.R.cx",
+        0x0040,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.right_cam.cy",
+        "FISH.R.cy",
+        0x0048,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.right_cam.xi",
+        "FISH.R.xi",
+        0x0050,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.right_cam.alpha",
+        "FISH.R.alpha",
+        0x0058,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.px",
+        "FISH.X.px",
+        0x0060,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.py",
+        "FISH.X.py",
+        0x0068,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.pz",
+        "FISH.X.pz",
+        0x0070,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.qx",
+        "FISH.X.qx",
+        0x0078,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.qy",
+        "FISH.X.qy",
+        0x0080,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.qz",
+        "FISH.X.qz",
+        0x0088,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "fish_param.extrinsic.qw",
+        "FISH.X.qw",
+        0x0090,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("fish_param_check_sum", "FISHCK", 0x0098, U8, 1, true),
+    storage_field!(
+        "padding.after_fish_checksum",
+        "PAD",
+        0x0099,
+        Reserved,
+        7,
+        false
+    ),
+    storage_field!("cam_param.left_cam.fx", "CAM.L.fx", 0x00a0, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.fy", "CAM.L.fy", 0x00a8, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.cx", "CAM.L.cx", 0x00b0, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.cy", "CAM.L.cy", 0x00b8, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.k1", "CAM.L.k1", 0x00c0, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.k2", "CAM.L.k2", 0x00c8, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.k3", "CAM.L.k3", 0x00d0, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.p1", "CAM.L.p1", 0x00d8, F64Le, 8, true),
+    storage_field!("cam_param.left_cam.p2", "CAM.L.p2", 0x00e0, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.fx", "CAM.R.fx", 0x00e8, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.fy", "CAM.R.fy", 0x00f0, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.cx", "CAM.R.cx", 0x00f8, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.cy", "CAM.R.cy", 0x0100, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.k1", "CAM.R.k1", 0x0108, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.k2", "CAM.R.k2", 0x0110, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.k3", "CAM.R.k3", 0x0118, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.p1", "CAM.R.p1", 0x0120, F64Le, 8, true),
+    storage_field!("cam_param.right_cam.p2", "CAM.R.p2", 0x0128, F64Le, 8, true),
+    storage_field!(
+        "cam_param.extrinsic.r00",
+        "CAM.X.r00",
+        0x0130,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_param.extrinsic.r01",
+        "CAM.X.r01",
+        0x0138,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_param.extrinsic.r02",
+        "CAM.X.r02",
+        0x0140,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("cam_param.extrinsic.t0", "CAM.X.t0", 0x0148, F64Le, 8, true),
+    storage_field!(
+        "cam_param.extrinsic.r10",
+        "CAM.X.r10",
+        0x0150,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_param.extrinsic.r11",
+        "CAM.X.r11",
+        0x0158,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_param.extrinsic.r12",
+        "CAM.X.r12",
+        0x0160,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("cam_param.extrinsic.t1", "CAM.X.t1", 0x0168, F64Le, 8, true),
+    storage_field!(
+        "cam_param.extrinsic.r20",
+        "CAM.X.r20",
+        0x0170,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_param.extrinsic.r21",
+        "CAM.X.r21",
+        0x0178,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_param.extrinsic.r22",
+        "CAM.X.r22",
+        0x0180,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("cam_param.extrinsic.t2", "CAM.X.t2", 0x0188, F64Le, 8, true),
+    storage_field!("cam_param_check_sum", "CAMCK", 0x0190, U8, 1, true),
+    storage_field!(
+        "padding.after_cam_checksum",
+        "PAD",
+        0x0191,
+        Reserved,
+        7,
+        false
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r00",
+        "CIMU.L.r00",
+        0x0198,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r01",
+        "CIMU.L.r01",
+        0x01a0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r02",
+        "CIMU.L.r02",
+        0x01a8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.t0",
+        "CIMU.L.t0",
+        0x01b0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r10",
+        "CIMU.L.r10",
+        0x01b8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r11",
+        "CIMU.L.r11",
+        0x01c0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r12",
+        "CIMU.L.r12",
+        0x01c8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.t1",
+        "CIMU.L.t1",
+        0x01d0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r20",
+        "CIMU.L.r20",
+        0x01d8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r21",
+        "CIMU.L.r21",
+        0x01e0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.r22",
+        "CIMU.L.r22",
+        0x01e8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.left_cam_imu.t2",
+        "CIMU.L.t2",
+        0x01f0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r00",
+        "CIMU.R.r00",
+        0x01f8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r01",
+        "CIMU.R.r01",
+        0x0200,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r02",
+        "CIMU.R.r02",
+        0x0208,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.t0",
+        "CIMU.R.t0",
+        0x0210,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r10",
+        "CIMU.R.r10",
+        0x0218,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r11",
+        "CIMU.R.r11",
+        0x0220,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r12",
+        "CIMU.R.r12",
+        0x0228,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.t1",
+        "CIMU.R.t1",
+        0x0230,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r20",
+        "CIMU.R.r20",
+        0x0238,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r21",
+        "CIMU.R.r21",
+        0x0240,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.r22",
+        "CIMU.R.r22",
+        0x0248,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_imu_extrinsic.right_cam_imu.t2",
+        "CIMU.R.t2",
+        0x0250,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("cam_imu_extrinsic_check_sum", "CIMUCK", 0x0258, U8, 1, true),
+    storage_field!(
+        "padding.after_cam_imu_checksum",
+        "PAD",
+        0x0259,
+        Reserved,
+        7,
+        false
+    ),
+];
+
+const BATON_PARAM_RW_LEGACY_SUFFIX_FIELDS: [StorageField;
+    BATON_PARAM_RW_LEGACY_SUFFIX_FIELD_COUNT] = [
+    storage_field!("imu_instrinsic.gyr_n", "IMU.gyr_n", 0x0260, F64Le, 8, true),
+    storage_field!("imu_instrinsic.gyr_w", "IMU.gyr_w", 0x0268, F64Le, 8, true),
+    storage_field!("imu_instrinsic.acc_n", "IMU.acc_n", 0x0270, F64Le, 8, true),
+    storage_field!("imu_instrinsic.acc_w", "IMU.acc_w", 0x0278, F64Le, 8, true),
+    storage_field!("imu_instrinsic_check_sum", "IMUCK", 0x0280, U8, 1, true),
+    storage_field!(
+        "padding.after_imu_instrinsic_checksum",
+        "PAD",
+        0x0281,
+        Reserved,
+        7,
+        false
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_bias_vector[0]",
+        "ELL.AB0",
+        0x0288,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_bias_vector[1]",
+        "ELL.AB1",
+        0x0290,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_bias_vector[2]",
+        "ELL.AB2",
+        0x0298,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.gyr_bias_vector[0]",
+        "ELL.GB0",
+        0x02a0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.gyr_bias_vector[1]",
+        "ELL.GB1",
+        0x02a8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.gyr_bias_vector[2]",
+        "ELL.GB2",
+        0x02b0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_scale[0]",
+        "ELL.AS0",
+        0x02b8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_scale[1]",
+        "ELL.AS1",
+        0x02c0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_scale[2]",
+        "ELL.AS2",
+        0x02c8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.groy_scale[0]",
+        "ELL.GS0",
+        0x02d0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.groy_scale[1]",
+        "ELL.GS1",
+        0x02d8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.groy_scale[2]",
+        "ELL.GS2",
+        0x02e0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_Misalignment[0]",
+        "ELL.AM0",
+        0x02e8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_Misalignment[1]",
+        "ELL.AM1",
+        0x02f0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.acc_Misalignment[2]",
+        "ELL.AM2",
+        0x02f8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.groy_Misalignment[0]",
+        "ELL.GM0",
+        0x0300,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.groy_Misalignment[1]",
+        "ELL.GM1",
+        0x0308,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "imu_elliposoid.groy_Misalignment[2]",
+        "ELL.GM2",
+        0x0310,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("imu_elliposoid_check_sum", "ELLCK", 0x0318, U8, 1, true),
+    storage_field!("md_sn", "SNID", 0x0319, AsciiNulTerminated, 21, true),
+    storage_field!("padding.after_md_sn", "PAD", 0x032e, Reserved, 2, false),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.fx",
+        "RGB.K.fx",
+        0x0330,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.fy",
+        "RGB.K.fy",
+        0x0338,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.cx",
+        "RGB.K.cx",
+        0x0340,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.cy",
+        "RGB.K.cy",
+        0x0348,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.k1",
+        "RGB.K.k1",
+        0x0350,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.k2",
+        "RGB.K.k2",
+        0x0358,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.k3",
+        "RGB.K.k3",
+        0x0360,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.p1",
+        "RGB.K.p1",
+        0x0368,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_cam.p2",
+        "RGB.K.p2",
+        0x0370,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r00",
+        "RGB.X.r00",
+        0x0378,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r01",
+        "RGB.X.r01",
+        0x0380,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r02",
+        "RGB.X.r02",
+        0x0388,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.t0",
+        "RGB.X.t0",
+        0x0390,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r10",
+        "RGB.X.r10",
+        0x0398,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r11",
+        "RGB.X.r11",
+        0x03a0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r12",
+        "RGB.X.r12",
+        0x03a8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.t1",
+        "RGB.X.t1",
+        0x03b0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r20",
+        "RGB.X.r20",
+        0x03b8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r21",
+        "RGB.X.r21",
+        0x03c0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.r22",
+        "RGB.X.r22",
+        0x03c8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "cam_rgb_param.rgb_to_left_extrinsic.t2",
+        "RGB.X.t2",
+        0x03d0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("cam_rgb_param.width", "RGB.W", 0x03d8, F64Le, 8, true),
+    storage_field!("cam_rgb_param.height", "RGB.H", 0x03e0, F64Le, 8, true),
+    storage_field!("cam_rgb_param_check_sum", "RGBCK", 0x03e8, U8, 1, true),
+    storage_field!("padding.tail", "PAD", 0x03e9, Reserved, 7, false),
+];
+
+const BATON_PARAM_RW_FIELDS: [StorageField; BATON_PARAM_RW_FIELD_COUNT] = combine_storage_fields::<
+    BATON_PARAM_RW_FIELD_COUNT,
+    BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT,
+    BATON_PARAM_RW_LEGACY_SUFFIX_FIELD_COUNT,
+>(
+    BATON_PARAM_RW_SHARED_PREFIX_FIELDS,
+    BATON_PARAM_RW_LEGACY_SUFFIX_FIELDS,
+);
+
+const fn combine_storage_fields<const OUT: usize, const PREFIX: usize, const SUFFIX: usize>(
+    prefix: [StorageField; PREFIX],
+    suffix: [StorageField; SUFFIX],
+) -> [StorageField; OUT] {
+    let mut fields = [storage_field!("padding.unused", "PAD", 0, Reserved, 0, false); OUT];
+    let mut index = 0;
+    while index < PREFIX {
+        fields[index] = prefix[index];
+        index += 1;
+    }
+    let mut suffix_index = 0;
+    while suffix_index < SUFFIX {
+        fields[index + suffix_index] = suffix[suffix_index];
+        suffix_index += 1;
+    }
+    fields
+}
+
+const BATON_PARAM_RW_MAP: CalibrationStorageMap = CalibrationStorageMap {
+    id: BATON_PARAM_RW_NATIVE_LP64_LE_V1_MAP_ID,
+    display_name: "Baton param_rw native LP64 LE v1",
+    transport: EepromTransportSpec {
+        i2c_address: 0x50,
+        address_width_bits: 16,
+        page_size_bytes: 32,
+        write_cycle_ms: 5,
+    },
+    fields: &BATON_PARAM_RW_FIELDS,
+};
+
+/// 返回 Baton `param_rw` 原生结构体 EEPROM 映射。
+#[must_use]
+pub const fn baton_param_rw_native_lp64_le_v1() -> &'static CalibrationStorageMap {
+    &BATON_PARAM_RW_MAP
+}
+
+/// PUEO-EDU DF9-40 当前 `eeprom_data` 原生 ABI 映射，来自用户提供的新版结构声明。
+pub const PUEO_EDU_DF9_40_NATIVE_LP64_LE_V1_MAP_ID: &str = "pueo-edu-df9-40-native-lp64-le-v1";
+/// AArch64/LP64、未 packed、`double` 为 IEEE754 little-endian 时的 `sizeof(eeprom_data)`。
+pub const PUEO_EDU_DF9_40_IMAGE_BYTES: usize = 0x0388;
+
+#[cfg(test)]
+const PUEO_IMU_PARAM_OFFSET: u16 = 0x0260;
+const PUEO_IMU_PARAM_CHECKSUM_OFFSET: u16 = 0x0290;
+const PUEO_MD_SN_OFFSET: u16 = 0x0291;
+#[cfg(test)]
+const PUEO_RGB_CAMERA_OFFSET: u16 = 0x02a8;
+const PUEO_RGB_CAMERA_CHECKSUM_OFFSET: u16 = 0x0380;
+
+const PUEO_EDU_DF9_40_SUFFIX_FIELD_COUNT: usize = 41;
+const PUEO_EDU_DF9_40_FIELD_COUNT: usize =
+    BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT + PUEO_EDU_DF9_40_SUFFIX_FIELD_COUNT;
+
+const PUEO_EDU_DF9_40_SUFFIX_FIELDS: [StorageField; PUEO_EDU_DF9_40_SUFFIX_FIELD_COUNT] = [
+    storage_field!("imu_param.acc_bias[0]", "IMU.AB0", 0x0260, F64Le, 8, true),
+    storage_field!("imu_param.acc_bias[1]", "IMU.AB1", 0x0268, F64Le, 8, true),
+    storage_field!("imu_param.acc_bias[2]", "IMU.AB2", 0x0270, F64Le, 8, true),
+    storage_field!("imu_param.groy_bias[0]", "IMU.GB0", 0x0278, F64Le, 8, true),
+    storage_field!("imu_param.groy_bias[1]", "IMU.GB1", 0x0280, F64Le, 8, true),
+    storage_field!("imu_param.groy_bias[2]", "IMU.GB2", 0x0288, F64Le, 8, true),
+    storage_field!(
+        "imu_param_check_sum",
+        "IMUCK",
+        PUEO_IMU_PARAM_CHECKSUM_OFFSET,
+        U8,
+        1,
+        true
+    ),
+    storage_field!(
+        "md_sn",
+        "SNID",
+        PUEO_MD_SN_OFFSET,
+        AsciiNulTerminated,
+        21,
+        true
+    ),
+    storage_field!("padding.after_md_sn", "PAD", 0x02a6, Reserved, 2, false),
+    storage_field!("rgb_camera.rgb_cam.fx", "RGB.K.fx", 0x02a8, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.fy", "RGB.K.fy", 0x02b0, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.cx", "RGB.K.cx", 0x02b8, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.cy", "RGB.K.cy", 0x02c0, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.k1", "RGB.K.k1", 0x02c8, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.k2", "RGB.K.k2", 0x02d0, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.k3", "RGB.K.k3", 0x02d8, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.p1", "RGB.K.p1", 0x02e0, F64Le, 8, true),
+    storage_field!("rgb_camera.rgb_cam.p2", "RGB.K.p2", 0x02e8, F64Le, 8, true),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r00",
+        "RGB.X.r00",
+        0x02f0,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r01",
+        "RGB.X.r01",
+        0x02f8,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r02",
+        "RGB.X.r02",
+        0x0300,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.t0",
+        "RGB.X.t0",
+        0x0308,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r10",
+        "RGB.X.r10",
+        0x0310,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r11",
+        "RGB.X.r11",
+        0x0318,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r12",
+        "RGB.X.r12",
+        0x0320,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.t1",
+        "RGB.X.t1",
+        0x0328,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r20",
+        "RGB.X.r20",
+        0x0330,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r21",
+        "RGB.X.r21",
+        0x0338,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.r22",
+        "RGB.X.r22",
+        0x0340,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!(
+        "rgb_camera.rgb_to_left_extrinsic.t2",
+        "RGB.X.t2",
+        0x0348,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("rgb_camera.width", "RGB.W", 0x0350, F64Le, 8, true),
+    storage_field!("rgb_camera.height", "RGB.H", 0x0358, F64Le, 8, true),
+    storage_field!("rgb_camera.fps", "RGB.FPS", 0x0360, F64Le, 8, true),
+    storage_field!(
+        "rgb_camera.exposure_time",
+        "RGB.EXP",
+        0x0368,
+        F64Le,
+        8,
+        true
+    ),
+    storage_field!("rgb_camera.gain", "RGB.GAIN", 0x0370, F64Le, 8, true),
+    storage_field!("rgb_camera.auto_exposure", "RGB.AE", 0x0378, U8, 1, true),
+    storage_field!("rgb_camera.auto_gain", "RGB.AG", 0x0379, U8, 1, true),
+    storage_field!(
+        "rgb_camera.auto_white_balance",
+        "RGB.AWB",
+        0x037a,
+        U8,
+        1,
+        true
+    ),
+    storage_field!("padding.after_rgb_auto", "PAD", 0x037b, Reserved, 5, false),
+    storage_field!(
+        "rgb_camera_check_sum",
+        "RGBCK",
+        PUEO_RGB_CAMERA_CHECKSUM_OFFSET,
+        U8,
+        1,
+        true
+    ),
+    storage_field!("padding.tail", "PAD", 0x0381, Reserved, 7, false),
+];
+
+const PUEO_EDU_DF9_40_FIELDS: [StorageField; PUEO_EDU_DF9_40_FIELD_COUNT] = combine_storage_fields::<
+    PUEO_EDU_DF9_40_FIELD_COUNT,
+    BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT,
+    PUEO_EDU_DF9_40_SUFFIX_FIELD_COUNT,
+>(
+    BATON_PARAM_RW_SHARED_PREFIX_FIELDS,
+    PUEO_EDU_DF9_40_SUFFIX_FIELDS,
+);
+
+const PUEO_EDU_DF9_40_MAP: CalibrationStorageMap = CalibrationStorageMap {
+    id: PUEO_EDU_DF9_40_NATIVE_LP64_LE_V1_MAP_ID,
+    display_name: "PUEO-EDU DF9-40 pinout",
+    transport: EepromTransportSpec {
+        i2c_address: 0x50,
+        address_width_bits: 16,
+        page_size_bytes: 32,
+        write_cycle_ms: 5,
+    },
+    fields: &PUEO_EDU_DF9_40_FIELDS,
+};
+
+/// 返回 PUEO-EDU DF9-40 当前 `eeprom_data` 原生 ABI EEPROM 映射。
+#[must_use]
+pub const fn pueo_edu_df9_40_native_lp64_le_v1() -> &'static CalibrationStorageMap {
+    &PUEO_EDU_DF9_40_MAP
 }
 
 /// 直接烧录或仅更新内参时 helper 的行为模式。
@@ -263,6 +1358,155 @@ pub enum EepromProvisionRequestError {
     InvalidSerialChecksum,
     #[error("UpdateCalibration cannot overwrite an existing SN")]
     OverwriteNotAllowedForUpdate,
+}
+
+/// YgStereo SNID 中允许写入的模组型号码。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum YgStereoModuleCode {
+    Model233,
+    Model235,
+}
+
+impl YgStereoModuleCode {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Model233 => "233",
+            Self::Model235 => "235",
+        }
+    }
+
+    const fn bytes(self) -> [u8; 3] {
+        match self {
+            Self::Model233 => *b"233",
+            Self::Model235 => *b"235",
+        }
+    }
+}
+
+/// GUI 采集的 YgStereo SNID 语义字段；编码后正好覆盖 `0x0125..0x0132`。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct YgStereoSerialIdInput {
+    pub module: YgStereoModuleCode,
+    pub year: u16,
+    pub month: u8,
+    pub day: u8,
+    pub optical_axis_class: u8,
+    pub sequence: u16,
+}
+
+impl YgStereoSerialIdInput {
+    #[must_use]
+    pub const fn new(
+        module: YgStereoModuleCode,
+        year: u16,
+        month: u8,
+        day: u8,
+        optical_axis_class: u8,
+        sequence: u16,
+    ) -> Self {
+        Self {
+            module,
+            year,
+            month,
+            day,
+            optical_axis_class,
+            sequence,
+        }
+    }
+
+    /// 将语义字段编码为 14-byte ASCII SNID。
+    ///
+    /// Year 输入两位十进制年份并原样写入；序号按 1-based 十进制输入，写入
+    /// `0-9a-zA-Z` base-62 高低位。
+    pub fn serial_number(self) -> Result<String, YgStereoSerialIdError> {
+        let bytes = self.serial_bytes()?;
+        Ok(std::str::from_utf8(&bytes)
+            .expect("YgStereo SNID encoder only writes ASCII bytes")
+            .to_owned())
+    }
+
+    pub fn serial_bytes(self) -> Result<[u8; SERIAL_BYTES], YgStereoSerialIdError> {
+        if self.year > 99 {
+            return Err(YgStereoSerialIdError::YearOutOfRange { value: self.year });
+        }
+        let month = encode_month(self.month)?;
+        let day = encode_day(self.day)?;
+        let axis = encode_optical_axis_class(self.optical_axis_class)?;
+        let [sequence_high, sequence_low] = encode_sequence(self.sequence)?;
+        let year = self.year;
+        let module = self.module.bytes();
+        Ok([
+            b'2',
+            b'T',
+            module[0],
+            module[1],
+            module[2],
+            b'0' + (year / 10) as u8,
+            b'0' + (year % 10) as u8,
+            month,
+            day,
+            axis,
+            sequence_high,
+            sequence_low,
+            b'0',
+            b'0',
+        ])
+    }
+}
+
+#[derive(Clone, Debug, Error, PartialEq, Eq)]
+pub enum YgStereoSerialIdError {
+    #[error("SNID year must be a two-digit decimal value in 0..=99, got {value}")]
+    YearOutOfRange { value: u16 },
+    #[error("SNID month must be in 1..=12, got {value}")]
+    MonthOutOfRange { value: u8 },
+    #[error("SNID day must be in 1..=31, got {value}")]
+    DayOutOfRange { value: u8 },
+    #[error("SNID optical-axis class must be in 0..=4, got {value}")]
+    OpticalAxisClassOutOfRange { value: u8 },
+    #[error("SNID sequence must be in 1..=3844, got {value}")]
+    SequenceOutOfRange { value: u16 },
+}
+
+fn encode_month(value: u8) -> Result<u8, YgStereoSerialIdError> {
+    match value {
+        1..=9 => Ok(b'0' + value),
+        10..=12 => Ok(b'A' + (value - 10)),
+        _ => Err(YgStereoSerialIdError::MonthOutOfRange { value }),
+    }
+}
+
+fn encode_day(value: u8) -> Result<u8, YgStereoSerialIdError> {
+    match value {
+        1..=9 => Ok(b'0' + value),
+        10..=31 => Ok(b'A' + (value - 10)),
+        _ => Err(YgStereoSerialIdError::DayOutOfRange { value }),
+    }
+}
+
+fn encode_optical_axis_class(value: u8) -> Result<u8, YgStereoSerialIdError> {
+    match value {
+        0..=4 => Ok(b'0' + value),
+        _ => Err(YgStereoSerialIdError::OpticalAxisClassOutOfRange { value }),
+    }
+}
+
+fn encode_sequence(value: u16) -> Result<[u8; 2], YgStereoSerialIdError> {
+    if !(1..=3844).contains(&value) {
+        return Err(YgStereoSerialIdError::SequenceOutOfRange { value });
+    }
+    let zero_based = value - 1;
+    Ok([base62_digit(zero_based / 62), base62_digit(zero_based % 62)])
+}
+
+fn base62_digit(value: u16) -> u8 {
+    match value {
+        0..=9 => b'0' + value as u8,
+        10..=35 => b'a' + (value as u8 - 10),
+        36..=61 => b'A' + (value as u8 - 36),
+        _ => unreachable!("base62 digit must be in 0..62"),
+    }
 }
 
 /// 与既有 `make_eeprom_bin.py` 相同布局的完整 EEPROM 镜像。
@@ -467,12 +1711,67 @@ mod tests {
     }
 
     #[test]
+    fn yg_stereo_snid_encoder_converts_date_sequence_and_checksum() {
+        let input = YgStereoSerialIdInput::new(YgStereoModuleCode::Model233, 26, 10, 31, 4, 3844);
+        let serial = input.serial_number().unwrap();
+        assert_eq!(serial, "2T23326AV4ZZ00");
+
+        let bytes = input.serial_bytes().unwrap();
+        assert_eq!(serial_checksum(&bytes), 0x69);
+        let image = FullEepromImage::from_solution(&solution(), &serial).unwrap();
+        assert_eq!(
+            &image.as_bytes()[SERIAL_OFFSET..SERIAL_OFFSET + SERIAL_BYTES],
+            &bytes
+        );
+        assert_eq!(image.as_bytes()[SERIAL_CHECKSUM_OFFSET], 0x69);
+    }
+
+    #[test]
+    fn yg_stereo_snid_encoder_supports_model_235_and_first_sequence() {
+        let input = YgStereoSerialIdInput::new(YgStereoModuleCode::Model235, 26, 1, 9, 0, 1);
+        assert_eq!(input.serial_number().unwrap(), "2T235261900000");
+    }
+
+    #[test]
+    fn yg_stereo_snid_encoder_rejects_out_of_range_fields() {
+        assert_eq!(
+            YgStereoSerialIdInput::new(YgStereoModuleCode::Model233, 100, 1, 1, 0, 1)
+                .serial_number()
+                .unwrap_err(),
+            YgStereoSerialIdError::YearOutOfRange { value: 100 }
+        );
+        assert_eq!(
+            YgStereoSerialIdInput::new(YgStereoModuleCode::Model233, 26, 13, 1, 0, 1)
+                .serial_number()
+                .unwrap_err(),
+            YgStereoSerialIdError::MonthOutOfRange { value: 13 }
+        );
+        assert_eq!(
+            YgStereoSerialIdInput::new(YgStereoModuleCode::Model233, 26, 1, 32, 0, 1)
+                .serial_number()
+                .unwrap_err(),
+            YgStereoSerialIdError::DayOutOfRange { value: 32 }
+        );
+        assert_eq!(
+            YgStereoSerialIdInput::new(YgStereoModuleCode::Model233, 26, 1, 1, 5, 1)
+                .serial_number()
+                .unwrap_err(),
+            YgStereoSerialIdError::OpticalAxisClassOutOfRange { value: 5 }
+        );
+        assert_eq!(
+            YgStereoSerialIdInput::new(YgStereoModuleCode::Model233, 26, 1, 1, 0, 3845)
+                .serial_number()
+                .unwrap_err(),
+            YgStereoSerialIdError::SequenceOutOfRange { value: 3845 }
+        );
+    }
+
+    #[test]
     fn full_image_matches_make_eeprom_bin_default_byte_for_byte() {
         let image = FullEepromImage::from_solution(&solution(), "2T02D2567K0042").unwrap();
-        let golden: &[u8; YG_STEREO_P24C64G_IMAGE_BYTES] =
-            include_bytes!("fixtures/yg_stereo_p24c64g_script_default.bin");
-
-        assert_eq!(image.as_bytes(), golden);
+        let golden = include_bytes!("fixtures/yg_stereo_p24c64g_script_default.bin");
+        assert_eq!(golden.len(), YG_STEREO_P24C64G_IMAGE_BYTES);
+        assert_eq!(image.as_bytes(), &golden[..]);
         let thin_prism_offset = DISTORTION_OFFSET + 8 * std::mem::size_of::<f32>();
         assert!(
             image.as_bytes()[thin_prism_offset..thin_prism_offset + 4 * 4]
@@ -528,5 +1827,250 @@ mod tests {
             FullEepromImage::from_solution(&invalid, "2T02D2567K0042"),
             Err(EepromImageError::UnexpectedDistortionCount { .. })
         ));
+    }
+
+    #[test]
+    fn baton_param_rw_map_matches_native_layout_contract() {
+        let map = baton_param_rw_native_lp64_le_v1();
+        assert_eq!(map.id, BATON_PARAM_RW_NATIVE_LP64_LE_V1_MAP_ID);
+        assert_eq!(BATON_PARAM_RW_IMAGE_BYTES, 1008);
+        assert_eq!(map.transport.i2c_address, 0x50);
+        assert_eq!(map.transport.address_width_bits, 16);
+        assert_eq!(map.transport.page_size_bytes, 32);
+        assert_eq!(map.transport.write_cycle_ms, 5);
+
+        let field = |name: &str| {
+            map.fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing Baton field {name}"))
+        };
+        assert_eq!(field("cam_rgb_param.width").offset, 0x03d8);
+        assert_eq!(field("cam_rgb_param.width").byte_len, 8);
+        assert_eq!(
+            field("cam_rgb_param.width").encoding,
+            StorageEncoding::F64Le
+        );
+        assert_eq!(field("cam_rgb_param.height").offset, 0x03e0);
+        assert_eq!(field("md_sn").offset, 0x0319);
+        assert_eq!(field("md_sn").byte_len, 21);
+        assert_eq!(field("md_sn").encoding, StorageEncoding::AsciiNulTerminated);
+        assert_eq!(
+            field("cam_rgb_param.rgb_to_left_extrinsic.r00").offset,
+            0x0378
+        );
+        assert_eq!(
+            field("cam_rgb_param.rgb_to_left_extrinsic.t2").offset,
+            0x03d0
+        );
+        assert_eq!(
+            field("padding.tail").offset + field("padding.tail").byte_len,
+            1008
+        );
+    }
+
+    #[test]
+    fn pueo_edu_df9_40_map_matches_repr_c_layout_contract() {
+        use std::mem::{align_of, offset_of, size_of};
+
+        #[repr(C)]
+        struct CamIntrinsicParam {
+            fx: f64,
+            fy: f64,
+            cx: f64,
+            cy: f64,
+            k1: f64,
+            k2: f64,
+            k3: f64,
+            p1: f64,
+            p2: f64,
+        }
+
+        #[repr(C)]
+        struct ExtrinsicMatrix {
+            r00: f64,
+            r01: f64,
+            r02: f64,
+            t0: f64,
+            r10: f64,
+            r11: f64,
+            r12: f64,
+            t1: f64,
+            r20: f64,
+            r21: f64,
+            r22: f64,
+            t2: f64,
+        }
+
+        #[repr(C)]
+        struct CamParam {
+            left_cam: CamIntrinsicParam,
+            right_cam: CamIntrinsicParam,
+            extrinsic: ExtrinsicMatrix,
+        }
+
+        #[repr(C)]
+        struct RgbCameraParam {
+            rgb_cam: CamIntrinsicParam,
+            rgb_to_left_extrinsic: ExtrinsicMatrix,
+            width: f64,
+            height: f64,
+            fps: f64,
+            exposure_time: f64,
+            gain: f64,
+            auto_exposure: u8,
+            auto_gain: u8,
+            auto_white_balance: u8,
+        }
+
+        #[repr(C)]
+        struct FishEyeIntrinsicParam {
+            fx: f64,
+            fy: f64,
+            cx: f64,
+            cy: f64,
+            xi: f64,
+            alpha: f64,
+        }
+
+        #[repr(C)]
+        struct ExtrinsicQuaternion {
+            px: f64,
+            py: f64,
+            pz: f64,
+            qx: f64,
+            qy: f64,
+            qz: f64,
+            qw: f64,
+        }
+
+        #[repr(C)]
+        struct FishEyeParam {
+            left_cam: FishEyeIntrinsicParam,
+            right_cam: FishEyeIntrinsicParam,
+            extrinsic: ExtrinsicQuaternion,
+        }
+
+        #[repr(C)]
+        struct CamImuExtrinsicParam {
+            left_cam_imu: ExtrinsicMatrix,
+            right_cam_imu: ExtrinsicMatrix,
+        }
+
+        #[repr(C)]
+        struct ImuParam {
+            acc_bias: [f64; 3],
+            groy_bias: [f64; 3],
+        }
+
+        #[repr(C)]
+        struct EepromData {
+            fish_param: FishEyeParam,
+            fish_param_check_sum: u8,
+            cam_param: CamParam,
+            cam_param_check_sum: u8,
+            cam_imu_extrinsic: CamImuExtrinsicParam,
+            cam_imu_extrinsic_check_sum: u8,
+            imu_param: ImuParam,
+            imu_param_check_sum: u8,
+            md_sn: [u8; 21],
+            rgb_camera: RgbCameraParam,
+            rgb_camera_check_sum: u8,
+        }
+
+        assert_eq!(size_of::<EepromData>(), PUEO_EDU_DF9_40_IMAGE_BYTES);
+        assert_eq!(align_of::<EepromData>(), 8);
+        assert_eq!(size_of::<f64>(), 8);
+        assert_eq!(
+            offset_of!(EepromData, imu_param),
+            usize::from(PUEO_IMU_PARAM_OFFSET)
+        );
+        assert_eq!(
+            offset_of!(EepromData, imu_param_check_sum),
+            usize::from(PUEO_IMU_PARAM_CHECKSUM_OFFSET)
+        );
+        assert_eq!(
+            offset_of!(EepromData, md_sn),
+            usize::from(PUEO_MD_SN_OFFSET)
+        );
+        assert_eq!(
+            offset_of!(EepromData, rgb_camera),
+            usize::from(PUEO_RGB_CAMERA_OFFSET)
+        );
+        assert_eq!(
+            offset_of!(EepromData, rgb_camera_check_sum),
+            usize::from(PUEO_RGB_CAMERA_CHECKSUM_OFFSET)
+        );
+
+        let map = pueo_edu_df9_40_native_lp64_le_v1();
+        assert_eq!(map.id, PUEO_EDU_DF9_40_NATIVE_LP64_LE_V1_MAP_ID);
+        assert_eq!(map.transport.i2c_address, 0x50);
+        assert_eq!(map.transport.address_width_bits, 16);
+        assert_eq!(map.transport.page_size_bytes, 32);
+
+        let prefix_tail = BATON_PARAM_RW_SHARED_PREFIX_FIELDS
+            .last()
+            .expect("shared prefix is non-empty");
+        assert_eq!(BATON_PARAM_RW_SHARED_PREFIX_FIELDS.len(), 79);
+        assert_eq!(prefix_tail.name, "padding.after_cam_imu_checksum");
+        assert_eq!(
+            prefix_tail.offset + prefix_tail.byte_len,
+            PUEO_IMU_PARAM_OFFSET
+        );
+        assert_eq!(
+            PUEO_EDU_DF9_40_FIELDS[BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT].name,
+            "imu_param.acc_bias[0]"
+        );
+        assert_eq!(
+            BATON_PARAM_RW_FIELDS[BATON_PARAM_RW_SHARED_PREFIX_FIELD_COUNT].name,
+            "imu_instrinsic.gyr_n"
+        );
+
+        let field = |name: &str| {
+            map.fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing PUEO field {name}"))
+        };
+        let imu_base = offset_of!(EepromData, imu_param);
+        assert_eq!(
+            usize::from(field("imu_param.acc_bias[0]").offset),
+            imu_base + offset_of!(ImuParam, acc_bias)
+        );
+        assert_eq!(
+            usize::from(field("imu_param.groy_bias[0]").offset),
+            imu_base + offset_of!(ImuParam, groy_bias)
+        );
+        assert_eq!(
+            field("imu_param.acc_bias[0]").encoding,
+            StorageEncoding::F64Le
+        );
+
+        let rgb_base = offset_of!(EepromData, rgb_camera);
+        assert_eq!(
+            usize::from(field("rgb_camera.fps").offset),
+            rgb_base + offset_of!(RgbCameraParam, fps)
+        );
+        assert_eq!(
+            usize::from(field("rgb_camera.exposure_time").offset),
+            rgb_base + offset_of!(RgbCameraParam, exposure_time)
+        );
+        assert_eq!(
+            usize::from(field("rgb_camera.gain").offset),
+            rgb_base + offset_of!(RgbCameraParam, gain)
+        );
+        assert_eq!(
+            usize::from(field("rgb_camera.auto_exposure").offset),
+            rgb_base + offset_of!(RgbCameraParam, auto_exposure)
+        );
+        assert_eq!(
+            field("rgb_camera.auto_exposure").encoding,
+            StorageEncoding::U8
+        );
+        assert!(
+            !map.fields
+                .iter()
+                .any(|field| field.name.starts_with("imu_instrinsic"))
+        );
     }
 }

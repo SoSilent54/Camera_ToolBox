@@ -27,12 +27,13 @@ pub(crate) enum ImageDocumentSource {
         asset: Arc<EphemeralAsset>,
         resolution: Arc<TargetResolutionSnapshot>,
     },
+    GeneratedCapture,
 }
 
 impl ImageDocumentSource {
     pub(crate) fn asset(&self) -> Option<&Arc<EphemeralAsset>> {
         match self {
-            Self::WorkspaceFile { .. } => None,
+            Self::WorkspaceFile { .. } | Self::GeneratedCapture => None,
             Self::Capture { asset, .. } => Some(asset),
         }
     }
@@ -222,6 +223,44 @@ impl ImageDocument {
         }
     }
 
+    pub(crate) fn from_generated_capture(
+        id: DocumentId,
+        generation: u64,
+        source_name: String,
+        display: Arc<Rgba8Frame>,
+        last_access: u64,
+    ) -> Self {
+        let width = display.width;
+        let height = display.height;
+        let native = NativeImage::Rgba8(Arc::clone(&display));
+        let mut analysis_panel = AnalysisPanelState::default_for_native(&native);
+        analysis_panel.open_for_first_image();
+        Self {
+            id,
+            title: source_name.clone(),
+            generation,
+            source: ImageDocumentSource::GeneratedCapture,
+            native,
+            display: DisplaySurface::new(generation, display),
+            viewer: ImageViewerState::default(),
+            hover_view: HoverViewSettings::default(),
+            roi: Roi {
+                x: 0,
+                y: 0,
+                width,
+                height,
+            },
+            analysis_panel,
+            analysis_pending_active: None,
+            spatial_requested: None,
+            spatial_highlight: None,
+            yuv_inspector: None,
+            decode_generation: 0,
+            last_access,
+            unsaved: false,
+        }
+    }
+
     pub(crate) fn yuv_workspace_source(&self) -> Option<(ImageSourceHandle, ImageFileKind)> {
         let ImageDocumentSource::WorkspaceFile { handle, kind, .. } = &self.source else {
             return None;
@@ -286,8 +325,27 @@ impl ImageDocument {
                     chroma_order_hint: None,
                 } => "YUV420SP",
             },
-            ImageDocumentSource::Capture { .. } => "Capture",
+            ImageDocumentSource::Capture { .. } | ImageDocumentSource::GeneratedCapture => {
+                "Capture"
+            }
         }
+    }
+
+    pub(crate) fn is_png_workspace_file(&self) -> bool {
+        matches!(
+            self.source,
+            ImageDocumentSource::WorkspaceFile {
+                kind: ImageFileKind::Png,
+                ..
+            }
+        )
+    }
+
+    pub(crate) fn is_color_capture(&self) -> bool {
+        matches!(
+            self.source,
+            ImageDocumentSource::Capture { .. } | ImageDocumentSource::GeneratedCapture
+        )
     }
 
     pub(crate) fn ensure_texture(&mut self, context: &egui::Context) -> Result<(), String> {

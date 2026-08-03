@@ -22,6 +22,8 @@ use crate::calibration_workspace::{
 
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
+#[cfg(feature = "platform-ssh")]
+use crate::i2c_tools::{I2cToolsAction, I2cToolsWorkspace};
 use crate::{
     analysis_panel::{DesiredAnalysis, render_analysis_panel},
     analysis_worker::{
@@ -29,6 +31,10 @@ use crate::{
     },
     auto_open::{AutoOpenCandidate, AutoOpenCoordinator},
     color_controls::{DisplayMode, render_color_controls},
+    color_inspection::{
+        ColorImagePoint, ColorInspectionAction, ColorInspectionWorkspace, ColorMetricsExport,
+        paint_color_chart_overlay, paint_manual_corner_overlay,
+    },
     color_worker::{ColorRenderRequest, ColorRenderResult, ColorRenderWorker},
     explorer::{ExplorerAction, ExplorerState},
     export_dialog::ExportNameDialogState,
@@ -58,21 +64,24 @@ use crate::{
 use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    RusshTransportFactory, SshConnectionTarget, SshEepromProvisionService,
+    RusshTransportFactory, SshConnectionTarget, SshEepromProvisionService, SshI2cHelperService,
 };
 use camera_toolbox_app::{
     AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
-    FsCancellation, FsControl, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
+    FsCancellation, FsControl, I2cBusInfo, I2cHelperAction, I2cHelperOperation, I2cHelperResult,
+    I2cHelperService, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
     ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterImageCodec,
     RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec, RtspLatencyMode,
     RtspStreamConfig, RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
 };
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_app::{
+    DumpCancellation, I2cHelperServiceError, RemoteOperationControl, RemoteTimeouts,
+};
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_app::{
-    DumpCancellation, EepromDryRunResult, EepromHelperResult, EepromInspectResult,
-    EepromProvisionOperation, EepromProvisionService, EepromProvisionServiceError,
-    EepromWriteResult, ExportArtifact, ExportService, RemoteOperationControl, RemoteTimeouts,
-    SnapshotHash,
+    EepromHelperResult, EepromInspectResult, EepromProvisionOperation, EepromProvisionService,
+    EepromProvisionServiceError, EepromWriteResult, SnapshotHash,
 };
 use camera_toolbox_core::{
     ChromaOrder, MediaFormat, NativeImage, OwnedMediaPayload, PackedRawSpec, Rgba8Frame, Roi,
@@ -175,6 +184,9 @@ enum PendingNamedExport {
     Image {
         snapshot: ImageExportSnapshot,
     },
+    Color {
+        export: ColorMetricsExport,
+    },
     #[cfg(feature = "calibration-opencv")]
     Calibration {
         export: CalibrationExport,
@@ -189,32 +201,58 @@ struct CalibrationExportResult {
     result: Result<ExportReceipt, String>,
 }
 
+struct ColorExportResult {
+    destination: ExportDestination,
+    target_label: String,
+    label: &'static str,
+    result: Result<ExportReceipt, String>,
+}
+
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 #[derive(Clone)]
 struct EepromProvisioningTarget {
     service: Arc<dyn EepromProvisionService>,
     snapshot_hash: SnapshotHash,
     label: String,
+    i2c_bus: u32,
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 #[derive(Debug)]
 enum EepromOperationOutcome {
     Inspect(EepromInspectResult),
-    DryRun {
-        request: camera_toolbox_core::EepromProvisionRequest,
-        result: EepromDryRunResult,
-        backup_file: String,
-        manifest_file: String,
+    BusDiscovery {
+        buses: Vec<I2cBusInfo>,
     },
     Provision {
         result: EepromWriteResult,
-        audit_file: String,
+        history_file: String,
     },
     ProvisionAuditFailed {
         result: EepromWriteResult,
         error: String,
     },
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EepromOperationKind {
+    Inspect,
+    BusDiscovery,
+    Provision,
+}
+
+#[cfg(feature = "platform-ssh")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum I2cToolsOperationKind {
+    BusDiscovery,
+    Transfer,
+}
+
+#[cfg(feature = "platform-ssh")]
+struct I2cToolsOperationResult {
+    kind: I2cToolsOperationKind,
+    result: Result<I2cHelperResult, String>,
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -250,8 +288,8 @@ impl From<String> for EepromOperationFailure {
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 struct EepromOperationResult {
+    kind: EepromOperationKind,
     target_label: String,
-    destination: Option<ExportDestination>,
     result: Result<EepromOperationOutcome, EepromOperationFailure>,
 }
 
@@ -259,14 +297,13 @@ struct EepromOperationResult {
 fn run_eeprom_operation(
     target: EepromProvisioningTarget,
     intent: CalibrationProvisionIntent,
-    destination: Option<&ExportDestination>,
-    directory_label: Option<&str>,
     operation_id: u64,
     cancellation: DumpCancellation,
 ) -> Result<EepromOperationOutcome, EepromOperationFailure> {
     let action = intent
         .helper_action()
         .ok_or_else(|| "cancel is not an executable EEPROM helper action".to_owned())?;
+
     let control = RemoteOperationControl::new(
         RemoteTimeouts {
             connect: Duration::from_secs(10),
@@ -297,20 +334,21 @@ fn run_eeprom_operation(
                 ) if failure.rollback == camera_toolbox_app::EepromRollbackState::Failed
             );
             let mut message = format_eeprom_service_error(&error);
-            if matches!(&intent, CalibrationProvisionIntent::Provision { .. })
-                && let (Some(destination), Some(directory_label)) = (destination, directory_label)
-            {
+            if let CalibrationProvisionIntent::Provision { request, .. } = &intent {
                 let document = serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "operation": "eeprom_provision_failure",
-                    "target": target.label,
-                    "target_snapshot_sha256": target.snapshot_hash.to_hex(),
-                    "request": action,
+                    "operation_id": operation_id,
+                    "target": eeprom_target_json(&target),
+                    "request": eeprom_action_parameters_json(&action),
                     "failure": eeprom_failure_json(&error),
                     "device_state_unknown": provision_state_unknown,
                 });
-                let name = format!("eeprom-write-failure-{operation_id:06}.json");
-                match persist_eeprom_json(destination, directory_label, &name, &document) {
+                match persist_eeprom_write_history_yaml(
+                    &request.serial_number,
+                    operation_id,
+                    &document,
+                ) {
                     Ok(label) => message.push_str(&format!("; failure audit: {label}")),
                     Err(audit_error) => message
                         .push_str(&format!("; failure audit save also failed: {audit_error}")),
@@ -328,99 +366,129 @@ fn run_eeprom_operation(
         (CalibrationProvisionIntent::Inspect, EepromHelperResult::Inspect(result)) => {
             Ok(EepromOperationOutcome::Inspect(result))
         }
-        (CalibrationProvisionIntent::DryRun { request }, EepromHelperResult::DryRun(result)) => {
-            let destination = destination
-                .ok_or_else(|| "dry-run backup destination is unavailable".to_owned())?;
-            let directory_label = directory_label
-                .ok_or_else(|| "dry-run destination label is unavailable".to_owned())?;
-            let hash_prefix = &result.state.image_sha256[..result.state.image_sha256.len().min(12)];
-            let backup_name = format!("eeprom-backup-{operation_id:06}-{hash_prefix}.bin");
-            let backup_file = persist_eeprom_bytes(
-                destination,
-                directory_label,
-                &backup_name,
-                result.backup.clone(),
-            )?;
-            let manifest_name = format!("eeprom-dry-run-{operation_id:06}.json");
+        (
+            CalibrationProvisionIntent::Provision { request, .. },
+            EepromHelperResult::Provision(result),
+        ) => {
             let document = serde_json::json!({
-                "schema_version": 1,
-                "operation": "eeprom_dry_run",
-                "target": target.label,
-                "target_snapshot_sha256": target.snapshot_hash.to_hex(),
-                "request": request,
-                "device_state": result.state,
-                "page_plan": result.page_plan,
-                "dry_run_token": result.dry_run_token,
-                "backup_file": backup_file,
-                "backup_sha256": camera_toolbox_app::SnapshotHash::digest_bytes(&result.backup)
-                    .to_hex(),
-            });
-            let manifest_file =
-                persist_eeprom_json(destination, directory_label, &manifest_name, &document)?;
-            Ok(EepromOperationOutcome::DryRun {
-                request,
-                result,
-                backup_file,
-                manifest_file,
-            })
-        }
-        (CalibrationProvisionIntent::Provision { .. }, EepromHelperResult::Provision(result)) => {
-            let destination = destination
-                .ok_or_else(|| "provision audit destination is unavailable".to_owned())?;
-            let directory_label = directory_label
-                .ok_or_else(|| "provision destination label is unavailable".to_owned())?;
-            let audit_name = format!("eeprom-write-success-{operation_id:06}.json");
-            let document = serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "operation": "eeprom_provision_success",
-                "target": target.label,
-                "target_snapshot_sha256": target.snapshot_hash.to_hex(),
-                "request": action,
-                "result": result,
+                "operation_id": operation_id,
+                "target": eeprom_target_json(&target),
+                "request": eeprom_action_parameters_json(&action),
+                "result": eeprom_write_result_json(&result),
             });
-            match persist_eeprom_json(destination, directory_label, &audit_name, &document) {
-                Ok(audit_file) => Ok(EepromOperationOutcome::Provision { result, audit_file }),
+            match persist_eeprom_write_history_yaml(&request.serial_number, operation_id, &document)
+            {
+                Ok(history_file) => Ok(EepromOperationOutcome::Provision {
+                    result,
+                    history_file,
+                }),
                 Err(error) => Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }),
             }
         }
+
         (_, unexpected) => Err(EepromOperationFailure::known(format!(
             "EEPROM helper returned an unexpected result kind: {unexpected:?}"
         ))),
     }
 }
-
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-fn persist_eeprom_json(
-    destination: &ExportDestination,
-    directory_label: &str,
-    name: &str,
-    document: &serde_json::Value,
-) -> Result<String, String> {
-    let mut bytes = serde_json::to_vec_pretty(document).map_err(|error| error.to_string())?;
-    bytes.push(b'\n');
-    persist_eeprom_bytes(destination, directory_label, name, bytes)
+fn run_i2c_bus_discovery(
+    connection: SshConnectionTarget,
+    credential_ref: String,
+    helper_payload: Arc<[u8]>,
+    resolver: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::CredentialResolver>,
+    transport: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::SshTransportFactory>,
+    operation_id: u64,
+    cancellation: DumpCancellation,
+) -> Result<EepromOperationOutcome, EepromOperationFailure> {
+    let control = RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(15),
+            overall: Duration::from_secs(45),
+        },
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let service = SshI2cHelperService::new(
+        format!("calibration-i2c-{}", operation_id),
+        connection,
+        credential_ref,
+        65_536,
+        helper_payload,
+        resolver,
+        transport,
+    )
+    .map_err(|error: camera_toolbox_app::I2cHelperServiceError| {
+        EepromOperationFailure::known(error.to_string())
+    })?;
+    let result = service
+        .execute(
+            I2cHelperOperation {
+                action: I2cHelperAction::ListBuses,
+            },
+            control,
+        )
+        .map_err(|error: camera_toolbox_app::I2cHelperServiceError| {
+            EepromOperationFailure::known(error.to_string())
+        })?;
+    match result {
+        I2cHelperResult::BusList { buses } => Ok(EepromOperationOutcome::BusDiscovery { buses }),
+        unexpected => Err(EepromOperationFailure::known(format!(
+            "I2C helper returned an unexpected result kind: {unexpected:?}"
+        ))),
+    }
 }
 
-#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-fn persist_eeprom_bytes(
-    destination: &ExportDestination,
-    directory_label: &str,
-    name: &str,
-    bytes: Vec<u8>,
-) -> Result<String, String> {
-    let file_name = EntryName::new(name.to_owned()).map_err(|error| error.to_string())?;
-    let artifact = ExportArtifact::new(file_name.clone(), bytes);
-    ExportService
-        .save_new(
-            destination,
-            &artifact,
-            &FsControl::with_timeout(Duration::from_secs(60)),
-        )
-        .map_err(|error| error.to_string())?;
-    Ok(CameraToolboxApp::export_target_label(
-        directory_label,
-        &file_name,
-    ))
+#[cfg(feature = "platform-ssh")]
+fn run_i2c_tools_request(
+    connection: SshConnectionTarget,
+    credential_ref: String,
+    helper_payload: Arc<[u8]>,
+    resolver: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::CredentialResolver>,
+    transport: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::SshTransportFactory>,
+    action: I2cHelperAction,
+    cancellation: DumpCancellation,
+) -> Result<I2cHelperResult, String> {
+    let (idle, overall) = match action {
+        I2cHelperAction::ListBuses => (Duration::from_secs(15), Duration::from_secs(45)),
+        I2cHelperAction::Transfer { .. } => (Duration::from_secs(30), Duration::from_secs(120)),
+    };
+    let control = RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle,
+            overall,
+        },
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let service = SshI2cHelperService::new(
+        "i2c-tools".to_owned(),
+        connection,
+        credential_ref,
+        1_048_576,
+        helper_payload,
+        resolver,
+        transport,
+    )
+    .map_err(|error| error.to_string())?;
+    service
+        .execute(I2cHelperOperation { action }, control)
+        .map_err(|error| format_i2c_service_error(&error))
+}
+
+#[cfg(feature = "platform-ssh")]
+fn format_i2c_service_error(error: &I2cHelperServiceError) -> String {
+    match error {
+        I2cHelperServiceError::Helper(failure) => format!(
+            "I2C helper failure: code={}, message={}, transaction={:?}, message={:?}",
+            failure.code, failure.message, failure.transaction_index, failure.message_index
+        ),
+        _ => error.to_string(),
+    }
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -438,11 +506,26 @@ fn format_eeprom_service_error(error: &EepromProvisionServiceError) -> String {
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_FLAG_OFFSET: u16 = 0x0000;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_CALIBRATION_OFFSET: u16 = 0x0010;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_SERIAL_OFFSET: u16 = 0x0125;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_SERIAL_BYTES: usize = 14;
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn eeprom_failure_json(error: &EepromProvisionServiceError) -> serde_json::Value {
     match error {
         EepromProvisionServiceError::Helper(failure) => serde_json::json!({
             "kind": "helper",
-            "detail": failure,
+            "code": failure.code,
+            "message": failure.message,
+            "before": failure.before,
+            "backup_sha256": SnapshotHash::digest_bytes(&failure.backup).to_hex(),
+            "backup_bytes": failure.backup.len(),
+            "rollback": failure.rollback,
+            "rollback_error": failure.rollback_error,
         }),
         _ => serde_json::json!({
             "kind": "service",
@@ -451,10 +534,435 @@ fn eeprom_failure_json(error: &EepromProvisionServiceError) -> serde_json::Value
     }
 }
 
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_write_result_json(result: &EepromWriteResult) -> serde_json::Value {
+    serde_json::json!({
+        "before": result.before,
+        "after": result.after,
+        "backup_sha256": SnapshotHash::digest_bytes(&result.backup).to_hex(),
+        "backup_bytes": result.backup.len(),
+        "page_plan": result.page_plan,
+        "bytewise_verified": result.bytewise_verified,
+        "rollback": result.rollback,
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_target_json(target: &EepromProvisioningTarget) -> serde_json::Value {
+    serde_json::json!({
+        "label": target.label,
+        "i2c_bus": target.i2c_bus,
+        "target_snapshot_sha256": target.snapshot_hash.to_hex(),
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_action_parameters_json(
+    action: &camera_toolbox_app::EepromHelperAction,
+) -> serde_json::Value {
+    match action {
+        camera_toolbox_app::EepromHelperAction::Inspect => serde_json::json!({
+            "action": "inspect",
+        }),
+        camera_toolbox_app::EepromHelperAction::Provision {
+            request,
+            expected_before_sha256,
+        } => serde_json::json!({
+            "action": "provision",
+            "expected_before_sha256": expected_before_sha256,
+            "request": eeprom_request_parameters_json(request),
+        }),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_request_parameters_json(
+    request: &camera_toolbox_core::EepromProvisionRequest,
+) -> serde_json::Value {
+    let calibration_parameters = eeprom_calibration_parameters_json(request);
+    serde_json::json!({
+        "map_id": request.map_id,
+        "mode": request.mode,
+        "serial_number": request.serial_number,
+        "overwrite_existing_serial": request.overwrite_existing_serial,
+        "snid": eeprom_snid_json(&request.serial_number),
+        "calibration_parameters": calibration_parameters,
+        "write_segments": request.segments.iter().map(eeprom_write_segment_json).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_write_segment_json(
+    segment: &camera_toolbox_core::EepromWriteSegment,
+) -> serde_json::Value {
+    serde_json::json!({
+        "offset": format!("0x{:04x}", segment.offset),
+        "offset_u16": segment.offset,
+        "byte_len": segment.bytes.len(),
+        "purpose": eeprom_segment_purpose(segment.offset),
+        "payload_sha256": SnapshotHash::digest_bytes(&segment.bytes).to_hex(),
+        "semantic_value": eeprom_segment_semantic_json(segment),
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_segment_purpose(offset: u16) -> &'static str {
+    match offset {
+        EEPROM_FLAG_OFFSET => "valid_flag",
+        EEPROM_CALIBRATION_OFFSET => "calibration_parameters",
+        EEPROM_SERIAL_OFFSET => "serial_number_and_checksum",
+        _ => "custom_segment",
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_segment_semantic_json(
+    segment: &camera_toolbox_core::EepromWriteSegment,
+) -> serde_json::Value {
+    match segment.offset {
+        EEPROM_FLAG_OFFSET if segment.bytes == b"hessian\0" => serde_json::json!({
+            "flag_ascii": "hessian\\0",
+        }),
+        EEPROM_CALIBRATION_OFFSET => {
+            decode_calibration_segment_json(&segment.bytes).unwrap_or(serde_json::Value::Null)
+        }
+        EEPROM_SERIAL_OFFSET if segment.bytes.len() >= EEPROM_SERIAL_BYTES => {
+            let serial = std::str::from_utf8(&segment.bytes[..EEPROM_SERIAL_BYTES]).ok();
+            serde_json::json!({
+                "serial_number": serial,
+                "snid": serial.map(eeprom_snid_json),
+                "checksum_u8": segment.bytes.get(EEPROM_SERIAL_BYTES).copied(),
+                "checksum_hex": segment.bytes.get(EEPROM_SERIAL_BYTES).map(|value| format!("0x{value:02x}")),
+            })
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_calibration_parameters_json(
+    request: &camera_toolbox_core::EepromProvisionRequest,
+) -> serde_json::Value {
+    request
+        .segments
+        .iter()
+        .find(|segment| segment.offset == EEPROM_CALIBRATION_OFFSET)
+        .and_then(|segment| decode_calibration_segment_json(&segment.bytes))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_calibration_segment_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let width = read_u32_le(bytes, 0)?;
+    let height = read_u32_le(bytes, 4)?;
+    let fx = read_f32_le(bytes, 8)?;
+    let fy = read_f32_le(bytes, 12)?;
+    let cx = read_f32_le(bytes, 16)?;
+    let cy = read_f32_le(bytes, 20)?;
+    let distortion = (0..12)
+        .map(|index| read_f32_le(bytes, 24 + index * 4))
+        .collect::<Option<Vec<_>>>()?;
+    Some(serde_json::json!({
+        "image_size": {
+            "width": width,
+            "height": height,
+        },
+        "camera_matrix": {
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "matrix_3x3": [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+        "distortion": {
+            "model": "opencv_pinhole_radtan_thin_prism_d12",
+            "coefficients": {
+                "k1": distortion[0],
+                "k2": distortion[1],
+                "p1": distortion[2],
+                "p2": distortion[3],
+                "k3": distortion[4],
+                "k4": distortion[5],
+                "k5": distortion[6],
+                "k6": distortion[7],
+                "s1": distortion[8],
+                "s2": distortion[9],
+                "s3": distortion[10],
+                "s4": distortion[11],
+            },
+        },
+    }))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn read_f32_le(bytes: &[u8], offset: usize) -> Option<f32> {
+    Some(f32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_snid_json(serial_number: &str) -> serde_json::Value {
+    let bytes = serial_number.as_bytes();
+    if bytes.len() != EEPROM_SERIAL_BYTES {
+        return serde_json::json!({
+            "raw": serial_number,
+            "decoded": null,
+            "error": "SNID must be 14 ASCII bytes",
+        });
+    }
+    let module = std::str::from_utf8(&bytes[2..5]).unwrap_or("");
+    let year = std::str::from_utf8(&bytes[5..7]).unwrap_or("");
+    let sequence = decode_snid_sequence(bytes[10], bytes[11]);
+    serde_json::json!({
+        "resolution": {
+            "code": char::from(bytes[0]).to_string(),
+            "meaning": if bytes[0] == b'2' { "FHD" } else { "unknown" },
+        },
+        "vendor": {
+            "code": char::from(bytes[1]).to_string(),
+            "meaning": if bytes[1] == b'T' { "SmartSens" } else { "unknown" },
+        },
+        "module": module,
+        "year": year,
+        "month": {
+            "input_decimal": decode_snid_month(bytes[7]),
+            "encoded": char::from(bytes[7]).to_string(),
+        },
+        "day": {
+            "input_decimal": decode_snid_day(bytes[8]),
+            "encoded": char::from(bytes[8]).to_string(),
+        },
+        "optical_axis_class": {
+            "input": decode_ascii_digit(bytes[9]),
+            "encoded": char::from(bytes[9]).to_string(),
+        },
+        "sequence": {
+            "input_decimal": sequence,
+            "encoded_high": char::from(bytes[10]).to_string(),
+            "encoded_low": char::from(bytes[11]).to_string(),
+        },
+        "algorithm_version": char::from(bytes[12]).to_string(),
+        "reserved": char::from(bytes[13]).to_string(),
+        "checksum_expected": {
+            "offset": "0x0133",
+            "algorithm": "sum(serial_bytes) % 0xff + 1",
+            "value_u8": serial_checksum_value(bytes),
+            "value_hex": format!("0x{:02x}", serial_checksum_value(bytes)),
+        },
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_ascii_digit(byte: u8) -> Option<u8> {
+    byte.is_ascii_digit().then_some(byte - b'0')
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_snid_month(byte: u8) -> Option<u8> {
+    match byte {
+        b'1'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'C' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_snid_day(byte: u8) -> Option<u8> {
+    match byte {
+        b'1'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'V' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_base62_digit(byte: u8) -> Option<u16> {
+    match byte {
+        b'0'..=b'9' => Some(u16::from(byte - b'0')),
+        b'a'..=b'z' => Some(u16::from(byte - b'a') + 10),
+        b'A'..=b'Z' => Some(u16::from(byte - b'A') + 36),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_snid_sequence(high: u8, low: u8) -> Option<u16> {
+    Some(decode_base62_digit(high)? * 62 + decode_base62_digit(low)? + 1)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn serial_checksum_value(bytes: &[u8]) -> u8 {
+    ((bytes.iter().map(|byte| u16::from(*byte)).sum::<u16>() % 0xff) + 1) as u8
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
+    let file_name = safe_eeprom_history_file_name(serial_number)?;
+    Ok(PathBuf::from("write_history").join(file_name))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn legacy_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
+    Ok(PathBuf::from("write_history")
+        .join(format!("{}.json", safe_eeprom_history_stem(serial_number)?)))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn safe_eeprom_history_stem(serial_number: &str) -> Result<String, String> {
+    let serial = serial_number.trim();
+    if serial.is_empty() {
+        return Err("EEPROM serial number is empty; cannot create write history file".to_owned());
+    }
+    if !serial
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "EEPROM serial number {serial:?} cannot be used as a write history filename"
+        ));
+    }
+    Ok(serial.to_owned())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn safe_eeprom_history_file_name(serial_number: &str) -> Result<String, String> {
+    Ok(format!("{}.yaml", safe_eeprom_history_stem(serial_number)?))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), String> {
+    for path in [
+        eeprom_history_path(serial_number)?,
+        legacy_eeprom_history_path(serial_number)?,
+    ] {
+        if path.exists() {
+            return Err(format!(
+                "Write history already exists for SN {serial_number}: {}. Refusing to start EEPROM write; rename or archive the existing file before retrying.",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn path_parent_or_current(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
+    let directory = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "failed to open {label} directory {} for sync: {error}",
+            path.display()
+        )
+    })?;
+    directory.sync_all().map_err(|error| {
+        format!(
+            "failed to sync {label} directory {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn ensure_directory_durable(path: &Path, label: &str) -> Result<(), String> {
+    let existed = path.exists();
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "failed to create {label} directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if !existed {
+        // 新目录入口在父目录中，必须同步父目录后才能称为持久化。
+        sync_directory(path_parent_or_current(path), label)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn create_new_file(
+    path: &Path,
+    bytes: &[u8],
+    operation_id: u64,
+    label: &str,
+) -> Result<(), String> {
+    let parent = path.parent().map(Path::to_path_buf);
+    if let Some(parent) = parent.as_deref() {
+        ensure_directory_durable(parent, label)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "failed to create {label} for operation {operation_id} at {}: {error}",
+                path.display()
+            )
+        })?;
+    std::io::Write::write_all(&mut file, bytes).map_err(|error| {
+        format!(
+            "failed to write {label} for operation {operation_id} at {}: {error}",
+            path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "failed to sync {label} for operation {operation_id} at {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = parent.as_deref() {
+        sync_directory(parent, label)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn serialize_eeprom_yaml(document: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut text = serde_yaml::to_string(document).map_err(|error| error.to_string())?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(text.into_bytes())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn persist_eeprom_write_history_yaml(
+    serial_number: &str,
+    operation_id: u64,
+    document: &serde_json::Value,
+) -> Result<String, String> {
+    let path = eeprom_history_path(serial_number)?;
+    let bytes = serialize_eeprom_yaml(document)?;
+    create_new_file(&path, &bytes, operation_id, "EEPROM write history")?;
+    Ok(path.display().to_string())
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ProductWorkspace {
     #[default]
     Viewer,
+    Color,
+    #[cfg(feature = "platform-ssh")]
+    I2cTools,
     #[cfg(feature = "calibration-opencv")]
     Calibration,
 }
@@ -493,6 +1001,7 @@ pub(crate) struct CameraToolboxApp {
     #[cfg(feature = "calibration-opencv")]
     calibration: CalibrationWorkspace,
     workspace: WorkspaceState,
+    color_inspection: ColorInspectionWorkspace,
     auto_open: AutoOpenCoordinator,
     explorer: ExplorerState,
     explorer_panel_expanded: bool,
@@ -507,6 +1016,8 @@ pub(crate) struct CameraToolboxApp {
     analysis_worker: AnalysisWorker,
     spatial_worker: SpatialHighlightWorker,
     save_worker: ImageSaveWorker,
+    color_export_sender: Sender<ColorExportResult>,
+    color_export_receiver: Receiver<ColorExportResult>,
     #[cfg(feature = "calibration-opencv")]
     calibration_export_sender: Sender<CalibrationExportResult>,
     #[cfg(feature = "calibration-opencv")]
@@ -523,6 +1034,16 @@ pub(crate) struct CameraToolboxApp {
     active_eeprom_cancellable: bool,
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     next_eeprom_operation: u64,
+    #[cfg(feature = "platform-ssh")]
+    i2c_tools: I2cToolsWorkspace,
+    #[cfg(feature = "platform-ssh")]
+    i2c_tools_sender: Sender<I2cToolsOperationResult>,
+    #[cfg(feature = "platform-ssh")]
+    i2c_tools_receiver: Receiver<I2cToolsOperationResult>,
+    #[cfg(feature = "platform-ssh")]
+    active_i2c_tools_cancellation: Option<DumpCancellation>,
+    #[cfg(feature = "platform-ssh")]
+    active_i2c_tools_cancellable: bool,
     notifications: NotificationCenter,
     next_generation: u64,
     live_runtime: LiveRuntime,
@@ -562,10 +1083,13 @@ impl CameraToolboxApp {
         let (reinterpret_sender, reinterpret_receiver) = mpsc::channel();
         let (yuv_reinterpret_sender, yuv_reinterpret_receiver) = mpsc::channel();
         let (auto_open_sender, auto_open_receiver) = mpsc::channel();
+        let (color_export_sender, color_export_receiver) = mpsc::channel();
         #[cfg(feature = "calibration-opencv")]
         let (calibration_export_sender, calibration_export_receiver) = mpsc::channel();
         #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
         let (eeprom_operation_sender, eeprom_operation_receiver) = mpsc::channel();
+        #[cfg(feature = "platform-ssh")]
+        let (i2c_tools_sender, i2c_tools_receiver) = mpsc::channel();
         let live_runtime = LiveRuntime::new().map_err(std::io::Error::other)?;
         #[cfg(feature = "platform-ssh")]
         let explorer =
@@ -578,6 +1102,7 @@ impl CameraToolboxApp {
             #[cfg(feature = "calibration-opencv")]
             calibration: CalibrationWorkspace::new(context)?,
             workspace: WorkspaceState::default(),
+            color_inspection: ColorInspectionWorkspace::default(),
             explorer,
             auto_open,
             explorer_panel_expanded: false,
@@ -592,6 +1117,8 @@ impl CameraToolboxApp {
             analysis_worker: AnalysisWorker::new(context)?,
             spatial_worker: SpatialHighlightWorker::new(context)?,
             save_worker: ImageSaveWorker::new(context, codec)?,
+            color_export_sender,
+            color_export_receiver,
             #[cfg(feature = "calibration-opencv")]
             calibration_export_sender,
             #[cfg(feature = "calibration-opencv")]
@@ -608,6 +1135,16 @@ impl CameraToolboxApp {
             active_eeprom_cancellable: false,
             #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
             next_eeprom_operation: 1,
+            #[cfg(feature = "platform-ssh")]
+            i2c_tools: I2cToolsWorkspace::default(),
+            #[cfg(feature = "platform-ssh")]
+            i2c_tools_sender,
+            #[cfg(feature = "platform-ssh")]
+            i2c_tools_receiver,
+            #[cfg(feature = "platform-ssh")]
+            active_i2c_tools_cancellation: None,
+            #[cfg(feature = "platform-ssh")]
+            active_i2c_tools_cancellable: false,
             notifications: NotificationCenter::default(),
             next_generation: 1,
             live_runtime,
@@ -639,10 +1176,13 @@ impl eframe::App for CameraToolboxApp {
         self.poll_analysis_result();
         self.poll_spatial_highlight_result();
         self.poll_save_result(&context);
+        self.poll_color_export_result(&context);
         #[cfg(feature = "calibration-opencv")]
         self.poll_calibration_export_result(&context);
         #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
         self.poll_eeprom_operation_result(&context);
+        #[cfg(feature = "platform-ssh")]
+        self.poll_i2c_tools_result();
         self.poll_raw_open_result(&context);
         self.poll_auto_open_result(&context);
         self.enqueue_auto_open_candidates();
@@ -777,7 +1317,7 @@ impl eframe::App for CameraToolboxApp {
             self.start_direct_rtsp(config);
         }
         if let Some(action) = workspace_stream_action {
-            self.handle_workspace_stream_action(action);
+            self.handle_workspace_stream_action(&context, action);
         }
         egui::Panel::bottom("status_bar").show(ui, |ui| {
             #[cfg(feature = "calibration-opencv")]
@@ -787,12 +1327,50 @@ impl eframe::App for CameraToolboxApp {
             }
             self.render_status_bar(ui);
         });
-        if !self.is_calibration_workspace() {
+        if self.product_workspace == ProductWorkspace::Viewer {
             self.render_analysis_panel_ui(ui);
             self.render_color_panel(ui);
             self.render_yuv_inspector_panel(ui);
         }
+        let color_action = if self.is_color_workspace() {
+            let active_label = self
+                .workspace
+                .active_image()
+                .filter(|document| document.is_png_workspace_file() || document.is_color_capture())
+                .map(|document| document.title.clone());
+            let can_analyze = active_label.is_some();
+            let can_capture_rtsp = self
+                .workspace
+                .active_live()
+                .is_some_and(|document| document.displayed_frame().is_some());
+            egui::Panel::right("color_inspection_panel")
+                .resizable(true)
+                .default_size(360.0)
+                .min_size(280.0)
+                .show(ui, |ui| {
+                    self.color_inspection.render_right_panel(
+                        ui,
+                        active_label.as_deref(),
+                        can_analyze,
+                        can_capture_rtsp,
+                    )
+                })
+                .inner
+        } else {
+            None
+        };
+        if let Some(action) = color_action {
+            self.handle_color_inspection_action(&context, action);
+        }
 
+        #[cfg(feature = "platform-ssh")]
+        let i2c_tools_sftp_label: Result<String, String> = self
+            .explorer
+            .connected_sftp_label()
+            .map(str::to_owned)
+            .ok_or_else(|| "Connect Explorer SFTP before using I²C Tools.".to_owned());
+        #[cfg(feature = "platform-ssh")]
+        let mut i2c_tools_action = None;
         #[cfg(feature = "calibration-opencv")]
         let calibration_sftp_label: Result<String, String> = {
             #[cfg(feature = "platform-ssh")]
@@ -833,8 +1411,21 @@ impl eframe::App for CameraToolboxApp {
                 Some(&document.source),
             )
         });
+        let color_workspace = self.is_color_workspace();
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
+                #[cfg(feature = "platform-ssh")]
+                if self.product_workspace == ProductWorkspace::I2cTools {
+                    let rect = ui.available_rect_before_wrap();
+                    i2c_tools_action = self.i2c_tools.render(
+                        ui,
+                        i2c_tools_sftp_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
+                    );
+                    return ViewerOutput { rect, action: None };
+                }
                 #[cfg(feature = "calibration-opencv")]
                 if self.is_calibration_workspace() {
                     let has_live_inspection = self.workspace.active_live().is_some();
@@ -876,21 +1467,62 @@ impl eframe::App for CameraToolboxApp {
                     );
                     ViewerOutput { rect, action: None }
                 } else if let Some(document) = self.workspace.active_image_mut() {
+                    let document_id = document.id;
+                    let generation = document.generation;
+                    let dimensions = document.native.dimensions();
                     let image = document.display.texture_id().map(|texture_id| {
-                        ViewerImage::native(
-                            document.generation,
-                            document.native.clone(),
-                            texture_id,
-                            document.roi,
-                        )
+                        if color_workspace {
+                            ViewerImage::native_without_roi(
+                                document.generation,
+                                document.native.clone(),
+                                texture_id,
+                            )
+                        } else {
+                            ViewerImage::native(
+                                document.generation,
+                                document.native.clone(),
+                                texture_id,
+                                document.roi,
+                            )
+                        }
                     });
-                    render_viewer(
+                    let output = render_viewer(
                         ui,
                         image,
                         &mut document.viewer,
                         document.hover_view,
                         document.spatial_highlight.as_ref(),
-                    )
+                    );
+                    if color_workspace
+                        && let Some(analysis) = self
+                            .color_inspection
+                            .analysis_for_overlay(document_id, generation)
+                        && let Some(image_rect) = document.viewer.displayed_image_rect()
+                    {
+                        paint_color_chart_overlay(
+                            ui.painter(),
+                            image_rect,
+                            dimensions,
+                            analysis,
+                            document.viewer.horizontal_flip,
+                            self.color_inspection.selected_patch_index(),
+                        );
+                    }
+                    if color_workspace
+                        && let Some(points) = self
+                            .color_inspection
+                            .manual_corners_for_overlay(document_id, generation)
+                        && let Some(image_rect) = document.viewer.displayed_image_rect()
+                    {
+                        paint_manual_corner_overlay(
+                            ui.painter(),
+                            image_rect,
+                            dimensions,
+                            points,
+                            document.viewer.horizontal_flip,
+                        );
+                    }
+                    output
                 } else if let Some(document) = self.workspace.active_mut() {
                     let image = ViewerImage::raw(&document.loaded, document.display_mode);
                     render_viewer(
@@ -914,6 +1546,10 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
         }
+        #[cfg(feature = "platform-ssh")]
+        if let Some(action) = i2c_tools_action {
+            self.begin_i2c_tools_operation(&context, action);
+        }
         #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
         if let Some(intent) = self.calibration.take_provision_intent() {
             self.begin_eeprom_operation(&context, intent);
@@ -921,6 +1557,9 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         if let Some(export) = self.calibration.take_export() {
             self.begin_calibration_export(&context, export);
+        }
+        if let Some(export) = self.color_inspection.take_export() {
+            self.begin_color_export(&context, export);
         }
         self.render_named_export_dialog(&context);
         self.render_yuv_save_dialog(&context);
@@ -954,12 +1593,27 @@ impl CameraToolboxApp {
         }
     }
 
+    fn is_color_workspace(&self) -> bool {
+        self.product_workspace == ProductWorkspace::Color
+    }
+
     fn render_product_workspace_switch(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(
                 &mut self.product_workspace,
                 ProductWorkspace::Viewer,
                 "Viewer",
+            );
+            ui.selectable_value(
+                &mut self.product_workspace,
+                ProductWorkspace::Color,
+                "Color",
+            );
+            #[cfg(feature = "platform-ssh")]
+            ui.selectable_value(
+                &mut self.product_workspace,
+                ProductWorkspace::I2cTools,
+                "I²C Tools",
             );
             #[cfg(feature = "calibration-opencv")]
             ui.selectable_value(
@@ -1606,8 +2260,19 @@ impl CameraToolboxApp {
     }
 
     fn handle_viewer_action(&mut self, action: ViewerAction) {
+        let color_workspace = self.product_workspace == ProductWorkspace::Color;
         if let Some(document) = self.workspace.active_image_mut() {
             match action {
+                ViewerAction::ClickPixel { x, y } if color_workspace => {
+                    self.color_inspection.handle_manual_corner_click(
+                        document,
+                        ColorImagePoint {
+                            x: f64::from(x),
+                            y: f64::from(y),
+                        },
+                    );
+                }
+                ViewerAction::ClickPixel { .. } => {}
                 ViewerAction::CommitRoi(roi) => Self::commit_roi_for_image(document, roi),
                 ViewerAction::ResetRoi => {
                     let [width, height] = document.native.dimensions();
@@ -1641,6 +2306,7 @@ impl CameraToolboxApp {
                     },
                 );
             }
+            ViewerAction::ClickPixel { .. } => {}
         }
     }
 
@@ -2127,12 +2793,7 @@ impl CameraToolboxApp {
                     remote,
                 };
                 match kind {
-                    Ok(
-                        ImageFileKind::Raw
-                        | ImageFileKind::Png
-                        | ImageFileKind::Jpeg
-                        | ImageFileKind::Yuv420Sp { .. },
-                    ) => {
+                    Ok(kind) if kind == ImageFileKind::Png || !self.is_color_workspace() => {
                         let attempt = self.begin_raw_open_attempt();
                         self.start_load_workspace_file(
                             context,
@@ -2140,6 +2801,20 @@ impl CameraToolboxApp {
                             request,
                             ImageOpenMode::Auto,
                         );
+                    }
+                    Ok(kind) => {
+                        let attempt = self.begin_raw_open_attempt();
+                        tracing::warn!(
+                            operation = "open_color_input",
+                            path = %display_path.display(),
+                            kind = ?kind,
+                            "rejected non-PNG Color page file input"
+                        );
+                        self.notifications.push_once(UiNotification::error(
+                            NotificationKey::RawLoadFailed { attempt },
+                            "Color input must be PNG",
+                            "Color page file input accepts PNG only; use RTSP Capture for live input.",
+                        ));
                     }
                     Err(error) => {
                         let attempt = self.begin_raw_open_attempt();
@@ -2323,6 +2998,13 @@ impl CameraToolboxApp {
                 resolved.directory_label,
                 selection.file_name,
                 snapshot,
+            ),
+            PendingNamedExport::Color { export } => self.submit_color_export(
+                context,
+                resolved.destination,
+                resolved.directory_label,
+                selection.file_name,
+                export,
             ),
             #[cfg(feature = "calibration-opencv")]
             PendingNamedExport::Calibration { export } => self.submit_calibration_export(
@@ -2582,6 +3264,94 @@ impl CameraToolboxApp {
         }
     }
 
+    fn begin_color_export(&mut self, context: &egui::Context, export: ColorMetricsExport) {
+        let prefill = match self.explorer.export_dialog_prefill(context) {
+            Ok(prefill) => prefill,
+            Err(error) => {
+                self.color_inspection.report_export_finished(
+                    export.label(),
+                    "Workspace",
+                    Err(&error),
+                );
+                return;
+            }
+        };
+        let suggested_name = export.suggested_name();
+        self.pending_named_export = Some(PendingNamedExport::Color { export });
+        self.export_name_dialog
+            .open("Export color metrics", suggested_name, prefill);
+    }
+
+    fn submit_color_export(
+        &mut self,
+        context: &egui::Context,
+        destination: ExportDestination,
+        directory_label: String,
+        file_name: EntryName,
+        export: ColorMetricsExport,
+    ) {
+        let target_label = Self::export_target_label(&directory_label, &file_name);
+        let label = export.label();
+        self.color_inspection
+            .report_export_started(label, &target_label);
+        let sender = self.color_export_sender.clone();
+        let worker_context = context.clone();
+        let worker_destination = destination.clone();
+        let worker_target_label = target_label.clone();
+        let spawn_result = thread::Builder::new()
+            .name("camera-toolbox-color-export".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    export.save_new(
+                        &worker_destination,
+                        &file_name,
+                        &FsControl::with_timeout(Duration::from_secs(60)),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(camera_toolbox_app::FileSystemError::Io(
+                        "color metrics export worker panicked".to_owned(),
+                    ))
+                })
+                .map_err(|error| error.to_string());
+                let _ = sender.send(ColorExportResult {
+                    destination: worker_destination,
+                    target_label: worker_target_label,
+                    label,
+                    result,
+                });
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.color_inspection.report_export_finished(
+                label,
+                &target_label,
+                Err(&format!("start export worker failed: {error}")),
+            );
+        }
+    }
+
+    fn poll_color_export_result(&mut self, context: &egui::Context) {
+        while let Ok(result) = self.color_export_receiver.try_recv() {
+            match result.result {
+                Ok(receipt) => {
+                    self.explorer
+                        .refresh_save_destination(&result.destination, context);
+                    self.color_inspection.report_export_finished(
+                        result.label,
+                        &result.target_label,
+                        Ok(receipt.bytes_written()),
+                    );
+                }
+                Err(error) => self.color_inspection.report_export_finished(
+                    result.label,
+                    &result.target_label,
+                    Err(&error),
+                ),
+            }
+        }
+    }
+
     #[cfg(feature = "calibration-opencv")]
     fn poll_calibration_export_result(&mut self, context: &egui::Context) {
         while let Ok(result) = self.calibration_export_receiver.try_recv() {
@@ -2610,12 +3380,12 @@ impl CameraToolboxApp {
         self.calibration.report_target_invalidated(message);
     }
 
-    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    #[cfg(feature = "platform-ssh")]
     fn local_eeprom_helper_program_name() -> &'static str {
         "camera-toolbox-eeprom-helper-linux-aarch64"
     }
 
-    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    #[cfg(feature = "platform-ssh")]
     fn local_eeprom_helper_candidates() -> Result<Vec<PathBuf>, String> {
         let current = std::env::current_exe()
             .map_err(|error| format!("Resolve current executable failed: {error}"))?;
@@ -2657,7 +3427,7 @@ impl CameraToolboxApp {
         }
     }
 
-    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    #[cfg(feature = "platform-ssh")]
     fn read_local_eeprom_helper_payload() -> Result<Arc<[u8]>, String> {
         let candidates = Self::local_eeprom_helper_candidates()?;
         let mut missing = Vec::new();
@@ -2742,8 +3512,100 @@ impl CameraToolboxApp {
             service: Arc::new(service),
             snapshot_hash,
             label: label.clone(),
+            i2c_bus: u32::from(request.i2c_bus),
         });
         Ok(label)
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn begin_i2c_tools_operation(&mut self, context: &egui::Context, action: I2cToolsAction) {
+        if matches!(action, I2cToolsAction::Cancel) {
+            if !self.active_i2c_tools_cancellable {
+                self.i2c_tools
+                    .report_error("No cancellable I²C Tools operation is active.");
+            } else if let Some(cancellation) = &self.active_i2c_tools_cancellation {
+                cancellation.cancel();
+                self.i2c_tools.report_cancelled();
+            }
+            return;
+        }
+        if self.active_i2c_tools_cancellation.is_some() {
+            self.i2c_tools
+                .report_error("An I²C Tools operation is already active.");
+            return;
+        }
+        let source = match self.explorer.connected_sftp_connection().cloned() {
+            Some(source) => source,
+            None => {
+                self.i2c_tools
+                    .report_error("Connect Explorer SFTP before using I²C Tools.");
+                return;
+            }
+        };
+        let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
+        else {
+            self.i2c_tools
+                .report_error("I²C Tools requires the Explorer SFTP process-only password.");
+            return;
+        };
+        let helper_payload = match Self::read_local_eeprom_helper_payload() {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.i2c_tools.report_error(error);
+                return;
+            }
+        };
+        let (kind, helper_action) = match action {
+            I2cToolsAction::DiscoverBuses => (
+                I2cToolsOperationKind::BusDiscovery,
+                I2cHelperAction::ListBuses,
+            ),
+            I2cToolsAction::ExecuteTransfer(transactions) => (
+                I2cToolsOperationKind::Transfer,
+                I2cHelperAction::Transfer { transactions },
+            ),
+            I2cToolsAction::Cancel => unreachable!("cancel returns before worker dispatch"),
+        };
+        let credential_ref = format!("session:{slot_id}");
+        let connection = SshConnectionTarget {
+            host: source.host,
+            port: source.port,
+            username: source.username,
+            expected_host_key: None,
+            command_subsystem: None,
+            remote_event_subsystem: None,
+        };
+        let cancellation = DumpCancellation::default();
+        self.active_i2c_tools_cancellation = Some(cancellation.clone());
+        self.active_i2c_tools_cancellable = true;
+        let sender = self.i2c_tools_sender.clone();
+        let worker_context = context.clone();
+        let resolver = self.live_runtime.ssh_resolver();
+        let transport = Arc::new(RusshTransportFactory);
+        let spawn_result = thread::Builder::new()
+            .name("camera-toolbox-i2c-tools".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_i2c_tools_request(
+                        connection,
+                        credential_ref,
+                        helper_payload,
+                        resolver,
+                        transport,
+                        helper_action,
+                        cancellation,
+                    )
+                }))
+                .unwrap_or_else(|_| Err("I²C Tools worker panicked".to_owned()));
+                let _ = sender.send(I2cToolsOperationResult { kind, result });
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.active_i2c_tools_cancellation = None;
+            self.active_i2c_tools_cancellable = false;
+            self.i2c_tools
+                .report_error(format!("Failed to start I²C Tools worker: {error}"));
+        }
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -2761,7 +3623,7 @@ impl CameraToolboxApp {
                     return;
                 }
                 self.invalidate_eeprom_target(
-                    "Reconfiguring EEPROM target; previous Inspect and Dry-run are invalid.",
+                    "Reconfiguring EEPROM target; previous Inspect and Write authorization are invalid.",
                 );
                 match self.configure_eeprom_target(request) {
                     Ok(label) => self.calibration.report_target_configured(&label),
@@ -2773,9 +3635,8 @@ impl CameraToolboxApp {
         };
         if matches!(&intent, CalibrationProvisionIntent::Cancel) {
             if !self.active_eeprom_cancellable {
-                self.calibration.report_provision_error(
-                    "No cancellable EEPROM inspect/dry-run operation is active.",
-                );
+                self.calibration
+                    .report_provision_error("No cancellable EEPROM read operation is active.");
             } else if let Some(cancellation) = &self.active_eeprom_cancellation {
                 cancellation.cancel();
             }
@@ -2786,6 +3647,89 @@ impl CameraToolboxApp {
                 .report_provision_error("An EEPROM operation is already active.");
             return;
         }
+        if matches!(&intent, CalibrationProvisionIntent::DiscoverBuses) {
+            let source = match self.explorer.connected_sftp_connection().cloned() {
+                Some(source) => source,
+                None => {
+                    self.calibration.report_bus_discovery_failed(
+                        "Connect Explorer SFTP before discovering I²C buses.",
+                    );
+                    return;
+                }
+            };
+            let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
+                &source.authentication
+            else {
+                self.calibration.report_bus_discovery_failed(
+                    "I²C bus discovery requires the Explorer SFTP process-only password",
+                );
+                return;
+            };
+            let credential_ref = format!("session:{slot_id}");
+            let connection = SshConnectionTarget {
+                host: source.host.clone(),
+                port: source.port,
+                username: source.username.clone(),
+                expected_host_key: None,
+                command_subsystem: None,
+                remote_event_subsystem: None,
+            };
+            let helper_payload = match Self::read_local_eeprom_helper_payload() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.calibration.report_bus_discovery_failed(error);
+                    return;
+                }
+            };
+            let operation_id = self.next_eeprom_operation;
+            self.next_eeprom_operation = self.next_eeprom_operation.wrapping_add(1).max(1);
+            let cancellation = DumpCancellation::default();
+            self.active_eeprom_cancellation = Some(cancellation.clone());
+            self.active_eeprom_cancellable = true;
+            let sender = self.eeprom_operation_sender.clone();
+            let worker_context = context.clone();
+            let target_label = format!(
+                "{}@{}:{} / i2c-buses",
+                source.username, source.host, source.port,
+            );
+            let resolver = self.live_runtime.ssh_resolver();
+            let transport = Arc::new(RusshTransportFactory);
+            let spawn_result = thread::Builder::new()
+                .name("camera-toolbox-i2c-discovery".to_owned())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_i2c_bus_discovery(
+                            connection,
+                            credential_ref,
+                            helper_payload,
+                            resolver,
+                            transport,
+                            operation_id,
+                            cancellation,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(EepromOperationFailure::known(
+                            "I²C bus discovery worker panicked",
+                        ))
+                    });
+                    let _ = sender.send(EepromOperationResult {
+                        kind: EepromOperationKind::BusDiscovery,
+                        target_label,
+                        result,
+                    });
+                    worker_context.request_repaint();
+                });
+            if let Err(error) = spawn_result {
+                self.active_eeprom_cancellation = None;
+                self.active_eeprom_cancellable = false;
+                self.calibration.report_bus_discovery_failed(format!(
+                    "Failed to start I²C bus discovery worker: {error}"
+                ));
+            }
+            return;
+        }
+
         let target = match self.eeprom_target.clone() {
             Some(target) => target,
             None => {
@@ -2795,25 +3739,12 @@ impl CameraToolboxApp {
                 return;
             }
         };
-        let needs_destination = !matches!(&intent, CalibrationProvisionIntent::Inspect);
-        let destination = if needs_destination {
-            match self.explorer.active_save_destination() {
-                Ok(destination) => Some(destination),
-                Err(error) => {
-                    self.calibration.report_provision_error(format!(
-                        "EEPROM backup/audit destination is unavailable: {error}"
-                    ));
-                    return;
-                }
-            }
-        } else {
-            None
-        };
-        let directory_label = destination.as_ref().map(|_| {
-            self.explorer
-                .active_save_target_label()
-                .unwrap_or_else(|| "Workspace".to_owned())
-        });
+        if let CalibrationProvisionIntent::Provision { request, .. } = &intent
+            && let Err(error) = ensure_eeprom_history_slot_available(&request.serial_number)
+        {
+            self.calibration.report_provision_error(error);
+            return;
+        }
         let operation_id = self.next_eeprom_operation;
         self.next_eeprom_operation = self.next_eeprom_operation.wrapping_add(1).max(1);
         let cancellation = DumpCancellation::default();
@@ -2823,20 +3754,21 @@ impl CameraToolboxApp {
         let sender = self.eeprom_operation_sender.clone();
         let worker_context = context.clone();
         let target_label = target.label.clone();
-        let worker_destination = destination.clone();
         let provision_attempt = matches!(&intent, CalibrationProvisionIntent::Provision { .. });
+        let kind = match &intent {
+            CalibrationProvisionIntent::Inspect => EepromOperationKind::Inspect,
+            CalibrationProvisionIntent::Provision { .. } => EepromOperationKind::Provision,
+            CalibrationProvisionIntent::Cancel
+            | CalibrationProvisionIntent::ConfigureTarget(_)
+            | CalibrationProvisionIntent::DiscoverBuses => {
+                unreachable!("non-worker EEPROM intents return before worker dispatch")
+            }
+        };
         let spawn_result = thread::Builder::new()
             .name("camera-toolbox-eeprom-operation".to_owned())
             .spawn(move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    run_eeprom_operation(
-                        target,
-                        intent,
-                        worker_destination.as_ref(),
-                        directory_label.as_deref(),
-                        operation_id,
-                        cancellation,
-                    )
+                    run_eeprom_operation(target, intent, operation_id, cancellation)
                 }))
                 .unwrap_or_else(|_| {
                     Err(if provision_attempt {
@@ -2846,8 +3778,8 @@ impl CameraToolboxApp {
                     })
                 });
                 let _ = sender.send(EepromOperationResult {
+                    kind,
                     target_label,
-                    destination: worker_destination,
                     result,
                 });
                 worker_context.request_repaint();
@@ -2862,39 +3794,56 @@ impl CameraToolboxApp {
     }
 
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-    fn poll_eeprom_operation_result(&mut self, context: &egui::Context) {
+    fn poll_eeprom_operation_result(&mut self, _context: &egui::Context) {
         while let Ok(operation) = self.eeprom_operation_receiver.try_recv() {
             self.active_eeprom_cancellation = None;
             self.active_eeprom_cancellable = false;
-            if let Some(destination) = &operation.destination {
-                self.explorer.refresh_save_destination(destination, context);
-            }
             match operation.result {
                 Ok(EepromOperationOutcome::Inspect(result)) => self
                     .calibration
                     .report_eeprom_inspect(operation.target_label, result),
-                Ok(EepromOperationOutcome::DryRun {
-                    request,
+                Ok(EepromOperationOutcome::BusDiscovery { buses }) => {
+                    self.calibration.report_bus_discovery(buses);
+                }
+                Ok(EepromOperationOutcome::Provision {
                     result,
-                    backup_file,
-                    manifest_file,
-                }) => self.calibration.report_eeprom_dry_run(
+                    history_file,
+                }) => self.calibration.report_eeprom_provision(
                     operation.target_label,
-                    request,
-                    result,
-                    backup_file,
-                    manifest_file,
+                    &result,
+                    history_file,
                 ),
-                Ok(EepromOperationOutcome::Provision { result, audit_file }) => self
-                    .calibration
-                    .report_eeprom_provision(operation.target_label, &result, audit_file),
                 Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }) => self
                     .calibration
                     .report_eeprom_provision_audit_error(operation.target_label, &result, &error),
                 Err(error) if error.provision_state_unknown => self
                     .calibration
                     .report_eeprom_provision_unknown(error.message),
+                Err(error) if operation.kind == EepromOperationKind::BusDiscovery => {
+                    self.calibration.report_bus_discovery_failed(error.message);
+                }
                 Err(error) => self.calibration.report_provision_error(error.message),
+            }
+        }
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn poll_i2c_tools_result(&mut self) {
+        while let Ok(operation) = self.i2c_tools_receiver.try_recv() {
+            self.active_i2c_tools_cancellation = None;
+            self.active_i2c_tools_cancellable = false;
+            match (operation.kind, operation.result) {
+                (I2cToolsOperationKind::BusDiscovery, Ok(I2cHelperResult::BusList { buses })) => {
+                    self.i2c_tools.report_buses(buses)
+                }
+                (
+                    I2cToolsOperationKind::Transfer,
+                    Ok(I2cHelperResult::Transfer { transactions }),
+                ) => self.i2c_tools.report_transfer(transactions),
+                (kind, Ok(unexpected)) => self.i2c_tools.report_error(format!(
+                    "I²C helper returned an unexpected result for {kind:?}: {unexpected:?}"
+                )),
+                (_, Err(error)) => self.i2c_tools.report_error(error),
             }
         }
     }
@@ -3942,6 +4891,98 @@ impl CameraToolboxApp {
             .open_captured_image(generation, asset, snapshot, native, display, foreground)?;
         Ok(())
     }
+
+    fn capture_live_frame_for_color(
+        &mut self,
+        context: &egui::Context,
+        id: DocumentId,
+    ) -> Result<(), String> {
+        let frame = self
+            .workspace
+            .live(id)
+            .and_then(|document| document.displayed_frame().cloned())
+            .ok_or_else(|| "active RTSP stream has no displayed frame to capture".to_owned())?;
+        let display = Arc::new(
+            Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba))
+                .map_err(|error| error.to_string())?,
+        );
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let source_name = format!(
+            "color-rtsp-ch{}-frame{}.png",
+            frame.identity.channel, frame.identity.frame_sequence
+        );
+        let document_id = self.workspace.open_generated_capture(
+            generation,
+            source_name.clone(),
+            Arc::clone(&display),
+            true,
+        );
+        if let Some(document) = self.workspace.image_mut(document_id) {
+            document.ensure_texture(context)?;
+        }
+        self.color_inspection.analyze_frame(
+            document_id,
+            generation,
+            source_name,
+            Arc::clone(&display),
+        );
+        Ok(())
+    }
+
+    fn handle_color_inspection_action(
+        &mut self,
+        context: &egui::Context,
+        action: ColorInspectionAction,
+    ) {
+        match action {
+            ColorInspectionAction::AnalyzeCurrent => {
+                let Some(document) = self.workspace.active_image() else {
+                    self.color_inspection
+                        .report_error("open a PNG or capture an RTSP frame before analysis");
+                    return;
+                };
+                if !(document.is_png_workspace_file() || document.is_color_capture()) {
+                    self.color_inspection
+                        .report_error("Color page accepts PNG files and RTSP captures only");
+                    return;
+                }
+                self.color_inspection.analyze_document(document);
+            }
+            ColorInspectionAction::StartManualCorners => {
+                let Some(document) = self.workspace.active_image() else {
+                    self.color_inspection.report_error(
+                        "open a PNG or capture an RTSP frame before manual corner picking",
+                    );
+                    return;
+                };
+                if !(document.is_png_workspace_file() || document.is_color_capture()) {
+                    self.color_inspection
+                        .report_error("Color page accepts PNG files and RTSP captures only");
+                    return;
+                }
+                self.color_inspection.start_manual_corners(document);
+            }
+            ColorInspectionAction::ClearManualCorners => {
+                self.color_inspection.clear_manual_corners()
+            }
+            ColorInspectionAction::CaptureActiveRtsp => {
+                let Some(id) = self.workspace.active_live().map(|document| document.id) else {
+                    self.color_inspection
+                        .report_error("select an active RTSP stream before capture");
+                    return;
+                };
+                if let Err(error) = self.capture_live_frame_for_color(context, id) {
+                    self.color_inspection.report_error(error);
+                }
+            }
+            ColorInspectionAction::ExportMetrics => self.color_inspection.prepare_export(),
+            ColorInspectionAction::ExportYamlReport => {
+                self.color_inspection.prepare_yaml_report_export();
+            }
+        }
+    }
+
     fn save_active_ephemeral_source(&mut self) -> bool {
         let asset = self
             .workspace
@@ -4138,9 +5179,16 @@ impl CameraToolboxApp {
                                 ref status,
                                 ref stage,
                                 can_stop,
-                                _can_capture,
+                                can_capture,
                             ) = items[row.index()];
                             let is_selected = active == Some(id);
+                            let capture_hover = if self.is_color_workspace() {
+                                Some("Capture the displayed frame into the Color page")
+                            } else if cfg!(feature = "calibration-opencv") {
+                                Some("Capture the displayed frame into the Calibration dataset")
+                            } else {
+                                None
+                            };
                             row.col(|ui| {
                                 if ui.selectable_label(is_selected, title).clicked() {
                                     action = Some(WorkspaceStreamAction::Activate(id));
@@ -4152,13 +5200,14 @@ impl CameraToolboxApp {
                                 ui.label(format!("{stage} · {status}"));
                             });
                             row.col(|ui| {
-                                #[cfg(feature = "calibration-opencv")]
-                                if ui
-                                    .add_enabled(_can_capture, egui::Button::new("Capture").small())
-                                    .on_hover_text(
-                                        "Capture the displayed frame into the Calibration dataset",
-                                    )
-                                    .clicked()
+                                if let Some(hover) = capture_hover
+                                    && ui
+                                        .add_enabled(
+                                            can_capture,
+                                            egui::Button::new("Capture").small(),
+                                        )
+                                        .on_hover_text(hover)
+                                        .clicked()
                                 {
                                     action = Some(WorkspaceStreamAction::Capture(id));
                                 }
@@ -4341,7 +5390,11 @@ impl CameraToolboxApp {
         }
     }
 
-    fn handle_workspace_stream_action(&mut self, action: WorkspaceStreamAction) {
+    fn handle_workspace_stream_action(
+        &mut self,
+        context: &egui::Context,
+        action: WorkspaceStreamAction,
+    ) {
         match action {
             WorkspaceStreamAction::Activate(id) => {
                 self.workspace.activate(id);
@@ -4360,23 +5413,31 @@ impl CameraToolboxApp {
                     }
                 }
             }
-            #[cfg(feature = "calibration-opencv")]
             WorkspaceStreamAction::Capture(id) => {
-                self.workspace.activate(id);
-                let Some((frame, source)) = self.workspace.live(id).and_then(|document| {
-                    document
-                        .displayed_frame()
-                        .cloned()
-                        .map(|frame| (frame, document.source.clone()))
-                }) else {
+                if self.is_color_workspace() {
+                    if let Err(error) = self.capture_live_frame_for_color(context, id) {
+                        self.color_inspection.report_error(error);
+                    }
                     return;
-                };
-                self.calibration.capture_displayed_stream_frame(
-                    frame,
-                    source,
-                    self.live_runtime.capture_store().clone(),
-                );
-                self.product_workspace = ProductWorkspace::Calibration;
+                }
+                #[cfg(feature = "calibration-opencv")]
+                {
+                    self.workspace.activate(id);
+                    let Some((frame, source)) = self.workspace.live(id).and_then(|document| {
+                        document
+                            .displayed_frame()
+                            .cloned()
+                            .map(|frame| (frame, document.source.clone()))
+                    }) else {
+                        return;
+                    };
+                    self.calibration.capture_displayed_stream_frame(
+                        frame,
+                        source,
+                        self.live_runtime.capture_store().clone(),
+                    );
+                    self.product_workspace = ProductWorkspace::Calibration;
+                }
             }
         }
     }
@@ -5058,7 +6119,6 @@ fn write_live_snapshot(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WorkspaceStreamAction {
     Activate(DocumentId),
-    #[cfg(feature = "calibration-opencv")]
     Capture(DocumentId),
     Stop(DocumentId),
 }

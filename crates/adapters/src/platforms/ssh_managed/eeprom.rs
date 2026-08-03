@@ -9,27 +9,14 @@ use camera_toolbox_app::{
 };
 use camera_toolbox_core::{YG_STEREO_P24C64G_IMAGE_BYTES, YG_STEREO_P24C64G_V1_MAP_ID};
 
-use super::connection::{
-    CredentialResolver, SshConnectionTarget, SshTransportFactory, SshTransportSession,
-    TransportCommandOutput,
+use super::{
+    connection::{
+        CredentialResolver, SshConnectionTarget, SshTransportFactory, TransportCommandOutput,
+    },
+    helper,
 };
 
-/// GUI 每次 EEPROM 操作前都会把本地 companion helper 覆盖上传到该固定路径并 chmod 755。
-pub const EEPROM_HELPER_PROGRAM: &str = "/usr/local/libexec/camera-toolbox-eeprom-helper";
-const EEPROM_HELPER_INSTALL_PROGRAM: &str = "/bin/sh";
-const EEPROM_HELPER_INSTALL_SCRIPT: &str = concat!(
-    "set -u; ",
-    "case \"$(uname -s):$(uname -m)\" in Linux:aarch64|Linux:arm64) ;; ",
-    "*) echo 'camera-toolbox EEPROM helper requires Linux AArch64' >&2; cat >/dev/null; exit 64;; esac; ",
-    "umask 022; ",
-    "helper=/usr/local/libexec/camera-toolbox-eeprom-helper; ",
-    "if mkdir -p /usr/local/libexec; then ",
-    "if cat > \"$helper\"; then ",
-    "chmod 755 \"$helper\"; ",
-    "else status=$?; cat >/dev/null; exit \"$status\"; fi; ",
-    "else status=$?; cat >/dev/null; exit \"$status\"; fi",
-);
-const EEPROM_HELPER_INSTALL_OUTPUT_LIMIT: usize = 4096;
+pub const EEPROM_HELPER_PROGRAM: &str = helper::HELPER_PROGRAM;
 
 pub struct SshEepromProvisionService {
     service_id: String,
@@ -124,7 +111,8 @@ impl EepromProvisionService for SshEepromProvisionService {
                     "EEPROM SSH connection failed: {error}"
                 ))
             })?;
-        install_helper(&mut *session, &self.helper_payload, &control)?;
+        helper::install_helper(&mut *session, &self.helper_payload, &control, "EEPROM")
+            .map_err(EepromProvisionServiceError::Transport)?;
         let output = session
             .execute_argv_with_stdin(
                 &[EEPROM_HELPER_PROGRAM.to_owned(), "--json-stdin".to_owned()],
@@ -141,49 +129,13 @@ impl EepromProvisionService for SshEepromProvisionService {
     }
 }
 
-fn install_helper(
-    session: &mut dyn SshTransportSession,
-    helper_payload: &[u8],
-    control: &RemoteOperationControl,
-) -> Result<(), EepromProvisionServiceError> {
-    let output = session
-        .execute_argv_with_stdin(
-            &[
-                EEPROM_HELPER_INSTALL_PROGRAM.to_owned(),
-                "-c".to_owned(),
-                EEPROM_HELPER_INSTALL_SCRIPT.to_owned(),
-            ],
-            helper_payload,
-            EEPROM_HELPER_INSTALL_OUTPUT_LIMIT,
-            control,
-        )
-        .map_err(|error| {
-            EepromProvisionServiceError::Transport(format!(
-                "EEPROM helper upload command failed: {error}"
-            ))
-        })?;
-    if output.exit_status == Some(0) {
-        return Ok(());
-    }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Err(EepromProvisionServiceError::Transport(format!(
-        "EEPROM helper upload failed: exit={:?}, stderr={}, stdout={}",
-        output.exit_status,
-        stderr.trim(),
-        stdout.trim()
-    )))
-}
-
 fn validate_action(
     action: &EepromHelperAction,
     target: &EepromHelperTarget,
 ) -> Result<(), EepromProvisionServiceError> {
     let request = match action {
         EepromHelperAction::Inspect => return Ok(()),
-        EepromHelperAction::DryRun { request } | EepromHelperAction::Provision { request, .. } => {
-            request
-        }
+        EepromHelperAction::Provision { request, .. } => request,
     };
     request
         .validate()
@@ -196,18 +148,12 @@ fn validate_action(
     }
     if let EepromHelperAction::Provision {
         expected_before_sha256,
-        dry_run_token,
         ..
     } = action
     {
         if !is_sha256(expected_before_sha256) {
             return Err(EepromProvisionServiceError::InvalidRequest(
                 "expected-before SHA-256 must contain 64 lowercase hex characters".to_owned(),
-            ));
-        }
-        if !is_sha256(dry_run_token) {
-            return Err(EepromProvisionServiceError::InvalidRequest(
-                "dry-run token must contain 64 lowercase hex characters".to_owned(),
             ));
         }
     }
@@ -258,10 +204,6 @@ fn validate_result_kind(
         (action, result),
         (EepromHelperAction::Inspect, EepromHelperResult::Inspect(_))
             | (
-                EepromHelperAction::DryRun { .. },
-                EepromHelperResult::DryRun(_)
-            )
-            | (
                 EepromHelperAction::Provision { .. },
                 EepromHelperResult::Provision(_)
             )
@@ -275,20 +217,13 @@ fn validate_result_kind(
 }
 
 fn validate_result_payload(result: &EepromHelperResult) -> Result<(), EepromProvisionServiceError> {
-    let (backup, hashes, token, verified) = match result {
+    let (backup, hashes, verified) = match result {
         EepromHelperResult::Inspect(result) => {
-            (&result.backup, vec![&result.state.image_sha256], None, true)
+            (&result.backup, vec![&result.state.image_sha256], true)
         }
-        EepromHelperResult::DryRun(result) => (
-            &result.backup,
-            vec![&result.state.image_sha256],
-            Some(result.dry_run_token.as_str()),
-            true,
-        ),
         EepromHelperResult::Provision(result) => (
             &result.backup,
             vec![&result.before.image_sha256, &result.after.image_sha256],
-            None,
             result.bytewise_verified,
         ),
     };
@@ -301,11 +236,6 @@ fn validate_result_payload(result: &EepromHelperResult) -> Result<(), EepromProv
     if hashes.into_iter().any(|hash| !is_sha256(hash)) {
         return Err(EepromProvisionServiceError::Protocol(
             "helper returned an invalid image SHA-256".to_owned(),
-        ));
-    }
-    if token.is_some_and(|token| !is_sha256(token)) {
-        return Err(EepromProvisionServiceError::Protocol(
-            "helper returned an invalid dry-run token".to_owned(),
         ));
     }
     if !verified {
@@ -326,7 +256,7 @@ fn is_sha256(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
+    use std::{collections::VecDeque, time::Duration};
 
     use camera_toolbox_app::{
         DumpCancellation, EepromDeviceState, EepromHelperFailure, EepromInspectResult,
@@ -336,8 +266,8 @@ mod tests {
         EepromProvisionRequest, EepromProvisioningMode, YG_STEREO_P24C64G_V1_MAP_ID,
     };
 
-    use super::super::connection::{SshCredential, SshTransportError};
-    use super::super::memory_transport::MemorySshTransport;
+    use super::super::connection::{SshCredential, SshTransportError, SshTransportSession};
+    use super::super::memory_transport::{MemoryRemoteFile, MemorySshTransport};
 
     struct FailingConnectTransport;
 
@@ -480,17 +410,20 @@ mod tests {
             memory.captured_argv(),
             vec![
                 vec![
-                    EEPROM_HELPER_INSTALL_PROGRAM.to_owned(),
-                    "-c".to_owned(),
-                    EEPROM_HELPER_INSTALL_SCRIPT.to_owned(),
+                    helper::HELPER_INSTALL_PROGRAM.to_owned(),
+                    "755".to_owned(),
+                    helper::HELPER_PROGRAM.to_owned(),
                 ],
                 vec![EEPROM_HELPER_PROGRAM.to_owned(), "--json-stdin".to_owned(),],
             ]
         );
+        assert_eq!(
+            memory.file_bytes(helper::HELPER_PROGRAM),
+            Some(HELPER_PAYLOAD.to_vec())
+        );
         let requests = memory.captured_stdin();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0], HELPER_PAYLOAD);
-        let request: EepromHelperRequest = serde_json::from_slice(&requests[1]).unwrap();
+        assert_eq!(requests.len(), 1);
+        let request: EepromHelperRequest = serde_json::from_slice(&requests[0]).unwrap();
         assert_eq!(request.schema_version, EEPROM_HELPER_SCHEMA_VERSION);
         assert_eq!(request.target.map_id, YG_STEREO_P24C64G_V1_MAP_ID);
         assert_eq!(request.target.i2c_bus, 7);
@@ -498,19 +431,35 @@ mod tests {
     }
 
     #[test]
-    fn helper_install_script_uploads_to_fixed_path_and_drains_on_failures() {
-        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("mkdir -p /usr/local/libexec"));
-        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("cat > \"$helper\""));
-        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("chmod 755 \"$helper\""));
-        assert!(EEPROM_HELPER_INSTALL_SCRIPT.contains("Linux AArch64"));
-        assert!(!EEPROM_HELPER_INSTALL_SCRIPT.contains("/tmp"));
-        assert!(!EEPROM_HELPER_INSTALL_SCRIPT.contains("mv "));
-        assert_eq!(
-            EEPROM_HELPER_INSTALL_SCRIPT
-                .matches("cat >/dev/null")
-                .count(),
-            3
+    fn helper_upload_failure_reports_stage_and_skips_helper_invocation() {
+        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
+        memory.insert_file(
+            "/usr/local",
+            MemoryRemoteFile {
+                bytes: Vec::new(),
+                stats: VecDeque::new(),
+            },
         );
+        let service = service(&memory);
+
+        let error = service
+            .execute(
+                EepromProvisionOperation {
+                    action: EepromHelperAction::Inspect,
+                },
+                control(),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            &error,
+            EepromProvisionServiceError::Transport(message)
+                if message.contains("helper directory setup failed")
+                    && message.contains("/usr/local")
+        ));
+        assert!(memory.file_bytes(helper::HELPER_PROGRAM).is_none());
+        assert!(memory.captured_argv().is_empty());
+        assert!(memory.captured_stdin().is_empty());
     }
 
     #[test]
@@ -533,39 +482,7 @@ mod tests {
 
         assert!(matches!(result, EepromHelperResult::Inspect(_)));
         assert_eq!(memory.captured_argv().len(), 2);
-        assert_eq!(memory.captured_stdin().len(), 2);
-    }
-
-    #[test]
-    fn helper_upload_failure_reports_stage_and_skips_helper_invocation() {
-        let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
-        memory.set_command_output(TransportCommandOutput {
-            stdout: Vec::new(),
-            stderr: b"mkdir: can't create directory '/usr/local/libexec': Permission denied"
-                .to_vec(),
-            exit_status: Some(1),
-            stdout_truncated: false,
-            stderr_truncated: false,
-        });
-        let service = service(&memory);
-
-        let error = service
-            .execute(
-                EepromProvisionOperation {
-                    action: EepromHelperAction::Inspect,
-                },
-                control(),
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            &error,
-            EepromProvisionServiceError::Transport(message)
-                if message.contains("EEPROM helper upload failed")
-                    && message.contains("Permission denied")
-        ));
-        assert_eq!(memory.captured_argv().len(), 1);
-        assert_eq!(memory.captured_stdin(), vec![HELPER_PAYLOAD.to_vec()]);
+        assert_eq!(memory.captured_stdin().len(), 1);
     }
 
     #[test]
@@ -590,7 +507,6 @@ mod tests {
         let action = EepromHelperAction::Provision {
             request,
             expected_before_sha256: "a".repeat(64),
-            dry_run_token: "b".repeat(64),
         };
         let unverified = EepromHelperResult::Provision(EepromWriteResult {
             before: device_state('a'),

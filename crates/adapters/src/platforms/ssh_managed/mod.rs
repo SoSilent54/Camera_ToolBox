@@ -4,7 +4,9 @@ pub mod command;
 pub mod connection;
 pub mod credential;
 pub mod eeprom;
+mod helper;
 pub mod host_key;
+pub mod i2c;
 pub mod memory_transport;
 pub mod provider;
 pub mod remote_file;
@@ -27,6 +29,7 @@ pub use host_key::{
     HostKeyAssessment, HostKeyError, HostKeyManager, HostKeyTarget, HostKeyTrustOutcome,
     RusshServerHostKeyProbe, ServerHostKey, ServerHostKeyProbe,
 };
+pub use i2c::SshI2cHelperService;
 pub use memory_transport::{MemoryRemoteFile, MemorySshTransport};
 pub use provider::{SshManagedPlatformProvider, SshManagedProviderError};
 pub use remote_file::SshRemoteFileService;

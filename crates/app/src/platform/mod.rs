@@ -4,6 +4,7 @@ mod capability;
 mod controller;
 mod eeprom;
 mod events;
+mod i2c;
 mod ports;
 mod profile;
 mod profile_store;
@@ -24,14 +25,24 @@ pub use capability::{
 pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
 pub use eeprom::{
     EEPROM_EXPERIMENTAL_PROVISION_WARNING, EEPROM_HELPER_SCHEMA_VERSION, EepromDeviceState,
-    EepromDryRunResult, EepromHelperAction, EepromHelperFailure, EepromHelperOutput,
-    EepromHelperRequest, EepromHelperResult, EepromHelperTarget, EepromInspectResult,
-    EepromPageWritePlan, EepromProvisionOperation, EepromProvisionService,
-    EepromProvisionServiceError, EepromRollbackState, EepromSerialState, EepromWriteResult,
+    EepromHelperAction, EepromHelperFailure, EepromHelperOutput, EepromHelperRequest,
+    EepromHelperResult, EepromHelperTarget, EepromInspectResult, EepromPageWritePlan,
+    EepromProvisionOperation, EepromProvisionService, EepromProvisionServiceError,
+    EepromRollbackState, EepromSerialState, EepromWriteResult,
 };
 pub use events::{
     DumpJobEvent, DumpJobState, RemoteJobEvent, RemoteJobFailure, RemoteJobState,
     StreamSessionEvent,
+};
+pub use i2c::{
+    I2C_HELPER_MAX_MESSAGE_BYTES, I2C_HELPER_MAX_MESSAGES_PER_TRANSACTION,
+    I2C_HELPER_MAX_REQUEST_BYTES, I2C_HELPER_MAX_TOTAL_READ_BYTES,
+    I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST, I2C_HELPER_SCHEMA_VERSION, I2cBusInfo,
+    I2cHelperAction, I2cHelperFailure, I2cHelperOperation, I2cHelperOutput, I2cHelperRequest,
+    I2cHelperRequestValidationError, I2cHelperResult, I2cHelperService, I2cHelperServiceError,
+    I2cMessageData, I2cMessageDirection, I2cMessageFlag, I2cMessageResult, I2cMessageSpec,
+    I2cTransactionResult, I2cTransactionSpec, validate_i2c_helper_action,
+    validate_i2c_transfer_transactions,
 };
 pub use ports::{
     DecodedVideoFrame, DumpCancellation, DumpEnvelope, DumpOperationControl, DumpOperationResult,

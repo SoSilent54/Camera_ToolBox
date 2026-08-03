@@ -1,10 +1,9 @@
 //! EEPROM provisioning 状态机；设备 IO 通过窄 trait 注入，便于无硬件验证。
 
 use camera_toolbox_app::{
-    EEPROM_HELPER_SCHEMA_VERSION, EepromDeviceState, EepromDryRunResult, EepromHelperAction,
-    EepromHelperFailure, EepromHelperOutput, EepromHelperRequest, EepromHelperResult,
-    EepromInspectResult, EepromPageWritePlan, EepromRollbackState, EepromSerialState,
-    EepromWriteResult,
+    EEPROM_HELPER_SCHEMA_VERSION, EepromDeviceState, EepromHelperAction, EepromHelperFailure,
+    EepromHelperOutput, EepromHelperRequest, EepromHelperResult, EepromInspectResult,
+    EepromPageWritePlan, EepromRollbackState, EepromSerialState, EepromWriteResult,
 };
 use camera_toolbox_core::{
     CalibrationStorageMap, EepromProvisionRequest, EepromProvisioningMode, EepromWriteSegment,
@@ -63,18 +62,10 @@ pub(crate) fn execute(
     let map = yg_stereo_p24c64g_v1();
     match request.action {
         EepromHelperAction::Inspect => inspect(device, map),
-        EepromHelperAction::DryRun { request } => dry_run(device, map, &request),
         EepromHelperAction::Provision {
             request,
             expected_before_sha256,
-            dry_run_token,
-        } => provision(
-            device,
-            map,
-            &request,
-            &expected_before_sha256,
-            &dry_run_token,
-        ),
+        } => provision(device, map, &request, &expected_before_sha256),
     }
 }
 
@@ -97,63 +88,11 @@ fn inspect(device: &mut dyn EepromDevice, map: &CalibrationStorageMap) -> Eeprom
     }
 }
 
-fn dry_run(
-    device: &mut dyn EepromDevice,
-    map: &CalibrationStorageMap,
-    request: &EepromProvisionRequest,
-) -> EepromHelperOutput {
-    if let Err(error) = request.validate() {
-        return failure(
-            "invalid_request",
-            error.to_string(),
-            None,
-            Vec::new(),
-            EepromRollbackState::NotRequired,
-            None,
-        );
-    }
-    let backup = match read_image(device) {
-        Ok(backup) => backup,
-        Err(error) => {
-            return failure(
-                error.code,
-                error.message,
-                None,
-                Vec::new(),
-                EepromRollbackState::NotRequired,
-                None,
-            );
-        }
-    };
-    let state = device_state(map, &backup);
-    if let Err(error) = validate_device_state(request, &state) {
-        return failure(
-            error.code,
-            error.message,
-            Some(state),
-            backup,
-            EepromRollbackState::NotRequired,
-            None,
-        );
-    }
-    let page_plan = page_plan(map, request);
-    let dry_run_token = dry_run_token(request, &state.image_sha256);
-    EepromHelperOutput::Success {
-        result: EepromHelperResult::DryRun(EepromDryRunResult {
-            state,
-            backup,
-            page_plan,
-            dry_run_token,
-        }),
-    }
-}
-
 fn provision(
     device: &mut dyn EepromDevice,
     map: &CalibrationStorageMap,
     request: &EepromProvisionRequest,
     expected_before_sha256: &str,
-    expected_dry_run_token: &str,
 ) -> EepromHelperOutput {
     if let Err(error) = request.validate() {
         return failure(
@@ -192,18 +131,7 @@ fn provision(
     if before.image_sha256 != expected_before_sha256 {
         return failure(
             "stale_device",
-            "EEPROM contents changed after dry-run".to_owned(),
-            Some(before),
-            backup,
-            EepromRollbackState::NotRequired,
-            None,
-        );
-    }
-    let actual_token = dry_run_token(request, &before.image_sha256);
-    if actual_token != expected_dry_run_token {
-        return failure(
-            "dry_run_token_mismatch",
-            "provision request does not match the completed dry-run".to_owned(),
+            "EEPROM contents changed after read".to_owned(),
             Some(before),
             backup,
             EepromRollbackState::NotRequired,
@@ -533,15 +461,6 @@ fn field<'a>(
         })
 }
 
-fn dry_run_token(request: &EepromProvisionRequest, before_sha256: &str) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"camera-toolbox/eeprom-dry-run/v1\0");
-    hash.update(before_sha256.as_bytes());
-    let encoded = serde_json::to_vec(request).expect("validated request is serializable");
-    hash.update(encoded);
-    hex(&hash.finalize())
-}
-
 fn sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     hex(&digest)
@@ -667,15 +586,12 @@ mod tests {
         }
     }
 
-    fn dry_run(device: &mut MemoryDevice, request: EepromProvisionRequest) -> EepromDryRunResult {
+    fn inspect_state(device: &mut MemoryDevice) -> EepromInspectResult {
         let EepromHelperOutput::Success {
-            result: EepromHelperResult::DryRun(result),
-        } = execute(
-            helper_request(EepromHelperAction::DryRun { request }),
-            device,
-        )
+            result: EepromHelperResult::Inspect(result),
+        } = execute(helper_request(EepromHelperAction::Inspect), device)
         else {
-            panic!("dry-run failed")
+            panic!("inspect failed")
         };
         result
     }
@@ -689,9 +605,24 @@ mod tests {
         initial[0x125..0x133].fill(0xff);
         let reserved_before = initial[0x58..0x125].to_vec();
         let mut device = MemoryDevice::new(initial);
-        let dry = dry_run(&mut device, request.clone());
+        let before = inspect_state(&mut device);
+        let output = execute(
+            helper_request(EepromHelperAction::Provision {
+                request,
+                expected_before_sha256: before.state.image_sha256,
+            }),
+            &mut device,
+        );
+        let EepromHelperOutput::Success {
+            result: EepromHelperResult::Provision(result),
+        } = output
+        else {
+            panic!("provision failed")
+        };
+        assert!(result.bytewise_verified);
         assert_eq!(
-            dry.page_plan
+            result
+                .page_plan
                 .iter()
                 .map(|page| (page.stage.as_str(), page.offset, page.byte_len))
                 .collect::<Vec<_>>(),
@@ -704,22 +635,6 @@ mod tests {
                 ("commit_flag", 0x0000, 8),
             ]
         );
-
-        let output = execute(
-            helper_request(EepromHelperAction::Provision {
-                request,
-                expected_before_sha256: dry.state.image_sha256,
-                dry_run_token: dry.dry_run_token,
-            }),
-            &mut device,
-        );
-        let EepromHelperOutput::Success {
-            result: EepromHelperResult::Provision(result),
-        } = output
-        else {
-            panic!("provision failed")
-        };
-        assert!(result.bytewise_verified);
         assert_eq!(device.writes.first().unwrap(), &(0, vec![0; 8]));
         assert_eq!(device.writes.last().unwrap(), &(0, b"hessian\0".to_vec()));
         assert_eq!(&device.bytes[0x58..0x125], reserved_before);
@@ -737,12 +652,11 @@ mod tests {
         let identity_before = initial[0x125..0x134].to_vec();
         let reserved_before = initial[0x58..0x125].to_vec();
         let mut device = MemoryDevice::new(initial);
-        let dry = dry_run(&mut device, update.clone());
+        let before = inspect_state(&mut device);
         let output = execute(
             helper_request(EepromHelperAction::Provision {
                 request: update,
-                expected_before_sha256: dry.state.image_sha256,
-                dry_run_token: dry.dry_run_token,
+                expected_before_sha256: before.state.image_sha256,
             }),
             &mut device,
         );
@@ -762,9 +676,11 @@ mod tests {
         let replacement =
             FullEepromImage::from_solution(&solution(1400.0), "2T02D2567K9999").unwrap();
         let mut device = MemoryDevice::new(existing.as_bytes().to_vec());
+        let before_state = inspect_state(&mut device).state;
         let rejected = execute(
-            helper_request(EepromHelperAction::DryRun {
+            helper_request(EepromHelperAction::Provision {
                 request: replacement.full_provision_request(false),
+                expected_before_sha256: before_state.image_sha256.clone(),
             }),
             &mut device,
         );
@@ -776,14 +692,13 @@ mod tests {
         ));
 
         let request = replacement.full_provision_request(true);
-        let dry = dry_run(&mut device, request.clone());
+        let before_hash = inspect_state(&mut device).state.image_sha256;
         let before = device.bytes.clone();
         device.fail_once_at = Some(0x20);
         let failed = execute(
             helper_request(EepromHelperAction::Provision {
                 request,
-                expected_before_sha256: dry.state.image_sha256,
-                dry_run_token: dry.dry_run_token,
+                expected_before_sha256: before_hash,
             }),
             &mut device,
         );

@@ -178,7 +178,6 @@ fn test_calibration_item_id() -> camera_toolbox_app::CalibrationItemId {
     id
 }
 
-#[cfg(feature = "calibration-opencv")]
 fn test_decoded_frame(
     session_id: &camera_toolbox_app::StreamSessionId,
     sequence: u64,
@@ -276,6 +275,81 @@ fn workspace_source_modes_render_rtsp_controls_exclusively() {
     assert!(rtsp.contains("Connect RTSP"));
     assert!(rtsp.contains("Prefer hardware acceleration"));
     assert!(!rtsp.contains("Name"));
+}
+
+#[test]
+fn color_workspace_renders_input_viewer_and_controls() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.explorer_panel_expanded = true;
+    app.product_workspace = super::ProductWorkspace::Color;
+    let mut frame = eframe::Frame::_new_kittest();
+
+    let visible = accessibility_text(&run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        egui::vec2(1568.0, 882.0),
+        Vec::new(),
+    ));
+
+    assert!(visible.contains("Workspace"));
+    assert!(visible.contains("Color Check"));
+    assert!(visible.contains("D65"));
+    assert!(visible.contains("ColorChecker 24（Nov 2014+）"));
+    assert!(visible.contains("Analyze current image"));
+    assert!(visible.contains("Capture RTSP frame"));
+    assert!(visible.contains("Export metrics JSON"));
+    assert!(visible.contains("Export YAML Report"));
+    assert!(!visible.contains("Intrinsic Calibration"));
+}
+
+#[test]
+fn color_yaml_report_action_routes_to_workspace() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Color;
+    let mut frame = eframe::Frame::_new_kittest();
+
+    app.handle_color_inspection_action(&context, super::ColorInspectionAction::ExportYamlReport);
+    let visible = accessibility_text(&run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        egui::vec2(1568.0, 882.0),
+        Vec::new(),
+    ));
+
+    assert!(visible.contains("analyze an image before exporting color YAML report"));
+}
+
+#[test]
+fn color_workspace_rejects_non_png_file_inputs_before_open_worker() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Color;
+    let destination = test_export_destination();
+    let file_system = Arc::clone(destination.file_system());
+    let reference = FileRef::new(
+        file_system.source_id().clone(),
+        SourcePath::new("input.jpg").unwrap(),
+    );
+
+    app.handle_explorer_action(
+        &context,
+        crate::explorer::ExplorerAction::OpenAuto {
+            display_path: PathBuf::from("input.jpg"),
+            file_system,
+            reference,
+            remote: false,
+        },
+    );
+
+    assert!(app.active_raw_open.is_none());
+    assert!(app.pending_auto_open.is_empty());
+    assert!(app.workspace.active_image().is_none());
 }
 
 #[test]
@@ -1970,13 +2044,43 @@ fn sidebar_capture_uses_displayed_frame_when_latest_slot_advances() {
             "newer frame must not replace displayed capture",
         ),
     });
-    app.handle_workspace_stream_action(super::WorkspaceStreamAction::Capture(live_id));
+    app.handle_workspace_stream_action(&context, super::WorkspaceStreamAction::Capture(live_id));
 
     let output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 12.0);
     let visible = accessibility_text(&output);
     assert!(visible.contains("Dataset (1)"));
     assert!(visible.contains("RTSP ch0 frame 1"));
     assert!(!visible.contains("RTSP ch0 frame 2"));
+}
+
+#[test]
+fn color_stream_capture_creates_static_capture_image() {
+    let context = egui::Context::default();
+    context.enable_accesskit();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Color;
+    app.explorer_panel_expanded = true;
+    app.explorer.select_rtsp_mode_for_test();
+    let session_id = camera_toolbox_app::StreamSessionId::new("color-capture-test").unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+    latest.publish(test_decoded_frame(&session_id, 1, 128));
+    let live_id = app
+        .workspace
+        .open_live(session_id, Arc::clone(&latest), test_live_source());
+    let mut frame = eframe::Frame::_new_kittest();
+    let viewport = egui::vec2(1568.0, 882.0);
+    let _ = run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
+
+    app.handle_workspace_stream_action(&context, super::WorkspaceStreamAction::Capture(live_id));
+
+    let document = app
+        .workspace
+        .active_image()
+        .expect("Color capture opens an image");
+    assert!(document.is_color_capture());
+    assert_eq!(document.native.dimensions(), [1, 1]);
+    assert!(document.title.contains("color-rtsp-ch0-frame1.png"));
+    assert!(app.is_color_workspace());
 }
 
 #[cfg(feature = "calibration-opencv")]
@@ -2141,24 +2245,19 @@ fn inactive_stream_capture_activates_clicked_row_and_uses_snapshot() {
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 mod eeprom_operation_tests {
     use super::super::*;
-    use std::{
-        fs,
-        sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+    use std::{fs, path::PathBuf, sync::Arc};
 
-    use camera_toolbox_adapters::{
-        filesystem::LocalFileSystem,
-        platforms::ssh_managed::{CredentialResolver, MemorySshTransport, SshTransportFactory},
+    use camera_toolbox_adapters::platforms::ssh_managed::{
+        CredentialResolver, MemorySshTransport, SshTransportFactory,
     };
     use camera_toolbox_app::{
-        DirectoryRef, EepromDeviceState, EepromHelperFailure, EepromProvisionService,
-        EepromRollbackState, EepromSerialState, FileSourceId, RemoteAuthentication,
-        RemoteConnectionConfig, RemoteConnectionId, SnapshotHash,
+        EepromDeviceState, EepromHelperFailure, EepromProvisionService, EepromRollbackState,
+        EepromSerialState, RemoteAuthentication, RemoteConnectionConfig, RemoteConnectionId,
+        SnapshotHash,
     };
     use camera_toolbox_core::{
-        EepromProvisionRequest, EepromProvisioningMode, YG_STEREO_P24C64G_IMAGE_BYTES,
-        YG_STEREO_P24C64G_V1_MAP_ID,
+        EepromProvisionRequest, EepromProvisioningMode, EepromWriteSegment,
+        YG_STEREO_P24C64G_IMAGE_BYTES, YG_STEREO_P24C64G_V1_MAP_ID,
     };
 
     #[derive(Clone)]
@@ -2189,12 +2288,45 @@ mod eeprom_operation_tests {
     }
 
     fn request() -> EepromProvisionRequest {
+        request_with_sn("2T02D2567K0042")
+    }
+
+    fn request_with_sn(serial_number: &str) -> EepromProvisionRequest {
         EepromProvisionRequest {
             map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
             mode: EepromProvisioningMode::UpdateCalibration,
-            serial_number: "2T02D2567K0042".to_owned(),
+            serial_number: serial_number.to_owned(),
             overwrite_existing_serial: false,
             segments: Vec::new(),
+        }
+    }
+
+    fn calibration_segment(width: u32, height: u32, fx: f32, fy: f32, cx: f32, cy: f32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        for value in [fx, fy, cx, cy] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in 0..12_u32 {
+            bytes.extend_from_slice(&(0.1_f32 + index as f32).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn request_with_calibration_segment(serial_number: &str) -> EepromProvisionRequest {
+        let mut request = request_with_sn(serial_number);
+        request.segments = vec![EepromWriteSegment {
+            offset: 0x0010,
+            bytes: calibration_segment(1920, 1080, 1234.5, 1235.5, 960.25, 540.75),
+        }];
+        request
+    }
+
+    fn provision_intent(request: EepromProvisionRequest) -> CalibrationProvisionIntent {
+        CalibrationProvisionIntent::Provision {
+            request,
+            expected_before_sha256: "a".repeat(64),
         }
     }
 
@@ -2205,63 +2337,84 @@ mod eeprom_operation_tests {
             service: Arc::new(FixedEepromService { result }),
             snapshot_hash: SnapshotHash::digest_bytes(b"target"),
             label: "root@camera.local:22 / i2c-7 @test".to_owned(),
+            i2c_bus: 7,
         }
     }
 
-    fn destination() -> (std::path::PathBuf, ExportDestination) {
-        let suffix = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!("camera-toolbox-eeprom-{suffix}"));
-        fs::create_dir_all(&root).unwrap();
-        let source_id = FileSourceId::new(format!("eeprom-worker-{suffix}")).unwrap();
-        let file_system: Arc<dyn FileSystem> =
-            Arc::new(LocalFileSystem::new(source_id.clone(), &root).unwrap());
-        let destination =
-            ExportDestination::new(DirectoryRef::root(source_id), file_system).unwrap();
-        (root, destination)
+    fn history_path(serial_number: &str) -> PathBuf {
+        std::path::Path::new("write_history").join(format!("{serial_number}.yaml"))
+    }
+
+    fn legacy_history_path(serial_number: &str) -> PathBuf {
+        std::path::Path::new("write_history").join(format!("{serial_number}.json"))
+    }
+
+    fn remove_history(serial_number: &str) {
+        let _ = fs::remove_file(history_path(serial_number));
+        let _ = fs::remove_file(legacy_history_path(serial_number));
+    }
+
+    fn read_history(serial_number: &str) -> serde_json::Value {
+        serde_yaml::from_slice(&fs::read(history_path(serial_number)).unwrap()).unwrap()
+    }
+
+    fn cleanup_history(serial_number: &str) {
+        fs::remove_file(history_path(serial_number)).unwrap();
     }
 
     #[test]
-    fn dry_run_persists_exact_backup_before_manifest() {
-        let backup = vec![0x5a; YG_STEREO_P24C64G_IMAGE_BYTES];
-        let helper = EepromHelperResult::DryRun(EepromDryRunResult {
-            state: state('a'),
-            backup: backup.clone(),
+    fn provision_success_writes_yaml_with_bus_and_original_parameters() {
+        let serial = "TESTSUCCESS01";
+        remove_history(serial);
+        let request = request_with_calibration_segment(serial);
+        let helper = EepromHelperResult::Provision(EepromWriteResult {
+            before: state('a'),
+            after: state('c'),
+            backup: vec![0x44; YG_STEREO_P24C64G_IMAGE_BYTES],
             page_plan: Vec::new(),
-            dry_run_token: "b".repeat(64),
+            bytewise_verified: true,
+            rollback: EepromRollbackState::NotRequired,
         });
-        let (root, destination) = destination();
 
         let outcome = run_eeprom_operation(
             target(Ok(helper)),
-            CalibrationProvisionIntent::DryRun { request: request() },
-            Some(&destination),
-            Some(root.to_str().unwrap()),
-            42,
+            provision_intent(request),
+            45,
             DumpCancellation::default(),
         )
         .unwrap();
 
-        let EepromOperationOutcome::DryRun {
-            backup_file,
-            manifest_file,
-            ..
-        } = outcome
-        else {
-            panic!("expected dry-run outcome")
+        let EepromOperationOutcome::Provision { history_file, .. } = outcome else {
+            panic!("expected provision outcome")
         };
-        let backup_path = root.join("eeprom-backup-000042-aaaaaaaaaaaa.bin");
-        let manifest_path = root.join("eeprom-dry-run-000042.json");
-        assert_eq!(fs::read(&backup_path).unwrap(), backup);
-        let manifest: serde_json::Value =
-            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
-        assert_eq!(manifest["operation"], "eeprom_dry_run");
-        assert_eq!(manifest["dry_run_token"], "b".repeat(64));
-        assert!(backup_file.ends_with("eeprom-backup-000042-aaaaaaaaaaaa.bin"));
-        assert!(manifest_file.ends_with("eeprom-dry-run-000042.json"));
-        fs::remove_dir_all(root).unwrap();
+        assert!(history_file.ends_with("TESTSUCCESS01.yaml"));
+        let audit = read_history(serial);
+        assert_eq!(audit["schema_version"], 2);
+        assert_eq!(audit["operation"], "eeprom_provision_success");
+        assert_eq!(audit["target"]["i2c_bus"], 7);
+        assert_eq!(audit["request"]["request"]["mode"], "update_calibration");
+        assert_eq!(
+            audit["request"]["request"]["calibration_parameters"]["image_size"]["width"],
+            1920
+        );
+        assert_eq!(
+            audit["request"]["request"]["calibration_parameters"]["image_size"]["height"],
+            1080
+        );
+        assert_eq!(
+            audit["request"]["request"]["calibration_parameters"]["camera_matrix"]["fx"],
+            1234.5
+        );
+        assert_eq!(
+            audit["request"]["request"]["write_segments"][0]["semantic_value"]["camera_matrix"]["cx"],
+            960.25
+        );
+        assert_eq!(
+            audit["result"]["backup_bytes"],
+            YG_STEREO_P24C64G_IMAGE_BYTES
+        );
+        assert!(audit["result"].get("backup").is_none());
+        cleanup_history(serial);
     }
 
     #[test]
@@ -2274,17 +2427,12 @@ mod eeprom_operation_tests {
             rollback: EepromRollbackState::Restored,
             rollback_error: None,
         };
-        let (root, destination) = destination();
+        let serial = "TESTFAILREST01";
+        remove_history(serial);
 
         let error = run_eeprom_operation(
             target(Err(EepromProvisionServiceError::Helper(failure))),
-            CalibrationProvisionIntent::Provision {
-                request: request(),
-                expected_before_sha256: "a".repeat(64),
-                dry_run_token: "b".repeat(64),
-            },
-            Some(&destination),
-            Some(root.to_str().unwrap()),
+            provision_intent(request_with_sn(serial)),
             43,
             DumpCancellation::default(),
         )
@@ -2292,14 +2440,12 @@ mod eeprom_operation_tests {
 
         assert!(error.message.contains("rollback=Restored"));
         assert!(!error.provision_state_unknown);
-        let audit: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("eeprom-write-failure-000043.json")).unwrap(),
-        )
-        .unwrap();
+        let audit = read_history(serial);
         assert_eq!(audit["operation"], "eeprom_provision_failure");
-        assert_eq!(audit["failure"]["detail"]["code"], "write_failed");
-        assert_eq!(audit["failure"]["detail"]["rollback"], "restored");
-        fs::remove_dir_all(root).unwrap();
+        assert_eq!(audit["failure"]["code"], "write_failed");
+        assert_eq!(audit["failure"]["rollback"], "restored");
+        assert!(audit["failure"].get("backup").is_none());
+        cleanup_history(serial);
     }
 
     #[test]
@@ -2312,16 +2458,11 @@ mod eeprom_operation_tests {
             rollback: EepromRollbackState::Failed,
             rollback_error: Some("read-back mismatch".to_owned()),
         };
-
+        let serial = "TESTROLLFAIL01";
+        remove_history(serial);
         let error = run_eeprom_operation(
             target(Err(EepromProvisionServiceError::Helper(failure))),
-            CalibrationProvisionIntent::Provision {
-                request: request(),
-                expected_before_sha256: "a".repeat(64),
-                dry_run_token: "b".repeat(64),
-            },
-            None,
-            None,
+            provision_intent(request_with_sn(serial)),
             44,
             DumpCancellation::default(),
         )
@@ -2329,22 +2470,19 @@ mod eeprom_operation_tests {
 
         assert!(error.provision_state_unknown);
         assert!(error.message.contains("rollback=Failed"));
+        cleanup_history(serial);
     }
+
     #[test]
     fn provision_transport_failure_marks_device_unknown() {
-        let (root, destination) = destination();
+        let serial = "TESTTRANSPORT1";
+        remove_history(serial);
 
         let error = run_eeprom_operation(
             target(Err(EepromProvisionServiceError::Transport(
                 "SSH response was lost".to_owned(),
             ))),
-            CalibrationProvisionIntent::Provision {
-                request: request(),
-                expected_before_sha256: "a".repeat(64),
-                dry_run_token: "b".repeat(64),
-            },
-            Some(&destination),
-            Some(root.to_str().unwrap()),
+            provision_intent(request_with_sn(serial)),
             44,
             DumpCancellation::default(),
         )
@@ -2352,12 +2490,9 @@ mod eeprom_operation_tests {
 
         assert!(error.provision_state_unknown);
         assert!(error.message.contains("SSH response was lost"));
-        let audit: serde_json::Value = serde_json::from_slice(
-            &fs::read(root.join("eeprom-write-failure-000044.json")).unwrap(),
-        )
-        .unwrap();
+        let audit = read_history(serial);
         assert_eq!(audit["device_state_unknown"], true);
-        fs::remove_dir_all(root).unwrap();
+        cleanup_history(serial);
     }
     #[test]
     fn failed_reconfiguration_drops_previous_eeprom_target() {

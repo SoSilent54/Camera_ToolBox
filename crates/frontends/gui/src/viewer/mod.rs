@@ -20,7 +20,7 @@ pub(crate) use model::{LoadedRaw, bayer_label, pixel_inspection_texture_options}
 use hover::{render_hover_view, render_native_hover_view};
 use interaction::{
     RoiGesture, draw_minimap, draw_roi_draft, draw_roi_overlay, hover_pixel, image_extent_f32,
-    update_roi_interaction,
+    image_pixel_from_screen, update_roi_interaction,
 };
 
 #[cfg(test)]
@@ -29,8 +29,7 @@ use hover::{
 };
 #[cfg(test)]
 use interaction::{
-    ImagePixel, finish_roi_gesture, image_pixel_from_screen, roi_drag_pointer_position,
-    roi_from_inclusive_pixels,
+    ImagePixel, finish_roi_gesture, roi_drag_pointer_position, roi_from_inclusive_pixels,
 };
 #[cfg(test)]
 use model::preview_with_diagnostics;
@@ -49,6 +48,7 @@ pub(crate) struct CursorPixel {
 pub(crate) enum ViewerAction {
     CommitRoi(Roi),
     ResetRoi,
+    ClickPixel { x: u32, y: u32 },
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -63,6 +63,7 @@ pub(crate) struct ViewerImage<'a> {
     pub(crate) native: NativeImage,
     pub(crate) texture_id: egui::TextureId,
     pub(crate) roi: Roi,
+    pub(crate) show_roi: bool,
     raw: Option<&'a LoadedRaw>,
 }
 
@@ -73,6 +74,7 @@ impl<'a> ViewerImage<'a> {
             native: NativeImage::Raw(Arc::clone(&loaded.frame)),
             texture_id: loaded.active_texture_id(display_mode),
             roi: loaded.roi,
+            show_roi: true,
             raw: Some(loaded),
         }
     }
@@ -88,6 +90,28 @@ impl<'a> ViewerImage<'a> {
             native,
             texture_id,
             roi,
+            show_roi: true,
+            raw: None,
+        }
+    }
+
+    pub(crate) fn native_without_roi(
+        generation: u64,
+        native: NativeImage,
+        texture_id: egui::TextureId,
+    ) -> Self {
+        let dimensions = native.dimensions();
+        Self {
+            generation,
+            native,
+            texture_id,
+            roi: Roi {
+                x: 0,
+                y: 0,
+                width: dimensions[0],
+                height: dimensions[1],
+            },
+            show_roi: false,
             raw: None,
         }
     }
@@ -131,6 +155,10 @@ impl Default for ImageViewerState {
 }
 
 impl ImageViewerState {
+    pub(crate) fn displayed_image_rect(&self) -> Option<egui::Rect> {
+        self.geometry.map(|geometry| geometry.image_rect)
+    }
+
     pub(crate) fn zoom_by(
         &mut self,
         factor: f32,
@@ -309,7 +337,29 @@ pub(crate) fn render_viewer(
         viewer_rect,
         image_rect,
     });
-    let action = update_roi_interaction(ui, &response, image_rect, viewer, dimensions);
+    let mut action = if image.show_roi {
+        update_roi_interaction(ui, &response, image_rect, viewer, dimensions)
+    } else {
+        viewer.roi_gesture = None;
+        None
+    };
+    if action.is_none()
+        && response.clicked_by(egui::PointerButton::Primary)
+        && let Some(position) = response.interact_pointer_pos()
+        && let Some(pixel) = image_pixel_from_screen(
+            image_rect,
+            position,
+            dimensions[0],
+            dimensions[1],
+            false,
+            viewer.horizontal_flip,
+        )
+    {
+        action = Some(ViewerAction::ClickPixel {
+            x: pixel.x,
+            y: pixel.y,
+        });
+    }
     let spatial_texture_id =
         viewer.sync_spatial_overlay(ui.ctx(), image.generation, dimensions, spatial_highlight);
     let texture_uv = viewer_texture_uv(viewer.horizontal_flip);
@@ -322,22 +372,26 @@ pub(crate) fn render_viewer(
     if let Some(texture_id) = spatial_texture_id {
         painter.image(texture_id, image_rect, texture_uv, egui::Color32::WHITE);
     }
-    draw_roi_overlay(
-        &painter,
-        image_rect,
-        dimensions,
-        image.roi,
-        if viewer
-            .roi_gesture
-            .is_some_and(|gesture| gesture.drag_started)
-        {
-            egui::Color32::from_rgba_unmultiplied(0, 255, 0, 120)
-        } else {
-            egui::Color32::GREEN
-        },
-        viewer.horizontal_flip,
-    );
-    if let Some(gesture) = viewer.roi_gesture.filter(|gesture| gesture.drag_started) {
+    if image.show_roi {
+        draw_roi_overlay(
+            &painter,
+            image_rect,
+            dimensions,
+            image.roi,
+            if viewer
+                .roi_gesture
+                .is_some_and(|gesture| gesture.drag_started)
+            {
+                egui::Color32::from_rgba_unmultiplied(0, 255, 0, 120)
+            } else {
+                egui::Color32::GREEN
+            },
+            viewer.horizontal_flip,
+        );
+    }
+    if image.show_roi
+        && let Some(gesture) = viewer.roi_gesture.filter(|gesture| gesture.drag_started)
+    {
         draw_roi_draft(
             &painter,
             image_rect,
@@ -507,6 +561,29 @@ mod tests {
             viewer_texture_uv(true),
             egui::Rect::from_min_max(egui::pos2(1.0, 0.0), egui::pos2(0.0, 1.0))
         );
+    }
+
+    #[test]
+    fn screen_pixel_mapping_uses_viewer_zoom_pan_and_flip_geometry() {
+        let viewer_rect =
+            egui::Rect::from_min_size(egui::pos2(20.0, 10.0), egui::vec2(400.0, 260.0));
+        let mut viewer = ImageViewerState::default();
+        viewer.fit_to_rect(viewer_rect, 100.0, 50.0);
+        viewer.zoom_by(2.0, Some(viewer_rect.center()), viewer_rect);
+        viewer.horizontal_flip = true;
+        let image_rect = viewer.image_rect(viewer_rect, 100.0, 50.0);
+
+        let native = image_pixel_from_screen(
+            image_rect,
+            image_rect.left_top()
+                + egui::vec2(image_rect.width() * 0.25, image_rect.height() * 0.5),
+            100,
+            50,
+            false,
+            viewer.horizontal_flip,
+        );
+
+        assert_eq!(native, Some(ImagePixel { x: 75, y: 25 }));
     }
 
     #[test]
