@@ -1568,10 +1568,14 @@ fn remote_raw_progress_is_generation_safe_and_visible() {
 fn calibration_workspace_switch_preserves_viewer_documents() {
     let context = egui::Context::default();
     context.enable_accesskit();
+    context.set_theme(egui::Theme::Light);
     let mut app = app_with_loaded_raw(&context);
     let viewer_document = app.workspace.active_id();
-    app.product_workspace = super::ProductWorkspace::Calibration;
     let mut frame = eframe::Frame::_new_kittest();
+
+    let _ = run_app_frame(&context, &mut app, &mut frame, Vec::new());
+    let viewer_theme = context.theme();
+    app.product_workspace = super::ProductWorkspace::Calibration;
 
     let output = run_app_frame(&context, &mut app, &mut frame, Vec::new());
     let visible = output
@@ -1585,6 +1589,7 @@ fn calibration_workspace_switch_preserves_viewer_documents() {
         .join("\n");
 
     assert!(app.is_calibration_workspace());
+    assert_eq!(context.theme(), viewer_theme);
     assert_eq!(app.workspace.active_id(), viewer_document);
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
