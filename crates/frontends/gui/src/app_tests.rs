@@ -1859,7 +1859,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
         ],
     );
     output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 8.0);
-    assert!(accessibility_text(&output).contains("EEPROM SN"));
+    assert!(accessibility_text(&output).contains("YgStereo SNID"));
     let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
     output = run_app_frame_with_viewport(
         &context,
@@ -1883,7 +1883,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
         ],
     );
     output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 9.0);
-    assert!(!accessibility_text(&output).contains("EEPROM SN"));
+    assert!(!accessibility_text(&output).contains("YgStereo SNID"));
     let capture = accesskit_rect_center(accesskit_bounds(&output, "Capture"));
     output = run_app_frame_with_viewport(
         &context,
