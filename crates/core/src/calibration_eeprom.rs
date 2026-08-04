@@ -1645,9 +1645,9 @@ fn validated_distortion(values: &[f64]) -> Result<[f64; 12], EepromImageError> {
             actual: values.len(),
         });
     }
-    // 与 make_eeprom_bin.py --yml 保持一致：只写 OpenCV 前 8 项，s1..s4 默认清零。
+    // D8 输入保持兼容：缺失的 thin-prism 槽位清零；D12 输入必须完整写入 s1..s4。
     let mut distortion = [0.0_f64; 12];
-    distortion[..8].copy_from_slice(&values[..8]);
+    distortion[..values.len()].copy_from_slice(values);
     Ok(distortion)
 }
 
@@ -1768,16 +1768,24 @@ mod tests {
 
     #[test]
     fn full_image_matches_make_eeprom_bin_default_byte_for_byte() {
-        let image = FullEepromImage::from_solution(&solution(), "2T02D2567K0042").unwrap();
+        let mut solution = solution();
+        solution.distortion_coefficients.truncate(8);
+        let image = FullEepromImage::from_solution(&solution, "2T02D2567K0042").unwrap();
         let golden = include_bytes!("fixtures/yg_stereo_p24c64g_script_default.bin");
         assert_eq!(golden.len(), YG_STEREO_P24C64G_IMAGE_BYTES);
         assert_eq!(image.as_bytes(), &golden[..]);
-        let thin_prism_offset = DISTORTION_OFFSET + 8 * std::mem::size_of::<f32>();
-        assert!(
-            image.as_bytes()[thin_prism_offset..thin_prism_offset + 4 * 4]
-                .iter()
-                .all(|byte| *byte == 0)
-        );
+    }
+
+    #[test]
+    fn full_image_preserves_thin_prism_distortion_when_present() {
+        let image = FullEepromImage::from_solution(&solution(), "2T02D2567K0042").unwrap();
+        for (index, expected) in [0.007_f32, -0.008, 0.009, -0.01].iter().enumerate() {
+            let offset = DISTORTION_OFFSET + (8 + index) * std::mem::size_of::<f32>();
+            assert_eq!(
+                &image.as_bytes()[offset..offset + std::mem::size_of::<f32>()],
+                &expected.to_le_bytes()
+            );
+        }
     }
 
     #[test]
