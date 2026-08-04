@@ -15,6 +15,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -22,7 +23,7 @@ from pathlib import Path
 from typing import Iterable, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY = "SoSilent54/Camera_ToolBox"
+DEFAULT_REPOSITORY = "SoSilent54/Camera_ToolBox"
 RELEASE_TAG = "opencv-deps-v5.0.0-r1"
 OPENCV_VERSION = "5.0.0"
 OPENCV_COMMIT = "40738fb16ceddb5fb3fea747585f7ce6abb0605b"
@@ -206,11 +207,81 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def asset_url(spec: DependencySpec) -> str:
+def dependency_repository() -> str:
+    """Return the repository that owns dependency GitHub Releases."""
     return (
-        f"https://github.com/{REPOSITORY}/releases/download/"
+        os.environ.get("CAMERA_TOOLBOX_DEPENDENCY_REPOSITORY")
+        or os.environ.get("GITHUB_REPOSITORY")
+        or DEFAULT_REPOSITORY
+    )
+
+
+def github_token() -> str | None:
+    """Return an optional token for private repository release assets."""
+    return (
+        os.environ.get("CAMERA_TOOLBOX_GITHUB_TOKEN")
+        or os.environ.get("GH_TOKEN")
+        or os.environ.get("GITHUB_TOKEN")
+    )
+
+
+def github_request(url: str, *, accept: str) -> urllib.request.Request:
+    headers = {
+        "Accept": accept,
+        "User-Agent": "camera-toolbox-opencv5-consumer",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(url, headers=headers)
+
+
+def release_asset_browser_url(spec: DependencySpec) -> str:
+    return (
+        f"https://github.com/{dependency_repository()}/releases/download/"
         f"{RELEASE_TAG}/{spec.archive_name}"
     )
+
+
+def release_asset_api_url(spec: DependencySpec) -> str:
+    release_url = (
+        f"https://api.github.com/repos/{dependency_repository()}/releases/tags/"
+        f"{RELEASE_TAG}"
+    )
+    with urllib.request.urlopen(
+        github_request(release_url, accept="application/vnd.github+json"), timeout=120
+    ) as response:
+        release = json.load(response)
+    for asset in release.get("assets", []):
+        if asset.get("name") == spec.archive_name:
+            return str(asset["url"])
+    raise RuntimeError(
+        f"OpenCV dependency asset not found in GitHub Release {dependency_repository()} "
+        f"{RELEASE_TAG}: {spec.archive_name}"
+    )
+
+
+def release_asset_request(spec: DependencySpec) -> urllib.request.Request:
+    if github_token():
+        return github_request(release_asset_api_url(spec), accept="application/octet-stream")
+    return github_request(release_asset_browser_url(spec), accept="application/octet-stream")
+
+
+def download_error_message(spec: DependencySpec, error: urllib.error.HTTPError) -> str:
+    auth_state = "authenticated" if github_token() else "unauthenticated"
+    return (
+        f"failed to download OpenCV dependency asset {spec.archive_name} from "
+        f"GitHub Release {dependency_repository()} {RELEASE_TAG}: "
+        f"HTTP {error.code} {error.reason} ({auth_state}). "
+        "If the repository is private, pass GH_TOKEN/GITHUB_TOKEN with contents:read. "
+        "If only the Actions artifact is marked Expired, rerun the OpenCV 5 Dependencies "
+        "workflow and ensure the GitHub Release assets were published."
+    )
+
+
+def asset_url(spec: DependencySpec) -> str:
+    return release_asset_browser_url(spec)
 
 
 def download_archive(spec: DependencySpec, root: Path) -> Path:
@@ -223,13 +294,15 @@ def download_archive(spec: DependencySpec, root: Path) -> Path:
         archive_path.unlink()
 
     temporary = downloads / f".{spec.archive_name}.{os.getpid()}.tmp"
-    request = urllib.request.Request(
-        asset_url(spec), headers={"User-Agent": "camera-toolbox-opencv5-consumer"}
-    )
     print(f"Downloading {spec.archive_name}", file=sys.stderr)
     try:
-        with urllib.request.urlopen(request, timeout=120) as response, temporary.open("wb") as out:
-            shutil.copyfileobj(response, out, length=1024 * 1024)
+        try:
+            with urllib.request.urlopen(
+                release_asset_request(spec), timeout=120
+            ) as response, temporary.open("wb") as out:
+                shutil.copyfileobj(response, out, length=1024 * 1024)
+        except urllib.error.HTTPError as error:
+            raise RuntimeError(download_error_message(spec, error)) from error
         actual = file_sha256(temporary)
         if actual != spec.sha256:
             raise RuntimeError(

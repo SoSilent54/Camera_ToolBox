@@ -227,7 +227,7 @@ jobs:
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.checksum }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   build-macos:
     name: Build macos-aarch64-macos14
@@ -342,7 +342,7 @@ jobs:
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.checksum }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   build-windows:
     name: Build windows-x86_64-msvc
@@ -470,7 +470,7 @@ jobs:
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.checksum }}
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 30
 
   publish:
     name: Publish OpenCV dependency release

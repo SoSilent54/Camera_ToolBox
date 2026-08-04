@@ -16,6 +16,8 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  CAMERA_TOOLBOX_DEPENDENCY_REPOSITORY: ${{ github.repository }}
 
 jobs:
   validate-release:

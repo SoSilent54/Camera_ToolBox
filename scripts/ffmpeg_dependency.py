@@ -14,12 +14,13 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-REPOSITORY = "SoSilent54/Camera_ToolBox"
+DEFAULT_REPOSITORY = "SoSilent54/Camera_ToolBox"
 FFMPEG_VERSION = "8.1.2"
 DEPENDENCY_REVISION = 1
 RELEASE_TAG = f"ffmpeg-deps-v{FFMPEG_VERSION}-r{DEPENDENCY_REVISION}"
@@ -114,8 +115,74 @@ def dependency_cache_root(platform_id: str) -> Path:
     )
 
 
+def dependency_repository() -> str:
+    """Return the repository that owns dependency GitHub Releases."""
+    return (
+        os.environ.get("CAMERA_TOOLBOX_DEPENDENCY_REPOSITORY")
+        or os.environ.get("GITHUB_REPOSITORY")
+        or DEFAULT_REPOSITORY
+    )
+
+
+def github_token() -> str | None:
+    """Return an optional token for private repository release assets."""
+    return (
+        os.environ.get("CAMERA_TOOLBOX_GITHUB_TOKEN")
+        or os.environ.get("GH_TOKEN")
+        or os.environ.get("GITHUB_TOKEN")
+    )
+
+
+def github_request(url: str, *, accept: str) -> urllib.request.Request:
+    headers = {
+        "Accept": accept,
+        "User-Agent": "camera-toolbox-ffmpeg-consumer",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = github_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return urllib.request.Request(url, headers=headers)
+
+
+def release_asset_api_url(name: str) -> str:
+    release_url = (
+        f"https://api.github.com/repos/{dependency_repository()}/releases/tags/"
+        f"{RELEASE_TAG}"
+    )
+    with urllib.request.urlopen(
+        github_request(release_url, accept="application/vnd.github+json"), timeout=120
+    ) as response:
+        release = json.load(response)
+    for asset in release.get("assets", []):
+        if asset.get("name") == name:
+            return str(asset["url"])
+    raise DependencyError(
+        f"FFmpeg dependency asset not found in GitHub Release {dependency_repository()} "
+        f"{RELEASE_TAG}: {name}"
+    )
+
+
+def release_asset_request(name: str) -> urllib.request.Request:
+    if github_token():
+        return github_request(release_asset_api_url(name), accept="application/octet-stream")
+    return github_request(release_asset_url(name), accept="application/octet-stream")
+
+
+def download_error_message(name: str, error: urllib.error.HTTPError) -> str:
+    auth_state = "authenticated" if github_token() else "unauthenticated"
+    return (
+        f"failed to download FFmpeg dependency asset {name} from "
+        f"GitHub Release {dependency_repository()} {RELEASE_TAG}: "
+        f"HTTP {error.code} {error.reason} ({auth_state}). "
+        "If the repository is private, pass GH_TOKEN/GITHUB_TOKEN with contents:read. "
+        "If only the Actions artifact is marked Expired, rerun the FFmpeg Dependencies "
+        "workflow and ensure the GitHub Release assets were published."
+    )
+
+
 def release_asset_url(name: str) -> str:
-    return f"https://github.com/{REPOSITORY}/releases/download/{RELEASE_TAG}/{name}"
+    return f"https://github.com/{dependency_repository()}/releases/download/{RELEASE_TAG}/{name}"
 
 
 def sha256(path: Path) -> str:
@@ -126,11 +193,16 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def download(url: str, destination: Path) -> None:
+def download(name: str, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     try:
-        with urllib.request.urlopen(url, timeout=120) as response, temporary.open("wb") as stream:
-            shutil.copyfileobj(response, stream, length=1024 * 1024)
+        try:
+            with urllib.request.urlopen(
+                release_asset_request(name), timeout=120
+            ) as response, temporary.open("wb") as stream:
+                shutil.copyfileobj(response, stream, length=1024 * 1024)
+        except urllib.error.HTTPError as error:
+            raise DependencyError(download_error_message(name, error)) from error
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
@@ -218,11 +290,11 @@ def prepare() -> tuple[Path, Path, Path, Path]:
     checksums = downloads / "SHA256SUMS"
     downloads.mkdir(parents=True, exist_ok=True)
     if not checksums.is_file():
-        download(release_asset_url("SHA256SUMS"), checksums)
+        download("SHA256SUMS", checksums)
     expected = expected_checksum(checksums, asset)
     if not archive.is_file() or sha256(archive) != expected:
         archive.unlink(missing_ok=True)
-        download(release_asset_url(asset), archive)
+        download(asset, archive)
         actual = sha256(archive)
         if actual != expected:
             archive.unlink(missing_ok=True)

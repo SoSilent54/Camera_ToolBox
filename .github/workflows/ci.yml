@@ -9,6 +9,10 @@ name: CI
 permissions:
   contents: read
 
+env:
+  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  CAMERA_TOOLBOX_DEPENDENCY_REPOSITORY: ${{ github.repository }}
+
 jobs:
   common:
     name: Common Rust checks
