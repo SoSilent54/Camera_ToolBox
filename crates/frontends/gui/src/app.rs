@@ -864,7 +864,7 @@ fn path_parent_or_current(path: &Path) -> &Path {
         .unwrap_or_else(|| Path::new("."))
 }
 
-#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh", not(windows)))]
 fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
     let directory = std::fs::File::open(path).map_err(|error| {
         format!(
@@ -878,6 +878,12 @@ fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
             path.display()
         )
     })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh", windows))]
+fn sync_directory(_path: &Path, _label: &str) -> Result<(), String> {
+    // Windows 标准库不能用 File::open 打开目录做 sync；文件本身已 sync_all。
+    Ok(())
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
