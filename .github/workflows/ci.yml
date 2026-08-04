@@ -9,9 +9,6 @@ name: CI
 permissions:
   contents: read
 
-env:
-  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  CAMERA_TOOLBOX_DEPENDENCY_REPOSITORY: ${{ github.repository }}
 
 jobs:
   common:
@@ -110,6 +107,8 @@ jobs:
           where.exe cl.exe
       - name: Prepare pinned OpenCV 5 dependency
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
@@ -118,6 +117,8 @@ jobs:
             --github-path "$GITHUB_PATH"
       - name: Prepare pinned FFmpeg dependency
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
@@ -222,6 +223,8 @@ jobs:
           arch: x64
       - name: Prepare pinned OpenCV 5 dependency
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
@@ -230,6 +233,8 @@ jobs:
             --github-path "$GITHUB_PATH"
       - name: Prepare pinned FFmpeg dependency
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python_command=python3
           if [[ "$RUNNER_OS" == "Windows" ]]; then python_command=python; fi
