@@ -16,6 +16,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
@@ -24,10 +25,10 @@ from typing import Iterable, Mapping, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REPOSITORY = "SoSilent54/Camera_ToolBox"
-RELEASE_TAG = "opencv-deps-v5.0.0-r1"
 OPENCV_VERSION = "5.0.0"
 OPENCV_COMMIT = "40738fb16ceddb5fb3fea747585f7ce6abb0605b"
-DEPENDENCY_REVISION = 1
+DEPENDENCY_REVISION = 2
+RELEASE_TAG = f"opencv-deps-v{OPENCV_VERSION}-r{DEPENDENCY_REVISION}"
 CARGO_ENV_CONFIG = PROJECT_ROOT / ".cargo/opencv5.local.toml"
 CARGO_COMPILE_ENV_KEYS = (
     "CAMERA_TOOLBOX_OPENCV_ROOT",
@@ -57,10 +58,16 @@ MODULES = [
 @dataclass(frozen=True)
 class DependencySpec:
     platform_id: str
-    archive_name: str
     sha256: str
     archive_format: str
     link_name: str
+
+    @property
+    def archive_name(self) -> str:
+        return (
+            f"opencv-{OPENCV_VERSION}-r{DEPENDENCY_REVISION}-"
+            f"{self.platform_id}.{self.archive_format}"
+        )
 
 
 @dataclass(frozen=True)
@@ -77,43 +84,37 @@ class DependencyLayout:
 SPECS = {
     "windows-x86_64-msvc": DependencySpec(
         platform_id="windows-x86_64-msvc",
-        archive_name="opencv-5.0.0-r1-windows-x86_64-msvc.zip",
-        sha256="9a82dc4d0d4445b0c555a74d3a57333fc0990cd87abea4f727f1f2c1d01f8652",
+        sha256="e3f8ae7c69fd5ae3893d7e42c1d555bc2e3dc1a9c517017164d3448518f0bc53",
         archive_format="zip",
         link_name="opencv_world500",
     ),
     "macos-aarch64-macos14": DependencySpec(
         platform_id="macos-aarch64-macos14",
-        archive_name="opencv-5.0.0-r1-macos-aarch64-macos14.tar.gz",
-        sha256="8b456c505b50ecc476536692e06c44058699a4586e8a6247b86c36db0eec3cc5",
+        sha256="fcbb9bfa2b86636a2eee28aa0bf70ad1e48edaf3f653a9a67d336e7794da98f4",
         archive_format="tar.gz",
         link_name="opencv_world",
     ),
     "linux-x86_64-ubuntu20": DependencySpec(
         platform_id="linux-x86_64-ubuntu20",
-        archive_name="opencv-5.0.0-r1-linux-x86_64-ubuntu20.tar.gz",
-        sha256="cb29574e801c8c261337b6473bbdc770b7d9cca6b501749197318148419fedec",
+        sha256="e4495954bc1a6001466fed7090a039a3e799ab5bc8e7f66b92a2ef31f6f126c9",
         archive_format="tar.gz",
         link_name="opencv_world",
     ),
     "linux-x86_64-ubuntu22": DependencySpec(
         platform_id="linux-x86_64-ubuntu22",
-        archive_name="opencv-5.0.0-r1-linux-x86_64-ubuntu22.tar.gz",
-        sha256="19b8a24a07e690a7d33a7a010aa0a4de5afa312083540687d3804da9244e3aa4",
+        sha256="b4806b833893a96fe6fb2328a7c745f96475d446aed78312f1c8b2001040f666",
         archive_format="tar.gz",
         link_name="opencv_world",
     ),
     "linux-aarch64-ubuntu20": DependencySpec(
         platform_id="linux-aarch64-ubuntu20",
-        archive_name="opencv-5.0.0-r1-linux-aarch64-ubuntu20.tar.gz",
-        sha256="a5f8e5c2c6090fea39ea0d6120908c8c0a06c82873addd28aba487e0ae330879",
+        sha256="cd8a0de1063c2bf2231f31042bd7ee600d0b21e4b5fb80dacd6eaab644ad64ea",
         archive_format="tar.gz",
         link_name="opencv_world",
     ),
     "linux-aarch64-ubuntu22": DependencySpec(
         platform_id="linux-aarch64-ubuntu22",
-        archive_name="opencv-5.0.0-r1-linux-aarch64-ubuntu22.tar.gz",
-        sha256="151bb797e687c2965359684c6114aa4c5d2506af5450ba706f39717afd18b3f1",
+        sha256="59d43e5cc1d6cb1645b1554fea5b27d21c92fc532564710d73d7b71aae8429d0",
         archive_format="tar.gz",
         link_name="opencv_world",
     ),
@@ -237,6 +238,25 @@ def github_request(url: str, *, accept: str) -> urllib.request.Request:
     return urllib.request.Request(url, headers=headers)
 
 
+class CrossHostAuthorizationRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip GitHub tokens before following redirects to asset storage hosts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        old_host = urllib.parse.urlparse(req.full_url).netloc.lower()
+        new_host = urllib.parse.urlparse(newurl).netloc.lower()
+        if old_host != new_host:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def open_github_request(request: urllib.request.Request, *, timeout: int):
+    opener = urllib.request.build_opener(CrossHostAuthorizationRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
 def release_asset_browser_url(spec: DependencySpec) -> str:
     return (
         f"https://github.com/{dependency_repository()}/releases/download/"
@@ -249,7 +269,7 @@ def release_asset_api_url(spec: DependencySpec) -> str:
         f"https://api.github.com/repos/{dependency_repository()}/releases/tags/"
         f"{RELEASE_TAG}"
     )
-    with urllib.request.urlopen(
+    with open_github_request(
         github_request(release_url, accept="application/vnd.github+json"), timeout=120
     ) as response:
         release = json.load(response)
@@ -297,7 +317,7 @@ def download_archive(spec: DependencySpec, root: Path) -> Path:
     print(f"Downloading {spec.archive_name}", file=sys.stderr)
     try:
         try:
-            with urllib.request.urlopen(
+            with open_github_request(
                 release_asset_request(spec), timeout=120
             ) as response, temporary.open("wb") as out:
                 shutil.copyfileobj(response, out, length=1024 * 1024)

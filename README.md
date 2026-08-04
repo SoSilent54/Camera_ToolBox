@@ -34,7 +34,7 @@ cargo fmt --all -- --check
 ./build.sh debug
 ```
 
-`build.sh` 不选择 Local/CV610/SSH 功能平台；每次都统一编译三个 provider 和 OpenCV 标定。可选参数为 `debug`（默认）或 `release`，产物使用标准 Cargo 路径 `target/<profile>/camera-toolbox`。本机只需提供 Python 3、Clang/libclang 和 GUI 系统开发库；脚本会下载、校验并解压固定的 `opencv-deps-v5.0.0-r1` 平台资产到 `.deps/opencv5`，不使用系统 OpenCV 或 vcpkg，并把 `opencv_world` 运行库复制到可执行文件旁。可通过 `CAMERA_TOOLBOX_OPENCV_CACHE` 更改缓存目录；`CAMERA_TOOLBOX_CALIBRATION=0` 仅用于无需 OpenCV 的 agent/平台无关检查。
+`build.sh` 不选择 Local/CV610/SSH 功能平台；每次都统一编译三个 provider 和 OpenCV 标定。可选参数为 `debug`（默认）或 `release`，产物使用标准 Cargo 路径 `target/<profile>/camera-toolbox`。本机只需提供 Python 3、Clang/libclang 和 GUI 系统开发库；脚本会下载、校验并解压固定的 `opencv-deps-v5.0.0-r2` 平台资产到 `.deps/opencv5`，不使用系统 OpenCV 或 vcpkg，并把 `opencv_world` 运行库复制到可执行文件旁。可通过 `CAMERA_TOOLBOX_OPENCV_CACHE` 更改缓存目录；`CAMERA_TOOLBOX_CALIBRATION=0` 仅用于无需 OpenCV 的 agent/平台无关检查。
 
 `build.sh` 或 `python3 scripts/opencv5_dependency.py prepare` 成功后，会原子生成被 Git 忽略的 `.cargo/opencv5.local.toml`，保存当前平台固定资产的编译路径；此后同一 checkout 可直接执行 `cargo build`，仍使用 OpenCV 5 而不会回退到系统 OpenCV。干净 checkout 必须先执行上述任一 bootstrap 命令；依赖缓存位置、平台或 LLVM 安装变化后需重新 prepare。
 

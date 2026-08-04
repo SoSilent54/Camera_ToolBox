@@ -15,6 +15,7 @@ import sys
 import tarfile
 import tempfile
 import urllib.error
+import urllib.parse
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -145,12 +146,31 @@ def github_request(url: str, *, accept: str) -> urllib.request.Request:
     return urllib.request.Request(url, headers=headers)
 
 
+class CrossHostAuthorizationRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Strip GitHub tokens before following redirects to asset storage hosts."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is None:
+            return None
+        old_host = urllib.parse.urlparse(req.full_url).netloc.lower()
+        new_host = urllib.parse.urlparse(newurl).netloc.lower()
+        if old_host != new_host:
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+def open_github_request(request: urllib.request.Request, *, timeout: int):
+    opener = urllib.request.build_opener(CrossHostAuthorizationRedirectHandler)
+    return opener.open(request, timeout=timeout)
+
+
 def release_asset_api_url(name: str) -> str:
     release_url = (
         f"https://api.github.com/repos/{dependency_repository()}/releases/tags/"
         f"{RELEASE_TAG}"
     )
-    with urllib.request.urlopen(
+    with open_github_request(
         github_request(release_url, accept="application/vnd.github+json"), timeout=120
     ) as response:
         release = json.load(response)
@@ -197,7 +217,7 @@ def download(name: str, destination: Path) -> None:
     temporary = destination.with_suffix(destination.suffix + ".tmp")
     try:
         try:
-            with urllib.request.urlopen(
+            with open_github_request(
                 release_asset_request(name), timeout=120
             ) as response, temporary.open("wb") as stream:
                 shutil.copyfileobj(response, stream, length=1024 * 1024)
