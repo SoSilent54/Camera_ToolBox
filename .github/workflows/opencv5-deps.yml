@@ -208,6 +208,7 @@ jobs:
           "$build_dir/opencv5_dependency_smoke"
       - name: Build and run relocated opencv-rust consumer
         shell: bash
+        working-directory: ${{ runner.temp }}
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/opencv5-${{ matrix.platform }}/rust-target
           LD_LIBRARY_PATH: ${{ steps.package.outputs.runtime_dir }}
@@ -218,7 +219,7 @@ jobs:
           OPENCV_LINK_PATHS: ${{ steps.package.outputs.lib_dir }}
         run: >-
           cargo run --release --locked
-          --manifest-path .github/opencv5/smoke/rust/Cargo.toml
+          --manifest-path "$GITHUB_WORKSPACE/.github/opencv5/smoke/rust/Cargo.toml"
       - name: Upload verified Linux dependency
         uses: actions/upload-artifact@v4
         with:
@@ -323,6 +324,7 @@ jobs:
           "$build_dir/opencv5_dependency_smoke"
       - name: Build and run relocated opencv-rust consumer
         shell: bash
+        working-directory: ${{ runner.temp }}
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/opencv5-macos-aarch64-macos14/rust-target
           DYLD_FALLBACK_LIBRARY_PATH: ${{ steps.package.outputs.runtime_dir }}:${{ steps.llvm.outputs.libdir }}
@@ -333,7 +335,7 @@ jobs:
           OPENCV_LINK_PATHS: ${{ steps.package.outputs.lib_dir }}
         run: >-
           cargo run --release --locked
-          --manifest-path .github/opencv5/smoke/rust/Cargo.toml
+          --manifest-path "$GITHUB_WORKSPACE/.github/opencv5/smoke/rust/Cargo.toml"
       - name: Upload verified macOS dependency
         uses: actions/upload-artifact@v4
         with:
@@ -451,6 +453,7 @@ jobs:
           & (Join-Path $build "opencv5_dependency_smoke.exe")
       - name: Build and run relocated opencv-rust consumer
         shell: pwsh
+        working-directory: ${{ runner.temp }}
         env:
           CARGO_TARGET_DIR: ${{ runner.temp }}/opencv5-windows-x86_64-msvc/rust-target
           LIBCLANG_PATH: C:\Program Files\LLVM\bin
@@ -459,9 +462,9 @@ jobs:
           OPENCV_LINK_LIBS: ${{ steps.package.outputs.link_lib }}
           OPENCV_LINK_PATHS: ${{ steps.package.outputs.lib_dir }}
           OPENCV_MSVC_CRT: dynamic
-        run: >-
-          cargo run --release --locked
-          --manifest-path .github/opencv5/smoke/rust/Cargo.toml
+        run: |
+          $manifest = Join-Path $env:GITHUB_WORKSPACE ".github/opencv5/smoke/rust/Cargo.toml"
+          cargo run --release --locked --manifest-path $manifest
       - name: Upload verified Windows dependency
         uses: actions/upload-artifact@v4
         with:
