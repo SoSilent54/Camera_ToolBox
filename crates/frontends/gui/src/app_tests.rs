@@ -2349,6 +2349,29 @@ mod eeprom_operation_tests {
         std::path::Path::new("write_history").join(format!("{serial_number}.json"))
     }
 
+    fn history_file_path(file_name: &str) -> PathBuf {
+        std::path::Path::new("write_history").join(file_name)
+    }
+
+    fn write_history_with_recorded_snid(file_name: &str, serial_number: &str) -> PathBuf {
+        fs::create_dir_all("write_history").unwrap();
+        let path = history_file_path(file_name);
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "request": {
+                "request": {
+                    "serial_number": serial_number,
+                },
+            },
+        });
+        fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
+        path
+    }
+
+    fn remove_history_file(file_name: &str) {
+        let _ = fs::remove_file(history_file_path(file_name));
+    }
+
     fn remove_history(serial_number: &str) {
         let _ = fs::remove_file(history_path(serial_number));
         let _ = fs::remove_file(legacy_history_path(serial_number));
@@ -2419,17 +2442,45 @@ mod eeprom_operation_tests {
 
     #[test]
     fn history_slot_allows_case_distinct_snids() {
-        let existing = "TESTDUPCASE01";
-        let requested = "testdupcase01";
+        let existing = "testdupcase01";
+        let requested = "TESTDUPCASE01";
         remove_history(existing);
         remove_history(requested);
-        fs::create_dir_all("write_history").unwrap();
-        fs::write(history_path(existing), b"operation: existing\n").unwrap();
+        let existing_path = write_history_with_recorded_snid("testdupcase01.yaml", existing);
 
         let result = ensure_eeprom_history_slot_available(requested);
-        fs::remove_file(history_path(existing)).unwrap();
+        fs::remove_file(existing_path).unwrap();
 
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn history_slot_rejects_exact_snid_across_case_distinct_filename() {
+        let requested = "TESTDUPCASE02";
+        remove_history(requested);
+        remove_history_file("testdupcase02.yaml");
+        let existing_path = write_history_with_recorded_snid("testdupcase02.yaml", requested);
+
+        let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
+        fs::remove_file(existing_path).unwrap();
+
+        assert!(error.contains("already records SN TESTDUPCASE02"));
+    }
+
+    #[test]
+    fn history_slot_checks_all_case_insensitive_candidates_by_recorded_snid() {
+        let requested = "TESTDUPCASE03";
+        remove_history(requested);
+        remove_history_file("testdupcase03.yaml");
+        remove_history_file("testdupcase03.json");
+        let yaml_path = write_history_with_recorded_snid("testdupcase03.yaml", "testdupcase03");
+        let json_path = write_history_with_recorded_snid("testdupcase03.json", requested);
+
+        let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
+        fs::remove_file(yaml_path).unwrap();
+        fs::remove_file(json_path).unwrap();
+
+        assert!(error.contains("already records SN TESTDUPCASE03"));
     }
 
     #[test]

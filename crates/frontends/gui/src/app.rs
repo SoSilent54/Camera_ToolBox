@@ -843,18 +843,72 @@ fn safe_eeprom_history_file_name(serial_number: &str) -> Result<String, String> 
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), String> {
-    for path in [
-        eeprom_history_path(serial_number)?,
-        legacy_eeprom_history_path(serial_number)?,
-    ] {
-        if path.exists() {
+    let serial = safe_eeprom_history_stem(serial_number)?;
+    let current_path = eeprom_history_path(&serial)?;
+    let legacy_path = legacy_eeprom_history_path(&serial)?;
+    let target_names = [
+        current_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned(),
+        legacy_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_owned(),
+    ];
+    let history_dir = Path::new("write_history");
+    let entries = match fs::read_dir(history_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
             return Err(format!(
-                "Write history already exists for SN {serial_number}: {}. Refusing to start EEPROM write; rename or archive the existing file before retrying.",
+                "Failed to inspect EEPROM write history directory {} before writing SN {serial}: {error}",
+                history_dir.display()
+            ));
+        }
+    };
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed to inspect EEPROM write history directory {} before writing SN {serial}: {error}",
+                history_dir.display()
+            )
+        })?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if !target_names
+            .iter()
+            .any(|target| file_name.eq_ignore_ascii_case(target))
+        {
+            continue;
+        }
+        let path = entry.path();
+        if eeprom_history_recorded_serial_number(&path).as_deref() == Some(serial.as_str()) {
+            return Err(format!(
+                "Write history already records SN {serial}: {}. Refusing to start EEPROM write; rename or archive the existing file before retrying.",
                 path.display()
             ));
         }
     }
+
     Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_recorded_serial_number(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let document: serde_json::Value = serde_yaml::from_slice(&bytes).ok()?;
+    // Windows 目录可按大小写不敏感方式命中文件名；重复判断只信审计内容里的原始 SNID。
+    document
+        .pointer("/request/request/serial_number")
+        .or_else(|| document.pointer("/request/serial_number"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
