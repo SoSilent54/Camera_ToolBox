@@ -2391,7 +2391,7 @@ mod eeprom_operation_tests {
 
     #[test]
     fn provision_success_writes_yaml_with_bus_and_original_parameters() {
-        let serial = "TESTSUCCESS01";
+        let serial = "2T233268101900";
         remove_history(serial);
         let request = request_with_calibration_segment(serial);
         let helper = EepromHelperResult::Provision(EepromWriteResult {
@@ -2445,12 +2445,24 @@ mod eeprom_operation_tests {
     }
 
     #[test]
+    fn history_file_name_converts_snid_date_and_sequence_to_decimal() {
+        assert_eq!(
+            safe_eeprom_history_file_name("2T233268101a00").unwrap(),
+            "2T233000_260801_73.yaml"
+        );
+        assert_eq!(
+            safe_eeprom_history_file_name("2T23326CV0ZZ00").unwrap(),
+            "2T233000_261231_3844.yaml"
+        );
+    }
+
+    #[test]
     fn history_slot_allows_case_distinct_snids() {
-        let existing = "testdupcase01";
-        let requested = "TESTDUPCASE01";
+        let existing = "2T233268101a00";
+        let requested = "2T233268101A00";
         remove_history(existing);
         remove_history(requested);
-        let existing_path = write_history_with_recorded_snid("testdupcase01.yaml", existing);
+        let existing_path = write_history_with_recorded_snid("2T233268101a00.yaml", existing);
 
         let result = ensure_eeprom_history_slot_available(requested);
         fs::remove_file(existing_path).unwrap();
@@ -2460,62 +2472,55 @@ mod eeprom_operation_tests {
 
     #[test]
     fn history_slot_rejects_exact_snid_across_case_distinct_filename() {
-        let requested = "TESTDUPCASE02";
+        let requested = "2T233268201A00";
         remove_history(requested);
-        remove_history_file("testdupcase02.yaml");
-        let existing_path = write_history_with_recorded_snid("testdupcase02.yaml", requested);
+        remove_history_file("2T233268201a00.yaml");
+        let existing_path = write_history_with_recorded_snid("2T233268201a00.yaml", requested);
 
         let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
         fs::remove_file(existing_path).unwrap();
 
-        assert!(error.contains("already records SN TESTDUPCASE02"));
+        assert!(error.contains("already records SN 2T233268201A00"));
     }
 
     #[test]
-    fn history_slot_checks_all_case_insensitive_candidates_by_recorded_snid() {
-        let requested = "TESTDUPCASE03";
+    fn history_slot_checks_all_history_candidates_by_recorded_snid() {
+        let requested = "2T233268301B00";
         remove_history(requested);
-        remove_history_file("testdupcase03.yaml");
-        remove_history_file("testdupcase03.json");
-        let yaml_path = write_history_with_recorded_snid("testdupcase03.yaml", "testdupcase03");
-        let json_path = write_history_with_recorded_snid("testdupcase03.json", requested);
+        remove_history_file("2T233268301b00.yaml");
+        remove_history_file("legacy-case-candidate-03.json");
+        let yaml_path = write_history_with_recorded_snid("2T233268301b00.yaml", "2T233268301b00");
+        let json_path =
+            write_history_with_recorded_snid("legacy-case-candidate-03.json", requested);
 
         let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
         fs::remove_file(yaml_path).unwrap();
         fs::remove_file(json_path).unwrap();
 
-        assert!(error.contains("already records SN TESTDUPCASE03"));
+        assert!(error.contains("already records SN 2T233268301B00"));
     }
 
     #[test]
-    fn history_slot_rejects_exact_snid_from_suffixed_history_file() {
-        let requested = "TESTDUPCASE04";
+    fn history_slot_rejects_occupied_decimal_filename_without_matching_snid() {
+        let requested = "2T233268401C00";
+        let occupant = "2T233268401c00";
         remove_history(requested);
-        let suffix_name = format!(
-            "{requested}--{}.yaml",
-            eeprom_history_stem_hex_suffix(requested)
-        );
-        remove_history_file(&suffix_name);
-        let existing_path = write_history_with_recorded_snid(&suffix_name, requested);
+        let occupied_name = safe_eeprom_history_file_name(requested).unwrap();
+        remove_history_file(&occupied_name);
+        let occupied_path = write_history_with_recorded_snid(&occupied_name, occupant);
 
         let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
-        fs::remove_file(existing_path).unwrap();
+        fs::remove_file(occupied_path).unwrap();
 
-        assert!(error.contains("already records SN TESTDUPCASE04"));
+        assert!(error.contains("filename for SN 2T233268401C00 is already occupied"));
     }
 
     #[test]
-    fn persist_history_uses_suffix_when_default_filename_is_taken_by_distinct_snid() {
-        let existing = "testsavecase05";
-        let requested = "TESTSAVECASE05";
-        remove_history(existing);
+    fn persist_history_uses_decimal_snid_filename() {
+        let requested = "2T233268501Z00";
         remove_history(requested);
-        let fallback_name = format!(
-            "{requested}--{}.yaml",
-            eeprom_history_stem_hex_suffix(requested)
-        );
-        remove_history_file(&fallback_name);
-        let existing_path = write_history_with_recorded_snid("TESTSAVECASE05.yaml", existing);
+        let expected_name = "2T233000_260805_124.yaml";
+        remove_history_file(expected_name);
         let document = serde_json::json!({
             "request": {
                 "request": {
@@ -2527,10 +2532,9 @@ mod eeprom_operation_tests {
         let history_file = persist_eeprom_write_history_yaml(requested, 8, &document).unwrap();
         let saved_path = PathBuf::from(&history_file);
         let saved_audit = read_history_file(&saved_path);
-        fs::remove_file(existing_path).unwrap();
         fs::remove_file(&saved_path).unwrap();
 
-        assert_eq!(saved_path, history_file_path(&fallback_name));
+        assert_eq!(saved_path, history_file_path(expected_name));
         assert_eq!(
             saved_audit["request"]["request"]["serial_number"],
             requested
@@ -2547,7 +2551,7 @@ mod eeprom_operation_tests {
             rollback: EepromRollbackState::Restored,
             rollback_error: None,
         };
-        let serial = "TESTFAILREST01";
+        let serial = "2T233268101d00";
         remove_history(serial);
 
         let error = run_eeprom_operation(
@@ -2578,7 +2582,7 @@ mod eeprom_operation_tests {
             rollback: EepromRollbackState::Failed,
             rollback_error: Some("read-back mismatch".to_owned()),
         };
-        let serial = "TESTROLLFAIL01";
+        let serial = "2T233268101e00";
         remove_history(serial);
         let error = run_eeprom_operation(
             target(Err(EepromProvisionServiceError::Helper(failure))),
@@ -2595,7 +2599,7 @@ mod eeprom_operation_tests {
 
     #[test]
     fn provision_transport_failure_marks_device_unknown() {
-        let serial = "TESTTRANSPORT1";
+        let serial = "2T233268101f00";
         remove_history(serial);
 
         let error = run_eeprom_operation(

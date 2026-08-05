@@ -814,12 +814,6 @@ fn eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-fn legacy_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
-    Ok(PathBuf::from("write_history")
-        .join(format!("{}.json", safe_eeprom_history_stem(serial_number)?)))
-}
-
-#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn safe_eeprom_history_stem(serial_number: &str) -> Result<String, String> {
     let serial = serial_number.trim();
     if serial.is_empty() {
@@ -838,7 +832,27 @@ fn safe_eeprom_history_stem(serial_number: &str) -> Result<String, String> {
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn safe_eeprom_history_file_name(serial_number: &str) -> Result<String, String> {
-    Ok(format!("{}.yaml", safe_eeprom_history_stem(serial_number)?))
+    let serial = safe_eeprom_history_stem(serial_number)?;
+    let bytes = serial.as_bytes();
+    if bytes.len() != EEPROM_SERIAL_BYTES {
+        return Err(format!(
+            "EEPROM serial number {serial:?} must contain exactly {EEPROM_SERIAL_BYTES} ASCII bytes to create write history filename"
+        ));
+    }
+    let prefix = format!(
+        "{}{}{}",
+        std::str::from_utf8(&bytes[0..5]).expect("safe EEPROM serial stem is ASCII"),
+        char::from(bytes[9]),
+        std::str::from_utf8(&bytes[12..14]).expect("safe EEPROM serial stem is ASCII")
+    );
+    let year = std::str::from_utf8(&bytes[5..7]).expect("safe EEPROM serial stem is ASCII");
+    let month = decode_snid_month(bytes[7])
+        .ok_or_else(|| format!("EEPROM serial number {serial:?} has invalid encoded month"))?;
+    let day = decode_snid_day(bytes[8])
+        .ok_or_else(|| format!("EEPROM serial number {serial:?} has invalid encoded day"))?;
+    let sequence = decode_snid_sequence(bytes[10], bytes[11])
+        .ok_or_else(|| format!("EEPROM serial number {serial:?} has invalid encoded sequence"))?;
+    Ok(format!("{prefix}_{year}{month:02}{day:02}_{sequence}.yaml"))
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -849,14 +863,12 @@ fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), Strin
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
     let serial = safe_eeprom_history_stem(serial_number)?;
-    let default_path = eeprom_history_path(&serial)?;
-    let legacy_path = legacy_eeprom_history_path(&serial)?;
-    let default_name = eeprom_file_name_to_string(&default_path)?;
-    let legacy_name = eeprom_file_name_to_string(&legacy_path)?;
+    let target_path = eeprom_history_path(&serial)?;
+    let target_name = eeprom_file_name_to_string(&target_path)?;
     let history_dir = Path::new("write_history");
     let entries = match fs::read_dir(history_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(default_path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target_path),
         Err(error) => {
             return Err(format!(
                 "Failed to inspect EEPROM write history directory {} before writing SN {serial}: {error}",
@@ -864,8 +876,7 @@ fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
             ));
         }
     };
-    let mut existing_names = Vec::new();
-    let mut default_name_collides = false;
+    let mut occupied_target_path = None;
 
     for entry in entries {
         let entry = entry.map_err(|error| {
@@ -887,37 +898,19 @@ fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
                 path.display()
             ));
         }
-        if file_name.eq_ignore_ascii_case(&default_name)
-            || file_name.eq_ignore_ascii_case(&legacy_name)
-        {
-            default_name_collides = true;
-        }
-        existing_names.push(file_name);
-    }
-
-    if !default_name_collides {
-        return Ok(default_path);
-    }
-
-    // Windows 可能用大小写不敏感方式占用默认文件名；非重复 SNID 改用稳定后缀保证审计可落盘。
-    let suffix = eeprom_history_stem_hex_suffix(&serial);
-    for index in 0..1000_u16 {
-        let file_name = if index == 0 {
-            format!("{serial}--{suffix}.yaml")
-        } else {
-            format!("{serial}--{suffix}-{index}.yaml")
-        };
-        if !existing_names
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&file_name))
-        {
-            return Ok(history_dir.join(file_name));
+        if file_name.eq_ignore_ascii_case(&target_name) {
+            occupied_target_path = Some(path);
         }
     }
 
-    Err(format!(
-        "No available EEPROM write history filename remains for SN {serial}; archive colliding history files before retrying."
-    ))
+    if let Some(path) = occupied_target_path {
+        return Err(format!(
+            "EEPROM write history filename for SN {serial} is already occupied by {} but that file does not record the same SNID. Refusing to start EEPROM write; archive or repair the history file before retrying.",
+            path.display()
+        ));
+    }
+
+    Ok(target_path)
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -935,17 +928,9 @@ fn eeprom_file_name_to_string(path: &Path) -> Result<String, String> {
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn eeprom_history_may_record_snid(file_name: &str) -> bool {
-    file_name.ends_with(".yaml") || file_name.ends_with(".json")
-}
-
-#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
-fn eeprom_history_stem_hex_suffix(serial: &str) -> String {
-    serial
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02X}"))
-        .collect::<Vec<_>>()
-        .join("")
+    file_name.rsplit_once('.').is_some_and(|(_, extension)| {
+        extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("json")
+    })
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
