@@ -2381,6 +2381,10 @@ mod eeprom_operation_tests {
         serde_yaml::from_slice(&fs::read(history_path(serial_number)).unwrap()).unwrap()
     }
 
+    fn read_history_file(path: &std::path::Path) -> serde_json::Value {
+        serde_yaml::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
     fn cleanup_history(serial_number: &str) {
         fs::remove_file(history_path(serial_number)).unwrap();
     }
@@ -2481,6 +2485,56 @@ mod eeprom_operation_tests {
         fs::remove_file(json_path).unwrap();
 
         assert!(error.contains("already records SN TESTDUPCASE03"));
+    }
+
+    #[test]
+    fn history_slot_rejects_exact_snid_from_suffixed_history_file() {
+        let requested = "TESTDUPCASE04";
+        remove_history(requested);
+        let suffix_name = format!(
+            "{requested}--{}.yaml",
+            eeprom_history_stem_hex_suffix(requested)
+        );
+        remove_history_file(&suffix_name);
+        let existing_path = write_history_with_recorded_snid(&suffix_name, requested);
+
+        let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
+        fs::remove_file(existing_path).unwrap();
+
+        assert!(error.contains("already records SN TESTDUPCASE04"));
+    }
+
+    #[test]
+    fn persist_history_uses_suffix_when_default_filename_is_taken_by_distinct_snid() {
+        let existing = "testsavecase05";
+        let requested = "TESTSAVECASE05";
+        remove_history(existing);
+        remove_history(requested);
+        let fallback_name = format!(
+            "{requested}--{}.yaml",
+            eeprom_history_stem_hex_suffix(requested)
+        );
+        remove_history_file(&fallback_name);
+        let existing_path = write_history_with_recorded_snid("TESTSAVECASE05.yaml", existing);
+        let document = serde_json::json!({
+            "request": {
+                "request": {
+                    "serial_number": requested,
+                },
+            },
+        });
+
+        let history_file = persist_eeprom_write_history_yaml(requested, 8, &document).unwrap();
+        let saved_path = PathBuf::from(&history_file);
+        let saved_audit = read_history_file(&saved_path);
+        fs::remove_file(existing_path).unwrap();
+        fs::remove_file(&saved_path).unwrap();
+
+        assert_eq!(saved_path, history_file_path(&fallback_name));
+        assert_eq!(
+            saved_audit["request"]["request"]["serial_number"],
+            requested
+        );
     }
 
     #[test]

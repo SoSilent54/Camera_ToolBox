@@ -843,25 +843,20 @@ fn safe_eeprom_history_file_name(serial_number: &str) -> Result<String, String> 
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), String> {
+    new_eeprom_history_path(serial_number).map(|_| ())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
     let serial = safe_eeprom_history_stem(serial_number)?;
-    let current_path = eeprom_history_path(&serial)?;
+    let default_path = eeprom_history_path(&serial)?;
     let legacy_path = legacy_eeprom_history_path(&serial)?;
-    let target_names = [
-        current_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
-        legacy_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_owned(),
-    ];
+    let default_name = eeprom_file_name_to_string(&default_path)?;
+    let legacy_name = eeprom_file_name_to_string(&legacy_path)?;
     let history_dir = Path::new("write_history");
     let entries = match fs::read_dir(history_dir) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(default_path),
         Err(error) => {
             return Err(format!(
                 "Failed to inspect EEPROM write history directory {} before writing SN {serial}: {error}",
@@ -869,6 +864,8 @@ fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), Strin
             ));
         }
     };
+    let mut existing_names = Vec::new();
+    let mut default_name_collides = false;
 
     for entry in entries {
         let entry = entry.map_err(|error| {
@@ -878,25 +875,77 @@ fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), Strin
             )
         })?;
         let file_name = entry.file_name();
-        let Some(file_name) = file_name.to_str() else {
+        let Some(file_name) = file_name.to_str().map(str::to_owned) else {
             continue;
         };
-        if !target_names
-            .iter()
-            .any(|target| file_name.eq_ignore_ascii_case(target))
-        {
-            continue;
-        }
         let path = entry.path();
-        if eeprom_history_recorded_serial_number(&path).as_deref() == Some(serial.as_str()) {
+        if eeprom_history_may_record_snid(&file_name)
+            && eeprom_history_recorded_serial_number(&path).as_deref() == Some(serial.as_str())
+        {
             return Err(format!(
                 "Write history already records SN {serial}: {}. Refusing to start EEPROM write; rename or archive the existing file before retrying.",
                 path.display()
             ));
         }
+        if file_name.eq_ignore_ascii_case(&default_name)
+            || file_name.eq_ignore_ascii_case(&legacy_name)
+        {
+            default_name_collides = true;
+        }
+        existing_names.push(file_name);
     }
 
-    Ok(())
+    if !default_name_collides {
+        return Ok(default_path);
+    }
+
+    // Windows 可能用大小写不敏感方式占用默认文件名；非重复 SNID 改用稳定后缀保证审计可落盘。
+    let suffix = eeprom_history_stem_hex_suffix(&serial);
+    for index in 0..1000_u16 {
+        let file_name = if index == 0 {
+            format!("{serial}--{suffix}.yaml")
+        } else {
+            format!("{serial}--{suffix}-{index}.yaml")
+        };
+        if !existing_names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&file_name))
+        {
+            return Ok(history_dir.join(file_name));
+        }
+    }
+
+    Err(format!(
+        "No available EEPROM write history filename remains for SN {serial}; archive colliding history files before retrying."
+    ))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_file_name_to_string(path: &Path) -> Result<String, String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "EEPROM write history path {} has no UTF-8 file name",
+                path.display()
+            )
+        })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_may_record_snid(file_name: &str) -> bool {
+    file_name.ends_with(".yaml") || file_name.ends_with(".json")
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_stem_hex_suffix(serial: &str) -> String {
+    serial
+        .as_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join("")
 }
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
@@ -906,7 +955,9 @@ fn eeprom_history_recorded_serial_number(path: &Path) -> Option<String> {
     // Windows 目录可按大小写不敏感方式命中文件名；重复判断只信审计内容里的原始 SNID。
     document
         .pointer("/request/request/serial_number")
+        .or_else(|| document.pointer("/request/request/snid/raw"))
         .or_else(|| document.pointer("/request/serial_number"))
+        .or_else(|| document.pointer("/request/snid/raw"))
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
 }
@@ -1010,7 +1061,7 @@ fn persist_eeprom_write_history_yaml(
     operation_id: u64,
     document: &serde_json::Value,
 ) -> Result<String, String> {
-    let path = eeprom_history_path(serial_number)?;
+    let path = new_eeprom_history_path(serial_number)?;
     let bytes = serialize_eeprom_yaml(document)?;
     create_new_file(&path, &bytes, operation_id, "EEPROM write history")?;
     Ok(path.display().to_string())
