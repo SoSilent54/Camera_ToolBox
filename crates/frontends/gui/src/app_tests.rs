@@ -2342,7 +2342,7 @@ mod eeprom_operation_tests {
     }
 
     fn history_path(serial_number: &str) -> PathBuf {
-        std::path::Path::new("write_history").join(format!("{serial_number}.yaml"))
+        eeprom_history_path(serial_number).unwrap()
     }
 
     fn legacy_history_path(serial_number: &str) -> PathBuf {
@@ -2387,7 +2387,7 @@ mod eeprom_operation_tests {
         let EepromOperationOutcome::Provision { history_file, .. } = outcome else {
             panic!("expected provision outcome")
         };
-        assert!(history_file.ends_with("TESTSUCCESS01.yaml"));
+        assert_eq!(history_file, history_path(serial).display().to_string());
         let audit = read_history(serial);
         assert_eq!(audit["schema_version"], 2);
         assert_eq!(audit["operation"], "eeprom_provision_success");
@@ -2415,6 +2415,21 @@ mod eeprom_operation_tests {
         );
         assert!(audit["result"].get("backup").is_none());
         cleanup_history(serial);
+    }
+
+    #[test]
+    fn history_slot_allows_case_distinct_snids() {
+        let existing = "TESTDUPCASE01";
+        let requested = "testdupcase01";
+        remove_history(existing);
+        remove_history(requested);
+        fs::create_dir_all("write_history").unwrap();
+        fs::write(history_path(existing), b"operation: existing\n").unwrap();
+
+        let result = ensure_eeprom_history_slot_available(requested);
+        fs::remove_file(history_path(existing)).unwrap();
+
+        assert!(result.is_ok());
     }
 
     #[test]

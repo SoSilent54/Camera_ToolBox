@@ -671,6 +671,44 @@ mod tests {
     }
 
     #[test]
+    fn provision_snid_identity_checks_are_case_sensitive() {
+        let lower = "2T233268100a00";
+        let upper = "2T233268100A00";
+        let existing = FullEepromImage::from_solution(&solution(1000.0), lower).unwrap();
+        let replacement = FullEepromImage::from_solution(&solution(1300.0), upper).unwrap();
+        let mut device = MemoryDevice::new(existing.as_bytes().to_vec());
+        let before_state = inspect_state(&mut device).state;
+
+        let update_rejected = execute(
+            helper_request(EepromHelperAction::Provision {
+                request: replacement.update_calibration_request(),
+                expected_before_sha256: before_state.image_sha256.clone(),
+            }),
+            &mut device,
+        );
+        assert!(matches!(
+            update_rejected,
+            EepromHelperOutput::Failure {
+                failure: EepromHelperFailure { ref code, .. }
+            } if code == "serial_mismatch"
+        ));
+
+        let full_rejected = execute(
+            helper_request(EepromHelperAction::Provision {
+                request: replacement.full_provision_request(false),
+                expected_before_sha256: before_state.image_sha256,
+            }),
+            &mut device,
+        );
+        assert!(matches!(
+            full_rejected,
+            EepromHelperOutput::Failure {
+                failure: EepromHelperFailure { ref code, .. }
+            } if code == "serial_overwrite_confirmation_required"
+        ));
+    }
+
+    #[test]
     fn different_serial_requires_explicit_overwrite_and_failed_write_rolls_back() {
         let existing = FullEepromImage::from_solution(&solution(1000.0), "2T02D2567K0042").unwrap();
         let replacement =
