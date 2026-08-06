@@ -1,5 +1,5 @@
 use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
-use std::{path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use camera_toolbox_app::{
     DirectoryRef, ExportDestination, FileRef, FileSourceId, FsCancellation, ImageOpenMode,
@@ -16,8 +16,9 @@ use eframe::egui::{self, accesskit::Role};
 use super::LIVE_STOP_TIMEOUT;
 use super::{
     ActiveRawOpenJob, CameraToolboxApp, LoadedRaw, OpenedFileDocument, RawOpenJobEvent,
-    WorkspaceFileOpenRequest, decode_workspace_image_request, save_asset_source,
-    save_asset_source_with,
+    WorkspaceFileOpenRequest, decode_strided_u16le_raw, decode_workspace_image_request,
+    save_asset_source, save_asset_source_with, x5_233_channel_mapping, x5_233_live_source,
+    x5_233_raw_bit_depth, x5_233_rtsp_timeouts, x5_233_rtsp_url, x5_233_yuv_snapshot_spec,
 };
 use crate::{
     analysis_panel::DesiredAnalysis,
@@ -153,6 +154,7 @@ fn test_live_source() -> crate::workspace::LiveStreamSource {
         transport: camera_toolbox_app::RtspTransport::Tcp,
         source_fingerprint: "test-rtsp-source".to_owned(),
         geometry_key: "test-rtsp-config".to_owned(),
+        authoritative_capture: None,
     }
 }
 
@@ -212,7 +214,7 @@ fn live_viewer_texture_stays_live_when_dataset_overlay_exists() {
     document.install_latest_texture(&context);
     let live_texture_id = document.texture().unwrap().id();
     let presentation = crate::calibration_workspace::CalibrationViewerPresentation {
-        item_id: test_calibration_item_id(),
+        item_id: Some(test_calibration_item_id()),
         overlay: crate::calibration_workspace::CalibrationViewerOverlay::default(),
     };
 
@@ -275,6 +277,22 @@ fn workspace_source_modes_render_rtsp_controls_exclusively() {
     assert!(rtsp.contains("Connect RTSP"));
     assert!(rtsp.contains("Prefer hardware acceleration"));
     assert!(!rtsp.contains("Name"));
+
+    app.explorer.select_x5_233_driver_mode_for_test();
+    let x5_driver = accessibility_text(&run_app_frame(&context, &mut app, &mut frame, Vec::new()));
+    assert!(x5_driver.contains("X5_233 Driver"));
+    assert!(x5_driver.contains("Device / Control"));
+    assert!(x5_driver.contains("Host / IP"));
+    assert!(x5_driver.contains("RTSP Preview"));
+    assert!(x5_driver.contains("Read TCP Status"));
+    assert!(x5_driver.contains("Stop selected RTSP"));
+    assert!(x5_driver.contains("Connect selected RTSP"));
+    assert!(x5_driver.contains("TCP Snapshot"));
+    assert!(x5_driver.contains("Capture YUV"));
+    assert!(x5_driver.contains("Capture RAW"));
+    assert!(!x5_driver.contains("Connect RTSP"));
+    assert!(!x5_driver.contains("Connect device"));
+    assert!(!x5_driver.contains("SSH user"));
 }
 
 #[test]
@@ -365,6 +383,238 @@ fn direct_rtsp_defaults_to_tcp_stable_baseline() {
         app.direct_rtsp.latency_mode,
         camera_toolbox_app::RtspLatencyMode::Stable
     );
+}
+
+#[test]
+fn x5_233_driver_defaults_match_driver_contract() {
+    let context = egui::Context::default();
+    let app = CameraToolboxApp::new(&context).unwrap();
+
+    assert!(app.x5_233_driver.device_ip.is_empty());
+    assert_eq!(app.x5_233_driver.ssh_user, "root");
+    assert_eq!(app.x5_233_driver.ssh_password, "root");
+    assert_eq!(app.x5_233_driver.tcp_port, 9073);
+    assert!(app.x5_233_driver.configure_before_connect);
+    assert_eq!(app.x5_233_driver.width, 1920);
+    assert_eq!(app.x5_233_driver.height, 1080);
+    assert_eq!(app.x5_233_driver.fps, 60);
+    assert_eq!(app.x5_233_driver.bitrate_kbps, 12_000);
+    assert_eq!(app.selected_x5_233_channels(), vec![0, 3]);
+    assert_eq!(app.x5_233_driver.raw_camera, 0);
+}
+
+#[test]
+fn x5_233_rtsp_uses_slower_board_connect_timeout() {
+    let timeouts = x5_233_rtsp_timeouts();
+
+    assert_eq!(timeouts.connect, Duration::from_secs(8));
+    assert_eq!(timeouts.idle, Duration::from_secs(10));
+}
+
+#[test]
+fn x5_233_selected_rtsp_requires_explicit_device_ip() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+
+    app.start_x5_233_selected_rtsp();
+
+    assert_eq!(
+        app.x5_233_driver.last_error.as_deref(),
+        Some("Enter X5_233 device IP before opening RTSP.")
+    );
+    assert!(app.workspace.live_documents().is_empty());
+}
+
+#[test]
+fn x5_233_rtsp_url_maps_driver_channels_to_driver_ports() {
+    let expected = [
+        (0, "rtsp://10.21.12.108:554/PRR"),
+        (1, "rtsp://10.21.12.108:555/PRR"),
+        (3, "rtsp://10.21.12.108:557/PRR"),
+        (4, "rtsp://10.21.12.108:558/PRR"),
+    ];
+
+    for (driver_channel, url) in expected {
+        assert_eq!(
+            x5_233_channel_mapping(driver_channel).map(|mapping| mapping.driver_channel),
+            Some(driver_channel)
+        );
+        assert_eq!(
+            x5_233_rtsp_url("10.21.12.108", driver_channel).as_deref(),
+            Some(url)
+        );
+    }
+    assert!(x5_233_rtsp_url("10.21.12.108", 2).is_none());
+    assert!(x5_233_rtsp_url("", 0).is_none());
+    assert!(x5_233_rtsp_url("   ", 0).is_none());
+}
+
+#[test]
+fn x5_233_rtsp_and_tcp_capture_share_acquisition_identity() {
+    let rtsp = x5_233_live_source(
+        "10.21.12.108",
+        0,
+        9073,
+        camera_toolbox_app::RtspTransport::Tcp,
+        1920,
+        1080,
+    );
+    let tcp_snapshot = x5_233_live_source(
+        "10.21.12.108",
+        0,
+        9073,
+        camera_toolbox_app::RtspTransport::Tcp,
+        1920,
+        1080,
+    );
+    let other_channel = x5_233_live_source(
+        "10.21.12.108",
+        3,
+        9073,
+        camera_toolbox_app::RtspTransport::Tcp,
+        1920,
+        1080,
+    );
+
+    assert_eq!(rtsp, tcp_snapshot);
+    assert_ne!(rtsp, other_channel);
+}
+
+#[test]
+fn x5_233_snapshot_metadata_builds_nv12_spec() {
+    let spec = x5_233_yuv_snapshot_spec(4, 2, 8, 4).unwrap();
+
+    assert_eq!(spec.width, 4);
+    assert_eq!(spec.height, 2);
+    assert_eq!(spec.y_stride, 4);
+    assert_eq!(spec.chroma_stride, 4);
+    assert_eq!(spec.chroma_order, ChromaOrder::Uv);
+    assert_eq!(spec.matrix, YuvMatrix::Bt601);
+    assert_eq!(spec.range, YuvRange::Limited);
+    assert!(x5_233_yuv_snapshot_spec(4, 2, 7, 4).is_err());
+}
+
+#[test]
+fn x5_233_raw_metadata_decodes_strided_u16le() {
+    assert_eq!(x5_233_raw_bit_depth(24).unwrap(), 10);
+    assert_eq!(x5_233_raw_bit_depth(0x2b).unwrap(), 10);
+    assert_eq!(x5_233_raw_bit_depth(0x2c).unwrap(), 12);
+    assert_eq!(x5_233_raw_bit_depth(0x2d).unwrap(), 14);
+    assert!(x5_233_raw_bit_depth(0).is_err());
+
+    let payload = [1_u16, 2, 0, 3, 4, 0]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+    let frame = decode_strided_u16le_raw(2, 2, 6, 10, BayerPattern::Rggb, &payload).unwrap();
+
+    assert_eq!(frame.spec.width, 2);
+    assert_eq!(frame.spec.height, 2);
+    assert_eq!(frame.spec.bit_depth, 10);
+    assert_eq!(frame.pixels(), &[1, 2, 3, 4]);
+}
+
+#[test]
+fn x5_233_yuv_snapshot_publishes_image_document() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.x5_233_driver.device_ip = "10.21.12.108".to_owned();
+
+    let status = app
+        .publish_x5_233_yuv_snapshot(
+            &context,
+            crate::x5_tcp_client::X5YuvSnapshot {
+                channel: 0,
+                width: 2,
+                height: 2,
+                y_len: 4,
+                uv_len: 2,
+                frame_id: 7,
+                timestamp_ns: 123,
+                rtsp_timestamp_us: 0,
+                rtsp_pts_90k: 0,
+                match_rtsp_pts_delta_90k: None,
+                match_mode: Some("latest".to_owned()),
+                payload: vec![16, 32, 48, 64, 128, 128],
+            },
+        )
+        .unwrap();
+
+    let document = app.workspace.active_image().unwrap();
+    assert!(status.contains("Published YUV driver CH0"));
+    assert_eq!(document.title, "x5-233-ch0-frame7.nv12");
+    assert!(matches!(document.native, NativeImage::Yuv420Sp(_)));
+    let asset = document.source.asset().unwrap();
+    assert_eq!(asset.metadata.attributes.get("width").unwrap(), "2");
+    assert_eq!(asset.metadata.attributes.get("height").unwrap(), "2");
+    assert_eq!(asset.metadata.attributes.get("y_stride").unwrap(), "2");
+    assert_eq!(asset.metadata.attributes.get("chroma_stride").unwrap(), "2");
+    assert_eq!(
+        asset.metadata.format,
+        MediaFormat::Yuv420Sp {
+            chroma_order: ChromaOrder::Uv
+        }
+    );
+}
+
+#[test]
+fn x5_233_raw_snapshot_publishes_raw_document() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.x5_233_driver.device_ip = "10.21.12.108".to_owned();
+    let payload = [1_u16, 2, 3, 4]
+        .into_iter()
+        .flat_map(u16::to_le_bytes)
+        .collect::<Vec<_>>();
+
+    let status = app
+        .publish_x5_233_raw_snapshot(
+            &context,
+            crate::x5_tcp_client::X5RawSnapshot {
+                camera: 0,
+                width: 2,
+                height: 2,
+                stride: 4,
+                format_code: 24,
+                frame_id: 9,
+                timestamp_ns: 456,
+                payload,
+            },
+        )
+        .unwrap();
+
+    let document = app.workspace.active().unwrap();
+    assert!(status.contains("Published RAW cam0"));
+    assert_eq!(document.title, "x5-233-camera0-frame9.raw");
+    assert_eq!(document.loaded.frame.spec.width, 2);
+    assert_eq!(document.loaded.frame.spec.height, 2);
+    assert_eq!(document.loaded.frame.spec.bit_depth, 10);
+    assert_eq!(document.loaded.frame.pixels(), &[1, 2, 3, 4]);
+    let asset = document.source_asset.as_ref().unwrap();
+    assert_eq!(
+        asset.metadata.format,
+        MediaFormat::RawU16Le { bit_depth: 10 }
+    );
+    assert_eq!(asset.metadata.attributes.get("stride").unwrap(), "4");
+}
+
+#[cfg(feature = "platform-ssh")]
+#[test]
+fn x5_233_remote_control_fallback_builds_root_connection() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.x5_233_driver.device_ip = "10.21.12.108".to_owned();
+
+    let config = app.remote_control_connection("missing").unwrap();
+
+    assert_eq!(config.host, "10.21.12.108");
+    assert_eq!(config.port, 22);
+    assert_eq!(config.username, "root");
+    assert_eq!(config.display_name, "X5_233 root@10.21.12.108:22");
+    assert!(matches!(
+        config.authentication,
+        camera_toolbox_app::RemoteAuthentication::Password { .. }
+    ));
 }
 
 #[test]
@@ -1697,6 +1947,79 @@ fn live_status_bar_reports_stream_stage_before_media_negotiation() {
 
 #[cfg(feature = "calibration-opencv")]
 #[test]
+fn calibration_mode_open_live_document_creates_live_session() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Calibration;
+    let source = x5_233_live_source(
+        "10.21.12.108",
+        0,
+        9073,
+        camera_toolbox_app::RtspTransport::Tcp,
+        1920,
+        1080,
+    );
+    let session_id = camera_toolbox_app::StreamSessionId::new("x5-calibration-open-test").unwrap();
+    let latest = Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default());
+
+    let live_id = app.open_live_workspace_document(session_id, latest, source.clone());
+
+    assert_eq!(app.workspace.active_id(), Some(live_id));
+    assert_eq!(app.calibration.workspace_count_for_test(), 2);
+    assert_eq!(
+        app.calibration.active_label_for_test(),
+        "X5_233 10.21.12.108 CH0"
+    );
+    assert!(app.calibration.active_accepts_live_source(Some(&source)));
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn calibration_session_selection_reactivates_matching_live_document() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Calibration;
+    let source_ch0 = x5_233_live_source(
+        "10.21.12.108",
+        0,
+        9073,
+        camera_toolbox_app::RtspTransport::Tcp,
+        1920,
+        1080,
+    );
+    let source_ch3 = x5_233_live_source(
+        "10.21.12.108",
+        3,
+        9073,
+        camera_toolbox_app::RtspTransport::Tcp,
+        1920,
+        1080,
+    );
+    let ch0_id = app.open_live_workspace_document(
+        camera_toolbox_app::StreamSessionId::new("x5-calibration-ch0-test").unwrap(),
+        Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default()),
+        source_ch0.clone(),
+    );
+    let ch3_id = app.open_live_workspace_document(
+        camera_toolbox_app::StreamSessionId::new("x5-calibration-ch3-test").unwrap(),
+        Arc::new(camera_toolbox_app::LatestDecodedFrameSlot::default()),
+        source_ch3.clone(),
+    );
+    assert_eq!(app.workspace.active_id(), Some(ch3_id));
+
+    app.calibration.activate_live_source_session(&source_ch0);
+    app.sync_active_calibration_live_document();
+
+    assert_eq!(app.workspace.active_id(), Some(ch0_id));
+    assert!(
+        app.calibration.active_accepts_live_source(
+            app.workspace.active_live().map(|document| &document.source)
+        )
+    );
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
 fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     let context = egui::Context::default();
     context.enable_accesskit();
@@ -1727,6 +2050,8 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
         .expect("live document is active")
         .show_calibration_detection = false;
     app.product_workspace = super::ProductWorkspace::Calibration;
+    app.calibration
+        .ensure_live_source_for_test(&test_live_source());
     let mut frame = eframe::Frame::_new_kittest();
     let viewport = egui::vec2(1568.0, 882.0);
     let mut output =
@@ -1920,7 +2245,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
 
 #[cfg(feature = "calibration-opencv")]
 #[test]
-fn viewer_rtsp_sidebar_capture_adds_dataset_item() {
+fn viewer_rtsp_sidebar_capture_opens_viewer_document() {
     let context = egui::Context::default();
     context.enable_accesskit();
     let mut app = CameraToolboxApp::new(&context).unwrap();
@@ -1942,7 +2267,8 @@ fn viewer_rtsp_sidebar_capture_adds_dataset_item() {
             "viewer sidebar capture test",
         ),
     });
-    app.workspace
+    let live_id = app
+        .workspace
         .open_live(session_id, latest, test_live_source());
     app.workspace
         .active_live_mut()
@@ -1951,41 +2277,19 @@ fn viewer_rtsp_sidebar_capture_adds_dataset_item() {
 
     let mut frame = eframe::Frame::_new_kittest();
     let viewport = egui::vec2(1568.0, 882.0);
-    let mut output =
-        run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
+    let output = run_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, Vec::new());
     let visible = accessibility_text(&output);
     assert!(visible.contains("Capture"));
-    assert!(!visible.contains("Capture → Calibration dataset"));
+    assert!(visible.contains("Capture route follows current workspace: Viewer"));
     assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
 
-    let capture = accesskit_rect_center(accesskit_bounds(&output, "Capture"));
-    output = run_app_frame_with_viewport(
-        &context,
-        &mut app,
-        &mut frame,
-        viewport,
-        vec![
-            egui::Event::PointerMoved(capture),
-            egui::Event::PointerButton {
-                pos: capture,
-                button: egui::PointerButton::Primary,
-                pressed: true,
-                modifiers: egui::Modifiers::default(),
-            },
-            egui::Event::PointerButton {
-                pos: capture,
-                button: egui::PointerButton::Primary,
-                pressed: false,
-                modifiers: egui::Modifiers::default(),
-            },
-        ],
-    );
-    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 11.0);
-    let visible = accessibility_text(&output);
-    assert!(app.is_calibration_workspace());
-    assert!(visible.contains("Dataset (1)"));
-    assert!(!visible.contains("Capture → Calibration dataset"));
-    assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
+    app.handle_workspace_stream_action(&context, super::WorkspaceStreamAction::Capture(live_id));
+    let document = app
+        .workspace
+        .active_image()
+        .expect("Viewer-mode stream capture opens an image document");
+    assert!(document.title.contains("stream-ch0-frame1.png"));
+    assert!(!app.is_calibration_workspace());
 }
 
 #[cfg(feature = "calibration-opencv")]
@@ -1994,6 +2298,7 @@ fn sidebar_capture_uses_displayed_frame_when_latest_slot_advances() {
     let context = egui::Context::default();
     context.enable_accesskit();
     let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Calibration;
     app.explorer_panel_expanded = true;
     app.explorer.select_rtsp_mode_for_test();
     let session_id =
@@ -2059,6 +2364,7 @@ fn color_stream_capture_creates_static_capture_image() {
     context.enable_accesskit();
     let mut app = CameraToolboxApp::new(&context).unwrap();
     app.product_workspace = super::ProductWorkspace::Color;
+
     app.explorer_panel_expanded = true;
     app.explorer.select_rtsp_mode_for_test();
     let session_id = camera_toolbox_app::StreamSessionId::new("color-capture-test").unwrap();
@@ -2089,6 +2395,7 @@ fn inactive_stream_capture_activates_clicked_row_and_uses_snapshot() {
     let context = egui::Context::default();
     context.enable_accesskit();
     let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.product_workspace = super::ProductWorkspace::Calibration;
     app.explorer_panel_expanded = true;
     app.explorer.select_rtsp_mode_for_test();
 
@@ -2116,6 +2423,7 @@ fn inactive_stream_capture_activates_clicked_row_and_uses_snapshot() {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "test-rtsp-source-first".to_owned(),
             geometry_key: "test-rtsp-config-first".to_owned(),
+            authoritative_capture: None,
         },
     );
     app.workspace
@@ -2159,6 +2467,7 @@ fn inactive_stream_capture_activates_clicked_row_and_uses_snapshot() {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "test-rtsp-source-second".to_owned(),
             geometry_key: "test-rtsp-config-second".to_owned(),
+            authoritative_capture: None,
         },
     );
     app.workspace
@@ -2757,4 +3066,40 @@ fn live_overlay_maps_pixel_centers_and_rejects_out_of_bounds_points() {
         ),
         Some(egui::pos2(160.0, 45.0))
     );
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn guided_pose_arrow_depth_scales_make_near_endpoint_larger() {
+    let (far_start, near_end) = CameraToolboxApp::guided_pose_arrow_depth_scales(1000.0, 600.0)
+        .expect("valid positive depths produce perspective scales");
+    assert!(near_end > far_start);
+
+    let (near_start, far_end) = CameraToolboxApp::guided_pose_arrow_depth_scales(600.0, 1000.0)
+        .expect("valid positive depths produce perspective scales");
+    assert!(near_start > far_end);
+
+    let (same_start, same_end) = CameraToolboxApp::guided_pose_arrow_depth_scales(800.0, 800.0)
+        .expect("valid equal depths produce neutral scales");
+    assert!((same_start - same_end).abs() <= f32::EPSILON);
+
+    assert!(CameraToolboxApp::guided_pose_arrow_depth_scales(0.0, 800.0).is_none());
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn guided_pose_rotation_ring_sweep_uses_true_angle_degrees_and_preserves_direction() {
+    let positive = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(15.0)
+        .expect("finite angle produces a sweep");
+    assert!((positive - 15.0).abs() <= f32::EPSILON);
+
+    let negative = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(-5.0)
+        .expect("finite angle produces a sweep");
+    assert!((negative + 5.0).abs() <= f32::EPSILON);
+
+    let large = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(179.5)
+        .expect("finite angle produces a sweep");
+    assert!((large - 179.5).abs() <= f32::EPSILON);
+
+    assert!(CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(f64::NAN).is_none());
 }

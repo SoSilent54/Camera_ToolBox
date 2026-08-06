@@ -28,9 +28,11 @@ use camera_toolbox_app::{
 };
 use camera_toolbox_core::{
     AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
-    CaptureMetadata, ChessboardDetection, EphemeralAsset, InitialIntrinsics, IntegrityState,
-    MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult, YgStereoModuleCode,
-    YgStereoSerialIdInput, parse_opencv_pinhole_radtan_yaml, write_opencv_pinhole_radtan_yaml,
+    CaptureMetadata, ChessboardDetection, ChromaOrder, EphemeralAsset, InitialIntrinsics,
+    IntegrityState, MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult,
+    YgStereoModuleCode, YgStereoSerialIdInput, Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange,
+    parse_opencv_pinhole_radtan_yaml, write_opencv_pinhole_radtan_yaml,
+    yuv420sp_to_rgba8_with_cancel,
 };
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -50,13 +52,26 @@ use crate::calibration_pipeline::{
 use crate::{
     explorer::CalibrationImportCandidate,
     viewer::{pixel_inspection_texture_options, viewer_texture_uv},
-    workspace::LiveStreamSource,
+    workspace::{LiveAuthoritativeCapture, LiveStreamSource},
+    x5_tcp_client,
 };
 
 const MAX_DATASET_ITEMS: usize = 256;
 const REMOTE_READS_PER_SOURCE: usize = 8;
 const AUTO_CAPTURE_ANALYSIS_INTERVAL_NS: u64 = 200_000_000;
 const AUTO_CAPTURE_ACCEPT_COOLDOWN_NS: u64 = 750_000_000;
+const GUIDED_CAPTURE_HOLD_FRAMES: u8 = 4;
+const X5_RTSP_PTS_BRIDGE_TOLERANCE_90K: u64 = 3_000;
+const X5_RTSP_PTS_BRIDGE_MAX_AGE_NS: u64 = 2_000_000_000;
+const GUIDED_POSE_X_TOLERANCE: f64 = 0.10;
+const GUIDED_POSE_Y_TOLERANCE: f64 = 0.10;
+const GUIDED_POSE_Z_TOLERANCE: f64 = 0.24;
+const GUIDED_POSE_ROLL_TOLERANCE_DEGREES: f64 = 10.0;
+const GUIDED_POSE_PITCH_TOLERANCE_DEGREES: f64 = 10.0;
+const GUIDED_POSE_YAW_TOLERANCE_DEGREES: f64 = 15.0;
+const GUIDED_POSE_MATCH_SCORE_LIMIT: f64 = 1.0;
+// 透视引导网格由目标 pose + 当前 K/D12 投影；目标 depth 由 bbox scale 迭代反解。
+const GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS: usize = 12;
 // 检测结果异步返回；Acceptance live 标记保留 1 秒，不再把实时角点画到主 Viewer。
 const LIVE_DETECTION_MARKER_TTL_NS: u64 = 1_000_000_000;
 const LATEST_DATASET_OVERLAY_TTL_NS: u64 = 1_000_000_000;
@@ -172,9 +187,11 @@ enum CalibrationSourceKind {
 struct StreamCalibrationSource {
     store: CaptureStore,
     asset: Option<Arc<EphemeralAsset>>,
+    analysis_asset: Option<Arc<EphemeralAsset>>,
     identity: StreamFrameIdentity,
     image_size: CalibrationImageSize,
     acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
+    authoritative_capture: Option<LiveAuthoritativeCapture>,
 }
 
 impl CalibrationSource {
@@ -196,17 +213,49 @@ impl CalibrationSource {
         image_size: CalibrationImageSize,
         acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
     ) -> Self {
-        Self {
-            display_name: format!(
+        Self::stream_with_analysis(
+            store,
+            asset,
+            None,
+            identity,
+            image_size,
+            acquisition_key,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn stream_with_analysis(
+        store: CaptureStore,
+        asset: Arc<EphemeralAsset>,
+        analysis_asset: Option<Arc<EphemeralAsset>>,
+        identity: StreamFrameIdentity,
+        image_size: CalibrationImageSize,
+        acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
+        authoritative_capture: Option<LiveAuthoritativeCapture>,
+    ) -> Self {
+        let display_name = match asset.metadata.format {
+            MediaFormat::Yuv420Sp { .. } => {
+                format!(
+                    "X5 YUV ch{} frame {}",
+                    identity.channel, identity.frame_sequence
+                )
+            }
+            _ => format!(
                 "RTSP ch{} frame {}",
                 identity.channel, identity.frame_sequence
             ),
+        };
+        Self {
+            display_name,
             kind: CalibrationSourceKind::Stream(StreamCalibrationSource {
                 store,
                 asset: Some(asset),
+                analysis_asset,
                 identity,
                 image_size,
                 acquisition_key,
+                authoritative_capture,
             }),
             preview: None,
         }
@@ -234,11 +283,11 @@ impl CalibrationSource {
             return Ok(None);
         };
         let _retained_acquisition_key = &stream.acquisition_key;
-        let Some(asset) = stream.asset.as_ref() else {
+        let Some(asset) = stream.analysis_asset.as_ref().or(stream.asset.as_ref()) else {
             return Err("stream calibration asset was released".to_owned());
         };
         if asset.metadata.format != MediaFormat::Png {
-            return Err("stream calibration source is not a PNG asset".to_owned());
+            return Err("stream calibration analysis source is not a PNG asset".to_owned());
         }
         let OwnedMediaPayload::Bytes(bytes) = &asset.source else {
             return Err("stream calibration PNG must use one contiguous payload".to_owned());
@@ -253,13 +302,15 @@ impl CalibrationSource {
 
 impl Drop for StreamCalibrationSource {
     fn drop(&mut self) {
-        let Some(asset) = self.asset.take() else {
-            return;
-        };
-        let id = asset.id.clone();
-        drop(asset);
-        if let Err(error) = self.store.release(&id) {
-            tracing::warn!(asset_id = %id, %error, "stream calibration asset release deferred by external ownership");
+        for asset in [self.analysis_asset.take(), self.asset.take()]
+            .into_iter()
+            .flatten()
+        {
+            let id = asset.id.clone();
+            drop(asset);
+            if let Err(error) = self.store.release(&id) {
+                tracing::warn!(asset_id = %id, %error, "stream calibration asset release deferred by external ownership");
+            }
         }
     }
 }
@@ -269,10 +320,159 @@ struct FrozenStreamInput {
     encoded: CalibrationEncodedPng,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RtspPtsBridgeKey {
+    stream_id: StreamSessionId,
+    channel: u16,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RtspPtsBridgeSample {
+    source_pts_90k: u64,
+    driver_rtsp_pts_90k: u64,
+    offset_90k: i128,
+    sampled_frame_sequence: u64,
+    updated_at_host_ns: u64,
+}
+
+impl RtspPtsBridgeSample {
+    fn target_rtsp_pts_90k(&self, source_pts_90k: u64) -> Result<u64, String> {
+        let target = i128::from(source_pts_90k) + self.offset_90k;
+        u64::try_from(target).map_err(|_| {
+            format!(
+                "RTSP PTS bridge target is outside u64: source_pts_90k={source_pts_90k}, offset_90k={}",
+                self.offset_90k
+            )
+        })
+    }
+}
+
+// RTSP 当前未携带显式 board metadata；PTS bridge 是过渡方案，只匹配同一 RTP 90k 时间轴。
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum AuthoritativeYuvLookup {
+    FrameId(u64),
+    TimestampNs(u64),
+    RtspPts90k {
+        pts_90k: u64,
+        tolerance_90k: u64,
+        source_pts_90k: u64,
+        bridge_offset_90k: i128,
+    },
+}
+
+impl AuthoritativeYuvLookup {
+    fn from_rtsp_identity(identity: &StreamFrameIdentity) -> Result<Self, String> {
+        match &identity.source_pts {
+            camera_toolbox_app::SourcePts::Known { provenance, .. } => Err(format!(
+                "RTSP frame PTS ({provenance:?}) is presentation timing only; direct X5 authoritative YUV lookup requires explicit frame_id/timestamp_ns metadata from RTSP SEI or RTP header extension"
+            )),
+            camera_toolbox_app::SourcePts::Unavailable { reason } => Err(format!(
+                "RTSP frame has no board frame_id/timestamp_ns metadata: {reason}"
+            )),
+        }
+    }
+
+    const fn label(&self) -> &'static str {
+        match self {
+            Self::FrameId(_) => "frame_id",
+            Self::TimestampNs(_) => "timestamp_ns",
+            Self::RtspPts90k { .. } => "rtsp_pts_90k",
+        }
+    }
+
+    const fn value(&self) -> u64 {
+        match self {
+            Self::FrameId(value) | Self::TimestampNs(value) => *value,
+            Self::RtspPts90k { pts_90k, .. } => *pts_90k,
+        }
+    }
+}
+
+fn source_pts_to_90k(source_pts: &camera_toolbox_app::SourcePts) -> Result<u64, String> {
+    let camera_toolbox_app::SourcePts::Known {
+        ticks,
+        time_base_numerator,
+        time_base_denominator,
+        provenance,
+    } = source_pts
+    else {
+        return Err(format!("RTSP frame has no PTS: {source_pts:?}"));
+    };
+    if *ticks < 0 || *time_base_numerator == 0 || *time_base_denominator == 0 {
+        return Err(format!(
+            "RTSP frame PTS is invalid for bridge: ticks={ticks}, time_base={time_base_numerator}/{time_base_denominator}, provenance={provenance:?}"
+        ));
+    }
+    let scaled = i128::from(*ticks)
+        .checked_mul(i128::from(*time_base_numerator))
+        .and_then(|value| value.checked_mul(90_000))
+        .ok_or_else(|| format!("RTSP frame PTS overflows 90k bridge: ticks={ticks}"))?
+        / i128::from(*time_base_denominator);
+    u64::try_from(scaled).map_err(|_| {
+        format!(
+            "RTSP frame PTS cannot be represented as u64 90k ticks: ticks={ticks}, time_base={time_base_numerator}/{time_base_denominator}"
+        )
+    })
+}
+
+fn x5_ring_status_range(valid: u16, min: u64, max: u64) -> String {
+    if valid == 0 {
+        "—".to_owned()
+    } else if min == max {
+        min.to_string()
+    } else {
+        format!("{min}..{max}")
+    }
+}
+
+fn format_x5_authoritative_yuv_ring_diagnostics(
+    status: &x5_tcp_client::X5DriverStatus,
+    channel: u16,
+) -> String {
+    let Some(ring) = status.rings.iter().find(|ring| ring.channel == channel) else {
+        let channels = status
+            .rings
+            .iter()
+            .map(|ring| format!("CH{}", ring.channel))
+            .collect::<Vec<_>>()
+            .join(",");
+        return format!(
+            "ring_status=missing_channel_CH{channel}, available_rings={}",
+            if channels.is_empty() {
+                "—"
+            } else {
+                &channels
+            }
+        );
+    };
+    format!(
+        "ring_channel=CH{}, ring_valid={}/{}, ring_frame_id={}, ring_timestamp_ns={}, ring_rtsp_pts_90k={}, ring_last_rtsp_pts_90k={}, ring_retention_ns={}, ring_evicted={}, ring_dropped={}",
+        ring.channel,
+        ring.valid,
+        ring.depth,
+        x5_ring_status_range(ring.valid, ring.min_frame_id, ring.max_frame_id),
+        x5_ring_status_range(ring.valid, ring.min_timestamp_ns, ring.max_timestamp_ns),
+        x5_ring_status_range(ring.valid, ring.min_rtsp_pts_90k, ring.max_rtsp_pts_90k),
+        ring.last_rtsp_pts_90k,
+        ring.retention_ns,
+        ring.evicted,
+        ring.dropped
+    )
+}
+
+fn query_x5_authoritative_yuv_ring_diagnostics(host: &str, tcp_port: u16, channel: u16) -> String {
+    match x5_tcp_client::status(host, tcp_port) {
+        Ok(status) => format_x5_authoritative_yuv_ring_diagnostics(&status, channel),
+        Err(error) => format!("ring_status_error={error}"),
+    }
+}
+
 fn freeze_stream_input(
     frame: &Arc<DecodedVideoFrame>,
     store: CaptureStore,
     acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
+    authoritative_capture: Option<LiveAuthoritativeCapture>,
 ) -> Result<FrozenStreamInput, String> {
     let rgba = Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba))
         .map_err(|error| format!("Cannot freeze displayed stream frame: {error}"))?;
@@ -356,15 +556,279 @@ fn freeze_stream_input(
         encoded_bytes: asset.byte_len().unwrap_or_default() as u64,
     };
     Ok(FrozenStreamInput {
-        source: CalibrationSource::stream(
+        source: CalibrationSource::stream_with_analysis(
             store,
             asset,
+            None,
             frame.identity.clone(),
             image_size,
             acquisition_key,
+            authoritative_capture,
         ),
         encoded: CalibrationEncodedPng {
             bytes,
+            image_size,
+            source_revision,
+        },
+    })
+}
+
+fn x5_yuv_snapshot_spec(snapshot: &x5_tcp_client::X5YuvSnapshot) -> Result<Yuv420SpSpec, String> {
+    let height = usize::try_from(snapshot.height)
+        .map_err(|_| "X5 YUV height does not fit host usize".to_owned())?;
+    if height == 0 || snapshot.y_len % height != 0 {
+        return Err(format!(
+            "X5 YUV y_len {} is not divisible by height {}",
+            snapshot.y_len, snapshot.height
+        ));
+    }
+    let chroma_rows = height / 2;
+    if chroma_rows == 0 || snapshot.uv_len % chroma_rows != 0 {
+        return Err(format!(
+            "X5 YUV uv_len {} is not divisible by chroma rows {chroma_rows}",
+            snapshot.uv_len
+        ));
+    }
+    let spec = Yuv420SpSpec {
+        width: snapshot.width,
+        height: snapshot.height,
+        y_stride: snapshot.y_len / height,
+        chroma_stride: snapshot.uv_len / chroma_rows,
+        chroma_order: ChromaOrder::Uv,
+        matrix: YuvMatrix::Bt601,
+        range: YuvRange::Limited,
+    };
+    spec.validate()
+        .map_err(|error| format!("X5 YUV metadata is invalid: {error}"))?;
+    Ok(spec)
+}
+
+fn freeze_authoritative_yuv_input(
+    snapshot: x5_tcp_client::X5YuvSnapshot,
+    store: CaptureStore,
+    acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
+    rtsp_identity: &StreamFrameIdentity,
+    lookup: &AuthoritativeYuvLookup,
+) -> Result<FrozenStreamInput, String> {
+    let spec = x5_yuv_snapshot_spec(&snapshot)?;
+    let image_size = CalibrationImageSize::new(snapshot.width, snapshot.height)
+        .map_err(|error| format!("Cannot capture X5 YUV frame: {error}"))?;
+    let payload_len = snapshot.payload.len();
+    if payload_len != snapshot.y_len.saturating_add(snapshot.uv_len) {
+        return Err(format!(
+            "X5 YUV payload length mismatch: y_len + uv_len = {}, got {payload_len}",
+            snapshot.y_len.saturating_add(snapshot.uv_len)
+        ));
+    }
+
+    let primary_sha256 = SnapshotHash::digest_bytes(&snapshot.payload).to_hex();
+    let yuv_frame = Yuv420SpFrame::from_contiguous(spec, Arc::new(snapshot.payload.clone()))
+        .map_err(|error| format!("Cannot decode X5 YUV snapshot: {error}"))?;
+    let rgba = yuv420sp_to_rgba8_with_cancel(&yuv_frame, || false).map_err(|error| {
+        format!("Cannot derive calibration analysis image from X5 YUV: {error}")
+    })?;
+    let mut analysis_png = Vec::new();
+    ImageRasterCodec
+        .encode_png(&rgba, &mut analysis_png)
+        .map_err(|error| format!("Cannot encode X5 YUV analysis PNG: {error}"))?;
+    if analysis_png.len() > MAX_ENCODED_PNG_BYTES as usize {
+        return Err(format!(
+            "Encoded X5 YUV analysis image is {} bytes, limit is {} bytes.",
+            analysis_png.len(),
+            MAX_ENCODED_PNG_BYTES
+        ));
+    }
+    let analysis_sha256 = SnapshotHash::digest_bytes(&analysis_png).to_hex();
+    let captured_at_ns = host_monotonic_time_ns();
+
+    let mut primary_attributes = BTreeMap::new();
+    primary_attributes.insert(
+        "source".to_owned(),
+        "x5_233_tcp_authoritative_yuv".to_owned(),
+    );
+    primary_attributes.insert("channel".to_owned(), snapshot.channel.to_string());
+    primary_attributes.insert("width".to_owned(), snapshot.width.to_string());
+    primary_attributes.insert("height".to_owned(), snapshot.height.to_string());
+    primary_attributes.insert("y_stride".to_owned(), spec.y_stride.to_string());
+    primary_attributes.insert("chroma_stride".to_owned(), spec.chroma_stride.to_string());
+    primary_attributes.insert("y_len".to_owned(), snapshot.y_len.to_string());
+    primary_attributes.insert("uv_len".to_owned(), snapshot.uv_len.to_string());
+    primary_attributes.insert(
+        "rtsp_timestamp_us".to_owned(),
+        snapshot.rtsp_timestamp_us.to_string(),
+    );
+    primary_attributes.insert("rtsp_pts_90k".to_owned(), snapshot.rtsp_pts_90k.to_string());
+    if let Some(delta_90k) = snapshot.match_rtsp_pts_delta_90k {
+        primary_attributes.insert("match_rtsp_pts_delta_90k".to_owned(), delta_90k.to_string());
+    }
+    if let AuthoritativeYuvLookup::RtspPts90k {
+        source_pts_90k,
+        bridge_offset_90k,
+        tolerance_90k,
+        ..
+    } = lookup
+    {
+        primary_attributes.insert(
+            "rtsp_bridge_source_pts_90k".to_owned(),
+            source_pts_90k.to_string(),
+        );
+        primary_attributes.insert(
+            "rtsp_bridge_offset_90k".to_owned(),
+            bridge_offset_90k.to_string(),
+        );
+        primary_attributes.insert(
+            "rtsp_bridge_tolerance_90k".to_owned(),
+            tolerance_90k.to_string(),
+        );
+    }
+    primary_attributes.insert("frame_id".to_owned(), snapshot.frame_id.to_string());
+    primary_attributes.insert("timestamp_ns".to_owned(), snapshot.timestamp_ns.to_string());
+    primary_attributes.insert(
+        "match_mode".to_owned(),
+        snapshot
+            .match_mode
+            .as_deref()
+            .unwrap_or(lookup.label())
+            .to_owned(),
+    );
+    primary_attributes.insert(
+        "rtsp_precheck_stream_id".to_owned(),
+        rtsp_identity.stream_id.as_str().to_owned(),
+    );
+    primary_attributes.insert(
+        "rtsp_precheck_frame_sequence".to_owned(),
+        rtsp_identity.frame_sequence.to_string(),
+    );
+    primary_attributes.insert(
+        "rtsp_precheck_host_monotonic_time_ns".to_owned(),
+        rtsp_identity.host_monotonic_time_ns.to_string(),
+    );
+    primary_attributes.insert(
+        "rtsp_precheck_source_pts".to_owned(),
+        format!("{:?}", rtsp_identity.source_pts),
+    );
+    primary_attributes.insert(
+        "captured_at_host_monotonic_ns".to_owned(),
+        captured_at_ns.to_string(),
+    );
+    primary_attributes.insert(
+        "acquisition_source_fingerprint".to_owned(),
+        acquisition_key.source_fingerprint.clone(),
+    );
+    primary_attributes.insert(
+        "acquisition_geometry_key".to_owned(),
+        acquisition_key.geometry_key.clone(),
+    );
+
+    let primary_asset_id = AssetId::new(format!(
+        "calibration-x5-yuv-ch{}-frame{}-{captured_at_ns}-{}",
+        snapshot.channel,
+        snapshot.frame_id,
+        &primary_sha256[..16]
+    ))
+    .map_err(|error| format!("Cannot identify X5 YUV frame: {error}"))?;
+    let primary_operation_id = OperationId::new(format!("capture-{}", primary_asset_id.as_str()))
+        .map_err(|error| format!("Cannot reserve X5 YUV frame: {error}"))?;
+    let primary_bytes = Arc::<[u8]>::from(snapshot.payload);
+    let primary_reservation = store
+        .reserve(primary_operation_id, primary_bytes.len())
+        .map_err(|error| format!("Cannot reserve memory for X5 YUV frame: {error}"))?;
+    let primary_asset = EphemeralAsset::new(
+        primary_asset_id,
+        OwnedMediaPayload::Bytes(Arc::clone(&primary_bytes)),
+        CaptureMetadata {
+            format: MediaFormat::Yuv420Sp {
+                chroma_order: ChromaOrder::Uv,
+            },
+            source_name: format!(
+                "x5-233-ch{}-frame{}.nv12",
+                snapshot.channel, snapshot.frame_id
+            ),
+            attributes: primary_attributes,
+        },
+        IntegrityState::Verified {
+            algorithm: "sha256".to_owned(),
+            digest: primary_sha256.clone(),
+        },
+    );
+    let primary_asset = store
+        .publish_validated(primary_reservation, primary_asset)
+        .map_err(|error| format!("Cannot publish X5 YUV frame: {error}"))?;
+
+    let analysis_bytes: Arc<[u8]> = Arc::from(analysis_png);
+    let analysis_asset_id = AssetId::new(format!(
+        "calibration-x5-yuv-analysis-ch{}-frame{}-{captured_at_ns}-{}",
+        snapshot.channel,
+        snapshot.frame_id,
+        &analysis_sha256[..16]
+    ))
+    .map_err(|error| format!("Cannot identify X5 YUV analysis image: {error}"))?;
+    let analysis_operation_id = OperationId::new(format!("capture-{}", analysis_asset_id.as_str()))
+        .map_err(|error| format!("Cannot reserve X5 YUV analysis image: {error}"))?;
+    let analysis_reservation = store
+        .reserve(analysis_operation_id, analysis_bytes.len())
+        .map_err(|error| format!("Cannot reserve memory for X5 YUV analysis image: {error}"))?;
+    let mut analysis_attributes = BTreeMap::new();
+    analysis_attributes.insert(
+        "source".to_owned(),
+        "x5_233_tcp_authoritative_yuv_analysis".to_owned(),
+    );
+    analysis_attributes.insert("primary_sha256".to_owned(), primary_sha256.clone());
+    analysis_attributes.insert("primary_format".to_owned(), "nv12".to_owned());
+    analysis_attributes.insert("frame_id".to_owned(), snapshot.frame_id.to_string());
+    analysis_attributes.insert("timestamp_ns".to_owned(), snapshot.timestamp_ns.to_string());
+    let analysis_asset = EphemeralAsset::new(
+        analysis_asset_id,
+        OwnedMediaPayload::Bytes(Arc::clone(&analysis_bytes)),
+        CaptureMetadata {
+            format: MediaFormat::Png,
+            source_name: format!(
+                "x5-233-ch{}-frame{}-analysis.png",
+                snapshot.channel, snapshot.frame_id
+            ),
+            attributes: analysis_attributes,
+        },
+        IntegrityState::Verified {
+            algorithm: "sha256".to_owned(),
+            digest: analysis_sha256.clone(),
+        },
+    );
+    let analysis_asset = store
+        .publish_validated(analysis_reservation, analysis_asset)
+        .map_err(|error| format!("Cannot publish X5 YUV analysis image: {error}"))?;
+
+    let yuv_identity = StreamFrameIdentity::known_at(
+        rtsp_identity.stream_id.clone(),
+        snapshot.channel,
+        snapshot.frame_id,
+        camera_toolbox_app::SourcePts::Unavailable {
+            reason: format!(
+                "X5_233 TCP SNAPSHOT matched RTSP precheck by {}; timestamp_ns={}",
+                lookup.label(),
+                snapshot.timestamp_ns
+            ),
+        },
+        captured_at_ns,
+    );
+    let source_revision = CalibrationInputRevision::EphemeralRaster {
+        primary_sha256,
+        primary_bytes: u64::try_from(primary_bytes.len()).unwrap_or(u64::MAX),
+        primary_format: "nv12".to_owned(),
+        analysis_sha256,
+        analysis_encoded_bytes: u64::try_from(analysis_bytes.len()).unwrap_or(u64::MAX),
+    };
+    Ok(FrozenStreamInput {
+        source: CalibrationSource::stream_with_analysis(
+            store,
+            primary_asset,
+            Some(analysis_asset),
+            yuv_identity,
+            image_size,
+            acquisition_key,
+            None,
+        ),
+        encoded: CalibrationEncodedPng {
+            bytes: analysis_bytes,
             image_size,
             source_revision,
         },
@@ -507,15 +971,68 @@ pub(crate) struct ViewerDetectionOverlay {
     pub(crate) pose_axis: Option<ViewerPoseAxisOverlay>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewerGuidedPoseGridLine {
+    pub(crate) start_uv: [f32; 2],
+    pub(crate) end_uv: [f32; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewerGuidedPoseRotationArcOverlay {
+    pub(crate) label: &'static str,
+    pub(crate) error_degrees: f64,
+    pub(crate) tolerance_degrees: f64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewerGuidedPoseRotationRingsOverlay {
+    pub(crate) center_uv: [f32; 2],
+    pub(crate) roll: ViewerGuidedPoseRotationArcOverlay,
+    pub(crate) pitch: ViewerGuidedPoseRotationArcOverlay,
+    pub(crate) yaw: ViewerGuidedPoseRotationArcOverlay,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ViewerGuidedPoseArrowOverlay {
+    pub(crate) start_uv: [f32; 2],
+    pub(crate) end_uv: [f32; 2],
+    pub(crate) start_xyz: [f64; 3],
+    pub(crate) end_xyz: [f64; 3],
+    pub(crate) z_delta: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ViewerGuidedPoseInstructionOverlay {
+    pub(crate) primary: &'static str,
+    pub(crate) secondary: String,
+    pub(crate) score: f64,
+    pub(crate) matched: bool,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ViewerGuidedPoseOverlay {
+    pub(crate) center_uv: [f32; 2],
+    pub(crate) outline_uv: [[f32; 2]; 4],
+    pub(crate) grid_lines: Arc<[ViewerGuidedPoseGridLine]>,
+    pub(crate) rotation_rings: Option<ViewerGuidedPoseRotationRingsOverlay>,
+    pub(crate) pose_arrow: Option<ViewerGuidedPoseArrowOverlay>,
+    pub(crate) instruction: Option<ViewerGuidedPoseInstructionOverlay>,
+    pub(crate) matched: bool,
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct CalibrationViewerOverlay {
     /// Live Viewer 只叠加最近入库 Dataset 的短时角点提示，不替换实时视频底图。
     pub(crate) persistent: Option<ViewerDetectionOverlay>,
+    /// 实时检测到的当前棋盘坐标轴；Guided mode 用旋转圆环替代坐标轴显示。
+    pub(crate) realtime_detection: Option<ViewerDetectionOverlay>,
+    /// 引导式自动快门的当前目标位置提示；只表达操作目标，不代表已入库数据。
+    pub(crate) guided_target: Option<ViewerGuidedPoseOverlay>,
 }
 
 #[derive(Clone)]
 pub(crate) struct CalibrationViewerPresentation {
-    pub(crate) item_id: CalibrationItemId,
+    pub(crate) item_id: Option<CalibrationItemId>,
     pub(crate) overlay: CalibrationViewerOverlay,
 }
 
@@ -554,6 +1071,1176 @@ enum AutoCandidateState {
 enum CandidateIntent {
     PreviewOnly,
     AutoCommit,
+    GuidedMeasure,
+    GuidedCapture,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum AutoCaptureTriggerMode {
+    #[default]
+    DatasetGain,
+    GuidedPresetPose,
+}
+
+impl AutoCaptureTriggerMode {
+    const ALL: [Self; 2] = [Self::DatasetGain, Self::GuidedPresetPose];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::DatasetGain => "Dataset gain",
+            Self::GuidedPresetPose => "Guided preset pose",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GuidedPoseTolerance {
+    x: f64,
+    y: f64,
+    z: f64,
+    roll_degrees: f64,
+    pitch_degrees: f64,
+    yaw_degrees: f64,
+}
+
+impl Default for GuidedPoseTolerance {
+    fn default() -> Self {
+        Self {
+            x: GUIDED_POSE_X_TOLERANCE,
+            y: GUIDED_POSE_Y_TOLERANCE,
+            z: GUIDED_POSE_Z_TOLERANCE,
+            roll_degrees: GUIDED_POSE_ROLL_TOLERANCE_DEGREES,
+            pitch_degrees: GUIDED_POSE_PITCH_TOLERANCE_DEGREES,
+            yaw_degrees: GUIDED_POSE_YAW_TOLERANCE_DEGREES,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GuidedPose6Dof {
+    /// 棋盘中心在相机坐标系下的 XYZ；单位继承 BoardSpec::square_size。
+    xyz: [f64; 3],
+    /// board->camera 旋转矩阵按 ZYX 分解得到的 roll/pitch/yaw，单位 degree。
+    rpy_degrees: [f64; 3],
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    center_uv: [f32; 2],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GuidedPoseTarget {
+    label: &'static str,
+    pose: GuidedPose6Dof,
+    tolerance: GuidedPoseTolerance,
+    outline_uv: [[f32; 2]; 4],
+    grid_lines: Arc<[ViewerGuidedPoseGridLine]>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GuidedPoseMeasurement {
+    pose: GuidedPose6Dof,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuidedPoseInstructionComponent {
+    X,
+    Y,
+    Z,
+    Roll,
+    Pitch,
+    Yaw,
+}
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct GuidedPoseError {
+    x: f64,
+    y: f64,
+    z: f64,
+    roll_degrees: f64,
+    pitch_degrees: f64,
+    yaw_degrees: f64,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GuidedPoseAssessment {
+    step_index: usize,
+    target_label: &'static str,
+    measurement: GuidedPoseMeasurement,
+    error: GuidedPoseError,
+    signed_rotation_error_degrees: [f64; 3],
+    pose_error_score: f64,
+    matched: bool,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuidedCaptureState {
+    Running,
+    Paused,
+    Complete,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GuidedCaptureBinding {
+    source: LiveStreamSource,
+    acquisition_key: AutoCaptureAcquisitionKey,
+    image_size: CalibrationImageSize,
+    board: BoardSpec,
+    initial_intrinsics: InitialIntrinsics,
+    intrinsics_digest: SnapshotHash,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GuidedCaptureRuntime {
+    plan: Vec<GuidedPoseTarget>,
+    current_step: usize,
+    state: GuidedCaptureState,
+    binding: GuidedCaptureBinding,
+    hold_frames: u8,
+    capture_requested: bool,
+    last_assessment: Option<GuidedPoseAssessment>,
+}
+
+impl GuidedCaptureRuntime {
+    fn standard_25(binding: GuidedCaptureBinding) -> Result<Self, String> {
+        let plan = standard_guided_pose_plan(
+            binding.board,
+            &binding.initial_intrinsics,
+            binding.image_size,
+        )?;
+        Ok(Self {
+            plan,
+            current_step: 0,
+            state: GuidedCaptureState::Running,
+            binding,
+            hold_frames: 0,
+            capture_requested: false,
+            last_assessment: None,
+        })
+    }
+
+    fn current_target(&self) -> Option<&GuidedPoseTarget> {
+        self.plan.get(self.current_step)
+    }
+
+    fn is_running(&self) -> bool {
+        self.state == GuidedCaptureState::Running
+    }
+
+    fn current_step_label(&self) -> String {
+        match self.current_target() {
+            Some(target) => format!(
+                "Step {} / {} · {}",
+                self.current_step + 1,
+                self.plan.len(),
+                target.label
+            ),
+            None => "Standard 25 complete".to_owned(),
+        }
+    }
+
+    fn update_hold(&mut self, assessment: GuidedPoseAssessment) {
+        if assessment.matched {
+            self.hold_frames = self
+                .hold_frames
+                .saturating_add(1)
+                .min(GUIDED_CAPTURE_HOLD_FRAMES);
+            if self.hold_frames >= GUIDED_CAPTURE_HOLD_FRAMES {
+                self.capture_requested = true;
+            }
+        } else {
+            self.hold_frames = 0;
+            self.capture_requested = false;
+        }
+        self.last_assessment = Some(assessment);
+    }
+
+    fn advance_after_commit(&mut self) {
+        self.current_step = self.current_step.saturating_add(1);
+        self.hold_frames = 0;
+        self.capture_requested = false;
+        self.last_assessment = None;
+        if self.current_step >= self.plan.len() {
+            self.state = GuidedCaptureState::Complete;
+        }
+    }
+
+    fn reset_hold(&mut self) {
+        self.hold_frames = 0;
+        self.capture_requested = false;
+    }
+}
+
+fn standard_guided_pose_plan(
+    board: BoardSpec,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Result<Vec<GuidedPoseTarget>, String> {
+    const FAR: f64 = 0.52;
+    const MID: f64 = 0.56;
+    const NEAR: f64 = 0.62;
+    const LOW_TILT: f64 = 12.0;
+    const MID_TILT: f64 = 20.0;
+    const HIGH_TILT: f64 = 28.0;
+
+    let tolerance = GuidedPoseTolerance::default();
+    let mut plan = Vec::with_capacity(25);
+    let mut push = |label: &'static str,
+                    center_uv: [f64; 2],
+                    scale: f64,
+                    tilt_degrees: f64,
+                    azimuth_degrees: f64|
+     -> Result<(), String> {
+        let projection = guided_pose_grid_projection(
+            board,
+            center_uv,
+            scale,
+            tilt_degrees,
+            azimuth_degrees,
+            initial_intrinsics,
+            image_size,
+        )
+        .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
+        plan.push(GuidedPoseTarget {
+            label,
+            pose: projection.pose,
+            tolerance,
+            outline_uv: projection.outline_uv,
+            grid_lines: projection.grid_lines,
+        });
+        Ok(())
+    };
+
+    push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
+    push("Right · low tilt", [0.56, 0.50], MID, LOW_TILT, 0.0)?;
+    push("Upper right · low tilt", [0.55, 0.45], MID, LOW_TILT, 45.0)?;
+    push("Top · low tilt", [0.50, 0.44], MID, LOW_TILT, 90.0)?;
+    push("Upper left · low tilt", [0.45, 0.45], MID, LOW_TILT, 135.0)?;
+    push("Left · low tilt", [0.44, 0.50], MID, LOW_TILT, 180.0)?;
+    push("Lower left · low tilt", [0.45, 0.55], MID, LOW_TILT, 225.0)?;
+    push("Bottom · low tilt", [0.50, 0.56], MID, LOW_TILT, 270.0)?;
+    push("Lower right · low tilt", [0.55, 0.55], MID, LOW_TILT, 315.0)?;
+    push("Right · mid tilt", [0.56, 0.50], NEAR, MID_TILT, 0.0)?;
+    push("Upper right · mid tilt", [0.55, 0.45], NEAR, MID_TILT, 45.0)?;
+    push("Top · mid tilt", [0.50, 0.44], NEAR, MID_TILT, 90.0)?;
+    push("Upper left · mid tilt", [0.45, 0.45], NEAR, MID_TILT, 135.0)?;
+    push("Left · mid tilt", [0.44, 0.50], NEAR, MID_TILT, 180.0)?;
+    push("Lower left · mid tilt", [0.45, 0.55], NEAR, MID_TILT, 225.0)?;
+    push("Bottom · mid tilt", [0.50, 0.56], NEAR, MID_TILT, 270.0)?;
+    push(
+        "Lower right · mid tilt",
+        [0.55, 0.55],
+        NEAR,
+        MID_TILT,
+        315.0,
+    )?;
+    push("Right · high tilt", [0.54, 0.50], FAR, HIGH_TILT, 0.0)?;
+    push(
+        "Upper right · high tilt",
+        [0.535, 0.465],
+        FAR,
+        HIGH_TILT,
+        45.0,
+    )?;
+    push("Top · high tilt", [0.50, 0.46], FAR, HIGH_TILT, 90.0)?;
+    push(
+        "Upper left · high tilt",
+        [0.465, 0.465],
+        FAR,
+        HIGH_TILT,
+        135.0,
+    )?;
+    push("Left · high tilt", [0.46, 0.50], FAR, HIGH_TILT, 180.0)?;
+    push(
+        "Lower left · high tilt",
+        [0.465, 0.535],
+        FAR,
+        HIGH_TILT,
+        225.0,
+    )?;
+    push("Bottom · high tilt", [0.50, 0.54], FAR, HIGH_TILT, 270.0)?;
+    push(
+        "Lower right · high tilt",
+        [0.535, 0.535],
+        FAR,
+        HIGH_TILT,
+        315.0,
+    )?;
+    Ok(plan)
+}
+
+struct GuidedPoseGridProjection {
+    pose: GuidedPose6Dof,
+    outline_uv: [[f32; 2]; 4],
+    grid_lines: Arc<[ViewerGuidedPoseGridLine]>,
+}
+
+fn guided_pose_grid_projection(
+    board: BoardSpec,
+    center_uv: [f64; 2],
+    scale: f64,
+    tilt_degrees: f64,
+    azimuth_degrees: f64,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<GuidedPoseGridProjection> {
+    if center_uv.iter().any(|value| !value.is_finite()) || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
+    let rotation = guided_pose_rotation(tilt_degrees, azimuth_degrees);
+    let translation = guided_pose_target_translation(
+        board,
+        center_uv,
+        scale,
+        rotation,
+        initial_intrinsics,
+        image_size,
+    )?;
+    let left = -1.0;
+    let top = -1.0;
+    let right = f64::from(board.inner_cols);
+    let bottom = f64::from(board.inner_rows);
+    let mut grid_lines = Vec::with_capacity(usize::from(board.inner_cols + board.inner_rows) + 4);
+    for column in 0..=usize::from(board.inner_cols) + 1 {
+        let x = column as f64 - 1.0;
+        grid_lines.push(ViewerGuidedPoseGridLine {
+            start_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                x,
+                top,
+                initial_intrinsics,
+                image_size,
+            )?,
+            end_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                x,
+                bottom,
+                initial_intrinsics,
+                image_size,
+            )?,
+        });
+    }
+    for row in 0..=usize::from(board.inner_rows) + 1 {
+        let y = row as f64 - 1.0;
+        grid_lines.push(ViewerGuidedPoseGridLine {
+            start_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                left,
+                y,
+                initial_intrinsics,
+                image_size,
+            )?,
+            end_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                right,
+                y,
+                initial_intrinsics,
+                image_size,
+            )?,
+        });
+    }
+    let pose = guided_pose_6dof_from_rotation_translation(
+        board,
+        rotation,
+        translation,
+        initial_intrinsics,
+        image_size,
+    )?;
+    Some(GuidedPoseGridProjection {
+        pose,
+        outline_uv: [
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                left,
+                top,
+                initial_intrinsics,
+                image_size,
+            )?,
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                right,
+                top,
+                initial_intrinsics,
+                image_size,
+            )?,
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                right,
+                bottom,
+                initial_intrinsics,
+                image_size,
+            )?,
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                left,
+                bottom,
+                initial_intrinsics,
+                image_size,
+            )?,
+        ],
+        grid_lines: Arc::from(grid_lines),
+    })
+}
+
+fn guided_pose_target_translation(
+    board: BoardSpec,
+    center_uv: [f64; 2],
+    target_scale: f64,
+    rotation: [[f64; 3]; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<[f64; 3]> {
+    let target_pixel = [
+        center_uv[0] * f64::from(image_size.width),
+        center_uv[1] * f64::from(image_size.height),
+    ];
+    let center_ray = undistort_image_pixel_to_normalized(target_pixel, initial_intrinsics)?;
+    let inner_center = guided_pose_inner_center_point(board);
+    let rotated_center = rotate_guided_pose_point(rotation, inner_center);
+    let minimum_depth = guided_pose_minimum_center_depth(board, rotation, inner_center);
+    let mut center_depth =
+        guided_pose_initial_center_depth(board, target_scale, initial_intrinsics, image_size)?
+            .max(minimum_depth);
+    let mut last_translation = None;
+    for _ in 0..GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS {
+        let translation = guided_pose_translation_at_depth(
+            board,
+            rotation,
+            rotated_center,
+            center_ray,
+            target_pixel,
+            center_depth,
+            initial_intrinsics,
+        )?;
+        let current_scale = guided_pose_projected_inner_scale(
+            board,
+            rotation,
+            translation,
+            initial_intrinsics,
+            image_size,
+        )?;
+        last_translation = Some(translation);
+        let scale_ratio = current_scale / target_scale;
+        if !scale_ratio.is_finite() || scale_ratio <= 0.0 {
+            return last_translation;
+        }
+        if (current_scale - target_scale).abs() <= target_scale * 1.0e-4 {
+            return last_translation;
+        }
+        let next_depth = (center_depth * scale_ratio).max(minimum_depth);
+        if (next_depth - center_depth).abs() <= center_depth * 1.0e-5 {
+            return last_translation;
+        }
+        center_depth = next_depth;
+    }
+    last_translation
+}
+
+fn guided_pose_initial_center_depth(
+    board: BoardSpec,
+    target_scale: f64,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<f64> {
+    if !target_scale.is_finite() || target_scale <= 0.0 {
+        return None;
+    }
+    let short_side = f64::from(image_size.width.min(image_size.height));
+    let inner_width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
+    let inner_height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
+    let matrix = initial_intrinsics.camera_matrix;
+    let depth =
+        (inner_width * matrix[0]).max(inner_height * matrix[4]) / (target_scale * short_side);
+    depth
+        .is_finite()
+        .then_some(depth.max(board.square_size.max(1.0)))
+}
+
+fn guided_pose_translation_at_depth(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    rotated_center: [f64; 3],
+    center_ray: [f64; 2],
+    target_pixel: [f64; 2],
+    center_depth: f64,
+    initial_intrinsics: &InitialIntrinsics,
+) -> Option<[f64; 3]> {
+    if !center_depth.is_finite() || center_depth <= 0.0 {
+        return None;
+    }
+    let matrix = initial_intrinsics.camera_matrix;
+    let mut translation = [
+        center_ray[0] * center_depth - rotated_center[0],
+        center_ray[1] * center_depth - rotated_center[1],
+        center_depth - rotated_center[2],
+    ];
+    for _ in 0..8 {
+        let (minimum, maximum) = guided_pose_projected_inner_pixel_bounds(
+            board,
+            rotation,
+            translation,
+            initial_intrinsics,
+        )?;
+        let current_center = [
+            (minimum[0] + maximum[0]) * 0.5,
+            (minimum[1] + maximum[1]) * 0.5,
+        ];
+        let error = [
+            target_pixel[0] - current_center[0],
+            target_pixel[1] - current_center[1],
+        ];
+        if error[0].abs().max(error[1].abs()) <= 1.0e-3 {
+            break;
+        }
+        translation[0] += error[0] / matrix[0] * center_depth;
+        translation[1] += error[1] / matrix[4] * center_depth;
+        if translation.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+    }
+    Some(translation)
+}
+
+fn guided_pose_projected_inner_scale(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<f64> {
+    let (minimum, maximum) =
+        guided_pose_projected_inner_pixel_bounds(board, rotation, translation, initial_intrinsics)?;
+    let short_side = f64::from(image_size.width.min(image_size.height));
+    let scale = (maximum[0] - minimum[0]).max(maximum[1] - minimum[1]) / short_side;
+    scale.is_finite().then_some(scale)
+}
+
+fn guided_pose_projected_inner_pixel_bounds(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+) -> Option<([f64; 2], [f64; 2])> {
+    let right = f64::from(board.inner_cols.saturating_sub(1));
+    let bottom = f64::from(board.inner_rows.saturating_sub(1));
+    let corners = [[0.0, 0.0], [right, 0.0], [right, bottom], [0.0, bottom]];
+    let mut minimum = [f64::INFINITY, f64::INFINITY];
+    let mut maximum = [f64::NEG_INFINITY, f64::NEG_INFINITY];
+    for [x, y] in corners {
+        let point = project_board_point_image(
+            rotation,
+            translation,
+            guided_pose_board_point(board, x, y),
+            initial_intrinsics,
+        )?;
+        let image = [f64::from(point.x), f64::from(point.y)];
+        minimum[0] = minimum[0].min(image[0]);
+        minimum[1] = minimum[1].min(image[1]);
+        maximum[0] = maximum[0].max(image[0]);
+        maximum[1] = maximum[1].max(image[1]);
+    }
+    Some((minimum, maximum))
+}
+
+fn guided_pose_minimum_center_depth(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    inner_center: [f64; 3],
+) -> f64 {
+    let center_z = rotate_guided_pose_point(rotation, inner_center)[2];
+    let right = f64::from(board.inner_cols);
+    let bottom = f64::from(board.inner_rows);
+    let outline = [[-1.0, -1.0], [right, -1.0], [right, bottom], [-1.0, bottom]];
+    let min_delta = outline.iter().fold(f64::INFINITY, |minimum, [x, y]| {
+        let z = rotate_guided_pose_point(rotation, guided_pose_board_point(board, *x, *y))[2];
+        minimum.min(z - center_z)
+    });
+    let margin = board.square_size.max(1.0) * 0.05;
+    if min_delta < 0.0 {
+        -min_delta + margin
+    } else {
+        margin
+    }
+}
+
+fn guided_pose_inner_center_point(board: BoardSpec) -> [f64; 3] {
+    guided_pose_board_point(
+        board,
+        f64::from(board.inner_cols.saturating_sub(1)) * 0.5,
+        f64::from(board.inner_rows.saturating_sub(1)) * 0.5,
+    )
+}
+
+fn guided_pose_board_point(board: BoardSpec, x: f64, y: f64) -> [f64; 3] {
+    [x * board.square_size, y * board.square_size, 0.0]
+}
+
+fn guided_pose_project_board_uv(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    x: f64,
+    y: f64,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<[f32; 2]> {
+    let point = project_board_point_image(
+        rotation,
+        translation,
+        guided_pose_board_point(board, x, y),
+        initial_intrinsics,
+    )?;
+    Some([
+        point.x / image_size.width as f32,
+        point.y / image_size.height as f32,
+    ])
+}
+
+fn guided_pose_6dof_from_rotation_translation(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<GuidedPose6Dof> {
+    let center_point = guided_pose_inner_center_point(board);
+    let rotated_center = rotate_guided_pose_point(rotation, center_point);
+    let xyz = [
+        rotated_center[0] + translation[0],
+        rotated_center[1] + translation[1],
+        rotated_center[2] + translation[2],
+    ];
+    let center_image =
+        project_board_point_image(rotation, translation, center_point, initial_intrinsics)?;
+    let center_uv = [
+        center_image.x / image_size.width as f32,
+        center_image.y / image_size.height as f32,
+    ];
+    let rpy_degrees = guided_pose_rotation_to_rpy_degrees(rotation)?;
+    let pose = GuidedPose6Dof {
+        xyz,
+        rpy_degrees,
+        rotation,
+        translation,
+        center_uv,
+    };
+    guided_pose_6dof_is_finite(&pose).then_some(pose)
+}
+
+fn guided_pose_6dof_is_finite(pose: &GuidedPose6Dof) -> bool {
+    pose.xyz.iter().all(|value| value.is_finite())
+        && pose.rpy_degrees.iter().all(|value| value.is_finite())
+        && pose
+            .rotation
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+        && pose.translation.iter().all(|value| value.is_finite())
+        && pose.center_uv.iter().all(|value| value.is_finite())
+}
+
+fn guided_pose_rotation_to_rpy_degrees(rotation: [[f64; 3]; 3]) -> Option<[f64; 3]> {
+    if rotation.iter().flatten().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let pitch = (-rotation[2][0]).clamp(-1.0, 1.0).asin();
+    let cos_pitch = pitch.cos();
+    let (roll, yaw) = if cos_pitch.abs() > 1.0e-9 {
+        (
+            rotation[2][1].atan2(rotation[2][2]),
+            rotation[1][0].atan2(rotation[0][0]),
+        )
+    } else {
+        (0.0, (-rotation[0][1]).atan2(rotation[1][1]))
+    };
+    let rpy = [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()];
+    rpy.iter().all(|value| value.is_finite()).then_some(rpy)
+}
+
+fn mat3_transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    [
+        [matrix[0][0], matrix[1][0], matrix[2][0]],
+        [matrix[0][1], matrix[1][1], matrix[2][1]],
+        [matrix[0][2], matrix[1][2], matrix[2][2]],
+    ]
+}
+
+fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
+    let mut output = [[0.0; 3]; 3];
+    for row in 0..3 {
+        for column in 0..3 {
+            output[row][column] = left[row][0] * right[0][column]
+                + left[row][1] * right[1][column]
+                + left[row][2] * right[2][column];
+        }
+    }
+    output
+}
+
+fn guided_pose_signed_rotation_error_components(
+    measurement_rotation: [[f64; 3]; 3],
+    target_rotation: [[f64; 3]; 3],
+) -> Option<[f64; 3]> {
+    let relative_rotation = mat3_mul(mat3_transpose(target_rotation), measurement_rotation);
+    let rpy = guided_pose_rotation_to_rpy_degrees(relative_rotation)?;
+    Some([
+        signed_angle_distance_degrees(rpy[0], 0.0),
+        signed_angle_distance_degrees(rpy[1], 0.0),
+        signed_angle_distance_degrees(rpy[2], 0.0),
+    ])
+}
+
+fn guided_pose_rotation_error_score(components: [f64; 3], tolerance: GuidedPoseTolerance) -> f64 {
+    (components[0].abs() / tolerance.roll_degrees)
+        .max(components[1].abs() / tolerance.pitch_degrees)
+        .max(components[2].abs() / tolerance.yaw_degrees)
+}
+
+fn guided_pose_rotation_error_degrees(
+    measurement: &GuidedPose6Dof,
+    target: &GuidedPose6Dof,
+    tolerance: GuidedPoseTolerance,
+) -> Option<[f64; 3]> {
+    let direct =
+        guided_pose_signed_rotation_error_components(measurement.rotation, target.rotation)?;
+    // 普通棋盘没有方向标记，OpenCV/PnP 可能返回绕棋盘法线 180° 翻转的等价坐标系；
+    // 物理姿态接近时不能把这个不可观测翻转记成 180° yaw error。
+    let board_half_turn = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]];
+    let symmetric_measurement = mat3_mul(measurement.rotation, board_half_turn);
+    let symmetric =
+        guided_pose_signed_rotation_error_components(symmetric_measurement, target.rotation)?;
+    let direct_score = guided_pose_rotation_error_score(direct, tolerance);
+    let symmetric_score = guided_pose_rotation_error_score(symmetric, tolerance);
+    Some(if symmetric_score < direct_score {
+        symmetric
+    } else {
+        direct
+    })
+}
+fn undistort_image_pixel_to_normalized(
+    pixel: [f64; 2],
+    initial_intrinsics: &InitialIntrinsics,
+) -> Option<[f64; 2]> {
+    let matrix = initial_intrinsics.camera_matrix;
+    if matrix[0] <= 0.0 || matrix[4] <= 0.0 || pixel.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let distorted = [
+        (pixel[0] - matrix[2]) / matrix[0],
+        (pixel[1] - matrix[5]) / matrix[4],
+    ];
+    if distorted.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let mut undistorted = distorted;
+    for _ in 0..12 {
+        let projected = distort_normalized_point(
+            undistorted[0],
+            undistorted[1],
+            &initial_intrinsics.distortion_coefficients,
+        )?;
+        let error = [projected[0] - distorted[0], projected[1] - distorted[1]];
+        undistorted[0] -= error[0];
+        undistorted[1] -= error[1];
+        if error[0].abs().max(error[1].abs()) <= 1.0e-12 {
+            break;
+        }
+    }
+    undistorted
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(undistorted)
+}
+
+fn distort_normalized_point(x: f64, y: f64, distortion: &[f64]) -> Option<[f64; 2]> {
+    let coefficient = |index: usize| distortion.get(index).copied().unwrap_or(0.0);
+    let r2 = x * x + y * y;
+    let r4 = r2 * r2;
+    let r6 = r4 * r2;
+    let numerator = 1.0 + coefficient(0) * r2 + coefficient(1) * r4 + coefficient(4) * r6;
+    let denominator = 1.0 + coefficient(5) * r2 + coefficient(6) * r4 + coefficient(7) * r6;
+    if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
+        return None;
+    }
+    let radial = numerator / denominator;
+    let distorted = [
+        x * radial
+            + 2.0 * coefficient(2) * x * y
+            + coefficient(3) * (r2 + 2.0 * x * x)
+            + coefficient(8) * r2
+            + coefficient(9) * r4,
+        y * radial
+            + coefficient(2) * (r2 + 2.0 * y * y)
+            + 2.0 * coefficient(3) * x * y
+            + coefficient(10) * r2
+            + coefficient(11) * r4,
+    ];
+    distorted
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(distorted)
+}
+
+fn guided_pose_rotation(tilt_degrees: f64, azimuth_degrees: f64) -> [[f64; 3]; 3] {
+    let tilt = tilt_degrees.to_radians();
+    if tilt.abs() <= f64::EPSILON {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
+    let azimuth = azimuth_degrees.to_radians();
+    let axis = [-azimuth.sin(), azimuth.cos(), 0.0];
+    let (sin_theta, cos_theta) = tilt.sin_cos();
+    let one_minus_cos = 1.0 - cos_theta;
+    let [x, y, z] = axis;
+    [
+        [
+            cos_theta + x * x * one_minus_cos,
+            x * y * one_minus_cos - z * sin_theta,
+            x * z * one_minus_cos + y * sin_theta,
+        ],
+        [
+            y * x * one_minus_cos + z * sin_theta,
+            cos_theta + y * y * one_minus_cos,
+            y * z * one_minus_cos - x * sin_theta,
+        ],
+        [
+            z * x * one_minus_cos - y * sin_theta,
+            z * y * one_minus_cos + x * sin_theta,
+            cos_theta + z * z * one_minus_cos,
+        ],
+    ]
+}
+
+fn rotate_guided_pose_point(rotation: [[f64; 3]; 3], point: [f64; 3]) -> [f64; 3] {
+    [
+        rotation[0][0] * point[0] + rotation[0][1] * point[1] + rotation[0][2] * point[2],
+        rotation[1][0] * point[0] + rotation[1][1] * point[1] + rotation[1][2] * point[2],
+        rotation[2][0] * point[0] + rotation[2][1] * point[1] + rotation[2][2] * point[2],
+    ]
+}
+
+fn guided_pose_measurement(
+    detection: &ChessboardDetection,
+    pnp_observation: &PnPObservation,
+    board: BoardSpec,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Result<GuidedPoseMeasurement, String> {
+    if detection.corners.is_empty() {
+        return Err("guided pose requires detected board corners".to_owned());
+    }
+    if detection.image_size != image_size {
+        return Err("guided pose detection image size does not match target binding".to_owned());
+    }
+    for point in &detection.corners {
+        if !point.x.is_finite() || !point.y.is_finite() {
+            return Err("guided pose contains non-finite board corners".to_owned());
+        }
+    }
+    let rotation = rodrigues_matrix_for_preview(pnp_observation.rotation_vector)
+        .ok_or_else(|| "guided pose rotation is not finite".to_owned())?;
+    let pose = guided_pose_6dof_from_rotation_translation(
+        board,
+        rotation,
+        pnp_observation.translation_vector,
+        initial_intrinsics,
+        image_size,
+    )
+    .ok_or_else(|| "guided pose 6DoF projection is invalid".to_owned())?;
+    let measurement = GuidedPoseMeasurement { pose };
+    if measurement.pose.xyz[2] <= 0.0 {
+        return Err("guided pose measurement contains non-positive depth".to_owned());
+    }
+    Ok(measurement)
+}
+
+fn assess_guided_pose(
+    step_index: usize,
+    target: &GuidedPoseTarget,
+    detection: &ChessboardDetection,
+    pnp_observation: &PnPObservation,
+    board: BoardSpec,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Result<GuidedPoseAssessment, String> {
+    let measurement = guided_pose_measurement(
+        detection,
+        pnp_observation,
+        board,
+        initial_intrinsics,
+        image_size,
+    )?;
+    let depth_scale = target.pose.xyz[2]
+        .abs()
+        .max(measurement.pose.xyz[2].abs())
+        .max(board.square_size.max(1.0));
+    let signed_rotation_error_degrees =
+        guided_pose_rotation_error_degrees(&measurement.pose, &target.pose, target.tolerance)
+            .ok_or_else(|| "guided pose rotation error is not finite".to_owned())?;
+    let [
+        signed_roll_degrees,
+        signed_pitch_degrees,
+        signed_yaw_degrees,
+    ] = signed_rotation_error_degrees;
+    let error = GuidedPoseError {
+        x: (measurement.pose.xyz[0] - target.pose.xyz[0]).abs() / depth_scale,
+        y: (measurement.pose.xyz[1] - target.pose.xyz[1]).abs() / depth_scale,
+        z: (measurement.pose.xyz[2] - target.pose.xyz[2]).abs() / depth_scale,
+        roll_degrees: signed_roll_degrees.abs(),
+        pitch_degrees: signed_pitch_degrees.abs(),
+        yaw_degrees: signed_yaw_degrees.abs(),
+    };
+    let pose_error_score = (error.x / target.tolerance.x)
+        .max(error.y / target.tolerance.y)
+        .max(error.z / target.tolerance.z)
+        .max(error.roll_degrees / target.tolerance.roll_degrees)
+        .max(error.pitch_degrees / target.tolerance.pitch_degrees)
+        .max(error.yaw_degrees / target.tolerance.yaw_degrees);
+    if !pose_error_score.is_finite() {
+        return Err("guided pose score is not finite".to_owned());
+    }
+    let matched = pose_error_score <= GUIDED_POSE_MATCH_SCORE_LIMIT;
+    let reason = if matched {
+        None
+    } else {
+        Some(guided_pose_error_reason(&error, target))
+    };
+    Ok(GuidedPoseAssessment {
+        step_index,
+        target_label: target.label,
+        measurement,
+        error,
+        signed_rotation_error_degrees,
+        pose_error_score,
+        matched,
+        reason,
+    })
+}
+
+fn guided_pose_instruction_overlay(
+    assessment: &GuidedPoseAssessment,
+    target: &GuidedPoseTarget,
+    hold_frames: u8,
+) -> ViewerGuidedPoseInstructionOverlay {
+    if assessment.matched {
+        return ViewerGuidedPoseInstructionOverlay {
+            primary: "HOLD STILL",
+            secondary: format!(
+                "locked · hold {}/{} · pose error {:.2}/{:.2}",
+                hold_frames.min(GUIDED_CAPTURE_HOLD_FRAMES),
+                GUIDED_CAPTURE_HOLD_FRAMES,
+                assessment.pose_error_score,
+                GUIDED_POSE_MATCH_SCORE_LIMIT
+            ),
+            score: assessment.pose_error_score,
+            matched: true,
+        };
+    }
+
+    let candidates = [
+        (
+            GuidedPoseInstructionComponent::X,
+            assessment.error.x,
+            target.tolerance.x,
+            "x",
+            "",
+        ),
+        (
+            GuidedPoseInstructionComponent::Y,
+            assessment.error.y,
+            target.tolerance.y,
+            "y",
+            "",
+        ),
+        (
+            GuidedPoseInstructionComponent::Z,
+            assessment.error.z,
+            target.tolerance.z,
+            "z",
+            "",
+        ),
+        (
+            GuidedPoseInstructionComponent::Roll,
+            assessment.error.roll_degrees,
+            target.tolerance.roll_degrees,
+            "roll",
+            "°",
+        ),
+        (
+            GuidedPoseInstructionComponent::Pitch,
+            assessment.error.pitch_degrees,
+            target.tolerance.pitch_degrees,
+            "pitch",
+            "°",
+        ),
+        (
+            GuidedPoseInstructionComponent::Yaw,
+            assessment.error.yaw_degrees,
+            target.tolerance.yaw_degrees,
+            "yaw",
+            "°",
+        ),
+    ];
+    let (component, actual, limit, label, unit, component_score) = candidates
+        .into_iter()
+        .map(|(component, actual, limit, label, unit)| {
+            (component, actual, limit, label, unit, actual / limit)
+        })
+        .max_by(|left, right| left.5.total_cmp(&right.5))
+        .unwrap_or((
+            GuidedPoseInstructionComponent::Z,
+            assessment.error.z,
+            target.tolerance.z,
+            "pose",
+            "",
+            assessment.pose_error_score,
+        ));
+    let primary = guided_pose_instruction_primary(component, assessment, target);
+    let secondary = if unit.is_empty() {
+        format!(
+            "{label} {:.0}% of limit · pose error {:.2}/{:.2}",
+            component_score * 100.0,
+            assessment.pose_error_score,
+            GUIDED_POSE_MATCH_SCORE_LIMIT
+        )
+    } else {
+        format!(
+            "{label} {actual:.1}{unit}/{limit:.1}{unit} · pose error {:.2}/{:.2}",
+            assessment.pose_error_score, GUIDED_POSE_MATCH_SCORE_LIMIT
+        )
+    };
+    ViewerGuidedPoseInstructionOverlay {
+        primary,
+        secondary,
+        score: assessment.pose_error_score,
+        matched: false,
+    }
+}
+
+fn guided_pose_instruction_primary(
+    component: GuidedPoseInstructionComponent,
+    assessment: &GuidedPoseAssessment,
+    target: &GuidedPoseTarget,
+) -> &'static str {
+    match component {
+        GuidedPoseInstructionComponent::X => {
+            if target.pose.center_uv[0] >= assessment.measurement.pose.center_uv[0] {
+                "MOVE BOARD RIGHT"
+            } else {
+                "MOVE BOARD LEFT"
+            }
+        }
+        GuidedPoseInstructionComponent::Y => {
+            if target.pose.center_uv[1] >= assessment.measurement.pose.center_uv[1] {
+                "MOVE BOARD DOWN"
+            } else {
+                "MOVE BOARD UP"
+            }
+        }
+        GuidedPoseInstructionComponent::Z => {
+            if target.pose.xyz[2] >= assessment.measurement.pose.xyz[2] {
+                "MOVE BOARD FARTHER"
+            } else {
+                "MOVE BOARD CLOSER"
+            }
+        }
+        GuidedPoseInstructionComponent::Roll => "ROLL BOARD INTO GHOST",
+        GuidedPoseInstructionComponent::Pitch => "TILT BOARD INTO GHOST",
+        GuidedPoseInstructionComponent::Yaw => "ROTATE BOARD INTO GHOST",
+    }
+}
+
+fn guided_pose_rotation_rings_overlay(
+    assessment: &GuidedPoseAssessment,
+    target: &GuidedPoseTarget,
+) -> ViewerGuidedPoseRotationRingsOverlay {
+    let [roll, pitch, yaw] = assessment.signed_rotation_error_degrees;
+    ViewerGuidedPoseRotationRingsOverlay {
+        center_uv: assessment.measurement.pose.center_uv,
+        roll: ViewerGuidedPoseRotationArcOverlay {
+            label: "ROLL",
+            error_degrees: roll,
+            tolerance_degrees: target.tolerance.roll_degrees,
+        },
+        pitch: ViewerGuidedPoseRotationArcOverlay {
+            label: "PITCH",
+            error_degrees: pitch,
+            tolerance_degrees: target.tolerance.pitch_degrees,
+        },
+        yaw: ViewerGuidedPoseRotationArcOverlay {
+            label: "YAW",
+            error_degrees: yaw,
+            tolerance_degrees: target.tolerance.yaw_degrees,
+        },
+    }
+}
+
+fn guided_pose_error_reason(error: &GuidedPoseError, target: &GuidedPoseTarget) -> String {
+    let x_score = error.x / target.tolerance.x;
+    let y_score = error.y / target.tolerance.y;
+    let z_score = error.z / target.tolerance.z;
+    let roll_score = error.roll_degrees / target.tolerance.roll_degrees;
+    let pitch_score = error.pitch_degrees / target.tolerance.pitch_degrees;
+    let yaw_score = error.yaw_degrees / target.tolerance.yaw_degrees;
+    let (label, actual, limit, unit) = [
+        ("x", error.x, target.tolerance.x, ""),
+        ("y", error.y, target.tolerance.y, ""),
+        ("z", error.z, target.tolerance.z, ""),
+        (
+            "roll",
+            error.roll_degrees,
+            target.tolerance.roll_degrees,
+            "°",
+        ),
+        (
+            "pitch",
+            error.pitch_degrees,
+            target.tolerance.pitch_degrees,
+            "°",
+        ),
+        ("yaw", error.yaw_degrees, target.tolerance.yaw_degrees, "°"),
+    ]
+    .into_iter()
+    .zip([
+        x_score,
+        y_score,
+        z_score,
+        roll_score,
+        pitch_score,
+        yaw_score,
+    ])
+    .max_by(|(_, left), (_, right)| left.total_cmp(right))
+    .map(|(component, _)| component)
+    .unwrap_or(("pose", 0.0, 0.0, ""));
+    format!("{label} error {actual:.3}{unit} exceeds {limit:.3}{unit}")
+}
+
+fn signed_angle_distance_degrees(left: f64, right: f64) -> f64 {
+    let delta = (left - right).rem_euclid(360.0);
+    if delta > 180.0 { delta - 360.0 } else { delta }
+}
+
+fn candidate_operation_label(intent: CandidateIntent) -> &'static str {
+    match intent {
+        CandidateIntent::PreviewOnly => "Board preview",
+        CandidateIntent::AutoCommit => "Automatic capture",
+        CandidateIntent::GuidedMeasure => "Guided pose measurement",
+        CandidateIntent::GuidedCapture => "Guided capture",
+    }
 }
 
 struct PendingCandidate {
@@ -563,6 +2250,7 @@ struct PendingCandidate {
     encoded: Option<CalibrationEncodedPng>,
     cancellation: CalibrationCancellation,
     pose_request: Option<PoseEstimationRequest>,
+    guided_step_index: Option<usize>,
     state: AutoCandidateState,
 }
 
@@ -829,9 +2517,12 @@ pub(crate) struct CalibrationWorkspace {
     display_layer: CalibrationDisplayLayer,
     preview_viewport: CalibrationPreviewViewport,
     preview_mode: CalibrationPreviewMode,
+    pts_bridge_cache: BTreeMap<RtspPtsBridgeKey, RtspPtsBridgeSample>,
     coverage: Option<CoverageVisualization>,
     coverage_dirty: bool,
     auto_capture_enabled: bool,
+    auto_capture_trigger_mode: AutoCaptureTriggerMode,
+    guided_capture: Option<GuidedCaptureRuntime>,
     dataset_sidebar_expanded: bool,
     dataset_acceptance_expanded: bool,
     dataset_table_expanded: bool,
@@ -839,6 +2530,441 @@ pub(crate) struct CalibrationWorkspace {
     acceptance_draft: DatasetAcceptanceDraft,
     acceptance_last_valid_criteria: AutoCaptureAcceptanceCriteria,
     live_admission_context: Option<LiveAdmissionContext>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CalibrationWorkspaceKey(String);
+
+impl CalibrationWorkspaceKey {
+    fn manual() -> Self {
+        Self("manual".to_owned())
+    }
+
+    fn for_live_source(source: &LiveStreamSource) -> Self {
+        match source {
+            LiveStreamSource::Cv610 {
+                profile_id,
+                channel,
+                source_fingerprint,
+                geometry_key,
+                ..
+            } => Self(format!(
+                "cv610:{profile_id}:ch{channel}:{source_fingerprint}:{geometry_key}"
+            )),
+            LiveStreamSource::Rtsp {
+                channel,
+                source_fingerprint,
+                geometry_key,
+                ..
+            } => Self(format!(
+                "rtsp:ch{channel}:{source_fingerprint}:{geometry_key}"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CalibrationWorkspaceKind {
+    ManualFiles,
+    LiveStream,
+}
+
+impl CalibrationWorkspaceKind {
+    const fn allows_live_inspection(self) -> bool {
+        matches!(self, Self::LiveStream)
+    }
+}
+
+struct CalibrationWorkspaceEntry {
+    kind: CalibrationWorkspaceKind,
+    label: String,
+    workspace: CalibrationWorkspace,
+}
+
+/// 多路内参标定编排器；每个 live source 独立持有 Dataset、自动采集和求解状态。
+pub(crate) struct CalibrationWorkspaceManager {
+    context: egui::Context,
+    active: CalibrationWorkspaceKey,
+    entries: BTreeMap<CalibrationWorkspaceKey, CalibrationWorkspaceEntry>,
+}
+
+impl CalibrationWorkspaceManager {
+    pub(crate) fn new(context: &egui::Context) -> std::io::Result<Self> {
+        let manual = CalibrationWorkspaceKey::manual();
+        let mut entries = BTreeMap::new();
+        entries.insert(
+            manual.clone(),
+            CalibrationWorkspaceEntry {
+                kind: CalibrationWorkspaceKind::ManualFiles,
+                label: "Manual / Files".to_owned(),
+                workspace: CalibrationWorkspace::new(context)?,
+            },
+        );
+        Ok(Self {
+            context: context.clone(),
+            active: manual,
+            entries,
+        })
+    }
+
+    fn active_workspace(&self) -> &CalibrationWorkspace {
+        &self
+            .entries
+            .get(&self.active)
+            .expect("active calibration workspace exists")
+            .workspace
+    }
+
+    fn active_workspace_mut(&mut self) -> &mut CalibrationWorkspace {
+        &mut self
+            .entries
+            .get_mut(&self.active)
+            .expect("active calibration workspace exists")
+            .workspace
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_count_for_test(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_label_for_test(&self) -> &str {
+        self.entries
+            .get(&self.active)
+            .map(|entry| entry.label.as_str())
+            .expect("active calibration workspace exists")
+    }
+    fn manual_workspace_mut(&mut self) -> &mut CalibrationWorkspace {
+        &mut self
+            .entries
+            .get_mut(&CalibrationWorkspaceKey::manual())
+            .expect("manual calibration workspace exists")
+            .workspace
+    }
+
+    fn activate_manual_workspace(&mut self) {
+        self.active = CalibrationWorkspaceKey::manual();
+    }
+
+    fn live_source_label(source: &LiveStreamSource) -> String {
+        match source {
+            LiveStreamSource::Cv610 {
+                profile_label,
+                channel,
+                ..
+            } => format!("{profile_label} CH{channel}"),
+            LiveStreamSource::Rtsp { label, channel, .. } => format!("{label} CH{channel}"),
+        }
+    }
+
+    fn ensure_live_workspace(
+        &mut self,
+        source: &LiveStreamSource,
+    ) -> Option<&mut CalibrationWorkspace> {
+        let key = CalibrationWorkspaceKey::for_live_source(source);
+        if !self.entries.contains_key(&key) {
+            let label = Self::live_source_label(source);
+            let workspace = match CalibrationWorkspace::new(&self.context) {
+                Ok(workspace) => workspace,
+                Err(error) => {
+                    self.active_workspace_mut().status =
+                        format!("Cannot create calibration session for {label}: {error}");
+                    return None;
+                }
+            };
+            self.entries.insert(
+                key.clone(),
+                CalibrationWorkspaceEntry {
+                    kind: CalibrationWorkspaceKind::LiveStream,
+                    label,
+                    workspace,
+                },
+            );
+        }
+        self.entries.get_mut(&key).map(|entry| &mut entry.workspace)
+    }
+
+    fn workspace_for_live_source(
+        &self,
+        source: &LiveStreamSource,
+    ) -> Option<&CalibrationWorkspace> {
+        let key = CalibrationWorkspaceKey::for_live_source(source);
+        self.entries.get(&key).map(|entry| &entry.workspace)
+    }
+
+    fn activate_live_source(&mut self, source: &LiveStreamSource) {
+        self.active = CalibrationWorkspaceKey::for_live_source(source);
+    }
+    fn close_session(&mut self, key: &CalibrationWorkspaceKey) -> bool {
+        if *key == CalibrationWorkspaceKey::manual() {
+            return false;
+        }
+        if self.entries.remove(key).is_none() {
+            return false;
+        }
+        if self.active == *key {
+            self.activate_manual_workspace();
+        }
+        true
+    }
+
+    pub(crate) fn activate_live_source_session(&mut self, source: &LiveStreamSource) {
+        if self.ensure_live_workspace(source).is_some() {
+            self.activate_live_source(source);
+        }
+    }
+
+    pub(crate) fn import(&mut self, candidates: Vec<CalibrationImportCandidate>) {
+        self.activate_manual_workspace();
+        self.manual_workspace_mut().import(candidates);
+    }
+
+    pub(crate) fn reject_import(&mut self, display_path: &std::path::Path) {
+        self.activate_manual_workspace();
+        self.manual_workspace_mut().reject_import(display_path);
+    }
+
+    pub(crate) fn capture_displayed_stream_frame(
+        &mut self,
+        frame: Arc<DecodedVideoFrame>,
+        live_source: LiveStreamSource,
+        store: CaptureStore,
+    ) {
+        if self.ensure_live_workspace(&live_source).is_some() {
+            self.activate_live_source(&live_source);
+            self.active_workspace_mut()
+                .capture_displayed_stream_frame(frame, live_source, store);
+        }
+    }
+    pub(crate) fn active_accepts_live_source(&self, source: Option<&LiveStreamSource>) -> bool {
+        let Some(source) = source else {
+            return false;
+        };
+        let key = CalibrationWorkspaceKey::for_live_source(source);
+        self.active == key
+            && self
+                .entries
+                .get(&self.active)
+                .is_some_and(|entry| entry.kind.allows_live_inspection())
+    }
+    #[cfg(test)]
+    pub(crate) fn ensure_live_source_for_test(&mut self, source: &LiveStreamSource) {
+        self.activate_live_source_session(source);
+    }
+
+    pub(crate) fn observe_live_frame(
+        &mut self,
+        frame: Arc<DecodedVideoFrame>,
+        live_source: LiveStreamSource,
+        store: CaptureStore,
+        preview_requested: bool,
+    ) {
+        let key = CalibrationWorkspaceKey::for_live_source(&live_source);
+        let Some(entry) = self.entries.get_mut(&key) else {
+            return;
+        };
+        entry
+            .workspace
+            .observe_live_frame(frame, live_source, store, preview_requested);
+    }
+
+    pub(crate) fn stream_disconnected(&mut self, session_id: &StreamSessionId) {
+        for entry in self.entries.values_mut() {
+            entry.workspace.stream_disconnected(session_id);
+        }
+    }
+
+    pub(crate) fn take_export(&mut self) -> Option<CalibrationExport> {
+        if let Some(export) = self.active_workspace_mut().take_export() {
+            return Some(export);
+        }
+        for entry in self.entries.values_mut() {
+            if let Some(export) = entry.workspace.take_export() {
+                return Some(export);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn take_provision_intent(&mut self) -> Option<CalibrationProvisionIntent> {
+        if let Some(intent) = self.active_workspace_mut().take_provision_intent() {
+            return Some(intent);
+        }
+        for entry in self.entries.values_mut() {
+            if let Some(intent) = entry.workspace.take_provision_intent() {
+                return Some(intent);
+            }
+        }
+        None
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_configured(&mut self, label: &str) {
+        self.active_workspace_mut().report_target_configured(label);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_configuration_failed(&mut self, message: impl Into<String>) {
+        self.active_workspace_mut()
+            .report_target_configuration_failed(message);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_invalidated(&mut self, message: impl Into<String>) {
+        self.active_workspace_mut()
+            .report_target_invalidated(message);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_bus_discovery_failed(&mut self, message: impl Into<String>) {
+        self.active_workspace_mut()
+            .report_bus_discovery_failed(message);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_bus_discovery(&mut self, buses: Vec<camera_toolbox_app::I2cBusInfo>) {
+        self.active_workspace_mut().report_bus_discovery(buses);
+    }
+
+    pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
+        self.active_workspace_mut().report_provision_error(message);
+    }
+
+    pub(crate) fn report_eeprom_provision_unknown(&mut self, message: impl Into<String>) {
+        self.active_workspace_mut()
+            .report_eeprom_provision_unknown(message);
+    }
+
+    pub(crate) fn report_eeprom_inspect(
+        &mut self,
+        target_label: String,
+        result: EepromInspectResult,
+    ) {
+        self.active_workspace_mut()
+            .report_eeprom_inspect(target_label, result);
+    }
+
+    pub(crate) fn report_eeprom_provision(
+        &mut self,
+        target_label: String,
+        result: &EepromWriteResult,
+        audit_file: String,
+    ) {
+        self.active_workspace_mut()
+            .report_eeprom_provision(target_label, result, audit_file);
+    }
+
+    pub(crate) fn report_eeprom_provision_audit_error(
+        &mut self,
+        target_label: String,
+        result: &EepromWriteResult,
+        error: &str,
+    ) {
+        self.active_workspace_mut()
+            .report_eeprom_provision_audit_error(target_label, result, error);
+    }
+
+    pub(crate) fn report_export_started(&mut self, label: &str, target_label: &str) {
+        self.active_workspace_mut()
+            .report_export_started(label, target_label);
+    }
+
+    pub(crate) fn report_export_finished(
+        &mut self,
+        label: &str,
+        target_label: &str,
+        result: Result<u64, &str>,
+    ) {
+        self.active_workspace_mut()
+            .report_export_finished(label, target_label, result);
+    }
+
+    pub(crate) fn tick(&mut self, context: &egui::Context) {
+        for entry in self.entries.values_mut() {
+            entry.workspace.tick(context);
+        }
+    }
+
+    pub(crate) fn live_viewer_presentation(
+        &self,
+        live_frame: Option<&DecodedVideoFrame>,
+        live_source: Option<&LiveStreamSource>,
+    ) -> Option<CalibrationViewerPresentation> {
+        if let Some(source) = live_source {
+            return self
+                .workspace_for_live_source(source)
+                .and_then(|workspace| workspace.live_viewer_presentation(live_frame, live_source));
+        }
+        self.active_workspace()
+            .live_viewer_presentation(live_frame, live_source)
+    }
+
+    pub(crate) fn render(
+        &mut self,
+        context: &egui::Context,
+        ui: &mut egui::Ui,
+        export_enabled: bool,
+        export_reason: Option<&str>,
+        sftp_source: Result<&str, &str>,
+        provision_target: Result<&str, &str>,
+        has_live_inspection: bool,
+        render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
+    ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
+        let tabs: Vec<_> = self
+            .entries
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.label.clone(), entry.kind))
+            .collect();
+        if tabs.len() > 1 {
+            let mut close_key = None;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Calibration session:");
+                for (key, label, kind) in tabs {
+                    if ui.selectable_label(self.active == key, &label).clicked() {
+                        self.active = key.clone();
+                    }
+                    if self.active == key
+                        && kind.allows_live_inspection()
+                        && ui
+                            .small_button("Close session")
+                            .on_hover_text("Remove this Calibration session; the RTSP live document stays open.")
+                            .clicked()
+                    {
+                        close_key = Some(key);
+                    }
+                }
+            });
+            if let Some(key) = close_key {
+                self.close_session(&key);
+            }
+            ui.separator();
+        }
+        let has_live_inspection = has_live_inspection
+            && self
+                .entries
+                .get(&self.active)
+                .is_some_and(|entry| entry.kind.allows_live_inspection());
+        self.active_workspace_mut().render(
+            context,
+            ui,
+            export_enabled,
+            export_reason,
+            sftp_source,
+            provision_target,
+            has_live_inspection,
+            render_live_inspection,
+        )
+    }
+
+    pub(crate) fn render_status(&self, ui: &mut egui::Ui) {
+        if self.entries.len() > 1
+            && let Some(entry) = self.entries.get(&self.active)
+        {
+            ui.label(format!("{}:", entry.label));
+        }
+        self.active_workspace().render_status(ui);
+    }
 }
 
 impl CalibrationWorkspace {
@@ -880,9 +3006,12 @@ impl CalibrationWorkspace {
             display_layer: CalibrationDisplayLayer::default(),
             preview_viewport: CalibrationPreviewViewport::default(),
             preview_mode: CalibrationPreviewMode::default(),
+            pts_bridge_cache: BTreeMap::new(),
             coverage: None,
             coverage_dirty: true,
             auto_capture_enabled: false,
+            auto_capture_trigger_mode: AutoCaptureTriggerMode::default(),
+            guided_capture: None,
             dataset_sidebar_expanded: true,
             dataset_acceptance_expanded: true,
             dataset_table_expanded: true,
@@ -974,6 +3103,7 @@ impl CalibrationWorkspace {
         let mut refreshed = 0_usize;
         let mut skipped = offered.saturating_sub(available);
         let mut detection_ids = Vec::new();
+
         for candidate in candidates.into_iter().take(available) {
             let name = candidate.entry.name.as_str().to_owned();
             let outcome = self.session.add_or_refresh(
@@ -1079,7 +3209,7 @@ impl CalibrationWorkspace {
         };
 
         let FrozenStreamInput { source, encoded } =
-            match freeze_stream_input(&frame, store, source_acquisition_key.clone()) {
+            match freeze_stream_input(&frame, store, source_acquisition_key.clone(), None) {
                 Ok(frozen) => frozen,
                 Err(error) => {
                     self.status = error;
@@ -1126,23 +3256,67 @@ impl CalibrationWorkspace {
                 return;
             }
         };
+        let frame_image_size = match CalibrationImageSize::new(frame.width, frame.height) {
+            Ok(image_size) => image_size,
+            Err(error) => {
+                self.status = format!("Live frame has invalid geometry: {error}");
+                return;
+            }
+        };
+
+        let mut guided_step_index = None;
         let intent = if self.auto_capture_enabled && self.active_live_admission() {
-            CandidateIntent::AutoCommit
+            match self.auto_capture_trigger_mode {
+                AutoCaptureTriggerMode::DatasetGain => CandidateIntent::AutoCommit,
+                AutoCaptureTriggerMode::GuidedPresetPose => {
+                    let Some(runtime) = self.guided_capture.as_ref() else {
+                        self.status =
+                            "Guided Auto Capture is selected; press Start guided first.".to_owned();
+                        return;
+                    };
+                    if !runtime.is_running() {
+                        if preview_requested {
+                            CandidateIntent::PreviewOnly
+                        } else {
+                            return;
+                        }
+                    } else if runtime.binding.source != live_source
+                        || runtime.binding.acquisition_key != source_acquisition_key
+                        || runtime.binding.image_size != frame_image_size
+                    {
+                        self.stop_guided_capture(
+                            "Guided Auto Capture stopped because the live source binding changed.",
+                        );
+                        return;
+                    } else {
+                        guided_step_index = Some(runtime.current_step);
+                        if runtime.capture_requested {
+                            CandidateIntent::GuidedCapture
+                        } else {
+                            CandidateIntent::GuidedMeasure
+                        }
+                    }
+                }
+            }
         } else if preview_requested {
             CandidateIntent::PreviewOnly
         } else {
             return;
         };
+        let commits_dataset = matches!(
+            intent,
+            CandidateIntent::AutoCommit | CandidateIntent::GuidedCapture
+        );
         if self.active_job.is_some()
             || self.auto_capture.pending.is_some()
-            || (intent == CandidateIntent::AutoCommit
-                && self.session.items().len() >= MAX_DATASET_ITEMS)
+            || (commits_dataset && self.session.items().len() >= MAX_DATASET_ITEMS)
         {
             return;
         }
         let capture_id = StreamCaptureId::from(&frame.identity);
-        if self.auto_capture.last_observed.as_ref() == Some(&capture_id)
-            || (intent == CandidateIntent::AutoCommit
+        let repeated_observation = self.auto_capture.last_observed.as_ref() == Some(&capture_id);
+        if (repeated_observation && intent != CandidateIntent::GuidedCapture)
+            || (commits_dataset
                 && self.session.items().iter().any(|item| {
                     item.input == CalibrationInputKey::StreamCapture(capture_id.clone())
                 }))
@@ -1152,21 +3326,15 @@ impl CalibrationWorkspace {
         let now_ns = host_monotonic_time_ns();
         if (self.auto_capture.last_observed.is_some()
             && now_ns.saturating_sub(self.auto_capture.last_observed_at_ns)
-                < AUTO_CAPTURE_ANALYSIS_INTERVAL_NS)
-            || (intent == CandidateIntent::AutoCommit
+                < AUTO_CAPTURE_ANALYSIS_INTERVAL_NS
+            && intent != CandidateIntent::GuidedCapture)
+            || (commits_dataset
                 && self.auto_capture.last_accepted_at_ns != 0
                 && now_ns.saturating_sub(self.auto_capture.last_accepted_at_ns)
                     < AUTO_CAPTURE_ACCEPT_COOLDOWN_NS)
         {
             return;
         }
-        let frame_image_size = match CalibrationImageSize::new(frame.width, frame.height) {
-            Ok(image_size) => image_size,
-            Err(error) => {
-                self.status = format!("Live frame has invalid geometry: {error}");
-                return;
-            }
-        };
         let pose_request = self
             .session
             .initial_intrinsics_binding()
@@ -1176,25 +3344,34 @@ impl CalibrationWorkspace {
                 reference_image_size: binding.reference_image_size,
                 binding_digest: binding.digest.clone(),
             });
-        if intent == CandidateIntent::AutoCommit && pose_request.is_none() {
+        if matches!(
+            intent,
+            CandidateIntent::AutoCommit
+                | CandidateIntent::GuidedMeasure
+                | CandidateIntent::GuidedCapture
+        ) && pose_request.is_none()
+        {
             self.status = "Automatic capture waits for a valid current K/D12 binding.".to_owned();
             return;
         }
         self.auto_capture.last_observed = Some(capture_id);
         self.auto_capture.last_observed_at_ns = now_ns;
 
-        let FrozenStreamInput { source, encoded } =
-            match freeze_stream_input(&frame, store, source_acquisition_key.clone()) {
-                Ok(frozen) => frozen,
-                Err(error) => {
-                    let operation = match intent {
-                        CandidateIntent::PreviewOnly => "Board preview",
-                        CandidateIntent::AutoCommit => "Automatic capture",
-                    };
-                    self.status = format!("{operation} rejected before detection: {error}");
-                    return;
-                }
-            };
+        let FrozenStreamInput { source, encoded } = match freeze_stream_input(
+            &frame,
+            store,
+            source_acquisition_key.clone(),
+            live_source.authoritative_capture().cloned(),
+        ) {
+            Ok(frozen) => frozen,
+            Err(error) => {
+                self.status = format!(
+                    "{} rejected before detection: {error}",
+                    candidate_operation_label(intent)
+                );
+                return;
+            }
+        };
         let candidate_id = AutoCandidateId::new(self.auto_capture.next_candidate_id);
         self.auto_capture.next_candidate_id =
             self.auto_capture.next_candidate_id.wrapping_add(1).max(1);
@@ -1207,11 +3384,10 @@ impl CalibrationWorkspace {
         ) {
             Ok(token) => token,
             Err(error) => {
-                let operation = match intent {
-                    CandidateIntent::PreviewOnly => "Board preview candidate",
-                    CandidateIntent::AutoCommit => "Automatic candidate",
-                };
-                self.status = format!("{operation} rejected: {error}");
+                self.status = format!(
+                    "{} candidate rejected: {error}",
+                    candidate_operation_label(intent)
+                );
                 return;
             }
         };
@@ -1222,6 +3398,7 @@ impl CalibrationWorkspace {
             encoded: Some(encoded),
             cancellation: CalibrationCancellation::default(),
             pose_request,
+            guided_step_index,
             state: AutoCandidateState::Queued,
         });
         self.status = match intent {
@@ -1232,6 +3409,16 @@ impl CalibrationWorkspace {
             CandidateIntent::AutoCommit => format!(
                 "Automatic candidate {} queued for authoritative detection and PnP.",
                 candidate_id.get()
+            ),
+            CandidateIntent::GuidedMeasure => format!(
+                "Guided pose measurement {} queued for step {}.",
+                candidate_id.get(),
+                guided_step_index.map_or(0, |step| step + 1)
+            ),
+            CandidateIntent::GuidedCapture => format!(
+                "Guided capture {} queued for step {}.",
+                candidate_id.get(),
+                guided_step_index.map_or(0, |step| step + 1)
             ),
         };
     }
@@ -1263,6 +3450,11 @@ impl CalibrationWorkspace {
                     "Live detection candidate cancelled because source or image geometry changed.",
                 );
             }
+            if self.guided_capture.is_some() {
+                self.stop_guided_capture(
+                    "Guided Auto Capture stopped because source or image geometry changed.",
+                );
+            }
             self.session
                 .configure_auto_admission(None, None)
                 .map_err(|error| error.to_string())?;
@@ -1271,6 +3463,7 @@ impl CalibrationWorkspace {
                 acquisition_key: acquisition_key.clone(),
                 image_size,
             });
+            self.pts_bridge_cache.clear();
             self.auto_capture.latest_detection = None;
             self.auto_capture.last_assessment = None;
         }
@@ -1325,8 +3518,9 @@ impl CalibrationWorkspace {
                 return;
             }
         };
-        let reconfigure = self.session.auto_capture_baseline() != Some(&baseline)
-            || self.session.initial_intrinsics_binding() != Some(&binding);
+        let binding_changed = self.session.initial_intrinsics_binding() != Some(&binding);
+        let reconfigure =
+            self.session.auto_capture_baseline() != Some(&baseline) || binding_changed;
         if reconfigure {
             if self.auto_capture.pending.is_some() {
                 self.cancel_auto_candidate(
@@ -1341,6 +3535,11 @@ impl CalibrationWorkspace {
                 return;
             }
             self.auto_capture.last_assessment = self.session.assess_auto_admission(None).ok();
+            if binding_changed && self.guided_capture.is_some() {
+                self.stop_guided_capture(
+                    "Guided Auto Capture stopped because K/D12 binding changed.",
+                );
+            }
         }
         self.acceptance_draft.error = None;
     }
@@ -1358,6 +3557,98 @@ impl CalibrationWorkspace {
             && baseline.board == self.session.board()
             && binding.acquisition_key == context.acquisition_key
             && binding.reference_image_size == context.image_size
+    }
+
+    fn start_guided_capture(&mut self) {
+        if let Some(intent) = self
+            .auto_capture
+            .pending
+            .as_ref()
+            .map(|candidate| candidate.intent)
+        {
+            if intent == CandidateIntent::PreviewOnly {
+                self.cancel_auto_candidate(
+                    "Live board preview cancelled because Guided Auto Capture started.",
+                );
+            } else {
+                self.status = "Wait for the current auto-capture candidate before starting Guided Auto Capture."
+                    .to_owned();
+                return;
+            }
+        }
+        self.refresh_runtime_auto_admission();
+        if !self.active_live_admission() {
+            self.status =
+                "Guided Auto Capture waits for one displayed live frame and valid K/D12 inputs."
+                    .to_owned();
+            return;
+        }
+        let (Some(context), Some(binding)) = (
+            self.live_admission_context.clone(),
+            self.session.initial_intrinsics_binding().cloned(),
+        ) else {
+            self.status =
+                "Guided Auto Capture cannot start without a live admission binding.".to_owned();
+            return;
+        };
+        let guided_binding = GuidedCaptureBinding {
+            source: context.source,
+            acquisition_key: context.acquisition_key,
+            image_size: context.image_size,
+            board: self.session.board(),
+            initial_intrinsics: binding.initial_intrinsics,
+            intrinsics_digest: binding.digest,
+        };
+        let runtime = match GuidedCaptureRuntime::standard_25(guided_binding) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.status = format!("Guided Auto Capture cannot project target grid: {error}");
+                return;
+            }
+        };
+        self.auto_capture_trigger_mode = AutoCaptureTriggerMode::GuidedPresetPose;
+        self.auto_capture_enabled = true;
+        self.auto_capture.last_observed = None;
+        self.guided_capture = Some(runtime);
+        self.status =
+            "Guided Auto Capture started with the Standard 25 preset pose plan.".to_owned();
+    }
+
+    fn pause_guided_capture(&mut self) {
+        if let Some(runtime) = self.guided_capture.as_mut()
+            && runtime.state == GuidedCaptureState::Running
+        {
+            runtime.state = GuidedCaptureState::Paused;
+            runtime.reset_hold();
+            self.status = "Guided Auto Capture paused.".to_owned();
+        }
+    }
+
+    fn resume_guided_capture(&mut self) {
+        if let Some(runtime) = self.guided_capture.as_mut()
+            && runtime.state == GuidedCaptureState::Paused
+        {
+            runtime.state = GuidedCaptureState::Running;
+            runtime.reset_hold();
+            self.auto_capture_enabled = true;
+            self.status = runtime.current_step_label();
+        }
+    }
+
+    fn stop_guided_capture(&mut self, message: impl Into<String>) {
+        if self.auto_capture.pending.as_ref().is_some_and(|candidate| {
+            matches!(
+                candidate.intent,
+                CandidateIntent::GuidedMeasure | CandidateIntent::GuidedCapture
+            )
+        }) {
+            self.cancel_auto_candidate("Guided Auto Capture candidate cancelled.");
+        }
+        self.guided_capture = None;
+        if self.auto_capture_trigger_mode == AutoCaptureTriggerMode::GuidedPresetPose {
+            self.auto_capture_enabled = false;
+        }
+        self.status = message.into();
     }
 
     /// 普通 Dataset PnP 绑定当前 GUI K/D12 和各自图片尺寸，不继承 live source acquisition key。
@@ -1394,6 +3685,8 @@ impl CalibrationWorkspace {
     }
 
     pub(crate) fn stream_disconnected(&mut self, session_id: &StreamSessionId) {
+        self.pts_bridge_cache
+            .retain(|key, _| key.stream_id != *session_id);
         let pending_matches = self
             .auto_capture
             .pending
@@ -1446,6 +3739,277 @@ impl CalibrationWorkspace {
         }
     }
 
+    fn authoritative_yuv_lookup_for_rtsp_identity(
+        &mut self,
+        host: &str,
+        tcp_port: u16,
+        rtsp_identity: &StreamFrameIdentity,
+    ) -> Result<AuthoritativeYuvLookup, String> {
+        if let Ok(lookup) = AuthoritativeYuvLookup::from_rtsp_identity(rtsp_identity) {
+            return Ok(lookup);
+        }
+        let source_pts_90k = source_pts_to_90k(&rtsp_identity.source_pts)?;
+        let key = RtspPtsBridgeKey {
+            stream_id: rtsp_identity.stream_id.clone(),
+            channel: rtsp_identity.channel,
+        };
+        let now_ns = host_monotonic_time_ns();
+        let sample = self
+            .pts_bridge_cache
+            .get(&key)
+            .filter(|sample| {
+                now_ns.saturating_sub(sample.updated_at_host_ns) <= X5_RTSP_PTS_BRIDGE_MAX_AGE_NS
+            })
+            .cloned()
+            .map(Ok)
+            .unwrap_or_else(|| {
+                self.refresh_rtsp_pts_bridge_sample(host, tcp_port, rtsp_identity, source_pts_90k)
+            })?;
+        let target_pts_90k = sample.target_rtsp_pts_90k(source_pts_90k)?;
+        tracing::warn!(
+            operation = "x5_rtsp_pts_bridge",
+            channel = rtsp_identity.channel,
+            frame_sequence = rtsp_identity.frame_sequence,
+            source_pts_90k,
+            target_rtsp_pts_90k = target_pts_90k,
+            bridge_offset_90k = sample.offset_90k,
+            sampled_frame_sequence = sample.sampled_frame_sequence,
+            sampled_source_pts_90k = sample.source_pts_90k,
+            sampled_driver_rtsp_pts_90k = sample.driver_rtsp_pts_90k,
+            tolerance_90k = X5_RTSP_PTS_BRIDGE_TOLERANCE_90K,
+            "X5 authoritative YUV using experimental RTSP PTS bridge"
+        );
+        Ok(AuthoritativeYuvLookup::RtspPts90k {
+            pts_90k: target_pts_90k,
+            tolerance_90k: X5_RTSP_PTS_BRIDGE_TOLERANCE_90K,
+            source_pts_90k,
+            bridge_offset_90k: sample.offset_90k,
+        })
+    }
+
+    fn refresh_rtsp_pts_bridge_sample(
+        &mut self,
+        host: &str,
+        tcp_port: u16,
+        rtsp_identity: &StreamFrameIdentity,
+        source_pts_90k: u64,
+    ) -> Result<RtspPtsBridgeSample, String> {
+        let status = x5_tcp_client::status(host, tcp_port)
+            .map_err(|error| format!("RTSP PTS bridge status query failed: {error}"))?;
+        let ring = status
+            .rings
+            .iter()
+            .find(|ring| ring.channel == rtsp_identity.channel)
+            .ok_or_else(|| {
+                format!(
+                    "RTSP PTS bridge missing CH{} ring status",
+                    rtsp_identity.channel
+                )
+            })?;
+        if ring.valid == 0 || ring.last_rtsp_pts_90k == 0 {
+            return Err(format!(
+                "RTSP PTS bridge needs driver rtsp_pts_90k status, got CH{} valid={} last_rtsp_pts_90k={}",
+                rtsp_identity.channel, ring.valid, ring.last_rtsp_pts_90k
+            ));
+        }
+        let sample = RtspPtsBridgeSample {
+            source_pts_90k,
+            driver_rtsp_pts_90k: ring.last_rtsp_pts_90k,
+            offset_90k: i128::from(ring.last_rtsp_pts_90k) - i128::from(source_pts_90k),
+            sampled_frame_sequence: rtsp_identity.frame_sequence,
+            updated_at_host_ns: host_monotonic_time_ns(),
+        };
+        self.pts_bridge_cache.insert(
+            RtspPtsBridgeKey {
+                stream_id: rtsp_identity.stream_id.clone(),
+                channel: rtsp_identity.channel,
+            },
+            sample.clone(),
+        );
+        tracing::warn!(
+            operation = "x5_rtsp_pts_bridge",
+            channel = rtsp_identity.channel,
+            frame_sequence = rtsp_identity.frame_sequence,
+            source_pts_90k,
+            driver_rtsp_pts_90k = sample.driver_rtsp_pts_90k,
+            bridge_offset_90k = sample.offset_90k,
+            ring_valid = ring.valid,
+            ring_depth = ring.depth,
+            "X5 RTSP PTS bridge sample refreshed from TCP ring tail"
+        );
+        Ok(sample)
+    }
+
+    fn remember_successful_rtsp_pts_bridge(
+        &mut self,
+        rtsp_identity: &StreamFrameIdentity,
+        source_pts_90k: u64,
+        driver_rtsp_pts_90k: u64,
+    ) {
+        if driver_rtsp_pts_90k == 0 {
+            return;
+        }
+        let sample = RtspPtsBridgeSample {
+            source_pts_90k,
+            driver_rtsp_pts_90k,
+            offset_90k: i128::from(driver_rtsp_pts_90k) - i128::from(source_pts_90k),
+            sampled_frame_sequence: rtsp_identity.frame_sequence,
+            updated_at_host_ns: host_monotonic_time_ns(),
+        };
+        self.pts_bridge_cache.insert(
+            RtspPtsBridgeKey {
+                stream_id: rtsp_identity.stream_id.clone(),
+                channel: rtsp_identity.channel,
+            },
+            sample,
+        );
+    }
+
+    fn queue_authoritative_yuv_candidate(
+        &mut self,
+        source: &CalibrationSource,
+        rtsp_identity: &StreamFrameIdentity,
+        intent: CandidateIntent,
+        guided_step_index: Option<usize>,
+        pose_request: Option<PoseEstimationRequest>,
+    ) -> Result<AutoCandidateId, String> {
+        let (store, acquisition_key, image_size, authoritative_capture) = match &source.kind {
+            CalibrationSourceKind::Stream(stream) => (
+                stream.store.clone(),
+                stream.acquisition_key.clone(),
+                stream.image_size,
+                stream.authoritative_capture.clone(),
+            ),
+            CalibrationSourceKind::File { .. } => {
+                return Err("RTSP precheck source is not stream-backed".to_owned());
+            }
+        };
+        let Some(authoritative_capture) = authoritative_capture else {
+            return Err("live source has no authoritative YUV capture provider".to_owned());
+        };
+        let LiveAuthoritativeCapture::X5233TcpYuv { host, tcp_port } = authoritative_capture;
+        let lookup = self
+            .authoritative_yuv_lookup_for_rtsp_identity(&host, tcp_port, rtsp_identity)
+            .map_err(|error| {
+                tracing::warn!(
+                    operation = "x5_authoritative_yuv_lookup",
+                    channel = rtsp_identity.channel,
+                    frame_sequence = rtsp_identity.frame_sequence,
+                    source_pts = ?rtsp_identity.source_pts,
+                    error = %error,
+                    "X5 authoritative YUV lookup could not derive frame identity"
+                );
+                error
+            })?;
+        let lookup_label = lookup.label();
+        let lookup_value = lookup.value();
+        let snapshot = match &lookup {
+            AuthoritativeYuvLookup::FrameId(frame_id) => {
+                x5_tcp_client::capture_yuv_snapshot_by_frame_id(
+                    &host,
+                    tcp_port,
+                    rtsp_identity.channel,
+                    *frame_id,
+                )
+            }
+            AuthoritativeYuvLookup::TimestampNs(timestamp_ns) => {
+                x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
+                    &host,
+                    tcp_port,
+                    rtsp_identity.channel,
+                    *timestamp_ns,
+                )
+            }
+            AuthoritativeYuvLookup::RtspPts90k {
+                pts_90k,
+                tolerance_90k,
+                ..
+            } => x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
+                &host,
+                tcp_port,
+                rtsp_identity.channel,
+                *pts_90k,
+                *tolerance_90k,
+            ),
+        }
+        .map_err(|error| {
+            let ring_diagnostics =
+                query_x5_authoritative_yuv_ring_diagnostics(&host, tcp_port, rtsp_identity.channel);
+            let message = format!(
+                "X5 authoritative YUV lookup by {lookup_label} failed: {error}; current {ring_diagnostics}"
+            );
+            tracing::warn!(
+                operation = "x5_authoritative_yuv_lookup",
+                host = %host,
+                tcp_port,
+                channel = rtsp_identity.channel,
+                lookup = lookup_label,
+                lookup_value,
+                error = %error,
+                ring = %ring_diagnostics,
+                "X5 authoritative YUV lookup failed"
+            );
+            message
+        })?;
+        if snapshot.channel != rtsp_identity.channel {
+            return Err(format!(
+                "X5 authoritative YUV channel {} does not match RTSP channel {}",
+                snapshot.channel, rtsp_identity.channel
+            ));
+        }
+        if snapshot.width != image_size.width || snapshot.height != image_size.height {
+            return Err(format!(
+                "X5 authoritative YUV geometry {}x{} does not match RTSP precheck {}x{}",
+                snapshot.width, snapshot.height, image_size.width, image_size.height
+            ));
+        }
+        if let AuthoritativeYuvLookup::RtspPts90k { source_pts_90k, .. } = &lookup {
+            self.remember_successful_rtsp_pts_bridge(
+                rtsp_identity,
+                *source_pts_90k,
+                snapshot.rtsp_pts_90k,
+            );
+        }
+
+        let FrozenStreamInput { source, encoded } = freeze_authoritative_yuv_input(
+            snapshot,
+            store,
+            acquisition_key.clone(),
+            rtsp_identity,
+            &lookup,
+        )?;
+        let frame_identity = match &source.kind {
+            CalibrationSourceKind::Stream(stream) => stream.identity.clone(),
+            CalibrationSourceKind::File { .. } => {
+                return Err("X5 authoritative YUV candidate is not stream-backed".to_owned());
+            }
+        };
+        let candidate_id = AutoCandidateId::new(self.auto_capture.next_candidate_id);
+        self.auto_capture.next_candidate_id =
+            self.auto_capture.next_candidate_id.wrapping_add(1).max(1);
+        let token = self
+            .session
+            .bind_auto_candidate(
+                candidate_id,
+                frame_identity,
+                encoded.source_revision.clone(),
+                source.display_name.clone(),
+                Some(acquisition_key),
+            )
+            .map_err(|error| format!("X5 authoritative YUV candidate rejected: {error}"))?;
+        self.auto_capture.pending = Some(PendingCandidate {
+            token,
+            intent,
+            source,
+            encoded: Some(encoded),
+            cancellation: CalibrationCancellation::default(),
+            pose_request,
+            guided_step_index,
+            state: AutoCandidateState::Queued,
+        });
+        Ok(candidate_id)
+    }
+
     fn finalize_candidate(
         &mut self,
         context: Option<&egui::Context>,
@@ -1464,6 +4028,8 @@ impl CalibrationWorkspace {
             intent,
             source,
             cancellation,
+            pose_request,
+            guided_step_index,
             ..
         } = candidate;
         cancellation.cancel();
@@ -1520,6 +4086,47 @@ impl CalibrationWorkspace {
                             }
                         };
                         let gain = assessment.constraint_gain;
+                        if let Some(baseline) = self.session.auto_capture_baseline()
+                            && assessment.constraint_gain < baseline.criteria.minimum_auto_gain
+                        {
+                            self.auto_capture.last_assessment =
+                                self.session.assess_auto_admission(None).ok();
+                            self.status = format!(
+                                "Automatic RTSP precheck rejected: candidate gain {} is below minimum {}.",
+                                format_gain(gain),
+                                format_gain(baseline.criteria.minimum_auto_gain)
+                            );
+                            return;
+                        }
+                        if matches!(
+                            &source.kind,
+                            CalibrationSourceKind::Stream(stream)
+                                if stream.authoritative_capture.is_some()
+                        ) {
+                            match self.queue_authoritative_yuv_candidate(
+                                &source,
+                                token.frame_identity(),
+                                intent,
+                                guided_step_index,
+                                pose_request.clone(),
+                            ) {
+                                Ok(yuv_candidate_id) => {
+                                    self.auto_capture.last_assessment = Some(assessment.clone());
+                                    self.status = format!(
+                                        "RTSP precheck passed (gain {}); queued X5 YUV candidate {} for same-frame validation.",
+                                        format_gain(gain),
+                                        yuv_candidate_id.get()
+                                    );
+                                }
+                                Err(error) => {
+                                    self.auto_capture.last_assessment = Some(assessment.clone());
+                                    self.status = format!(
+                                        "Automatic RTSP precheck passed, but X5 YUV confirmation was not queued: {error}"
+                                    );
+                                }
+                            }
+                            return;
+                        }
                         let commit = AutoCandidateCommit::new(
                             token,
                             source_revision,
@@ -1567,6 +4174,229 @@ impl CalibrationWorkspace {
                             }
                         }
                     }
+                    CandidateIntent::GuidedMeasure => {
+                        let Some(pnp_observation) = pnp_observation else {
+                            if let Some(runtime) = self.guided_capture.as_mut() {
+                                runtime.reset_hold();
+                            }
+                            self.status =
+                                "Guided pose rejected: PnP evidence was not produced.".to_owned();
+                            return;
+                        };
+                        let Some(runtime) = self.guided_capture.as_ref() else {
+                            self.status =
+                                "Guided pose result ignored because the guided session stopped."
+                                    .to_owned();
+                            return;
+                        };
+                        let expected_step = runtime.current_step;
+                        if guided_step_index != Some(expected_step) {
+                            self.status =
+                                "Guided pose result ignored because its step is stale.".to_owned();
+                            return;
+                        }
+                        let Some(target) = runtime.current_target().cloned() else {
+                            self.status =
+                                "Guided pose result ignored because the preset is complete."
+                                    .to_owned();
+                            return;
+                        };
+                        let assessment = match assess_guided_pose(
+                            expected_step,
+                            &target,
+                            &detection,
+                            &pnp_observation,
+                            runtime.binding.board,
+                            &runtime.binding.initial_intrinsics,
+                            runtime.binding.image_size,
+                        ) {
+                            Ok(assessment) => assessment,
+                            Err(error) => {
+                                if let Some(runtime) = self.guided_capture.as_mut() {
+                                    runtime.reset_hold();
+                                }
+                                self.status = format!("Guided pose rejected: {error}");
+                                return;
+                            }
+                        };
+                        let matched = assessment.matched;
+                        let score = assessment.pose_error_score;
+                        let reason = assessment.reason.clone();
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.update_hold(assessment);
+                            if matched && runtime.capture_requested {
+                                self.status = format!(
+                                    "Guided pose matched for step {} (error {:.2}); capturing.",
+                                    expected_step + 1,
+                                    score
+                                );
+                            } else if matched {
+                                self.status = format!(
+                                    "Guided pose matched for step {} (error {:.2}); hold {}/{}.",
+                                    expected_step + 1,
+                                    score,
+                                    runtime.hold_frames,
+                                    GUIDED_CAPTURE_HOLD_FRAMES
+                                );
+                            } else {
+                                self.status = format!(
+                                    "Guided pose waiting for step {}: {}.",
+                                    expected_step + 1,
+                                    reason
+                                        .unwrap_or_else(|| "pose error above threshold".to_owned())
+                                );
+                            }
+                        }
+                    }
+                    CandidateIntent::GuidedCapture => {
+                        let Some(pnp_observation) = pnp_observation else {
+                            if let Some(runtime) = self.guided_capture.as_mut() {
+                                runtime.reset_hold();
+                            }
+                            self.status = "Guided capture rejected: PnP evidence was not produced."
+                                .to_owned();
+                            return;
+                        };
+                        let Some(runtime) = self.guided_capture.as_ref() else {
+                            self.status =
+                                "Guided capture ignored because the guided session stopped."
+                                    .to_owned();
+                            return;
+                        };
+                        let expected_step = runtime.current_step;
+                        if guided_step_index != Some(expected_step) {
+                            self.status =
+                                "Guided capture ignored because its step is stale.".to_owned();
+                            return;
+                        }
+                        let Some(target) = runtime.current_target().cloned() else {
+                            self.status =
+                                "Guided capture ignored because the preset is complete.".to_owned();
+                            return;
+                        };
+                        let assessment = match assess_guided_pose(
+                            expected_step,
+                            &target,
+                            &detection,
+                            &pnp_observation,
+                            runtime.binding.board,
+                            &runtime.binding.initial_intrinsics,
+                            runtime.binding.image_size,
+                        ) {
+                            Ok(assessment) => assessment,
+                            Err(error) => {
+                                if let Some(runtime) = self.guided_capture.as_mut() {
+                                    runtime.reset_hold();
+                                }
+                                self.status = format!("Guided capture rejected: {error}");
+                                return;
+                            }
+                        };
+                        if !assessment.matched {
+                            let reason = assessment
+                                .reason
+                                .clone()
+                                .unwrap_or_else(|| "pose error above threshold".to_owned());
+                            if let Some(runtime) = self.guided_capture.as_mut() {
+                                runtime.last_assessment = Some(assessment);
+                                runtime.reset_hold();
+                            }
+                            self.status = format!(
+                                "Guided capture rejected for step {}: {reason}.",
+                                expected_step + 1
+                            );
+                            return;
+                        }
+                        if matches!(
+                            &source.kind,
+                            CalibrationSourceKind::Stream(stream)
+                                if stream.authoritative_capture.is_some()
+                        ) {
+                            match self.queue_authoritative_yuv_candidate(
+                                &source,
+                                token.frame_identity(),
+                                intent,
+                                guided_step_index,
+                                pose_request.clone(),
+                            ) {
+                                Ok(yuv_candidate_id) => {
+                                    self.status = format!(
+                                        "Guided RTSP precheck matched step {}; queued X5 YUV candidate {} for same-frame validation.",
+                                        expected_step + 1,
+                                        yuv_candidate_id.get()
+                                    );
+                                }
+                                Err(error) => {
+                                    self.status = format!(
+                                        "Guided RTSP precheck matched step {}, but X5 YUV confirmation was not queued: {error}",
+                                        expected_step + 1
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        let commit = AutoCandidateCommit::new(
+                            token,
+                            source_revision,
+                            detection.clone(),
+                            pnp_observation.clone(),
+                        );
+                        match self.session.commit_guided_auto_candidate(commit) {
+                            Ok(item_id) => {
+                                let overlay_acquisition_key = match &source.kind {
+                                    CalibrationSourceKind::Stream(stream) => {
+                                        Some(stream.acquisition_key.clone())
+                                    }
+                                    CalibrationSourceKind::File { .. } => None,
+                                };
+                                self.sources.insert(item_id, source);
+                                if let (Some(context), Some(frame)) = (context, preview) {
+                                    self.install_preview(context, item_id, frame);
+                                }
+                                let committed_at_ns = host_monotonic_time_ns();
+                                if let Some(acquisition_key) = overlay_acquisition_key {
+                                    self.auto_capture.last_dataset_overlay =
+                                        Some(DatasetDetectionOverlay {
+                                            item_id,
+                                            detection,
+                                            acquisition_key,
+                                            pnp_observation: Some(pnp_observation),
+                                            committed_at_ns,
+                                        });
+                                }
+                                self.auto_capture.last_assessment =
+                                    self.session.assess_auto_admission(None).ok();
+                                self.auto_capture.last_accepted_at_ns = committed_at_ns;
+                                self.coverage_dirty = true;
+                                if let Some(runtime) = self.guided_capture.as_mut() {
+                                    runtime.advance_after_commit();
+                                    self.status = if runtime.state == GuidedCaptureState::Complete {
+                                        format!(
+                                            "Guided Auto Capture complete; committed dataset item {} as step {}/{}.",
+                                            item_id.get(),
+                                            expected_step + 1,
+                                            runtime.plan.len()
+                                        )
+                                    } else {
+                                        format!(
+                                            "Guided capture committed dataset item {} as step {}; next: {}.",
+                                            item_id.get(),
+                                            expected_step + 1,
+                                            runtime.current_step_label()
+                                        )
+                                    };
+                                }
+                            }
+                            Err(error) => {
+                                if let Some(runtime) = self.guided_capture.as_mut() {
+                                    runtime.reset_hold();
+                                }
+                                self.auto_capture.last_assessment =
+                                    self.session.assess_auto_admission(None).ok();
+                                self.status = format!("Guided capture commit rejected: {error}");
+                            }
+                        }
+                    }
                 }
             }
             CandidateTerminal::Detection(Ok(DetectionProduct {
@@ -1580,6 +4410,18 @@ impl CalibrationWorkspace {
                     }
                     CandidateIntent::AutoCommit => {
                         "Automatic candidate rejected: chessboard not found.".to_owned()
+                    }
+                    CandidateIntent::GuidedMeasure => {
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.reset_hold();
+                        }
+                        "Guided pose rejected: chessboard not found.".to_owned()
+                    }
+                    CandidateIntent::GuidedCapture => {
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.reset_hold();
+                        }
+                        "Guided capture rejected: chessboard not found.".to_owned()
                     }
                 };
             }
@@ -1597,6 +4439,30 @@ impl CalibrationWorkspace {
                     }
                     (CandidateIntent::AutoCommit, false) => {
                         format!("Automatic candidate detection or PnP failed: {error}")
+                    }
+                    (CandidateIntent::GuidedMeasure, true) => {
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.reset_hold();
+                        }
+                        "Guided pose detection cancelled.".to_owned()
+                    }
+                    (CandidateIntent::GuidedMeasure, false) => {
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.reset_hold();
+                        }
+                        format!("Guided pose detection or PnP failed: {error}")
+                    }
+                    (CandidateIntent::GuidedCapture, true) => {
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.reset_hold();
+                        }
+                        "Guided capture cancelled.".to_owned()
+                    }
+                    (CandidateIntent::GuidedCapture, false) => {
+                        if let Some(runtime) = self.guided_capture.as_mut() {
+                            runtime.reset_hold();
+                        }
+                        format!("Guided capture detection or PnP failed: {error}")
                     }
                 };
             }
@@ -1812,21 +4678,92 @@ impl CalibrationWorkspace {
         let (frame, live_source) = live_frame.zip(live_source)?;
         let image_size = CalibrationImageSize::new(frame.width, frame.height).ok()?;
         let acquisition_key = live_source.acquisition_key_for_frame(frame).ok()?;
-        let latest = self.auto_capture.last_dataset_overlay.as_ref()?;
-        if latest.acquisition_key != acquisition_key
-            || latest.detection.image_size != image_size
-            || now_ns.saturating_sub(latest.committed_at_ns) > LATEST_DATASET_OVERLAY_TTL_NS
-        {
+        let guided_target = self.guided_capture.as_ref().and_then(|runtime| {
+            (self.auto_capture_trigger_mode == AutoCaptureTriggerMode::GuidedPresetPose
+                && runtime.binding.source == *live_source
+                && runtime.binding.acquisition_key == acquisition_key
+                && runtime.binding.image_size == image_size
+                && matches!(
+                    runtime.state,
+                    GuidedCaptureState::Running | GuidedCaptureState::Paused
+                ))
+            .then(|| {
+                runtime.current_target().map(|target| {
+                    let current_assessment = runtime
+                        .last_assessment
+                        .as_ref()
+                        .filter(|assessment| assessment.step_index == runtime.current_step);
+                    let pose_arrow =
+                        current_assessment.map(|assessment| ViewerGuidedPoseArrowOverlay {
+                            start_uv: assessment.measurement.pose.center_uv,
+                            end_uv: target.pose.center_uv,
+                            start_xyz: assessment.measurement.pose.xyz,
+                            end_xyz: target.pose.xyz,
+                            z_delta: target.pose.xyz[2] - assessment.measurement.pose.xyz[2],
+                        });
+                    let instruction = current_assessment.map(|assessment| {
+                        guided_pose_instruction_overlay(assessment, target, runtime.hold_frames)
+                    });
+                    let rotation_rings = current_assessment
+                        .map(|assessment| guided_pose_rotation_rings_overlay(assessment, target));
+                    ViewerGuidedPoseOverlay {
+                        center_uv: target.pose.center_uv,
+                        outline_uv: target.outline_uv,
+                        grid_lines: Arc::clone(&target.grid_lines),
+                        rotation_rings,
+                        pose_arrow,
+                        instruction,
+                        matched: current_assessment.is_some_and(|assessment| assessment.matched),
+                    }
+                })
+            })
+            .flatten()
+        });
+        let latest = self
+            .auto_capture
+            .last_dataset_overlay
+            .as_ref()
+            .filter(|latest| {
+                latest.acquisition_key == acquisition_key
+                    && latest.detection.image_size == image_size
+                    && now_ns.saturating_sub(latest.committed_at_ns)
+                        <= LATEST_DATASET_OVERLAY_TTL_NS
+            });
+        let realtime = self
+            .auto_capture
+            .latest_detection
+            .as_ref()
+            .filter(|latest| {
+                latest.acquisition_key == acquisition_key
+                    && latest.detection.image_size == image_size
+                    && now_ns.saturating_sub(latest.completed_at_ns) <= LIVE_DETECTION_MARKER_TTL_NS
+            });
+        if latest.is_none() && guided_target.is_none() && realtime.is_none() {
             return None;
         }
+        let realtime_detection = realtime.and_then(|latest| {
+            let observation = latest.pnp_observation.as_ref()?;
+            let binding = self
+                .live_admission_context
+                .as_ref()
+                .filter(|context| {
+                    context.acquisition_key == acquisition_key && context.image_size == image_size
+                })
+                .and_then(|_| self.session.initial_intrinsics_binding());
+            Some(self.viewer_detection_overlay(&latest.detection, Some(observation), binding))
+        });
         Some(CalibrationViewerPresentation {
-            item_id: latest.item_id,
+            item_id: latest.map(|latest| latest.item_id),
             overlay: CalibrationViewerOverlay {
-                persistent: Some(self.viewer_detection_overlay(
-                    &latest.detection,
-                    latest.pnp_observation.as_ref(),
-                    self.dataset_pnp_binding(image_size).as_ref(),
-                )),
+                persistent: latest.map(|latest| {
+                    self.viewer_detection_overlay(
+                        &latest.detection,
+                        latest.pnp_observation.as_ref(),
+                        self.dataset_pnp_binding(image_size).as_ref(),
+                    )
+                }),
+                realtime_detection,
+                guided_target,
             },
         })
     }
@@ -2280,26 +5217,141 @@ impl CalibrationWorkspace {
             });
         });
         ui.collapsing("Auto Capture", |ui| {
-            let auto_capture_changed = ui
-                .checkbox(&mut self.auto_capture_enabled, "Request RTSP auto capture")
-                .on_hover_text(
-                    "Uses the current displayed source, valid Dataset Acceptance thresholds, and the current K/D12 seed.",
-                )
-                .changed();
-            if auto_capture_changed {
-                self.refresh_runtime_auto_admission();
-                if self.auto_capture_enabled && !self.active_live_admission() {
-                    self.status = "Auto Capture waits for one displayed frame and complete valid acceptance inputs."
-                        .to_owned();
+            let previous_mode = self.auto_capture_trigger_mode;
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Trigger mode");
+                for mode in AutoCaptureTriggerMode::ALL {
+                    ui.selectable_value(&mut self.auto_capture_trigger_mode, mode, mode.label());
+                }
+            });
+            if previous_mode != self.auto_capture_trigger_mode {
+                match previous_mode {
+                    AutoCaptureTriggerMode::DatasetGain => self.auto_capture_enabled = false,
+                    AutoCaptureTriggerMode::GuidedPresetPose => {
+                        self.stop_guided_capture(
+                            "Guided Auto Capture stopped because the trigger mode changed.",
+                        );
+                        self.auto_capture_enabled = false;
+                    }
                 }
             }
-            ui.weak(
-                "Admission is in-memory and source-bound. Valid threshold and K edits take effect immediately.",
-            );
-            if let Some(assessment) = self.auto_capture.last_assessment.as_ref() {
-                self.render_dataset_assessment(ui, assessment);
-            } else {
-                ui.weak("Display a live frame to initialize runtime Dataset Acceptance.");
+            match self.auto_capture_trigger_mode {
+                AutoCaptureTriggerMode::DatasetGain => {
+                    let auto_capture_changed = ui
+                        .checkbox(&mut self.auto_capture_enabled, "Enable Dataset-gain auto capture")
+                        .on_hover_text(
+                            "Preserves the existing flow: captures candidates whose Dataset Acceptance Gain exceeds Minimum auto Gain.",
+                        )
+                        .changed();
+                    if auto_capture_changed {
+                        self.refresh_runtime_auto_admission();
+                        if self.auto_capture_enabled && !self.active_live_admission() {
+                            self.status = "Auto Capture waits for one displayed frame and complete valid acceptance inputs."
+                                .to_owned();
+                        }
+                    }
+                    ui.weak(
+                        "Dataset gain mode uses Minimum auto Gain from Dataset Acceptance. It does not follow preset poses.",
+                    );
+                    if let Some(assessment) = self.auto_capture.last_assessment.as_ref() {
+                        self.render_dataset_assessment(ui, assessment);
+                    } else {
+                        ui.weak("Display a live frame to initialize runtime Dataset Acceptance.");
+                    }
+                }
+                AutoCaptureTriggerMode::GuidedPresetPose => {
+                    ui.weak(
+                        "Guided mode triggers only when the detected board pose matches the current preset pose threshold; Minimum auto Gain is ignored.",
+                    );
+                    let pending_blocks_guided_start = self
+                        .auto_capture
+                        .pending
+                        .as_ref()
+                        .is_some_and(|candidate| candidate.intent != CandidateIntent::PreviewOnly);
+                    let start_enabled = idle
+                        && self.active_live_admission()
+                        && !pending_blocks_guided_start
+                        && self.session.items().len() < MAX_DATASET_ITEMS;
+                    let start_reason = if !idle {
+                        "Wait for the active calibration operation."
+                    } else if pending_blocks_guided_start {
+                        "Wait for the current auto-capture candidate. Live preview detection will be cancelled automatically when Guided starts."
+                    } else if self.session.items().len() >= MAX_DATASET_ITEMS {
+                        "Dataset is full."
+                    } else {
+                        "Display one live frame with valid K/D12 inputs before starting."
+                    };
+                    match self.guided_capture.as_ref().map(|runtime| runtime.state) {
+                        None | Some(GuidedCaptureState::Complete) => {
+                            if ui
+                                .add_enabled(start_enabled, egui::Button::new("Start guided"))
+                                .on_disabled_hover_text(start_reason)
+                                .clicked()
+                            {
+                                self.start_guided_capture();
+                            } else if !start_enabled {
+                                ui.weak(start_reason);
+                            }
+                        }
+                        Some(GuidedCaptureState::Running) => {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Pause").clicked() {
+                                    self.pause_guided_capture();
+                                }
+                                if ui.button("Stop").clicked() {
+                                    self.stop_guided_capture("Guided Auto Capture stopped by user.");
+                                }
+                            });
+                        }
+                        Some(GuidedCaptureState::Paused) => {
+                            ui.horizontal_wrapped(|ui| {
+                                if ui.button("Resume").clicked() {
+                                    self.resume_guided_capture();
+                                }
+                                if ui.button("Stop").clicked() {
+                                    self.stop_guided_capture("Guided Auto Capture stopped by user.");
+                                }
+                            });
+                        }
+                    }
+                    if let Some(runtime) = self.guided_capture.as_ref() {
+                        ui.monospace(runtime.current_step_label());
+                        if let Some(assessment) = runtime.last_assessment.as_ref() {
+                            ui.monospace(format!(
+                                "Pose error {:.2}/{:.2} · hold {}/{}",
+                                assessment.pose_error_score,
+                                GUIDED_POSE_MATCH_SCORE_LIMIT,
+                                runtime.hold_frames,
+                                GUIDED_CAPTURE_HOLD_FRAMES
+                            ));
+                            ui.monospace(format!(
+                                "XYZ {:.3}/{:.3} {:.3}/{:.3} {:.3}/{:.3} · RPY {:.1}°/{:.1}° {:.1}°/{:.1}° {:.1}°/{:.1}°",
+                                assessment.error.x,
+                                GUIDED_POSE_X_TOLERANCE,
+                                assessment.error.y,
+                                GUIDED_POSE_Y_TOLERANCE,
+                                assessment.error.z,
+                                GUIDED_POSE_Z_TOLERANCE,
+                                assessment.error.roll_degrees,
+                                GUIDED_POSE_ROLL_TOLERANCE_DEGREES,
+                                assessment.error.pitch_degrees,
+                                GUIDED_POSE_PITCH_TOLERANCE_DEGREES,
+                                assessment.error.yaw_degrees,
+                                GUIDED_POSE_YAW_TOLERANCE_DEGREES
+                            ));
+                            if let Some(reason) = assessment.reason.as_deref() {
+                                ui.weak(reason);
+                            }
+                        } else {
+                            ui.weak("Start guided capture, then move the board into the displayed target pose.");
+                        }
+                    }
+                    if let Some(assessment) = self.auto_capture.last_assessment.as_ref() {
+                        ui.collapsing("Advanced Dataset diagnostics", |ui| {
+                            self.render_dataset_assessment(ui, assessment);
+                        });
+                    }
+                }
             }
         });
         let mut intrinsics_changed = false;
@@ -3094,6 +6146,11 @@ impl CalibrationWorkspace {
                     "Live detection candidate cancelled because the board specification changed.",
                 );
             }
+            if self.guided_capture.is_some() {
+                self.stop_guided_capture(
+                    "Guided Auto Capture stopped because the board specification changed.",
+                );
+            }
             self.refresh_runtime_auto_admission();
         }
         if corner_layout_changed {
@@ -3512,6 +6569,12 @@ impl CalibrationWorkspace {
                         }
                         CandidateIntent::AutoCommit => {
                             format!("Detecting automatic candidate {}.", token.id().get())
+                        }
+                        CandidateIntent::GuidedMeasure => {
+                            format!("Detecting guided pose measurement {}.", token.id().get())
+                        }
+                        CandidateIntent::GuidedCapture => {
+                            format!("Detecting guided capture {}.", token.id().get())
                         }
                     };
                 }
@@ -4120,6 +7183,20 @@ impl CalibrationWorkspace {
                         "content_sha256": content_sha256,
                         "encoded_bytes": encoded_bytes,
                     }),
+                    CalibrationInputRevision::EphemeralRaster {
+                        primary_sha256,
+                        primary_bytes,
+                        primary_format,
+                        analysis_sha256,
+                        analysis_encoded_bytes,
+                    } => serde_json::json!({
+                        "kind": "ephemeral_raster",
+                        "primary_sha256": primary_sha256,
+                        "primary_bytes": primary_bytes,
+                        "primary_format": primary_format,
+                        "analysis_sha256": analysis_sha256,
+                        "analysis_encoded_bytes": analysis_encoded_bytes,
+                    }),
                 };
                 let stream_provenance = match &source.kind {
                     CalibrationSourceKind::File { .. } => None,
@@ -4441,27 +7518,8 @@ fn project_board_point_image(
     }
     let x = camera[0] / camera[2];
     let y = camera[1] / camera[2];
-    let distortion = &intrinsics.distortion_coefficients;
-    let coefficient = |index: usize| distortion.get(index).copied().unwrap_or(0.0);
-    let r2 = x * x + y * y;
-    let r4 = r2 * r2;
-    let r6 = r4 * r2;
-    let numerator = 1.0 + coefficient(0) * r2 + coefficient(1) * r4 + coefficient(4) * r6;
-    let denominator = 1.0 + coefficient(5) * r2 + coefficient(6) * r4 + coefficient(7) * r6;
-    if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
-        return None;
-    }
-    let radial = numerator / denominator;
-    let x_distorted = x * radial
-        + 2.0 * coefficient(2) * x * y
-        + coefficient(3) * (r2 + 2.0 * x * x)
-        + coefficient(8) * r2
-        + coefficient(9) * r4;
-    let y_distorted = y * radial
-        + coefficient(2) * (r2 + 2.0 * y * y)
-        + 2.0 * coefficient(3) * x * y
-        + coefficient(10) * r2
-        + coefficient(11) * r4;
+    let [x_distorted, y_distorted] =
+        distort_normalized_point(x, y, &intrinsics.distortion_coefficients)?;
     let matrix = intrinsics.camera_matrix;
     let image_x = matrix[0] * x_distorted + matrix[2];
     let image_y = matrix[4] * y_distorted + matrix[5];
@@ -5150,6 +8208,99 @@ mod tests {
     use std::time::Instant;
 
     #[test]
+    fn x5_authoritative_lookup_rejects_ffmpeg_pts_as_board_timestamp() {
+        let identity = StreamFrameIdentity::known_at(
+            StreamSessionId::new("rtsp-pts-test").unwrap(),
+            0,
+            42,
+            camera_toolbox_app::SourcePts::Known {
+                ticks: 30_000,
+                time_base_numerator: 1,
+                time_base_denominator: 90_000,
+                provenance: camera_toolbox_app::SourcePtsProvenance::FfmpegDecodedFrame,
+            },
+            123,
+        );
+
+        let error = AuthoritativeYuvLookup::from_rtsp_identity(&identity).unwrap_err();
+
+        assert!(error.contains("presentation timing only"));
+        assert!(error.contains("explicit frame_id/timestamp_ns metadata"));
+    }
+
+    #[test]
+    fn x5_rtsp_pts_bridge_converts_source_pts_to_90k() {
+        let ffmpeg_pts = camera_toolbox_app::SourcePts::Known {
+            ticks: 500,
+            time_base_numerator: 1,
+            time_base_denominator: 1_000,
+            provenance: camera_toolbox_app::SourcePtsProvenance::FfmpegDecodedFrame,
+        };
+
+        assert_eq!(source_pts_to_90k(&ffmpeg_pts).unwrap(), 45_000);
+    }
+
+    #[test]
+    fn x5_rtsp_pts_bridge_applies_cached_offset() {
+        let sample = RtspPtsBridgeSample {
+            source_pts_90k: 30_000,
+            driver_rtsp_pts_90k: 1_030_000,
+            offset_90k: 1_000_000,
+            sampled_frame_sequence: 7,
+            updated_at_host_ns: 0,
+        };
+
+        assert_eq!(sample.target_rtsp_pts_90k(31_527).unwrap(), 1_031_527);
+    }
+    #[test]
+    fn x5_authoritative_ring_diagnostics_formats_status_range() {
+        let status = x5_tcp_client::X5DriverStatus {
+            camera_running: true,
+            rtsp_started: true,
+            rtsp_tx_enabled: true,
+            rtsp_requested_enabled: true,
+            rtsp_control_busy: false,
+            rtsp_pending_action: String::new(),
+            rtsp_last_error: 0,
+            rtsp_action_id: 0,
+            rtsp_last_message: String::new(),
+            rtsp_channels: Vec::new(),
+            rings: vec![x5_tcp_client::X5RingStatus {
+                channel: 0,
+                depth: 24,
+                valid: 24,
+                write_index: 5,
+                min_frame_id: 10,
+                max_frame_id: 33,
+                last_frame_id: 33,
+                min_timestamp_ns: 37_906_100_000,
+                max_timestamp_ns: 37_906_777_777,
+                last_timestamp_ns: 37_906_777_777,
+                last_rtsp_timestamp_us: 42_118_642,
+                last_rtsp_pts_90k: 3_790_677,
+                min_rtsp_pts_90k: 3_790_610,
+                max_rtsp_pts_90k: 3_790_677,
+                retention_ns: 677_777,
+                dropped: 2,
+                evicted: 9,
+            }],
+            fps: Some(60),
+            bitrate_kbps: Some(6_000),
+            pipeline_config_version: Some(1),
+        };
+
+        let diagnostics = format_x5_authoritative_yuv_ring_diagnostics(&status, 0);
+
+        assert!(diagnostics.contains("ring_valid=24/24"));
+        assert!(diagnostics.contains("ring_frame_id=10..33"));
+        assert!(diagnostics.contains("ring_timestamp_ns=37906100000..37906777777"));
+        assert!(diagnostics.contains("ring_rtsp_pts_90k=3790610..3790677"));
+        assert!(diagnostics.contains("ring_last_rtsp_pts_90k=3790677"));
+        assert!(diagnostics.contains("ring_retention_ns=677777"));
+        assert!(diagnostics.contains("ring_evicted=9"));
+        assert!(diagnostics.contains("ring_dropped=2"));
+    }
+    #[test]
     fn loaded_yaml_result_becomes_active_without_dataset_calibration() {
         let context = egui::Context::default();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
@@ -5290,6 +8441,431 @@ mod tests {
         assert!((eeprom_fx - 878.7023_f32).abs() < 0.0001, "fx={eeprom_fx}");
     }
 
+    fn guided_test_detection(center_uv: [f64; 2], scale: f64) -> ChessboardDetection {
+        let image_size = CalibrationImageSize::new(1000, 800).unwrap();
+        let side = (scale * f64::from(image_size.width.min(image_size.height))) as f32;
+        let center_x = (center_uv[0] * f64::from(image_size.width)) as f32;
+        let center_y = (center_uv[1] * f64::from(image_size.height)) as f32;
+        let half = side * 0.5;
+        ChessboardDetection {
+            image_size,
+            corners: vec![
+                CalibrationPoint::new(center_x - half, center_y - half),
+                CalibrationPoint::new(center_x + half, center_y - half),
+                CalibrationPoint::new(center_x + half, center_y + half),
+                CalibrationPoint::new(center_x - half, center_y + half),
+            ],
+        }
+    }
+
+    fn guided_test_rotation_vector(tilt_degrees: f64, azimuth_degrees: f64) -> [f64; 3] {
+        let tilt = tilt_degrees.to_radians();
+        if tilt.abs() <= f64::EPSILON {
+            return [0.0; 3];
+        }
+        let azimuth = azimuth_degrees.to_radians();
+        [-azimuth.sin() * tilt, azimuth.cos() * tilt, 0.0]
+    }
+
+    fn guided_test_pnp(
+        center_uv: [f64; 2],
+        scale: f64,
+        tilt_degrees: f64,
+        azimuth_degrees: f64,
+        reprojection_rmse: f64,
+        max_reprojection_error: f64,
+    ) -> PnPObservation {
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let intrinsics = guided_test_intrinsics();
+        let image_size = guided_test_image_size();
+        let rotation = guided_pose_rotation(tilt_degrees, azimuth_degrees);
+        let translation = guided_pose_target_translation(
+            board,
+            center_uv,
+            scale,
+            rotation,
+            &intrinsics,
+            image_size,
+        )
+        .unwrap();
+        let pose = guided_pose_6dof_from_rotation_translation(
+            board,
+            rotation,
+            translation,
+            &intrinsics,
+            image_size,
+        )
+        .unwrap();
+        PnPObservation {
+            binding_digest: SnapshotHash::digest_bytes(b"guided-pose-test"),
+            rotation_vector: guided_test_rotation_vector(tilt_degrees, azimuth_degrees),
+            translation_vector: translation,
+            depth: pose.xyz[2],
+            minimum_board_depth: pose.xyz[2],
+            maximum_board_depth: pose.xyz[2],
+            tilt_degrees,
+            azimuth_degrees,
+            reprojection_rmse,
+            max_reprojection_error,
+        }
+    }
+
+    fn guided_test_image_size() -> CalibrationImageSize {
+        CalibrationImageSize::new(1000, 800).unwrap()
+    }
+
+    fn guided_test_intrinsics() -> InitialIntrinsics {
+        InitialIntrinsics {
+            camera_matrix: [900.0, 0.0, 500.0, 0.0, 900.0, 400.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        }
+    }
+
+    fn guided_test_target(
+        center_uv: [f64; 2],
+        scale: f64,
+        tilt_degrees: f64,
+        azimuth_degrees: f64,
+    ) -> GuidedPoseTarget {
+        let intrinsics = guided_test_intrinsics();
+        let projection = guided_pose_grid_projection(
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            center_uv,
+            scale,
+            tilt_degrees,
+            azimuth_degrees,
+            &intrinsics,
+            guided_test_image_size(),
+        )
+        .unwrap();
+        GuidedPoseTarget {
+            label: "test",
+            pose: projection.pose,
+            tolerance: GuidedPoseTolerance::default(),
+            outline_uv: projection.outline_uv,
+            grid_lines: projection.grid_lines,
+        }
+    }
+
+    fn guided_test_target_depth(
+        _board: BoardSpec,
+        target: &GuidedPoseTarget,
+        _intrinsics: &InitialIntrinsics,
+        _image_size: CalibrationImageSize,
+    ) -> f64 {
+        target.pose.xyz[2]
+    }
+
+    fn guided_test_target_normal(target: &GuidedPoseTarget) -> [f64; 3] {
+        [
+            target.pose.rotation[0][2],
+            target.pose.rotation[1][2],
+            target.pose.rotation[2][2],
+        ]
+    }
+
+    #[test]
+    fn guided_rotation_rings_report_signed_errors_from_current_pose() {
+        let target = guided_test_target([0.50, 0.50], 0.50, 0.0, 0.0);
+        let assessment = assess_guided_pose(
+            0,
+            &target,
+            &guided_test_detection([0.48, 0.52], 0.50),
+            &guided_test_pnp([0.48, 0.52], 0.50, 12.0, 45.0, 0.8, 2.0),
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+
+        let rings = guided_pose_rotation_rings_overlay(&assessment, &target);
+
+        assert_eq!(rings.center_uv, assessment.measurement.pose.center_uv);
+        assert_eq!(rings.roll.label, "ROLL");
+        assert_eq!(rings.pitch.label, "PITCH");
+        assert_eq!(rings.yaw.label, "YAW");
+        assert_eq!(
+            rings.roll.tolerance_degrees,
+            GUIDED_POSE_ROLL_TOLERANCE_DEGREES
+        );
+        assert!((rings.roll.error_degrees.abs() - assessment.error.roll_degrees).abs() < 1.0e-9);
+        assert!((rings.pitch.error_degrees.abs() - assessment.error.pitch_degrees).abs() < 1.0e-9);
+        assert!((rings.yaw.error_degrees.abs() - assessment.error.yaw_degrees).abs() < 1.0e-9);
+        assert!(
+            rings.roll.error_degrees.abs()
+                + rings.pitch.error_degrees.abs()
+                + rings.yaw.error_degrees.abs()
+                > 1.0
+        );
+    }
+
+    #[test]
+    fn guided_instruction_hud_reports_dominant_board_move_and_hold() {
+        let target = guided_test_target([0.50, 0.50], 0.50, 0.0, 0.0);
+        let shifted = assess_guided_pose(
+            0,
+            &target,
+            &guided_test_detection([0.25, 0.50], 0.50),
+            &guided_test_pnp([0.25, 0.50], 0.50, 0.0, 0.0, 0.8, 2.0),
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+
+        let shifted_instruction = guided_pose_instruction_overlay(&shifted, &target, 0);
+        assert!(!shifted_instruction.matched);
+        assert_eq!(shifted_instruction.primary, "MOVE BOARD RIGHT");
+        assert!(shifted_instruction.secondary.contains("pose error"));
+
+        let aligned = assess_guided_pose(
+            0,
+            &target,
+            &guided_test_detection([0.50, 0.50], 0.50),
+            &guided_test_pnp([0.50, 0.50], 0.50, 0.0, 0.0, 0.8, 2.0),
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+        let hold_instruction = guided_pose_instruction_overlay(&aligned, &target, 2);
+
+        assert!(hold_instruction.matched);
+        assert_eq!(hold_instruction.primary, "HOLD STILL");
+        assert!(hold_instruction.secondary.contains("hold 2/4"));
+    }
+
+    #[test]
+    fn guided_pose_assessment_matches_preset_thresholds_and_wraps_yaw() {
+        let target = guided_test_target([0.50, 0.50], 0.50, 20.0, 359.0);
+        let detection = guided_test_detection([0.50, 0.50], 0.50);
+        let pnp = guided_test_pnp([0.50, 0.50], 0.50, 24.0, 1.0, 0.8, 2.0);
+
+        let assessment = assess_guided_pose(
+            0,
+            &target,
+            &detection,
+            &pnp,
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+
+        assert!(assessment.matched, "{assessment:?}");
+        assert!(assessment.pose_error_score <= 1.0, "{assessment:?}");
+        assert!(assessment.error.yaw_degrees <= GUIDED_POSE_YAW_TOLERANCE_DEGREES);
+    }
+
+    #[test]
+    fn guided_pose_assessment_accepts_chessboard_half_turn_yaw_ambiguity() {
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let target = guided_test_target([0.50, 0.50], 0.50, 0.0, 0.0);
+        let center = guided_pose_inner_center_point(board);
+        let rotated_center = [-center[0], -center[1], center[2]];
+        let translation = [
+            target.pose.xyz[0] - rotated_center[0],
+            target.pose.xyz[1] - rotated_center[1],
+            target.pose.xyz[2] - rotated_center[2],
+        ];
+        let pnp = PnPObservation {
+            binding_digest: SnapshotHash::digest_bytes(b"guided-pose-half-turn-test"),
+            rotation_vector: [0.0, 0.0, std::f64::consts::PI],
+            translation_vector: translation,
+            depth: target.pose.xyz[2],
+            minimum_board_depth: target.pose.xyz[2],
+            maximum_board_depth: target.pose.xyz[2],
+            tilt_degrees: 0.0,
+            azimuth_degrees: 0.0,
+            reprojection_rmse: 0.8,
+            max_reprojection_error: 2.0,
+        };
+
+        let assessment = assess_guided_pose(
+            0,
+            &target,
+            &guided_test_detection([0.50, 0.50], 0.50),
+            &pnp,
+            board,
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+
+        assert!(assessment.matched, "{assessment:?}");
+        assert!(
+            assessment.error.yaw_degrees <= 1.0e-9,
+            "half-turn chessboard ambiguity must not report 180° yaw: {assessment:?}"
+        );
+    }
+
+    #[test]
+    fn guided_pose_assessment_rejects_6dof_error_without_pnp_rmse_gate() {
+        let target = guided_test_target([0.50, 0.50], 0.50, 20.0, 90.0);
+        let far_detection = guided_test_detection([0.80, 0.50], 0.50);
+        let far_pnp = guided_test_pnp([0.80, 0.50], 0.50, 20.0, 90.0, 0.8, 2.0);
+
+        let pose_rejected = assess_guided_pose(
+            0,
+            &target,
+            &far_detection,
+            &far_pnp,
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+        assert!(!pose_rejected.matched);
+        assert!(pose_rejected.pose_error_score > 1.0);
+
+        let noisy_but_aligned = assess_guided_pose(
+            0,
+            &target,
+            &guided_test_detection([0.50, 0.50], 0.50),
+            &guided_test_pnp([0.50, 0.50], 0.50, 20.0, 90.0, 999.0, 999.0),
+            BoardSpec::new(11, 8, 40.0).unwrap(),
+            &guided_test_intrinsics(),
+            guided_test_image_size(),
+        )
+        .unwrap();
+        assert!(
+            noisy_but_aligned.matched,
+            "Guided pose should ignore PnP RMSE/max reprojection gates: {noisy_but_aligned:?}"
+        );
+    }
+
+    #[test]
+    fn guided_pose_overlay_projects_complete_perspective_chessboard_grid() {
+        let intrinsics = guided_test_intrinsics();
+        let image_size = guided_test_image_size();
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let plan = standard_guided_pose_plan(board, &intrinsics, image_size).unwrap();
+
+        assert_eq!(plan.len(), 25);
+
+        let target_tilts = plan
+            .iter()
+            .map(|target| {
+                let normal = guided_test_target_normal(target);
+                normal[0]
+                    .hypot(normal[1])
+                    .atan2(normal[2])
+                    .to_degrees()
+                    .round()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 0.0).count(), 1);
+        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 12.0).count(), 8);
+        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 20.0).count(), 8);
+        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 28.0).count(), 8);
+
+        let mut minimum_depth = f64::INFINITY;
+        let mut maximum_depth = f64::NEG_INFINITY;
+        let mut xyz_min = [f64::INFINITY; 3];
+        let mut xyz_max = [f64::NEG_INFINITY; 3];
+        for target in &plan {
+            let depth = guided_test_target_depth(board, target, &intrinsics, image_size);
+            minimum_depth = minimum_depth.min(depth);
+            maximum_depth = maximum_depth.max(depth);
+            for axis in 0..3 {
+                xyz_min[axis] = xyz_min[axis].min(target.pose.xyz[axis]);
+                xyz_max[axis] = xyz_max[axis].max(target.pose.xyz[axis]);
+            }
+            assert!(
+                (680.0..=950.0).contains(&depth),
+                "guided target '{}' depth must stay inside 680..950: {depth:.3}",
+                target.label
+            );
+            assert!(
+                target
+                    .pose
+                    .rpy_degrees
+                    .iter()
+                    .all(|value| value.abs() <= 30.0),
+                "guided target '{}' RPY must stay within ±30°: {:?}",
+                target.label,
+                target.pose.rpy_degrees
+            );
+        }
+        assert!(
+            minimum_depth <= 710.0 && maximum_depth >= 920.0,
+            "guided depth distribution should cover the easy 680..950 band: {minimum_depth:.3}..{maximum_depth:.3}"
+        );
+        for axis in 0..3 {
+            let range = xyz_max[axis] - xyz_min[axis];
+            assert!(
+                range <= 500.0,
+                "guided camera-relative translation axis {axis} must stay inside a 50 cm cube: {range:.3}"
+            );
+        }
+
+        for pair in plan.windows(2) {
+            let center_step = (f64::from(pair[0].pose.center_uv[0] - pair[1].pose.center_uv[0]))
+                .abs()
+                .max(f64::from(pair[0].pose.center_uv[1] - pair[1].pose.center_uv[1]).abs());
+            assert!(
+                center_step <= 0.10,
+                "guided center step too large: {center_step:.3}"
+            );
+            let translation_delta = pair[0]
+                .pose
+                .xyz
+                .iter()
+                .zip(pair[1].pose.xyz.iter())
+                .map(|(left, right)| (left - right).powi(2))
+                .sum::<f64>()
+                .sqrt();
+            assert!(translation_delta <= 160.0);
+        }
+
+        for (index, target) in plan.iter().enumerate() {
+            for uv in target.outline_uv.iter().copied().chain(
+                target
+                    .grid_lines
+                    .iter()
+                    .flat_map(|line| [line.start_uv, line.end_uv]),
+            ) {
+                assert!(
+                    uv.iter()
+                        .all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
+                    "guided target #{index} '{}' must stay fully inside normalized image bounds: {:?}",
+                    target.label,
+                    uv
+                );
+            }
+        }
+        let tilted = &plan[1];
+        assert_eq!(
+            tilted.grid_lines.len(),
+            usize::from(board.inner_cols) + usize::from(board.inner_rows) + 4
+        );
+        assert!(
+            tilted
+                .outline_uv
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(tilted.grid_lines.iter().all(|line| {
+            line.start_uv
+                .iter()
+                .chain(line.end_uv.iter())
+                .all(|value| value.is_finite())
+        }));
+        assert!(
+            (tilted.outline_uv[0][1] - tilted.outline_uv[1][1]).abs() > 1.0e-4,
+            "tilted target should not render as an axis-aligned box: {:?}",
+            tilted.outline_uv
+        );
+
+        let mut distorted = intrinsics;
+        distorted.distortion_coefficients[0] = 0.15;
+        let distorted_plan = standard_guided_pose_plan(board, &distorted, image_size).unwrap();
+        assert_ne!(
+            tilted.outline_uv, distorted_plan[1].outline_uv,
+            "guided target grid must be projected through the bound K/D12 model"
+        );
+    }
     #[test]
     fn enabled_row_without_admission_contribution_is_outside_active_set() {
         assert_eq!(
@@ -6583,6 +10159,7 @@ mod tests {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "other-rtsp-source".to_owned(),
             geometry_key: "other-rtsp-config".to_owned(),
+            authoritative_capture: None,
         };
         let mismatched_key = mismatched_source
             .acquisition_key_for_frame(&live_frame(2))
@@ -6613,6 +10190,7 @@ mod tests {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "test-rtsp-source".to_owned(),
             geometry_key: "test-rtsp-config".to_owned(),
+            authoritative_capture: None,
         }
     }
 
@@ -6623,6 +10201,7 @@ mod tests {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "other-rtsp-source".to_owned(),
             geometry_key: "other-rtsp-config".to_owned(),
+            authoritative_capture: None,
         }
     }
 
@@ -6642,6 +10221,71 @@ mod tests {
                 "test fixture",
             ),
         })
+    }
+
+    #[test]
+    fn manager_observe_unknown_live_source_does_not_create_workspace() {
+        let context = egui::Context::default();
+        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
+
+        manager.observe_live_frame(
+            live_frame(1),
+            test_live_source(),
+            auto_capture_store(),
+            true,
+        );
+
+        assert_eq!(manager.workspace_count_for_test(), 1);
+        assert_eq!(manager.active_label_for_test(), "Manual / Files");
+    }
+
+    #[test]
+    fn manager_explicit_stream_capture_creates_live_workspace() {
+        let context = egui::Context::default();
+        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
+
+        manager.capture_displayed_stream_frame(
+            live_frame(1),
+            test_live_source(),
+            auto_capture_store(),
+        );
+
+        assert_eq!(manager.workspace_count_for_test(), 2);
+        assert_eq!(manager.active_label_for_test(), "Test CH0");
+    }
+
+    #[test]
+    fn manager_can_close_live_session_without_removing_manual_workspace() {
+        let context = egui::Context::default();
+        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
+        let source = test_live_source();
+        let live_key = CalibrationWorkspaceKey::for_live_source(&source);
+
+        manager.ensure_live_source_for_test(&source);
+        assert_eq!(manager.workspace_count_for_test(), 2);
+        assert_eq!(manager.active_label_for_test(), "Test CH0");
+
+        assert!(manager.close_session(&live_key));
+
+        assert_eq!(manager.workspace_count_for_test(), 1);
+        assert_eq!(manager.active_label_for_test(), "Manual / Files");
+        assert!(!manager.active_accepts_live_source(Some(&source)));
+        assert!(!manager.close_session(&CalibrationWorkspaceKey::manual()));
+    }
+
+    #[test]
+    fn manager_manual_workspace_rejects_live_inspection_context() {
+        let context = egui::Context::default();
+        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
+        let source = test_live_source();
+
+        assert!(!manager.active_accepts_live_source(Some(&source)));
+        manager.ensure_live_source_for_test(&source);
+        assert!(manager.active_accepts_live_source(Some(&source)));
+        manager.import(Vec::new());
+
+        assert_eq!(manager.active_label_for_test(), "Manual / Files");
+        assert!(!manager.active_accepts_live_source(Some(&source)));
     }
 
     fn chessboard_live_frame(sequence: u64) -> Arc<DecodedVideoFrame> {
@@ -6741,9 +10385,11 @@ mod tests {
                 kind: CalibrationSourceKind::Stream(StreamCalibrationSource {
                     store: auto_capture_store(),
                     asset: None,
+                    analysis_asset: None,
                     identity: frame.identity.clone(),
                     image_size,
                     acquisition_key: acquisition_key.clone(),
+                    authoritative_capture: None,
                 }),
                 preview: None,
             },
@@ -6984,6 +10630,7 @@ mod tests {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "other-rtsp-source".to_owned(),
             geometry_key: "other-rtsp-config".to_owned(),
+            authoritative_capture: None,
         };
         let mismatched_overlay = workspace.viewer_overlay(&reconnected, &mismatched_source);
         assert!(mismatched_overlay.persistent.is_none());
@@ -7053,8 +10700,60 @@ mod tests {
         let presentation = workspace
             .live_viewer_presentation_at(Some(&displayed), Some(&source), 1_000)
             .unwrap();
-        assert_eq!(presentation.item_id, item_id);
+        assert_eq!(presentation.item_id, Some(item_id));
         assert_eq!(presentation.overlay.persistent.unwrap().corners.len(), 88);
+    }
+
+    #[test]
+    fn live_preview_publishes_realtime_pose_axis_overlay() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let source = test_live_source();
+        let displayed = live_frame(43);
+        workspace.observe_live_frame(Arc::clone(&displayed), source.clone(), store, false);
+        let acquisition_key = source.acquisition_key_for_frame(&displayed).unwrap();
+        let binding = workspace
+            .session
+            .initial_intrinsics_binding()
+            .expect("live observation creates an intrinsics binding")
+            .clone();
+        let board = workspace.session.board();
+        let board_center = guided_pose_inner_center_point(board);
+        let detection = found_chessboard_detection(displayed.width, displayed.height);
+        workspace.auto_capture.latest_detection = Some(IdentityBoundDetection {
+            identity: displayed.identity.clone(),
+            acquisition_key,
+            detection,
+            pnp_observation: Some(PnPObservation {
+                binding_digest: binding.digest,
+                rotation_vector: [0.0, 0.0, 0.0],
+                translation_vector: [-board_center[0], -board_center[1], 1000.0],
+                depth: 1000.0,
+                minimum_board_depth: 1000.0,
+                maximum_board_depth: 1000.0,
+                tilt_degrees: 0.0,
+                azimuth_degrees: 0.0,
+                reprojection_rmse: 999.0,
+                max_reprojection_error: 999.0,
+            }),
+            completed_at_ns: 1_000,
+        });
+
+        let presentation = workspace
+            .live_viewer_presentation_at(Some(&displayed), Some(&source), 1_000)
+            .expect("fresh realtime detection should publish a viewer overlay");
+        assert!(presentation.item_id.is_none());
+        assert!(presentation.overlay.persistent.is_none());
+        assert!(
+            presentation
+                .overlay
+                .realtime_detection
+                .as_ref()
+                .and_then(|overlay| overlay.pose_axis.as_ref())
+                .is_some(),
+            "realtime overlay must carry the current detection pose axes"
+        );
     }
 
     #[test]
@@ -7113,7 +10812,7 @@ mod tests {
         let old_presentation = workspace
             .live_viewer_presentation_at(Some(&old_frame), Some(&source), 5_500)
             .unwrap();
-        assert_eq!(old_presentation.item_id, old_item);
+        assert_eq!(old_presentation.item_id, Some(old_item));
 
         workspace.auto_capture.last_dataset_overlay = Some(DatasetDetectionOverlay {
             item_id: new_item,
@@ -7125,7 +10824,7 @@ mod tests {
         let new_presentation = workspace
             .live_viewer_presentation_at(Some(&new_frame), Some(&source), 5_600)
             .unwrap();
-        assert_eq!(new_presentation.item_id, new_item);
+        assert_eq!(new_presentation.item_id, Some(new_item));
         assert_eq!(
             new_presentation.overlay.persistent.unwrap().corners.len(),
             88
@@ -7161,7 +10860,7 @@ mod tests {
             workspace.display_layer,
             CalibrationDisplayLayer::DatasetImage
         );
-        assert_eq!(old_presentation.item_id, old_item);
+        assert_eq!(old_presentation.item_id, Some(old_item));
 
         workspace.auto_capture.last_dataset_overlay = Some(DatasetDetectionOverlay {
             item_id: new_item,
@@ -7178,7 +10877,7 @@ mod tests {
             workspace.display_layer,
             CalibrationDisplayLayer::DatasetImage
         );
-        assert_eq!(new_presentation.item_id, new_item);
+        assert_eq!(new_presentation.item_id, Some(new_item));
         assert_eq!(
             new_presentation.overlay.persistent.unwrap().corners.len(),
             88
@@ -7335,6 +11034,102 @@ mod tests {
     }
 
     #[test]
+    fn guided_capture_mode_routes_live_frames_to_pose_measurement() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let source = test_live_source();
+        let first_frame = live_frame(1);
+        workspace.observe_live_frame(
+            Arc::clone(&first_frame),
+            source.clone(),
+            store.clone(),
+            false,
+        );
+
+        workspace.auto_capture_trigger_mode = AutoCaptureTriggerMode::GuidedPresetPose;
+        workspace.start_guided_capture();
+
+        assert!(workspace.auto_capture_enabled);
+        assert_eq!(
+            workspace
+                .guided_capture
+                .as_ref()
+                .map(|runtime| (runtime.current_step, runtime.state)),
+            Some((0, GuidedCaptureState::Running))
+        );
+        let presentation = workspace
+            .live_viewer_presentation(Some(first_frame.as_ref()), Some(&source))
+            .expect("guided mode should publish a target overlay");
+        assert!(presentation.item_id.is_none());
+        let guided_target = presentation
+            .overlay
+            .guided_target
+            .expect("guided presentation should carry the perspective grid target");
+        assert_eq!(guided_target.grid_lines.len(), 23);
+        assert!(
+            guided_target
+                .outline_uv
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+
+        workspace.observe_live_frame(live_frame(2), source, store, false);
+
+        let pending = workspace
+            .auto_capture
+            .pending
+            .as_ref()
+            .expect("guided mode should queue a measurement candidate");
+        assert_eq!(pending.intent, CandidateIntent::GuidedMeasure);
+        assert_eq!(pending.guided_step_index, Some(0));
+        assert!(workspace.session.items().is_empty());
+    }
+
+    #[test]
+    fn live_preview_does_not_queue_detection_when_auto_capture_is_disabled() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let source = test_live_source();
+        let first_frame = live_frame(1);
+        workspace.observe_live_frame(Arc::clone(&first_frame), source.clone(), store, true);
+
+        assert!(workspace.active_live_admission());
+        assert_eq!(
+            workspace
+                .auto_capture
+                .pending
+                .as_ref()
+                .map(|pending| pending.intent),
+            Some(CandidateIntent::PreviewOnly)
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+            workspace.tick(&context);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(workspace.auto_capture.pending.is_none());
+
+        workspace.auto_capture_trigger_mode = AutoCaptureTriggerMode::GuidedPresetPose;
+        workspace.start_guided_capture();
+
+        assert!(workspace.auto_capture_enabled);
+        assert_eq!(
+            workspace
+                .guided_capture
+                .as_ref()
+                .map(|runtime| (runtime.current_step, runtime.state)),
+            Some((0, GuidedCaptureState::Running))
+        );
+        let presentation = workspace
+            .live_viewer_presentation(Some(first_frame.as_ref()), Some(&source))
+            .expect("guided mode should publish a target overlay without live preview detection");
+        assert!(presentation.overlay.guided_target.is_some());
+    }
+
+    #[test]
     fn invalid_acceptance_edit_defers_error_until_edit_finishes() {
         let context = egui::Context::default();
         let store = auto_capture_store();
@@ -7435,6 +11230,7 @@ mod tests {
             transport: camera_toolbox_app::RtspTransport::Tcp,
             source_fingerprint: "changed-rtsp-source".to_owned(),
             geometry_key: "changed-rtsp-config".to_owned(),
+            authoritative_capture: None,
         };
         workspace.observe_live_frame(live_frame(2), changed_source, store, false);
 

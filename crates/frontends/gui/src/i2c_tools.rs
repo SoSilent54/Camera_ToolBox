@@ -106,7 +106,7 @@ impl Default for I2cToolsWorkspace {
             loaded_config: None,
             busy: false,
             cancel_requested: false,
-            status: "Connect Explorer SFTP, refresh buses, choose one I²C bus, then use row Read/Write or All Read."
+            status: "Connect SSH/SFTP control, refresh buses, choose one I²C bus, then use row Read/Write or All Read."
                 .to_owned(),
         }
     }
@@ -145,7 +145,7 @@ impl I2cToolsWorkspace {
                     "All rows use the single selected I²C bus. Read builds offset-write + read when Offset is set; Write encodes Write value by Type and sends Offset + payload. Validation rejects 0x00..=0x02 reserved/general-call addresses; 7-bit max is 0x7f, TenBit max is 0x03ff.",
                 );
                 match sftp_source {
-                    Ok(label) => ui.label(format!("Explorer SFTP: {label}")),
+                    Ok(label) => ui.label(format!("SSH/SFTP control: {label}")),
                     Err(reason) => ui.colored_label(egui::Color32::YELLOW, reason),
                 };
 
@@ -169,7 +169,7 @@ impl I2cToolsWorkspace {
                             egui::Button::new("All Read"),
                         )
                         .on_disabled_hover_text(
-                            "Connect Explorer SFTP and keep at least one row before All Read.",
+                            "Connect SSH/SFTP control and keep at least one row before All Read.",
                         );
                     if all_read_response.clicked() {
                         match self.build_all_read_transfer() {
@@ -261,7 +261,7 @@ impl I2cToolsWorkspace {
                     self.cancel_requested = false;
                     self.pending_transfer = None;
                     self.status =
-                        "Discovering I²C buses through the active Explorer SFTP connection..."
+                        "Discovering I²C buses through the active SSH/SFTP control connection..."
                             .to_owned();
                     *action = Some(I2cToolsAction::DiscoverBuses);
                 }
@@ -564,7 +564,7 @@ impl I2cToolsWorkspace {
         preview: Result<&[I2cTransactionSpec], &str>,
     ) -> Option<String> {
         if let Err(reason) = sftp_source {
-            return Some(format!("Connect Explorer SFTP first: {reason}"));
+            return Some(format!("Connect SSH/SFTP control first: {reason}"));
         }
         if let Err(error) = preview {
             return Some(format!("Fix the draft before executing: {error}"));
@@ -1259,7 +1259,7 @@ fn render_row(
         |ui| {
             if ui
                 .add_enabled(!busy && sftp_connected, egui::Button::new("Read"))
-                .on_disabled_hover_text("Connect Explorer SFTP before reading this row.")
+                .on_disabled_hover_text("Connect SSH/SFTP control before reading this row.")
                 .clicked()
             {
                 action = Some(RowUiAction::Read(index));
@@ -1354,7 +1354,7 @@ fn render_row_card(
         render_default_operation(ui, index, row, busy);
         if ui
             .add_enabled(!busy && sftp_connected, egui::Button::new("Read"))
-            .on_disabled_hover_text("Connect Explorer SFTP before reading this row.")
+            .on_disabled_hover_text("Connect SSH/SFTP control before reading this row.")
             .clicked()
         {
             action = Some(RowUiAction::Read(index));
@@ -2109,11 +2109,11 @@ mod tests {
 
         let disconnected = I2cToolsWorkspace::execute_disabled_reason(
             true,
-            Err("no active Explorer SFTP connection"),
+            Err("no active SSH/SFTP control connection"),
             Err("row 0: invalid draft"),
         )
         .unwrap();
-        assert!(disconnected.starts_with("Connect Explorer SFTP first"));
+        assert!(disconnected.starts_with("Connect SSH/SFTP control first"));
 
         let invalid_draft = I2cToolsWorkspace::execute_disabled_reason(
             true,

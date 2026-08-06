@@ -47,6 +47,7 @@ enum WorkspaceMode {
     #[cfg(feature = "platform-ssh")]
     Sftp,
     Rtsp,
+    X5233Driver,
 }
 
 impl WorkspaceMode {
@@ -56,6 +57,7 @@ impl WorkspaceMode {
             #[cfg(feature = "platform-ssh")]
             Self::Sftp => "SFTP",
             Self::Rtsp => "RTSP",
+            Self::X5233Driver => "X5_233_Driver",
         }
     }
 }
@@ -507,12 +509,17 @@ impl ExplorerState {
                     #[cfg(feature = "platform-ssh")]
                     ui.selectable_value(&mut self.mode, WorkspaceMode::Sftp, "SFTP");
                     ui.selectable_value(&mut self.mode, WorkspaceMode::Rtsp, "RTSP");
+                    ui.selectable_value(
+                        &mut self.mode,
+                        WorkspaceMode::X5233Driver,
+                        "X5_233_Driver",
+                    );
                 });
         });
         if self.mode != previous_mode {
             self.switch_mode(context);
         }
-        if self.mode == WorkspaceMode::Rtsp {
+        if matches!(self.mode, WorkspaceMode::Rtsp | WorkspaceMode::X5233Driver) {
             return None;
         }
         self.ensure_local_workspace(context);
@@ -610,9 +617,19 @@ impl ExplorerState {
         matches!(self.mode, WorkspaceMode::Rtsp)
     }
 
+    #[must_use]
+    pub(crate) const fn is_x5_233_driver_mode(&self) -> bool {
+        matches!(self.mode, WorkspaceMode::X5233Driver)
+    }
+
     #[cfg(test)]
     pub(crate) fn select_rtsp_mode_for_test(&mut self) {
         self.mode = WorkspaceMode::Rtsp;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn select_x5_233_driver_mode_for_test(&mut self) {
+        self.mode = WorkspaceMode::X5233Driver;
     }
 
     #[cfg(test)]
@@ -697,7 +714,7 @@ impl ExplorerState {
                     busy,
                 )
             }
-            WorkspaceMode::Rtsp => None,
+            WorkspaceMode::Rtsp | WorkspaceMode::X5233Driver => None,
         }
     }
 
@@ -737,8 +754,8 @@ impl ExplorerState {
                             .and_then(|_| source_path_from_remote(&value));
                         parsed.map(|path| self.navigate_to(path, context))
                     }
-                    WorkspaceMode::Rtsp => {
-                        Err("RTSP workspace has no file path navigation".to_owned())
+                    WorkspaceMode::Rtsp | WorkspaceMode::X5233Driver => {
+                        Err("Live stream workspace has no file path navigation".to_owned())
                     }
                 };
                 match result {
@@ -1264,7 +1281,7 @@ impl ExplorerState {
             WorkspaceMode::Local => self.local_view.as_ref(),
             #[cfg(feature = "platform-ssh")]
             WorkspaceMode::Sftp => self.sftp_view.as_ref(),
-            WorkspaceMode::Rtsp => None,
+            WorkspaceMode::Rtsp | WorkspaceMode::X5233Driver => None,
         }
     }
 
@@ -1273,7 +1290,7 @@ impl ExplorerState {
             WorkspaceMode::Local => self.local_view.as_mut(),
             #[cfg(feature = "platform-ssh")]
             WorkspaceMode::Sftp => self.sftp_view.as_mut(),
-            WorkspaceMode::Rtsp => None,
+            WorkspaceMode::Rtsp | WorkspaceMode::X5233Driver => None,
         }
     }
 

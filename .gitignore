@@ -7,6 +7,7 @@
 
 # Local project data and settings
 /local_data/
+/write_history/
 /.env
 /.env.*
 !/.env.example

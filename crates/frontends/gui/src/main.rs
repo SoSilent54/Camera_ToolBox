@@ -25,6 +25,7 @@ mod raw_dialog;
 mod raw_inspector;
 mod viewer;
 mod workspace;
+mod x5_tcp_client;
 mod yuv_inspector;
 
 use std::sync::Arc;

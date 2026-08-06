@@ -1,4 +1,4 @@
-//! 标定 EEPROM 的 GUI 安全状态机；SSH 登录复用 Explorer SFTP，仅选择 I²C bus。
+//! 标定 EEPROM 的 GUI 安全状态机；SSH 登录复用可用的 SSH/SFTP 控制源，仅选择 I²C bus。
 
 use camera_toolbox_app::{
     EEPROM_EXPERIMENTAL_PROVISION_WARNING, EepromDeviceState, EepromHelperAction,
@@ -11,7 +11,7 @@ use camera_toolbox_core::{
 use eframe::egui;
 
 #[cfg(feature = "platform-ssh")]
-/// 复用当前 Explorer SFTP 连接，仅选择目标物理 I²C bus。
+/// 复用当前 SSH/SFTP 控制源，仅选择目标物理 I²C bus。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct CalibrationEepromTargetRequest {
     pub(crate) i2c_bus: u16,
@@ -119,9 +119,9 @@ impl CalibrationEepromState {
         self.cancel_requested = false;
         self.pending = Some(CalibrationProvisionIntent::DiscoverBuses);
         self.status = if self.discovered_buses.is_empty() {
-            "Discovering I²C buses from the active Explorer SFTP connection...".to_owned()
+            "Discovering I²C buses from the active SSH/SFTP control connection...".to_owned()
         } else {
-            "Refreshing the I²C bus list from the active Explorer SFTP connection...".to_owned()
+            "Refreshing the I²C bus list from the active SSH/SFTP control connection...".to_owned()
         };
     }
 
@@ -186,7 +186,7 @@ impl CalibrationEepromState {
             },
         ));
         self.status = format!(
-            "Configuring EEPROM target i2c-{} from the active Explorer SFTP connection...",
+            "Configuring EEPROM target i2c-{} from the active SSH/SFTP control connection...",
             self.target_i2c_bus
         );
     }
@@ -444,10 +444,10 @@ impl CalibrationEepromState {
     #[cfg(feature = "platform-ssh")]
     fn render_target_editor(&mut self, ui: &mut egui::Ui, sftp_source: Result<&str, &str>) {
         ui.collapsing("EEPROM SSH Target", |ui| {
-            ui.weak("Reuses the active Explorer SFTP endpoint and process-only password.");
+            ui.weak("Reuses the active SSH/SFTP endpoint and process-only password.");
             match sftp_source {
                 Ok(label) => {
-                    ui.label(format!("Explorer SFTP: {label}"));
+                    ui.label(format!("SSH/SFTP control: {label}"));
                 }
                 Err(reason) => {
                     ui.colored_label(egui::Color32::YELLOW, reason);
@@ -512,12 +512,12 @@ impl CalibrationEepromState {
                 );
             }
             ui.weak(
-                "Before each EEPROM operation, Camera Toolbox uploads the bundled companion helper to /usr/local/libexec/camera-toolbox-eeprom-helper, runs chmod 755, then reuses the Explorer SFTP password. SSH host keys are not saved or verified.",
+                "Before each EEPROM operation, Camera Toolbox uploads the bundled companion helper to /usr/local/libexec/camera-toolbox-eeprom-helper, runs chmod 755, then reuses the selected SSH/SFTP control password. SSH host keys are not saved or verified.",
             );
             if ui
                 .add_enabled(
                     !self.busy && sftp_source.is_ok(),
-                    egui::Button::new("Use Explorer SFTP for EEPROM"),
+                    egui::Button::new("Use SSH/SFTP control for EEPROM"),
                 )
                 .clicked()
             {

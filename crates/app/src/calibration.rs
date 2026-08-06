@@ -72,6 +72,13 @@ pub enum CalibrationInputRevision {
         content_sha256: String,
         encoded_bytes: u64,
     },
+    EphemeralRaster {
+        primary_sha256: String,
+        primary_bytes: u64,
+        primary_format: String,
+        analysis_sha256: String,
+        analysis_encoded_bytes: u64,
+    },
 }
 
 impl CalibrationInputRevision {
@@ -80,6 +87,10 @@ impl CalibrationInputRevision {
         match self {
             Self::File(version) => version.size,
             Self::EphemeralPng { encoded_bytes, .. } => *encoded_bytes,
+            Self::EphemeralRaster {
+                analysis_encoded_bytes,
+                ..
+            } => *analysis_encoded_bytes,
         }
     }
 
@@ -87,7 +98,31 @@ impl CalibrationInputRevision {
     pub const fn file_version(&self) -> Option<FileVersion> {
         match self {
             Self::File(version) => Some(*version),
-            Self::EphemeralPng { .. } => None,
+            Self::EphemeralPng { .. } | Self::EphemeralRaster { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn is_valid_ephemeral_candidate(&self) -> bool {
+        match self {
+            Self::EphemeralPng {
+                content_sha256,
+                encoded_bytes,
+            } => !content_sha256.is_empty() && *encoded_bytes > 0,
+            Self::EphemeralRaster {
+                primary_sha256,
+                primary_bytes,
+                primary_format,
+                analysis_sha256,
+                analysis_encoded_bytes,
+            } => {
+                !primary_sha256.is_empty()
+                    && *primary_bytes > 0
+                    && !primary_format.trim().is_empty()
+                    && !analysis_sha256.is_empty()
+                    && *analysis_encoded_bytes > 0
+            }
+            Self::File(_) => false,
         }
     }
 }
@@ -1184,6 +1219,12 @@ impl AutoCandidateCommit {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCandidateCommitPolicy {
+    DatasetGain,
+    GuidedPose,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct CalibrationSnapshot {
     pub item_ids: Vec<CalibrationItemId>,
@@ -1632,11 +1673,11 @@ impl CalibrationSession {
         AddCalibrationItemOutcome::Added(id)
     }
 
-    /// 为尚未入库的直播 PNG 创建不可变候选绑定，不修改 Dataset。
+    /// 为尚未入库的直播/端侧临时帧创建不可变候选绑定，不修改 Dataset。
     ///
     /// # Errors
     ///
-    /// 输入不是匹配 identity 的 stream PNG、输入已存在或 revision 无效时返回错误。
+    /// 输入不是匹配 identity 的 stream ephemeral revision、输入已存在或 revision 无效时返回错误。
     pub fn bind_auto_candidate(
         &self,
         id: AutoCandidateId,
@@ -1649,13 +1690,7 @@ impl CalibrationSession {
         if self.items.iter().any(|item| item.input == input) {
             return Err(CalibrationSessionError::AutoCandidateAlreadyPresent);
         }
-        if !matches!(
-            &source_revision,
-            CalibrationInputRevision::EphemeralPng {
-                content_sha256,
-                encoded_bytes,
-            } if !content_sha256.is_empty() && *encoded_bytes > 0
-        ) {
+        if !source_revision.is_valid_ephemeral_candidate() {
             return Err(CalibrationSessionError::InvalidAutoCandidateRevision);
         }
         if let Some(source_acquisition_key) = &source_acquisition_key {
@@ -1682,14 +1717,34 @@ impl CalibrationSession {
         })
     }
 
-    /// 原子提交已通过 authoritative detection 和 PnP 硬门规的自动候选。
+    /// 原子提交已通过 authoritative detection 和 PnP 硬门规的增益型自动候选。
+    ///
+    /// # Errors
+    ///
+    /// 任一不可变 binding 已过期、输入已存在、检测/PnP 证据无效或 Gain 低于阈值时返回错误，且 Dataset 不变。
+    pub fn commit_auto_candidate(
+        &mut self,
+        commit: AutoCandidateCommit,
+    ) -> Result<CalibrationItemId, CalibrationSessionError> {
+        self.commit_auto_candidate_with_policy(commit, AutoCandidateCommitPolicy::DatasetGain)
+    }
+
+    /// 原子提交已通过预设姿态差异阈值的引导式自动候选。
     ///
     /// # Errors
     ///
     /// 任一不可变 binding 已过期、输入已存在或检测/PnP 证据无效时返回错误，且 Dataset 不变。
-    pub fn commit_auto_candidate(
+    pub fn commit_guided_auto_candidate(
         &mut self,
         commit: AutoCandidateCommit,
+    ) -> Result<CalibrationItemId, CalibrationSessionError> {
+        self.commit_auto_candidate_with_policy(commit, AutoCandidateCommitPolicy::GuidedPose)
+    }
+
+    fn commit_auto_candidate_with_policy(
+        &mut self,
+        commit: AutoCandidateCommit,
+        policy: AutoCandidateCommitPolicy,
     ) -> Result<CalibrationItemId, CalibrationSessionError> {
         let AutoCandidateCommit {
             token,
@@ -1731,7 +1786,9 @@ impl CalibrationSession {
         }
         let assessment =
             self.assess_auto_admission_with(&admission, Some((&detection, &pnp_observation)))?;
-        if assessment.constraint_gain < admission.baseline.criteria.minimum_auto_gain {
+        if policy == AutoCandidateCommitPolicy::DatasetGain
+            && assessment.constraint_gain < admission.baseline.criteria.minimum_auto_gain
+        {
             return Err(CalibrationSessionError::RejectInsufficientConstraintGain {
                 actual: assessment.constraint_gain,
                 minimum: admission.baseline.criteria.minimum_auto_gain,
@@ -3797,6 +3854,39 @@ mod tests {
             other => panic!("expected insufficient gain rejection, got {other:?}"),
         }
         assert!(session.items().is_empty());
+    }
+
+    #[test]
+    fn guided_auto_candidate_bypasses_minimum_gain_gate() {
+        let mut session = CalibrationSession::new(board());
+        let mut criteria = test_criteria();
+        criteria.minimum_auto_gain = 0.75;
+        let baseline = AutoCaptureBaseline::new(
+            test_acquisition_key(0),
+            CalibrationImageSize::new(640, 480).unwrap(),
+            board(),
+            criteria,
+        )
+        .unwrap();
+        session
+            .configure_auto_admission(Some(baseline), Some(test_binding()))
+            .unwrap();
+        let (token, revision) = auto_candidate_fixture(&session, 1, 32);
+        let ChessboardDetectionOutcome::Found(found) = detection() else {
+            panic!("fixture must contain a found detection");
+        };
+
+        let item_id = session
+            .commit_guided_auto_candidate(AutoCandidateCommit::new(
+                token,
+                revision,
+                found,
+                test_pnp_observation(),
+            ))
+            .expect("guided pose mode must not apply minimum_auto_gain");
+
+        assert_eq!(session.items().len(), 1);
+        assert_eq!(session.items()[0].id, item_id);
     }
 
     #[test]

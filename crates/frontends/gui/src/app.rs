@@ -17,13 +17,17 @@ use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvi
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{
     CalibrationExport, CalibrationViewerOverlay, CalibrationViewerPresentation,
-    CalibrationWorkspace, ViewerDetectionOverlay, ViewerPoseAxisOverlay,
+    CalibrationWorkspaceManager, ViewerDetectionOverlay, ViewerGuidedPoseArrowOverlay,
+    ViewerGuidedPoseInstructionOverlay, ViewerGuidedPoseOverlay,
+    ViewerGuidedPoseRotationArcOverlay, ViewerGuidedPoseRotationRingsOverlay,
+    ViewerPoseAxisOverlay,
 };
 
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
 #[cfg(feature = "platform-ssh")]
 use crate::i2c_tools::{I2cToolsAction, I2cToolsWorkspace};
+use crate::x5_tcp_client::{self, X5RtspEncoderConfig};
 use crate::{
     analysis_panel::{DesiredAnalysis, render_analysis_panel},
     analysis_worker::{
@@ -56,8 +60,8 @@ use crate::{
         ViewerImage, ViewerOutput, bayer_label, render_viewer, viewer_texture_uv,
     },
     workspace::{
-        DocumentId, DocumentIdentity, LiveDocument, LiveDocumentLifecycle, LiveStreamSource,
-        TabBarAction, WorkspaceState, render_tab_bar,
+        DocumentId, DocumentIdentity, LiveAuthoritativeCapture, LiveDocument,
+        LiveDocumentLifecycle, LiveStreamSource, TabBarAction, WorkspaceState, render_tab_bar,
     },
     yuv_inspector::render_yuv_inspector,
 };
@@ -67,28 +71,35 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     RusshTransportFactory, SshConnectionTarget, SshEepromProvisionService, SshI2cHelperService,
 };
 use camera_toolbox_app::{
-    AutoOpenActivation, EntryName, ExportDestination, ExportReceipt, FileRef, FileSystem,
-    FsCancellation, FsControl, I2cBusInfo, I2cHelperAction, I2cHelperOperation, I2cHelperResult,
-    I2cHelperService, ImageFileKind, ImageOpenMode, ImageOpenPipeline, ImageOpenResult,
-    ImageSourceHandle, LocalRawAnalyzeReport, LocalRawAnalyzeRequest, RasterImageCodec,
-    RawDecodeParams, RawInterpretation, RawOpenMode, RawOpenPipeline, RtspCodec, RtspLatencyMode,
-    RtspStreamConfig, RtspTransport, SourceCache, SourceReadProgress, WorkspaceSettings,
+    AutoOpenActivation, CapabilityResolutionKey, DecodedVideoFrame, EntryName, ExportDestination,
+    ExportReceipt, FileRef, FileSystem, FsCancellation, FsControl, I2cBusInfo, I2cHelperAction,
+    I2cHelperOperation, I2cHelperResult, I2cHelperService, ImageFileKind, ImageOpenMode,
+    ImageOpenPipeline, ImageOpenResult, ImageSourceHandle, LocalRawAnalyzeReport,
+    LocalRawAnalyzeRequest, OperationId, PlatformProfileId, RasterImageCodec, RawDecodeParams,
+    RawInterpretation, RawOpenMode, RawOpenPipeline, ResolvedLocalBindings, ResolvedTargetBindings,
+    RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport, SensorSelection, SnapshotHash,
+    SourceCache, SourceReadProgress, StreamFrameIdentity, StreamSessionId, StreamTimeouts,
+    TargetResolutionSnapshot, WorkspaceSettings,
 };
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{
-    DumpCancellation, I2cHelperServiceError, RemoteOperationControl, RemoteTimeouts,
+    DumpCancellation, I2cHelperServiceError, RemoteAuthentication, RemoteConnectionConfig,
+    RemoteConnectionId, RemoteOperationControl, RemoteTimeouts,
 };
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_app::{
     EepromHelperResult, EepromInspectResult, EepromProvisionOperation, EepromProvisionService,
-    EepromProvisionServiceError, EepromWriteResult, SnapshotHash,
+    EepromProvisionServiceError, EepromWriteResult,
 };
 use camera_toolbox_core::{
-    ChromaOrder, MediaFormat, NativeImage, OwnedMediaPayload, PackedRawSpec, Rgba8Frame, Roi,
-    Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange, analyze_roi, decode_le_continuous_raw,
-    yuv420sp_to_rgba8_with_cancel,
+    AssetId, BayerPattern, CaptureMetadata, ChromaOrder, EphemeralAsset, IntegrityState,
+    MediaFormat, NativeImage, OwnedMediaPayload, PackedRawSpec, RawEncoding, RawFrame, RawSpec,
+    Rgba8Frame, Roi, Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange, analyze_roi,
+    decode_le_continuous_raw, yuv420sp_to_rgba8_with_cancel,
 };
 use eframe::egui;
+#[cfg(feature = "platform-ssh")]
+use secrecy::SecretString;
 const LIVE_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const AUTO_OPEN_QUEUE_LIMIT: usize = 16;
 const AUTO_OPEN_BACKGROUND_TAB_LIMIT: usize = 8;
@@ -1063,6 +1074,36 @@ enum ProductWorkspace {
     Calibration,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureTarget {
+    Viewer,
+    Color,
+    #[cfg(feature = "calibration-opencv")]
+    Calibration,
+}
+
+impl CaptureTarget {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Viewer => "Viewer",
+            Self::Color => "Color",
+            #[cfg(feature = "calibration-opencv")]
+            Self::Calibration => "Calibration",
+        }
+    }
+
+    const fn hover(self) -> &'static str {
+        match self {
+            Self::Viewer => "current workspace opens the captured frame as a Viewer image document",
+            Self::Color => "current workspace opens the captured frame and analyzes it in Color",
+            #[cfg(feature = "calibration-opencv")]
+            Self::Calibration => {
+                "current workspace adds the captured frame to the matching Calibration session"
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct DirectRtspWorkspace {
     url: String,
@@ -1073,8 +1114,67 @@ struct DirectRtspWorkspace {
     transport: RtspTransport,
     latency_mode: RtspLatencyMode,
     prefer_hardware_acceleration: bool,
+    last_status: Option<String>,
     last_error: Option<String>,
 }
+
+#[derive(Debug, Clone)]
+struct X5233DriverWorkspace {
+    device_ip: String,
+    ssh_user: String,
+    ssh_password: String,
+    tcp_port: u16,
+    configure_before_connect: bool,
+    width: u32,
+    height: u32,
+    fps: u16,
+    bitrate_kbps: u32,
+    driver_channel_0: bool,
+    driver_channel_1: bool,
+    driver_channel_3: bool,
+    driver_channel_4: bool,
+    yuv_channel: u16,
+    last_tcp_status: Option<x5_tcp_client::X5ProbeSummary>,
+    raw_camera: u16,
+    last_status: Option<String>,
+    last_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum LiveStreamOpenRequest {
+    DirectRtsp(RtspStreamConfig),
+    X5233Selected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct X5233ChannelMapping {
+    driver_channel: u16,
+    rtsp_port: u16,
+    label: &'static str,
+}
+
+const X5_233_DRIVER_CHANNELS: [X5233ChannelMapping; 4] = [
+    X5233ChannelMapping {
+        driver_channel: 0,
+        rtsp_port: 554,
+        label: "CH0 cam0 H",
+    },
+    X5233ChannelMapping {
+        driver_channel: 1,
+        rtsp_port: 555,
+        label: "CH1 cam0 L",
+    },
+    X5233ChannelMapping {
+        driver_channel: 3,
+        rtsp_port: 557,
+        label: "CH3 cam1 H",
+    },
+    X5233ChannelMapping {
+        driver_channel: 4,
+        rtsp_port: 558,
+        label: "CH4 cam1 L",
+    },
+];
 
 impl Default for DirectRtspWorkspace {
     fn default() -> Self {
@@ -1087,21 +1187,443 @@ impl Default for DirectRtspWorkspace {
             transport: RtspTransport::Tcp,
             latency_mode: RtspLatencyMode::Stable,
             prefer_hardware_acceleration: false,
+            last_status: None,
             last_error: None,
         }
     }
 }
 
+impl Default for X5233DriverWorkspace {
+    fn default() -> Self {
+        Self {
+            device_ip: String::new(),
+            ssh_user: "root".to_owned(),
+            ssh_password: "root".to_owned(),
+            tcp_port: 9073,
+            configure_before_connect: true,
+            width: 1920,
+            height: 1080,
+            fps: 60,
+            bitrate_kbps: 12_000,
+            driver_channel_0: true,
+            driver_channel_1: false,
+            driver_channel_3: true,
+            driver_channel_4: false,
+            yuv_channel: 0,
+            last_tcp_status: None,
+            raw_camera: 0,
+            last_status: None,
+            last_error: None,
+        }
+    }
+}
+
+fn x5_233_channel_mapping(driver_channel: u16) -> Option<X5233ChannelMapping> {
+    X5_233_DRIVER_CHANNELS
+        .iter()
+        .copied()
+        .find(|mapping| mapping.driver_channel == driver_channel)
+}
+
+fn x5_233_rtsp_url(host: &str, driver_channel: u16) -> Option<String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return None;
+    }
+    let mapping = x5_233_channel_mapping(driver_channel)?;
+    Some(format!("rtsp://{host}:{}/PRR", mapping.rtsp_port))
+}
+
+fn x5_233_rtsp_timeouts() -> StreamTimeouts {
+    // 板端 vendor RTSP server 在 DESCRIBE/SETUP 阶段偶发超过 3s；连接超时只放宽 X5 专用入口。
+    StreamTimeouts {
+        connect: Duration::from_secs(8),
+        idle: Duration::from_secs(10),
+    }
+}
+
+fn x5_233_acquisition_fingerprint(host: &str, channel: u16) -> String {
+    let host = host.trim();
+    let digest = SnapshotHash::digest_bytes(
+        format!("camera-toolbox/x5-233-acquisition/v1\0{host}\0{channel}").as_bytes(),
+    )
+    .to_hex();
+    format!("x5-233:{digest}")
+}
+
+fn x5_233_acquisition_geometry_key(width: u32, height: u32) -> String {
+    format!("source=x5-233;image={width}x{height};orientation=upright;pixel=opencv-centers")
+}
+
+fn x5_233_live_source(
+    host: &str,
+    channel: u16,
+    tcp_port: u16,
+    transport: RtspTransport,
+    width: u32,
+    height: u32,
+) -> LiveStreamSource {
+    let host = host.trim();
+    LiveStreamSource::Rtsp {
+        label: format!("X5_233 {host}"),
+        channel,
+        transport,
+        source_fingerprint: x5_233_acquisition_fingerprint(host, channel),
+        geometry_key: x5_233_acquisition_geometry_key(width, height),
+        authoritative_capture: Some(LiveAuthoritativeCapture::X5233TcpYuv {
+            host: host.to_owned(),
+            tcp_port,
+        }),
+    }
+}
+
+fn x5_233_bool_cell(value: Option<bool>) -> &'static str {
+    match value {
+        Some(true) => "yes",
+        Some(false) => "no",
+        None => "—",
+    }
+}
+
+fn x5_233_ring_range_cell(valid: u16, min: u64, max: u64) -> String {
+    if valid == 0 {
+        "—".to_owned()
+    } else if min == max {
+        min.to_string()
+    } else {
+        format!("{min}..{max}")
+    }
+}
+
+fn x5_233_ring_retention_cell(valid: u16, retention_ns: u64) -> String {
+    if valid == 0 || retention_ns == 0 {
+        "—".to_owned()
+    } else {
+        format!("{:.1} ms", retention_ns as f64 / 1_000_000.0)
+    }
+}
+
+fn render_x5_233_tcp_status(ui: &mut egui::Ui, summary: &x5_tcp_client::X5ProbeSummary) {
+    egui::Grid::new("x5_233_tcp_status_summary")
+        .num_columns(4)
+        .spacing([12.0, 4.0])
+        .show(ui, |ui| {
+            ui.strong("Protocol");
+            ui.label(summary.protocol.to_string());
+            ui.strong("Channels");
+            ui.label(
+                summary
+                    .channels
+                    .iter()
+                    .map(u16::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            ui.end_row();
+            ui.strong("FPS");
+            ui.label(
+                summary
+                    .fps
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_owned()),
+            );
+            ui.strong("Bitrate");
+            ui.label(
+                summary
+                    .bitrate_kbps
+                    .map(|value| format!("{value} kbps"))
+                    .unwrap_or_else(|| "—".to_owned()),
+            );
+            ui.end_row();
+            ui.strong("Config version");
+            ui.label(
+                summary
+                    .pipeline_config_version
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_owned()),
+            );
+            ui.strong("RTSP requested / started");
+            ui.label(format!(
+                "{} / {}",
+                x5_233_bool_cell(Some(summary.rtsp_requested_enabled)),
+                x5_233_bool_cell(Some(summary.rtsp_started))
+            ));
+            ui.end_row();
+        });
+
+    ui.separator();
+    ui.strong("RTSP channels");
+    if summary.rtsp_channels.is_empty() {
+        ui.weak("legacy driver status: no per-channel RTSP status returned");
+    } else {
+        egui::Grid::new("x5_233_tcp_status_rtsp_channels")
+            .striped(true)
+            .num_columns(9)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("CH");
+                ui.strong("Req");
+                ui.strong("Run");
+                ui.strong("TX");
+                ui.strong("Busy");
+                ui.strong("Port");
+                ui.strong("Action");
+                ui.strong("Err");
+                ui.strong("Message");
+                ui.end_row();
+                for channel in &summary.rtsp_channels {
+                    ui.label(channel.channel.to_string());
+                    ui.label(x5_233_bool_cell(Some(channel.requested_enabled)));
+                    ui.label(x5_233_bool_cell(Some(channel.started)));
+                    ui.label(x5_233_bool_cell(Some(channel.tx_enabled)));
+                    ui.label(x5_233_bool_cell(Some(channel.busy)));
+                    ui.label(
+                        channel
+                            .port
+                            .map(|port| port.to_string())
+                            .unwrap_or_else(|| "—".to_owned()),
+                    );
+                    ui.label(channel.action_id.to_string());
+                    ui.label(channel.last_error.to_string());
+                    ui.label(if channel.last_message.is_empty() {
+                        "—"
+                    } else {
+                        channel.last_message.as_str()
+                    });
+                    ui.end_row();
+                }
+            });
+    }
+
+    ui.separator();
+    ui.strong("Snapshot rings");
+    if summary.rings.is_empty() {
+        ui.weak("legacy driver status: no snapshot ring status returned");
+    } else {
+        egui::Grid::new("x5_233_tcp_status_rings")
+            .striped(true)
+            .num_columns(7)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("CH");
+                ui.strong("Valid / Depth");
+                ui.strong("Frame ID range");
+                ui.strong("Timestamp ns range");
+                ui.strong("Retention");
+                ui.strong("Evicted");
+                ui.strong("Dropped");
+                ui.end_row();
+                for ring in &summary.rings {
+                    ui.label(ring.channel.to_string());
+                    ui.label(format!("{} / {}", ring.valid, ring.depth));
+                    ui.label(x5_233_ring_range_cell(
+                        ring.valid,
+                        ring.min_frame_id,
+                        ring.max_frame_id,
+                    ));
+                    ui.label(x5_233_ring_range_cell(
+                        ring.valid,
+                        ring.min_timestamp_ns,
+                        ring.max_timestamp_ns,
+                    ));
+                    ui.label(x5_233_ring_retention_cell(ring.valid, ring.retention_ns));
+                    ui.label(ring.evicted.to_string());
+                    ui.label(ring.dropped.to_string());
+                    ui.end_row();
+                }
+            });
+    }
+}
+
+const X5_233_SSH_PORT: u16 = 22;
+const X5_233_HBN_RAW10_FORMAT_CODE: u32 = 24;
+const MIPI_RAW10_DATA_TYPE: u32 = 0x2b;
+const MIPI_RAW12_DATA_TYPE: u32 = 0x2c;
+const MIPI_RAW14_DATA_TYPE: u32 = 0x2d;
+
+fn x5_233_safe_id_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len().max(1));
+    for ch in value.trim().chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            output.push(ch);
+        } else {
+            output.push('_');
+        }
+    }
+    if output.is_empty() {
+        output.push_str("unknown");
+    }
+    output
+}
+
+fn x5_233_target_snapshot(
+    host: &str,
+    tcp_port: u16,
+    media_label: &str,
+) -> Result<Arc<TargetResolutionSnapshot>, String> {
+    let host = host.trim();
+    if host.is_empty() {
+        return Err("Enter X5_233 device IP before publishing captured media.".to_owned());
+    }
+    let platform_id = PlatformProfileId::new(format!("x5-233-{}", x5_233_safe_id_component(host)))
+        .map_err(|error| error.to_string())?;
+    let material = format!("camera-toolbox/x5-233-capture/v1\0{host}\0{tcp_port}\0{media_label}");
+    let platform_snapshot_hash = SnapshotHash::digest_bytes(material.as_bytes());
+    let aggregate_hash = SnapshotHash::aggregate(platform_snapshot_hash, None, None);
+    Ok(Arc::new(TargetResolutionSnapshot {
+        key: CapabilityResolutionKey {
+            platform_id,
+            sensor: SensorSelection::Unbound,
+        },
+        bindings: Arc::new(ResolvedTargetBindings::Local(ResolvedLocalBindings {
+            open: None,
+        })),
+        platform_snapshot_hash,
+        sensor_mode_snapshot_hash: None,
+        capability_cell_snapshot_hash: None,
+        aggregate_hash,
+    }))
+}
+
+fn x5_233_yuv_snapshot_spec(
+    width: u32,
+    height: u32,
+    y_len: usize,
+    uv_len: usize,
+) -> Result<Yuv420SpSpec, String> {
+    let height_usize = usize::try_from(height)
+        .map_err(|_| "X5_233 YUV height does not fit host usize".to_owned())?;
+    if height_usize == 0 || y_len % height_usize != 0 {
+        return Err(format!(
+            "X5_233 YUV Y plane length {y_len} is not divisible by height {height}"
+        ));
+    }
+    let chroma_rows = height_usize / 2;
+    if chroma_rows == 0 || uv_len % chroma_rows != 0 {
+        return Err(format!(
+            "X5_233 YUV UV plane length {uv_len} is not divisible by chroma rows {chroma_rows}"
+        ));
+    }
+    let spec = Yuv420SpSpec {
+        width,
+        height,
+        y_stride: y_len / height_usize,
+        chroma_stride: uv_len / chroma_rows,
+        chroma_order: ChromaOrder::Uv,
+        matrix: YuvMatrix::Bt601,
+        range: YuvRange::Limited,
+    };
+    spec.validate()
+        .map_err(|error| format!("X5_233 YUV metadata is invalid: {error}"))?;
+    let expected = spec
+        .payload_len()
+        .map_err(|error| format!("X5_233 YUV payload length overflows: {error}"))?;
+    let actual = y_len
+        .checked_add(uv_len)
+        .ok_or_else(|| "X5_233 YUV payload length overflows host usize".to_owned())?;
+    if expected != actual {
+        return Err(format!(
+            "X5_233 YUV metadata length mismatch: expected {expected}, got {actual}"
+        ));
+    }
+    Ok(spec)
+}
+
+fn x5_233_raw_bit_depth(format_code: u32) -> Result<u8, String> {
+    match format_code {
+        // 当前 X5 HBN ABI 在 SC233 RAW10 VIN snapshot 中返回 24；MIPI 数据类型仍保留兼容。
+        X5_233_HBN_RAW10_FORMAT_CODE | MIPI_RAW10_DATA_TYPE => Ok(10),
+        MIPI_RAW12_DATA_TYPE => Ok(12),
+        MIPI_RAW14_DATA_TYPE => Ok(14),
+        _ => Err(format!(
+            "Unsupported X5_233 RAW format_code={format_code}; expected RAW10/RAW12/RAW14 metadata"
+        )),
+    }
+}
+
+fn decode_strided_u16le_raw(
+    width: u32,
+    height: u32,
+    stride: usize,
+    bit_depth: u8,
+    bayer: BayerPattern,
+    payload: &[u8],
+) -> Result<RawFrame, String> {
+    let width_usize =
+        usize::try_from(width).map_err(|_| "u16le RAW width does not fit host usize".to_owned())?;
+    let height_usize = usize::try_from(height)
+        .map_err(|_| "u16le RAW height does not fit host usize".to_owned())?;
+    let row_bytes = width_usize
+        .checked_mul(RawEncoding::U16Le.bytes_per_pixel())
+        .ok_or_else(|| "u16le RAW row byte count overflows host usize".to_owned())?;
+    if stride < row_bytes {
+        return Err(format!(
+            "u16le RAW stride {stride} is smaller than tight row {row_bytes}"
+        ));
+    }
+    let expected = stride
+        .checked_mul(height_usize)
+        .ok_or_else(|| "u16le RAW payload length overflows host usize".to_owned())?;
+    if payload.len() != expected {
+        return Err(format!(
+            "u16le RAW payload length mismatch: expected {expected}, got {}",
+            payload.len()
+        ));
+    }
+    let spec = RawSpec {
+        width,
+        height,
+        bit_depth,
+        bayer,
+    };
+    if stride == row_bytes {
+        return RawFrame::from_bytes(spec, RawEncoding::U16Le, payload)
+            .map_err(|error| error.to_string());
+    }
+    let pixel_count = width_usize
+        .checked_mul(height_usize)
+        .ok_or_else(|| "u16le RAW pixel count overflows host usize".to_owned())?;
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(pixel_count)
+        .map_err(|_| format!("u16le RAW pixel allocation failed: {pixel_count} samples"))?;
+    for row in payload.chunks_exact(stride) {
+        for chunk in row[..row_bytes].chunks_exact(2) {
+            pixels.push(u16::from_le_bytes([chunk[0], chunk[1]]));
+        }
+    }
+    RawFrame::new(spec, pixels).map_err(|error| error.to_string())
+}
+
+fn decode_x5_233_raw_u16le(
+    width: u32,
+    height: u32,
+    stride: usize,
+    format_code: u32,
+    bayer: BayerPattern,
+    payload: &[u8],
+) -> Result<RawFrame, String> {
+    decode_strided_u16le_raw(
+        width,
+        height,
+        stride,
+        x5_233_raw_bit_depth(format_code)?,
+        bayer,
+        payload,
+    )
+}
+
 pub(crate) struct CameraToolboxApp {
     product_workspace: ProductWorkspace,
     #[cfg(feature = "calibration-opencv")]
-    calibration: CalibrationWorkspace,
+    calibration: CalibrationWorkspaceManager,
     workspace: WorkspaceState,
     color_inspection: ColorInspectionWorkspace,
     auto_open: AutoOpenCoordinator,
     explorer: ExplorerState,
     explorer_panel_expanded: bool,
     direct_rtsp: DirectRtspWorkspace,
+    x5_233_driver: X5233DriverWorkspace,
     empty_viewer: ImageViewerState,
     raw_dialog: RawOpenDialogState,
     yuv_save_dialog: YuvSaveDialogState,
@@ -1196,13 +1718,14 @@ impl CameraToolboxApp {
         Ok(Self {
             product_workspace: ProductWorkspace::Viewer,
             #[cfg(feature = "calibration-opencv")]
-            calibration: CalibrationWorkspace::new(context)?,
+            calibration: CalibrationWorkspaceManager::new(context)?,
             workspace: WorkspaceState::default(),
             color_inspection: ColorInspectionWorkspace::default(),
             explorer,
             auto_open,
             explorer_panel_expanded: false,
             direct_rtsp: DirectRtspWorkspace::default(),
+            x5_233_driver: X5233DriverWorkspace::default(),
             empty_viewer: ImageViewerState::default(),
             raw_dialog: RawOpenDialogState::default(),
             yuv_save_dialog: YuvSaveDialogState::default(),
@@ -1291,17 +1814,26 @@ impl eframe::App for CameraToolboxApp {
         }
         self.advance_live_close_deadlines();
         #[cfg(feature = "calibration-opencv")]
-        let displayed_live_frame = if let Some(document) = self.workspace.active_live_mut() {
-            document.install_latest_texture(&context);
-            document.displayed_frame().cloned().map(|frame| {
-                (
-                    frame,
-                    document.source.clone(),
-                    document.show_calibration_detection,
-                )
-            })
-        } else {
-            None
+        let displayed_live_frames = {
+            let active_id = self.workspace.active_id();
+            let mut frames = Vec::new();
+            for document in self.workspace.live_documents_mut() {
+                let is_active_live = Some(document.id) == active_id;
+                let frame = if is_active_live {
+                    document.install_latest_texture(&context);
+                    document.displayed_frame().cloned()
+                } else {
+                    document.refresh_background_frame()
+                };
+                if let Some(frame) = frame {
+                    frames.push((
+                        frame,
+                        document.source.clone(),
+                        is_active_live && document.show_calibration_detection,
+                    ));
+                }
+            }
+            frames
         };
         #[cfg(not(feature = "calibration-opencv"))]
         if let Some(document) = self.workspace.active_live_mut() {
@@ -1310,7 +1842,7 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         {
             self.calibration.tick(&context);
-            if let Some((frame, source, preview_requested)) = displayed_live_frame {
+            for (frame, source, preview_requested) in displayed_live_frames {
                 self.calibration.observe_live_frame(
                     frame,
                     source,
@@ -1350,7 +1882,7 @@ impl eframe::App for CameraToolboxApp {
             }
         }
         let calibration_workspace = self.is_calibration_workspace();
-        let (direct_rtsp_config, explorer_action, workspace_stream_action) = if self
+        let (live_open_request, explorer_action, workspace_stream_action) = if self
             .explorer_panel_expanded
         {
             let mut collapse = false;
@@ -1369,23 +1901,36 @@ impl eframe::App for CameraToolboxApp {
                     });
                     ui.separator();
                     let explorer_action = self.explorer.render(&context, ui, calibration_workspace);
-                    let (direct_rtsp_config, stream_action) = if self.explorer.is_rtsp_mode() {
+                    let (live_open_request, stream_action) = if self.explorer.is_rtsp_mode() {
                         egui::ScrollArea::vertical()
                             .id_salt("workspace_rtsp_sidebar_scroll")
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.separator();
-                                let direct_rtsp_config = self.render_direct_rtsp_workspace(ui);
+                                let live_open_request = self.render_direct_rtsp_workspace(ui);
                                 ui.separator();
                                 let stream_action = self.render_workspace_stream_section(ui);
                                 self.render_stream_metrics(ui);
-                                (direct_rtsp_config, stream_action)
+                                (live_open_request, stream_action)
+                            })
+                            .inner
+                    } else if self.explorer.is_x5_233_driver_mode() {
+                        egui::ScrollArea::vertical()
+                            .id_salt("workspace_x5_233_driver_sidebar_scroll")
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.separator();
+                                let live_open_request = self.render_x5_233_driver_workspace(ui);
+                                ui.separator();
+                                let stream_action = self.render_workspace_stream_section(ui);
+                                self.render_stream_metrics(ui);
+                                (live_open_request, stream_action)
                             })
                             .inner
                     } else {
                         (None, None)
                     };
-                    (direct_rtsp_config, explorer_action, stream_action)
+                    (live_open_request, explorer_action, stream_action)
                 })
                 .inner;
             if collapse {
@@ -1409,8 +1954,8 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = explorer_action {
             self.handle_explorer_action(&context, action);
         }
-        if let Some(config) = direct_rtsp_config {
-            self.start_direct_rtsp(config);
+        if let Some(request) = live_open_request {
+            self.start_live_stream(request);
         }
         if let Some(action) = workspace_stream_action {
             self.handle_workspace_stream_action(&context, action);
@@ -1460,25 +2005,22 @@ impl eframe::App for CameraToolboxApp {
         }
 
         #[cfg(feature = "platform-ssh")]
-        let i2c_tools_sftp_label: Result<String, String> = self
-            .explorer
-            .connected_sftp_label()
-            .map(str::to_owned)
-            .ok_or_else(|| "Connect Explorer SFTP before using I²C Tools.".to_owned());
+        let i2c_tools_sftp_label: Result<String, String> = self.remote_control_label(
+            "Connect Explorer SFTP or enter an X5 board IP before using I²C Tools.",
+        );
         #[cfg(feature = "platform-ssh")]
         let mut i2c_tools_action = None;
         #[cfg(feature = "calibration-opencv")]
         let calibration_sftp_label: Result<String, String> = {
             #[cfg(feature = "platform-ssh")]
             {
-                self.explorer
-                    .connected_sftp_label()
-                    .map(str::to_owned)
-                    .ok_or_else(|| "Connect Explorer SFTP before configuring EEPROM.".to_owned())
+                self.remote_control_label(
+                    "Connect Explorer SFTP or enter an X5 board IP before configuring EEPROM.",
+                )
             }
             #[cfg(not(feature = "platform-ssh"))]
             {
-                Err("This build does not include Explorer SFTP.".to_owned())
+                Err("This build does not include SSH/SFTP control.".to_owned())
             }
         };
         #[cfg(feature = "calibration-opencv")]
@@ -1489,7 +2031,7 @@ impl eframe::App for CameraToolboxApp {
                     .as_ref()
                     .map(|target| target.label.clone())
                     .ok_or_else(|| {
-                        "Use the connected Explorer SFTP source for EEPROM, then Inspect."
+                        "Use the available SSH/SFTP control source for EEPROM, then Inspect."
                             .to_owned()
                     })
             }
@@ -1499,6 +2041,8 @@ impl eframe::App for CameraToolboxApp {
             }
         };
         let calibration_export_error = self.explorer.export_dialog_prefill(&context).err();
+        #[cfg(feature = "calibration-opencv")]
+        self.sync_active_calibration_live_document();
 
         #[cfg(feature = "calibration-opencv")]
         let calibration_viewer_presentation = self.workspace.active_live().and_then(|document| {
@@ -1524,7 +2068,14 @@ impl eframe::App for CameraToolboxApp {
                 }
                 #[cfg(feature = "calibration-opencv")]
                 if self.is_calibration_workspace() {
-                    let has_live_inspection = self.workspace.active_live().is_some();
+                    let has_live_inspection = {
+                        let active_live_source = self
+                            .workspace
+                            .active_live()
+                            .map(|document| &document.source);
+                        self.calibration
+                            .active_accepts_live_source(active_live_source)
+                    };
                     let workspace = &mut self.workspace;
                     let (rect, _) = self.calibration.render(
                         &context,
@@ -1692,7 +2243,127 @@ impl CameraToolboxApp {
     fn is_color_workspace(&self) -> bool {
         self.product_workspace == ProductWorkspace::Color
     }
+    #[cfg(feature = "calibration-opencv")]
+    fn sync_active_calibration_live_document(&mut self) {
+        if !self.is_calibration_workspace() {
+            return;
+        }
+        if self.workspace.active_live().is_some_and(|document| {
+            self.calibration
+                .active_accepts_live_source(Some(&document.source))
+        }) {
+            return;
+        }
+        let matching_live_id = self
+            .workspace
+            .live_documents()
+            .iter()
+            .find(|document| {
+                self.calibration
+                    .active_accepts_live_source(Some(&document.source))
+            })
+            .map(|document| document.id);
+        if let Some(id) = matching_live_id {
+            self.workspace.activate(id);
+        }
+    }
 
+    fn capture_target_for_current_workspace(&self) -> CaptureTarget {
+        match self.product_workspace {
+            ProductWorkspace::Viewer => CaptureTarget::Viewer,
+            ProductWorkspace::Color => CaptureTarget::Color,
+            #[cfg(feature = "platform-ssh")]
+            ProductWorkspace::I2cTools => CaptureTarget::Viewer,
+            #[cfg(feature = "calibration-opencv")]
+            ProductWorkspace::Calibration => CaptureTarget::Calibration,
+        }
+    }
+
+    fn capture_route_label(&self) -> String {
+        let target = self.capture_target_for_current_workspace();
+        #[cfg(feature = "platform-ssh")]
+        if self.product_workspace == ProductWorkspace::I2cTools {
+            return format!(
+                "Capture route follows current workspace: {} (I²C Tools has no image consumer)",
+                target.label()
+            );
+        }
+        format!(
+            "Capture route follows current workspace: {}",
+            target.label()
+        )
+    }
+
+    fn x5_233_control_label(&self) -> Result<String, String> {
+        let host = self.x5_233_driver.device_ip.trim();
+        if host.is_empty() {
+            return Err("Connect Explorer SFTP or enter an X5 board IP.".to_owned());
+        }
+        Ok(format!(
+            "X5_233 {}@{}:{}",
+            self.x5_233_driver.ssh_user.trim(),
+            host,
+            X5_233_SSH_PORT
+        ))
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn x5_233_control_connection(&mut self) -> Result<RemoteConnectionConfig, String> {
+        let host = self.x5_233_driver.device_ip.trim();
+        if host.is_empty() {
+            return Err("Enter X5_233 device IP before using SSH/SFTP control.".to_owned());
+        }
+        let username = self.x5_233_driver.ssh_user.trim();
+        if username.is_empty() {
+            return Err("X5_233 SSH username must not be empty.".to_owned());
+        }
+        if self.x5_233_driver.ssh_password.is_empty() {
+            return Err("X5_233 SSH password must not be empty.".to_owned());
+        }
+        let host_id = x5_233_safe_id_component(host);
+        let user_id = x5_233_safe_id_component(username);
+        let slot_id = format!("x5-233-{user_id}-{host_id}");
+        self.live_runtime
+            .ssh_credential_resolver()
+            .register_session_password(
+                &slot_id,
+                SecretString::from(self.x5_233_driver.ssh_password.clone()),
+            )
+            .map_err(|error| format!("Register X5_233 SSH password failed: {error}"))?;
+        let config = RemoteConnectionConfig {
+            id: RemoteConnectionId::new(format!("x5-233-{user_id}-{host_id}"))
+                .map_err(|error| error.to_string())?,
+            display_name: format!("X5_233 {username}@{host}:{X5_233_SSH_PORT}"),
+            host: host.to_owned(),
+            port: X5_233_SSH_PORT,
+            username: username.to_owned(),
+            expected_host_key: None,
+            authentication: RemoteAuthentication::Password { slot_id },
+        };
+        config.validate().map_err(|error| error.to_string())?;
+        Ok(config)
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn remote_control_label(&self, missing_reason: &str) -> Result<String, String> {
+        if let Some(label) = self.explorer.connected_sftp_label() {
+            return Ok(label.to_owned());
+        }
+        self.x5_233_control_label()
+            .map_err(|_| missing_reason.to_owned())
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn remote_control_connection(
+        &mut self,
+        missing_reason: &str,
+    ) -> Result<RemoteConnectionConfig, String> {
+        if let Some(source) = self.explorer.connected_sftp_connection().cloned() {
+            return Ok(source);
+        }
+        self.x5_233_control_connection()
+            .map_err(|_| missing_reason.to_owned())
+    }
     fn render_product_workspace_switch(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.selectable_value(
@@ -3555,14 +4226,12 @@ impl CameraToolboxApp {
         &mut self,
         request: CalibrationEepromTargetRequest,
     ) -> Result<String, String> {
-        let source = self
-            .explorer
-            .connected_sftp_connection()
-            .cloned()
-            .ok_or_else(|| "Connect Explorer SFTP before configuring EEPROM.".to_owned())?;
+        let source = self.remote_control_connection(
+            "Connect Explorer SFTP or enter an X5 board IP before configuring EEPROM.",
+        )?;
         let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
         else {
-            return Err("EEPROM requires the Explorer SFTP process-only password".to_owned());
+            return Err("EEPROM requires a process-only SSH/SFTP password".to_owned());
         };
         let credential_ref = format!("session:{slot_id}");
         let connection = SshConnectionTarget {
@@ -3630,18 +4299,19 @@ impl CameraToolboxApp {
                 .report_error("An I²C Tools operation is already active.");
             return;
         }
-        let source = match self.explorer.connected_sftp_connection().cloned() {
-            Some(source) => source,
-            None => {
-                self.i2c_tools
-                    .report_error("Connect Explorer SFTP before using I²C Tools.");
+        let source = match self.remote_control_connection(
+            "Connect Explorer SFTP or enter an X5 board IP before using I²C Tools.",
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                self.i2c_tools.report_error(error);
                 return;
             }
         };
         let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
         else {
             self.i2c_tools
-                .report_error("I²C Tools requires the Explorer SFTP process-only password.");
+                .report_error("I²C Tools requires a process-only SSH/SFTP password.");
             return;
         };
         let helper_payload = match Self::read_local_eeprom_helper_payload() {
@@ -3744,12 +4414,12 @@ impl CameraToolboxApp {
             return;
         }
         if matches!(&intent, CalibrationProvisionIntent::DiscoverBuses) {
-            let source = match self.explorer.connected_sftp_connection().cloned() {
-                Some(source) => source,
-                None => {
-                    self.calibration.report_bus_discovery_failed(
-                        "Connect Explorer SFTP before discovering I²C buses.",
-                    );
+            let source = match self.remote_control_connection(
+                "Connect Explorer SFTP or enter an X5 board IP before discovering I²C buses.",
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.calibration.report_bus_discovery_failed(error);
                     return;
                 }
             };
@@ -3757,7 +4427,7 @@ impl CameraToolboxApp {
                 &source.authentication
             else {
                 self.calibration.report_bus_discovery_failed(
-                    "I²C bus discovery requires the Explorer SFTP process-only password",
+                    "I²C bus discovery requires a process-only SSH/SFTP password",
                 );
                 return;
             };
@@ -4853,9 +5523,12 @@ impl CameraToolboxApp {
         let result = match asset.metadata.format {
             MediaFormat::RawPacked { bit_depth } => self
                 .open_packed_raw_asset(context, asset, snapshot, spec.bayer, bit_depth, foreground),
-            MediaFormat::Jpeg | MediaFormat::Png | MediaFormat::Yuv420Sp { .. } => {
-                self.open_captured_raster_asset(asset, snapshot, foreground)
+            MediaFormat::RawU16Le { bit_depth } => {
+                self.open_u16_raw_asset(context, asset, snapshot, spec.bayer, bit_depth, foreground)
             }
+            MediaFormat::Jpeg | MediaFormat::Png | MediaFormat::Yuv420Sp { .. } => self
+                .open_captured_raster_asset(asset, snapshot, foreground)
+                .map(|_| ()),
             ref format => Err(format!(
                 "captured asset format {format:?} cannot be opened as an image"
             )),
@@ -4929,12 +5602,52 @@ impl CameraToolboxApp {
         Ok(())
     }
 
+    fn open_u16_raw_asset(
+        &mut self,
+        context: &egui::Context,
+        asset: Arc<EphemeralAsset>,
+        snapshot: Arc<TargetResolutionSnapshot>,
+        bayer: BayerPattern,
+        bit_depth: u8,
+        foreground: bool,
+    ) -> Result<(), String> {
+        let width = u32::try_from(asset_attribute_usize(&asset, "width")?)
+            .map_err(|_| "captured u16le RAW width does not fit u32".to_owned())?;
+        let height = u32::try_from(asset_attribute_usize(&asset, "height")?)
+            .map_err(|_| "captured u16le RAW height does not fit u32".to_owned())?;
+        let stride = asset_attribute_usize(&asset, "stride")?;
+        let bytes = asset_payload_bytes(&asset.source)?;
+        let frame = decode_strided_u16le_raw(width, height, stride, bit_depth, bayer, bytes)?;
+        let roi = Roi {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        let stats = analyze_roi(&frame, roi).map_err(|error| error.to_string())?;
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let loaded = LoadedRaw::from_report(
+            context,
+            LocalRawAnalyzeReport {
+                path: std::path::PathBuf::from(&asset.metadata.source_name),
+                frame,
+                roi,
+                stats,
+            },
+            generation,
+        );
+        self.workspace
+            .open_captured_raw(loaded, asset, snapshot, foreground);
+        Ok(())
+    }
+
     fn open_captured_raster_asset(
         &mut self,
         asset: Arc<camera_toolbox_core::EphemeralAsset>,
         snapshot: Arc<camera_toolbox_app::TargetResolutionSnapshot>,
         foreground: bool,
-    ) -> Result<(), String> {
+    ) -> Result<DocumentId, String> {
         let generation = self.next_generation;
         self.next_generation = self.next_generation.saturating_add(1);
         let (native, display) = match asset.metadata.format {
@@ -4984,8 +5697,42 @@ impl CameraToolboxApp {
             }
         };
         self.workspace
-            .open_captured_image(generation, asset, snapshot, native, display, foreground)?;
-        Ok(())
+            .open_captured_image(generation, asset, snapshot, native, display, foreground)
+    }
+
+    fn capture_live_frame_to_viewer(
+        &mut self,
+        context: &egui::Context,
+        id: DocumentId,
+    ) -> Result<DocumentId, String> {
+        let frame = self
+            .workspace
+            .live(id)
+            .and_then(|document| document.displayed_frame().cloned())
+            .ok_or_else(|| "active stream has no displayed frame to capture".to_owned())?;
+        let display = Arc::new(
+            Rgba8Frame::tight(frame.width, frame.height, Arc::clone(&frame.rgba))
+                .map_err(|error| error.to_string())?,
+        );
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let source_name = format!(
+            "stream-ch{}-frame{}.png",
+            frame.identity.channel, frame.identity.frame_sequence
+        );
+        let document_id = self.workspace.open_generated_capture(
+            generation,
+            source_name.clone(),
+            Arc::clone(&display),
+            true,
+        );
+        if let Some(document) = self.workspace.image_mut(document_id) {
+            document.ensure_texture(context)?;
+        }
+        if let Some(document) = self.workspace.live_mut(id) {
+            document.last_snapshot = Some(format!("Captured {source_name}"));
+        }
+        Ok(document_id)
     }
 
     fn capture_live_frame_for_color(
@@ -5153,9 +5900,9 @@ impl CameraToolboxApp {
         }
     }
 
-    fn render_direct_rtsp_workspace(&mut self, ui: &mut egui::Ui) -> Option<RtspStreamConfig> {
+    fn render_direct_rtsp_workspace(&mut self, ui: &mut egui::Ui) -> Option<LiveStreamOpenRequest> {
         ui.heading("RTSP Stream");
-        ui.weak("Independent live-image input; it does not use Local or SFTP mounts.");
+        ui.weak("Generic RTSP input; device-specific TCP control stays in dedicated workspaces.");
         ui.label("URL");
         ui.text_edit_singleline(&mut self.direct_rtsp.url);
         ui.horizontal(|ui| {
@@ -5194,11 +5941,9 @@ impl CameraToolboxApp {
             "Prefer hardware acceleration",
         );
         ui.weak("A preference only; the Viewer reports the actual decoder backend after connect.");
-        if let Some(error) = self.direct_rtsp.last_error.as_deref() {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
-        }
+        let mut request = None;
         if ui.button("Connect RTSP").clicked() {
-            return Some(RtspStreamConfig {
+            request = Some(LiveStreamOpenRequest::DirectRtsp(RtspStreamConfig {
                 url: self.direct_rtsp.url.clone(),
                 channel: self.direct_rtsp.channel,
                 width: self.direct_rtsp.width,
@@ -5206,9 +5951,213 @@ impl CameraToolboxApp {
                 codec: self.direct_rtsp.codec,
                 transport: self.direct_rtsp.transport,
                 latency_mode: self.direct_rtsp.latency_mode,
-            });
+            }));
         }
-        None
+        if let Some(status) = self.direct_rtsp.last_status.as_deref() {
+            ui.weak(status);
+        }
+        if let Some(error) = self.direct_rtsp.last_error.as_deref() {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        request
+    }
+
+    fn render_x5_233_driver_workspace(
+        &mut self,
+        ui: &mut egui::Ui,
+    ) -> Option<LiveStreamOpenRequest> {
+        ui.heading("X5_233 Driver");
+        ui.weak(
+            "X5 control is split into SSH/SFTP control, RTSP preview, and TCP snapshot capture.",
+        );
+
+        let status_snapshot = self.x5_233_driver.last_tcp_status.clone();
+        let host_ready = !self.x5_233_driver.device_ip.trim().is_empty();
+        let channel_ready = !self.selected_x5_233_channels().is_empty();
+        let mut request = None;
+
+        ui.group(|ui| {
+            ui.heading("Device / Control");
+            egui::Grid::new("x5_233_device_control_grid")
+                .num_columns(2)
+                .spacing([12.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Host / IP");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.x5_233_driver.device_ip)
+                            .hint_text("X5 board IP"),
+                    );
+                    ui.end_row();
+                    ui.label("TCP port");
+                    ui.add(
+                        egui::DragValue::new(&mut self.x5_233_driver.tcp_port).range(1..=u16::MAX),
+                    );
+                    ui.end_row();
+                });
+            let control_label = self.x5_233_control_label().unwrap_or_else(|_| {
+                format!(
+                    "X5_233 {}@<ip>:{}",
+                    self.x5_233_driver.ssh_user, X5_233_SSH_PORT
+                )
+            });
+            ui.weak(format!(
+                "SSH/SFTP control: {control_label}; process-only password defaults to {}.",
+                self.x5_233_driver.ssh_password
+            ));
+            if ui
+                .add_enabled(host_ready, egui::Button::new("Read TCP Status"))
+                .clicked()
+            {
+                self.read_x5_233_tcp_status();
+            }
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("RTSP Preview");
+            ui.checkbox(
+                &mut self.x5_233_driver.configure_before_connect,
+                "Configure encoder before RTSP connect",
+            );
+            egui::Grid::new("x5_233_encoder_grid")
+                .num_columns(4)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Width");
+                    ui.add(egui::DragValue::new(&mut self.x5_233_driver.width).range(1..=16_384));
+                    ui.label("Height");
+                    ui.add(egui::DragValue::new(&mut self.x5_233_driver.height).range(1..=16_384));
+                    ui.end_row();
+                    ui.label("FPS");
+                    ui.add(egui::DragValue::new(&mut self.x5_233_driver.fps).range(1..=240));
+                    ui.label("Bitrate kbps");
+                    ui.add(
+                        egui::DragValue::new(&mut self.x5_233_driver.bitrate_kbps)
+                            .range(200..=50_000),
+                    );
+                    ui.end_row();
+                });
+
+            ui.label("Channels");
+            egui::Grid::new("x5_233_channel_status_grid")
+                .striped(true)
+                .num_columns(7)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    ui.strong("Sel");
+                    ui.strong("CH");
+                    ui.strong("RTSP");
+                    ui.strong("Req");
+                    ui.strong("Started");
+                    ui.strong("TX");
+                    ui.strong("Busy");
+                    ui.end_row();
+                    for mapping in X5_233_DRIVER_CHANNELS {
+                        let selected = match mapping.driver_channel {
+                            0 => &mut self.x5_233_driver.driver_channel_0,
+                            1 => &mut self.x5_233_driver.driver_channel_1,
+                            3 => &mut self.x5_233_driver.driver_channel_3,
+                            4 => &mut self.x5_233_driver.driver_channel_4,
+                            _ => continue,
+                        };
+                        let channel_status = status_snapshot.as_ref().and_then(|summary| {
+                            summary
+                                .rtsp_channels
+                                .iter()
+                                .find(|status| status.channel == mapping.driver_channel)
+                        });
+                        ui.checkbox(selected, "");
+                        ui.label(mapping.label);
+                        ui.label(format!(":{}", mapping.rtsp_port));
+                        ui.label(x5_233_bool_cell(
+                            channel_status.map(|status| status.requested_enabled),
+                        ));
+                        ui.label(x5_233_bool_cell(channel_status.map(|status| status.started)));
+                        ui.label(x5_233_bool_cell(channel_status.map(|status| status.tx_enabled)));
+                        ui.label(x5_233_bool_cell(channel_status.map(|status| status.busy)));
+                        ui.end_row();
+                    }
+                });
+            ui.horizontal(|ui| {
+                if ui
+                    .add_enabled(
+                        host_ready && channel_ready,
+                        egui::Button::new("Connect selected RTSP"),
+                    )
+                    .clicked()
+                {
+                    request = Some(LiveStreamOpenRequest::X5233Selected);
+                }
+                if ui
+                    .add_enabled(
+                        host_ready && channel_ready,
+                        egui::Button::new("Stop selected RTSP"),
+                    )
+                    .clicked()
+                {
+                    self.stop_x5_233_rtsp();
+                }
+            });
+            ui.weak("RTSP preview only opens stream monitor documents; it does not create Calibration sessions.");
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("TCP Snapshot");
+            ui.weak(
+                "SNAPSHOT reads the latest ISP NV12 frame; SNAPSHOT_RAW reads a VIN RAW frame.",
+            );
+            let capture_route = self.capture_route_label();
+            ui.weak(capture_route);
+            ui.weak(self.capture_target_for_current_workspace().hover());
+            ui.horizontal(|ui| {
+                ui.label("YUV channel");
+                egui::ComboBox::from_id_salt("x5_233_yuv_channel")
+                    .selected_text(format!("CH{}", self.x5_233_driver.yuv_channel))
+                    .show_ui(ui, |ui| {
+                        for mapping in X5_233_DRIVER_CHANNELS {
+                            ui.selectable_value(
+                                &mut self.x5_233_driver.yuv_channel,
+                                mapping.driver_channel,
+                                mapping.label,
+                            );
+                        }
+                    });
+                if ui
+                    .add_enabled(host_ready, egui::Button::new("Capture YUV"))
+                    .clicked()
+                {
+                    self.capture_x5_233_yuv_snapshot(ui.ctx());
+                }
+                ui.separator();
+                ui.label("RAW camera");
+                ui.add(egui::DragValue::new(&mut self.x5_233_driver.raw_camera).range(0..=1));
+                if ui
+                    .add_enabled(host_ready, egui::Button::new("Capture RAW"))
+                    .clicked()
+                {
+                    self.capture_x5_233_raw_snapshot(ui.ctx());
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+        ui.group(|ui| {
+            ui.heading("TCP Status");
+            if let Some(status) = &self.x5_233_driver.last_tcp_status {
+                render_x5_233_tcp_status(ui, status);
+            } else {
+                ui.weak("Read TCP Status to show protocol, RTSP channel, and snapshot ring state.");
+            }
+            if let Some(status) = self.x5_233_driver.last_status.as_deref() {
+                ui.separator();
+                ui.label(format!("Last operation: {status}"));
+            }
+        });
+        if let Some(error) = self.x5_233_driver.last_error.as_deref() {
+            ui.colored_label(egui::Color32::LIGHT_RED, error);
+        }
+        request
     }
 
     fn render_workspace_stream_section(
@@ -5218,6 +6167,9 @@ impl CameraToolboxApp {
         use egui_extras::{Column, TableBuilder};
 
         ui.heading("Active Streams");
+        let capture_route = self.capture_route_label();
+        ui.weak(capture_route);
+        ui.weak(self.capture_target_for_current_workspace().hover());
         let active = self.workspace.active_id();
         let items: Vec<_> = self
             .workspace
@@ -5278,13 +6230,7 @@ impl CameraToolboxApp {
                                 can_capture,
                             ) = items[row.index()];
                             let is_selected = active == Some(id);
-                            let capture_hover = if self.is_color_workspace() {
-                                Some("Capture the displayed frame into the Color page")
-                            } else if cfg!(feature = "calibration-opencv") {
-                                Some("Capture the displayed frame into the Calibration dataset")
-                            } else {
-                                None
-                            };
+                            let capture_hover = self.capture_target_for_current_workspace().hover();
                             row.col(|ui| {
                                 if ui.selectable_label(is_selected, title).clicked() {
                                     action = Some(WorkspaceStreamAction::Activate(id));
@@ -5296,14 +6242,10 @@ impl CameraToolboxApp {
                                 ui.label(format!("{stage} · {status}"));
                             });
                             row.col(|ui| {
-                                if let Some(hover) = capture_hover
-                                    && ui
-                                        .add_enabled(
-                                            can_capture,
-                                            egui::Button::new("Capture").small(),
-                                        )
-                                        .on_hover_text(hover)
-                                        .clicked()
+                                if ui
+                                    .add_enabled(can_capture, egui::Button::new("Capture").small())
+                                    .on_hover_text(capture_hover)
+                                    .clicked()
                                 {
                                     action = Some(WorkspaceStreamAction::Capture(id));
                                 }
@@ -5436,18 +6378,613 @@ impl CameraToolboxApp {
         });
     }
 
-    fn start_direct_rtsp(&mut self, config: RtspStreamConfig) {
+    fn start_live_stream(&mut self, request: LiveStreamOpenRequest) {
+        match request {
+            LiveStreamOpenRequest::DirectRtsp(config) => self.open_direct_rtsp_config(config),
+            LiveStreamOpenRequest::X5233Selected => self.start_x5_233_selected_rtsp(),
+        }
+    }
+    fn open_live_workspace_document(
+        &mut self,
+        session_id: StreamSessionId,
+        latest_frame: Arc<camera_toolbox_app::LatestDecodedFrameSlot>,
+        source: LiveStreamSource,
+    ) -> DocumentId {
+        #[cfg(feature = "calibration-opencv")]
+        if self.is_calibration_workspace() {
+            self.calibration.activate_live_source_session(&source);
+        }
+        self.workspace.open_live(session_id, latest_frame, source)
+    }
+
+    fn open_direct_rtsp_config(&mut self, config: RtspStreamConfig) {
         let prefer_hardware_acceleration = self.direct_rtsp.prefer_hardware_acceleration;
         match self
             .live_runtime
             .start_direct_rtsp(config, prefer_hardware_acceleration)
         {
             Ok((session_id, latest_frame, source)) => {
-                self.workspace.open_live(session_id, latest_frame, source);
+                self.open_live_workspace_document(session_id, latest_frame, source);
                 self.direct_rtsp.last_error = None;
             }
             Err(error) => self.direct_rtsp.last_error = Some(error),
         }
+    }
+
+    fn open_x5_233_rtsp_config(&mut self, config: RtspStreamConfig) -> bool {
+        let source = x5_233_live_source(
+            &self.x5_233_driver.device_ip,
+            config.channel,
+            self.x5_233_driver.tcp_port,
+            config.transport,
+            config.width,
+            config.height,
+        );
+        match self.live_runtime.start_named_direct_rtsp_with_timeouts(
+            config,
+            false,
+            "X5_233_Driver",
+            x5_233_rtsp_timeouts(),
+        ) {
+            Ok((session_id, latest_frame, _decoder_source)) => {
+                self.open_live_workspace_document(session_id, latest_frame, source);
+                self.x5_233_driver.last_error = None;
+                true
+            }
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(error);
+                false
+            }
+        }
+    }
+
+    fn start_x5_233_selected_rtsp(&mut self) {
+        if self.x5_233_driver.device_ip.trim().is_empty() {
+            self.x5_233_driver.last_error =
+                Some("Enter X5_233 device IP before opening RTSP.".to_owned());
+            return;
+        }
+        let channels = self.selected_x5_233_channels();
+        if channels.is_empty() {
+            self.x5_233_driver.last_error = Some("Select at least one X5_233 channel.".to_owned());
+            return;
+        }
+        if self.x5_233_driver.configure_before_connect {
+            let config = X5RtspEncoderConfig {
+                fps: self.x5_233_driver.fps,
+                bitrate_kbps: self.x5_233_driver.bitrate_kbps,
+            };
+            match x5_tcp_client::configure_rtsp(
+                &self.x5_233_driver.device_ip,
+                self.x5_233_driver.tcp_port,
+                config,
+            ) {
+                Ok(summary) => {
+                    self.x5_233_driver.last_status = Some(format!(
+                        "X5_233 RTSP config {}: fps={} bitrate={} kbps version={} action={:?}",
+                        summary.apply_mode,
+                        summary.fps,
+                        summary.bitrate_kbps,
+                        summary.pipeline_config_version,
+                        summary.action_id
+                    ));
+                    self.x5_233_driver.last_error = None;
+                }
+                Err(error) => {
+                    self.x5_233_driver.last_error = Some(error);
+                    return;
+                }
+            }
+        }
+        let status =
+            match x5_tcp_client::status(&self.x5_233_driver.device_ip, self.x5_233_driver.tcp_port)
+            {
+                Ok(status) => status,
+                Err(error) => {
+                    self.x5_233_driver.last_error = Some(error);
+                    return;
+                }
+            };
+        let channels_to_start =
+            match x5_tcp_client::rtsp_channels_requiring_start(&status, &channels) {
+                Ok(channels_to_start) => channels_to_start,
+                Err(error) => {
+                    self.x5_233_driver.last_error = Some(error);
+                    return;
+                }
+            };
+        let mut queued = Vec::new();
+        if channels_to_start.is_empty() {
+            queued.push("selected channels already requested or running".to_owned());
+        }
+        for driver_channel in &channels_to_start {
+            match x5_tcp_client::start_rtsp_channel(
+                &self.x5_233_driver.device_ip,
+                self.x5_233_driver.tcp_port,
+                *driver_channel,
+            ) {
+                Ok(summary) => {
+                    queued.push(format!(
+                        "CH{} {} action={} busy={} affected={:?}",
+                        summary.channel.unwrap_or(*driver_channel),
+                        summary.queued_action,
+                        summary.action_id,
+                        summary.worker_busy,
+                        summary.affected_channels
+                    ));
+                }
+                Err(error) => {
+                    self.x5_233_driver.last_error = Some(error);
+                    return;
+                }
+            }
+        }
+        self.x5_233_driver.last_status = Some(format!(
+            "X5_233 RTSP control through TCP: {}",
+            queued.join("; ")
+        ));
+        self.x5_233_driver.last_error = None;
+        match x5_tcp_client::wait_for_rtsp_channels_ready(
+            &self.x5_233_driver.device_ip,
+            self.x5_233_driver.tcp_port,
+            &channels,
+        ) {
+            Ok(status) => {
+                self.x5_233_driver.last_status = Some(format!(
+                    "X5_233 RTSP ready for {:?}: fps={:?} bitrate={:?} kbps",
+                    channels, status.fps, status.bitrate_kbps
+                ));
+                self.x5_233_driver.last_error = None;
+            }
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(error);
+                return;
+            }
+        }
+        let mut opened = 0_usize;
+        for driver_channel in channels {
+            let Some(mapping) = x5_233_channel_mapping(driver_channel) else {
+                self.x5_233_driver.last_error = Some(format!(
+                    "Unsupported X5_233 driver channel CH{driver_channel}."
+                ));
+                continue;
+            };
+            let Some(url) = x5_233_rtsp_url(&self.x5_233_driver.device_ip, driver_channel) else {
+                self.x5_233_driver.last_error = Some("X5_233 device IP is required.".to_owned());
+                continue;
+            };
+            let config = RtspStreamConfig {
+                url,
+                channel: mapping.driver_channel,
+                width: self.x5_233_driver.width,
+                height: self.x5_233_driver.height,
+                codec: RtspCodec::H264,
+                transport: RtspTransport::Tcp,
+                latency_mode: RtspLatencyMode::Stable,
+            };
+            if self.open_x5_233_rtsp_config(config) {
+                opened = opened.saturating_add(1);
+            }
+        }
+        if opened > 0 {
+            self.x5_233_driver.last_status = Some(format!(
+                "Opened {opened} X5_233 RTSP stream(s); RTSP worker was started through TCP."
+            ));
+        }
+    }
+
+    fn read_x5_233_tcp_status(&mut self) {
+        match x5_tcp_client::probe(&self.x5_233_driver.device_ip, self.x5_233_driver.tcp_port) {
+            Ok(summary) => {
+                if let Some(fps) = summary.fps {
+                    self.x5_233_driver.fps = fps;
+                }
+                if let Some(bitrate_kbps) = summary.bitrate_kbps {
+                    self.x5_233_driver.bitrate_kbps = bitrate_kbps;
+                }
+                let status_line = format!(
+                    "Read TCP Status OK: protocol={} channels={} fps={} bitrate={} version={} rtsp={}/{} rings={}",
+                    summary.protocol,
+                    summary
+                        .channels
+                        .iter()
+                        .map(u16::to_string)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    summary
+                        .fps
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".to_owned()),
+                    summary
+                        .bitrate_kbps
+                        .map(|value| format!("{value} kbps"))
+                        .unwrap_or_else(|| "—".to_owned()),
+                    summary
+                        .pipeline_config_version
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "—".to_owned()),
+                    x5_233_bool_cell(Some(summary.rtsp_requested_enabled)),
+                    x5_233_bool_cell(Some(summary.rtsp_started)),
+                    summary.rings.len()
+                );
+                self.x5_233_driver.last_tcp_status = Some(summary);
+                self.x5_233_driver.last_status = Some(status_line);
+                self.x5_233_driver.last_error = None;
+            }
+            Err(error) => self.x5_233_driver.last_error = Some(error),
+        }
+    }
+
+    fn stop_x5_233_rtsp(&mut self) {
+        if self.x5_233_driver.device_ip.trim().is_empty() {
+            self.x5_233_driver.last_error =
+                Some("Enter X5_233 device IP before stopping RTSP.".to_owned());
+            return;
+        }
+        let channels = self.selected_x5_233_channels();
+        if channels.is_empty() {
+            self.x5_233_driver.last_error = Some("Select at least one X5_233 channel.".to_owned());
+            return;
+        }
+        let mut stopped = Vec::new();
+        for driver_channel in channels {
+            match x5_tcp_client::stop_rtsp_channel(
+                &self.x5_233_driver.device_ip,
+                self.x5_233_driver.tcp_port,
+                driver_channel,
+            ) {
+                Ok(summary) => {
+                    stopped.push(format!(
+                        "CH{} {} action={} busy={} requested={}",
+                        summary.channel.unwrap_or(driver_channel),
+                        summary.queued_action,
+                        summary.action_id,
+                        summary.worker_busy,
+                        summary.requested_enabled
+                    ));
+                }
+                Err(error) => {
+                    self.x5_233_driver.last_error = Some(error);
+                    return;
+                }
+            }
+        }
+        self.x5_233_driver.last_status = Some(format!(
+            "X5_233 RTSP stop queued through TCP: {}",
+            stopped.join("; ")
+        ));
+        self.x5_233_driver.last_error = None;
+    }
+
+    fn capture_x5_233_yuv_snapshot(&mut self, context: &egui::Context) {
+        let driver_channel = self.x5_233_driver.yuv_channel;
+        let Some(mapping) = x5_233_channel_mapping(driver_channel) else {
+            self.x5_233_driver.last_error = Some(format!(
+                "Unsupported X5_233 driver channel CH{driver_channel}."
+            ));
+            return;
+        };
+        match x5_tcp_client::capture_yuv_snapshot(
+            &self.x5_233_driver.device_ip,
+            self.x5_233_driver.tcp_port,
+            mapping.driver_channel,
+        ) {
+            Ok(snapshot) => match self.publish_x5_233_yuv_snapshot(context, snapshot) {
+                Ok(status) => {
+                    self.x5_233_driver.last_status = Some(status);
+                    self.x5_233_driver.last_error = None;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        operation = "x5_manual_yuv_publish",
+                        channel = mapping.driver_channel,
+                        error = %error,
+                        "X5 manual YUV snapshot publish failed"
+                    );
+                    self.x5_233_driver.last_error = Some(error);
+                }
+            },
+            Err(error) => {
+                tracing::warn!(
+                    operation = "x5_manual_yuv_snapshot",
+                    host = %self.x5_233_driver.device_ip,
+                    port = self.x5_233_driver.tcp_port,
+                    channel = mapping.driver_channel,
+                    error = %error,
+                    "X5 manual YUV snapshot failed"
+                );
+                self.x5_233_driver.last_error = Some(error);
+            }
+        }
+    }
+
+    fn publish_x5_233_yuv_snapshot(
+        &mut self,
+        _context: &egui::Context,
+        snapshot: x5_tcp_client::X5YuvSnapshot,
+    ) -> Result<String, String> {
+        let channel = snapshot.channel;
+        let width = snapshot.width;
+        let height = snapshot.height;
+        let y_len = snapshot.y_len;
+        let uv_len = snapshot.uv_len;
+        let frame_id = snapshot.frame_id;
+        let timestamp_ns = snapshot.timestamp_ns;
+        let spec = x5_233_yuv_snapshot_spec(width, height, y_len, uv_len)?;
+        if snapshot.payload.len() != y_len.saturating_add(uv_len) {
+            return Err(format!(
+                "X5_233 YUV payload length mismatch: y_len + uv_len = {}, got {}",
+                y_len.saturating_add(uv_len),
+                snapshot.payload.len()
+            ));
+        }
+        let source_name = format!("x5-233-ch{channel}-frame{frame_id}.nv12");
+        let media_label = format!("yuv-ch{channel}-frame{frame_id}");
+        let target_snapshot = x5_233_target_snapshot(
+            &self.x5_233_driver.device_ip,
+            self.x5_233_driver.tcp_port,
+            &media_label,
+        )?;
+        let digest = SnapshotHash::digest_bytes(&snapshot.payload).to_hex();
+        let captured_at_ns = camera_toolbox_app::host_monotonic_time_ns();
+        let asset_id = AssetId::new(format!(
+            "x5-233-yuv-ch{channel}-frame{frame_id}-{captured_at_ns}-{}",
+            &digest[..16]
+        ))
+        .map_err(|error| error.to_string())?;
+        let operation_id = OperationId::new(format!("x5-233-yuv-{}", asset_id.as_str()))
+            .map_err(|error| error.to_string())?;
+        let payload_len = snapshot.payload.len();
+        let source = OwnedMediaPayload::from_bytes(Arc::<[u8]>::from(snapshot.payload));
+        let mut attributes = BTreeMap::new();
+        attributes.insert("source".to_owned(), "x5_233_tcp_snapshot".to_owned());
+        attributes.insert(
+            "host".to_owned(),
+            self.x5_233_driver.device_ip.trim().to_owned(),
+        );
+        attributes.insert(
+            "tcp_port".to_owned(),
+            self.x5_233_driver.tcp_port.to_string(),
+        );
+        attributes.insert("channel".to_owned(), channel.to_string());
+        attributes.insert("width".to_owned(), width.to_string());
+        attributes.insert("height".to_owned(), height.to_string());
+        attributes.insert("y_stride".to_owned(), spec.y_stride.to_string());
+        attributes.insert("chroma_stride".to_owned(), spec.chroma_stride.to_string());
+        attributes.insert("y_len".to_owned(), y_len.to_string());
+        attributes.insert("uv_len".to_owned(), uv_len.to_string());
+        attributes.insert("frame_id".to_owned(), frame_id.to_string());
+        attributes.insert("timestamp_ns".to_owned(), timestamp_ns.to_string());
+        attributes.insert(
+            "captured_at_host_monotonic_ns".to_owned(),
+            captured_at_ns.to_string(),
+        );
+        let asset = EphemeralAsset::new(
+            asset_id,
+            source,
+            CaptureMetadata {
+                format: MediaFormat::Yuv420Sp {
+                    chroma_order: ChromaOrder::Uv,
+                },
+                source_name,
+                attributes,
+            },
+            IntegrityState::Verified {
+                algorithm: "sha256".to_owned(),
+                digest,
+            },
+        );
+        let store = self.live_runtime.capture_store().clone();
+        let reservation = store
+            .reserve(operation_id, payload_len)
+            .map_err(|error| format!("Reserve X5_233 YUV capture failed: {error}"))?;
+        let asset = store
+            .publish_validated(reservation, asset)
+            .map_err(|error| format!("Publish X5_233 YUV capture failed: {error}"))?;
+        let target = self.capture_target_for_current_workspace();
+        #[cfg(feature = "calibration-opencv")]
+        let foreground = !matches!(target, CaptureTarget::Calibration);
+        #[cfg(not(feature = "calibration-opencv"))]
+        let foreground = true;
+        let document_id = self.open_captured_raster_asset(asset, target_snapshot, foreground)?;
+        match target {
+            CaptureTarget::Viewer => {
+                self.workspace.activate(document_id);
+                self.product_workspace = ProductWorkspace::Viewer;
+            }
+            CaptureTarget::Color => {
+                self.workspace.activate(document_id);
+                if let Some(document) = self.workspace.image(document_id) {
+                    self.color_inspection.analyze_document(document);
+                }
+            }
+            #[cfg(feature = "calibration-opencv")]
+            CaptureTarget::Calibration => {
+                let display = self
+                    .workspace
+                    .image(document_id)
+                    .map(|document| Arc::clone(&document.display.frame))
+                    .ok_or_else(|| {
+                        "X5_233 YUV capture image was not opened for calibration".to_owned()
+                    })?;
+                self.capture_x5_233_yuv_for_calibration(channel, width, height, frame_id, display)?;
+            }
+        }
+        Ok(format!(
+            "Published YUV driver CH{channel} to {} as image document {:?}: {width}x{height} y={y_len} uv={uv_len} payload={payload_len} frame_id={frame_id} timestamp_ns={timestamp_ns}",
+            target.label(),
+            document_id,
+        ))
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn capture_x5_233_yuv_for_calibration(
+        &mut self,
+        channel: u16,
+        width: u32,
+        height: u32,
+        frame_id: u64,
+        display: Arc<Rgba8Frame>,
+    ) -> Result<(), String> {
+        let host = self.x5_233_driver.device_ip.trim();
+        let stream_id = StreamSessionId::new(format!(
+            "x5-233-tcp-{}-ch{channel}",
+            x5_233_safe_id_component(host)
+        ))
+        .map_err(|error| error.to_string())?;
+        let frame = Arc::new(DecodedVideoFrame {
+            width,
+            height,
+            rgba: Arc::<[u8]>::from(display.pixels().to_vec()),
+            identity: StreamFrameIdentity::unavailable(
+                stream_id,
+                channel,
+                frame_id,
+                "X5_233 TCP SNAPSHOT exposes device timestamp_ns only",
+            ),
+        });
+        let source = x5_233_live_source(
+            host,
+            channel,
+            self.x5_233_driver.tcp_port,
+            RtspTransport::Tcp,
+            width,
+            height,
+        );
+        self.calibration.capture_displayed_stream_frame(
+            frame,
+            source,
+            self.live_runtime.capture_store().clone(),
+        );
+        Ok(())
+    }
+
+    fn capture_x5_233_raw_snapshot(&mut self, context: &egui::Context) {
+        match x5_tcp_client::capture_raw_snapshot(
+            &self.x5_233_driver.device_ip,
+            self.x5_233_driver.tcp_port,
+            self.x5_233_driver.raw_camera,
+            1000,
+        ) {
+            Ok(snapshot) => match self.publish_x5_233_raw_snapshot(context, snapshot) {
+                Ok(status) => {
+                    self.x5_233_driver.last_status = Some(status);
+                    self.x5_233_driver.last_error = None;
+                }
+                Err(error) => self.x5_233_driver.last_error = Some(error),
+            },
+            Err(error) => self.x5_233_driver.last_error = Some(error),
+        }
+    }
+
+    fn publish_x5_233_raw_snapshot(
+        &mut self,
+        context: &egui::Context,
+        snapshot: x5_tcp_client::X5RawSnapshot,
+    ) -> Result<String, String> {
+        let bit_depth = x5_233_raw_bit_depth(snapshot.format_code)?;
+        let source_name = format!(
+            "x5-233-camera{}-frame{}.raw",
+            snapshot.camera, snapshot.frame_id
+        );
+        let media_label = format!("raw-cam{}-frame{}", snapshot.camera, snapshot.frame_id);
+        let target_snapshot = x5_233_target_snapshot(
+            &self.x5_233_driver.device_ip,
+            self.x5_233_driver.tcp_port,
+            &media_label,
+        )?;
+        let digest = SnapshotHash::digest_bytes(&snapshot.payload).to_hex();
+        let captured_at_ns = camera_toolbox_app::host_monotonic_time_ns();
+        let asset_id = AssetId::new(format!(
+            "x5-233-raw-cam{}-frame{}-{captured_at_ns}-{}",
+            snapshot.camera,
+            snapshot.frame_id,
+            &digest[..16]
+        ))
+        .map_err(|error| error.to_string())?;
+        let operation_id = OperationId::new(format!("x5-233-raw-{}", asset_id.as_str()))
+            .map_err(|error| error.to_string())?;
+        let payload_len = snapshot.payload.len();
+        let mut attributes = BTreeMap::new();
+        attributes.insert("source".to_owned(), "x5_233_tcp_snapshot_raw".to_owned());
+        attributes.insert(
+            "host".to_owned(),
+            self.x5_233_driver.device_ip.trim().to_owned(),
+        );
+        attributes.insert(
+            "tcp_port".to_owned(),
+            self.x5_233_driver.tcp_port.to_string(),
+        );
+        attributes.insert("camera".to_owned(), snapshot.camera.to_string());
+        attributes.insert("width".to_owned(), snapshot.width.to_string());
+        attributes.insert("height".to_owned(), snapshot.height.to_string());
+        attributes.insert("stride".to_owned(), snapshot.stride.to_string());
+        attributes.insert("format_code".to_owned(), snapshot.format_code.to_string());
+        attributes.insert("frame_id".to_owned(), snapshot.frame_id.to_string());
+        attributes.insert("timestamp_ns".to_owned(), snapshot.timestamp_ns.to_string());
+        attributes.insert(
+            "captured_at_host_monotonic_ns".to_owned(),
+            captured_at_ns.to_string(),
+        );
+        let asset = EphemeralAsset::new(
+            asset_id,
+            OwnedMediaPayload::from_bytes(Arc::<[u8]>::from(snapshot.payload)),
+            CaptureMetadata {
+                format: MediaFormat::RawU16Le { bit_depth },
+                source_name,
+                attributes,
+            },
+            IntegrityState::Verified {
+                algorithm: "sha256".to_owned(),
+                digest,
+            },
+        );
+        let store = self.live_runtime.capture_store().clone();
+        let reservation = store
+            .reserve(operation_id, payload_len)
+            .map_err(|error| format!("Reserve X5_233 RAW capture failed: {error}"))?;
+        let asset = store
+            .publish_validated(reservation, asset)
+            .map_err(|error| format!("Publish X5_233 RAW capture failed: {error}"))?;
+        self.open_u16_raw_asset(
+            context,
+            asset,
+            target_snapshot,
+            BayerPattern::Rggb,
+            bit_depth,
+            true,
+        )?;
+        let opened_document_id = self.workspace.active_id();
+        Ok(format!(
+            "Published RAW cam{} as RAW document {:?}: {}x{} stride={} bit_depth={} format_code={} payload={} frame_id={} timestamp_ns={}",
+            snapshot.camera,
+            opened_document_id,
+            snapshot.width,
+            snapshot.height,
+            snapshot.stride,
+            bit_depth,
+            snapshot.format_code,
+            payload_len,
+            snapshot.frame_id,
+            snapshot.timestamp_ns
+        ))
+    }
+
+    fn selected_x5_233_channels(&self) -> Vec<u16> {
+        let mut channels = Vec::new();
+        if self.x5_233_driver.driver_channel_0 {
+            channels.push(0);
+        }
+        if self.x5_233_driver.driver_channel_1 {
+            channels.push(1);
+        }
+        if self.x5_233_driver.driver_channel_3 {
+            channels.push(3);
+        }
+        if self.x5_233_driver.driver_channel_4 {
+            channels.push(4);
+        }
+        channels
     }
 
     fn handle_stream_panel_action(&mut self, action: StreamPanelAction) {
@@ -5509,15 +7046,23 @@ impl CameraToolboxApp {
                     }
                 }
             }
-            WorkspaceStreamAction::Capture(id) => {
-                if self.is_color_workspace() {
+            WorkspaceStreamAction::Capture(id) => match self.capture_target_for_current_workspace()
+            {
+                CaptureTarget::Viewer => match self.capture_live_frame_to_viewer(context, id) {
+                    Ok(_) => self.product_workspace = ProductWorkspace::Viewer,
+                    Err(error) => {
+                        if let Some(document) = self.workspace.live_mut(id) {
+                            document.last_snapshot = Some(format!("Capture failed: {error}"));
+                        }
+                    }
+                },
+                CaptureTarget::Color => {
                     if let Err(error) = self.capture_live_frame_for_color(context, id) {
                         self.color_inspection.report_error(error);
                     }
-                    return;
                 }
                 #[cfg(feature = "calibration-opencv")]
-                {
+                CaptureTarget::Calibration => {
                     self.workspace.activate(id);
                     let Some((frame, source)) = self.workspace.live(id).and_then(|document| {
                         document
@@ -5532,9 +7077,8 @@ impl CameraToolboxApp {
                         source,
                         self.live_runtime.capture_store().clone(),
                     );
-                    self.product_workspace = ProductWorkspace::Calibration;
                 }
-            }
+            },
         }
     }
 
@@ -5555,16 +7099,34 @@ impl CameraToolboxApp {
             ) {
                 self.calibration.stream_disconnected(&event.session_id);
             }
-            if let Some(document) = self.workspace.live_by_session_mut(&event.session_id) {
-                let is_terminal = matches!(
-                    event.event,
-                    camera_toolbox_app::StreamServiceEvent::Terminal(_)
-                );
-                document.apply_event(event.event);
-                if is_terminal {
-                    let id = document.id;
-                    self.workspace.remove_live(id);
-                }
+            let x5_terminal_error =
+                if let Some(document) = self.workspace.live_by_session_mut(&event.session_id) {
+                    let is_terminal = matches!(
+                        &event.event,
+                        camera_toolbox_app::StreamServiceEvent::Terminal(_)
+                    );
+                    let x5_terminal_error = match (&document.source, &event.event) {
+                        (
+                            LiveStreamSource::Rtsp { label, channel, .. },
+                            camera_toolbox_app::StreamServiceEvent::Terminal(
+                                camera_toolbox_app::StreamTerminal::Failed(error),
+                            ),
+                        ) if label == "X5_233_Driver" => {
+                            Some(format!("X5_233 RTSP CH{channel} failed: {error}"))
+                        }
+                        _ => None,
+                    };
+                    document.apply_event(event.event);
+                    if is_terminal {
+                        let id = document.id;
+                        self.workspace.remove_live(id);
+                    }
+                    x5_terminal_error
+                } else {
+                    None
+                };
+            if let Some(error) = x5_terminal_error {
+                self.x5_233_driver.last_error = Some(error);
             }
         }
     }
@@ -5725,6 +7287,22 @@ impl CameraToolboxApp {
         show_detection: bool,
         horizontal_flip: bool,
     ) {
+        if let Some(target) = &overlay.guided_target {
+            Self::paint_live_guided_pose_overlay(painter, image_rect, target, horizontal_flip);
+        }
+        if overlay.guided_target.is_none() {
+            if let Some(realtime) = &overlay.realtime_detection {
+                if let Some(axis) = &realtime.pose_axis {
+                    Self::paint_live_pose_axis_overlay(
+                        painter,
+                        image_rect,
+                        realtime.image_size,
+                        axis,
+                        horizontal_flip,
+                    );
+                }
+            }
+        }
         if !show_detection {
             return;
         }
@@ -5739,6 +7317,621 @@ impl CameraToolboxApp {
                 3.0,
             );
         }
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_guided_pose_overlay(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        target: &ViewerGuidedPoseOverlay,
+        horizontal_flip: bool,
+    ) {
+        let Some(center) =
+            Self::live_overlay_normalized_uv(target.center_uv, image_rect, horizontal_flip)
+        else {
+            return;
+        };
+        let color = if target.matched {
+            egui::Color32::from_rgb(80, 230, 120)
+        } else {
+            egui::Color32::from_rgb(255, 210, 80)
+        };
+        let grid_color = if target.matched {
+            egui::Color32::from_rgba_unmultiplied(80, 230, 120, 140)
+        } else {
+            egui::Color32::from_rgba_unmultiplied(255, 210, 80, 125)
+        };
+        if let Some(arrow) = &target.pose_arrow {
+            Self::paint_live_guided_pose_arrow(painter, image_rect, arrow, horizontal_flip);
+        }
+        for line in target.grid_lines.iter() {
+            if let (Some(start), Some(end)) = (
+                Self::live_overlay_normalized_uv(line.start_uv, image_rect, horizontal_flip),
+                Self::live_overlay_normalized_uv(line.end_uv, image_rect, horizontal_flip),
+            ) {
+                painter.line_segment([start, end], egui::Stroke::new(1.0, grid_color));
+            }
+        }
+        for index in 0..target.outline_uv.len() {
+            let start_uv = target.outline_uv[index];
+            let end_uv = target.outline_uv[(index + 1) % target.outline_uv.len()];
+            if let (Some(start), Some(end)) = (
+                Self::live_overlay_normalized_uv(start_uv, image_rect, horizontal_flip),
+                Self::live_overlay_normalized_uv(end_uv, image_rect, horizontal_flip),
+            ) {
+                painter.line_segment([start, end], egui::Stroke::new(2.25, color));
+            }
+        }
+        painter.line_segment(
+            [
+                center + egui::vec2(-10.0, 0.0),
+                center + egui::vec2(10.0, 0.0),
+            ],
+            egui::Stroke::new(1.5, color),
+        );
+        painter.line_segment(
+            [
+                center + egui::vec2(0.0, -10.0),
+                center + egui::vec2(0.0, 10.0),
+            ],
+            egui::Stroke::new(1.5, color),
+        );
+        if let Some(rings) = &target.rotation_rings {
+            Self::paint_live_guided_rotation_rings(
+                painter,
+                image_rect,
+                rings,
+                &target.outline_uv,
+                horizontal_flip,
+                target.matched,
+            );
+        }
+        if let Some(instruction) = &target.instruction {
+            Self::paint_live_guided_instruction(painter, image_rect, instruction);
+        }
+        let label_anchor = target
+            .outline_uv
+            .iter()
+            .filter_map(|uv| Self::live_overlay_normalized_uv(*uv, image_rect, horizontal_flip))
+            .min_by(|left, right| {
+                left.y
+                    .total_cmp(&right.y)
+                    .then_with(|| left.x.total_cmp(&right.x))
+            })
+            .unwrap_or(center);
+        painter.text(
+            label_anchor + egui::vec2(4.0, 4.0),
+            egui::Align2::LEFT_TOP,
+            "TARGET BOARD",
+            egui::FontId::monospace(12.0),
+            color,
+        );
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_guided_instruction(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        instruction: &ViewerGuidedPoseInstructionOverlay,
+    ) {
+        let accent = if instruction.matched {
+            egui::Color32::from_rgb(80, 230, 120)
+        } else {
+            egui::Color32::from_rgb(255, 210, 80)
+        };
+        let panel_width = (image_rect.width() - 32.0).clamp(280.0, 680.0);
+        let panel_height = 72.0;
+        let panel_center = egui::pos2(
+            image_rect.center().x,
+            image_rect.bottom() - panel_height * 0.5 - 16.0,
+        );
+        let panel = egui::Rect::from_center_size(
+            panel_center,
+            egui::vec2(panel_width, panel_height.min(image_rect.height() * 0.30)),
+        );
+        painter.rect_filled(
+            panel,
+            10.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+        );
+        painter.rect_stroke(
+            panel,
+            10.0,
+            egui::Stroke::new(1.6, accent),
+            egui::StrokeKind::Inside,
+        );
+        painter.circle_filled(panel.left_center() + egui::vec2(20.0, 0.0), 7.0, accent);
+        let score_fraction = (instruction.score as f32).clamp(0.0, 1.25) / 1.25;
+        let score_track = egui::Rect::from_min_size(
+            egui::pos2(panel.left() + 44.0, panel.bottom() - 8.0),
+            egui::vec2(panel.width() - 88.0, 3.0),
+        );
+        painter.rect_filled(score_track, 1.5, egui::Color32::from_gray(60));
+        painter.rect_filled(
+            egui::Rect::from_min_size(
+                score_track.min,
+                egui::vec2(score_track.width() * score_fraction, score_track.height()),
+            ),
+            1.5,
+            accent,
+        );
+        painter.text(
+            panel.center_top() + egui::vec2(0.0, 10.0),
+            egui::Align2::CENTER_TOP,
+            instruction.primary,
+            egui::FontId::proportional(22.0),
+            accent,
+        );
+        painter.text(
+            panel.center_bottom() - egui::vec2(0.0, 14.0),
+            egui::Align2::CENTER_BOTTOM,
+            &instruction.secondary,
+            egui::FontId::monospace(12.0),
+            egui::Color32::from_gray(235),
+        );
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    const GUIDED_POSE_ARROW_MIN_DEPTH_SCALE: f32 = 0.42;
+    #[cfg(feature = "calibration-opencv")]
+    const GUIDED_POSE_ARROW_MAX_DEPTH_SCALE: f32 = 2.25;
+
+    #[cfg(feature = "calibration-opencv")]
+    fn guided_pose_rotation_ring_visual_sweep_degrees(error_degrees: f64) -> Option<f32> {
+        if !error_degrees.is_finite()
+            || error_degrees < f64::from(f32::MIN)
+            || error_degrees > f64::from(f32::MAX)
+        {
+            return None;
+        }
+        Some(error_degrees as f32)
+    }
+    #[cfg(feature = "calibration-opencv")]
+    /// 将相机坐标系 Z 深度转换为屏幕绘制尺度：Z 越小越近，箭头端面越大。
+    fn guided_pose_arrow_depth_scales(start_depth: f64, end_depth: f64) -> Option<(f32, f32)> {
+        if !start_depth.is_finite()
+            || !end_depth.is_finite()
+            || start_depth <= 1.0e-6
+            || end_depth <= 1.0e-6
+        {
+            return None;
+        }
+        let reference_depth = (start_depth * end_depth).sqrt();
+        if !reference_depth.is_finite() || reference_depth <= 1.0e-6 {
+            return None;
+        }
+        let start_scale = (reference_depth / start_depth).clamp(
+            f64::from(Self::GUIDED_POSE_ARROW_MIN_DEPTH_SCALE),
+            f64::from(Self::GUIDED_POSE_ARROW_MAX_DEPTH_SCALE),
+        ) as f32;
+        let end_scale = (reference_depth / end_depth).clamp(
+            f64::from(Self::GUIDED_POSE_ARROW_MIN_DEPTH_SCALE),
+            f64::from(Self::GUIDED_POSE_ARROW_MAX_DEPTH_SCALE),
+        ) as f32;
+        Some((start_scale, end_scale))
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_guided_pose_arrow(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        arrow: &ViewerGuidedPoseArrowOverlay,
+        horizontal_flip: bool,
+    ) {
+        let (Some(start), Some(end)) = (
+            Self::live_overlay_normalized_uv(arrow.start_uv, image_rect, horizontal_flip),
+            Self::live_overlay_normalized_uv(arrow.end_uv, image_rect, horizontal_flip),
+        ) else {
+            return;
+        };
+        let (start_depth_scale, end_depth_scale) =
+            Self::guided_pose_arrow_depth_scales(arrow.start_xyz[2], arrow.end_xyz[2])
+                .unwrap_or((1.0, 1.0));
+        let depth_reference = arrow.start_xyz[2]
+            .abs()
+            .max(arrow.end_xyz[2].abs())
+            .max(1.0);
+        let depth_motion = (arrow.z_delta.abs() / depth_reference).clamp(0.0, 0.9) as f32;
+        let start_radius = 8.0 * start_depth_scale;
+        let end_radius = 8.0 * end_depth_scale;
+        let shaft_start_half_width = (4.0 + depth_motion * 3.0) * start_depth_scale;
+        let shaft_end_half_width = (4.0 + depth_motion * 3.0) * end_depth_scale;
+        let head_length_px = 18.0 * end_depth_scale.max(0.72);
+        let head_half_width = 9.0 * end_depth_scale.max(0.72);
+        let delta = end - start;
+        let length = delta.length();
+        if !length.is_finite() {
+            return;
+        }
+        let color = if arrow.z_delta.abs() > 1.0e-6 {
+            egui::Color32::from_rgb(255, 170, 72)
+        } else {
+            egui::Color32::from_rgb(80, 220, 240)
+        };
+        let glow = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 54);
+        let start_ring = egui::Color32::from_rgba_unmultiplied(245, 245, 245, 132);
+        let end_ring = egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 168);
+        painter.circle_stroke(
+            start,
+            start_radius + 4.0,
+            egui::Stroke::new(2.0, start_ring),
+        );
+        painter.circle_stroke(end, end_radius + 5.0, egui::Stroke::new(3.0, end_ring));
+        painter.circle_filled(start, start_radius * 0.35, start_ring);
+        painter.circle_filled(end, end_radius * 0.42, end_ring);
+        painter.text(
+            start + egui::vec2(start_radius + 7.0, start_radius + 9.0),
+            egui::Align2::LEFT_TOP,
+            "CURRENT",
+            egui::FontId::monospace(11.0),
+            start_ring,
+        );
+        painter.text(
+            end + egui::vec2(end_radius + 7.0, end_radius + 9.0),
+            egui::Align2::LEFT_TOP,
+            "TARGET",
+            egui::FontId::monospace(11.0),
+            color,
+        );
+        if length >= 4.0 {
+            for step in 1..4 {
+                let t = step as f32 * 0.25;
+                let center = start + delta * t;
+                let scale = start_depth_scale + (end_depth_scale - start_depth_scale) * t;
+                let alpha = (64.0 + 72.0 * t) as u8;
+                let ring_color =
+                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), alpha);
+                painter.circle_stroke(center, 7.0 * scale, egui::Stroke::new(1.4, ring_color));
+                painter.circle_filled(center, 1.3 * scale, ring_color);
+            }
+        }
+        if length < 4.0 {
+            let label = if arrow.z_delta > 0.0 {
+                "TARGET FARTHER · board looks smaller"
+            } else if arrow.z_delta < 0.0 {
+                "TARGET CLOSER · board looks larger"
+            } else {
+                "TARGET DEPTH"
+            };
+            painter.text(
+                end + egui::vec2(end_radius + 8.0, -end_radius),
+                egui::Align2::LEFT_BOTTOM,
+                label,
+                egui::FontId::monospace(12.0),
+                color,
+            );
+            return;
+        }
+        let direction = delta / length;
+        let normal = egui::vec2(-direction.y, direction.x);
+        let head_length = head_length_px.min((length * 0.45).max(8.0));
+        let head_base = end - direction * head_length;
+        let shadow_offset = egui::vec2(8.0, 10.0) * (1.0 + depth_motion);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                start + shadow_offset + normal * (shaft_start_half_width + 3.0),
+                head_base + shadow_offset + normal * (shaft_end_half_width + 3.0),
+                head_base + shadow_offset - normal * (shaft_end_half_width + 3.0),
+                start + shadow_offset - normal * (shaft_start_half_width + 3.0),
+            ],
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 38),
+            egui::Stroke::NONE,
+        ));
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                start + normal * shaft_start_half_width,
+                head_base + normal * shaft_end_half_width,
+                head_base - normal * shaft_end_half_width,
+                start - normal * shaft_start_half_width,
+            ],
+            glow,
+            egui::Stroke::new(1.0, color),
+        ));
+        painter.line_segment(
+            [start, head_base],
+            egui::Stroke::new(1.5, egui::Color32::WHITE),
+        );
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                end,
+                head_base + normal * head_half_width,
+                head_base - normal * head_half_width,
+            ],
+            color,
+            egui::Stroke::new(1.0, egui::Color32::WHITE),
+        ));
+        let label = if arrow.z_delta > 0.0 {
+            "FOLLOW ARROW TO TARGET · farther / smaller"
+        } else if arrow.z_delta < 0.0 {
+            "FOLLOW ARROW TO TARGET · closer / larger"
+        } else {
+            "FOLLOW ARROW TO TARGET"
+        };
+        painter.text(
+            start + delta * 0.5 + egui::vec2(8.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            label,
+            egui::FontId::monospace(12.0),
+            color,
+        );
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_guided_rotation_rings(
+        painter: &egui::Painter,
+        image_rect: egui::Rect,
+        rings: &ViewerGuidedPoseRotationRingsOverlay,
+        outline_uv: &[[f32; 2]; 4],
+        horizontal_flip: bool,
+        matched: bool,
+    ) {
+        let Some(center) =
+            Self::live_overlay_normalized_uv(rings.center_uv, image_rect, horizontal_flip)
+        else {
+            return;
+        };
+        let outline_radius = outline_uv
+            .iter()
+            .filter_map(|uv| Self::live_overlay_normalized_uv(*uv, image_rect, horizontal_flip))
+            .map(|point| point.distance(center))
+            .fold(0.0_f32, f32::max);
+        let radius = (outline_radius * 0.58).clamp(36.0, 124.0);
+        let base_alpha = if matched { 92 } else { 76 };
+        let rotation = if horizontal_flip { 12.0_f32 } else { -12.0_f32 }.to_radians();
+        let dominant_score = Self::guided_pose_rotation_ring_score(&rings.roll)
+            .max(Self::guided_pose_rotation_ring_score(&rings.pitch))
+            .max(Self::guided_pose_rotation_ring_score(&rings.yaw));
+
+        // 三轴旋转圆环替代 Guided mode 的坐标轴：暗环给参考，高亮弧长给当前到目标角度差。
+        Self::paint_live_guided_rotation_ring(
+            painter,
+            center,
+            radius * 1.06,
+            radius * 0.62,
+            rotation,
+            -92.0_f32.to_radians(),
+            &rings.yaw,
+            egui::Color32::from_rgb(80, 155, 255),
+            base_alpha,
+            dominant_score,
+        );
+        Self::paint_live_guided_rotation_ring(
+            painter,
+            center,
+            radius * 0.98,
+            radius * 0.28,
+            rotation,
+            180.0_f32.to_radians(),
+            &rings.roll,
+            egui::Color32::from_rgb(255, 82, 82),
+            base_alpha,
+            dominant_score,
+        );
+        Self::paint_live_guided_rotation_ring(
+            painter,
+            center,
+            radius * 0.32,
+            radius * 1.02,
+            rotation,
+            88.0_f32.to_radians(),
+            &rings.pitch,
+            egui::Color32::from_rgb(62, 232, 124),
+            base_alpha,
+            dominant_score,
+        );
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn guided_pose_rotation_ring_score(arc: &ViewerGuidedPoseRotationArcOverlay) -> f32 {
+        if !arc.error_degrees.is_finite()
+            || !arc.tolerance_degrees.is_finite()
+            || arc.tolerance_degrees <= 1.0e-9
+        {
+            return 0.0;
+        }
+        (arc.error_degrees.abs() / arc.tolerance_degrees).clamp(0.0, 2.0) as f32
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_guided_rotation_ring(
+        painter: &egui::Painter,
+        center: egui::Pos2,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        start_angle: f32,
+        arc: &ViewerGuidedPoseRotationArcOverlay,
+        color: egui::Color32,
+        base_alpha: u8,
+        dominant_score: f32,
+    ) {
+        let full_color =
+            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), base_alpha);
+        painter.add(egui::Shape::line(
+            Self::guided_pose_rotation_ellipse_points(
+                center,
+                radius_x,
+                radius_y,
+                rotation,
+                0.0,
+                std::f32::consts::TAU,
+                96,
+            ),
+            egui::Stroke::new(3.0, full_color),
+        ));
+        let target_tick = Self::guided_pose_rotation_ellipse_point(
+            center,
+            radius_x,
+            radius_y,
+            rotation,
+            start_angle,
+        );
+        let tick_vector = target_tick - center;
+        let tick_outer = center + tick_vector * 1.10;
+        let tick_inner = center + tick_vector * 0.92;
+        painter.line_segment([tick_inner, tick_outer], egui::Stroke::new(2.8, color));
+        let Some(sweep_degrees) =
+            Self::guided_pose_rotation_ring_visual_sweep_degrees(arc.error_degrees)
+        else {
+            return;
+        };
+        let sweep = sweep_degrees.to_radians();
+        if sweep.abs() > 0.5_f32.to_radians() {
+            let score = Self::guided_pose_rotation_ring_score(arc);
+            let is_dominant = score + 1.0e-6 >= dominant_score && dominant_score > 0.0;
+            let glow_alpha = if is_dominant { 90 } else { 52 };
+            let arc_alpha = if is_dominant { 238 } else { 196 };
+            let glow_color =
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), glow_alpha);
+            let arc_color =
+                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), arc_alpha);
+            let arc_points = Self::guided_pose_rotation_ellipse_points(
+                center,
+                radius_x,
+                radius_y,
+                rotation,
+                start_angle,
+                sweep,
+                36,
+            );
+            painter.add(egui::Shape::line(
+                arc_points.clone(),
+                egui::Stroke::new(if is_dominant { 12.0 } else { 9.0 }, glow_color),
+            ));
+            painter.add(egui::Shape::line(
+                arc_points,
+                egui::Stroke::new(if is_dominant { 7.0 } else { 5.6 }, arc_color),
+            ));
+            let end_angle = start_angle + sweep;
+            let (tip, tangent) = Self::guided_pose_rotation_ellipse_tip(
+                center,
+                radius_x,
+                radius_y,
+                rotation,
+                end_angle,
+                sweep.signum(),
+            );
+            Self::paint_live_guided_rotation_arrowhead(painter, tip, tangent, arc_color, 8.0);
+        }
+        let label_anchor = Self::guided_pose_rotation_ellipse_point(
+            center,
+            radius_x,
+            radius_y,
+            rotation,
+            start_angle + sweep,
+        );
+        painter.text(
+            label_anchor + egui::vec2(6.0, -6.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!("{} {:.1}°", arc.label, arc.error_degrees.abs()),
+            egui::FontId::monospace(11.0),
+            color,
+        );
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn guided_pose_rotation_ellipse_points(
+        center: egui::Pos2,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        start_angle: f32,
+        sweep: f32,
+        segments: usize,
+    ) -> Vec<egui::Pos2> {
+        let steps = segments.max(1);
+        (0..=steps)
+            .map(|index| {
+                let t = index as f32 / steps as f32;
+                Self::guided_pose_rotation_ellipse_point(
+                    center,
+                    radius_x,
+                    radius_y,
+                    rotation,
+                    start_angle + sweep * t,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn guided_pose_rotation_ellipse_point(
+        center: egui::Pos2,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        angle: f32,
+    ) -> egui::Pos2 {
+        let local = egui::vec2(radius_x * angle.cos(), radius_y * angle.sin());
+        center + Self::guided_pose_rotation_rotate_vec(local, rotation)
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn guided_pose_rotation_ellipse_tip(
+        center: egui::Pos2,
+        radius_x: f32,
+        radius_y: f32,
+        rotation: f32,
+        angle: f32,
+        direction_sign: f32,
+    ) -> (egui::Pos2, egui::Vec2) {
+        let point =
+            Self::guided_pose_rotation_ellipse_point(center, radius_x, radius_y, rotation, angle);
+        let local_tangent = egui::vec2(-radius_x * angle.sin(), radius_y * angle.cos());
+        let tangent = Self::guided_pose_rotation_rotate_vec(local_tangent, rotation)
+            * direction_sign.signum();
+        (point, tangent)
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn guided_pose_rotation_rotate_vec(vector: egui::Vec2, rotation: f32) -> egui::Vec2 {
+        let (sin_rotation, cos_rotation) = rotation.sin_cos();
+        egui::vec2(
+            vector.x * cos_rotation - vector.y * sin_rotation,
+            vector.x * sin_rotation + vector.y * cos_rotation,
+        )
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn paint_live_guided_rotation_arrowhead(
+        painter: &egui::Painter,
+        tip: egui::Pos2,
+        tangent: egui::Vec2,
+        color: egui::Color32,
+        size: f32,
+    ) {
+        let length = tangent.length();
+        if !length.is_finite() || length <= 1.0e-6 {
+            return;
+        }
+        let direction = tangent / length;
+        let normal = egui::vec2(-direction.y, direction.x);
+        painter.add(egui::Shape::convex_polygon(
+            vec![
+                tip,
+                tip - direction * size + normal * size * 0.58,
+                tip - direction * size - normal * size * 0.58,
+            ],
+            color,
+            egui::Stroke::new(0.8, egui::Color32::WHITE),
+        ));
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    fn live_overlay_normalized_uv(
+        uv: [f32; 2],
+        image_rect: egui::Rect,
+        horizontal_flip: bool,
+    ) -> Option<egui::Pos2> {
+        let normalized_x = if horizontal_flip { 1.0 - uv[0] } else { uv[0] };
+        let normalized_y = uv[1];
+        if !normalized_x.is_finite() || !normalized_y.is_finite() {
+            return None;
+        }
+        Some(egui::pos2(
+            image_rect.left() + normalized_x * image_rect.width(),
+            image_rect.top() + normalized_y * image_rect.height(),
+        ))
     }
 
     #[cfg(feature = "calibration-opencv")]

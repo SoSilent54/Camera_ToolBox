@@ -11,6 +11,11 @@ use camera_toolbox_core::CalibrationImageSize;
 use eframe::egui;
 
 use super::DocumentId;
+/// 自动标定在 RTSP 预判通过后可回查的无损帧来源。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LiveAuthoritativeCapture {
+    X5233TcpYuv { host: String, tcp_port: u16 },
+}
 
 /// Workspace 所需的脱敏实时输入身份；URL 和认证信息永不进入文档状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +33,7 @@ pub(crate) enum LiveStreamSource {
         transport: RtspTransport,
         source_fingerprint: String,
         geometry_key: String,
+        authoritative_capture: Option<LiveAuthoritativeCapture>,
     },
 }
 
@@ -104,10 +110,19 @@ impl LiveStreamSource {
             } => source_fingerprint,
         }
     }
-
-    fn geometry_key(&self) -> &str {
+    pub(crate) fn geometry_key(&self) -> &str {
         match self {
             Self::Cv610 { geometry_key, .. } | Self::Rtsp { geometry_key, .. } => geometry_key,
+        }
+    }
+
+    pub(crate) fn authoritative_capture(&self) -> Option<&LiveAuthoritativeCapture> {
+        match self {
+            Self::Cv610 { .. } => None,
+            Self::Rtsp {
+                authoritative_capture,
+                ..
+            } => authoritative_capture.as_ref(),
         }
     }
 }
@@ -267,6 +282,28 @@ impl LiveDocument {
             _ => 0,
         };
     }
+    /// 后台直播文档不创建 GPU texture，但仍刷新最近不可变帧，供多路标定自动采集使用。
+    pub(crate) fn refresh_background_frame(&mut self) -> Option<Arc<DecodedVideoFrame>> {
+        if !matches!(self.lifecycle, LiveDocumentLifecycle::Open) {
+            return None;
+        }
+        let frame = self.latest_frame.latest()?;
+        if self.displayed_frame.as_ref().is_some_and(|displayed| {
+            displayed.identity.frame_sequence == frame.identity.frame_sequence
+        }) {
+            return self.displayed_frame.clone();
+        }
+        let width = usize::try_from(frame.width).ok()?;
+        let height = usize::try_from(frame.height).ok()?;
+        let expected = width
+            .checked_mul(height)
+            .and_then(|value| value.checked_mul(4));
+        if expected != Some(frame.rgba.len()) {
+            return None;
+        }
+        self.displayed_frame = Some(frame);
+        self.displayed_frame.clone()
+    }
 
     /// 按当前单调时间计算展示帧率；停帧超过窗口后必须归零。
     pub(crate) fn presented_fps_millihz_at(&self, now_ns: u64) -> u64 {
@@ -349,6 +386,7 @@ mod tests {
             transport: RtspTransport::Tcp,
             source_fingerprint: "test-rtsp-source".to_owned(),
             geometry_key: "test-rtsp-config".to_owned(),
+            authoritative_capture: None,
         }
     }
 
@@ -429,6 +467,32 @@ mod tests {
                 .frame_sequence,
             2
         );
+    }
+
+    #[test]
+    fn background_refresh_updates_displayed_frame_without_texture() {
+        let latest = Arc::new(LatestDecodedFrameSlot::default());
+        latest.publish(frame(1, 17));
+        let mut document = LiveDocument::new(
+            DocumentId::from_raw(1),
+            StreamSessionId::new("live-document-test").unwrap(),
+            Arc::clone(&latest),
+            source(),
+        );
+
+        let displayed = document
+            .refresh_background_frame()
+            .expect("background refresh installs latest frame");
+        assert_eq!(displayed.identity.frame_sequence, 1);
+        assert!(document.texture().is_none());
+
+        latest.publish(frame(2, 34));
+        let displayed = document
+            .refresh_background_frame()
+            .expect("background refresh advances displayed frame");
+        assert_eq!(displayed.identity.frame_sequence, 2);
+        assert_eq!(displayed.rgba[0], 34);
+        assert!(document.texture().is_none());
     }
 
     #[test]

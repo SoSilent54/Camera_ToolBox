@@ -15,7 +15,9 @@ mod tabs;
 
 pub(crate) use document::RawDocument;
 pub(crate) use image_document::ImageDocument;
-pub(crate) use live_document::{LiveDocument, LiveDocumentLifecycle, LiveStreamSource};
+pub(crate) use live_document::{
+    LiveAuthoritativeCapture, LiveDocument, LiveDocumentLifecycle, LiveStreamSource,
+};
 pub(crate) use tabs::{TabBarAction, render_tab_bar};
 
 pub(crate) const DEFAULT_DERIVED_RESOURCE_BUDGET_BYTES: usize = 256 * 1024 * 1024;
@@ -304,6 +306,10 @@ impl WorkspaceState {
 
     pub(crate) fn live_documents(&self) -> &[LiveDocument] {
         &self.live_documents
+    }
+
+    pub(crate) fn live_documents_mut(&mut self) -> &mut [LiveDocument] {
+        &mut self.live_documents
     }
 
     fn document_for_asset(&self, asset_id: &camera_toolbox_core::AssetId) -> Option<DocumentId> {

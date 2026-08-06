@@ -153,6 +153,15 @@ fn rtsp_source_fingerprint(config: &RtspStreamConfig) -> String {
     format!("rtsp:{}", SnapshotHash::digest_bytes(material.as_bytes()))
 }
 
+fn direct_rtsp_service_id(config: &RtspStreamConfig) -> String {
+    let material = format!(
+        "camera-toolbox/direct-rtsp-service/v1\0{}\0{}\0{:?}\0{:?}",
+        config.url, config.channel, config.codec, config.transport
+    );
+    let digest = SnapshotHash::digest_bytes(material.as_bytes());
+    format!("direct-rtsp-ch{}-{digest}", config.channel)
+}
+
 fn rtsp_geometry_key(config: &RtspStreamConfig) -> String {
     format!(
         "rtsp-fixed-config:{}x{};codec={:?};transport={:?}",
@@ -1071,6 +1080,7 @@ impl LiveRuntime {
                         transport: rtsp.transport,
                         source_fingerprint: profile_fingerprint,
                         geometry_key: rtsp_geometry_key(rtsp),
+                        authoritative_capture: None,
                     },
                 )
             }
@@ -1101,6 +1111,45 @@ impl LiveRuntime {
         ),
         String,
     > {
+        self.start_named_direct_rtsp(config, prefer_hardware_acceleration, "Direct URL")
+    }
+
+    pub(crate) fn start_named_direct_rtsp(
+        &self,
+        config: RtspStreamConfig,
+        prefer_hardware_acceleration: bool,
+        label: impl Into<String>,
+    ) -> Result<
+        (
+            StreamSessionId,
+            Arc<LatestDecodedFrameSlot>,
+            LiveStreamSource,
+        ),
+        String,
+    > {
+        self.start_named_direct_rtsp_with_timeouts(
+            config,
+            prefer_hardware_acceleration,
+            label,
+            StreamTimeouts::default(),
+        )
+    }
+
+    pub(crate) fn start_named_direct_rtsp_with_timeouts(
+        &self,
+        config: RtspStreamConfig,
+        prefer_hardware_acceleration: bool,
+        label: impl Into<String>,
+        timeouts: StreamTimeouts,
+    ) -> Result<
+        (
+            StreamSessionId,
+            Arc<LatestDecodedFrameSlot>,
+            LiveStreamSource,
+        ),
+        String,
+    > {
+        let label = label.into();
         config.validate().map_err(|error| error.to_string())?;
         let request = StreamOpenRequest {
             channel: config.channel,
@@ -1113,12 +1162,12 @@ impl LiveRuntime {
             .controller
             .submit_stream_service(
                 Arc::new(FfmpegRtspStreamService::new(
-                    format!("direct-rtsp-ch{}", config.channel),
+                    direct_rtsp_service_id(&config),
                     config.clone(),
                 )),
                 1,
                 request,
-                StreamTimeouts::default(),
+                timeouts,
             )
             .map_err(|error| error.to_string())?;
         let latest = self
@@ -1129,11 +1178,12 @@ impl LiveRuntime {
             session_id,
             latest,
             LiveStreamSource::Rtsp {
-                label: "Direct URL".to_owned(),
+                label,
                 channel: config.channel,
                 transport: config.transport,
                 source_fingerprint: rtsp_source_fingerprint(&config),
                 geometry_key: rtsp_geometry_key(&config),
+                authoritative_capture: None,
             },
         ))
     }
