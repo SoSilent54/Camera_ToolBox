@@ -448,6 +448,72 @@ fn x5_233_driver_content_width_tracks_current_sidebar_width() {
     );
 }
 
+#[cfg(feature = "calibration-opencv")]
+fn assert_pos2_near(actual: egui::Pos2, expected: egui::Pos2) {
+    assert!(
+        actual.distance(expected) <= 1.0e-4,
+        "expected {expected:?}, got {actual:?}"
+    );
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn guided_rotation_hemisphere_uses_shared_pitch_yaw_start() {
+    let center = egui::pos2(100.0, 100.0);
+    let outline = [
+        egui::pos2(20.0, 60.0),
+        egui::pos2(180.0, 60.0),
+        egui::pos2(180.0, 140.0),
+        egui::pos2(20.0, 140.0),
+    ];
+    let geometry = super::CameraToolboxApp::guided_pose_rotation_hemisphere_geometry(
+        center,
+        outline,
+        egui::pos2(100.0, 30.0),
+    )
+    .unwrap();
+    let pitch_start = super::CameraToolboxApp::guided_pose_rotation_basis_point(
+        geometry.center,
+        geometry.pitch_axis,
+        geometry.dome_axis,
+        90.0_f32.to_radians(),
+    );
+    let yaw_start = super::CameraToolboxApp::guided_pose_rotation_basis_point(
+        geometry.center,
+        geometry.yaw_axis,
+        geometry.dome_axis,
+        90.0_f32.to_radians(),
+    );
+    let dome_top = geometry.center + geometry.dome_axis;
+
+    assert_pos2_near(pitch_start, dome_top);
+    assert_pos2_near(yaw_start, dome_top);
+    assert!(geometry.dome_axis.y < 0.0);
+    assert!(geometry.yaw_axis.x.abs() > geometry.yaw_axis.y.abs());
+    assert!(geometry.pitch_axis.y.abs() > geometry.pitch_axis.x.abs());
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn guided_rotation_hemisphere_rejects_lower_normal_projection() {
+    let center = egui::pos2(100.0, 100.0);
+    let outline = [
+        egui::pos2(20.0, 60.0),
+        egui::pos2(180.0, 60.0),
+        egui::pos2(180.0, 140.0),
+        egui::pos2(20.0, 140.0),
+    ];
+    let geometry = super::CameraToolboxApp::guided_pose_rotation_hemisphere_geometry(
+        center,
+        outline,
+        egui::pos2(100.0, 180.0),
+    )
+    .unwrap();
+
+    assert!(geometry.dome_axis.y < 0.0);
+    assert!(geometry.dome_axis.x.abs() <= 1.0e-4);
+}
+
 #[test]
 fn x5_233_rtsp_uses_slower_board_connect_timeout() {
     let timeouts = x5_233_rtsp_timeouts();
@@ -3161,29 +3227,18 @@ fn guided_pose_rotation_ring_sweep_emphasizes_small_errors_and_preserves_directi
 
 #[cfg(feature = "calibration-opencv")]
 #[test]
-fn guided_pose_rotation_ring_geometry_only_translates_in_view_frame() {
-    assert_eq!(
-        CameraToolboxApp::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS,
-        0.0
-    );
-
+fn guided_pose_rotation_basis_geometry_translates_in_view_frame() {
     let center_a = egui::pos2(120.0, 90.0);
     let center_b = egui::pos2(260.0, 170.0);
     let angle = 37.0_f32.to_radians();
-    let offset_a = CameraToolboxApp::guided_pose_rotation_ellipse_point(
-        center_a,
-        24.0,
-        72.0,
-        CameraToolboxApp::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS,
-        angle,
-    ) - center_a;
-    let offset_b = CameraToolboxApp::guided_pose_rotation_ellipse_point(
-        center_b,
-        24.0,
-        72.0,
-        CameraToolboxApp::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS,
-        angle,
-    ) - center_b;
+    let axis_x = egui::vec2(24.0, 0.0);
+    let axis_y = egui::vec2(0.0, 72.0);
+    let offset_a =
+        CameraToolboxApp::guided_pose_rotation_basis_point(center_a, axis_x, axis_y, angle)
+            - center_a;
+    let offset_b =
+        CameraToolboxApp::guided_pose_rotation_basis_point(center_b, axis_x, axis_y, angle)
+            - center_b;
 
     assert!((offset_a - offset_b).length() <= 1.0e-4);
 }

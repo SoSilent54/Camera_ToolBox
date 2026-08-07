@@ -995,6 +995,8 @@ pub(crate) struct ViewerGuidedPoseRotationArcOverlay {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ViewerGuidedPoseRotationRingsOverlay {
     pub(crate) center_uv: [f32; 2],
+    pub(crate) outline_uv: [[f32; 2]; 4],
+    pub(crate) normal_uv: [f32; 2],
     pub(crate) roll: ViewerGuidedPoseRotationArcOverlay,
     pub(crate) pitch: ViewerGuidedPoseRotationArcOverlay,
     pub(crate) yaw: ViewerGuidedPoseRotationArcOverlay,
@@ -1147,6 +1149,8 @@ struct GuidedPoseTarget {
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GuidedPoseMeasurement {
     pose: GuidedPose6Dof,
+    outline_uv: [[f32; 2]; 4],
+    normal_uv: [f32; 2],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1847,6 +1851,76 @@ fn guided_pose_project_board_uv(
     ])
 }
 
+fn guided_pose_project_normal_uv(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<[f32; 2]> {
+    let center = guided_pose_inner_center_point(board);
+    let normal_length =
+        (f64::from(board.inner_cols.max(board.inner_rows)) * board.square_size * 0.45)
+            .max(board.square_size);
+    let normal_tip = [center[0], center[1], center[2] + normal_length];
+    let point = project_board_point_image(rotation, translation, normal_tip, initial_intrinsics)?;
+    Some([
+        point.x / image_size.width as f32,
+        point.y / image_size.height as f32,
+    ])
+}
+
+fn guided_pose_outline_uv(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<[[f32; 2]; 4]> {
+    let left = -1.0;
+    let top = -1.0;
+    let right = f64::from(board.inner_cols);
+    let bottom = f64::from(board.inner_rows);
+    Some([
+        guided_pose_project_board_uv(
+            board,
+            rotation,
+            translation,
+            left,
+            top,
+            initial_intrinsics,
+            image_size,
+        )?,
+        guided_pose_project_board_uv(
+            board,
+            rotation,
+            translation,
+            right,
+            top,
+            initial_intrinsics,
+            image_size,
+        )?,
+        guided_pose_project_board_uv(
+            board,
+            rotation,
+            translation,
+            right,
+            bottom,
+            initial_intrinsics,
+            image_size,
+        )?,
+        guided_pose_project_board_uv(
+            board,
+            rotation,
+            translation,
+            left,
+            bottom,
+            initial_intrinsics,
+            image_size,
+        )?,
+    ])
+}
+
 fn guided_pose_6dof_from_rotation_translation(
     board: BoardSpec,
     rotation: [[f64; 3]; 3],
@@ -2132,7 +2206,27 @@ fn guided_pose_measurement(
         image_size,
     )
     .ok_or_else(|| "guided pose 6DoF projection is invalid".to_owned())?;
-    let measurement = GuidedPoseMeasurement { pose };
+    let outline_uv = guided_pose_outline_uv(
+        board,
+        rotation,
+        pnp_observation.translation_vector,
+        initial_intrinsics,
+        image_size,
+    )
+    .ok_or_else(|| "guided pose board outline projection is invalid".to_owned())?;
+    let normal_uv = guided_pose_project_normal_uv(
+        board,
+        rotation,
+        pnp_observation.translation_vector,
+        initial_intrinsics,
+        image_size,
+    )
+    .ok_or_else(|| "guided pose board normal projection is invalid".to_owned())?;
+    let measurement = GuidedPoseMeasurement {
+        pose,
+        outline_uv,
+        normal_uv,
+    };
     if measurement.pose.xyz[2] <= 0.0 {
         return Err("guided pose measurement contains non-positive depth".to_owned());
     }
@@ -2342,6 +2436,8 @@ fn guided_pose_rotation_rings_overlay(
     let [roll, pitch, yaw] = assessment.signed_rotation_error_degrees;
     ViewerGuidedPoseRotationRingsOverlay {
         center_uv: assessment.measurement.pose.center_uv,
+        outline_uv: assessment.measurement.outline_uv,
+        normal_uv: assessment.measurement.normal_uv,
         roll: ViewerGuidedPoseRotationArcOverlay {
             label: "ROLL",
             error_degrees: roll,
@@ -8857,6 +8953,8 @@ mod tests {
                     translation: xyz,
                     center_uv: [0.5, 0.5],
                 },
+                outline_uv: [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]],
+                normal_uv: [0.5, 0.35],
             },
             error: GuidedPoseError {
                 x: 0.0,
@@ -9039,6 +9137,9 @@ mod tests {
         let rings = guided_pose_rotation_rings_overlay(&assessment, &target);
 
         assert_eq!(rings.center_uv, assessment.measurement.pose.center_uv);
+        assert_eq!(rings.outline_uv, assessment.measurement.outline_uv);
+        assert_eq!(rings.normal_uv, assessment.measurement.normal_uv);
+        assert!(rings.normal_uv.iter().all(|value| value.is_finite()));
         assert_eq!(rings.roll.label, "ROLL");
         assert_eq!(rings.pitch.label, "PITCH");
         assert_eq!(rings.yaw.label, "YAW");
