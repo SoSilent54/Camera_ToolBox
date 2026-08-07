@@ -1305,15 +1305,21 @@ fn x5_233_ring_retention_cell(valid: u16, retention_ns: u64) -> String {
 
 const WORKSPACE_EXPLORER_DEFAULT_WIDTH: f32 = 280.0;
 const WORKSPACE_EXPLORER_MIN_WIDTH: f32 = 220.0;
+const WORKSPACE_EXPLORER_MAX_WIDTH_FRACTION: f32 = 0.42;
+const WORKSPACE_EXPLORER_MAX_WIDTH_CAP: f32 = 420.0;
 const X5_233_FORM_STACK_THRESHOLD: f32 = 260.0;
 const X5_233_FORM_LABEL_WIDTH: f32 = 108.0;
 const X5_233_SIDEBAR_DEFAULT_WIDTH: f32 = 360.0;
 const X5_233_SIDEBAR_MIN_WIDTH: f32 = 280.0;
+const X5_233_SIDEBAR_MAX_WIDTH_FRACTION: f32 = 0.45;
+const X5_233_SIDEBAR_MAX_WIDTH_CAP: f32 = 720.0;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WorkspaceExplorerPanelLayout {
     default_width: f32,
     min_width: f32,
+    max_width_fraction: f32,
+    max_width_cap: f32,
 }
 
 fn workspace_explorer_panel_layout(is_x5_233_driver_mode: bool) -> WorkspaceExplorerPanelLayout {
@@ -1321,11 +1327,27 @@ fn workspace_explorer_panel_layout(is_x5_233_driver_mode: bool) -> WorkspaceExpl
         WorkspaceExplorerPanelLayout {
             default_width: X5_233_SIDEBAR_DEFAULT_WIDTH,
             min_width: X5_233_SIDEBAR_MIN_WIDTH,
+            max_width_fraction: X5_233_SIDEBAR_MAX_WIDTH_FRACTION,
+            max_width_cap: X5_233_SIDEBAR_MAX_WIDTH_CAP,
         }
     } else {
         WorkspaceExplorerPanelLayout {
             default_width: WORKSPACE_EXPLORER_DEFAULT_WIDTH,
             min_width: WORKSPACE_EXPLORER_MIN_WIDTH,
+            max_width_fraction: WORKSPACE_EXPLORER_MAX_WIDTH_FRACTION,
+            max_width_cap: WORKSPACE_EXPLORER_MAX_WIDTH_CAP,
+        }
+    }
+}
+
+impl WorkspaceExplorerPanelLayout {
+    fn max_width(self, available_width: f32) -> f32 {
+        if available_width.is_finite() && available_width > 0.0 {
+            (available_width * self.max_width_fraction)
+                .clamp(self.default_width, self.max_width_cap)
+                .max(self.min_width)
+        } else {
+            self.default_width
         }
     }
 }
@@ -2004,6 +2026,7 @@ impl eframe::App for CameraToolboxApp {
                 .resizable(true)
                 .default_size(panel_layout.default_width)
                 .min_size(panel_layout.min_width)
+                .max_size(panel_layout.max_width(ui.available_width()))
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("Workspace");

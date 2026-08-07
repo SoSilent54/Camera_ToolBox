@@ -415,9 +415,26 @@ fn x5_233_driver_sidebar_uses_resizable_minimum_layout() {
     assert_eq!(generic.min_width, super::WORKSPACE_EXPLORER_MIN_WIDTH);
     assert_eq!(x5.default_width, super::X5_233_SIDEBAR_DEFAULT_WIDTH);
     assert_eq!(x5.min_width, super::X5_233_SIDEBAR_MIN_WIDTH);
+    assert_eq!(
+        generic.max_width_fraction,
+        super::WORKSPACE_EXPLORER_MAX_WIDTH_FRACTION
+    );
+    assert_eq!(
+        generic.max_width_cap,
+        super::WORKSPACE_EXPLORER_MAX_WIDTH_CAP
+    );
+    assert_eq!(
+        x5.max_width_fraction,
+        super::X5_233_SIDEBAR_MAX_WIDTH_FRACTION
+    );
+    assert_eq!(x5.max_width_cap, super::X5_233_SIDEBAR_MAX_WIDTH_CAP);
     assert!(x5.default_width > generic.default_width);
     assert!(x5.min_width > generic.min_width);
     assert!(x5.default_width > x5.min_width);
+    assert!(x5.max_width(1568.0) < 1568.0 * 0.5);
+    assert_eq!(x5.max_width(f32::INFINITY), x5.default_width);
+    assert_eq!(x5.max_width(640.0), x5.default_width);
+    assert_eq!(x5.max_width(4000.0), super::X5_233_SIDEBAR_MAX_WIDTH_CAP);
 }
 
 #[test]
