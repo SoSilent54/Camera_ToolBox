@@ -1303,135 +1303,219 @@ fn x5_233_ring_retention_cell(valid: u16, retention_ns: u64) -> String {
     }
 }
 
+const X5_233_FORM_STACK_THRESHOLD: f32 = 260.0;
+const X5_233_FORM_LABEL_WIDTH: f32 = 108.0;
+
+fn x5_233_available_width(ui: &egui::Ui) -> f32 {
+    let width = ui.available_width();
+    if width.is_finite() {
+        width.max(1.0)
+    } else {
+        360.0
+    }
+}
+
+fn x5_233_wrapped_text(
+    ui: &mut egui::Ui,
+    text: impl Into<String>,
+    color: egui::Color32,
+    monospace: bool,
+) -> egui::Response {
+    let width = x5_233_available_width(ui);
+    let font_id = if monospace {
+        egui::TextStyle::Monospace.resolve(ui.style())
+    } else {
+        egui::TextStyle::Body.resolve(ui.style())
+    };
+    let mut job = egui::text::LayoutJob::simple(text.into(), font_id, color, width);
+    job.wrap.break_anywhere = true;
+    ui.add_sized([width, 0.0], egui::Label::new(job).wrap())
+}
+
+fn x5_233_wrapped_weak(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    x5_233_wrapped_text(ui, text, ui.visuals().weak_text_color(), false)
+}
+
+fn x5_233_wrapped_monospace(ui: &mut egui::Ui, text: impl Into<String>) -> egui::Response {
+    x5_233_wrapped_text(ui, text, ui.visuals().text_color(), true)
+}
+
+fn x5_233_section<R>(
+    ui: &mut egui::Ui,
+    title: &str,
+    add_contents: impl FnOnce(&mut egui::Ui) -> R,
+) -> R {
+    let width = x5_233_available_width(ui);
+    ui.group(|ui| {
+        // 侧栏分组占满同一可用宽度，避免不同 section 由内部控件撑出不同宽度。
+        ui.set_width(width);
+        ui.heading(title);
+        ui.add_space(2.0);
+        add_contents(ui)
+    })
+    .inner
+}
+
+fn x5_233_form_row<R>(
+    ui: &mut egui::Ui,
+    label: &str,
+    add_control: impl FnOnce(&mut egui::Ui, f32) -> R,
+) -> R {
+    let width = x5_233_available_width(ui);
+    if width < X5_233_FORM_STACK_THRESHOLD {
+        ui.strong(label);
+        add_control(ui, width)
+    } else {
+        ui.horizontal(|ui| {
+            ui.add_sized(
+                [X5_233_FORM_LABEL_WIDTH, 0.0],
+                egui::Label::new(egui::RichText::new(label).strong()).wrap(),
+            );
+            let control_width = x5_233_available_width(ui);
+            add_control(ui, control_width)
+        })
+        .inner
+    }
+}
+
+fn x5_233_status_pair(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
+    ui.horizontal(|ui| {
+        ui.strong(label);
+        ui.monospace(value.into());
+    });
+}
+
+fn x5_233_status_long(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
+    ui.strong(label);
+    x5_233_wrapped_monospace(ui, value);
+}
+
 fn render_x5_233_tcp_status(ui: &mut egui::Ui, summary: &x5_tcp_client::X5ProbeSummary) {
-    egui::Grid::new("x5_233_tcp_status_summary")
-        .num_columns(4)
-        .spacing([12.0, 4.0])
-        .show(ui, |ui| {
-            ui.strong("Protocol");
-            ui.label(summary.protocol.to_string());
-            ui.strong("Channels");
-            ui.label(
-                summary
-                    .channels
-                    .iter()
-                    .map(u16::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            );
-            ui.end_row();
-            ui.strong("FPS");
-            ui.label(
-                summary
-                    .fps
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "—".to_owned()),
-            );
-            ui.strong("Bitrate");
-            ui.label(
-                summary
-                    .bitrate_kbps
-                    .map(|value| format!("{value} kbps"))
-                    .unwrap_or_else(|| "—".to_owned()),
-            );
-            ui.end_row();
-            ui.strong("Config version");
-            ui.label(
-                summary
-                    .pipeline_config_version
-                    .map(|value| value.to_string())
-                    .unwrap_or_else(|| "—".to_owned()),
-            );
-            ui.strong("RTSP requested / started");
-            ui.label(format!(
+    ui.horizontal_wrapped(|ui| {
+        x5_233_status_pair(ui, "Protocol", summary.protocol.to_string());
+        x5_233_status_pair(
+            ui,
+            "Channels",
+            summary
+                .channels
+                .iter()
+                .map(u16::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        x5_233_status_pair(
+            ui,
+            "FPS",
+            summary
+                .fps
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "—".to_owned()),
+        );
+        x5_233_status_pair(
+            ui,
+            "Bitrate",
+            summary
+                .bitrate_kbps
+                .map(|value| format!("{value} kbps"))
+                .unwrap_or_else(|| "—".to_owned()),
+        );
+        x5_233_status_pair(
+            ui,
+            "Config",
+            summary
+                .pipeline_config_version
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "—".to_owned()),
+        );
+        x5_233_status_pair(
+            ui,
+            "RTSP req/run",
+            format!(
                 "{} / {}",
                 x5_233_bool_cell(Some(summary.rtsp_requested_enabled)),
                 x5_233_bool_cell(Some(summary.rtsp_started))
-            ));
-            ui.end_row();
-        });
+            ),
+        );
+    });
 
     ui.separator();
     ui.strong("RTSP channels");
     if summary.rtsp_channels.is_empty() {
-        ui.weak("legacy driver status: no per-channel RTSP status returned");
+        x5_233_wrapped_weak(
+            ui,
+            "legacy driver status: no per-channel RTSP status returned",
+        );
     } else {
-        egui::Grid::new("x5_233_tcp_status_rtsp_channels")
-            .striped(true)
-            .num_columns(9)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.strong("CH");
-                ui.strong("Req");
-                ui.strong("Run");
-                ui.strong("TX");
-                ui.strong("Busy");
-                ui.strong("Port");
-                ui.strong("Action");
-                ui.strong("Err");
-                ui.strong("Message");
-                ui.end_row();
-                for channel in &summary.rtsp_channels {
-                    ui.label(channel.channel.to_string());
-                    ui.label(x5_233_bool_cell(Some(channel.requested_enabled)));
-                    ui.label(x5_233_bool_cell(Some(channel.started)));
-                    ui.label(x5_233_bool_cell(Some(channel.tx_enabled)));
-                    ui.label(x5_233_bool_cell(Some(channel.busy)));
-                    ui.label(
+        for channel in &summary.rtsp_channels {
+            ui.group(|ui| {
+                ui.set_width(x5_233_available_width(ui));
+                ui.horizontal_wrapped(|ui| {
+                    x5_233_status_pair(ui, "CH", channel.channel.to_string());
+                    x5_233_status_pair(
+                        ui,
+                        "Req",
+                        x5_233_bool_cell(Some(channel.requested_enabled)),
+                    );
+                    x5_233_status_pair(ui, "Run", x5_233_bool_cell(Some(channel.started)));
+                    x5_233_status_pair(ui, "TX", x5_233_bool_cell(Some(channel.tx_enabled)));
+                    x5_233_status_pair(ui, "Busy", x5_233_bool_cell(Some(channel.busy)));
+                    x5_233_status_pair(
+                        ui,
+                        "Port",
                         channel
                             .port
                             .map(|port| port.to_string())
                             .unwrap_or_else(|| "—".to_owned()),
                     );
-                    ui.label(channel.action_id.to_string());
-                    ui.label(channel.last_error.to_string());
-                    ui.label(if channel.last_message.is_empty() {
-                        "—"
-                    } else {
-                        channel.last_message.as_str()
-                    });
-                    ui.end_row();
+                    x5_233_status_pair(ui, "Action", channel.action_id.to_string());
+                    x5_233_status_pair(ui, "Err", channel.last_error.to_string());
+                });
+                if !channel.last_message.is_empty() {
+                    x5_233_status_long(ui, "Message", channel.last_message.as_str());
                 }
             });
+        }
     }
 
     ui.separator();
     ui.strong("Snapshot rings");
     if summary.rings.is_empty() {
-        ui.weak("legacy driver status: no snapshot ring status returned");
+        x5_233_wrapped_weak(ui, "legacy driver status: no snapshot ring status returned");
     } else {
-        egui::Grid::new("x5_233_tcp_status_rings")
-            .striped(true)
-            .num_columns(7)
-            .spacing([8.0, 4.0])
-            .show(ui, |ui| {
-                ui.strong("CH");
-                ui.strong("Valid / Depth");
-                ui.strong("Frame ID range");
-                ui.strong("Timestamp ns range");
-                ui.strong("Retention");
-                ui.strong("Evicted");
-                ui.strong("Dropped");
-                ui.end_row();
-                for ring in &summary.rings {
-                    ui.label(ring.channel.to_string());
-                    ui.label(format!("{} / {}", ring.valid, ring.depth));
-                    ui.label(x5_233_ring_range_cell(
-                        ring.valid,
-                        ring.min_frame_id,
-                        ring.max_frame_id,
-                    ));
-                    ui.label(x5_233_ring_range_cell(
+        for ring in &summary.rings {
+            ui.group(|ui| {
+                ui.set_width(x5_233_available_width(ui));
+                ui.horizontal_wrapped(|ui| {
+                    x5_233_status_pair(ui, "CH", ring.channel.to_string());
+                    x5_233_status_pair(
+                        ui,
+                        "Valid / Depth",
+                        format!("{} / {}", ring.valid, ring.depth),
+                    );
+                    x5_233_status_pair(
+                        ui,
+                        "Retention",
+                        x5_233_ring_retention_cell(ring.valid, ring.retention_ns),
+                    );
+                    x5_233_status_pair(ui, "Evicted", ring.evicted.to_string());
+                    x5_233_status_pair(ui, "Dropped", ring.dropped.to_string());
+                });
+                x5_233_status_long(
+                    ui,
+                    "Frame ID range",
+                    x5_233_ring_range_cell(ring.valid, ring.min_frame_id, ring.max_frame_id),
+                );
+                x5_233_status_long(
+                    ui,
+                    "Timestamp ns range",
+                    x5_233_ring_range_cell(
                         ring.valid,
                         ring.min_timestamp_ns,
                         ring.max_timestamp_ns,
-                    ));
-                    ui.label(x5_233_ring_retention_cell(ring.valid, ring.retention_ns));
-                    ui.label(ring.evicted.to_string());
-                    ui.label(ring.dropped.to_string());
-                    ui.end_row();
-                }
+                    ),
+                );
             });
+        }
     }
 }
 
@@ -5967,7 +6051,8 @@ impl CameraToolboxApp {
         ui: &mut egui::Ui,
     ) -> Option<LiveStreamOpenRequest> {
         ui.heading("X5_233 Driver");
-        ui.weak(
+        x5_233_wrapped_weak(
+            ui,
             "X5 control is split into SSH/SFTP control, RTSP preview, and TCP snapshot capture.",
         );
 
@@ -5976,36 +6061,40 @@ impl CameraToolboxApp {
         let channel_ready = !self.selected_x5_233_channels().is_empty();
         let mut request = None;
 
-        ui.group(|ui| {
-            ui.heading("Device / Control");
-            egui::Grid::new("x5_233_device_control_grid")
-                .num_columns(2)
-                .spacing([12.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Host / IP");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.x5_233_driver.device_ip)
-                            .hint_text("X5 board IP"),
-                    );
-                    ui.end_row();
-                    ui.label("TCP port");
-                    ui.add(
-                        egui::DragValue::new(&mut self.x5_233_driver.tcp_port).range(1..=u16::MAX),
-                    );
-                    ui.end_row();
-                });
+        x5_233_section(ui, "Device / Control", |ui| {
+            x5_233_form_row(ui, "Host / IP", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::TextEdit::singleline(&mut self.x5_233_driver.device_ip)
+                        .hint_text("X5 board IP"),
+                );
+            });
+            x5_233_form_row(ui, "TCP port", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::DragValue::new(&mut self.x5_233_driver.tcp_port).range(1..=u16::MAX),
+                );
+            });
             let control_label = self.x5_233_control_label().unwrap_or_else(|_| {
                 format!(
                     "X5_233 {}@<ip>:{}",
                     self.x5_233_driver.ssh_user, X5_233_SSH_PORT
                 )
             });
-            ui.weak(format!(
-                "SSH/SFTP control: {control_label}; process-only password defaults to {}.",
-                self.x5_233_driver.ssh_password
-            ));
+            x5_233_wrapped_weak(
+                ui,
+                format!(
+                    "SSH/SFTP control: {control_label}; process-only password defaults to {}.",
+                    self.x5_233_driver.ssh_password
+                ),
+            );
             if ui
-                .add_enabled(host_ready, egui::Button::new("Read TCP Status"))
+                .add_enabled(
+                    host_ready,
+                    egui::Button::new("Read TCP Status")
+                        .min_size(egui::vec2(x5_233_available_width(ui), 0.0)),
+                )
+                .on_disabled_hover_text("Enter Host / IP before reading TCP status.")
                 .clicked()
             {
                 self.read_x5_233_tcp_status();
@@ -6013,76 +6102,88 @@ impl CameraToolboxApp {
         });
 
         ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.heading("RTSP Preview");
+        x5_233_section(ui, "RTSP Preview", |ui| {
             ui.checkbox(
                 &mut self.x5_233_driver.configure_before_connect,
                 "Configure encoder before RTSP connect",
             );
-            egui::Grid::new("x5_233_encoder_grid")
-                .num_columns(4)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Width");
-                    ui.add(egui::DragValue::new(&mut self.x5_233_driver.width).range(1..=16_384));
-                    ui.label("Height");
-                    ui.add(egui::DragValue::new(&mut self.x5_233_driver.height).range(1..=16_384));
-                    ui.end_row();
-                    ui.label("FPS");
-                    ui.add(egui::DragValue::new(&mut self.x5_233_driver.fps).range(1..=240));
-                    ui.label("Bitrate kbps");
-                    ui.add(
-                        egui::DragValue::new(&mut self.x5_233_driver.bitrate_kbps)
-                            .range(200..=50_000),
-                    );
-                    ui.end_row();
-                });
+            x5_233_form_row(ui, "Width", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::DragValue::new(&mut self.x5_233_driver.width).range(1..=16_384),
+                );
+            });
+            x5_233_form_row(ui, "Height", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::DragValue::new(&mut self.x5_233_driver.height).range(1..=16_384),
+                );
+            });
+            x5_233_form_row(ui, "FPS", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::DragValue::new(&mut self.x5_233_driver.fps).range(1..=240),
+                );
+            });
+            x5_233_form_row(ui, "Bitrate kbps", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::DragValue::new(&mut self.x5_233_driver.bitrate_kbps).range(200..=50_000),
+                );
+            });
 
-            ui.label("Channels");
-            egui::Grid::new("x5_233_channel_status_grid")
-                .striped(true)
-                .num_columns(7)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    ui.strong("Sel");
-                    ui.strong("CH");
-                    ui.strong("RTSP");
-                    ui.strong("Req");
-                    ui.strong("Started");
-                    ui.strong("TX");
-                    ui.strong("Busy");
-                    ui.end_row();
-                    for mapping in X5_233_DRIVER_CHANNELS {
-                        let selected = match mapping.driver_channel {
-                            0 => &mut self.x5_233_driver.driver_channel_0,
-                            1 => &mut self.x5_233_driver.driver_channel_1,
-                            3 => &mut self.x5_233_driver.driver_channel_3,
-                            4 => &mut self.x5_233_driver.driver_channel_4,
-                            _ => continue,
-                        };
-                        let channel_status = status_snapshot.as_ref().and_then(|summary| {
-                            summary
-                                .rtsp_channels
-                                .iter()
-                                .find(|status| status.channel == mapping.driver_channel)
-                        });
-                        ui.checkbox(selected, "");
-                        ui.label(mapping.label);
-                        ui.label(format!(":{}", mapping.rtsp_port));
-                        ui.label(x5_233_bool_cell(
-                            channel_status.map(|status| status.requested_enabled),
-                        ));
-                        ui.label(x5_233_bool_cell(channel_status.map(|status| status.started)));
-                        ui.label(x5_233_bool_cell(channel_status.map(|status| status.tx_enabled)));
-                        ui.label(x5_233_bool_cell(channel_status.map(|status| status.busy)));
-                        ui.end_row();
-                    }
+            ui.strong("Channels");
+            for mapping in X5_233_DRIVER_CHANNELS {
+                let selected = match mapping.driver_channel {
+                    0 => &mut self.x5_233_driver.driver_channel_0,
+                    1 => &mut self.x5_233_driver.driver_channel_1,
+                    3 => &mut self.x5_233_driver.driver_channel_3,
+                    4 => &mut self.x5_233_driver.driver_channel_4,
+                    _ => continue,
+                };
+                let channel_status = status_snapshot.as_ref().and_then(|summary| {
+                    summary
+                        .rtsp_channels
+                        .iter()
+                        .find(|status| status.channel == mapping.driver_channel)
                 });
-            ui.horizontal(|ui| {
+                ui.group(|ui| {
+                    ui.set_width(x5_233_available_width(ui));
+                    ui.horizontal_wrapped(|ui| {
+                        ui.checkbox(selected, mapping.label);
+                        x5_233_status_pair(ui, "RTSP", format!(":{}", mapping.rtsp_port));
+                        x5_233_status_pair(
+                            ui,
+                            "Req",
+                            x5_233_bool_cell(channel_status.map(|status| status.requested_enabled)),
+                        );
+                        x5_233_status_pair(
+                            ui,
+                            "Run",
+                            x5_233_bool_cell(channel_status.map(|status| status.started)),
+                        );
+                        x5_233_status_pair(
+                            ui,
+                            "TX",
+                            x5_233_bool_cell(channel_status.map(|status| status.tx_enabled)),
+                        );
+                        x5_233_status_pair(
+                            ui,
+                            "Busy",
+                            x5_233_bool_cell(channel_status.map(|status| status.busy)),
+                        );
+                    });
+                });
+            }
+            ui.horizontal_wrapped(|ui| {
+                let button_width = ((x5_233_available_width(ui) - ui.spacing().item_spacing.x)
+                    * 0.5)
+                    .clamp(128.0, 220.0);
                 if ui
                     .add_enabled(
                         host_ready && channel_ready,
-                        egui::Button::new("Connect selected RTSP"),
+                        egui::Button::new("Connect selected RTSP")
+                            .min_size(egui::vec2(button_width, 0.0)),
                     )
                     .clicked()
                 {
@@ -6091,71 +6192,145 @@ impl CameraToolboxApp {
                 if ui
                     .add_enabled(
                         host_ready && channel_ready,
-                        egui::Button::new("Stop selected RTSP"),
+                        egui::Button::new("Stop selected RTSP")
+                            .min_size(egui::vec2(button_width, 0.0)),
                     )
                     .clicked()
                 {
                     self.stop_x5_233_rtsp();
                 }
             });
-            ui.weak("RTSP preview only opens stream monitor documents; it does not create Calibration sessions.");
+            x5_233_wrapped_weak(
+                ui,
+                "RTSP Preview opens live monitor documents; Calibration mode also binds the matching live session.",
+            );
         });
 
         ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.heading("TCP Snapshot");
-            ui.weak(
+        x5_233_section(ui, "TCP Snapshot", |ui| {
+            x5_233_wrapped_weak(
+                ui,
                 "SNAPSHOT reads the latest ISP NV12 frame; SNAPSHOT_RAW reads a VIN RAW frame.",
             );
             let capture_route = self.capture_route_label();
-            ui.weak(capture_route);
-            ui.weak(self.capture_target_for_current_workspace().hover());
-            ui.horizontal(|ui| {
-                ui.label("YUV channel");
-                egui::ComboBox::from_id_salt("x5_233_yuv_channel")
-                    .selected_text(format!("CH{}", self.x5_233_driver.yuv_channel))
-                    .show_ui(ui, |ui| {
-                        for mapping in X5_233_DRIVER_CHANNELS {
-                            ui.selectable_value(
-                                &mut self.x5_233_driver.yuv_channel,
-                                mapping.driver_channel,
-                                mapping.label,
-                            );
+            x5_233_wrapped_weak(ui, capture_route);
+            x5_233_wrapped_weak(ui, self.capture_target_for_current_workspace().hover());
+            x5_233_form_row(ui, "YUV channel", |ui, width| {
+                let compact = width < 220.0;
+                if compact {
+                    egui::ComboBox::from_id_salt("x5_233_yuv_channel")
+                        .width(width)
+                        .selected_text(format!("CH{}", self.x5_233_driver.yuv_channel))
+                        .show_ui(ui, |ui| {
+                            for mapping in X5_233_DRIVER_CHANNELS {
+                                ui.selectable_value(
+                                    &mut self.x5_233_driver.yuv_channel,
+                                    mapping.driver_channel,
+                                    mapping.label,
+                                );
+                            }
+                        });
+                    if ui
+                        .add_enabled(
+                            host_ready,
+                            egui::Button::new("Capture YUV").min_size(egui::vec2(width, 0.0)),
+                        )
+                        .clicked()
+                    {
+                        self.capture_x5_233_yuv_snapshot(ui.ctx());
+                    }
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        let button_width = 112.0;
+                        let combo_width =
+                            (width - button_width - ui.spacing().item_spacing.x).max(96.0);
+                        egui::ComboBox::from_id_salt("x5_233_yuv_channel")
+                            .width(combo_width)
+                            .selected_text(format!("CH{}", self.x5_233_driver.yuv_channel))
+                            .show_ui(ui, |ui| {
+                                for mapping in X5_233_DRIVER_CHANNELS {
+                                    ui.selectable_value(
+                                        &mut self.x5_233_driver.yuv_channel,
+                                        mapping.driver_channel,
+                                        mapping.label,
+                                    );
+                                }
+                            });
+                        if ui
+                            .add_enabled(
+                                host_ready,
+                                egui::Button::new("Capture YUV")
+                                    .min_size(egui::vec2(button_width, 0.0)),
+                            )
+                            .clicked()
+                        {
+                            self.capture_x5_233_yuv_snapshot(ui.ctx());
                         }
                     });
-                if ui
-                    .add_enabled(host_ready, egui::Button::new("Capture YUV"))
-                    .clicked()
-                {
-                    self.capture_x5_233_yuv_snapshot(ui.ctx());
                 }
-                ui.separator();
-                ui.label("RAW camera");
-                ui.add(egui::DragValue::new(&mut self.x5_233_driver.raw_camera).range(0..=1));
-                if ui
-                    .add_enabled(host_ready, egui::Button::new("Capture RAW"))
-                    .clicked()
-                {
-                    self.capture_x5_233_raw_snapshot(ui.ctx());
+            });
+            x5_233_form_row(ui, "RAW camera", |ui, width| {
+                let compact = width < 220.0;
+                if compact {
+                    ui.add_sized(
+                        [width, 0.0],
+                        egui::DragValue::new(&mut self.x5_233_driver.raw_camera).range(0..=1),
+                    );
+                    if ui
+                        .add_enabled(
+                            host_ready,
+                            egui::Button::new("Capture RAW").min_size(egui::vec2(width, 0.0)),
+                        )
+                        .clicked()
+                    {
+                        self.capture_x5_233_raw_snapshot(ui.ctx());
+                    }
+                } else {
+                    ui.horizontal_wrapped(|ui| {
+                        let button_width = 112.0;
+                        let input_width =
+                            (width - button_width - ui.spacing().item_spacing.x).max(72.0);
+                        ui.add_sized(
+                            [input_width, 0.0],
+                            egui::DragValue::new(&mut self.x5_233_driver.raw_camera).range(0..=1),
+                        );
+                        if ui
+                            .add_enabled(
+                                host_ready,
+                                egui::Button::new("Capture RAW")
+                                    .min_size(egui::vec2(button_width, 0.0)),
+                            )
+                            .clicked()
+                        {
+                            self.capture_x5_233_raw_snapshot(ui.ctx());
+                        }
+                    });
                 }
             });
         });
 
         ui.add_space(8.0);
-        ui.group(|ui| {
-            ui.heading("TCP Status");
+        x5_233_section(ui, "TCP Status", |ui| {
             if let Some(status) = &self.x5_233_driver.last_tcp_status {
                 render_x5_233_tcp_status(ui, status);
             } else {
-                ui.weak("Read TCP Status to show protocol, RTSP channel, and snapshot ring state.");
+                x5_233_wrapped_weak(
+                    ui,
+                    "Read TCP Status to show protocol, RTSP channel, and snapshot ring state.",
+                );
             }
             if let Some(status) = self.x5_233_driver.last_status.as_deref() {
                 ui.separator();
-                ui.label(format!("Last operation: {status}"));
+                x5_233_wrapped_text(
+                    ui,
+                    format!("Last operation: {status}"),
+                    ui.visuals().text_color(),
+                    false,
+                );
             }
         });
         if let Some(error) = self.x5_233_driver.last_error.as_deref() {
-            ui.colored_label(egui::Color32::LIGHT_RED, error);
+            x5_233_wrapped_text(ui, error, egui::Color32::LIGHT_RED, false);
         }
         request
     }
@@ -7477,6 +7652,9 @@ impl CameraToolboxApp {
     const GUIDED_POSE_ARROW_MAX_DEPTH_SCALE: f32 = 2.25;
 
     #[cfg(feature = "calibration-opencv")]
+    const GUIDED_POSE_RING_VIEW_ROTATION_RADIANS: f32 = 0.0;
+
+    #[cfg(feature = "calibration-opencv")]
     fn guided_pose_rotation_ring_visual_sweep_degrees(error_degrees: f64) -> Option<f32> {
         if !error_degrees.is_finite()
             || error_degrees < f64::from(f32::MIN)
@@ -7676,46 +7854,46 @@ impl CameraToolboxApp {
             .map(|point| point.distance(center))
             .fold(0.0_f32, f32::max);
         let radius = (outline_radius * 0.58).clamp(36.0, 124.0);
-        let base_alpha = if matched { 92 } else { 76 };
-        let rotation = if horizontal_flip { 12.0_f32 } else { -12.0_f32 }.to_radians();
+        let base_alpha = if matched { 150 } else { 128 };
+        let rotation = Self::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS;
         let dominant_score = Self::guided_pose_rotation_ring_score(&rings.roll)
             .max(Self::guided_pose_rotation_ring_score(&rings.pitch))
             .max(Self::guided_pose_rotation_ring_score(&rings.yaw));
 
-        // 三轴旋转圆环替代 Guided mode 的坐标轴：暗环给参考，高亮弧长给当前到目标角度差。
+        // 三轴旋转圆环固定在相机/视野坐标系下：检测 pose 只驱动中心平移和尺度，不驱动圆环旋转。
+        Self::paint_live_guided_rotation_ring(
+            painter,
+            center,
+            radius * 0.92,
+            radius * 0.92,
+            rotation,
+            -90.0_f32.to_radians(),
+            &rings.yaw,
+            egui::Color32::from_rgb(64, 210, 255),
+            base_alpha,
+            dominant_score,
+        );
+        Self::paint_live_guided_rotation_ring(
+            painter,
+            center,
+            radius * 0.34,
+            radius * 1.06,
+            rotation,
+            0.0,
+            &rings.roll,
+            egui::Color32::from_rgb(255, 48, 86),
+            base_alpha,
+            dominant_score,
+        );
         Self::paint_live_guided_rotation_ring(
             painter,
             center,
             radius * 1.06,
-            radius * 0.62,
-            rotation,
-            -92.0_f32.to_radians(),
-            &rings.yaw,
-            egui::Color32::from_rgb(80, 155, 255),
-            base_alpha,
-            dominant_score,
-        );
-        Self::paint_live_guided_rotation_ring(
-            painter,
-            center,
-            radius * 0.98,
-            radius * 0.28,
+            radius * 0.34,
             rotation,
             180.0_f32.to_radians(),
-            &rings.roll,
-            egui::Color32::from_rgb(255, 82, 82),
-            base_alpha,
-            dominant_score,
-        );
-        Self::paint_live_guided_rotation_ring(
-            painter,
-            center,
-            radius * 0.32,
-            radius * 1.02,
-            rotation,
-            88.0_f32.to_radians(),
             &rings.pitch,
-            egui::Color32::from_rgb(62, 232, 124),
+            egui::Color32::from_rgb(70, 255, 132),
             base_alpha,
             dominant_score,
         );
@@ -7745,19 +7923,25 @@ impl CameraToolboxApp {
         base_alpha: u8,
         dominant_score: f32,
     ) {
+        let shadow_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
         let full_color =
             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), base_alpha);
+        let base_points = Self::guided_pose_rotation_ellipse_points(
+            center,
+            radius_x,
+            radius_y,
+            rotation,
+            0.0,
+            std::f32::consts::TAU,
+            96,
+        );
         painter.add(egui::Shape::line(
-            Self::guided_pose_rotation_ellipse_points(
-                center,
-                radius_x,
-                radius_y,
-                rotation,
-                0.0,
-                std::f32::consts::TAU,
-                96,
-            ),
-            egui::Stroke::new(3.0, full_color),
+            base_points.clone(),
+            egui::Stroke::new(5.8, shadow_color),
+        ));
+        painter.add(egui::Shape::line(
+            base_points,
+            egui::Stroke::new(3.6, full_color),
         ));
         let target_tick = Self::guided_pose_rotation_ellipse_point(
             center,
@@ -7767,9 +7951,13 @@ impl CameraToolboxApp {
             start_angle,
         );
         let tick_vector = target_tick - center;
-        let tick_outer = center + tick_vector * 1.10;
-        let tick_inner = center + tick_vector * 0.92;
-        painter.line_segment([tick_inner, tick_outer], egui::Stroke::new(2.8, color));
+        let tick_outer = center + tick_vector * 1.11;
+        let tick_inner = center + tick_vector * 0.91;
+        painter.line_segment(
+            [tick_inner, tick_outer],
+            egui::Stroke::new(5.2, shadow_color),
+        );
+        painter.line_segment([tick_inner, tick_outer], egui::Stroke::new(3.6, color));
         let Some(sweep_degrees) =
             Self::guided_pose_rotation_ring_visual_sweep_degrees(arc.error_degrees)
         else {
@@ -7779,8 +7967,8 @@ impl CameraToolboxApp {
         if sweep.abs() > 0.5_f32.to_radians() {
             let score = Self::guided_pose_rotation_ring_score(arc);
             let is_dominant = score + 1.0e-6 >= dominant_score && dominant_score > 0.0;
-            let glow_alpha = if is_dominant { 90 } else { 52 };
-            let arc_alpha = if is_dominant { 238 } else { 196 };
+            let glow_alpha = if is_dominant { 126 } else { 84 };
+            let arc_alpha = if is_dominant { 255 } else { 232 };
             let glow_color =
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), glow_alpha);
             let arc_color =
@@ -7796,11 +7984,11 @@ impl CameraToolboxApp {
             );
             painter.add(egui::Shape::line(
                 arc_points.clone(),
-                egui::Stroke::new(if is_dominant { 12.0 } else { 9.0 }, glow_color),
+                egui::Stroke::new(if is_dominant { 14.0 } else { 10.0 }, glow_color),
             ));
             painter.add(egui::Shape::line(
                 arc_points,
-                egui::Stroke::new(if is_dominant { 7.0 } else { 5.6 }, arc_color),
+                egui::Stroke::new(if is_dominant { 8.0 } else { 6.6 }, arc_color),
             ));
             let end_angle = start_angle + sweep;
             let (tip, tangent) = Self::guided_pose_rotation_ellipse_tip(
@@ -7811,7 +7999,7 @@ impl CameraToolboxApp {
                 end_angle,
                 sweep.signum(),
             );
-            Self::paint_live_guided_rotation_arrowhead(painter, tip, tangent, arc_color, 8.0);
+            Self::paint_live_guided_rotation_arrowhead(painter, tip, tangent, arc_color, 9.0);
         }
         let label_anchor = Self::guided_pose_rotation_ellipse_point(
             center,
@@ -7820,10 +8008,19 @@ impl CameraToolboxApp {
             rotation,
             start_angle + sweep,
         );
+        let label_text = format!("{} {:.1}°", arc.label, arc.error_degrees.abs());
+        let label_pos = label_anchor + egui::vec2(6.0, -6.0);
         painter.text(
-            label_anchor + egui::vec2(6.0, -6.0),
+            label_pos + egui::vec2(1.0, 1.0),
             egui::Align2::LEFT_BOTTOM,
-            format!("{} {:.1}°", arc.label, arc.error_degrees.abs()),
+            &label_text,
+            egui::FontId::monospace(11.0),
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+        );
+        painter.text(
+            label_pos,
+            egui::Align2::LEFT_BOTTOM,
+            label_text,
             egui::FontId::monospace(11.0),
             color,
         );

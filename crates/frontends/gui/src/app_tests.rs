@@ -3103,3 +3103,32 @@ fn guided_pose_rotation_ring_sweep_uses_true_angle_degrees_and_preserves_directi
 
     assert!(CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(f64::NAN).is_none());
 }
+
+#[cfg(feature = "calibration-opencv")]
+#[test]
+fn guided_pose_rotation_ring_geometry_only_translates_in_view_frame() {
+    assert_eq!(
+        CameraToolboxApp::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS,
+        0.0
+    );
+
+    let center_a = egui::pos2(120.0, 90.0);
+    let center_b = egui::pos2(260.0, 170.0);
+    let angle = 37.0_f32.to_radians();
+    let offset_a = CameraToolboxApp::guided_pose_rotation_ellipse_point(
+        center_a,
+        24.0,
+        72.0,
+        CameraToolboxApp::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS,
+        angle,
+    ) - center_a;
+    let offset_b = CameraToolboxApp::guided_pose_rotation_ellipse_point(
+        center_b,
+        24.0,
+        72.0,
+        CameraToolboxApp::GUIDED_POSE_RING_VIEW_ROTATION_RADIANS,
+        angle,
+    ) - center_b;
+
+    assert!((offset_a - offset_b).length() <= 1.0e-4);
+}

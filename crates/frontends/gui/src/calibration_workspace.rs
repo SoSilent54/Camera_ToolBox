@@ -1772,14 +1772,6 @@ fn guided_pose_rotation_to_rpy_degrees(rotation: [[f64; 3]; 3]) -> Option<[f64; 
     rpy.iter().all(|value| value.is_finite()).then_some(rpy)
 }
 
-fn mat3_transpose(matrix: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    [
-        [matrix[0][0], matrix[1][0], matrix[2][0]],
-        [matrix[0][1], matrix[1][1], matrix[2][1]],
-        [matrix[0][2], matrix[1][2], matrix[2][2]],
-    ]
-}
-
 fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut output = [[0.0; 3]; 3];
     for row in 0..3 {
@@ -1793,15 +1785,21 @@ fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 }
 
 fn guided_pose_signed_rotation_error_components(
-    measurement_rotation: [[f64; 3]; 3],
-    target_rotation: [[f64; 3]; 3],
+    measurement_rpy_degrees: [f64; 3],
+    target_rpy_degrees: [f64; 3],
 ) -> Option<[f64; 3]> {
-    let relative_rotation = mat3_mul(mat3_transpose(target_rotation), measurement_rotation);
-    let rpy = guided_pose_rotation_to_rpy_degrees(relative_rotation)?;
+    if measurement_rpy_degrees
+        .iter()
+        .chain(&target_rpy_degrees)
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
+    // 圆环固定在相机/视野坐标系下显示；误差也按该世界系 RPY 分量做劣弧 delta。
     Some([
-        signed_angle_distance_degrees(rpy[0], 0.0),
-        signed_angle_distance_degrees(rpy[1], 0.0),
-        signed_angle_distance_degrees(rpy[2], 0.0),
+        signed_angle_distance_degrees(target_rpy_degrees[0], measurement_rpy_degrees[0]),
+        signed_angle_distance_degrees(target_rpy_degrees[1], measurement_rpy_degrees[1]),
+        signed_angle_distance_degrees(target_rpy_degrees[2], measurement_rpy_degrees[2]),
     ])
 }
 
@@ -1817,13 +1815,14 @@ fn guided_pose_rotation_error_degrees(
     tolerance: GuidedPoseTolerance,
 ) -> Option<[f64; 3]> {
     let direct =
-        guided_pose_signed_rotation_error_components(measurement.rotation, target.rotation)?;
+        guided_pose_signed_rotation_error_components(measurement.rpy_degrees, target.rpy_degrees)?;
     // 普通棋盘没有方向标记，OpenCV/PnP 可能返回绕棋盘法线 180° 翻转的等价坐标系；
     // 物理姿态接近时不能把这个不可观测翻转记成 180° yaw error。
     let board_half_turn = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]];
     let symmetric_measurement = mat3_mul(measurement.rotation, board_half_turn);
+    let symmetric_rpy = guided_pose_rotation_to_rpy_degrees(symmetric_measurement)?;
     let symmetric =
-        guided_pose_signed_rotation_error_components(symmetric_measurement, target.rotation)?;
+        guided_pose_signed_rotation_error_components(symmetric_rpy, target.rpy_degrees)?;
     let direct_score = guided_pose_rotation_error_score(direct, tolerance);
     let symmetric_score = guided_pose_rotation_error_score(symmetric, tolerance);
     Some(if symmetric_score < direct_score {
@@ -8564,6 +8563,45 @@ mod tests {
         ]
     }
 
+    fn guided_test_rpy_rotation(rpy_degrees: [f64; 3]) -> [[f64; 3]; 3] {
+        let [roll_degrees, pitch_degrees, yaw_degrees] = rpy_degrees;
+        let (sin_roll, cos_roll) = roll_degrees.to_radians().sin_cos();
+        let (sin_pitch, cos_pitch) = pitch_degrees.to_radians().sin_cos();
+        let (sin_yaw, cos_yaw) = yaw_degrees.to_radians().sin_cos();
+
+        [
+            [
+                cos_yaw * cos_pitch,
+                cos_yaw * sin_pitch * sin_roll - sin_yaw * cos_roll,
+                cos_yaw * sin_pitch * cos_roll + sin_yaw * sin_roll,
+            ],
+            [
+                sin_yaw * cos_pitch,
+                sin_yaw * sin_pitch * sin_roll + cos_yaw * cos_roll,
+                sin_yaw * sin_pitch * cos_roll - cos_yaw * sin_roll,
+            ],
+            [-sin_pitch, cos_pitch * sin_roll, cos_pitch * cos_roll],
+        ]
+    }
+
+    fn guided_test_pose_from_rpy(rpy_degrees: [f64; 3]) -> GuidedPose6Dof {
+        let rotation = guided_test_rpy_rotation(rpy_degrees);
+        GuidedPose6Dof {
+            xyz: [0.0, 0.0, 1000.0],
+            rpy_degrees: guided_pose_rotation_to_rpy_degrees(rotation).unwrap(),
+            rotation,
+            translation: [0.0; 3],
+            center_uv: [0.5, 0.5],
+        }
+    }
+
+    fn assert_degrees_near(actual: f64, expected: f64) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-9,
+            "expected {expected}°, got {actual}°"
+        );
+    }
+
     #[test]
     fn guided_rotation_rings_report_signed_errors_from_current_pose() {
         let target = guided_test_target([0.50, 0.50], 0.50, 0.0, 0.0);
@@ -8597,6 +8635,23 @@ mod tests {
                 + rings.yaw.error_degrees.abs()
                 > 1.0
         );
+    }
+
+    #[test]
+    fn guided_rotation_error_uses_world_rpy_shortest_current_to_target_delta() {
+        let measurement = guided_test_pose_from_rpy([20.0, -5.0, 179.0]);
+        let target = guided_test_pose_from_rpy([5.0, 7.0, -179.0]);
+
+        let error = guided_pose_rotation_error_degrees(
+            &measurement,
+            &target,
+            GuidedPoseTolerance::default(),
+        )
+        .unwrap();
+
+        assert_degrees_near(error[0], -15.0);
+        assert_degrees_near(error[1], 12.0);
+        assert_degrees_near(error[2], 2.0);
     }
 
     #[test]
