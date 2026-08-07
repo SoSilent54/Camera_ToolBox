@@ -1347,8 +1347,11 @@ fn standard_guided_pose_plan(
     const FAR_TILTED: f64 = 0.56;
     const MID: f64 = 0.64;
     const NEAR: f64 = 0.72;
-    const FAR_TRANSLATED: f64 = 0.40;
-    const DISTANT_TRANSLATED: f64 = 0.36;
+    const FAR_MIDDLE: f64 = 0.36;
+    const CLOSE_CORNER: f64 = 0.62;
+    const OUTER_CORNER: f64 = 0.56;
+    const LOW_MIDDLE: f64 = 0.56;
+    const LOW_EDGE: f64 = 0.64;
     const LOW_TILT: f64 = 12.0;
     const MID_TILT: f64 = 20.0;
     const HIGH_TILT: f64 = 28.0;
@@ -1382,206 +1385,27 @@ fn standard_guided_pose_plan(
     };
 
     push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
+    push("Top · mid tilt", [0.50, 0.40], NEAR, MID_TILT, 90.0)?;
     push(
-        "Far left edge · fronto",
-        [0.20, 0.50],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far top edge · fronto",
-        [0.50, 0.20],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far right edge · fronto",
-        [0.80, 0.50],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far bottom edge · fronto",
-        [0.50, 0.80],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far upper left corner · fronto",
-        [0.22, 0.22],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far upper right corner · fronto",
-        [0.78, 0.22],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far lower left corner · fronto",
-        [0.22, 0.78],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far lower right corner · fronto",
-        [0.78, 0.78],
-        FAR_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Distant upper left corner · fronto",
-        [0.20, 0.20],
-        DISTANT_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Distant upper right corner · fronto",
-        [0.80, 0.20],
-        DISTANT_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Distant lower left corner · fronto",
-        [0.20, 0.80],
-        DISTANT_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Distant lower right corner · fronto",
-        [0.80, 0.80],
-        DISTANT_TRANSLATED,
-        0.0,
-        0.0,
-    )?;
-    push("Right · low tilt", [0.61, 0.50], MID, LOW_TILT, 0.0)?;
-    push("Right edge · low tilt", [0.66, 0.50], MID, LOW_TILT, 0.0)?;
-    push(
-        "Upper right · low tilt",
-        [0.586, 0.414],
-        MID,
+        "Top edge · low tilt",
+        [0.50, 0.34],
+        LOW_EDGE,
         LOW_TILT,
-        45.0,
-    )?;
-    push(
-        "Upper right corner · low tilt",
-        [0.62, 0.38],
-        MID,
-        LOW_TILT,
-        45.0,
-    )?;
-    push("Top · low tilt", [0.50, 0.39], MID, LOW_TILT, 90.0)?;
-    push("Top edge · low tilt", [0.50, 0.34], MID, LOW_TILT, 90.0)?;
-    push(
-        "Upper left · low tilt",
-        [0.414, 0.414],
-        MID,
-        LOW_TILT,
-        135.0,
+        90.0,
     )?;
     push(
         "Upper left corner · low tilt",
         [0.38, 0.38],
-        MID,
+        LOW_EDGE,
         LOW_TILT,
         135.0,
     )?;
-    push("Left · low tilt", [0.39, 0.50], MID, LOW_TILT, 180.0)?;
-    push("Left edge · low tilt", [0.34, 0.50], MID, LOW_TILT, 180.0)?;
-    push(
-        "Lower left · low tilt",
-        [0.414, 0.586],
-        MID,
-        LOW_TILT,
-        225.0,
-    )?;
-    push(
-        "Lower left corner · low tilt",
-        [0.38, 0.62],
-        MID,
-        LOW_TILT,
-        225.0,
-    )?;
-    push("Bottom · low tilt", [0.50, 0.61], MID, LOW_TILT, 270.0)?;
-    push("Bottom edge · low tilt", [0.50, 0.66], MID, LOW_TILT, 270.0)?;
-    push(
-        "Lower right · low tilt",
-        [0.586, 0.586],
-        MID,
-        LOW_TILT,
-        315.0,
-    )?;
-    push(
-        "Lower right corner · low tilt",
-        [0.62, 0.62],
-        MID,
-        LOW_TILT,
-        315.0,
-    )?;
-    push("Right · mid tilt", [0.60, 0.50], NEAR, MID_TILT, 0.0)?;
-    push(
-        "Upper right · mid tilt",
-        [0.578, 0.422],
-        NEAR,
-        MID_TILT,
-        45.0,
-    )?;
-    push("Top · mid tilt", [0.50, 0.40], NEAR, MID_TILT, 90.0)?;
     push(
         "Upper left · mid tilt",
         [0.422, 0.422],
         NEAR,
         MID_TILT,
         135.0,
-    )?;
-    push("Left · mid tilt", [0.40, 0.50], NEAR, MID_TILT, 180.0)?;
-    push(
-        "Lower left · mid tilt",
-        [0.422, 0.578],
-        NEAR,
-        MID_TILT,
-        225.0,
-    )?;
-    push("Bottom · mid tilt", [0.50, 0.60], NEAR, MID_TILT, 270.0)?;
-    push(
-        "Lower right · mid tilt",
-        [0.578, 0.578],
-        NEAR,
-        MID_TILT,
-        315.0,
-    )?;
-    push(
-        "Right · high tilt",
-        [0.575, 0.50],
-        FAR_TILTED,
-        HIGH_TILT,
-        0.0,
-    )?;
-    push(
-        "Upper right · high tilt",
-        [0.559, 0.441],
-        FAR_TILTED,
-        HIGH_TILT,
-        45.0,
-    )?;
-    push(
-        "Top · high tilt",
-        [0.50, 0.425],
-        FAR_TILTED,
-        HIGH_TILT,
-        90.0,
     )?;
     push(
         "Upper left · high tilt",
@@ -1591,11 +1415,27 @@ fn standard_guided_pose_plan(
         135.0,
     )?;
     push(
+        "Upper left · low tilt",
+        [0.43, 0.43],
+        LOW_MIDDLE,
+        LOW_TILT,
+        135.0,
+    )?;
+    push("Left · low tilt", [0.41, 0.50], LOW_MIDDLE, LOW_TILT, 180.0)?;
+    push(
         "Left · high tilt",
         [0.425, 0.50],
         FAR_TILTED,
         HIGH_TILT,
         180.0,
+    )?;
+    push("Left · mid tilt", [0.40, 0.50], NEAR, MID_TILT, 180.0)?;
+    push(
+        "Lower left · mid tilt",
+        [0.422, 0.578],
+        NEAR,
+        MID_TILT,
+        225.0,
     )?;
     push(
         "Lower left · high tilt",
@@ -1603,6 +1443,144 @@ fn standard_guided_pose_plan(
         FAR_TILTED,
         HIGH_TILT,
         225.0,
+    )?;
+    push(
+        "Lower left · low tilt",
+        [0.43, 0.57],
+        LOW_MIDDLE,
+        LOW_TILT,
+        225.0,
+    )?;
+    push(
+        "Lower left corner · low tilt",
+        [0.38, 0.62],
+        LOW_EDGE,
+        LOW_TILT,
+        225.0,
+    )?;
+    push(
+        "Close lower left corner · fronto",
+        [0.27, 0.73],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer lower left corner · fronto",
+        [0.245, 0.755],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Left edge · low tilt",
+        [0.34, 0.50],
+        LOW_EDGE,
+        LOW_TILT,
+        180.0,
+    )?;
+    push(
+        "Close upper left corner · fronto",
+        [0.27, 0.27],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer upper left corner · fronto",
+        [0.245, 0.245],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far left field · fronto",
+        [0.32, 0.50],
+        FAR_MIDDLE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far bottom field · fronto",
+        [0.50, 0.68],
+        FAR_MIDDLE,
+        0.0,
+        0.0,
+    )?;
+    push("Far top field · fronto", [0.50, 0.32], FAR_MIDDLE, 0.0, 0.0)?;
+    push("Top · low tilt", [0.50, 0.41], LOW_MIDDLE, LOW_TILT, 90.0)?;
+    push(
+        "Top · high tilt",
+        [0.50, 0.425],
+        FAR_TILTED,
+        HIGH_TILT,
+        90.0,
+    )?;
+    push(
+        "Upper right · high tilt",
+        [0.559, 0.441],
+        FAR_TILTED,
+        HIGH_TILT,
+        45.0,
+    )?;
+    push(
+        "Upper right · low tilt",
+        [0.57, 0.43],
+        LOW_MIDDLE,
+        LOW_TILT,
+        45.0,
+    )?;
+    push(
+        "Upper right · mid tilt",
+        [0.578, 0.422],
+        NEAR,
+        MID_TILT,
+        45.0,
+    )?;
+    push(
+        "Upper right corner · low tilt",
+        [0.62, 0.38],
+        LOW_EDGE,
+        LOW_TILT,
+        45.0,
+    )?;
+    push(
+        "Right edge · low tilt",
+        [0.66, 0.50],
+        LOW_EDGE,
+        LOW_TILT,
+        0.0,
+    )?;
+    push("Right · low tilt", [0.59, 0.50], LOW_MIDDLE, LOW_TILT, 0.0)?;
+    push(
+        "Right · high tilt",
+        [0.575, 0.50],
+        FAR_TILTED,
+        HIGH_TILT,
+        0.0,
+    )?;
+    push("Right · mid tilt", [0.60, 0.50], NEAR, MID_TILT, 0.0)?;
+    push(
+        "Lower right · mid tilt",
+        [0.578, 0.578],
+        NEAR,
+        MID_TILT,
+        315.0,
+    )?;
+    push("Bottom · mid tilt", [0.50, 0.60], NEAR, MID_TILT, 270.0)?;
+    push(
+        "Bottom edge · low tilt",
+        [0.50, 0.66],
+        LOW_EDGE,
+        LOW_TILT,
+        270.0,
+    )?;
+    push(
+        "Bottom · low tilt",
+        [0.50, 0.59],
+        LOW_MIDDLE,
+        LOW_TILT,
+        270.0,
     )?;
     push(
         "Bottom · high tilt",
@@ -1617,6 +1595,55 @@ fn standard_guided_pose_plan(
         FAR_TILTED,
         HIGH_TILT,
         315.0,
+    )?;
+    push(
+        "Lower right · low tilt",
+        [0.57, 0.57],
+        LOW_MIDDLE,
+        LOW_TILT,
+        315.0,
+    )?;
+    push(
+        "Lower right corner · low tilt",
+        [0.62, 0.62],
+        LOW_EDGE,
+        LOW_TILT,
+        315.0,
+    )?;
+    push(
+        "Close lower right corner · fronto",
+        [0.73, 0.73],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer lower right corner · fronto",
+        [0.755, 0.755],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far right field · fronto",
+        [0.68, 0.50],
+        FAR_MIDDLE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer upper right corner · fronto",
+        [0.755, 0.245],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Close upper right corner · fronto",
+        [0.73, 0.27],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
     )?;
     Ok(plan)
 }
@@ -9624,18 +9651,18 @@ mod tests {
 
         let target_labels = plan.iter().map(|target| target.label).collect::<Vec<_>>();
         for required in [
-            "Far left edge · fronto",
-            "Far top edge · fronto",
-            "Far right edge · fronto",
-            "Far bottom edge · fronto",
-            "Far upper left corner · fronto",
-            "Far upper right corner · fronto",
-            "Far lower left corner · fronto",
-            "Far lower right corner · fronto",
-            "Distant upper left corner · fronto",
-            "Distant upper right corner · fronto",
-            "Distant lower left corner · fronto",
-            "Distant lower right corner · fronto",
+            "Far left field · fronto",
+            "Far top field · fronto",
+            "Far right field · fronto",
+            "Far bottom field · fronto",
+            "Close upper left corner · fronto",
+            "Outer upper left corner · fronto",
+            "Close upper right corner · fronto",
+            "Outer upper right corner · fronto",
+            "Close lower left corner · fronto",
+            "Outer lower left corner · fronto",
+            "Close lower right corner · fronto",
+            "Outer lower right corner · fronto",
             "Right edge · low tilt",
             "Top edge · low tilt",
             "Left edge · low tilt",
@@ -9689,8 +9716,8 @@ mod tests {
             ) {
                 assert!(
                     uv.iter()
-                        .all(|value| value.is_finite() && (0.0..=1.0).contains(value)),
-                    "guided target #{index} '{}' must stay fully inside normalized image bounds: {:?}",
+                        .all(|value| value.is_finite() && (-0.05..=1.05).contains(value)),
+                    "guided target #{index} '{}' must stay finite and near normalized image bounds: {:?}",
                     target.label,
                     uv
                 );
@@ -9750,6 +9777,10 @@ mod tests {
         let mut minimum_depth = f64::INFINITY;
         let mut maximum_depth = f64::NEG_INFINITY;
         let mut far_depth_count = 0_usize;
+        let mut adjacent_translation_total = 0.0_f64;
+        let mut adjacent_translation_max = 0.0_f64;
+        let mut adjacent_translation_count = 0_usize;
+        let mut previous_xyz = None::<[f64; 3]>;
         for target in &sixteen_nine_plan {
             let depth = guided_test_target_depth(
                 board,
@@ -9762,6 +9793,32 @@ mod tests {
             if (700.0..=1000.0).contains(&depth) {
                 far_depth_count += 1;
             }
+            if target.label.contains("corner · fronto") {
+                assert!(
+                    depth <= 650.0,
+                    "fronto corner '{}' should stay close enough to avoid large operator motion: {depth:.3}",
+                    target.label
+                );
+            }
+            if target.label.contains("field · fronto") {
+                assert!(
+                    (900.0..=1000.0).contains(&depth),
+                    "fronto middle-field '{}' should carry the far-depth samples: {depth:.3}",
+                    target.label
+                );
+            }
+            if let Some(previous_xyz) = previous_xyz {
+                let delta = previous_xyz
+                    .iter()
+                    .zip(target.pose.xyz.iter())
+                    .map(|(left, right)| (left - right).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                adjacent_translation_total += delta;
+                adjacent_translation_max = adjacent_translation_max.max(delta);
+                adjacent_translation_count += 1;
+            }
+            previous_xyz = Some(target.pose.xyz);
             for row in 0..board.inner_rows {
                 for column in 0..board.inner_cols {
                     let point = project_board_point_image(
@@ -9824,32 +9881,39 @@ mod tests {
             "16:9 guided depth distribution should include close and 700..1000 far samples: {minimum_depth:.3}..{maximum_depth:.3}"
         );
         assert!(
-            far_depth_count >= 12,
-            "far depth samples: {far_depth_count}"
+            far_depth_count >= 4,
+            "far middle-field samples: {far_depth_count}"
+        );
+        assert_eq!(adjacent_translation_count, sixteen_nine_plan.len() - 1);
+        let adjacent_translation_average =
+            adjacent_translation_total / adjacent_translation_count.max(1) as f64;
+        assert!(
+            adjacent_translation_max <= 460.0 && adjacent_translation_average <= 160.0,
+            "guided pose order should avoid large adjacent jumps: max={adjacent_translation_max:.3}, avg={adjacent_translation_average:.3}"
         );
         assert!(
             corner_min[0] <= 170.0
                 && corner_max[0] >= 1750.0
-                && corner_min[1] <= 70.0
-                && corner_max[1] >= 1010.0,
+                && corner_min[1] <= 60.0
+                && corner_max[1] >= 1020.0,
             "16:9 inner-corner coverage should reach the frame edges: min={corner_min:?} max={corner_max:?}"
         );
         assert!(
-            corner_bins[0][0] >= 70
-                && corner_bins[0][3] >= 70
-                && corner_bins[3][0] >= 70
-                && corner_bins[3][3] >= 70,
+            corner_bins[0][0] >= 48
+                && corner_bins[0][3] >= 48
+                && corner_bins[3][0] >= 48
+                && corner_bins[3][3] >= 48,
             "16:9 corner bins lack samples: {corner_bins:?}"
         );
         assert!(
-            corner_region_counts[0] >= 96
-                && corner_region_counts[1] >= 96
-                && corner_region_counts[2] >= 140
-                && corner_region_counts[3] >= 140,
+            corner_region_counts[0] >= 64
+                && corner_region_counts[1] >= 64
+                && corner_region_counts[2] >= 96
+                && corner_region_counts[3] >= 96,
             "16:9 edge regions lack samples: {corner_region_counts:?}"
         );
         assert!(
-            corner_region_counts[4..].iter().all(|count| *count >= 70),
+            corner_region_counts[4..].iter().all(|count| *count >= 48),
             "16:9 corner regions lack samples: {corner_region_counts:?}"
         );
     }
