@@ -1303,18 +1303,44 @@ fn x5_233_ring_retention_cell(valid: u16, retention_ns: u64) -> String {
     }
 }
 
+const WORKSPACE_EXPLORER_DEFAULT_WIDTH: f32 = 280.0;
+const WORKSPACE_EXPLORER_MIN_WIDTH: f32 = 220.0;
 const X5_233_FORM_STACK_THRESHOLD: f32 = 260.0;
 const X5_233_FORM_LABEL_WIDTH: f32 = 108.0;
-const X5_233_SIDEBAR_MAX_WIDTH: f32 = 360.0;
+const X5_233_SIDEBAR_DEFAULT_WIDTH: f32 = 360.0;
+const X5_233_SIDEBAR_MIN_WIDTH: f32 = 280.0;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct WorkspaceExplorerPanelLayout {
+    default_width: f32,
+    min_width: f32,
+}
+
+fn workspace_explorer_panel_layout(is_x5_233_driver_mode: bool) -> WorkspaceExplorerPanelLayout {
+    if is_x5_233_driver_mode {
+        WorkspaceExplorerPanelLayout {
+            default_width: X5_233_SIDEBAR_DEFAULT_WIDTH,
+            min_width: X5_233_SIDEBAR_MIN_WIDTH,
+        }
+    } else {
+        WorkspaceExplorerPanelLayout {
+            default_width: WORKSPACE_EXPLORER_DEFAULT_WIDTH,
+            min_width: WORKSPACE_EXPLORER_MIN_WIDTH,
+        }
+    }
+}
+
+fn x5_233_available_width_from_raw(width: f32) -> f32 {
+    if width.is_finite() {
+        // X5 驱动区随当前侧栏宽度自适应；最小宽度由外层可调整 side panel 保证。
+        width.max(1.0)
+    } else {
+        X5_233_SIDEBAR_DEFAULT_WIDTH
+    }
+}
 
 fn x5_233_available_width(ui: &egui::Ui) -> f32 {
-    let width = ui.available_width();
-    if width.is_finite() {
-        // X5 驱动区应保持左侧栏形态；内部控件只在侧栏宽度内对齐，不反向撑大主界面。
-        width.clamp(1.0, X5_233_SIDEBAR_MAX_WIDTH)
-    } else {
-        X5_233_SIDEBAR_MAX_WIDTH
-    }
+    x5_233_available_width_from_raw(ui.available_width())
 }
 
 fn x5_233_wrapped_text(
@@ -1972,14 +1998,12 @@ impl eframe::App for CameraToolboxApp {
             .explorer_panel_expanded
         {
             let mut collapse = false;
-            let mut explorer_panel = egui::Panel::left("workspace_explorer_panel")
+            let panel_layout =
+                workspace_explorer_panel_layout(self.explorer.is_x5_233_driver_mode());
+            let actions = egui::Panel::left("workspace_explorer_panel")
                 .resizable(true)
-                .default_size(280.0)
-                .min_size(220.0);
-            if self.explorer.is_x5_233_driver_mode() {
-                explorer_panel = explorer_panel.max_size(X5_233_SIDEBAR_MAX_WIDTH);
-            }
-            let actions = explorer_panel
+                .default_size(panel_layout.default_width)
+                .min_size(panel_layout.min_width)
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("Workspace");

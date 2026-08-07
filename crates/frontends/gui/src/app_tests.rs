@@ -404,6 +404,34 @@ fn x5_233_driver_defaults_match_driver_contract() {
 }
 
 #[test]
+fn x5_233_driver_sidebar_uses_resizable_minimum_layout() {
+    let generic = super::workspace_explorer_panel_layout(false);
+    let x5 = super::workspace_explorer_panel_layout(true);
+
+    assert_eq!(
+        generic.default_width,
+        super::WORKSPACE_EXPLORER_DEFAULT_WIDTH
+    );
+    assert_eq!(generic.min_width, super::WORKSPACE_EXPLORER_MIN_WIDTH);
+    assert_eq!(x5.default_width, super::X5_233_SIDEBAR_DEFAULT_WIDTH);
+    assert_eq!(x5.min_width, super::X5_233_SIDEBAR_MIN_WIDTH);
+    assert!(x5.default_width > generic.default_width);
+    assert!(x5.min_width > generic.min_width);
+    assert!(x5.default_width > x5.min_width);
+}
+
+#[test]
+fn x5_233_driver_content_width_tracks_current_sidebar_width() {
+    assert_eq!(super::x5_233_available_width_from_raw(120.0), 120.0);
+    assert_eq!(super::x5_233_available_width_from_raw(360.0), 360.0);
+    assert_eq!(super::x5_233_available_width_from_raw(720.0), 720.0);
+    assert_eq!(
+        super::x5_233_available_width_from_raw(f32::INFINITY),
+        super::X5_233_SIDEBAR_DEFAULT_WIDTH
+    );
+}
+
+#[test]
 fn x5_233_rtsp_uses_slower_board_connect_timeout() {
     let timeouts = x5_233_rtsp_timeouts();
 
