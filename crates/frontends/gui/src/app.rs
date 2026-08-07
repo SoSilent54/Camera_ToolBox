@@ -1309,10 +1309,10 @@ const WORKSPACE_EXPLORER_MAX_WIDTH_FRACTION: f32 = 0.42;
 const WORKSPACE_EXPLORER_MAX_WIDTH_CAP: f32 = 420.0;
 const X5_233_FORM_STACK_THRESHOLD: f32 = 260.0;
 const X5_233_FORM_LABEL_WIDTH: f32 = 108.0;
-const X5_233_SIDEBAR_DEFAULT_WIDTH: f32 = 360.0;
-const X5_233_SIDEBAR_MIN_WIDTH: f32 = 280.0;
-const X5_233_SIDEBAR_MAX_WIDTH_FRACTION: f32 = 0.45;
-const X5_233_SIDEBAR_MAX_WIDTH_CAP: f32 = 720.0;
+const X5_233_SIDEBAR_DEFAULT_WIDTH: f32 = WORKSPACE_EXPLORER_DEFAULT_WIDTH;
+const X5_233_SIDEBAR_MIN_WIDTH: f32 = WORKSPACE_EXPLORER_MIN_WIDTH;
+const X5_233_SIDEBAR_MAX_WIDTH_FRACTION: f32 = WORKSPACE_EXPLORER_MAX_WIDTH_FRACTION;
+const X5_233_SIDEBAR_MAX_WIDTH_CAP: f32 = WORKSPACE_EXPLORER_MAX_WIDTH_CAP;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct WorkspaceExplorerPanelLayout {
@@ -1396,14 +1396,12 @@ fn x5_233_section<R>(
     add_contents: impl FnOnce(&mut egui::Ui) -> R,
 ) -> R {
     let width = x5_233_available_width(ui);
-    ui.group(|ui| {
-        // 侧栏分组占满同一可用宽度，避免不同 section 由内部控件撑出不同宽度。
-        ui.set_width(width);
-        ui.heading(title);
-        ui.add_space(2.0);
-        add_contents(ui)
-    })
-    .inner
+    ui.set_width(width);
+    ui.strong(title);
+    ui.add_space(2.0);
+    ui.separator();
+    ui.add_space(2.0);
+    add_contents(ui)
 }
 
 fn x5_233_form_row<R>(
@@ -1414,7 +1412,9 @@ fn x5_233_form_row<R>(
     let width = x5_233_available_width(ui);
     if width < X5_233_FORM_STACK_THRESHOLD {
         ui.strong(label);
-        add_control(ui, width)
+        let result = add_control(ui, width);
+        ui.add_space(2.0);
+        result
     } else {
         ui.horizontal(|ui| {
             ui.add_sized(
