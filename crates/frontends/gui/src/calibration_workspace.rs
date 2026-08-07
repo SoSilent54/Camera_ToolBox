@@ -60,7 +60,11 @@ const MAX_DATASET_ITEMS: usize = 256;
 const REMOTE_READS_PER_SOURCE: usize = 8;
 const AUTO_CAPTURE_ANALYSIS_INTERVAL_NS: u64 = 200_000_000;
 const AUTO_CAPTURE_ACCEPT_COOLDOWN_NS: u64 = 750_000_000;
+const LIVE_AUTO_CANDIDATE_CAPACITY: usize = 4;
 const GUIDED_CAPTURE_HOLD_FRAMES: u8 = 4;
+const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
+const GUIDED_HOLD_JITTER_Z_LIMIT: f64 = 0.04;
+const GUIDED_HOLD_JITTER_RPY_DEGREES: f64 = 2.0;
 const X5_RTSP_PTS_BRIDGE_TOLERANCE_90K: u64 = 3_000;
 const X5_RTSP_PTS_BRIDGE_MAX_AGE_NS: u64 = 2_000_000_000;
 const GUIDED_POSE_X_TOLERANCE: f64 = 0.10;
@@ -170,12 +174,14 @@ struct LoadedCalibrationResult {
     solution: CalibrationSolution,
 }
 
+#[derive(Clone)]
 struct CalibrationSource {
     display_name: String,
     kind: CalibrationSourceKind,
     preview: Option<CalibrationPreview>,
 }
 
+#[derive(Clone)]
 enum CalibrationSourceKind {
     File {
         file_system: Arc<dyn FileSystem>,
@@ -184,6 +190,7 @@ enum CalibrationSourceKind {
     Stream(StreamCalibrationSource),
 }
 
+#[derive(Clone)]
 struct StreamCalibrationSource {
     store: CaptureStore,
     asset: Option<Arc<EphemeralAsset>>,
@@ -835,6 +842,7 @@ fn freeze_authoritative_yuv_input(
     })
 }
 
+#[derive(Clone)]
 struct CalibrationPreview {
     frame: Arc<Rgba8Frame>,
     texture: egui::TextureHandle,
@@ -1189,7 +1197,18 @@ struct GuidedCaptureBinding {
     intrinsics_digest: SnapshotHash,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+struct GuidedHoldSample {
+    token: AutoCandidateToken,
+    source: CalibrationSource,
+    pose_request: Option<PoseEstimationRequest>,
+    guided_step_index: Option<usize>,
+    stability_score: f64,
+}
+
+struct GuidedHoldUpdate {
+    capture_sample: Option<GuidedHoldSample>,
+}
+
 struct GuidedCaptureRuntime {
     plan: Vec<GuidedPoseTarget>,
     current_step: usize,
@@ -1198,6 +1217,8 @@ struct GuidedCaptureRuntime {
     hold_frames: u8,
     capture_requested: bool,
     last_assessment: Option<GuidedPoseAssessment>,
+    last_hold_measurement: Option<GuidedPoseMeasurement>,
+    best_hold_sample: Option<GuidedHoldSample>,
 }
 
 impl GuidedCaptureRuntime {
@@ -1215,6 +1236,8 @@ impl GuidedCaptureRuntime {
             hold_frames: 0,
             capture_requested: false,
             last_assessment: None,
+            last_hold_measurement: None,
+            best_hold_sample: None,
         })
     }
 
@@ -1234,31 +1257,68 @@ impl GuidedCaptureRuntime {
                 self.plan.len(),
                 target.label
             ),
-            None => "Standard 25 complete".to_owned(),
+            None => "Standard guided complete".to_owned(),
         }
     }
 
-    fn update_hold(&mut self, assessment: GuidedPoseAssessment) {
+    fn update_hold(
+        &mut self,
+        mut assessment: GuidedPoseAssessment,
+        sample: Option<GuidedHoldSample>,
+    ) -> GuidedHoldUpdate {
+        let mut capture_sample = None;
         if assessment.matched {
-            self.hold_frames = self
-                .hold_frames
-                .saturating_add(1)
-                .min(GUIDED_CAPTURE_HOLD_FRAMES);
-            if self.hold_frames >= GUIDED_CAPTURE_HOLD_FRAMES {
-                self.capture_requested = true;
+            let jitter_score = self.last_hold_measurement.as_ref().map_or(0.0, |previous| {
+                guided_hold_jitter_score(previous, &assessment.measurement)
+            });
+            if jitter_score > 1.0 {
+                assessment.matched = false;
+                assessment.reason = Some(format!(
+                    "hold jitter {:.2} exceeds stability limit",
+                    jitter_score
+                ));
+                self.reset_hold();
+            } else {
+                self.hold_frames = self
+                    .hold_frames
+                    .saturating_add(1)
+                    .min(GUIDED_CAPTURE_HOLD_FRAMES);
+                self.last_hold_measurement = Some(assessment.measurement);
+                if let Some(mut sample) = sample {
+                    sample.stability_score = sample
+                        .stability_score
+                        .min(assessment.pose_error_score + jitter_score);
+                    let replace_best = self
+                        .best_hold_sample
+                        .as_ref()
+                        .is_none_or(|best| sample.stability_score < best.stability_score);
+                    if replace_best {
+                        self.best_hold_sample = Some(sample);
+                    }
+                }
+                if self.hold_frames >= GUIDED_CAPTURE_HOLD_FRAMES {
+                    self.capture_requested = true;
+                    capture_sample = self.best_hold_sample.take();
+                }
             }
         } else {
-            self.hold_frames = 0;
-            self.capture_requested = false;
+            self.reset_hold();
         }
         self.last_assessment = Some(assessment);
+        GuidedHoldUpdate { capture_sample }
+    }
+
+    fn clear_hold_state(&mut self) {
+        self.hold_frames = 0;
+        self.capture_requested = false;
+        self.last_hold_measurement = None;
+        self.best_hold_sample = None;
+        self.last_assessment = None;
     }
 
     fn advance_after_commit(&mut self) {
         self.current_step = self.current_step.saturating_add(1);
-        self.hold_frames = 0;
-        self.capture_requested = false;
-        self.last_assessment = None;
+        self.clear_hold_state();
         if self.current_step >= self.plan.len() {
             self.state = GuidedCaptureState::Complete;
         }
@@ -1267,6 +1327,8 @@ impl GuidedCaptureRuntime {
     fn reset_hold(&mut self) {
         self.hold_frames = 0;
         self.capture_requested = false;
+        self.last_hold_measurement = None;
+        self.best_hold_sample = None;
     }
 }
 
@@ -1283,7 +1345,7 @@ fn standard_guided_pose_plan(
     const HIGH_TILT: f64 = 28.0;
 
     let tolerance = GuidedPoseTolerance::default();
-    let mut plan = Vec::with_capacity(25);
+    let mut plan = Vec::with_capacity(33);
     let mut push = |label: &'static str,
                     center_uv: [f64; 2],
                     scale: f64,
@@ -1312,6 +1374,7 @@ fn standard_guided_pose_plan(
 
     push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
     push("Right · low tilt", [0.61, 0.50], MID, LOW_TILT, 0.0)?;
+    push("Right edge · low tilt", [0.66, 0.50], MID, LOW_TILT, 0.0)?;
     push(
         "Upper right · low tilt",
         [0.586, 0.414],
@@ -1319,7 +1382,15 @@ fn standard_guided_pose_plan(
         LOW_TILT,
         45.0,
     )?;
+    push(
+        "Upper right corner · low tilt",
+        [0.62, 0.38],
+        MID,
+        LOW_TILT,
+        45.0,
+    )?;
     push("Top · low tilt", [0.50, 0.39], MID, LOW_TILT, 90.0)?;
+    push("Top edge · low tilt", [0.50, 0.34], MID, LOW_TILT, 90.0)?;
     push(
         "Upper left · low tilt",
         [0.414, 0.414],
@@ -1327,7 +1398,15 @@ fn standard_guided_pose_plan(
         LOW_TILT,
         135.0,
     )?;
+    push(
+        "Upper left corner · low tilt",
+        [0.38, 0.38],
+        MID,
+        LOW_TILT,
+        135.0,
+    )?;
     push("Left · low tilt", [0.39, 0.50], MID, LOW_TILT, 180.0)?;
+    push("Left edge · low tilt", [0.34, 0.50], MID, LOW_TILT, 180.0)?;
     push(
         "Lower left · low tilt",
         [0.414, 0.586],
@@ -1335,10 +1414,25 @@ fn standard_guided_pose_plan(
         LOW_TILT,
         225.0,
     )?;
+    push(
+        "Lower left corner · low tilt",
+        [0.38, 0.62],
+        MID,
+        LOW_TILT,
+        225.0,
+    )?;
     push("Bottom · low tilt", [0.50, 0.61], MID, LOW_TILT, 270.0)?;
+    push("Bottom edge · low tilt", [0.50, 0.66], MID, LOW_TILT, 270.0)?;
     push(
         "Lower right · low tilt",
         [0.586, 0.586],
+        MID,
+        LOW_TILT,
+        315.0,
+    )?;
+    push(
+        "Lower right corner · low tilt",
+        [0.62, 0.62],
         MID,
         LOW_TILT,
         315.0,
@@ -1948,6 +2042,7 @@ fn guided_pose_rotation(tilt_degrees: f64, azimuth_degrees: f64) -> [[f64; 3]; 3
     let (sin_theta, cos_theta) = tilt.sin_cos();
     let one_minus_cos = 1.0 - cos_theta;
     let [x, y, z] = axis;
+
     [
         [
             cos_theta + x * x * one_minus_cos,
@@ -1965,6 +2060,40 @@ fn guided_pose_rotation(tilt_degrees: f64, azimuth_degrees: f64) -> [[f64; 3]; 3
             cos_theta + z * z * one_minus_cos,
         ],
     ]
+}
+fn guided_hold_jitter_score(
+    previous: &GuidedPoseMeasurement,
+    current: &GuidedPoseMeasurement,
+) -> f64 {
+    let depth_scale = previous.pose.xyz[2]
+        .abs()
+        .max(current.pose.xyz[2].abs())
+        .max(1.0);
+    let xyz_score = ((previous.pose.xyz[0] - current.pose.xyz[0]).abs()
+        / depth_scale
+        / GUIDED_HOLD_JITTER_XYZ_LIMIT)
+        .max(
+            (previous.pose.xyz[1] - current.pose.xyz[1]).abs()
+                / depth_scale
+                / GUIDED_HOLD_JITTER_XYZ_LIMIT,
+        )
+        .max(
+            (previous.pose.xyz[2] - current.pose.xyz[2]).abs()
+                / depth_scale
+                / GUIDED_HOLD_JITTER_Z_LIMIT,
+        );
+    let rpy_score = guided_pose_signed_rotation_error_components(
+        previous.pose.rpy_degrees,
+        current.pose.rpy_degrees,
+    )
+    .map(|components| {
+        components
+            .into_iter()
+            .map(|component| component.abs() / GUIDED_HOLD_JITTER_RPY_DEGREES)
+            .fold(0.0_f64, f64::max)
+    })
+    .unwrap_or(f64::INFINITY);
+    xyz_score.max(rpy_score)
 }
 
 fn rotate_guided_pose_point(rotation: [[f64; 3]; 3], point: [f64; 3]) -> [f64; 3] {
@@ -2298,7 +2427,8 @@ struct PendingCandidate {
 
 #[derive(Default)]
 struct AutoCaptureSession {
-    pending: Option<PendingCandidate>,
+    pending: VecDeque<PendingCandidate>,
+    completed: Vec<(AutoCandidateId, CandidateTerminal)>,
     last_observed: Option<StreamCaptureId>,
     last_observed_at_ns: u64,
     latest_detection: Option<IdentityBoundDetection>,
@@ -3233,8 +3363,8 @@ impl CalibrationWorkspace {
         if self
             .auto_capture
             .pending
-            .as_ref()
-            .is_some_and(|candidate| candidate.token.frame_identity() == &frame.identity)
+            .iter()
+            .any(|candidate| candidate.token.frame_identity() == &frame.identity)
         {
             self.status =
                 "This displayed stream frame is already an automatic candidate.".to_owned();
@@ -3332,11 +3462,7 @@ impl CalibrationWorkspace {
                         return;
                     } else {
                         guided_step_index = Some(runtime.current_step);
-                        if runtime.capture_requested {
-                            CandidateIntent::GuidedCapture
-                        } else {
-                            CandidateIntent::GuidedMeasure
-                        }
+                        CandidateIntent::GuidedMeasure
                     }
                 }
             }
@@ -3350,7 +3476,7 @@ impl CalibrationWorkspace {
             CandidateIntent::AutoCommit | CandidateIntent::GuidedCapture
         );
         if self.active_job.is_some()
-            || self.auto_capture.pending.is_some()
+            || self.auto_capture.pending.len() >= LIVE_AUTO_CANDIDATE_CAPACITY
             || (commits_dataset && self.session.items().len() >= MAX_DATASET_ITEMS)
         {
             return;
@@ -3358,6 +3484,11 @@ impl CalibrationWorkspace {
         let capture_id = StreamCaptureId::from(&frame.identity);
         let repeated_observation = self.auto_capture.last_observed.as_ref() == Some(&capture_id);
         if (repeated_observation && intent != CandidateIntent::GuidedCapture)
+            || self
+                .auto_capture
+                .pending
+                .iter()
+                .any(|candidate| candidate.token.frame_identity() == &frame.identity)
             || (commits_dataset
                 && self.session.items().iter().any(|item| {
                     item.input == CalibrationInputKey::StreamCapture(capture_id.clone())
@@ -3433,7 +3564,7 @@ impl CalibrationWorkspace {
                 return;
             }
         };
-        self.auto_capture.pending = Some(PendingCandidate {
+        self.auto_capture.pending.push_back(PendingCandidate {
             token,
             intent,
             source,
@@ -3487,9 +3618,10 @@ impl CalibrationWorkspace {
                 || context.acquisition_key != acquisition_key
         });
         if context_changed {
-            if self.auto_capture.pending.is_some() {
-                self.cancel_auto_candidate(
+            if !self.auto_capture.pending.is_empty() {
+                self.cancel_auto_candidates_matching(
                     "Live detection candidate cancelled because source or image geometry changed.",
+                    |_| true,
                 );
             }
             if self.guided_capture.is_some() {
@@ -3564,9 +3696,10 @@ impl CalibrationWorkspace {
         let reconfigure =
             self.session.auto_capture_baseline() != Some(&baseline) || binding_changed;
         if reconfigure {
-            if self.auto_capture.pending.is_some() {
-                self.cancel_auto_candidate(
+            if !self.auto_capture.pending.is_empty() {
+                self.cancel_auto_candidates_matching(
                     "Live detection candidate cancelled because acceptance settings or K/D12 changed.",
+                    |_| true,
                 );
             }
             if let Err(error) = self
@@ -3602,15 +3735,16 @@ impl CalibrationWorkspace {
     }
 
     fn start_guided_capture(&mut self) {
-        if let Some(intent) = self
-            .auto_capture
-            .pending
-            .as_ref()
-            .map(|candidate| candidate.intent)
-        {
-            if intent == CandidateIntent::PreviewOnly {
-                self.cancel_auto_candidate(
+        if !self.auto_capture.pending.is_empty() {
+            if self
+                .auto_capture
+                .pending
+                .iter()
+                .all(|candidate| candidate.intent == CandidateIntent::PreviewOnly)
+            {
+                self.cancel_auto_candidates_matching(
                     "Live board preview cancelled because Guided Auto Capture started.",
+                    |_| true,
                 );
             } else {
                 self.status = "Wait for the current auto-capture candidate before starting Guided Auto Capture."
@@ -3653,7 +3787,7 @@ impl CalibrationWorkspace {
         self.auto_capture.last_observed = None;
         self.guided_capture = Some(runtime);
         self.status =
-            "Guided Auto Capture started with the Standard 25 preset pose plan.".to_owned();
+            "Guided Auto Capture started with the Standard guided preset pose plan.".to_owned();
     }
 
     fn pause_guided_capture(&mut self) {
@@ -3676,15 +3810,22 @@ impl CalibrationWorkspace {
             self.status = runtime.current_step_label();
         }
     }
-
     fn stop_guided_capture(&mut self, message: impl Into<String>) {
-        if self.auto_capture.pending.as_ref().is_some_and(|candidate| {
+        if self.auto_capture.pending.iter().any(|candidate| {
             matches!(
                 candidate.intent,
                 CandidateIntent::GuidedMeasure | CandidateIntent::GuidedCapture
             )
         }) {
-            self.cancel_auto_candidate("Guided Auto Capture candidate cancelled.");
+            self.cancel_auto_candidates_matching(
+                "Guided Auto Capture candidate cancelled.",
+                |candidate| {
+                    matches!(
+                        candidate.intent,
+                        CandidateIntent::GuidedMeasure | CandidateIntent::GuidedCapture
+                    )
+                },
+            );
         }
         self.guided_capture = None;
         if self.auto_capture_trigger_mode == AutoCaptureTriggerMode::GuidedPresetPose {
@@ -3732,11 +3873,12 @@ impl CalibrationWorkspace {
         let pending_matches = self
             .auto_capture
             .pending
-            .as_ref()
-            .is_some_and(|candidate| candidate.token.frame_identity().stream_id == *session_id);
+            .iter()
+            .any(|candidate| candidate.token.frame_identity().stream_id == *session_id);
         if pending_matches {
-            self.cancel_auto_candidate(
+            self.cancel_auto_candidates_matching(
                 "Live detection candidate cancelled because its stream disconnected.",
+                |candidate| candidate.token.frame_identity().stream_id == *session_id,
             );
             return;
         }
@@ -3751,33 +3893,41 @@ impl CalibrationWorkspace {
     }
 
     fn dispatch_auto_candidate(&mut self, context: &egui::Context) {
-        let Some(candidate) = self.auto_capture.pending.as_mut() else {
-            return;
-        };
-        if candidate.state != AutoCandidateState::Queued {
-            return;
-        }
-        let Some(encoded) = candidate.encoded.take() else {
-            return;
-        };
-        let candidate_id = candidate.token.id();
-        let job = LoadedDetectionJob::from_encoded(
-            candidate_id.get(),
-            EncodedDetectionRequest::Candidate(candidate.token.clone()),
-            encoded,
-            candidate.cancellation.clone(),
-            candidate.pose_request.clone(),
-        );
-        match self.detection_pipeline.try_submit_detection(job) {
-            Ok(()) => candidate.state = AutoCandidateState::Submitted,
-            Err(TrySendError::Full(job)) => candidate.encoded = Some(job.encoded),
-            Err(TrySendError::Disconnected(_)) => self.finalize_candidate(
-                Some(context),
-                candidate_id,
-                CandidateTerminal::Discard(
-                    "Calibration detection workers stopped unexpectedly.".to_owned(),
-                ),
-            ),
+        for index in 0..self.auto_capture.pending.len() {
+            let Some(candidate) = self.auto_capture.pending.get_mut(index) else {
+                break;
+            };
+            if candidate.state != AutoCandidateState::Queued {
+                continue;
+            }
+            let Some(encoded) = candidate.encoded.take() else {
+                continue;
+            };
+            let candidate_id = candidate.token.id();
+            let job = LoadedDetectionJob::from_encoded(
+                candidate_id.get(),
+                EncodedDetectionRequest::Candidate(candidate.token.clone()),
+                encoded,
+                candidate.cancellation.clone(),
+                candidate.pose_request.clone(),
+            );
+            match self.detection_pipeline.try_submit_detection(job) {
+                Ok(()) => candidate.state = AutoCandidateState::Submitted,
+                Err(TrySendError::Full(job)) => {
+                    candidate.encoded = Some(job.encoded);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.complete_auto_candidate(
+                        Some(context),
+                        candidate_id,
+                        CandidateTerminal::Discard(
+                            "Calibration detection workers stopped unexpectedly.".to_owned(),
+                        ),
+                    );
+                    break;
+                }
+            }
         }
     }
 
@@ -4039,7 +4189,7 @@ impl CalibrationWorkspace {
                 Some(acquisition_key),
             )
             .map_err(|error| format!("X5 authoritative YUV candidate rejected: {error}"))?;
-        self.auto_capture.pending = Some(PendingCandidate {
+        self.auto_capture.pending.push_back(PendingCandidate {
             token,
             intent,
             source,
@@ -4052,19 +4202,123 @@ impl CalibrationWorkspace {
         Ok(candidate_id)
     }
 
-    fn finalize_candidate(
+    fn complete_auto_candidate(
         &mut self,
         context: Option<&egui::Context>,
         candidate_id: AutoCandidateId,
         terminal: CandidateTerminal,
     ) {
-        let Some(candidate) = self.auto_capture.pending.take() else {
-            return;
-        };
-        if candidate.token.id() != candidate_id {
-            self.auto_capture.pending = Some(candidate);
+        if !self
+            .auto_capture
+            .pending
+            .iter()
+            .any(|candidate| candidate.token.id() == candidate_id)
+        {
             return;
         }
+        self.auto_capture.completed.push((candidate_id, terminal));
+        self.finalize_completed_auto_candidates(context);
+    }
+
+    fn finalize_completed_auto_candidates(&mut self, context: Option<&egui::Context>) {
+        loop {
+            let Some(front_id) = self
+                .auto_capture
+                .pending
+                .front()
+                .map(|candidate| candidate.token.id())
+            else {
+                break;
+            };
+            let Some(done_index) = self
+                .auto_capture
+                .completed
+                .iter()
+                .position(|(candidate_id, _)| *candidate_id == front_id)
+            else {
+                break;
+            };
+            let (_, terminal) = self.auto_capture.completed.remove(done_index);
+            let candidate = self
+                .auto_capture
+                .pending
+                .pop_front()
+                .expect("front candidate was checked");
+            self.finalize_candidate_entry(context, candidate, terminal);
+        }
+    }
+
+    fn cancel_auto_candidates_matching(
+        &mut self,
+        message: impl Into<String>,
+        mut predicate: impl FnMut(&PendingCandidate) -> bool,
+    ) {
+        let message = message.into();
+        let mut cancelled = false;
+        self.auto_capture.pending.retain(|candidate| {
+            if predicate(candidate) {
+                candidate.cancellation.cancel();
+                cancelled = true;
+                false
+            } else {
+                true
+            }
+        });
+        self.auto_capture.completed.retain(|(candidate_id, _)| {
+            self.auto_capture
+                .pending
+                .iter()
+                .any(|candidate| candidate.token.id() == *candidate_id)
+        });
+        if cancelled {
+            self.status = message;
+        }
+    }
+
+    fn enqueue_guided_capture_sample(&mut self, sample: GuidedHoldSample) {
+        if self.auto_capture.pending.len() >= LIVE_AUTO_CANDIDATE_CAPACITY
+            || self
+                .auto_capture
+                .pending
+                .iter()
+                .any(|candidate| candidate.token.id() == sample.token.id())
+        {
+            return;
+        }
+        let encoded = match sample.source.encoded_png(sample.token.source_revision()) {
+            Ok(Some(encoded)) => encoded,
+            Ok(None) => {
+                self.status = "Guided capture sample is not stream-backed.".to_owned();
+                return;
+            }
+            Err(error) => {
+                self.status = format!("Guided capture sample is unavailable: {error}");
+                return;
+            }
+        };
+        let step = sample.guided_step_index;
+        self.auto_capture.pending.push_back(PendingCandidate {
+            token: sample.token,
+            intent: CandidateIntent::GuidedCapture,
+            source: sample.source,
+            encoded: Some(encoded),
+            cancellation: CalibrationCancellation::default(),
+            pose_request: sample.pose_request,
+            guided_step_index: step,
+            state: AutoCandidateState::Queued,
+        });
+        self.status = format!(
+            "Guided hold stable; queued best frame for step {} capture.",
+            step.map_or(0, |step| step + 1)
+        );
+    }
+
+    fn finalize_candidate_entry(
+        &mut self,
+        context: Option<&egui::Context>,
+        candidate: PendingCandidate,
+        terminal: CandidateTerminal,
+    ) {
         let PendingCandidate {
             token,
             intent,
@@ -4264,30 +4518,36 @@ impl CalibrationWorkspace {
                         let matched = assessment.matched;
                         let score = assessment.pose_error_score;
                         let reason = assessment.reason.clone();
+                        let hold_sample = GuidedHoldSample {
+                            token: token.clone(),
+                            source: source.clone(),
+                            pose_request: pose_request.clone(),
+                            guided_step_index,
+                            stability_score: score,
+                        };
+                        let mut capture_sample = None;
+                        let mut hold_frames = 0;
                         if let Some(runtime) = self.guided_capture.as_mut() {
-                            runtime.update_hold(assessment);
-                            if matched && runtime.capture_requested {
-                                self.status = format!(
-                                    "Guided pose matched for step {} (error {:.2}); capturing.",
-                                    expected_step + 1,
-                                    score
-                                );
-                            } else if matched {
-                                self.status = format!(
-                                    "Guided pose matched for step {} (error {:.2}); hold {}/{}.",
-                                    expected_step + 1,
-                                    score,
-                                    runtime.hold_frames,
-                                    GUIDED_CAPTURE_HOLD_FRAMES
-                                );
-                            } else {
-                                self.status = format!(
-                                    "Guided pose waiting for step {}: {}.",
-                                    expected_step + 1,
-                                    reason
-                                        .unwrap_or_else(|| "pose error above threshold".to_owned())
-                                );
-                            }
+                            let update = runtime.update_hold(assessment, Some(hold_sample));
+                            capture_sample = update.capture_sample;
+                            hold_frames = runtime.hold_frames;
+                        }
+                        if let Some(sample) = capture_sample {
+                            self.enqueue_guided_capture_sample(sample);
+                        } else if matched {
+                            self.status = format!(
+                                "Guided pose matched for step {} (error {:.2}); hold {}/{}.",
+                                expected_step + 1,
+                                score,
+                                hold_frames,
+                                GUIDED_CAPTURE_HOLD_FRAMES
+                            );
+                        } else {
+                            self.status = format!(
+                                "Guided pose waiting for step {}: {}.",
+                                expected_step + 1,
+                                reason.unwrap_or_else(|| "pose error above threshold".to_owned())
+                            );
                         }
                     }
                     CandidateIntent::GuidedCapture => {
@@ -4516,17 +4776,7 @@ impl CalibrationWorkspace {
     }
 
     fn cancel_auto_candidate(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        if let Some(candidate_id) = self
-            .auto_capture
-            .pending
-            .as_ref()
-            .map(|candidate| candidate.token.id())
-        {
-            self.finalize_candidate(None, candidate_id, CandidateTerminal::Discard(message));
-        } else {
-            self.status = message;
-        }
+        self.cancel_auto_candidates_matching(message, |_| true);
     }
 
     fn remember_stream_detection(
@@ -4959,7 +5209,7 @@ impl CalibrationWorkspace {
     pub(crate) fn render_status(&self, ui: &mut egui::Ui) {
         ui.set_min_height(22.0);
         ui.horizontal(|ui| {
-            if self.active_job.is_some() || self.auto_capture.pending.is_some() {
+            if self.active_job.is_some() || !self.auto_capture.pending.is_empty() {
                 ui.spinner();
                 ui.separator();
             }
@@ -5308,8 +5558,8 @@ impl CalibrationWorkspace {
                     let pending_blocks_guided_start = self
                         .auto_capture
                         .pending
-                        .as_ref()
-                        .is_some_and(|candidate| candidate.intent != CandidateIntent::PreviewOnly);
+                        .iter()
+                        .any(|candidate| candidate.intent != CandidateIntent::PreviewOnly);
                     let start_enabled = idle
                         && self.active_live_admission()
                         && !pending_blocks_guided_start
@@ -5477,7 +5727,7 @@ impl CalibrationWorkspace {
             }
             if ui
                 .add_enabled(
-                    idle && self.auto_capture.pending.is_none() && current_result_available,
+                    idle && self.auto_capture.pending.is_empty() && current_result_available,
                     egui::Button::new("Use result as initial K+D12"),
                 )
                 .on_disabled_hover_text(if latest_result_stale {
@@ -6183,9 +6433,10 @@ impl CalibrationWorkspace {
             return false;
         }
         if previous != board {
-            if self.auto_capture.pending.is_some() {
-                self.cancel_auto_candidate(
+            if !self.auto_capture.pending.is_empty() {
+                self.cancel_auto_candidates_matching(
                     "Live detection candidate cancelled because the board specification changed.",
+                    |_| true,
                 );
             }
             if self.guided_capture.is_some() {
@@ -6469,18 +6720,10 @@ impl CalibrationWorkspace {
                             "Calibration detection workers stopped unexpectedly.".to_owned(),
                         );
                     }
-                    if let Some(candidate_id) = self
-                        .auto_capture
-                        .pending
-                        .as_ref()
-                        .map(|candidate| candidate.token.id())
-                    {
-                        self.finalize_candidate(
-                            Some(context),
-                            candidate_id,
-                            CandidateTerminal::Discard(
-                                "Calibration detection workers stopped unexpectedly.".to_owned(),
-                            ),
+                    if !self.auto_capture.pending.is_empty() {
+                        self.cancel_auto_candidates_matching(
+                            "Calibration detection workers stopped unexpectedly.",
+                            |_| true,
                         );
                     }
                     break;
@@ -6511,7 +6754,6 @@ impl CalibrationWorkspace {
         self.finish_detection_batch_if_ready();
         self.dispatch_auto_candidate(context);
     }
-
     fn handle_read_event(&mut self, event: ReadStageEvent) {
         match event {
             ReadStageEvent::Started { batch_id, token } => {
@@ -6601,8 +6843,11 @@ impl CalibrationWorkspace {
                 request: EncodedDetectionRequest::Candidate(token),
                 ..
             } => {
-                if let Some(candidate) = self.auto_capture.pending.as_mut()
-                    && candidate.token == token
+                if let Some(candidate) = self
+                    .auto_capture
+                    .pending
+                    .iter_mut()
+                    .find(|candidate| candidate.token == token)
                 {
                     candidate.state = AutoCandidateState::Detecting;
                     self.status = match candidate.intent {
@@ -6634,7 +6879,7 @@ impl CalibrationWorkspace {
         } = result;
         let token = match request {
             EncodedDetectionRequest::Candidate(token) => {
-                self.finalize_candidate(
+                self.complete_auto_candidate(
                     Some(context),
                     token.id(),
                     CandidateTerminal::Detection(result),
@@ -7283,17 +7528,8 @@ impl Drop for CalibrationWorkspace {
                 cancellation.cancel();
             }
         }
-        if let Some(candidate_id) = self
-            .auto_capture
-            .pending
-            .as_ref()
-            .map(|candidate| candidate.token.id())
-        {
-            self.finalize_candidate(
-                None,
-                candidate_id,
-                CandidateTerminal::Discard("Calibration workspace closed.".to_owned()),
-            );
+        if !self.auto_capture.pending.is_empty() {
+            self.cancel_auto_candidates_matching("Calibration workspace closed.", |_| true);
         }
     }
 }
@@ -8605,6 +8841,147 @@ mod tests {
             target.pose.rotation[2][2],
         ]
     }
+    fn guided_hold_assessment(
+        xyz: [f64; 3],
+        rpy_degrees: [f64; 3],
+        score: f64,
+    ) -> GuidedPoseAssessment {
+        GuidedPoseAssessment {
+            step_index: 0,
+            target_label: "test",
+            measurement: GuidedPoseMeasurement {
+                pose: GuidedPose6Dof {
+                    xyz,
+                    rpy_degrees,
+                    rotation: guided_test_rpy_rotation(rpy_degrees),
+                    translation: xyz,
+                    center_uv: [0.5, 0.5],
+                },
+            },
+            error: GuidedPoseError {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                roll_degrees: 0.0,
+                pitch_degrees: 0.0,
+                yaw_degrees: 0.0,
+            },
+            signed_rotation_error_degrees: [0.0; 3],
+            pose_error_score: score,
+            matched: true,
+            reason: None,
+        }
+    }
+
+    fn guided_hold_runtime() -> GuidedCaptureRuntime {
+        let source = test_live_source();
+        let frame = live_frame(1);
+        let acquisition_key = source.acquisition_key_for_frame(&frame).unwrap();
+        GuidedCaptureRuntime::standard_25(GuidedCaptureBinding {
+            source,
+            acquisition_key,
+            image_size: guided_test_image_size(),
+            board: BoardSpec::new(11, 8, 40.0).unwrap(),
+            initial_intrinsics: guided_test_intrinsics(),
+            intrinsics_digest: SnapshotHash::digest_bytes(b"guided-hold-runtime-test"),
+        })
+        .unwrap()
+    }
+
+    fn guided_hold_sample(sequence: u64, stability_score: f64) -> GuidedHoldSample {
+        let session = CalibrationSession::new(BoardSpec::new(11, 8, 40.0).unwrap());
+        let source = test_live_source();
+        let frame = live_frame(sequence);
+        let store = auto_capture_store();
+        let acquisition_key = source.acquisition_key_for_frame(&frame).unwrap();
+        let FrozenStreamInput { source, encoded } =
+            freeze_stream_input(&frame, store, acquisition_key.clone(), None).unwrap();
+        let token = session
+            .bind_auto_candidate(
+                AutoCandidateId::new(sequence),
+                frame.identity.clone(),
+                encoded.source_revision.clone(),
+                source.display_name.clone(),
+                Some(acquisition_key),
+            )
+            .unwrap();
+        GuidedHoldSample {
+            token,
+            source,
+            pose_request: None,
+            guided_step_index: Some(0),
+            stability_score,
+        }
+    }
+
+    #[test]
+    fn guided_hold_rejects_jitter_between_matched_frames() {
+        let mut runtime = guided_hold_runtime();
+        let first = guided_hold_assessment([0.0, 0.0, 1000.0], [0.0; 3], 0.2);
+        let second = guided_hold_assessment([40.0, 0.0, 1000.0], [0.0; 3], 0.2);
+
+        let first_update = runtime.update_hold(first, None);
+        assert!(first_update.capture_sample.is_none());
+        assert_eq!(runtime.hold_frames, 1);
+
+        let second_update = runtime.update_hold(second, None);
+        assert!(second_update.capture_sample.is_none());
+        assert_eq!(runtime.hold_frames, 0);
+        let assessment = runtime.last_assessment.as_ref().unwrap();
+        assert!(!assessment.matched);
+        assert!(
+            assessment
+                .reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("hold jitter"))
+        );
+    }
+
+    #[test]
+    fn guided_hold_captures_lowest_stability_sample() {
+        let mut runtime = guided_hold_runtime();
+        let inputs = [(1, 0.8), (2, 0.2), (3, 0.6), (4, 0.7)];
+        let mut capture = None;
+        for (sequence, score) in inputs {
+            capture = runtime
+                .update_hold(
+                    guided_hold_assessment([0.0, 0.0, 1000.0], [0.0; 3], score),
+                    Some(guided_hold_sample(sequence, score)),
+                )
+                .capture_sample;
+        }
+
+        let capture = capture.expect("four stable hold frames should trigger capture");
+        assert_eq!(capture.token.id().get(), 2);
+        assert_eq!(runtime.hold_frames, GUIDED_CAPTURE_HOLD_FRAMES);
+        assert!(runtime.capture_requested);
+    }
+
+    #[test]
+    fn guided_hold_full_queues_capture_without_waiting_for_next_frame() {
+        let context = egui::Context::default();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let mut runtime = guided_hold_runtime();
+
+        for sequence in 1..=GUIDED_CAPTURE_HOLD_FRAMES {
+            let update = runtime.update_hold(
+                guided_hold_assessment([0.0, 0.0, 1000.0], [0.0; 3], 0.1),
+                Some(guided_hold_sample(u64::from(sequence), 0.1)),
+            );
+            if let Some(sample) = update.capture_sample {
+                workspace.enqueue_guided_capture_sample(sample);
+            }
+        }
+
+        let pending = workspace
+            .auto_capture
+            .pending
+            .front()
+            .expect("hold completion should queue a capture candidate immediately");
+        assert_eq!(pending.intent, CandidateIntent::GuidedCapture);
+        assert_eq!(pending.guided_step_index, Some(0));
+        assert!(pending.encoded.is_some());
+    }
 
     fn guided_test_rpy_rotation(rpy_degrees: [f64; 3]) -> [[f64; 3]; 3] {
         let [roll_degrees, pitch_degrees, yaw_degrees] = rpy_degrees;
@@ -8839,7 +9216,24 @@ mod tests {
         let board = BoardSpec::new(11, 8, 40.0).unwrap();
         let plan = standard_guided_pose_plan(board, &intrinsics, image_size).unwrap();
 
-        assert_eq!(plan.len(), 25);
+        assert_eq!(plan.len(), 33);
+
+        let target_labels = plan.iter().map(|target| target.label).collect::<Vec<_>>();
+        for required in [
+            "Right edge · low tilt",
+            "Top edge · low tilt",
+            "Left edge · low tilt",
+            "Bottom edge · low tilt",
+            "Upper right corner · low tilt",
+            "Upper left corner · low tilt",
+            "Lower left corner · low tilt",
+            "Lower right corner · low tilt",
+        ] {
+            assert!(
+                target_labels.contains(&required),
+                "missing guided target: {required}"
+            );
+        }
 
         let target_tilts = plan
             .iter()
@@ -8853,7 +9247,10 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 0.0).count(), 1);
-        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 12.0).count(), 8);
+        assert_eq!(
+            target_tilts.iter().filter(|tilt| **tilt == 12.0).count(),
+            16
+        );
         assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 20.0).count(), 8);
         assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 28.0).count(), 8);
 
@@ -10529,7 +10926,7 @@ mod tests {
             store.clone(),
             false,
         );
-        assert!(workspace.auto_capture.pending.is_none());
+        assert!(workspace.auto_capture.pending.is_empty());
         assert_eq!(store.stats().unwrap(), baseline);
 
         workspace.observe_live_frame(
@@ -10540,17 +10937,17 @@ mod tests {
         );
 
         assert_eq!(
-            workspace.auto_capture.pending.as_ref().unwrap().intent,
+            workspace.auto_capture.pending.front().unwrap().intent,
             CandidateIntent::PreviewOnly
         );
         let deadline = Instant::now() + Duration::from_secs(10);
-        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
             workspace.tick(&context);
             thread::sleep(Duration::from_millis(10));
         }
 
         assert!(
-            workspace.auto_capture.pending.is_none(),
+            workspace.auto_capture.pending.is_empty(),
             "preview worker did not finish: {}",
             workspace.status
         );
@@ -10602,13 +10999,13 @@ mod tests {
         );
 
         let deadline = Instant::now() + Duration::from_secs(10);
-        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
             workspace.tick(&context);
             thread::sleep(Duration::from_millis(10));
         }
 
         assert!(
-            workspace.auto_capture.pending.is_none(),
+            workspace.auto_capture.pending.is_empty(),
             "preview worker did not finish: {}",
             workspace.status
         );
@@ -10943,6 +11340,58 @@ mod tests {
             88
         );
     }
+    #[test]
+    fn live_preview_allows_multiple_candidates_in_flight() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let source = test_live_source();
+
+        workspace.observe_live_frame(live_frame(1), source.clone(), store.clone(), true);
+        workspace.auto_capture.last_observed_at_ns = 0;
+        workspace.auto_capture.last_observed = None;
+        workspace.observe_live_frame(live_frame(2), source, store, true);
+
+        assert_eq!(workspace.auto_capture.pending.len(), 2);
+        assert!(
+            workspace
+                .auto_capture
+                .pending
+                .iter()
+                .all(|candidate| candidate.intent == CandidateIntent::PreviewOnly)
+        );
+    }
+
+    #[test]
+    fn completed_auto_candidates_finalize_in_original_fifo_order() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        let source = test_live_source();
+
+        workspace.observe_live_frame(live_frame(1), source.clone(), store.clone(), true);
+        workspace.auto_capture.last_observed_at_ns = 0;
+        workspace.auto_capture.last_observed = None;
+        workspace.observe_live_frame(live_frame(2), source, store, true);
+        let first_id = workspace.auto_capture.pending[0].token.id();
+        let second_id = workspace.auto_capture.pending[1].token.id();
+
+        workspace.complete_auto_candidate(
+            None,
+            second_id,
+            CandidateTerminal::Discard("second complete".to_owned()),
+        );
+        assert_eq!(workspace.auto_capture.pending.len(), 2);
+        assert_ne!(workspace.status, "second complete");
+
+        workspace.complete_auto_candidate(
+            None,
+            first_id,
+            CandidateTerminal::Discard("first complete".to_owned()),
+        );
+        assert!(workspace.auto_capture.pending.is_empty());
+        assert_eq!(workspace.status, "second complete");
+    }
 
     #[test]
     fn selected_dataset_item_switches_dataset_layer_without_blocking_latest_live_overlay() {
@@ -11036,13 +11485,13 @@ mod tests {
         );
 
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
             workspace.tick(&context);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         assert!(
-            workspace.auto_capture.pending.is_none(),
+            workspace.auto_capture.pending.is_empty(),
             "auto worker did not finish: {}",
             workspace.status
         );
@@ -11105,13 +11554,13 @@ mod tests {
         );
 
         let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
             workspace.tick(&context);
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
 
         assert!(
-            workspace.auto_capture.pending.is_none(),
+            workspace.auto_capture.pending.is_empty(),
             "auto worker did not finish: {}",
             workspace.status
         );
@@ -11140,7 +11589,7 @@ mod tests {
             workspace
                 .auto_capture
                 .pending
-                .as_ref()
+                .front()
                 .map(|candidate| candidate.intent),
             Some(CandidateIntent::AutoCommit)
         );
@@ -11193,7 +11642,7 @@ mod tests {
         let pending = workspace
             .auto_capture
             .pending
-            .as_ref()
+            .front()
             .expect("guided mode should queue a measurement candidate");
         assert_eq!(pending.intent, CandidateIntent::GuidedMeasure);
         assert_eq!(pending.guided_step_index, Some(0));
@@ -11214,16 +11663,16 @@ mod tests {
             workspace
                 .auto_capture
                 .pending
-                .as_ref()
+                .front()
                 .map(|pending| pending.intent),
             Some(CandidateIntent::PreviewOnly)
         );
         let deadline = Instant::now() + Duration::from_secs(10);
-        while workspace.auto_capture.pending.is_some() && Instant::now() < deadline {
+        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
             workspace.tick(&context);
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(workspace.auto_capture.pending.is_none());
+        assert!(workspace.auto_capture.pending.is_empty());
 
         workspace.auto_capture_trigger_mode = AutoCaptureTriggerMode::GuidedPresetPose;
         workspace.start_guided_capture();
