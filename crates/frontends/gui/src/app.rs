@@ -1305,13 +1305,15 @@ fn x5_233_ring_retention_cell(valid: u16, retention_ns: u64) -> String {
 
 const X5_233_FORM_STACK_THRESHOLD: f32 = 260.0;
 const X5_233_FORM_LABEL_WIDTH: f32 = 108.0;
+const X5_233_SIDEBAR_MAX_WIDTH: f32 = 360.0;
 
 fn x5_233_available_width(ui: &egui::Ui) -> f32 {
     let width = ui.available_width();
     if width.is_finite() {
-        width.max(1.0)
+        // X5 驱动区应保持左侧栏形态；内部控件只在侧栏宽度内对齐，不反向撑大主界面。
+        width.clamp(1.0, X5_233_SIDEBAR_MAX_WIDTH)
     } else {
-        360.0
+        X5_233_SIDEBAR_MAX_WIDTH
     }
 }
 
@@ -1970,10 +1972,14 @@ impl eframe::App for CameraToolboxApp {
             .explorer_panel_expanded
         {
             let mut collapse = false;
-            let actions = egui::Panel::left("workspace_explorer_panel")
+            let mut explorer_panel = egui::Panel::left("workspace_explorer_panel")
                 .resizable(true)
                 .default_size(280.0)
-                .min_size(220.0)
+                .min_size(220.0);
+            if self.explorer.is_x5_233_driver_mode() {
+                explorer_panel = explorer_panel.max_size(X5_233_SIDEBAR_MAX_WIDTH);
+            }
+            let actions = explorer_panel
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         ui.heading("Workspace");
