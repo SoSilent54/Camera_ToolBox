@@ -2365,17 +2365,6 @@ impl eframe::App for CameraToolboxApp {
     }
 }
 
-#[cfg(feature = "calibration-opencv")]
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GuidedPoseRotationHemisphereGeometry {
-    center: egui::Pos2,
-    roll_axis_x: egui::Vec2,
-    roll_axis_y: egui::Vec2,
-    pitch_axis: egui::Vec2,
-    yaw_axis: egui::Vec2,
-    dome_axis: egui::Vec2,
-}
-
 impl CameraToolboxApp {
     fn is_calibration_workspace(&self) -> bool {
         #[cfg(feature = "calibration-opencv")]
@@ -7716,28 +7705,6 @@ impl CameraToolboxApp {
     const GUIDED_POSE_ARROW_MAX_DEPTH_SCALE: f32 = 2.25;
 
     #[cfg(feature = "calibration-opencv")]
-    const GUIDED_POSE_RING_SMALL_ERROR_GAIN: f32 = 3.0;
-    #[cfg(feature = "calibration-opencv")]
-    const GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES: f32 = 8.0;
-
-    #[cfg(feature = "calibration-opencv")]
-    fn guided_pose_rotation_ring_visual_sweep_degrees(error_degrees: f64) -> Option<f32> {
-        if !error_degrees.is_finite()
-            || error_degrees < f64::from(f32::MIN)
-            || error_degrees > f64::from(f32::MAX)
-        {
-            return None;
-        }
-        let signed_error = error_degrees as f32;
-        let error_abs = signed_error.abs();
-        if error_abs <= f32::EPSILON {
-            return Some(0.0);
-        }
-        let emphasis = Self::GUIDED_POSE_RING_SMALL_ERROR_GAIN
-            * (-error_abs / Self::GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES).exp();
-        Some(signed_error.signum() * error_abs.min(180.0) * (1.0 + emphasis))
-    }
-    #[cfg(feature = "calibration-opencv")]
     /// 将相机坐标系 Z 深度转换为屏幕绘制尺度：Z 越小越近，箭头端面越大。
     fn guided_pose_arrow_depth_scales(start_depth: f64, end_depth: f64) -> Option<(f32, f32)> {
         if !start_depth.is_finite()
@@ -7916,65 +7883,34 @@ impl CameraToolboxApp {
         horizontal_flip: bool,
         matched: bool,
     ) {
-        let Some(center) =
-            Self::live_overlay_normalized_uv(rings.center_uv, image_rect, horizontal_flip)
-        else {
-            return;
-        };
-        let outline_points = rings.outline_uv.map(|uv| {
-            Self::live_overlay_normalized_uv(uv, image_rect, horizontal_flip).unwrap_or(center)
-        });
-        let normal_tip =
-            Self::live_overlay_normalized_uv(rings.normal_uv, image_rect, horizontal_flip)
-                .unwrap_or(center + egui::vec2(0.0, -1.0));
-        let Some(geometry) =
-            Self::guided_pose_rotation_hemisphere_geometry(center, outline_points, normal_tip)
-        else {
-            return;
-        };
         let base_alpha = if matched { 150 } else { 128 };
         let dominant_score = Self::guided_pose_rotation_ring_score(&rings.roll)
             .max(Self::guided_pose_rotation_ring_score(&rings.pitch))
             .max(Self::guided_pose_rotation_ring_score(&rings.yaw));
 
-        // roll 贴在当前检测棋盘格平面；pitch/yaw 只画棋盘格平面上方的两个半圆。
-        Self::paint_live_guided_rotation_basis_ring(
+        // 圆环点已经按当前检测板面的 3D 几何和相机模型投影；这里只做屏幕坐标映射和绘制。
+        Self::paint_live_guided_projected_rotation_ring(
             painter,
-            geometry.center,
-            geometry.roll_axis_x,
-            geometry.roll_axis_y,
-            0.0,
-            std::f32::consts::TAU,
-            -90.0_f32.to_radians(),
-            std::f32::consts::PI,
+            image_rect,
+            horizontal_flip,
             &rings.roll,
             egui::Color32::from_rgb(255, 48, 86),
             base_alpha,
             dominant_score,
         );
-        Self::paint_live_guided_rotation_basis_ring(
+        Self::paint_live_guided_projected_rotation_ring(
             painter,
-            geometry.center,
-            geometry.pitch_axis,
-            geometry.dome_axis,
-            0.0,
-            std::f32::consts::PI,
-            90.0_f32.to_radians(),
-            90.0_f32.to_radians(),
+            image_rect,
+            horizontal_flip,
             &rings.pitch,
             egui::Color32::from_rgb(70, 255, 132),
             base_alpha,
             dominant_score,
         );
-        Self::paint_live_guided_rotation_basis_ring(
+        Self::paint_live_guided_projected_rotation_ring(
             painter,
-            geometry.center,
-            geometry.yaw_axis,
-            geometry.dome_axis,
-            0.0,
-            std::f32::consts::PI,
-            90.0_f32.to_radians(),
-            90.0_f32.to_radians(),
+            image_rect,
+            horizontal_flip,
             &rings.yaw,
             egui::Color32::from_rgb(64, 210, 255),
             base_alpha,
@@ -7994,56 +7930,10 @@ impl CameraToolboxApp {
     }
 
     #[cfg(feature = "calibration-opencv")]
-    fn guided_pose_rotation_hemisphere_geometry(
-        center: egui::Pos2,
-        outline_points: [egui::Pos2; 4],
-        normal_tip: egui::Pos2,
-    ) -> Option<GuidedPoseRotationHemisphereGeometry> {
-        let top = outline_points[1] - outline_points[0];
-        let bottom = outline_points[2] - outline_points[3];
-        let right = outline_points[2] - outline_points[1];
-        let left = outline_points[3] - outline_points[0];
-        let board_x = Self::guided_pose_rotation_unit_vector((top + bottom) * 0.5)?;
-        let board_y = Self::guided_pose_rotation_unit_vector((left + right) * 0.5)?;
-        let width = (top.length() + bottom.length()) * 0.5;
-        let height = (left.length() + right.length()) * 0.5;
-        if !width.is_finite() || !height.is_finite() || width <= 1.0 || height <= 1.0 {
-            return None;
-        }
-        let roll_x = (width * 0.34).clamp(34.0, 124.0);
-        let roll_y = (height * 0.34).clamp(24.0, 104.0);
-        let dome_height = roll_x.max(roll_y).mul_add(1.12, 0.0).clamp(42.0, 138.0);
-        let fallback_up = Self::guided_pose_rotation_unit_vector(-board_y)
-            .unwrap_or_else(|| egui::vec2(0.0, -1.0));
-        let normal_direction = Self::guided_pose_rotation_unit_vector(normal_tip - center)
-            .filter(|direction| direction.dot(fallback_up) >= -0.15)
-            .unwrap_or(fallback_up);
-        Some(GuidedPoseRotationHemisphereGeometry {
-            center,
-            roll_axis_x: board_x * roll_x,
-            roll_axis_y: board_y * roll_y,
-            pitch_axis: board_y * roll_y.max(34.0),
-            yaw_axis: board_x * roll_x.max(34.0),
-            dome_axis: normal_direction * dome_height,
-        })
-    }
-
-    #[cfg(feature = "calibration-opencv")]
-    fn guided_pose_rotation_unit_vector(vector: egui::Vec2) -> Option<egui::Vec2> {
-        let length = vector.length();
-        (length.is_finite() && length > 1.0e-6).then_some(vector / length)
-    }
-
-    #[cfg(feature = "calibration-opencv")]
-    fn paint_live_guided_rotation_basis_ring(
+    fn paint_live_guided_projected_rotation_ring(
         painter: &egui::Painter,
-        center: egui::Pos2,
-        axis_x: egui::Vec2,
-        axis_y: egui::Vec2,
-        base_start_angle: f32,
-        base_sweep: f32,
-        arc_start_angle: f32,
-        max_arc_sweep: f32,
+        image_rect: egui::Rect,
+        horizontal_flip: bool,
         arc: &ViewerGuidedPoseRotationArcOverlay,
         color: egui::Color32,
         base_alpha: u8,
@@ -8052,139 +7942,87 @@ impl CameraToolboxApp {
         let shadow_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
         let full_color =
             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), base_alpha);
-        let base_points = Self::guided_pose_rotation_basis_points(
-            center,
-            axis_x,
-            axis_y,
-            base_start_angle,
-            base_sweep,
-            96,
-        );
-        painter.add(egui::Shape::line(
-            base_points.clone(),
-            egui::Stroke::new(5.8, shadow_color),
-        ));
-        painter.add(egui::Shape::line(
-            base_points,
-            egui::Stroke::new(3.6, full_color),
-        ));
-        let target_tick =
-            Self::guided_pose_rotation_basis_point(center, axis_x, axis_y, arc_start_angle);
-        let tick_vector = target_tick - center;
-        let tick_outer = center + tick_vector * 1.11;
-        let tick_inner = center + tick_vector * 0.91;
-        painter.line_segment(
-            [tick_inner, tick_outer],
-            egui::Stroke::new(5.2, shadow_color),
-        );
-        painter.line_segment([tick_inner, tick_outer], egui::Stroke::new(3.6, color));
-        let Some(sweep_degrees) =
-            Self::guided_pose_rotation_ring_visual_sweep_degrees(arc.error_degrees)
-        else {
-            return;
-        };
-        let sweep = sweep_degrees
-            .to_radians()
-            .clamp(-max_arc_sweep.abs(), max_arc_sweep.abs());
-        if sweep.abs() > 0.5_f32.to_radians() {
-            let score = Self::guided_pose_rotation_ring_score(arc);
-            let is_dominant = score + 1.0e-6 >= dominant_score && dominant_score > 0.0;
+        let base_points =
+            Self::guided_pose_rotation_projected_points(&arc.base_uv, image_rect, horizontal_flip);
+        if base_points.len() >= 2 {
+            painter.add(egui::Shape::line(
+                base_points.clone(),
+                egui::Stroke::new(5.8, shadow_color),
+            ));
+            painter.add(egui::Shape::line(
+                base_points.clone(),
+                egui::Stroke::new(3.6, full_color),
+            ));
+        }
+        if let Some(target_tick) =
+            Self::live_overlay_normalized_uv(arc.tick_uv, image_rect, horizontal_flip)
+        {
+            painter.circle_filled(target_tick, 4.2, shadow_color);
+            painter.circle_filled(target_tick, 2.6, color);
+        }
+        let arc_points =
+            Self::guided_pose_rotation_projected_points(&arc.arc_uv, image_rect, horizontal_flip);
+        let score = Self::guided_pose_rotation_ring_score(arc);
+        let is_dominant = score + 1.0e-6 >= dominant_score && dominant_score > 0.0;
+        if arc_points.len() >= 2 {
             let glow_alpha = if is_dominant { 126 } else { 84 };
             let arc_alpha = if is_dominant { 255 } else { 232 };
             let glow_color =
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), glow_alpha);
             let arc_color =
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), arc_alpha);
-            let arc_points = Self::guided_pose_rotation_basis_points(
-                center,
-                axis_x,
-                axis_y,
-                arc_start_angle,
-                sweep,
-                36,
-            );
             painter.add(egui::Shape::line(
                 arc_points.clone(),
                 egui::Stroke::new(if is_dominant { 14.0 } else { 10.0 }, glow_color),
             ));
             painter.add(egui::Shape::line(
-                arc_points,
+                arc_points.clone(),
                 egui::Stroke::new(if is_dominant { 8.0 } else { 6.6 }, arc_color),
             ));
-            let end_angle = arc_start_angle + sweep;
-            let (tip, tangent) = Self::guided_pose_rotation_basis_tip(
-                center,
-                axis_x,
-                axis_y,
-                end_angle,
-                sweep.signum(),
+            let tip = arc_points[arc_points.len() - 1];
+            let previous = arc_points[arc_points.len() - 2];
+            Self::paint_live_guided_rotation_arrowhead(
+                painter,
+                tip,
+                tip - previous,
+                arc_color,
+                9.0,
             );
-            Self::paint_live_guided_rotation_arrowhead(painter, tip, tangent, arc_color, 9.0);
         }
         let label_anchor =
-            Self::guided_pose_rotation_basis_point(center, axis_x, axis_y, arc_start_angle + sweep);
-        let label_text = format!("{} {:.1}°", arc.label, arc.error_degrees.abs());
-        let label_pos = label_anchor + egui::vec2(6.0, -6.0);
-        painter.text(
-            label_pos + egui::vec2(1.0, 1.0),
-            egui::Align2::LEFT_BOTTOM,
-            &label_text,
-            egui::FontId::monospace(11.0),
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
-        );
-        painter.text(
-            label_pos,
-            egui::Align2::LEFT_BOTTOM,
-            label_text,
-            egui::FontId::monospace(11.0),
-            color,
-        );
+            Self::live_overlay_normalized_uv(arc.label_uv, image_rect, horizontal_flip)
+                .or_else(|| arc_points.last().copied())
+                .or_else(|| base_points.first().copied());
+        if let Some(label_anchor) = label_anchor {
+            let label_text = format!("{} {:.1}°", arc.label, arc.error_degrees.abs());
+            let label_pos = label_anchor + egui::vec2(6.0, -6.0);
+            painter.text(
+                label_pos + egui::vec2(1.0, 1.0),
+                egui::Align2::LEFT_BOTTOM,
+                &label_text,
+                egui::FontId::monospace(11.0),
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 220),
+            );
+            painter.text(
+                label_pos,
+                egui::Align2::LEFT_BOTTOM,
+                label_text,
+                egui::FontId::monospace(11.0),
+                color,
+            );
+        }
     }
 
     #[cfg(feature = "calibration-opencv")]
-    fn guided_pose_rotation_basis_points(
-        center: egui::Pos2,
-        axis_x: egui::Vec2,
-        axis_y: egui::Vec2,
-        start_angle: f32,
-        sweep: f32,
-        segments: usize,
+    fn guided_pose_rotation_projected_points(
+        points_uv: &[[f32; 2]],
+        image_rect: egui::Rect,
+        horizontal_flip: bool,
     ) -> Vec<egui::Pos2> {
-        let steps = segments.max(1);
-        (0..=steps)
-            .map(|index| {
-                let t = index as f32 / steps as f32;
-                Self::guided_pose_rotation_basis_point(
-                    center,
-                    axis_x,
-                    axis_y,
-                    start_angle + sweep * t,
-                )
-            })
+        points_uv
+            .iter()
+            .filter_map(|uv| Self::live_overlay_normalized_uv(*uv, image_rect, horizontal_flip))
             .collect()
-    }
-
-    #[cfg(feature = "calibration-opencv")]
-    fn guided_pose_rotation_basis_point(
-        center: egui::Pos2,
-        axis_x: egui::Vec2,
-        axis_y: egui::Vec2,
-        angle: f32,
-    ) -> egui::Pos2 {
-        center + axis_x * angle.cos() + axis_y * angle.sin()
-    }
-
-    #[cfg(feature = "calibration-opencv")]
-    fn guided_pose_rotation_basis_tip(
-        center: egui::Pos2,
-        axis_x: egui::Vec2,
-        axis_y: egui::Vec2,
-        angle: f32,
-        direction_sign: f32,
-    ) -> (egui::Pos2, egui::Vec2) {
-        let point = Self::guided_pose_rotation_basis_point(center, axis_x, axis_y, angle);
-        let tangent = (axis_x * -angle.sin() + axis_y * angle.cos()) * direction_sign.signum();
-        (point, tangent)
     }
 
     #[cfg(feature = "calibration-opencv")]

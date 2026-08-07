@@ -985,18 +985,20 @@ pub(crate) struct ViewerGuidedPoseGridLine {
     pub(crate) end_uv: [f32; 2],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ViewerGuidedPoseRotationArcOverlay {
     pub(crate) label: &'static str,
     pub(crate) error_degrees: f64,
     pub(crate) tolerance_degrees: f64,
+    pub(crate) base_uv: Arc<[[f32; 2]]>,
+    pub(crate) arc_uv: Arc<[[f32; 2]]>,
+    pub(crate) tick_uv: [f32; 2],
+    pub(crate) label_uv: [f32; 2],
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ViewerGuidedPoseRotationRingsOverlay {
     pub(crate) center_uv: [f32; 2],
-    pub(crate) outline_uv: [[f32; 2]; 4],
-    pub(crate) normal_uv: [f32; 2],
     pub(crate) roll: ViewerGuidedPoseRotationArcOverlay,
     pub(crate) pitch: ViewerGuidedPoseRotationArcOverlay,
     pub(crate) yaw: ViewerGuidedPoseRotationArcOverlay,
@@ -1146,11 +1148,12 @@ struct GuidedPoseTarget {
     grid_lines: Arc<[ViewerGuidedPoseGridLine]>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct GuidedPoseMeasurement {
     pose: GuidedPose6Dof,
-    outline_uv: [[f32; 2]; 4],
-    normal_uv: [f32; 2],
+    board: BoardSpec,
+    initial_intrinsics: InitialIntrinsics,
+    image_size: CalibrationImageSize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1287,7 +1290,7 @@ impl GuidedCaptureRuntime {
                     .hold_frames
                     .saturating_add(1)
                     .min(GUIDED_CAPTURE_HOLD_FRAMES);
-                self.last_hold_measurement = Some(assessment.measurement);
+                self.last_hold_measurement = Some(assessment.measurement.clone());
                 if let Some(mut sample) = sample {
                     sample.stability_score = sample
                         .stability_score
@@ -1851,76 +1854,6 @@ fn guided_pose_project_board_uv(
     ])
 }
 
-fn guided_pose_project_normal_uv(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    translation: [f64; 3],
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<[f32; 2]> {
-    let center = guided_pose_inner_center_point(board);
-    let normal_length =
-        (f64::from(board.inner_cols.max(board.inner_rows)) * board.square_size * 0.45)
-            .max(board.square_size);
-    let normal_tip = [center[0], center[1], center[2] + normal_length];
-    let point = project_board_point_image(rotation, translation, normal_tip, initial_intrinsics)?;
-    Some([
-        point.x / image_size.width as f32,
-        point.y / image_size.height as f32,
-    ])
-}
-
-fn guided_pose_outline_uv(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    translation: [f64; 3],
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<[[f32; 2]; 4]> {
-    let left = -1.0;
-    let top = -1.0;
-    let right = f64::from(board.inner_cols);
-    let bottom = f64::from(board.inner_rows);
-    Some([
-        guided_pose_project_board_uv(
-            board,
-            rotation,
-            translation,
-            left,
-            top,
-            initial_intrinsics,
-            image_size,
-        )?,
-        guided_pose_project_board_uv(
-            board,
-            rotation,
-            translation,
-            right,
-            top,
-            initial_intrinsics,
-            image_size,
-        )?,
-        guided_pose_project_board_uv(
-            board,
-            rotation,
-            translation,
-            right,
-            bottom,
-            initial_intrinsics,
-            image_size,
-        )?,
-        guided_pose_project_board_uv(
-            board,
-            rotation,
-            translation,
-            left,
-            bottom,
-            initial_intrinsics,
-            image_size,
-        )?,
-    ])
-}
-
 fn guided_pose_6dof_from_rotation_translation(
     board: BoardSpec,
     rotation: [[f64; 3]; 3],
@@ -2206,26 +2139,11 @@ fn guided_pose_measurement(
         image_size,
     )
     .ok_or_else(|| "guided pose 6DoF projection is invalid".to_owned())?;
-    let outline_uv = guided_pose_outline_uv(
-        board,
-        rotation,
-        pnp_observation.translation_vector,
-        initial_intrinsics,
-        image_size,
-    )
-    .ok_or_else(|| "guided pose board outline projection is invalid".to_owned())?;
-    let normal_uv = guided_pose_project_normal_uv(
-        board,
-        rotation,
-        pnp_observation.translation_vector,
-        initial_intrinsics,
-        image_size,
-    )
-    .ok_or_else(|| "guided pose board normal projection is invalid".to_owned())?;
     let measurement = GuidedPoseMeasurement {
         pose,
-        outline_uv,
-        normal_uv,
+        board,
+        initial_intrinsics: initial_intrinsics.clone(),
+        image_size,
     };
     if measurement.pose.xyz[2] <= 0.0 {
         return Err("guided pose measurement contains non-positive depth".to_owned());
@@ -2429,30 +2347,213 @@ fn guided_pose_instruction_primary(
     }
 }
 
+const GUIDED_POSE_RING_SEGMENTS: usize = 96;
+const GUIDED_POSE_HALF_RING_SEGMENTS: usize = 48;
+const GUIDED_POSE_RING_SMALL_ERROR_GAIN: f32 = 3.0;
+const GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES: f32 = 8.0;
+
+#[derive(Clone, Copy, Debug)]
+enum GuidedPoseRotationRingPlane {
+    RollXy,
+    PitchYzNegativeZ,
+    YawXzNegativeZ,
+}
+
+fn guided_pose_rotation_ring_visual_sweep_degrees(error_degrees: f64) -> Option<f32> {
+    if !error_degrees.is_finite()
+        || error_degrees < f64::from(f32::MIN)
+        || error_degrees > f64::from(f32::MAX)
+    {
+        return None;
+    }
+    let signed_error = error_degrees as f32;
+    let error_abs = signed_error.abs();
+    if error_abs <= f32::EPSILON {
+        return Some(0.0);
+    }
+    let emphasis = GUIDED_POSE_RING_SMALL_ERROR_GAIN
+        * (-error_abs / GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES).exp();
+    Some(signed_error.signum() * error_abs.min(180.0) * (1.0 + emphasis))
+}
+
+fn guided_pose_rotation_ring_radius(board: BoardSpec) -> f64 {
+    let width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
+    let height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
+    width.min(height).max(board.square_size) * 0.34
+}
+
+fn guided_pose_rotation_ring_local_point(
+    center: [f64; 3],
+    radius: f64,
+    plane: GuidedPoseRotationRingPlane,
+    angle: f32,
+) -> [f64; 3] {
+    let cos = f64::from(angle.cos());
+    let sin = f64::from(angle.sin());
+    match plane {
+        GuidedPoseRotationRingPlane::RollXy => [
+            center[0] + radius * cos,
+            center[1] + radius * sin,
+            center[2],
+        ],
+        GuidedPoseRotationRingPlane::PitchYzNegativeZ => [
+            center[0],
+            center[1] + radius * cos,
+            center[2] - radius * sin,
+        ],
+        GuidedPoseRotationRingPlane::YawXzNegativeZ => [
+            center[0] + radius * cos,
+            center[1],
+            center[2] - radius * sin,
+        ],
+    }
+}
+
+fn guided_pose_project_local_uv(
+    measurement: &GuidedPoseMeasurement,
+    point: [f64; 3],
+) -> Option<[f32; 2]> {
+    let image = project_board_point_image(
+        measurement.pose.rotation,
+        measurement.pose.translation,
+        point,
+        &measurement.initial_intrinsics,
+    )?;
+    Some([
+        image.x / measurement.image_size.width as f32,
+        image.y / measurement.image_size.height as f32,
+    ])
+}
+
+fn guided_pose_project_rotation_ring_points(
+    measurement: &GuidedPoseMeasurement,
+    plane: GuidedPoseRotationRingPlane,
+    start_angle: f32,
+    sweep: f32,
+    segments: usize,
+) -> Arc<[[f32; 2]]> {
+    let center = guided_pose_inner_center_point(measurement.board);
+    let radius = guided_pose_rotation_ring_radius(measurement.board);
+    let steps = segments.max(1);
+    let mut points = Vec::with_capacity(steps + 1);
+    for index in 0..=steps {
+        let t = index as f32 / steps as f32;
+        let point =
+            guided_pose_rotation_ring_local_point(center, radius, plane, start_angle + sweep * t);
+        if let Some(uv) = guided_pose_project_local_uv(measurement, point) {
+            points.push(uv);
+        }
+    }
+    Arc::from(points)
+}
+
+fn guided_pose_project_rotation_ring_point(
+    measurement: &GuidedPoseMeasurement,
+    plane: GuidedPoseRotationRingPlane,
+    angle: f32,
+) -> [f32; 2] {
+    let center = guided_pose_inner_center_point(measurement.board);
+    let radius = guided_pose_rotation_ring_radius(measurement.board);
+    guided_pose_project_local_uv(
+        measurement,
+        guided_pose_rotation_ring_local_point(center, radius, plane, angle),
+    )
+    .unwrap_or(measurement.pose.center_uv)
+}
+
+fn guided_pose_rotation_arc_overlay(
+    measurement: &GuidedPoseMeasurement,
+    label: &'static str,
+    error_degrees: f64,
+    tolerance_degrees: f64,
+    plane: GuidedPoseRotationRingPlane,
+    base_start_angle: f32,
+    base_sweep: f32,
+    arc_start_angle: f32,
+    arc_sweep_limit: f32,
+) -> ViewerGuidedPoseRotationArcOverlay {
+    let base_segments = if base_sweep.abs() >= std::f32::consts::TAU - 1.0e-6 {
+        GUIDED_POSE_RING_SEGMENTS
+    } else {
+        GUIDED_POSE_HALF_RING_SEGMENTS
+    };
+    let visual_sweep = guided_pose_rotation_ring_visual_sweep_degrees(error_degrees)
+        .unwrap_or(0.0)
+        .to_radians()
+        .clamp(-arc_sweep_limit.abs(), arc_sweep_limit.abs());
+    let arc_uv = if visual_sweep.abs() > 0.5_f32.to_radians() {
+        guided_pose_project_rotation_ring_points(
+            measurement,
+            plane,
+            arc_start_angle,
+            visual_sweep,
+            GUIDED_POSE_HALF_RING_SEGMENTS,
+        )
+    } else {
+        Arc::from([])
+    };
+    ViewerGuidedPoseRotationArcOverlay {
+        label,
+        error_degrees,
+        tolerance_degrees,
+        base_uv: guided_pose_project_rotation_ring_points(
+            measurement,
+            plane,
+            base_start_angle,
+            base_sweep,
+            base_segments,
+        ),
+        arc_uv,
+        tick_uv: guided_pose_project_rotation_ring_point(measurement, plane, arc_start_angle),
+        label_uv: guided_pose_project_rotation_ring_point(
+            measurement,
+            plane,
+            arc_start_angle + visual_sweep,
+        ),
+    }
+}
+
 fn guided_pose_rotation_rings_overlay(
     assessment: &GuidedPoseAssessment,
     target: &GuidedPoseTarget,
 ) -> ViewerGuidedPoseRotationRingsOverlay {
     let [roll, pitch, yaw] = assessment.signed_rotation_error_degrees;
+    let measurement = &assessment.measurement;
     ViewerGuidedPoseRotationRingsOverlay {
-        center_uv: assessment.measurement.pose.center_uv,
-        outline_uv: assessment.measurement.outline_uv,
-        normal_uv: assessment.measurement.normal_uv,
-        roll: ViewerGuidedPoseRotationArcOverlay {
-            label: "ROLL",
-            error_degrees: roll,
-            tolerance_degrees: target.tolerance.roll_degrees,
-        },
-        pitch: ViewerGuidedPoseRotationArcOverlay {
-            label: "PITCH",
-            error_degrees: pitch,
-            tolerance_degrees: target.tolerance.pitch_degrees,
-        },
-        yaw: ViewerGuidedPoseRotationArcOverlay {
-            label: "YAW",
-            error_degrees: yaw,
-            tolerance_degrees: target.tolerance.yaw_degrees,
-        },
+        center_uv: measurement.pose.center_uv,
+        roll: guided_pose_rotation_arc_overlay(
+            measurement,
+            "ROLL",
+            roll,
+            target.tolerance.roll_degrees,
+            GuidedPoseRotationRingPlane::RollXy,
+            0.0,
+            std::f32::consts::TAU,
+            -90.0_f32.to_radians(),
+            std::f32::consts::PI,
+        ),
+        pitch: guided_pose_rotation_arc_overlay(
+            measurement,
+            "PITCH",
+            pitch,
+            target.tolerance.pitch_degrees,
+            GuidedPoseRotationRingPlane::PitchYzNegativeZ,
+            0.0,
+            std::f32::consts::PI,
+            90.0_f32.to_radians(),
+            90.0_f32.to_radians(),
+        ),
+        yaw: guided_pose_rotation_arc_overlay(
+            measurement,
+            "YAW",
+            yaw,
+            target.tolerance.yaw_degrees,
+            GuidedPoseRotationRingPlane::YawXzNegativeZ,
+            0.0,
+            std::f32::consts::PI,
+            90.0_f32.to_radians(),
+            90.0_f32.to_radians(),
+        ),
     }
 }
 
@@ -8953,8 +9054,9 @@ mod tests {
                     translation: xyz,
                     center_uv: [0.5, 0.5],
                 },
-                outline_uv: [[0.25, 0.25], [0.75, 0.25], [0.75, 0.75], [0.25, 0.75]],
-                normal_uv: [0.5, 0.35],
+                board: BoardSpec::new(11, 8, 40.0).unwrap(),
+                initial_intrinsics: guided_test_intrinsics(),
+                image_size: guided_test_image_size(),
             },
             error: GuidedPoseError {
                 x: 0.0,
@@ -9121,6 +9223,33 @@ mod tests {
     }
 
     #[test]
+    fn guided_pose_rotation_ring_sweep_emphasizes_small_errors_and_preserves_direction() {
+        let tiny = guided_pose_rotation_ring_visual_sweep_degrees(1.0)
+            .expect("finite angle produces a sweep");
+        assert!(tiny > 3.0 && tiny < 4.0, "tiny sweep {tiny}");
+
+        let positive = guided_pose_rotation_ring_visual_sweep_degrees(15.0)
+            .expect("finite angle produces a sweep");
+        assert!(
+            positive > 15.0 && positive < 23.0,
+            "positive sweep {positive}"
+        );
+
+        let negative = guided_pose_rotation_ring_visual_sweep_degrees(-5.0)
+            .expect("finite angle produces a sweep");
+        assert!(
+            negative < -5.0 && negative > -14.0,
+            "negative sweep {negative}"
+        );
+
+        let large = guided_pose_rotation_ring_visual_sweep_degrees(179.5)
+            .expect("finite angle produces a sweep");
+        assert!((large - 179.5).abs() <= 1.0e-3, "large sweep {large}");
+
+        assert!(guided_pose_rotation_ring_visual_sweep_degrees(f64::NAN).is_none());
+    }
+
+    #[test]
     fn guided_rotation_rings_report_signed_errors_from_current_pose() {
         let target = guided_test_target([0.50, 0.50], 0.50, 0.0, 0.0);
         let assessment = assess_guided_pose(
@@ -9137,9 +9266,37 @@ mod tests {
         let rings = guided_pose_rotation_rings_overlay(&assessment, &target);
 
         assert_eq!(rings.center_uv, assessment.measurement.pose.center_uv);
-        assert_eq!(rings.outline_uv, assessment.measurement.outline_uv);
-        assert_eq!(rings.normal_uv, assessment.measurement.normal_uv);
-        assert!(rings.normal_uv.iter().all(|value| value.is_finite()));
+        assert_eq!(rings.roll.base_uv.len(), GUIDED_POSE_RING_SEGMENTS + 1);
+        assert_eq!(
+            rings.pitch.base_uv.len(),
+            GUIDED_POSE_HALF_RING_SEGMENTS + 1
+        );
+        assert_eq!(rings.yaw.base_uv.len(), GUIDED_POSE_HALF_RING_SEGMENTS + 1);
+        assert_eq!(rings.pitch.tick_uv, rings.yaw.tick_uv);
+        assert!(
+            rings
+                .roll
+                .base_uv
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            rings
+                .pitch
+                .base_uv
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
+        assert!(
+            rings
+                .yaw
+                .base_uv
+                .iter()
+                .flatten()
+                .all(|value| value.is_finite())
+        );
         assert_eq!(rings.roll.label, "ROLL");
         assert_eq!(rings.pitch.label, "PITCH");
         assert_eq!(rings.yaw.label, "YAW");
@@ -9156,6 +9313,42 @@ mod tests {
                 + rings.yaw.error_degrees.abs()
                 > 1.0
         );
+    }
+
+    #[test]
+    fn guided_rotation_ring_local_planes_match_board_axes() {
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let center = guided_pose_inner_center_point(board);
+        let radius = guided_pose_rotation_ring_radius(board);
+
+        let roll_top = guided_pose_rotation_ring_local_point(
+            center,
+            radius,
+            GuidedPoseRotationRingPlane::RollXy,
+            -90.0_f32.to_radians(),
+        );
+        assert_eq!(roll_top[2], center[2]);
+        assert!(roll_top[1] < center[1]);
+
+        let pitch_dome = guided_pose_rotation_ring_local_point(
+            center,
+            radius,
+            GuidedPoseRotationRingPlane::PitchYzNegativeZ,
+            90.0_f32.to_radians(),
+        );
+        let yaw_dome = guided_pose_rotation_ring_local_point(
+            center,
+            radius,
+            GuidedPoseRotationRingPlane::YawXzNegativeZ,
+            90.0_f32.to_radians(),
+        );
+
+        assert!((pitch_dome[0] - center[0]).abs() < 1.0e-6);
+        assert!((pitch_dome[1] - center[1]).abs() < 1.0e-4);
+        assert!((yaw_dome[0] - center[0]).abs() < 1.0e-4);
+        assert!((yaw_dome[1] - center[1]).abs() < 1.0e-6);
+        assert!((pitch_dome[2] - (center[2] - radius)).abs() < 1.0e-4);
+        assert!((yaw_dome[2] - (center[2] - radius)).abs() < 1.0e-4);
     }
 
     #[test]
