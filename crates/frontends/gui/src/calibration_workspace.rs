@@ -1275,9 +1275,9 @@ fn standard_guided_pose_plan(
     initial_intrinsics: &InitialIntrinsics,
     image_size: CalibrationImageSize,
 ) -> Result<Vec<GuidedPoseTarget>, String> {
-    const FAR: f64 = 0.52;
-    const MID: f64 = 0.56;
-    const NEAR: f64 = 0.62;
+    const FAR: f64 = 0.56;
+    const MID: f64 = 0.64;
+    const NEAR: f64 = 0.72;
     const LOW_TILT: f64 = 12.0;
     const MID_TILT: f64 = 20.0;
     const HIGH_TILT: f64 = 28.0;
@@ -1311,56 +1311,98 @@ fn standard_guided_pose_plan(
     };
 
     push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
-    push("Right · low tilt", [0.56, 0.50], MID, LOW_TILT, 0.0)?;
-    push("Upper right · low tilt", [0.55, 0.45], MID, LOW_TILT, 45.0)?;
-    push("Top · low tilt", [0.50, 0.44], MID, LOW_TILT, 90.0)?;
-    push("Upper left · low tilt", [0.45, 0.45], MID, LOW_TILT, 135.0)?;
-    push("Left · low tilt", [0.44, 0.50], MID, LOW_TILT, 180.0)?;
-    push("Lower left · low tilt", [0.45, 0.55], MID, LOW_TILT, 225.0)?;
-    push("Bottom · low tilt", [0.50, 0.56], MID, LOW_TILT, 270.0)?;
-    push("Lower right · low tilt", [0.55, 0.55], MID, LOW_TILT, 315.0)?;
-    push("Right · mid tilt", [0.56, 0.50], NEAR, MID_TILT, 0.0)?;
-    push("Upper right · mid tilt", [0.55, 0.45], NEAR, MID_TILT, 45.0)?;
-    push("Top · mid tilt", [0.50, 0.44], NEAR, MID_TILT, 90.0)?;
-    push("Upper left · mid tilt", [0.45, 0.45], NEAR, MID_TILT, 135.0)?;
-    push("Left · mid tilt", [0.44, 0.50], NEAR, MID_TILT, 180.0)?;
-    push("Lower left · mid tilt", [0.45, 0.55], NEAR, MID_TILT, 225.0)?;
-    push("Bottom · mid tilt", [0.50, 0.56], NEAR, MID_TILT, 270.0)?;
+    push("Right · low tilt", [0.61, 0.50], MID, LOW_TILT, 0.0)?;
+    push(
+        "Upper right · low tilt",
+        [0.586, 0.414],
+        MID,
+        LOW_TILT,
+        45.0,
+    )?;
+    push("Top · low tilt", [0.50, 0.39], MID, LOW_TILT, 90.0)?;
+    push(
+        "Upper left · low tilt",
+        [0.414, 0.414],
+        MID,
+        LOW_TILT,
+        135.0,
+    )?;
+    push("Left · low tilt", [0.39, 0.50], MID, LOW_TILT, 180.0)?;
+    push(
+        "Lower left · low tilt",
+        [0.414, 0.586],
+        MID,
+        LOW_TILT,
+        225.0,
+    )?;
+    push("Bottom · low tilt", [0.50, 0.61], MID, LOW_TILT, 270.0)?;
+    push(
+        "Lower right · low tilt",
+        [0.586, 0.586],
+        MID,
+        LOW_TILT,
+        315.0,
+    )?;
+    push("Right · mid tilt", [0.60, 0.50], NEAR, MID_TILT, 0.0)?;
+    push(
+        "Upper right · mid tilt",
+        [0.578, 0.422],
+        NEAR,
+        MID_TILT,
+        45.0,
+    )?;
+    push("Top · mid tilt", [0.50, 0.40], NEAR, MID_TILT, 90.0)?;
+    push(
+        "Upper left · mid tilt",
+        [0.422, 0.422],
+        NEAR,
+        MID_TILT,
+        135.0,
+    )?;
+    push("Left · mid tilt", [0.40, 0.50], NEAR, MID_TILT, 180.0)?;
+    push(
+        "Lower left · mid tilt",
+        [0.422, 0.578],
+        NEAR,
+        MID_TILT,
+        225.0,
+    )?;
+    push("Bottom · mid tilt", [0.50, 0.60], NEAR, MID_TILT, 270.0)?;
     push(
         "Lower right · mid tilt",
-        [0.55, 0.55],
+        [0.578, 0.578],
         NEAR,
         MID_TILT,
         315.0,
     )?;
-    push("Right · high tilt", [0.54, 0.50], FAR, HIGH_TILT, 0.0)?;
+    push("Right · high tilt", [0.575, 0.50], FAR, HIGH_TILT, 0.0)?;
     push(
         "Upper right · high tilt",
-        [0.535, 0.465],
+        [0.559, 0.441],
         FAR,
         HIGH_TILT,
         45.0,
     )?;
-    push("Top · high tilt", [0.50, 0.46], FAR, HIGH_TILT, 90.0)?;
+    push("Top · high tilt", [0.50, 0.425], FAR, HIGH_TILT, 90.0)?;
     push(
         "Upper left · high tilt",
-        [0.465, 0.465],
+        [0.441, 0.441],
         FAR,
         HIGH_TILT,
         135.0,
     )?;
-    push("Left · high tilt", [0.46, 0.50], FAR, HIGH_TILT, 180.0)?;
+    push("Left · high tilt", [0.425, 0.50], FAR, HIGH_TILT, 180.0)?;
     push(
         "Lower left · high tilt",
-        [0.465, 0.535],
+        [0.441, 0.559],
         FAR,
         HIGH_TILT,
         225.0,
     )?;
-    push("Bottom · high tilt", [0.50, 0.54], FAR, HIGH_TILT, 270.0)?;
+    push("Bottom · high tilt", [0.50, 0.575], FAR, HIGH_TILT, 270.0)?;
     push(
         "Lower right · high tilt",
-        [0.535, 0.535],
+        [0.559, 0.559],
         FAR,
         HIGH_TILT,
         315.0,
@@ -1795,12 +1837,13 @@ fn guided_pose_signed_rotation_error_components(
     {
         return None;
     }
-    // 圆环固定在相机/视野坐标系下显示；误差也按该世界系 RPY 分量做劣弧 delta。
-    Some([
+    let raw_zyx = [
         signed_angle_distance_degrees(target_rpy_degrees[0], measurement_rpy_degrees[0]),
         signed_angle_distance_degrees(target_rpy_degrees[1], measurement_rpy_degrees[1]),
         signed_angle_distance_degrees(target_rpy_degrees[2], measurement_rpy_degrees[2]),
-    ])
+    ];
+    // 操作提示采用使用者视角：roll=视线/光轴，pitch=点头抬头横轴，yaw=重力/竖直轴。
+    Some([raw_zyx[2], raw_zyx[0], raw_zyx[1]])
 }
 
 fn guided_pose_rotation_error_score(components: [f64; 3], tolerance: GuidedPoseTolerance) -> f64 {
@@ -8638,7 +8681,7 @@ mod tests {
     }
 
     #[test]
-    fn guided_rotation_error_uses_world_rpy_shortest_current_to_target_delta() {
+    fn guided_rotation_error_uses_operator_roll_pitch_yaw_axes() {
         let measurement = guided_test_pose_from_rpy([20.0, -5.0, 179.0]);
         let target = guided_test_pose_from_rpy([5.0, 7.0, -179.0]);
 
@@ -8649,9 +8692,9 @@ mod tests {
         )
         .unwrap();
 
-        assert_degrees_near(error[0], -15.0);
-        assert_degrees_near(error[1], 12.0);
-        assert_degrees_near(error[2], 2.0);
+        assert_degrees_near(error[0], 2.0);
+        assert_degrees_near(error[1], -15.0);
+        assert_degrees_near(error[2], 12.0);
     }
 
     #[test]
@@ -8818,6 +8861,8 @@ mod tests {
         let mut maximum_depth = f64::NEG_INFINITY;
         let mut xyz_min = [f64::INFINITY; 3];
         let mut xyz_max = [f64::NEG_INFINITY; 3];
+        let mut outline_min = [f32::INFINITY; 2];
+        let mut outline_max = [f32::NEG_INFINITY; 2];
         for target in &plan {
             let depth = guided_test_target_depth(board, target, &intrinsics, image_size);
             minimum_depth = minimum_depth.min(depth);
@@ -8826,9 +8871,15 @@ mod tests {
                 xyz_min[axis] = xyz_min[axis].min(target.pose.xyz[axis]);
                 xyz_max[axis] = xyz_max[axis].max(target.pose.xyz[axis]);
             }
+            for uv in target.outline_uv {
+                outline_min[0] = outline_min[0].min(uv[0]);
+                outline_min[1] = outline_min[1].min(uv[1]);
+                outline_max[0] = outline_max[0].max(uv[0]);
+                outline_max[1] = outline_max[1].max(uv[1]);
+            }
             assert!(
-                (680.0..=950.0).contains(&depth),
-                "guided target '{}' depth must stay inside 680..950: {depth:.3}",
+                (590.0..=890.0).contains(&depth),
+                "guided target '{}' depth must stay inside 590..890: {depth:.3}",
                 target.label
             );
             assert!(
@@ -8843,8 +8894,15 @@ mod tests {
             );
         }
         assert!(
-            minimum_depth <= 710.0 && maximum_depth >= 920.0,
-            "guided depth distribution should cover the easy 680..950 band: {minimum_depth:.3}..{maximum_depth:.3}"
+            minimum_depth <= 620.0 && maximum_depth >= 860.0,
+            "guided depth distribution should cover the close 590..890 band: {minimum_depth:.3}..{maximum_depth:.3}"
+        );
+        assert!(
+            outline_min[0] <= 0.05
+                && outline_max[0] >= 0.95
+                && outline_min[1] <= 0.11
+                && outline_max[1] >= 0.89,
+            "guided field distribution should fill the frame: min={outline_min:?} max={outline_max:?}"
         );
         for axis in 0..3 {
             let range = xyz_max[axis] - xyz_min[axis];
@@ -8859,7 +8917,7 @@ mod tests {
                 .abs()
                 .max(f64::from(pair[0].pose.center_uv[1] - pair[1].pose.center_uv[1]).abs());
             assert!(
-                center_step <= 0.10,
+                center_step <= 0.12,
                 "guided center step too large: {center_step:.3}"
             );
             let translation_delta = pair[0]

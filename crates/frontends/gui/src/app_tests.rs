@@ -3088,18 +3088,28 @@ fn guided_pose_arrow_depth_scales_make_near_endpoint_larger() {
 
 #[cfg(feature = "calibration-opencv")]
 #[test]
-fn guided_pose_rotation_ring_sweep_uses_true_angle_degrees_and_preserves_direction() {
+fn guided_pose_rotation_ring_sweep_emphasizes_small_errors_and_preserves_direction() {
+    let tiny = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(1.0)
+        .expect("finite angle produces a sweep");
+    assert!(tiny > 3.0 && tiny < 4.0, "tiny sweep {tiny}");
+
     let positive = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(15.0)
         .expect("finite angle produces a sweep");
-    assert!((positive - 15.0).abs() <= f32::EPSILON);
+    assert!(
+        positive > 15.0 && positive < 23.0,
+        "positive sweep {positive}"
+    );
 
     let negative = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(-5.0)
         .expect("finite angle produces a sweep");
-    assert!((negative + 5.0).abs() <= f32::EPSILON);
+    assert!(
+        negative < -5.0 && negative > -14.0,
+        "negative sweep {negative}"
+    );
 
     let large = CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(179.5)
         .expect("finite angle produces a sweep");
-    assert!((large - 179.5).abs() <= f32::EPSILON);
+    assert!((large - 179.5).abs() <= 1.0e-3, "large sweep {large}");
 
     assert!(CameraToolboxApp::guided_pose_rotation_ring_visual_sweep_degrees(f64::NAN).is_none());
 }

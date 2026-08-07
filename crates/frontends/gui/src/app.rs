@@ -7661,6 +7661,11 @@ impl CameraToolboxApp {
     const GUIDED_POSE_RING_VIEW_ROTATION_RADIANS: f32 = 0.0;
 
     #[cfg(feature = "calibration-opencv")]
+    const GUIDED_POSE_RING_SMALL_ERROR_GAIN: f32 = 3.0;
+    #[cfg(feature = "calibration-opencv")]
+    const GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES: f32 = 8.0;
+
+    #[cfg(feature = "calibration-opencv")]
     fn guided_pose_rotation_ring_visual_sweep_degrees(error_degrees: f64) -> Option<f32> {
         if !error_degrees.is_finite()
             || error_degrees < f64::from(f32::MIN)
@@ -7668,7 +7673,14 @@ impl CameraToolboxApp {
         {
             return None;
         }
-        Some(error_degrees as f32)
+        let signed_error = error_degrees as f32;
+        let error_abs = signed_error.abs();
+        if error_abs <= f32::EPSILON {
+            return Some(0.0);
+        }
+        let emphasis = Self::GUIDED_POSE_RING_SMALL_ERROR_GAIN
+            * (-error_abs / Self::GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES).exp();
+        Some(signed_error.signum() * error_abs.min(180.0) * (1.0 + emphasis))
     }
     #[cfg(feature = "calibration-opencv")]
     /// 将相机坐标系 Z 深度转换为屏幕绘制尺度：Z 越小越近，箭头端面越大。
@@ -7866,7 +7878,7 @@ impl CameraToolboxApp {
             .max(Self::guided_pose_rotation_ring_score(&rings.pitch))
             .max(Self::guided_pose_rotation_ring_score(&rings.yaw));
 
-        // 三轴旋转圆环固定在相机/视野坐标系下：检测 pose 只驱动中心平移和尺度，不驱动圆环旋转。
+        // 使用者视角轴语义：roll 绕视线/光轴，pitch 绕图像横轴，yaw 绕重力/图像竖轴。
         Self::paint_live_guided_rotation_ring(
             painter,
             center,
@@ -7874,8 +7886,8 @@ impl CameraToolboxApp {
             radius * 0.92,
             rotation,
             -90.0_f32.to_radians(),
-            &rings.yaw,
-            egui::Color32::from_rgb(64, 210, 255),
+            &rings.roll,
+            egui::Color32::from_rgb(255, 48, 86),
             base_alpha,
             dominant_score,
         );
@@ -7886,8 +7898,8 @@ impl CameraToolboxApp {
             radius * 1.06,
             rotation,
             0.0,
-            &rings.roll,
-            egui::Color32::from_rgb(255, 48, 86),
+            &rings.pitch,
+            egui::Color32::from_rgb(70, 255, 132),
             base_alpha,
             dominant_score,
         );
@@ -7898,8 +7910,8 @@ impl CameraToolboxApp {
             radius * 0.34,
             rotation,
             180.0_f32.to_radians(),
-            &rings.pitch,
-            egui::Color32::from_rgb(70, 255, 132),
+            &rings.yaw,
+            egui::Color32::from_rgb(64, 210, 255),
             base_alpha,
             dominant_score,
         );
