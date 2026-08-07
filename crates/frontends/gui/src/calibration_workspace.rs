@@ -1344,15 +1344,17 @@ fn standard_guided_pose_plan(
     initial_intrinsics: &InitialIntrinsics,
     image_size: CalibrationImageSize,
 ) -> Result<Vec<GuidedPoseTarget>, String> {
-    const FAR: f64 = 0.56;
+    const FAR_TILTED: f64 = 0.56;
     const MID: f64 = 0.64;
     const NEAR: f64 = 0.72;
+    const FAR_TRANSLATED: f64 = 0.40;
+    const DISTANT_TRANSLATED: f64 = 0.36;
     const LOW_TILT: f64 = 12.0;
     const MID_TILT: f64 = 20.0;
     const HIGH_TILT: f64 = 28.0;
 
     let tolerance = GuidedPoseTolerance::default();
-    let mut plan = Vec::with_capacity(33);
+    let mut plan = Vec::with_capacity(45);
     let mut push = |label: &'static str,
                     center_uv: [f64; 2],
                     scale: f64,
@@ -1380,6 +1382,90 @@ fn standard_guided_pose_plan(
     };
 
     push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
+    push(
+        "Far left edge · fronto",
+        [0.20, 0.50],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far top edge · fronto",
+        [0.50, 0.20],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far right edge · fronto",
+        [0.80, 0.50],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far bottom edge · fronto",
+        [0.50, 0.80],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far upper left corner · fronto",
+        [0.22, 0.22],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far upper right corner · fronto",
+        [0.78, 0.22],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far lower left corner · fronto",
+        [0.22, 0.78],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far lower right corner · fronto",
+        [0.78, 0.78],
+        FAR_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Distant upper left corner · fronto",
+        [0.20, 0.20],
+        DISTANT_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Distant upper right corner · fronto",
+        [0.80, 0.20],
+        DISTANT_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Distant lower left corner · fronto",
+        [0.20, 0.80],
+        DISTANT_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Distant lower right corner · fronto",
+        [0.80, 0.80],
+        DISTANT_TRANSLATED,
+        0.0,
+        0.0,
+    )?;
     push("Right · low tilt", [0.61, 0.50], MID, LOW_TILT, 0.0)?;
     push("Right edge · low tilt", [0.66, 0.50], MID, LOW_TILT, 0.0)?;
     push(
@@ -1476,35 +1562,59 @@ fn standard_guided_pose_plan(
         MID_TILT,
         315.0,
     )?;
-    push("Right · high tilt", [0.575, 0.50], FAR, HIGH_TILT, 0.0)?;
+    push(
+        "Right · high tilt",
+        [0.575, 0.50],
+        FAR_TILTED,
+        HIGH_TILT,
+        0.0,
+    )?;
     push(
         "Upper right · high tilt",
         [0.559, 0.441],
-        FAR,
+        FAR_TILTED,
         HIGH_TILT,
         45.0,
     )?;
-    push("Top · high tilt", [0.50, 0.425], FAR, HIGH_TILT, 90.0)?;
+    push(
+        "Top · high tilt",
+        [0.50, 0.425],
+        FAR_TILTED,
+        HIGH_TILT,
+        90.0,
+    )?;
     push(
         "Upper left · high tilt",
         [0.441, 0.441],
-        FAR,
+        FAR_TILTED,
         HIGH_TILT,
         135.0,
     )?;
-    push("Left · high tilt", [0.425, 0.50], FAR, HIGH_TILT, 180.0)?;
+    push(
+        "Left · high tilt",
+        [0.425, 0.50],
+        FAR_TILTED,
+        HIGH_TILT,
+        180.0,
+    )?;
     push(
         "Lower left · high tilt",
         [0.441, 0.559],
-        FAR,
+        FAR_TILTED,
         HIGH_TILT,
         225.0,
     )?;
-    push("Bottom · high tilt", [0.50, 0.575], FAR, HIGH_TILT, 270.0)?;
+    push(
+        "Bottom · high tilt",
+        [0.50, 0.575],
+        FAR_TILTED,
+        HIGH_TILT,
+        270.0,
+    )?;
     push(
         "Lower right · high tilt",
         [0.559, 0.559],
-        FAR,
+        FAR_TILTED,
         HIGH_TILT,
         315.0,
     )?;
@@ -9510,10 +9620,22 @@ mod tests {
         let board = BoardSpec::new(11, 8, 40.0).unwrap();
         let plan = standard_guided_pose_plan(board, &intrinsics, image_size).unwrap();
 
-        assert_eq!(plan.len(), 33);
+        assert_eq!(plan.len(), 45);
 
         let target_labels = plan.iter().map(|target| target.label).collect::<Vec<_>>();
         for required in [
+            "Far left edge · fronto",
+            "Far top edge · fronto",
+            "Far right edge · fronto",
+            "Far bottom edge · fronto",
+            "Far upper left corner · fronto",
+            "Far upper right corner · fronto",
+            "Far lower left corner · fronto",
+            "Far lower right corner · fronto",
+            "Distant upper left corner · fronto",
+            "Distant upper right corner · fronto",
+            "Distant lower left corner · fronto",
+            "Distant lower right corner · fronto",
             "Right edge · low tilt",
             "Top edge · low tilt",
             "Left edge · low tilt",
@@ -9540,7 +9662,7 @@ mod tests {
                     .round()
             })
             .collect::<Vec<_>>();
-        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 0.0).count(), 1);
+        assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 0.0).count(), 13);
         assert_eq!(
             target_tilts.iter().filter(|tilt| **tilt == 12.0).count(),
             16
@@ -9548,31 +9670,7 @@ mod tests {
         assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 20.0).count(), 8);
         assert_eq!(target_tilts.iter().filter(|tilt| **tilt == 28.0).count(), 8);
 
-        let mut minimum_depth = f64::INFINITY;
-        let mut maximum_depth = f64::NEG_INFINITY;
-        let mut xyz_min = [f64::INFINITY; 3];
-        let mut xyz_max = [f64::NEG_INFINITY; 3];
-        let mut outline_min = [f32::INFINITY; 2];
-        let mut outline_max = [f32::NEG_INFINITY; 2];
-        for target in &plan {
-            let depth = guided_test_target_depth(board, target, &intrinsics, image_size);
-            minimum_depth = minimum_depth.min(depth);
-            maximum_depth = maximum_depth.max(depth);
-            for axis in 0..3 {
-                xyz_min[axis] = xyz_min[axis].min(target.pose.xyz[axis]);
-                xyz_max[axis] = xyz_max[axis].max(target.pose.xyz[axis]);
-            }
-            for uv in target.outline_uv {
-                outline_min[0] = outline_min[0].min(uv[0]);
-                outline_min[1] = outline_min[1].min(uv[1]);
-                outline_max[0] = outline_max[0].max(uv[0]);
-                outline_max[1] = outline_max[1].max(uv[1]);
-            }
-            assert!(
-                (590.0..=890.0).contains(&depth),
-                "guided target '{}' depth must stay inside 590..890: {depth:.3}",
-                target.label
-            );
+        for (index, target) in plan.iter().enumerate() {
             assert!(
                 target
                     .pose
@@ -9583,46 +9681,6 @@ mod tests {
                 target.label,
                 target.pose.rpy_degrees
             );
-        }
-        assert!(
-            minimum_depth <= 620.0 && maximum_depth >= 860.0,
-            "guided depth distribution should cover the close 590..890 band: {minimum_depth:.3}..{maximum_depth:.3}"
-        );
-        assert!(
-            outline_min[0] <= 0.05
-                && outline_max[0] >= 0.95
-                && outline_min[1] <= 0.11
-                && outline_max[1] >= 0.89,
-            "guided field distribution should fill the frame: min={outline_min:?} max={outline_max:?}"
-        );
-        for axis in 0..3 {
-            let range = xyz_max[axis] - xyz_min[axis];
-            assert!(
-                range <= 500.0,
-                "guided camera-relative translation axis {axis} must stay inside a 50 cm cube: {range:.3}"
-            );
-        }
-
-        for pair in plan.windows(2) {
-            let center_step = (f64::from(pair[0].pose.center_uv[0] - pair[1].pose.center_uv[0]))
-                .abs()
-                .max(f64::from(pair[0].pose.center_uv[1] - pair[1].pose.center_uv[1]).abs());
-            assert!(
-                center_step <= 0.12,
-                "guided center step too large: {center_step:.3}"
-            );
-            let translation_delta = pair[0]
-                .pose
-                .xyz
-                .iter()
-                .zip(pair[1].pose.xyz.iter())
-                .map(|(left, right)| (left - right).powi(2))
-                .sum::<f64>()
-                .sqrt();
-            assert!(translation_delta <= 160.0);
-        }
-
-        for (index, target) in plan.iter().enumerate() {
             for uv in target.outline_uv.iter().copied().chain(
                 target
                     .grid_lines
@@ -9638,7 +9696,11 @@ mod tests {
                 );
             }
         }
-        let tilted = &plan[1];
+
+        let tilted = plan
+            .iter()
+            .find(|target| target.label == "Right · low tilt")
+            .unwrap();
         assert_eq!(
             tilted.grid_lines.len(),
             usize::from(board.inner_cols) + usize::from(board.inner_rows) + 4
@@ -9665,9 +9727,130 @@ mod tests {
         let mut distorted = intrinsics;
         distorted.distortion_coefficients[0] = 0.15;
         let distorted_plan = standard_guided_pose_plan(board, &distorted, image_size).unwrap();
+        let distorted_tilted = distorted_plan
+            .iter()
+            .find(|target| target.label == "Right · low tilt")
+            .unwrap();
         assert_ne!(
-            tilted.outline_uv, distorted_plan[1].outline_uv,
+            tilted.outline_uv, distorted_tilted.outline_uv,
             "guided target grid must be projected through the bound K/D12 model"
+        );
+
+        let sixteen_nine_size = CalibrationImageSize::new(1920, 1080).unwrap();
+        let sixteen_nine_intrinsics = InitialIntrinsics {
+            camera_matrix: [900.0, 0.0, 960.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        let sixteen_nine_plan =
+            standard_guided_pose_plan(board, &sixteen_nine_intrinsics, sixteen_nine_size).unwrap();
+        let mut corner_bins = [[0_usize; 4]; 4];
+        let mut corner_region_counts = [0_usize; 8];
+        let mut corner_min = [f64::INFINITY; 2];
+        let mut corner_max = [f64::NEG_INFINITY; 2];
+        let mut minimum_depth = f64::INFINITY;
+        let mut maximum_depth = f64::NEG_INFINITY;
+        let mut far_depth_count = 0_usize;
+        for target in &sixteen_nine_plan {
+            let depth = guided_test_target_depth(
+                board,
+                target,
+                &sixteen_nine_intrinsics,
+                sixteen_nine_size,
+            );
+            minimum_depth = minimum_depth.min(depth);
+            maximum_depth = maximum_depth.max(depth);
+            if (700.0..=1000.0).contains(&depth) {
+                far_depth_count += 1;
+            }
+            for row in 0..board.inner_rows {
+                for column in 0..board.inner_cols {
+                    let point = project_board_point_image(
+                        target.pose.rotation,
+                        target.pose.translation,
+                        guided_pose_board_point(board, f64::from(column), f64::from(row)),
+                        &sixteen_nine_intrinsics,
+                    )
+                    .unwrap();
+                    let x = f64::from(point.x);
+                    let y = f64::from(point.y);
+                    corner_min[0] = corner_min[0].min(x);
+                    corner_min[1] = corner_min[1].min(y);
+                    corner_max[0] = corner_max[0].max(x);
+                    corner_max[1] = corner_max[1].max(y);
+                    let bin_x = ((x / f64::from(sixteen_nine_size.width)) * 4.0)
+                        .floor()
+                        .clamp(0.0, 3.0) as usize;
+                    let bin_y = ((y / f64::from(sixteen_nine_size.height)) * 4.0)
+                        .floor()
+                        .clamp(0.0, 3.0) as usize;
+                    corner_bins[bin_y][bin_x] += 1;
+                    if x < f64::from(sixteen_nine_size.width) * 0.15 {
+                        corner_region_counts[0] += 1;
+                    }
+                    if x > f64::from(sixteen_nine_size.width) * 0.85 {
+                        corner_region_counts[1] += 1;
+                    }
+                    if y < f64::from(sixteen_nine_size.height) * 0.15 {
+                        corner_region_counts[2] += 1;
+                    }
+                    if y > f64::from(sixteen_nine_size.height) * 0.85 {
+                        corner_region_counts[3] += 1;
+                    }
+                    if x < f64::from(sixteen_nine_size.width) * 0.25
+                        && y < f64::from(sixteen_nine_size.height) * 0.25
+                    {
+                        corner_region_counts[4] += 1;
+                    }
+                    if x > f64::from(sixteen_nine_size.width) * 0.75
+                        && y < f64::from(sixteen_nine_size.height) * 0.25
+                    {
+                        corner_region_counts[5] += 1;
+                    }
+                    if x < f64::from(sixteen_nine_size.width) * 0.25
+                        && y > f64::from(sixteen_nine_size.height) * 0.75
+                    {
+                        corner_region_counts[6] += 1;
+                    }
+                    if x > f64::from(sixteen_nine_size.width) * 0.75
+                        && y > f64::from(sixteen_nine_size.height) * 0.75
+                    {
+                        corner_region_counts[7] += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            minimum_depth <= 500.0 && maximum_depth >= 900.0 && maximum_depth <= 1000.0,
+            "16:9 guided depth distribution should include close and 700..1000 far samples: {minimum_depth:.3}..{maximum_depth:.3}"
+        );
+        assert!(
+            far_depth_count >= 12,
+            "far depth samples: {far_depth_count}"
+        );
+        assert!(
+            corner_min[0] <= 170.0
+                && corner_max[0] >= 1750.0
+                && corner_min[1] <= 70.0
+                && corner_max[1] >= 1010.0,
+            "16:9 inner-corner coverage should reach the frame edges: min={corner_min:?} max={corner_max:?}"
+        );
+        assert!(
+            corner_bins[0][0] >= 70
+                && corner_bins[0][3] >= 70
+                && corner_bins[3][0] >= 70
+                && corner_bins[3][3] >= 70,
+            "16:9 corner bins lack samples: {corner_bins:?}"
+        );
+        assert!(
+            corner_region_counts[0] >= 96
+                && corner_region_counts[1] >= 96
+                && corner_region_counts[2] >= 140
+                && corner_region_counts[3] >= 140,
+            "16:9 edge regions lack samples: {corner_region_counts:?}"
+        );
+        assert!(
+            corner_region_counts[4..].iter().all(|count| *count >= 70),
+            "16:9 corner regions lack samples: {corner_region_counts:?}"
         );
     }
     #[test]

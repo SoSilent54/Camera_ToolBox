@@ -7883,10 +7883,7 @@ impl CameraToolboxApp {
         horizontal_flip: bool,
         matched: bool,
     ) {
-        let base_alpha = if matched { 150 } else { 128 };
-        let dominant_score = Self::guided_pose_rotation_ring_score(&rings.roll)
-            .max(Self::guided_pose_rotation_ring_score(&rings.pitch))
-            .max(Self::guided_pose_rotation_ring_score(&rings.yaw));
+        let base_alpha = if matched { 132 } else { 112 };
 
         // 圆环点已经按当前检测板面的 3D 几何和相机模型投影；这里只做屏幕坐标映射和绘制。
         Self::paint_live_guided_projected_rotation_ring(
@@ -7896,7 +7893,6 @@ impl CameraToolboxApp {
             &rings.roll,
             egui::Color32::from_rgb(255, 48, 86),
             base_alpha,
-            dominant_score,
         );
         Self::paint_live_guided_projected_rotation_ring(
             painter,
@@ -7905,7 +7901,6 @@ impl CameraToolboxApp {
             &rings.pitch,
             egui::Color32::from_rgb(70, 255, 132),
             base_alpha,
-            dominant_score,
         );
         Self::paint_live_guided_projected_rotation_ring(
             painter,
@@ -7914,7 +7909,6 @@ impl CameraToolboxApp {
             &rings.yaw,
             egui::Color32::from_rgb(64, 210, 255),
             base_alpha,
-            dominant_score,
         );
     }
 
@@ -7937,9 +7931,7 @@ impl CameraToolboxApp {
         arc: &ViewerGuidedPoseRotationArcOverlay,
         color: egui::Color32,
         base_alpha: u8,
-        dominant_score: f32,
     ) {
-        let shadow_color = egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150);
         let full_color =
             egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), base_alpha);
         let base_points =
@@ -7947,47 +7939,25 @@ impl CameraToolboxApp {
         if base_points.len() >= 2 {
             painter.add(egui::Shape::line(
                 base_points.clone(),
-                egui::Stroke::new(5.8, shadow_color),
+                egui::Stroke::new(1.25, full_color),
             ));
-            painter.add(egui::Shape::line(
-                base_points.clone(),
-                egui::Stroke::new(3.6, full_color),
-            ));
-        }
-        if let Some(target_tick) =
-            Self::live_overlay_normalized_uv(arc.tick_uv, image_rect, horizontal_flip)
-        {
-            painter.circle_filled(target_tick, 4.2, shadow_color);
-            painter.circle_filled(target_tick, 2.6, color);
         }
         let arc_points =
             Self::guided_pose_rotation_projected_points(&arc.arc_uv, image_rect, horizontal_flip);
         let score = Self::guided_pose_rotation_ring_score(arc);
-        let is_dominant = score + 1.0e-6 >= dominant_score && dominant_score > 0.0;
         if arc_points.len() >= 2 {
-            let glow_alpha = if is_dominant { 126 } else { 84 };
-            let arc_alpha = if is_dominant { 255 } else { 232 };
-            let glow_color =
-                egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), glow_alpha);
+            let arc_alpha = if score >= 1.0 { 255 } else { 238 };
             let arc_color =
                 egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), arc_alpha);
+            let stroke_width = if score >= 1.0 { 4.0 } else { 3.2 };
             painter.add(egui::Shape::line(
                 arc_points.clone(),
-                egui::Stroke::new(if is_dominant { 14.0 } else { 10.0 }, glow_color),
-            ));
-            painter.add(egui::Shape::line(
-                arc_points.clone(),
-                egui::Stroke::new(if is_dominant { 8.0 } else { 6.6 }, arc_color),
+                egui::Stroke::new(stroke_width, arc_color),
             ));
             let tip = arc_points[arc_points.len() - 1];
-            let previous = arc_points[arc_points.len() - 2];
-            Self::paint_live_guided_rotation_arrowhead(
-                painter,
-                tip,
-                tip - previous,
-                arc_color,
-                9.0,
-            );
+            let radius = if score >= 1.0 { 5.0 } else { 4.2 };
+            painter.circle_filled(tip, radius, arc_color);
+            painter.circle_stroke(tip, radius, egui::Stroke::new(1.4, egui::Color32::BLACK));
         }
         let label_anchor =
             Self::live_overlay_normalized_uv(arc.label_uv, image_rect, horizontal_flip)
@@ -8023,31 +7993,6 @@ impl CameraToolboxApp {
             .iter()
             .filter_map(|uv| Self::live_overlay_normalized_uv(*uv, image_rect, horizontal_flip))
             .collect()
-    }
-
-    #[cfg(feature = "calibration-opencv")]
-    fn paint_live_guided_rotation_arrowhead(
-        painter: &egui::Painter,
-        tip: egui::Pos2,
-        tangent: egui::Vec2,
-        color: egui::Color32,
-        size: f32,
-    ) {
-        let length = tangent.length();
-        if !length.is_finite() || length <= 1.0e-6 {
-            return;
-        }
-        let direction = tangent / length;
-        let normal = egui::vec2(-direction.y, direction.x);
-        painter.add(egui::Shape::convex_polygon(
-            vec![
-                tip,
-                tip - direction * size + normal * size * 0.58,
-                tip - direction * size - normal * size * 0.58,
-            ],
-            color,
-            egui::Stroke::new(0.8, egui::Color32::WHITE),
-        ));
     }
 
     #[cfg(feature = "calibration-opencv")]
