@@ -16,11 +16,11 @@ use std::{
 use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvisionIntent};
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{
-    CalibrationExport, CalibrationViewerOverlay, CalibrationViewerPresentation,
-    CalibrationWorkspaceManager, ViewerDetectionOverlay, ViewerGuidedPoseArrowOverlay,
-    ViewerGuidedPoseInstructionOverlay, ViewerGuidedPoseOverlay,
+    CalibrationExport, CalibrationProvisionRequest, CalibrationViewerOverlay,
+    CalibrationViewerPresentation, CalibrationWorkspaceKey, CalibrationWorkspaceManager,
+    ViewerDetectionOverlay, ViewerGuidedPoseArrowOverlay, ViewerGuidedPoseOverlay,
     ViewerGuidedPoseRotationArcOverlay, ViewerGuidedPoseRotationRingsOverlay,
-    ViewerPoseAxisOverlay,
+    ViewerGuidedPoseStatusOverlay, ViewerPoseAxisOverlay,
 };
 
 #[cfg(feature = "platform-ssh")]
@@ -299,6 +299,7 @@ impl From<String> for EepromOperationFailure {
 
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 struct EepromOperationResult {
+    workspace_key: CalibrationWorkspaceKey,
     kind: EepromOperationKind,
     target_label: String,
     result: Result<EepromOperationOutcome, EepromOperationFailure>,
@@ -374,7 +375,7 @@ fn run_eeprom_operation(
     };
 
     match (intent, helper_result) {
-        (CalibrationProvisionIntent::Inspect, EepromHelperResult::Inspect(result)) => {
+        (CalibrationProvisionIntent::Inspect { .. }, EepromHelperResult::Inspect(result)) => {
             Ok(EepromOperationOutcome::Inspect(result))
         }
         (
@@ -583,6 +584,22 @@ fn eeprom_action_parameters_json(
             "expected_before_sha256": expected_before_sha256,
             "request": eeprom_request_parameters_json(request),
         }),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn expected_eeprom_target_label(intent: &CalibrationProvisionIntent) -> Option<&str> {
+    match intent {
+        CalibrationProvisionIntent::Inspect {
+            expected_target_label,
+        }
+        | CalibrationProvisionIntent::Provision {
+            expected_target_label,
+            ..
+        } => Some(expected_target_label.as_str()),
+        CalibrationProvisionIntent::Cancel
+        | CalibrationProvisionIntent::ConfigureTarget(_)
+        | CalibrationProvisionIntent::DiscoverBuses => None,
     }
 }
 
@@ -4515,12 +4532,17 @@ impl CameraToolboxApp {
     fn begin_eeprom_operation(
         &mut self,
         context: &egui::Context,
-        intent: CalibrationProvisionIntent,
+        request: CalibrationProvisionRequest,
     ) {
+        let CalibrationProvisionRequest {
+            workspace_key,
+            intent,
+        } = request;
         let intent = match intent {
             CalibrationProvisionIntent::ConfigureTarget(request) => {
                 if self.active_eeprom_cancellation.is_some() {
                     self.calibration.report_provision_error(
+                        &workspace_key,
                         "Wait for the active EEPROM operation to finish before reconfiguring its target.",
                     );
                     return;
@@ -4529,8 +4551,12 @@ impl CameraToolboxApp {
                     "Reconfiguring EEPROM target; previous Inspect and Write authorization are invalid.",
                 );
                 match self.configure_eeprom_target(request) {
-                    Ok(label) => self.calibration.report_target_configured(&label),
-                    Err(error) => self.calibration.report_target_configuration_failed(error),
+                    Ok(label) => self
+                        .calibration
+                        .report_target_configured(&workspace_key, &label),
+                    Err(error) => self
+                        .calibration
+                        .report_target_configuration_failed(&workspace_key, error),
                 }
                 return;
             }
@@ -4538,8 +4564,10 @@ impl CameraToolboxApp {
         };
         if matches!(&intent, CalibrationProvisionIntent::Cancel) {
             if !self.active_eeprom_cancellable {
-                self.calibration
-                    .report_provision_error("No cancellable EEPROM read operation is active.");
+                self.calibration.report_provision_error(
+                    &workspace_key,
+                    "No cancellable EEPROM read operation is active.",
+                );
             } else if let Some(cancellation) = &self.active_eeprom_cancellation {
                 cancellation.cancel();
             }
@@ -4547,7 +4575,7 @@ impl CameraToolboxApp {
         }
         if self.active_eeprom_cancellation.is_some() {
             self.calibration
-                .report_provision_error("An EEPROM operation is already active.");
+                .report_provision_error(&workspace_key, "An EEPROM operation is already active.");
             return;
         }
         if matches!(&intent, CalibrationProvisionIntent::DiscoverBuses) {
@@ -4556,7 +4584,8 @@ impl CameraToolboxApp {
             ) {
                 Ok(source) => source,
                 Err(error) => {
-                    self.calibration.report_bus_discovery_failed(error);
+                    self.calibration
+                        .report_bus_discovery_failed(&workspace_key, error);
                     return;
                 }
             };
@@ -4564,6 +4593,7 @@ impl CameraToolboxApp {
                 &source.authentication
             else {
                 self.calibration.report_bus_discovery_failed(
+                    &workspace_key,
                     "I²C bus discovery requires a process-only SSH/SFTP password",
                 );
                 return;
@@ -4580,7 +4610,8 @@ impl CameraToolboxApp {
             let helper_payload = match Self::read_local_eeprom_helper_payload() {
                 Ok(payload) => payload,
                 Err(error) => {
-                    self.calibration.report_bus_discovery_failed(error);
+                    self.calibration
+                        .report_bus_discovery_failed(&workspace_key, error);
                     return;
                 }
             };
@@ -4597,6 +4628,7 @@ impl CameraToolboxApp {
             );
             let resolver = self.live_runtime.ssh_resolver();
             let transport = Arc::new(RusshTransportFactory);
+            let operation_workspace_key = workspace_key.clone();
             let spawn_result = thread::Builder::new()
                 .name("camera-toolbox-i2c-discovery".to_owned())
                 .spawn(move || {
@@ -4619,6 +4651,7 @@ impl CameraToolboxApp {
                     let _ = sender.send(EepromOperationResult {
                         kind: EepromOperationKind::BusDiscovery,
                         target_label,
+                        workspace_key: operation_workspace_key,
                         result,
                     });
                     worker_context.request_repaint();
@@ -4626,9 +4659,10 @@ impl CameraToolboxApp {
             if let Err(error) = spawn_result {
                 self.active_eeprom_cancellation = None;
                 self.active_eeprom_cancellable = false;
-                self.calibration.report_bus_discovery_failed(format!(
-                    "Failed to start I²C bus discovery worker: {error}"
-                ));
+                self.calibration.report_bus_discovery_failed(
+                    &workspace_key,
+                    format!("Failed to start I²C bus discovery worker: {error}"),
+                );
             }
             return;
         }
@@ -4637,15 +4671,29 @@ impl CameraToolboxApp {
             Some(target) => target,
             None => {
                 self.calibration.report_provision_error(
+                    &workspace_key,
                     "Configure the EEPROM SSH target in the Calibration panel.",
                 );
                 return;
             }
         };
+        if let Some(expected_target_label) = expected_eeprom_target_label(&intent)
+            && target.label != expected_target_label
+        {
+            self.calibration.report_provision_error(
+                &workspace_key,
+                format!(
+                    "EEPROM target changed before execution: selected {expected_target_label}, current {}. Re-select the I²C bus and Inspect again before writing.",
+                    target.label
+                ),
+            );
+            return;
+        }
         if let CalibrationProvisionIntent::Provision { request, .. } = &intent
             && let Err(error) = ensure_eeprom_history_slot_available(&request.serial_number)
         {
-            self.calibration.report_provision_error(error);
+            self.calibration
+                .report_provision_error(&workspace_key, error);
             return;
         }
         let operation_id = self.next_eeprom_operation;
@@ -4659,7 +4707,7 @@ impl CameraToolboxApp {
         let target_label = target.label.clone();
         let provision_attempt = matches!(&intent, CalibrationProvisionIntent::Provision { .. });
         let kind = match &intent {
-            CalibrationProvisionIntent::Inspect => EepromOperationKind::Inspect,
+            CalibrationProvisionIntent::Inspect { .. } => EepromOperationKind::Inspect,
             CalibrationProvisionIntent::Provision { .. } => EepromOperationKind::Provision,
             CalibrationProvisionIntent::Cancel
             | CalibrationProvisionIntent::ConfigureTarget(_)
@@ -4667,6 +4715,7 @@ impl CameraToolboxApp {
                 unreachable!("non-worker EEPROM intents return before worker dispatch")
             }
         };
+        let operation_workspace_key = workspace_key.clone();
         let spawn_result = thread::Builder::new()
             .name("camera-toolbox-eeprom-operation".to_owned())
             .spawn(move || {
@@ -4681,6 +4730,7 @@ impl CameraToolboxApp {
                     })
                 });
                 let _ = sender.send(EepromOperationResult {
+                    workspace_key: operation_workspace_key,
                     kind,
                     target_label,
                     result,
@@ -4690,9 +4740,10 @@ impl CameraToolboxApp {
         if let Err(error) = spawn_result {
             self.active_eeprom_cancellation = None;
             self.active_eeprom_cancellable = false;
-            self.calibration.report_provision_error(format!(
-                "Failed to start EEPROM operation worker: {error}"
-            ));
+            self.calibration.report_provision_error(
+                &workspace_key,
+                format!("Failed to start EEPROM operation worker: {error}"),
+            );
         }
     }
 
@@ -4702,30 +4753,44 @@ impl CameraToolboxApp {
             self.active_eeprom_cancellation = None;
             self.active_eeprom_cancellable = false;
             match operation.result {
-                Ok(EepromOperationOutcome::Inspect(result)) => self
-                    .calibration
-                    .report_eeprom_inspect(operation.target_label, result),
+                Ok(EepromOperationOutcome::Inspect(result)) => {
+                    self.calibration.report_eeprom_inspect(
+                        &operation.workspace_key,
+                        operation.target_label,
+                        result,
+                    )
+                }
                 Ok(EepromOperationOutcome::BusDiscovery { buses }) => {
-                    self.calibration.report_bus_discovery(buses);
+                    self.calibration
+                        .report_bus_discovery(&operation.workspace_key, buses);
                 }
                 Ok(EepromOperationOutcome::Provision {
                     result,
                     history_file,
                 }) => self.calibration.report_eeprom_provision(
+                    &operation.workspace_key,
                     operation.target_label,
                     &result,
                     history_file,
                 ),
-                Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }) => self
-                    .calibration
-                    .report_eeprom_provision_audit_error(operation.target_label, &result, &error),
+                Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }) => {
+                    self.calibration.report_eeprom_provision_audit_error(
+                        &operation.workspace_key,
+                        operation.target_label,
+                        &result,
+                        &error,
+                    )
+                }
                 Err(error) if error.provision_state_unknown => self
                     .calibration
-                    .report_eeprom_provision_unknown(error.message),
+                    .report_eeprom_provision_unknown(&operation.workspace_key, error.message),
                 Err(error) if operation.kind == EepromOperationKind::BusDiscovery => {
-                    self.calibration.report_bus_discovery_failed(error.message);
+                    self.calibration
+                        .report_bus_discovery_failed(&operation.workspace_key, error.message);
                 }
-                Err(error) => self.calibration.report_provision_error(error.message),
+                Err(error) => self
+                    .calibration
+                    .report_provision_error(&operation.workspace_key, error.message),
             }
         }
     }
@@ -7531,6 +7596,9 @@ impl CameraToolboxApp {
                 }
             }
         }
+        if let Some(status) = &overlay.dataset_gain_status {
+            Self::paint_live_guided_status(painter, image_rect, status);
+        }
         if !show_detection {
             return;
         }
@@ -7614,87 +7682,52 @@ impl CameraToolboxApp {
                 target.matched,
             );
         }
-        if let Some(instruction) = &target.instruction {
-            Self::paint_live_guided_instruction(painter, image_rect, instruction);
+        if let Some(status) = &target.status {
+            Self::paint_live_guided_status(painter, image_rect, status);
         }
-        let label_anchor = target
-            .outline_uv
-            .iter()
-            .filter_map(|uv| Self::live_overlay_normalized_uv(*uv, image_rect, horizontal_flip))
-            .min_by(|left, right| {
-                left.y
-                    .total_cmp(&right.y)
-                    .then_with(|| left.x.total_cmp(&right.x))
-            })
-            .unwrap_or(center);
-        painter.text(
-            label_anchor + egui::vec2(4.0, 4.0),
-            egui::Align2::LEFT_TOP,
-            "TARGET BOARD",
-            egui::FontId::monospace(12.0),
-            color,
-        );
     }
 
     #[cfg(feature = "calibration-opencv")]
-    fn paint_live_guided_instruction(
+    fn paint_live_guided_status(
         painter: &egui::Painter,
         image_rect: egui::Rect,
-        instruction: &ViewerGuidedPoseInstructionOverlay,
+        status: &ViewerGuidedPoseStatusOverlay,
     ) {
-        let accent = if instruction.matched {
+        let accent = if status.matched {
             egui::Color32::from_rgb(80, 230, 120)
         } else {
             egui::Color32::from_rgb(255, 210, 80)
         };
-        let panel_width = (image_rect.width() - 32.0).clamp(280.0, 680.0);
-        let panel_height = 72.0;
-        let panel_center = egui::pos2(
-            image_rect.center().x,
-            image_rect.bottom() - panel_height * 0.5 - 16.0,
-        );
-        let panel = egui::Rect::from_center_size(
-            panel_center,
-            egui::vec2(panel_width, panel_height.min(image_rect.height() * 0.30)),
+        let panel = egui::Rect::from_min_size(
+            image_rect.left_top() + egui::vec2(12.0, 12.0),
+            egui::vec2(190.0, 48.0),
         );
         painter.rect_filled(
             panel,
-            10.0,
-            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 178),
+            6.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 150),
         );
         painter.rect_stroke(
             panel,
-            10.0,
-            egui::Stroke::new(1.6, accent),
+            6.0,
+            egui::Stroke::new(1.0, accent),
             egui::StrokeKind::Inside,
         );
-        painter.circle_filled(panel.left_center() + egui::vec2(20.0, 0.0), 7.0, accent);
-        let score_fraction = (instruction.score as f32).clamp(0.0, 1.25) / 1.25;
-        let score_track = egui::Rect::from_min_size(
-            egui::pos2(panel.left() + 44.0, panel.bottom() - 8.0),
-            egui::vec2(panel.width() - 88.0, 3.0),
+        painter.text(
+            panel.left_top() + egui::vec2(10.0, 7.0),
+            egui::Align2::LEFT_TOP,
+            format!("hold {}/{}", status.hold_frames, status.hold_target),
+            egui::FontId::monospace(13.0),
+            accent,
         );
-        painter.rect_filled(score_track, 1.5, egui::Color32::from_gray(60));
-        painter.rect_filled(
-            egui::Rect::from_min_size(
-                score_track.min,
-                egui::vec2(score_track.width() * score_fraction, score_track.height()),
+        painter.text(
+            panel.left_bottom() + egui::vec2(10.0, -8.0),
+            egui::Align2::LEFT_BOTTOM,
+            format!(
+                "{} {:.2}/{:.2}",
+                status.detail_label, status.detail_value, status.detail_limit
             ),
-            1.5,
-            accent,
-        );
-        painter.text(
-            panel.center_top() + egui::vec2(0.0, 10.0),
-            egui::Align2::CENTER_TOP,
-            instruction.primary,
-            egui::FontId::proportional(22.0),
-            accent,
-        );
-        painter.text(
-            panel.center_bottom() - egui::vec2(0.0, 14.0),
-            egui::Align2::CENTER_BOTTOM,
-            &instruction.secondary,
-            egui::FontId::monospace(12.0),
+            egui::FontId::monospace(13.0),
             egui::Color32::from_gray(235),
         );
     }

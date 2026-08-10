@@ -23,8 +23,11 @@ pub(crate) enum CalibrationProvisionIntent {
     ConfigureTarget(CalibrationEepromTargetRequest),
     #[cfg(feature = "platform-ssh")]
     DiscoverBuses,
-    Inspect,
+    Inspect {
+        expected_target_label: String,
+    },
     Provision {
+        expected_target_label: String,
         request: EepromProvisionRequest,
         expected_before_sha256: String,
     },
@@ -38,10 +41,11 @@ impl CalibrationProvisionIntent {
             Self::ConfigureTarget(_) => None,
             #[cfg(feature = "platform-ssh")]
             Self::DiscoverBuses => None,
-            Self::Inspect => Some(EepromHelperAction::Inspect),
+            Self::Inspect { .. } => Some(EepromHelperAction::Inspect),
             Self::Provision {
                 request,
                 expected_before_sha256,
+                ..
             } => Some(EepromHelperAction::Provision {
                 request: request.clone(),
                 expected_before_sha256: expected_before_sha256.clone(),
@@ -102,6 +106,16 @@ impl Default for CalibrationEepromState {
             pending: None,
             status: "Inspect the selected EEPROM before preparing a write.".to_owned(),
         }
+    }
+}
+#[cfg(test)]
+impl CalibrationEepromState {
+    pub(crate) fn set_pending_for_test(&mut self, intent: CalibrationProvisionIntent) {
+        self.pending = Some(intent);
+    }
+
+    pub(crate) fn inspected_target_for_test(&self) -> Option<&str> {
+        self.inspected_target.as_deref()
     }
 }
 
@@ -327,7 +341,12 @@ impl CalibrationEepromState {
                 self.busy = true;
                 self.active_operation = Some(ActiveEepromOperation::ReadOnly);
                 self.cancel_requested = false;
-                self.pending = Some(CalibrationProvisionIntent::Inspect);
+                self.pending =
+                    target_label.map(
+                        |expected_target_label| CalibrationProvisionIntent::Inspect {
+                            expected_target_label: expected_target_label.to_owned(),
+                        },
+                    );
                 self.status = "Reading EEPROM...".to_owned();
             }
             ui.add_enabled_ui(!self.busy, |ui| {
@@ -546,12 +565,14 @@ impl CalibrationEepromState {
         target_label: Option<&str>,
         request: Option<&EepromProvisionRequest>,
     ) -> Option<CalibrationProvisionIntent> {
-        if self.busy || self.inspected_target.as_deref() != target_label {
+        let target_label = target_label?;
+        if self.busy || self.inspected_target.as_deref() != Some(target_label) {
             return None;
         }
         let request = request?;
         let device = self.device.as_ref()?;
         Some(CalibrationProvisionIntent::Provision {
+            expected_target_label: target_label.to_owned(),
             request: request.clone(),
             expected_before_sha256: device.image_sha256.clone(),
         })
@@ -1021,6 +1042,7 @@ mod tests {
     fn provision_transport_unknown_forces_fresh_inspection_before_retry() {
         let mut state = CalibrationEepromState::default();
         state.pending = Some(CalibrationProvisionIntent::Provision {
+            expected_target_label: "root@camera / i2c-7".to_owned(),
             request: request(),
             expected_before_sha256: "a".repeat(64),
         });

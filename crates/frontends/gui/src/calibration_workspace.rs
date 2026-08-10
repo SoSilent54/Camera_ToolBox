@@ -62,6 +62,7 @@ const AUTO_CAPTURE_ANALYSIS_INTERVAL_NS: u64 = 200_000_000;
 const AUTO_CAPTURE_ACCEPT_COOLDOWN_NS: u64 = 750_000_000;
 const LIVE_AUTO_CANDIDATE_CAPACITY: usize = 4;
 const GUIDED_CAPTURE_HOLD_FRAMES: u8 = 4;
+const DATASET_GAIN_CAPTURE_HOLD_FRAMES: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
 const GUIDED_HOLD_JITTER_Z_LIMIT: f64 = 0.04;
 const GUIDED_HOLD_JITTER_RPY_DEGREES: f64 = 2.0;
@@ -1014,10 +1015,12 @@ pub(crate) struct ViewerGuidedPoseArrowOverlay {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ViewerGuidedPoseInstructionOverlay {
-    pub(crate) primary: &'static str,
-    pub(crate) secondary: String,
-    pub(crate) score: f64,
+pub(crate) struct ViewerGuidedPoseStatusOverlay {
+    pub(crate) hold_frames: u8,
+    pub(crate) hold_target: u8,
+    pub(crate) detail_label: &'static str,
+    pub(crate) detail_value: f64,
+    pub(crate) detail_limit: f64,
     pub(crate) matched: bool,
 }
 
@@ -1028,7 +1031,7 @@ pub(crate) struct ViewerGuidedPoseOverlay {
     pub(crate) grid_lines: Arc<[ViewerGuidedPoseGridLine]>,
     pub(crate) rotation_rings: Option<ViewerGuidedPoseRotationRingsOverlay>,
     pub(crate) pose_arrow: Option<ViewerGuidedPoseArrowOverlay>,
-    pub(crate) instruction: Option<ViewerGuidedPoseInstructionOverlay>,
+    pub(crate) status: Option<ViewerGuidedPoseStatusOverlay>,
     pub(crate) matched: bool,
 }
 
@@ -1040,6 +1043,8 @@ pub(crate) struct CalibrationViewerOverlay {
     pub(crate) realtime_detection: Option<ViewerDetectionOverlay>,
     /// 引导式自动快门的当前目标位置提示；只表达操作目标，不代表已入库数据。
     pub(crate) guided_target: Option<ViewerGuidedPoseOverlay>,
+    /// Dataset-gain 自动快门的稳定 hold 状态；复用左上角引导状态面板。
+    pub(crate) dataset_gain_status: Option<ViewerGuidedPoseStatusOverlay>,
 }
 
 #[derive(Clone)]
@@ -1156,15 +1161,6 @@ struct GuidedPoseMeasurement {
     image_size: CalibrationImageSize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GuidedPoseInstructionComponent {
-    X,
-    Y,
-    Z,
-    Roll,
-    Pitch,
-    Yaw,
-}
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GuidedPoseError {
     x: f64,
@@ -2351,136 +2347,35 @@ fn assess_guided_pose(
     })
 }
 
-fn guided_pose_instruction_overlay(
+fn guided_pose_status_overlay(
     assessment: &GuidedPoseAssessment,
-    target: &GuidedPoseTarget,
     hold_frames: u8,
-) -> ViewerGuidedPoseInstructionOverlay {
-    if assessment.matched {
-        return ViewerGuidedPoseInstructionOverlay {
-            primary: "HOLD STILL",
-            secondary: format!(
-                "locked · hold {}/{} · pose error {:.2}/{:.2}",
-                hold_frames.min(GUIDED_CAPTURE_HOLD_FRAMES),
-                GUIDED_CAPTURE_HOLD_FRAMES,
-                assessment.pose_error_score,
-                GUIDED_POSE_MATCH_SCORE_LIMIT
-            ),
-            score: assessment.pose_error_score,
-            matched: true,
-        };
-    }
-
-    let candidates = [
-        (
-            GuidedPoseInstructionComponent::X,
-            assessment.error.x,
-            target.tolerance.x,
-            "x",
-            "",
-        ),
-        (
-            GuidedPoseInstructionComponent::Y,
-            assessment.error.y,
-            target.tolerance.y,
-            "y",
-            "",
-        ),
-        (
-            GuidedPoseInstructionComponent::Z,
-            assessment.error.z,
-            target.tolerance.z,
-            "z",
-            "",
-        ),
-        (
-            GuidedPoseInstructionComponent::Roll,
-            assessment.error.roll_degrees,
-            target.tolerance.roll_degrees,
-            "roll",
-            "°",
-        ),
-        (
-            GuidedPoseInstructionComponent::Pitch,
-            assessment.error.pitch_degrees,
-            target.tolerance.pitch_degrees,
-            "pitch",
-            "°",
-        ),
-        (
-            GuidedPoseInstructionComponent::Yaw,
-            assessment.error.yaw_degrees,
-            target.tolerance.yaw_degrees,
-            "yaw",
-            "°",
-        ),
-    ];
-    let (component, actual, limit, label, unit, component_score) = candidates
-        .into_iter()
-        .map(|(component, actual, limit, label, unit)| {
-            (component, actual, limit, label, unit, actual / limit)
-        })
-        .max_by(|left, right| left.5.total_cmp(&right.5))
-        .unwrap_or((
-            GuidedPoseInstructionComponent::Z,
-            assessment.error.z,
-            target.tolerance.z,
-            "pose",
-            "",
-            assessment.pose_error_score,
-        ));
-    let primary = guided_pose_instruction_primary(component, assessment, target);
-    let secondary = if unit.is_empty() {
-        format!(
-            "{label} {:.0}% of limit · pose error {:.2}/{:.2}",
-            component_score * 100.0,
-            assessment.pose_error_score,
-            GUIDED_POSE_MATCH_SCORE_LIMIT
-        )
-    } else {
-        format!(
-            "{label} {actual:.1}{unit}/{limit:.1}{unit} · pose error {:.2}/{:.2}",
-            assessment.pose_error_score, GUIDED_POSE_MATCH_SCORE_LIMIT
-        )
-    };
-    ViewerGuidedPoseInstructionOverlay {
-        primary,
-        secondary,
-        score: assessment.pose_error_score,
-        matched: false,
+) -> ViewerGuidedPoseStatusOverlay {
+    ViewerGuidedPoseStatusOverlay {
+        hold_frames: hold_frames.min(GUIDED_CAPTURE_HOLD_FRAMES),
+        hold_target: GUIDED_CAPTURE_HOLD_FRAMES,
+        detail_label: "pose error",
+        detail_value: assessment.pose_error_score,
+        detail_limit: GUIDED_POSE_MATCH_SCORE_LIMIT,
+        matched: assessment.matched,
     }
 }
 
-fn guided_pose_instruction_primary(
-    component: GuidedPoseInstructionComponent,
-    assessment: &GuidedPoseAssessment,
-    target: &GuidedPoseTarget,
-) -> &'static str {
-    match component {
-        GuidedPoseInstructionComponent::X => {
-            if target.pose.center_uv[0] >= assessment.measurement.pose.center_uv[0] {
-                "MOVE BOARD RIGHT"
-            } else {
-                "MOVE BOARD LEFT"
-            }
-        }
-        GuidedPoseInstructionComponent::Y => {
-            if target.pose.center_uv[1] >= assessment.measurement.pose.center_uv[1] {
-                "MOVE BOARD DOWN"
-            } else {
-                "MOVE BOARD UP"
-            }
-        }
-        GuidedPoseInstructionComponent::Z => {
-            if target.pose.xyz[2] >= assessment.measurement.pose.xyz[2] {
-                "MOVE BOARD FARTHER"
-            } else {
-                "MOVE BOARD CLOSER"
-            }
-        }
-        GuidedPoseInstructionComponent::Roll => "ROLL BOARD INTO GHOST",
-        GuidedPoseInstructionComponent::Pitch => "TILT BOARD INTO GHOST",
-        GuidedPoseInstructionComponent::Yaw => "ROTATE BOARD INTO GHOST",
+fn dataset_gain_status_overlay(
+    assessment: &AutoAdmissionAssessment,
+    hold_frames: u8,
+) -> ViewerGuidedPoseStatusOverlay {
+    let minimum_gain = assessment
+        .active_criteria
+        .as_ref()
+        .map_or(0.0, |criteria| criteria.minimum_auto_gain);
+    ViewerGuidedPoseStatusOverlay {
+        hold_frames: hold_frames.min(DATASET_GAIN_CAPTURE_HOLD_FRAMES),
+        hold_target: DATASET_GAIN_CAPTURE_HOLD_FRAMES,
+        detail_label: "gain",
+        detail_value: assessment.constraint_gain,
+        detail_limit: minimum_gain,
+        matched: hold_frames >= DATASET_GAIN_CAPTURE_HOLD_FRAMES,
     }
 }
 
@@ -2770,6 +2665,40 @@ struct AutoCaptureSession {
     last_accepted_at_ns: u64,
     next_candidate_id: u64,
     last_assessment: Option<AutoAdmissionAssessment>,
+    dataset_gain_hold_frames: u8,
+    dataset_gain_last_hold_measurement: Option<GuidedPoseMeasurement>,
+}
+
+impl AutoCaptureSession {
+    fn update_dataset_gain_hold(
+        &mut self,
+        measurement: GuidedPoseMeasurement,
+    ) -> Result<u8, String> {
+        let jitter_score = self
+            .dataset_gain_last_hold_measurement
+            .as_ref()
+            .map_or(0.0, |previous| {
+                guided_hold_jitter_score(previous, &measurement)
+            });
+        if jitter_score > 1.0 {
+            self.reset_dataset_gain_hold();
+            return Err(format!(
+                "hold jitter {:.2} exceeds stability limit",
+                jitter_score
+            ));
+        }
+        self.dataset_gain_hold_frames = self
+            .dataset_gain_hold_frames
+            .saturating_add(1)
+            .min(DATASET_GAIN_CAPTURE_HOLD_FRAMES);
+        self.dataset_gain_last_hold_measurement = Some(measurement);
+        Ok(self.dataset_gain_hold_frames)
+    }
+
+    fn reset_dataset_gain_hold(&mut self) {
+        self.dataset_gain_hold_frames = 0;
+        self.dataset_gain_last_hold_measurement = None;
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -3039,10 +2968,15 @@ pub(crate) struct CalibrationWorkspace {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct CalibrationWorkspaceKey(String);
+pub(crate) struct CalibrationWorkspaceKey(String);
+
+pub(crate) struct CalibrationProvisionRequest {
+    pub(crate) workspace_key: CalibrationWorkspaceKey,
+    pub(crate) intent: CalibrationProvisionIntent,
+}
 
 impl CalibrationWorkspaceKey {
-    fn manual() -> Self {
+    pub(crate) fn manual() -> Self {
         Self("manual".to_owned())
     }
 
@@ -3293,81 +3227,150 @@ impl CalibrationWorkspaceManager {
         None
     }
 
-    pub(crate) fn take_provision_intent(&mut self) -> Option<CalibrationProvisionIntent> {
-        if let Some(intent) = self.active_workspace_mut().take_provision_intent() {
-            return Some(intent);
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn take_provision_intent(&mut self) -> Option<CalibrationProvisionRequest> {
+        let active_key = self.active.clone();
+        if let Some(intent) = self
+            .entries
+            .get_mut(&active_key)
+            .and_then(|entry| entry.workspace.take_provision_intent())
+        {
+            return Some(CalibrationProvisionRequest {
+                workspace_key: active_key,
+                intent,
+            });
         }
-        for entry in self.entries.values_mut() {
+        for (key, entry) in &mut self.entries {
+            if *key == active_key {
+                continue;
+            }
             if let Some(intent) = entry.workspace.take_provision_intent() {
-                return Some(intent);
+                return Some(CalibrationProvisionRequest {
+                    workspace_key: key.clone(),
+                    intent,
+                });
             }
         }
         None
     }
 
     #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_configured(&mut self, label: &str) {
-        self.active_workspace_mut().report_target_configured(label);
+    fn workspace_mut_for_report(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+    ) -> &mut CalibrationWorkspace {
+        let key = if self.entries.contains_key(workspace_key) {
+            workspace_key.clone()
+        } else {
+            self.active.clone()
+        };
+        &mut self
+            .entries
+            .get_mut(&key)
+            .expect("calibration workspace exists")
+            .workspace
     }
 
     #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_configuration_failed(&mut self, message: impl Into<String>) {
-        self.active_workspace_mut()
+    pub(crate) fn report_target_configured(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+        label: &str,
+    ) {
+        self.workspace_mut_for_report(workspace_key)
+            .report_target_configured(label);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_target_configuration_failed(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+        message: impl Into<String>,
+    ) {
+        self.workspace_mut_for_report(workspace_key)
             .report_target_configuration_failed(message);
     }
 
     #[cfg(feature = "platform-ssh")]
     pub(crate) fn report_target_invalidated(&mut self, message: impl Into<String>) {
-        self.active_workspace_mut()
-            .report_target_invalidated(message);
+        let message = message.into();
+        for entry in self.entries.values_mut() {
+            entry.workspace.report_target_invalidated(message.clone());
+        }
     }
 
     #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_bus_discovery_failed(&mut self, message: impl Into<String>) {
-        self.active_workspace_mut()
+    pub(crate) fn report_bus_discovery_failed(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+        message: impl Into<String>,
+    ) {
+        self.workspace_mut_for_report(workspace_key)
             .report_bus_discovery_failed(message);
     }
 
     #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_bus_discovery(&mut self, buses: Vec<camera_toolbox_app::I2cBusInfo>) {
-        self.active_workspace_mut().report_bus_discovery(buses);
+    pub(crate) fn report_bus_discovery(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+        buses: Vec<camera_toolbox_app::I2cBusInfo>,
+    ) {
+        self.workspace_mut_for_report(workspace_key)
+            .report_bus_discovery(buses);
     }
 
-    pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
-        self.active_workspace_mut().report_provision_error(message);
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_provision_error(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+        message: impl Into<String>,
+    ) {
+        self.workspace_mut_for_report(workspace_key)
+            .report_provision_error(message);
     }
 
-    pub(crate) fn report_eeprom_provision_unknown(&mut self, message: impl Into<String>) {
-        self.active_workspace_mut()
+    #[cfg(feature = "platform-ssh")]
+    pub(crate) fn report_eeprom_provision_unknown(
+        &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
+        message: impl Into<String>,
+    ) {
+        self.workspace_mut_for_report(workspace_key)
             .report_eeprom_provision_unknown(message);
     }
 
+    #[cfg(feature = "platform-ssh")]
     pub(crate) fn report_eeprom_inspect(
         &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
         target_label: String,
         result: EepromInspectResult,
     ) {
-        self.active_workspace_mut()
+        self.workspace_mut_for_report(workspace_key)
             .report_eeprom_inspect(target_label, result);
     }
 
+    #[cfg(feature = "platform-ssh")]
     pub(crate) fn report_eeprom_provision(
         &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
         target_label: String,
         result: &EepromWriteResult,
         audit_file: String,
     ) {
-        self.active_workspace_mut()
+        self.workspace_mut_for_report(workspace_key)
             .report_eeprom_provision(target_label, result, audit_file);
     }
 
+    #[cfg(feature = "platform-ssh")]
     pub(crate) fn report_eeprom_provision_audit_error(
         &mut self,
+        workspace_key: &CalibrationWorkspaceKey,
         target_label: String,
         result: &EepromWriteResult,
         error: &str,
     ) {
-        self.active_workspace_mut()
+        self.workspace_mut_for_report(workspace_key)
             .report_eeprom_provision_audit_error(target_label, result, error);
     }
 
@@ -3974,6 +3977,7 @@ impl CalibrationWorkspace {
             self.pts_bridge_cache.clear();
             self.auto_capture.latest_detection = None;
             self.auto_capture.last_assessment = None;
+            self.auto_capture.reset_dataset_gain_hold();
         }
         self.refresh_runtime_auto_admission();
         Ok(acquisition_key)
@@ -4044,6 +4048,7 @@ impl CalibrationWorkspace {
                 return;
             }
             self.auto_capture.last_assessment = self.session.assess_auto_admission(None).ok();
+            self.auto_capture.reset_dataset_gain_hold();
             if binding_changed && self.guided_capture.is_some() {
                 self.stop_guided_capture(
                     "Guided Auto Capture stopped because K/D12 binding changed.",
@@ -4700,6 +4705,7 @@ impl CalibrationWorkspace {
                     }
                     CandidateIntent::AutoCommit => {
                         let Some(pnp_observation) = pnp_observation else {
+                            self.auto_capture.reset_dataset_gain_hold();
                             self.status =
                                 "Automatic candidate rejected: PnP evidence was not produced."
                                     .to_owned();
@@ -4711,6 +4717,7 @@ impl CalibrationWorkspace {
                         {
                             Ok(assessment) => assessment,
                             Err(error) => {
+                                self.auto_capture.reset_dataset_gain_hold();
                                 self.status = format!("Automatic candidate rejected: {error}");
                                 return;
                             }
@@ -4719,12 +4726,56 @@ impl CalibrationWorkspace {
                         if let Some(baseline) = self.session.auto_capture_baseline()
                             && assessment.constraint_gain < baseline.criteria.minimum_auto_gain
                         {
+                            self.auto_capture.reset_dataset_gain_hold();
                             self.auto_capture.last_assessment =
                                 self.session.assess_auto_admission(None).ok();
                             self.status = format!(
                                 "Automatic RTSP precheck rejected: candidate gain {} is below minimum {}.",
                                 format_gain(gain),
                                 format_gain(baseline.criteria.minimum_auto_gain)
+                            );
+                            return;
+                        }
+                        let Some(pose_request) = pose_request.as_ref() else {
+                            self.auto_capture.reset_dataset_gain_hold();
+                            self.status = "Automatic candidate rejected: stable capture requires a valid current K/D12 binding."
+                                .to_owned();
+                            return;
+                        };
+                        let measurement = match guided_pose_measurement(
+                            &detection,
+                            &pnp_observation,
+                            self.session.board(),
+                            &pose_request.initial_intrinsics,
+                            pose_request.reference_image_size,
+                        ) {
+                            Ok(measurement) => measurement,
+                            Err(error) => {
+                                self.auto_capture.reset_dataset_gain_hold();
+                                self.auto_capture.last_assessment = Some(assessment.clone());
+                                self.status =
+                                    format!("Automatic capture waiting for stable board: {error}");
+                                return;
+                            }
+                        };
+                        let hold_frames =
+                            match self.auto_capture.update_dataset_gain_hold(measurement) {
+                                Ok(hold_frames) => hold_frames,
+                                Err(reason) => {
+                                    self.auto_capture.last_assessment = Some(assessment.clone());
+                                    self.status = format!(
+                                        "Automatic capture waiting for stable board: {reason}."
+                                    );
+                                    return;
+                                }
+                            };
+                        if hold_frames < DATASET_GAIN_CAPTURE_HOLD_FRAMES {
+                            self.auto_capture.last_assessment = Some(assessment.clone());
+                            self.status = format!(
+                                "Automatic candidate gain {} passed; stable hold {}/{}.",
+                                format_gain(gain),
+                                hold_frames,
+                                DATASET_GAIN_CAPTURE_HOLD_FRAMES
                             );
                             return;
                         }
@@ -4738,7 +4789,7 @@ impl CalibrationWorkspace {
                                 token.frame_identity(),
                                 intent,
                                 guided_step_index,
-                                pose_request.clone(),
+                                Some(pose_request.clone()),
                             ) {
                                 Ok(yuv_candidate_id) => {
                                     self.auto_capture.last_assessment = Some(assessment.clone());
@@ -4788,6 +4839,7 @@ impl CalibrationWorkspace {
                                 }
                                 self.auto_capture.last_assessment =
                                     self.session.assess_auto_admission(None).ok();
+                                self.auto_capture.reset_dataset_gain_hold();
                                 self.auto_capture.last_accepted_at_ns = committed_at_ns;
                                 self.coverage_dirty = true;
                                 self.status = format!(
@@ -4797,6 +4849,7 @@ impl CalibrationWorkspace {
                                 );
                             }
                             Err(error) => {
+                                self.auto_capture.reset_dataset_gain_hold();
                                 self.auto_capture.last_assessment =
                                     self.session.assess_auto_admission(None).ok();
                                 self.status =
@@ -5327,8 +5380,8 @@ impl CalibrationWorkspace {
                             end_xyz: target.pose.xyz,
                             z_delta: target.pose.xyz[2] - assessment.measurement.pose.xyz[2],
                         });
-                    let instruction = current_assessment.map(|assessment| {
-                        guided_pose_instruction_overlay(assessment, target, runtime.hold_frames)
+                    let status = current_assessment.map(|assessment| {
+                        guided_pose_status_overlay(assessment, runtime.hold_frames)
                     });
                     let rotation_rings = current_assessment
                         .map(|assessment| guided_pose_rotation_rings_overlay(assessment, target));
@@ -5338,13 +5391,30 @@ impl CalibrationWorkspace {
                         grid_lines: Arc::clone(&target.grid_lines),
                         rotation_rings,
                         pose_arrow,
-                        instruction,
+                        status,
                         matched: current_assessment.is_some_and(|assessment| assessment.matched),
                     }
                 })
             })
             .flatten()
         });
+        let dataset_gain_status = (self.auto_capture_enabled
+            && self.auto_capture_trigger_mode == AutoCaptureTriggerMode::DatasetGain
+            && self.live_admission_context.as_ref().is_some_and(|context| {
+                context.acquisition_key == acquisition_key && context.image_size == image_size
+            }))
+        .then(|| {
+            self.auto_capture
+                .last_assessment
+                .as_ref()
+                .map(|assessment| {
+                    dataset_gain_status_overlay(
+                        assessment,
+                        self.auto_capture.dataset_gain_hold_frames,
+                    )
+                })
+        })
+        .flatten();
         let latest = self
             .auto_capture
             .last_dataset_overlay
@@ -5364,7 +5434,11 @@ impl CalibrationWorkspace {
                     && latest.detection.image_size == image_size
                     && now_ns.saturating_sub(latest.completed_at_ns) <= LIVE_DETECTION_MARKER_TTL_NS
             });
-        if latest.is_none() && guided_target.is_none() && realtime.is_none() {
+        if latest.is_none()
+            && guided_target.is_none()
+            && realtime.is_none()
+            && dataset_gain_status.is_none()
+        {
             return None;
         }
         let realtime_detection = realtime.and_then(|latest| {
@@ -5390,6 +5464,7 @@ impl CalibrationWorkspace {
                 }),
                 realtime_detection,
                 guided_target,
+                dataset_gain_status,
             },
         })
     }
@@ -5780,21 +5855,25 @@ impl CalibrationWorkspace {
             snid_error
         };
 
-        ui.collapsing("EEPROM Provisioning", |ui| {
-            self.render_eeprom_snid_editor(ui, snid_result.as_ref().map(String::as_str));
-            if let Some(reason) = eeprom_disabled_reason {
-                ui.colored_label(egui::Color32::YELLOW, reason);
-            }
-            self.eeprom.render_body(
-                context,
-                ui,
-                eeprom_solution.as_ref(),
-                serial_number,
-                sftp_source,
-                provision_target,
-                eeprom_disabled_reason,
-            );
-        });
+        egui::CollapsingHeader::new("EEPROM Provisioning")
+            .id_salt("eeprom_provisioning_foldout")
+            .default_open(true)
+            .show(ui, |ui| {
+                self.render_eeprom_snid_editor(ui, snid_result.as_ref().map(String::as_str));
+                ui.separator();
+                if let Some(reason) = eeprom_disabled_reason {
+                    ui.colored_label(egui::Color32::YELLOW, reason);
+                }
+                self.eeprom.render_body(
+                    context,
+                    ui,
+                    eeprom_solution.as_ref(),
+                    serial_number,
+                    sftp_source,
+                    provision_target,
+                    export_reason,
+                );
+            });
         self.eeprom.render_confirmation(
             context,
             provision_target,
@@ -5852,7 +5931,10 @@ impl CalibrationWorkspace {
             });
             if previous_mode != self.auto_capture_trigger_mode {
                 match previous_mode {
-                    AutoCaptureTriggerMode::DatasetGain => self.auto_capture_enabled = false,
+                    AutoCaptureTriggerMode::DatasetGain => {
+                        self.auto_capture.reset_dataset_gain_hold();
+                        self.auto_capture_enabled = false;
+                    }
                     AutoCaptureTriggerMode::GuidedPresetPose => {
                         self.stop_guided_capture(
                             "Guided Auto Capture stopped because the trigger mode changed.",
@@ -5866,10 +5948,11 @@ impl CalibrationWorkspace {
                     let auto_capture_changed = ui
                         .checkbox(&mut self.auto_capture_enabled, "Enable Dataset-gain auto capture")
                         .on_hover_text(
-                            "Preserves the existing flow: captures candidates whose Dataset Acceptance Gain exceeds Minimum auto Gain.",
+                            "Captures only after Dataset Acceptance Gain passes and the detected board pose remains stable for several frames.",
                         )
                         .changed();
                     if auto_capture_changed {
+                        self.auto_capture.reset_dataset_gain_hold();
                         self.refresh_runtime_auto_admission();
                         if self.auto_capture_enabled && !self.active_live_admission() {
                             self.status = "Auto Capture waits for one displayed frame and complete valid acceptance inputs."
@@ -5877,8 +5960,15 @@ impl CalibrationWorkspace {
                         }
                     }
                     ui.weak(
-                        "Dataset gain mode uses Minimum auto Gain from Dataset Acceptance. It does not follow preset poses.",
+                        "Dataset gain mode uses Minimum auto Gain and requires a stable board hold before capture.",
                     );
+                    if self.auto_capture_enabled && self.auto_capture.dataset_gain_hold_frames > 0 {
+                        ui.weak(format!(
+                            "Stable hold: {}/{} frames",
+                            self.auto_capture.dataset_gain_hold_frames,
+                            DATASET_GAIN_CAPTURE_HOLD_FRAMES
+                        ));
+                    }
                     if let Some(assessment) = self.auto_capture.last_assessment.as_ref() {
                         self.render_dataset_assessment(ui, assessment);
                     } else {
@@ -8358,12 +8448,6 @@ fn pnp_state_reason(state: &AutoAdmissionPnpState) -> String {
         AutoAdmissionPnpState::BindingGap(reason) => format!("PnP binding gap: {reason}"),
         AutoAdmissionPnpState::DepthGap(reason) => format!("Depth gap: {reason}"),
         AutoAdmissionPnpState::PoseGap(reason) => format!("Pose gap: {reason}"),
-        AutoAdmissionPnpState::RmseReprojectionGap(reason) => {
-            format!("RMSE reprojection gap: {reason}")
-        }
-        AutoAdmissionPnpState::MaxReprojectionGap(reason) => {
-            format!("Max reprojection gap: {reason}")
-        }
         AutoAdmissionPnpState::Invalid(reason) => format!("PnP evidence was rejected: {reason}"),
     }
 }
@@ -8376,8 +8460,6 @@ fn pnp_state_gap_label(state: &AutoAdmissionPnpState) -> Option<&'static str> {
         AutoAdmissionPnpState::BindingGap(_) => Some("PnP Binding Gap"),
         AutoAdmissionPnpState::DepthGap(_) => Some("Depth Gap"),
         AutoAdmissionPnpState::PoseGap(_) => Some("Pose Gap"),
-        AutoAdmissionPnpState::RmseReprojectionGap(_) => Some("RMSE ReProj Gap"),
-        AutoAdmissionPnpState::MaxReprojectionGap(_) => Some("Max ReProj Gap"),
         AutoAdmissionPnpState::Invalid(_) => Some("PnP Gap"),
     }
 }
@@ -9351,6 +9433,49 @@ mod tests {
         }
     }
 
+    fn drain_auto_capture_for_test(workspace: &mut CalibrationWorkspace, context: &egui::Context) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
+            workspace.tick(context);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            workspace.auto_capture.pending.is_empty(),
+            "auto worker did not finish: {}",
+            workspace.status
+        );
+    }
+
+    fn configure_single_bin_acceptance(workspace: &mut CalibrationWorkspace) {
+        workspace.acceptance_draft.field_columns = "1".to_owned();
+        workspace.acceptance_draft.field_rows = "1".to_owned();
+        workspace.acceptance_draft.field_target_per_cell = "1".to_owned();
+        workspace.acceptance_draft.pnp_depth_min = "0.001".to_owned();
+        workspace.acceptance_draft.pnp_depth_max = "10000000".to_owned();
+        workspace.acceptance_draft.pnp_depth_bins = "1".to_owned();
+        workspace.acceptance_draft.depth_target_per_bin = "1".to_owned();
+        workspace.acceptance_draft.pnp_tilt_deadband_deg = "0".to_owned();
+        workspace.acceptance_draft.pnp_tilt_max_deg = "89".to_owned();
+        workspace.acceptance_draft.pnp_tilt_bins = "1".to_owned();
+        workspace.acceptance_draft.pnp_azimuth_sectors = "1".to_owned();
+        workspace.acceptance_draft.pose_target_per_bin = "1".to_owned();
+        workspace.acceptance_draft.minimum_auto_gain = "0.1".to_owned();
+    }
+
+    #[test]
+    fn dataset_gain_hold_rejects_jitter_between_matched_frames() {
+        let mut auto_capture = AutoCaptureSession::default();
+        let first = guided_hold_assessment([0.0, 0.0, 1000.0], [0.0; 3], 0.2).measurement;
+        let second = guided_hold_assessment([40.0, 0.0, 1000.0], [0.0; 3], 0.2).measurement;
+
+        assert_eq!(auto_capture.update_dataset_gain_hold(first).unwrap(), 1);
+        let error = auto_capture.update_dataset_gain_hold(second).unwrap_err();
+
+        assert!(error.contains("hold jitter"));
+        assert_eq!(auto_capture.dataset_gain_hold_frames, 0);
+        assert!(auto_capture.dataset_gain_last_hold_measurement.is_none());
+    }
+
     fn guided_hold_runtime() -> GuidedCaptureRuntime {
         let source = test_live_source();
         let frame = live_frame(1);
@@ -9647,7 +9772,7 @@ mod tests {
     }
 
     #[test]
-    fn guided_instruction_hud_reports_dominant_board_move_and_hold() {
+    fn guided_status_overlay_reports_hold_and_pose_error() {
         let target = guided_test_target([0.50, 0.50], 0.50, 0.0, 0.0);
         let shifted = assess_guided_pose(
             0,
@@ -9660,10 +9785,13 @@ mod tests {
         )
         .unwrap();
 
-        let shifted_instruction = guided_pose_instruction_overlay(&shifted, &target, 0);
-        assert!(!shifted_instruction.matched);
-        assert_eq!(shifted_instruction.primary, "MOVE BOARD RIGHT");
-        assert!(shifted_instruction.secondary.contains("pose error"));
+        let shifted_status = guided_pose_status_overlay(&shifted, 0);
+        assert!(!shifted_status.matched);
+        assert_eq!(shifted_status.hold_frames, 0);
+        assert_eq!(shifted_status.hold_target, GUIDED_CAPTURE_HOLD_FRAMES);
+        assert_eq!(shifted_status.detail_label, "pose error");
+        assert_eq!(shifted_status.detail_limit, GUIDED_POSE_MATCH_SCORE_LIMIT);
+        assert_eq!(shifted_status.detail_value, shifted.pose_error_score);
 
         let aligned = assess_guided_pose(
             0,
@@ -9675,11 +9803,12 @@ mod tests {
             guided_test_image_size(),
         )
         .unwrap();
-        let hold_instruction = guided_pose_instruction_overlay(&aligned, &target, 2);
+        let hold_status = guided_pose_status_overlay(&aligned, 2);
 
-        assert!(hold_instruction.matched);
-        assert_eq!(hold_instruction.primary, "HOLD STILL");
-        assert!(hold_instruction.secondary.contains("hold 2/4"));
+        assert!(hold_status.matched);
+        assert_eq!(hold_status.hold_frames, 2);
+        assert_eq!(hold_status.hold_target, GUIDED_CAPTURE_HOLD_FRAMES);
+        assert_eq!(hold_status.detail_value, aligned.pose_error_score);
     }
 
     #[test]
@@ -9747,7 +9876,7 @@ mod tests {
     }
 
     #[test]
-    fn guided_pose_assessment_rejects_6dof_error_without_pnp_rmse_gate() {
+    fn guided_pose_assessment_rejects_6dof_error_without_reprojection_metric_gate() {
         let target = guided_test_target([0.50, 0.50], 0.50, 20.0, 90.0);
         let far_detection = guided_test_detection([0.80, 0.50], 0.50);
         let far_pnp = guided_test_pnp([0.80, 0.50], 0.50, 20.0, 90.0, 0.8, 2.0);
@@ -9777,7 +9906,7 @@ mod tests {
         .unwrap();
         assert!(
             noisy_but_aligned.matched,
-            "Guided pose should ignore PnP RMSE/max reprojection gates: {noisy_but_aligned:?}"
+            "Guided pose should ignore PnP reprojection metrics: {noisy_but_aligned:?}"
         );
     }
 
@@ -11203,6 +11332,9 @@ mod tests {
             "fx",
             "620.00000000",
             "Distortion coefficients (OpenCV order)",
+            "YgStereo SNID",
+            "SNID incomplete",
+            "EEPROM Provisioning",
             "k1[0] = 0.1000000000",
             "Square size (mm)",
         ] {
@@ -11415,6 +11547,20 @@ mod tests {
         })
     }
 
+    #[cfg(feature = "platform-ssh")]
+    fn eeprom_inspect_result(serial: &str, hash_byte: char) -> EepromInspectResult {
+        EepromInspectResult {
+            state: camera_toolbox_app::EepromDeviceState {
+                image_sha256: hash_byte.to_string().repeat(64),
+                flag_valid: true,
+                serial: camera_toolbox_app::EepromSerialState::Valid {
+                    value: serial.to_owned(),
+                },
+            },
+            backup: vec![0; camera_toolbox_core::YG_STEREO_P24C64G_IMAGE_BYTES],
+        }
+    }
+
     #[test]
     fn manager_observe_unknown_live_source_does_not_create_workspace() {
         let context = egui::Context::default();
@@ -11429,6 +11575,91 @@ mod tests {
 
         assert_eq!(manager.workspace_count_for_test(), 1);
         assert_eq!(manager.active_label_for_test(), "Manual / Files");
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn manager_preserves_eeprom_intent_origin_for_inactive_session() {
+        let context = egui::Context::default();
+        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
+        let manual_key = CalibrationWorkspaceKey::manual();
+        let source = test_live_source();
+
+        manager.ensure_live_source_for_test(&source);
+        manager
+            .entries
+            .get_mut(&manual_key)
+            .unwrap()
+            .workspace
+            .eeprom
+            .set_pending_for_test(CalibrationProvisionIntent::Inspect {
+                expected_target_label: "root@camera:22 / i2c-4 @aaaa".to_owned(),
+            });
+
+        let request = manager.take_provision_intent().unwrap();
+
+        assert_eq!(request.workspace_key, manual_key);
+        assert!(matches!(
+            request.intent,
+            CalibrationProvisionIntent::Inspect {
+                ref expected_target_label
+            } if expected_target_label.contains("i2c-4")
+        ));
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn manager_routes_eeprom_results_to_origin_session() {
+        let context = egui::Context::default();
+        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
+        let manual_key = CalibrationWorkspaceKey::manual();
+        let source = test_live_source();
+        let live_key = CalibrationWorkspaceKey::for_live_source(&source);
+
+        manager.ensure_live_source_for_test(&source);
+        manager.report_eeprom_inspect(
+            &manual_key,
+            "root@camera:22 / i2c-4 @aaaa".to_owned(),
+            eeprom_inspect_result("sn4", '4'),
+        );
+
+        assert_eq!(
+            manager
+                .entries
+                .get(&manual_key)
+                .unwrap()
+                .workspace
+                .eeprom
+                .inspected_target_for_test(),
+            Some("root@camera:22 / i2c-4 @aaaa")
+        );
+        assert!(
+            manager
+                .entries
+                .get(&live_key)
+                .unwrap()
+                .workspace
+                .eeprom
+                .inspected_target_for_test()
+                .is_none()
+        );
+
+        manager.report_eeprom_inspect(
+            &live_key,
+            "root@camera:22 / i2c-6 @bbbb".to_owned(),
+            eeprom_inspect_result("sn6", '6'),
+        );
+
+        assert_eq!(
+            manager
+                .entries
+                .get(&live_key)
+                .unwrap()
+                .workspace
+                .eeprom
+                .inspected_target_for_test(),
+            Some("root@camera:22 / i2c-6 @bbbb")
+        );
     }
 
     #[test]
@@ -11912,6 +12143,7 @@ mod tests {
             .clone();
         let board = workspace.session.board();
         let board_center = guided_pose_inner_center_point(board);
+
         let detection = found_chessboard_detection(displayed.width, displayed.height);
         workspace.auto_capture.latest_detection = Some(IdentityBoundDetection {
             identity: displayed.identity.clone(),
@@ -11946,6 +12178,41 @@ mod tests {
                 .is_some(),
             "realtime overlay must carry the current detection pose axes"
         );
+    }
+
+    #[test]
+    fn dataset_gain_live_overlay_shows_stable_hold_in_top_left() {
+        let context = egui::Context::default();
+        let store = auto_capture_store();
+        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
+        configure_single_bin_acceptance(&mut workspace);
+        workspace.auto_capture_trigger_mode = AutoCaptureTriggerMode::DatasetGain;
+        workspace.acceptance_draft.minimum_auto_gain = "0.4".to_owned();
+        workspace.auto_capture_enabled = true;
+
+        let source = test_live_source();
+        let displayed = live_frame(47);
+        workspace.observe_live_frame(Arc::clone(&displayed), source.clone(), store, false);
+        workspace.auto_capture.dataset_gain_hold_frames = 2;
+        workspace.auto_capture.last_assessment = Some(AutoAdmissionAssessment {
+            active_criteria: Some(workspace.acceptance_draft.parse().unwrap()),
+            constraint_gain: 0.5,
+            ..Default::default()
+        });
+
+        let presentation = workspace
+            .live_viewer_presentation_at(Some(&displayed), Some(&source), 1_000)
+            .expect("dataset-gain overlay should be published while capture is enabled");
+        let status = presentation
+            .overlay
+            .dataset_gain_status
+            .expect("dataset-gain status must be shown in the viewer overlay");
+        assert_eq!(status.hold_frames, 2);
+        assert_eq!(status.hold_target, DATASET_GAIN_CAPTURE_HOLD_FRAMES);
+        assert_eq!(status.detail_label, "gain");
+        assert!((status.detail_value - 0.5).abs() < f64::EPSILON);
+        assert!((status.detail_limit - 0.4).abs() < f64::EPSILON);
+        assert!(presentation.overlay.guided_target.is_none());
     }
 
     #[test]
@@ -12142,41 +12409,35 @@ mod tests {
         let context = egui::Context::default();
         let store = auto_capture_store();
         let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        let displayed = chessboard_live_frame(3);
-        workspace.acceptance_draft.field_columns = "1".to_owned();
-        workspace.acceptance_draft.field_rows = "1".to_owned();
-        workspace.acceptance_draft.field_target_per_cell = "1".to_owned();
-        workspace.acceptance_draft.pnp_depth_min = "0.001".to_owned();
-        workspace.acceptance_draft.pnp_depth_max = "10000000".to_owned();
-        workspace.acceptance_draft.pnp_depth_bins = "1".to_owned();
-        workspace.acceptance_draft.depth_target_per_bin = "1".to_owned();
-        workspace.acceptance_draft.pnp_tilt_deadband_deg = "0".to_owned();
-        workspace.acceptance_draft.pnp_tilt_max_deg = "89".to_owned();
-        workspace.acceptance_draft.pnp_tilt_bins = "1".to_owned();
-        workspace.acceptance_draft.pnp_azimuth_sectors = "1".to_owned();
-        workspace.acceptance_draft.pose_target_per_bin = "1".to_owned();
-        workspace.acceptance_draft.pnp_max_rmse_px = "100".to_owned();
-        workspace.acceptance_draft.pnp_max_error_px = "100".to_owned();
+        configure_single_bin_acceptance(&mut workspace);
         workspace.auto_capture_enabled = true;
+        let source = test_live_source();
+        let mut displayed = chessboard_live_frame(1);
+        workspace.observe_live_frame(Arc::clone(&displayed), source.clone(), store.clone(), false);
+        assert!(workspace.active_live_admission(), "{}", workspace.status);
 
-        workspace.observe_live_frame(
-            Arc::clone(&displayed),
-            test_live_source(),
-            store.clone(),
-            true,
-        );
-
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while !workspace.auto_capture.pending.is_empty() && Instant::now() < deadline {
-            workspace.tick(&context);
-            std::thread::sleep(std::time::Duration::from_millis(10));
+        for sequence in 1..=DATASET_GAIN_CAPTURE_HOLD_FRAMES {
+            if sequence > 1 {
+                displayed = chessboard_live_frame(u64::from(sequence));
+            }
+            workspace.auto_capture.last_observed = None;
+            workspace.auto_capture.last_observed_at_ns = 0;
+            workspace.observe_live_frame(
+                Arc::clone(&displayed),
+                source.clone(),
+                store.clone(),
+                true,
+            );
+            drain_auto_capture_for_test(&mut workspace, &context);
+            if sequence < DATASET_GAIN_CAPTURE_HOLD_FRAMES {
+                assert_eq!(workspace.session.items().len(), 0, "{}", workspace.status);
+                assert_eq!(
+                    workspace.auto_capture.dataset_gain_hold_frames, sequence,
+                    "{}",
+                    workspace.status
+                );
+            }
         }
-
-        assert!(
-            workspace.auto_capture.pending.is_empty(),
-            "auto worker did not finish: {}",
-            workspace.status
-        );
         assert_eq!(workspace.session.items().len(), 1, "{}", workspace.status);
         let item = &workspace.session.items()[0];
         let CalibrationItemStatus::Found(detection) = &item.status else {
@@ -12223,8 +12484,6 @@ mod tests {
         workspace.acceptance_draft.pnp_tilt_bins = "1".to_owned();
         workspace.acceptance_draft.pnp_azimuth_sectors = "1".to_owned();
         workspace.acceptance_draft.pose_target_per_bin = "1".to_owned();
-        workspace.acceptance_draft.pnp_max_rmse_px = "100".to_owned();
-        workspace.acceptance_draft.pnp_max_error_px = "100".to_owned();
         workspace.acceptance_draft.minimum_auto_gain = "0.75".to_owned();
         workspace.auto_capture_enabled = true;
 
@@ -12396,7 +12655,7 @@ mod tests {
         );
         assert_eq!(
             workspace.acceptance_last_valid_criteria.pnp_depth_max,
-            2400.0
+            1000.0
         );
 
         workspace.apply_acceptance_render_result(false, false);

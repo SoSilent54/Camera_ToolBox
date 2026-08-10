@@ -35,8 +35,6 @@ pub(crate) struct DatasetAcceptanceDraft {
     pub(crate) pnp_tilt_bins: String,
     pub(crate) pnp_azimuth_sectors: String,
     pub(crate) pose_target_per_bin: String,
-    pub(crate) pnp_max_rmse_px: String,
-    pub(crate) pnp_max_error_px: String,
     pub(crate) minimum_auto_gain: String,
     pub(crate) error: Option<String>,
 }
@@ -64,8 +62,6 @@ impl DatasetAcceptanceDraft {
             pnp_tilt_bins: criteria.pnp_tilt_bins.to_string(),
             pnp_azimuth_sectors: criteria.pnp_azimuth_sectors.to_string(),
             pose_target_per_bin: criteria.pose_target_per_bin.to_string(),
-            pnp_max_rmse_px: criteria.pnp_max_rmse_px.to_string(),
-            pnp_max_error_px: criteria.pnp_max_error_px.to_string(),
             minimum_auto_gain: criteria.minimum_auto_gain.to_string(),
             error: None,
         }
@@ -139,14 +135,6 @@ impl DatasetAcceptanceDraft {
         pose_capacity
             .checked_mul(pose_target_per_bin)
             .ok_or_else(|| "Pose quota target overflows usize.".to_owned())?;
-        let pnp_max_rmse_px = parse_non_negative_f64("PnP maximum RMSE", &self.pnp_max_rmse_px)?;
-        let pnp_max_error_px =
-            parse_non_negative_f64("PnP maximum reprojection error", &self.pnp_max_error_px)?;
-        if pnp_max_error_px < pnp_max_rmse_px {
-            return Err(
-                "PnP maximum reprojection error must be at least the RMSE limit.".to_owned(),
-            );
-        }
         let minimum_auto_gain =
             parse_normalized_gain("Minimum automatic Gain", &self.minimum_auto_gain)?;
         Ok(AutoCaptureAcceptanceCriteria {
@@ -163,8 +151,6 @@ impl DatasetAcceptanceDraft {
             pnp_tilt_bins,
             pnp_azimuth_sectors,
             pose_target_per_bin,
-            pnp_max_rmse_px,
-            pnp_max_error_px,
             minimum_auto_gain,
         })
     }
@@ -574,28 +560,14 @@ pub(crate) fn render_dataset_acceptance(
                     });
 
                     ui.group(|ui| {
-                        ui.strong("PnP quality gates");
+                        ui.strong("Automatic capture gate");
                         ui.weak(
-                            "Only finite, positive-depth PnP evidence within both limits can occupy depth or pose bins.",
+                            "PnP evidence only needs a current binding, finite pose, positive board depth, and configured depth/pose coverage bins.",
                         );
                         egui::Grid::new("dataset_acceptance_pnp_quality_editor")
                             .num_columns(2)
                             .spacing([8.0, 4.0])
                             .show(ui, |ui| {
-                                acceptance_text_row(
-                                    ui,
-                                    "PnP RMSE max (px)",
-                                    &mut draft.pnp_max_rmse_px,
-                                    &mut changed,
-                                    &mut editing,
-                                );
-                                acceptance_text_row(
-                                    ui,
-                                    "PnP max error (px)",
-                                    &mut draft.pnp_max_error_px,
-                                    &mut changed,
-                                    &mut editing,
-                                );
                                 acceptance_text_row(
                                     ui,
                                     "Minimum auto Gain",
@@ -1348,8 +1320,6 @@ fn depth_range_state_label(state: &AutoAdmissionPnpState) -> &'static str {
         AutoAdmissionPnpState::BindingGap(_) => "binding mismatch",
         AutoAdmissionPnpState::DepthGap(_) => "depth gate failed",
         AutoAdmissionPnpState::PoseGap(_) => "pose gate failed",
-        AutoAdmissionPnpState::RmseReprojectionGap(_) => "RMSE gate failed",
-        AutoAdmissionPnpState::MaxReprojectionGap(_) => "max reprojection gate failed",
         AutoAdmissionPnpState::Invalid(_) => "invalid PnP evidence",
     }
 }
@@ -2033,18 +2003,18 @@ mod tests {
     #[test]
     fn acceptance_draft_parses_runtime_pnp_thresholds() {
         let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
-        assert_eq!(criteria.field_target_per_cell, 1);
-        assert!((criteria.minimum_auto_gain - 0.3).abs() < f64::EPSILON);
+        assert_eq!(criteria.field_target_per_cell, 50);
+        assert!((criteria.minimum_auto_gain - 0.4).abs() < f64::EPSILON);
 
         assert_eq!(
             (criteria.pnp_depth_min, criteria.pnp_depth_max),
-            (400.0, 2400.0)
+            (400.0, 1000.0)
         );
         assert_eq!(
             (criteria.pnp_depth_bins, criteria.depth_target_per_bin),
-            (4, 1)
+            (4, 100)
         );
-        assert_eq!(criteria.pose_target_per_bin, 1);
+        assert_eq!(criteria.pose_target_per_bin, 15);
     }
 
     #[test]
@@ -2064,7 +2034,7 @@ mod tests {
     #[test]
     fn acceptance_draft_rejects_invalid_yaml_thresholds() {
         let yaml = DEFAULT_DATASET_ACCEPTANCE_CONFIG
-            .replace("pnp_depth_max: 2400.0", "pnp_depth_max: 400.0");
+            .replace("pnp_depth_max: 1000.0", "pnp_depth_max: 400.0");
         assert!(
             DatasetAcceptanceDraft::from_yaml_str(&yaml)
                 .unwrap_err()
@@ -2083,10 +2053,6 @@ mod tests {
         draft.field_columns = "16".to_owned();
         draft.pnp_depth_max = "400".to_owned();
         assert!(draft.parse().unwrap_err().contains("greater than minimum"));
-
-        draft.pnp_depth_max = "2400".to_owned();
-        draft.pnp_max_error_px = "1.0".to_owned();
-        assert!(draft.parse().unwrap_err().contains("at least the RMSE"));
     }
 
     #[test]

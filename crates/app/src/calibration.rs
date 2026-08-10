@@ -486,8 +486,6 @@ pub struct AutoCaptureAcceptanceCriteria {
     pub pnp_azimuth_sectors: usize,
     /// 每个 pose bin 需要累计的合格 view 数。
     pub pose_target_per_bin: usize,
-    pub pnp_max_rmse_px: f64,
-    pub pnp_max_error_px: f64,
     /// 自动候选单张图的最小归一化总 Gain；低于该值不允许入库。
     pub minimum_auto_gain: f64,
 }
@@ -571,15 +569,6 @@ impl AutoCaptureAcceptanceCriteria {
                 "pose quota target overflows usize".to_owned(),
             ));
         }
-        if !self.pnp_max_rmse_px.is_finite()
-            || !self.pnp_max_error_px.is_finite()
-            || self.pnp_max_rmse_px < 0.0
-            || self.pnp_max_error_px < self.pnp_max_rmse_px
-        {
-            return Err(CalibrationSessionError::InvalidAutoCaptureBaseline(
-                "PnP reprojection gates are invalid".to_owned(),
-            ));
-        }
         if !self.minimum_auto_gain.is_finite()
             || self.minimum_auto_gain <= 0.0
             || self.minimum_auto_gain > 1.0
@@ -661,8 +650,6 @@ impl AutoCaptureBaseline {
         hash.u64(self.criteria.pnp_tilt_bins as u64);
         hash.u64(self.criteria.pnp_azimuth_sectors as u64);
         hash.u64(self.criteria.pose_target_per_bin as u64);
-        hash.bytes(&self.criteria.pnp_max_rmse_px.to_bits().to_be_bytes());
-        hash.bytes(&self.criteria.pnp_max_error_px.to_bits().to_be_bytes());
         hash.bytes(&self.criteria.minimum_auto_gain.to_bits().to_be_bytes());
         hash.finish()
     }
@@ -789,8 +776,6 @@ pub enum AutoAdmissionPnpState {
     BindingGap(String),
     DepthGap(String),
     PoseGap(String),
-    RmseReprojectionGap(String),
-    MaxReprojectionGap(String),
     Invalid(String),
 }
 
@@ -2472,11 +2457,7 @@ impl CalibrationSession {
             }
             CalibrationSessionError::RejectInvalidPnP(reason) => {
                 let lower = reason.to_ascii_lowercase();
-                if lower.contains("rmse") {
-                    AutoAdmissionPnpState::RmseReprojectionGap(reason)
-                } else if lower.contains("maximum reprojection") || lower.contains("max") {
-                    AutoAdmissionPnpState::MaxReprojectionGap(reason)
-                } else if lower.contains("depth") {
+                if lower.contains("depth") {
                     AutoAdmissionPnpState::DepthGap(reason)
                 } else if lower.contains("tilt")
                     || lower.contains("azimuth")
@@ -2535,18 +2516,6 @@ impl CalibrationSession {
             ));
         }
         let geometry = observation.geometry(board)?;
-        if observation.reprojection_rmse > criteria.pnp_max_rmse_px {
-            return Err(CalibrationSessionError::RejectInvalidPnP(format!(
-                "PnP reprojection RMSE {:.6} px exceeds {:.6} px",
-                observation.reprojection_rmse, criteria.pnp_max_rmse_px
-            )));
-        }
-        if observation.max_reprojection_error > criteria.pnp_max_error_px {
-            return Err(CalibrationSessionError::RejectInvalidPnP(format!(
-                "PnP maximum reprojection error {:.6} px exceeds {:.6} px",
-                observation.max_reprojection_error, criteria.pnp_max_error_px
-            )));
-        }
         let depth_corner_counts = depth_corner_counts_for_criteria(observation, criteria, board)?;
         Ok((
             depth_corner_counts,
@@ -2790,8 +2759,6 @@ mod tests {
             pnp_tilt_bins: 3,
             pnp_azimuth_sectors: 8,
             pose_target_per_bin: 1,
-            pnp_max_rmse_px: 1.5,
-            pnp_max_error_px: 4.0,
             minimum_auto_gain: 0.3,
         }
     }
@@ -3494,45 +3461,8 @@ mod tests {
     }
 
     #[test]
-    fn dataset_acceptance_reports_gate_gaps_separately_from_zero_gain() {
+    fn dataset_acceptance_reports_geometry_gaps_separately_from_zero_gain() {
         let binding = test_binding();
-
-        let mut rmse_session = CalibrationSession::new(board());
-        let rmse_item = add_found(&mut rmse_session, "rmse-gap.png", 10);
-        let mut rmse_observation = test_pnp_observation();
-        rmse_observation.reprojection_rmse = test_criteria().pnp_max_rmse_px + 0.1;
-        rmse_session.item_mut(rmse_item).unwrap().pnp_observation = Some(rmse_observation);
-        let rmse_assessment = rmse_session
-            .assess_dataset_acceptance(
-                binding.reference_image_size,
-                &test_criteria(),
-                Some(&binding),
-            )
-            .unwrap();
-        assert!(matches!(
-            rmse_assessment.item_contributions[0].pnp_state,
-            AutoAdmissionPnpState::RmseReprojectionGap(_)
-        ));
-
-        let mut max_error_session = CalibrationSession::new(board());
-        let max_error_item = add_found(&mut max_error_session, "max-error-gap.png", 10);
-        let mut max_error_observation = test_pnp_observation();
-        max_error_observation.max_reprojection_error = test_criteria().pnp_max_error_px + 0.1;
-        max_error_session
-            .item_mut(max_error_item)
-            .unwrap()
-            .pnp_observation = Some(max_error_observation);
-        let max_error_assessment = max_error_session
-            .assess_dataset_acceptance(
-                binding.reference_image_size,
-                &test_criteria(),
-                Some(&binding),
-            )
-            .unwrap();
-        assert!(matches!(
-            max_error_assessment.item_contributions[0].pnp_state,
-            AutoAdmissionPnpState::MaxReprojectionGap(_)
-        ));
 
         let mut depth_criteria = test_criteria();
         depth_criteria.pnp_depth_min = 1_500.0;

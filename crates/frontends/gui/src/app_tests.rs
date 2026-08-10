@@ -2685,6 +2685,7 @@ mod eeprom_operation_tests {
 
     fn provision_intent(request: EepromProvisionRequest) -> CalibrationProvisionIntent {
         CalibrationProvisionIntent::Provision {
+            expected_target_label: "root@camera / i2c-7".to_owned(),
             request,
             expected_before_sha256: "a".repeat(64),
         }
@@ -2988,9 +2989,12 @@ mod eeprom_operation_tests {
 
         app.begin_eeprom_operation(
             &context,
-            CalibrationProvisionIntent::ConfigureTarget(CalibrationEepromTargetRequest {
-                i2c_bus: 7,
-            }),
+            CalibrationProvisionRequest {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                intent: CalibrationProvisionIntent::ConfigureTarget(
+                    CalibrationEepromTargetRequest { i2c_bus: 7 },
+                ),
+            },
         );
 
         assert!(app.eeprom_target.is_none());
@@ -3033,9 +3037,12 @@ mod eeprom_operation_tests {
 
         app.begin_eeprom_operation(
             &context,
-            CalibrationProvisionIntent::ConfigureTarget(CalibrationEepromTargetRequest {
-                i2c_bus: 7,
-            }),
+            CalibrationProvisionRequest {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                intent: CalibrationProvisionIntent::ConfigureTarget(
+                    CalibrationEepromTargetRequest { i2c_bus: 7 },
+                ),
+            },
         );
 
         let target = app
@@ -3065,9 +3072,12 @@ mod eeprom_operation_tests {
 
         app.begin_eeprom_operation(
             &context,
-            CalibrationProvisionIntent::ConfigureTarget(CalibrationEepromTargetRequest {
-                i2c_bus: 7,
-            }),
+            CalibrationProvisionRequest {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                intent: CalibrationProvisionIntent::ConfigureTarget(
+                    CalibrationEepromTargetRequest { i2c_bus: 7 },
+                ),
+            },
         );
 
         assert!(app.eeprom_target.is_some());
