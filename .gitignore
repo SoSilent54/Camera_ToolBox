@@ -4,6 +4,8 @@
 /.ai_doc/
 /.cargo/opencv5.local.toml
 /.cargo/ffmpeg.local.toml
+/crates/frontends/workflow-web/web/node_modules/
+/crates/frontends/workflow-web/web/dist/
 
 # Local project data and settings
 /local_data/
