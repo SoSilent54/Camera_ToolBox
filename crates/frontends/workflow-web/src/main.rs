@@ -27,7 +27,10 @@ use camera_toolbox_app::{
 use clap::Parser;
 use image::{ColorType, codecs::jpeg::JpegEncoder};
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, time::sleep};
+use tokio::{
+    net::TcpListener,
+    time::{Instant, sleep, sleep_until},
+};
 use tower_http::services::{ServeDir, ServeFile};
 use workflow::{WorkflowGraph, seed_workflow_graph, validate_edge};
 
@@ -160,6 +163,7 @@ async fn mjpeg_stream(
         let _decoder = decoder;
         let _cancellation = cancellation;
         let mut last_sequence = None;
+        let mut next_frame_at = Instant::now();
         loop {
             if let Some(completion) = _decoder.completion() {
                 if let Err(error) = completion {
@@ -170,12 +174,21 @@ async fn mjpeg_stream(
             if let Some(frame) = latest_frame.latest()
                 && last_sequence != Some(frame.identity.frame_sequence)
             {
+                let now = Instant::now();
+                if now < next_frame_at {
+                    sleep_until(next_frame_at).await;
+                    continue;
+                }
                 last_sequence = Some(frame.identity.frame_sequence);
                 match mjpeg_chunk(&frame) {
                     Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
                     Err(error) => yield Err(std::io::Error::other(error)),
                 }
-                sleep(frame_interval).await;
+                next_frame_at += frame_interval;
+                let now = Instant::now();
+                while next_frame_at <= now {
+                    next_frame_at += frame_interval;
+                }
                 continue;
             }
             sleep(Duration::from_millis(10)).await;

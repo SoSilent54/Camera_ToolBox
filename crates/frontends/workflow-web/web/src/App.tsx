@@ -496,7 +496,7 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
       <div className="viewer-overlay">{statusText}</div>
       <dl className="viewer-metrics">
         <div><dt>stream</dt><dd>{metrics.streamFps.toFixed(1)} fps</dd></div>
-        <div><dt>render</dt><dd>{metrics.renderFps.toFixed(1)} fps</dd></div>
+        <div><dt>ui raf</dt><dd>{metrics.renderFps.toFixed(1)} fps</dd></div>
         <div><dt>frames</dt><dd>{metrics.frameCount}</dd></div>
         <div><dt>bytes</dt><dd>{formatBytes(metrics.bytes)}</dd></div>
         <div><dt>age</dt><dd>{metrics.lastFrameAgeMs === null ? 'n/a' : `${Math.round(metrics.lastFrameAgeMs)} ms`}</dd></div>
