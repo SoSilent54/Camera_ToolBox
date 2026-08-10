@@ -37,8 +37,8 @@ static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 #[command(name = "camera-toolbox-workflow-web")]
 #[command(about = "Camera Toolbox browser workflow canvas server")]
 struct ServerArgs {
-    /// Web 服务绑定地址；默认只允许本机浏览器访问。
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Web 服务绑定地址；默认允许局域网设备访问，生产环境需要另加认证或防火墙。
+    #[arg(long, default_value = "0.0.0.0")]
     host: IpAddr,
 
     /// Web 服务端口；传 0 时由系统分配可用端口。
