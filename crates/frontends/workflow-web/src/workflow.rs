@@ -106,7 +106,7 @@ pub fn seed_workflow_graph() -> WorkflowGraph {
                     data_kind: DataKind::RtspStream,
                 }],
                 config: json!({
-                    "url": "rtsp://127.0.0.1:554/PRR",
+                    "url": "rtsp://10.21.12.108:554/PRR",
                     "transport": "tcp",
                     "expectedWidth": 1920,
                     "expectedHeight": 1080,
