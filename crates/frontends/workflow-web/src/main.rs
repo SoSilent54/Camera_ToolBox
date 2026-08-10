@@ -1,6 +1,14 @@
 mod workflow;
 
-use std::{net::IpAddr, path::PathBuf, process::Stdio};
+use std::{
+    net::IpAddr,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result, bail};
 use axum::{
@@ -11,12 +19,19 @@ use axum::{
     response::{IntoResponse, Response},
     routing::get,
 };
+use bytes::Bytes;
+use camera_toolbox_adapters::media::{FfmpegRtspDecoder, FfmpegRtspTransport};
+use camera_toolbox_app::{
+    DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, StreamCancellation, StreamSessionId,
+};
 use clap::Parser;
+use image::{ColorType, codecs::jpeg::JpegEncoder};
 use serde::{Deserialize, Serialize};
-use tokio::{net::TcpListener, process::Command};
-use tokio_util::io::ReaderStream;
+use tokio::{net::TcpListener, time::sleep};
 use tower_http::services::{ServeDir, ServeFile};
 use workflow::{WorkflowGraph, seed_workflow_graph, validate_edge};
+
+static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "camera-toolbox-workflow-web")]
@@ -48,6 +63,7 @@ struct MjpegStreamQuery {
     url: String,
     fps: Option<u16>,
     width: Option<u16>,
+    height: Option<u16>,
 }
 
 #[derive(Debug, Clone)]
@@ -55,6 +71,7 @@ struct MjpegStreamConfig {
     url: String,
     fps: u16,
     width: u16,
+    height: u16,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -111,51 +128,64 @@ async fn mjpeg_stream(
     Query(query): Query<MjpegStreamQuery>,
 ) -> std::result::Result<Response, (StatusCode, String)> {
     let config = MjpegStreamConfig::from_query(query)?;
-    let mut child = Command::new("ffmpeg")
-        .arg("-hide_banner")
-        .arg("-loglevel")
-        .arg("error")
-        .arg("-rtsp_transport")
-        .arg("tcp")
-        .arg("-i")
-        .arg(&config.url)
-        .arg("-an")
-        .arg("-vf")
-        .arg(format!(
-            "fps={},scale={}:-1:force_original_aspect_ratio=decrease",
-            config.fps, config.width
-        ))
-        .arg("-q:v")
-        .arg("5")
-        .arg("-f")
-        .arg("mpjpeg")
-        .arg("pipe:1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to start ffmpeg: {error}"),
-            )
-        })?;
-    let stdout = child.stdout.take().ok_or_else(|| {
+    let latest_frame = Arc::new(LatestDecodedFrameSlot::default());
+    let cancellation = StreamCancellation::default();
+    let session_id = StreamSessionId::new(format!(
+        "workflow-mjpeg-{}",
+        NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
+    ))
+    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let decoder = FfmpegRtspDecoder::start(
+        &config.url,
+        FfmpegRtspTransport::Tcp,
+        RtspLatencyMode::Low,
+        u32::from(config.width),
+        u32::from(config.height),
+        session_id,
+        0,
+        Arc::clone(&latest_frame),
+        Duration::from_secs(8),
+        false,
+        &cancellation,
+    )
+    .map_err(|error| {
         (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "failed to capture ffmpeg stdout".to_owned(),
+            StatusCode::BAD_GATEWAY,
+            format!("failed to start internal RTSP decoder: {error}"),
         )
     })?;
-    tokio::spawn(async move {
-        match child.wait().await {
-            Ok(status) => tracing::debug!(operation = "mjpeg_ffmpeg_exit", %status),
-            Err(error) => tracing::debug!(operation = "mjpeg_ffmpeg_wait", error = %error),
-        }
-    });
 
-    let mut response = Body::from_stream(ReaderStream::new(stdout)).into_response();
+    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.fps));
+    let body_stream = async_stream::stream! {
+        let _decoder = decoder;
+        let _cancellation = cancellation;
+        let mut last_sequence = None;
+        loop {
+            if let Some(completion) = _decoder.completion() {
+                if let Err(error) = completion {
+                    tracing::debug!(operation = "mjpeg_internal_decoder", error = %error);
+                }
+                break;
+            }
+            if let Some(frame) = latest_frame.latest()
+                && last_sequence != Some(frame.identity.frame_sequence)
+            {
+                last_sequence = Some(frame.identity.frame_sequence);
+                match mjpeg_chunk(&frame) {
+                    Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
+                    Err(error) => yield Err(std::io::Error::other(error)),
+                }
+                sleep(frame_interval).await;
+                continue;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    };
+
+    let mut response = Body::from_stream(body_stream).into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_static("multipart/x-mixed-replace; boundary=ffmpeg"),
+        HeaderValue::from_static("multipart/x-mixed-replace; boundary=frame"),
     );
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -167,6 +197,40 @@ async fn mjpeg_stream(
     Ok(response)
 }
 
+fn mjpeg_chunk(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
+    let jpeg = encode_rgba_as_jpeg(frame)?;
+    let mut chunk = Vec::with_capacity(jpeg.len() + 64);
+    chunk.extend_from_slice(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n");
+    chunk.extend_from_slice(&jpeg);
+    chunk.extend_from_slice(b"\r\n");
+    Ok(chunk)
+}
+
+fn encode_rgba_as_jpeg(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
+    let pixel_count = u64::from(frame.width)
+        .checked_mul(u64::from(frame.height))
+        .ok_or_else(|| "frame dimensions overflow".to_owned())?;
+    let expected_rgba_len = usize::try_from(pixel_count.saturating_mul(4))
+        .map_err(|_| "frame byte length overflows usize".to_owned())?;
+    if frame.rgba.len() != expected_rgba_len {
+        return Err(format!(
+            "RGBA frame length mismatch: expected {expected_rgba_len}, got {}",
+            frame.rgba.len()
+        ));
+    }
+    let rgb_len = usize::try_from(pixel_count.saturating_mul(3))
+        .map_err(|_| "RGB frame byte length overflows usize".to_owned())?;
+    let mut rgb = Vec::with_capacity(rgb_len);
+    for pixel in frame.rgba.chunks_exact(4) {
+        rgb.extend_from_slice(&pixel[..3]);
+    }
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, 82)
+        .encode(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
+        .map_err(|error| format!("JPEG encode failed: {error}"))?;
+    Ok(jpeg)
+}
+
 impl MjpegStreamConfig {
     fn from_query(query: MjpegStreamQuery) -> std::result::Result<Self, (StatusCode, String)> {
         let url = query.url.trim();
@@ -176,10 +240,15 @@ impl MjpegStreamConfig {
                 "viewer stream URL must use rtsp:// or rtsps://".to_owned(),
             ));
         }
+        let width = query.width.unwrap_or(960).clamp(160, 1920);
+        let default_height = u16::try_from(u32::from(width).saturating_mul(9) / 16)
+            .unwrap_or(u16::MAX)
+            .clamp(90, 1080);
         Ok(Self {
             url: url.to_owned(),
-            fps: query.fps.unwrap_or(10).clamp(1, 30),
-            width: query.width.unwrap_or(960).clamp(160, 1920),
+            fps: query.fps.unwrap_or(30).clamp(1, 30),
+            width,
+            height: query.height.unwrap_or(default_height).clamp(90, 1080),
         })
     }
 }
@@ -215,6 +284,7 @@ mod tests {
             url: "http://camera.local/stream".to_owned(),
             fps: None,
             width: None,
+            height: None,
         });
         assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
     }
@@ -225,9 +295,21 @@ mod tests {
             url: "rtsp://camera.local/stream".to_owned(),
             fps: Some(120),
             width: Some(4096),
+            height: Some(4096),
         })
         .expect("valid RTSP URL");
         assert_eq!(config.fps, 30);
         assert_eq!(config.width, 1920);
+        assert_eq!(config.height, 1080);
+
+        let default_height = MjpegStreamConfig::from_query(MjpegStreamQuery {
+            url: "rtsp://camera.local/stream".to_owned(),
+            fps: None,
+            width: Some(960),
+            height: None,
+        })
+        .expect("valid RTSP URL");
+        assert_eq!(default_height.fps, 30);
+        assert_eq!(default_height.height, 540);
     }
 }

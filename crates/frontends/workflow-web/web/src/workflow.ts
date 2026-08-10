@@ -48,6 +48,7 @@ export interface PortEndpoint {
 export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
   previewUrl?: string;
+  onRtspUrlChange?: (nodeId: string, url: string) => void;
 }
 
 export interface FlowEdgeData extends Record<string, unknown> {

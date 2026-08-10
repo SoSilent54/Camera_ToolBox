@@ -133,6 +133,76 @@ export function App() {
     [canConnect, setEdges],
   );
 
+  const handleRtspUrlChange = useCallback(
+    (nodeId: string, nextUrl: string) => {
+      const trimmedUrl = nextUrl.trim();
+      if (!trimmedUrl.startsWith('rtsp://') && !trimmedUrl.startsWith('rtsps://')) {
+        setEvents((current) => [`拒绝 RTSP URL：必须使用 rtsp:// 或 rtsps://`, ...current].slice(0, 6));
+        return;
+      }
+      setNodes((current) => {
+        const updated = current.map((flowNode) => {
+          if (flowNode.id !== nodeId) {
+            return flowNode;
+          }
+          const workflowNode = flowNode.data.workflowNode;
+          return {
+            ...flowNode,
+            data: {
+              ...flowNode.data,
+              workflowNode: {
+                ...workflowNode,
+                config: { ...workflowNode.config, url: trimmedUrl },
+              },
+            },
+          };
+        });
+        const workflowNodes = new Map(updated.map((flowNode) => [flowNode.id, flowNode.data.workflowNode]));
+        return updated.map((flowNode) => {
+          if (flowNode.data.workflowNode.kind !== 'viewer') {
+            return {
+              ...flowNode,
+              data: { ...flowNode.data, onRtspUrlChange: handleRtspUrlChange },
+            };
+          }
+          const incoming = edges.find(
+            (edge) => edge.target === flowNode.id && edge.data?.dataKind === 'rtsp-stream',
+          );
+          const source = incoming ? workflowNodes.get(incoming.source) : undefined;
+          return {
+            ...flowNode,
+            data: {
+              ...flowNode.data,
+              previewUrl: typeof source?.config.url === 'string' ? source.config.url : undefined,
+              onRtspUrlChange: handleRtspUrlChange,
+            },
+          };
+        });
+      });
+      setSelection((current) => {
+        if (current.type !== 'node' || current.node.id !== nodeId) {
+          return current;
+        }
+        return {
+          type: 'node',
+          node: { ...current.node, config: { ...current.node.config, url: trimmedUrl } },
+        };
+      });
+      setEvents((current) => [`RTSP URL 已更新：${trimmedUrl}`, ...current].slice(0, 6));
+    },
+    [edges, setNodes],
+  );
+
+  useEffect(() => {
+    setNodes((current) =>
+      current.map((flowNode) =>
+        flowNode.data.onRtspUrlChange === handleRtspUrlChange
+          ? flowNode
+          : { ...flowNode, data: { ...flowNode.data, onRtspUrlChange: handleRtspUrlChange } },
+      ),
+    );
+  }, [handleRtspUrlChange, nodes.length, setNodes]);
+
   const onSelectionChange = useCallback((params: OnSelectionChangeParams) => {
     const firstNode = params.nodes[0] as FlowNode | undefined;
     if (firstNode) {
@@ -213,14 +283,33 @@ export function App() {
 }
 
 function RtspSourceNode({ data, selected }: NodeProps) {
-  const node = (data as FlowNodeData).workflowNode;
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
   const url = String(node.config.url ?? 'rtsp://');
+  const [draftUrl, setDraftUrl] = useState(url);
+  useEffect(() => {
+    setDraftUrl(url);
+  }, [url]);
+  const applyUrl = () => nodeData.onRtspUrlChange?.(node.id, draftUrl);
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
       <div className="node-body">
-        <label>RTSP URL</label>
-        <code>{url}</code>
+        <label htmlFor={`${node.id}-url`}>RTSP URL</label>
+        <input
+          id={`${node.id}-url`}
+          className="rtsp-url-input nodrag"
+          value={draftUrl}
+          spellCheck={false}
+          onChange={(event) => setDraftUrl(event.target.value)}
+          onBlur={applyUrl}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              applyUrl();
+              event.currentTarget.blur();
+            }
+          }}
+        />
         <span>Transport: {String(node.config.transport ?? 'tcp')}</span>
       </div>
       <Handle id="stream" type="source" position={Position.Right} className="stream-handle" />
@@ -233,7 +322,7 @@ function ViewerNode({ data, selected }: NodeProps) {
   const node = nodeData.workflowNode;
   const previewUrl = nodeData.previewUrl;
   const streamUrl = previewUrl
-    ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&fps=10&width=960`
+    ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&fps=30&width=960&height=540`
     : undefined;
   const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(
     streamUrl ? 'connecting' : 'error',
@@ -245,9 +334,9 @@ function ViewerNode({ data, selected }: NodeProps) {
   const statusText = !streamUrl
     ? 'No connected RTSP source'
     : streamState === 'playing'
-      ? 'MJPEG preview via FFmpeg'
+      ? 'MJPEG preview via internal ffmpeg-next'
       : streamState === 'connecting'
-        ? 'Connecting RTSP via FFmpeg...'
+        ? 'Connecting RTSP via internal decoder...'
         : 'Preview stream unavailable';
 
   return (
