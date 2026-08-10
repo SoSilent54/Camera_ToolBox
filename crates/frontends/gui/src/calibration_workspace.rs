@@ -5508,7 +5508,7 @@ impl CalibrationWorkspace {
         ui.separator();
         let available_height = ui.available_height();
         // Reserve bottom portion for calibration result so it is never hidden.
-        let result_reserve = 148.0;
+        let result_reserve = 176.0;
         let viewer_height = (available_height - result_reserve - 16.0).max(200.0);
         let mut capture_request = None;
         ui.allocate_ui_with_layout(
@@ -8734,6 +8734,57 @@ fn distortion_coefficients_to_d12(values: &[f64]) -> [f64; 12] {
     distortion
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CalibrationResultOptics {
+    horizontal_fov_degrees: f64,
+    vertical_fov_degrees: f64,
+    principal_offset_x_degrees: f64,
+    principal_offset_y_degrees: f64,
+}
+
+fn calibration_result_optics(solution: &CalibrationSolution) -> Option<CalibrationResultOptics> {
+    let matrix = solution.camera_matrix;
+    let fx = matrix[0];
+    let fy = matrix[4];
+    let cx = matrix[2];
+    let cy = matrix[5];
+    let width = f64::from(solution.image_size.width);
+    let height = f64::from(solution.image_size.height);
+    if [fx, fy, cx, cy, width, height]
+        .iter()
+        .any(|value| !value.is_finite())
+        || fx <= 0.0
+        || fy <= 0.0
+        || width <= 0.0
+        || height <= 0.0
+    {
+        return None;
+    }
+
+    // OpenCV 像素中心约定：沿用本页面自动内参的 width/2、height/2 作为几何中心。
+    let left = cx.atan2(fx);
+    let right = (width - cx).atan2(fx);
+    let top = cy.atan2(fy);
+    let bottom = (height - cy).atan2(fy);
+    let center_x = width * 0.5;
+    let center_y = height * 0.5;
+    let optics = CalibrationResultOptics {
+        horizontal_fov_degrees: (left + right).to_degrees(),
+        vertical_fov_degrees: (top + bottom).to_degrees(),
+        principal_offset_x_degrees: (cx - center_x).atan2(fx).to_degrees(),
+        principal_offset_y_degrees: (cy - center_y).atan2(fy).to_degrees(),
+    };
+    [
+        optics.horizontal_fov_degrees,
+        optics.vertical_fov_degrees,
+        optics.principal_offset_x_degrees,
+        optics.principal_offset_y_degrees,
+    ]
+    .iter()
+    .all(|value| value.is_finite())
+    .then_some(optics)
+}
+
 fn render_calibration_result(
     ui: &mut egui::Ui,
     solution: Option<&CalibrationSolution>,
@@ -8765,6 +8816,37 @@ fn render_calibration_result(
             });
         }
     });
+    if let Some(optics) = calibration_result_optics(solution) {
+        ui.horizontal_wrapped(|ui| {
+            for (name, value, hover) in [
+                (
+                    "FOV H",
+                    optics.horizontal_fov_degrees,
+                    "Horizontal field of view from fx, cx and image width",
+                ),
+                (
+                    "FOV V",
+                    optics.vertical_fov_degrees,
+                    "Vertical field of view from fy, cy and image height",
+                ),
+                (
+                    "Optical offset X",
+                    optics.principal_offset_x_degrees,
+                    "Principal point offset from image center; positive means cx is right of center",
+                ),
+                (
+                    "Optical offset Y",
+                    optics.principal_offset_y_degrees,
+                    "Principal point offset from image center; positive means cy is below center",
+                ),
+            ] {
+                ui.group(|ui| {
+                    ui.label(name).on_hover_text(hover);
+                    ui.monospace(format!("{value:+.4}°"));
+                });
+            }
+        });
+    }
     ui.horizontal_wrapped(|ui| {
         if imported_metrics_missing {
             ui.monospace(format!(
@@ -8970,6 +9052,65 @@ mod tests {
         assert!(text.contains("RMS N/A (not provided)"), "{text}");
         assert!(text.contains("flags N/A (not provided)"), "{text}");
         assert!(!text.contains("RMS 0.000000"), "{text}");
+    }
+
+    #[test]
+    fn calibration_result_optics_reports_fov_and_principal_offset() {
+        let solution = CalibrationSolution {
+            image_size: CalibrationImageSize::new(1920, 1080).unwrap(),
+            camera_matrix: [960.0, 0.0, 1008.0, 0.0, 540.0, 513.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+            rms_error: 0.0,
+            calibration_flags: camera_toolbox_core::PANGBOT_CALIBRATION_FLAGS,
+            views: Vec::new(),
+        };
+
+        let optics = calibration_result_optics(&solution).unwrap();
+        assert!((optics.horizontal_fov_degrees - 90.0).abs() < 0.1);
+        assert!((optics.vertical_fov_degrees - 90.0).abs() < 0.1);
+        assert!((optics.principal_offset_x_degrees - 2.8624).abs() < 0.0001);
+        assert!((optics.principal_offset_y_degrees + 2.8624).abs() < 0.0001);
+    }
+
+    #[test]
+    fn calibration_result_renders_fov_and_principal_offset() {
+        let context = egui::Context::default();
+        context.enable_accesskit();
+        let solution = CalibrationSolution {
+            image_size: CalibrationImageSize::new(1920, 1080).unwrap(),
+            camera_matrix: [960.0, 0.0, 1008.0, 0.0, 540.0, 513.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+            rms_error: 0.0,
+            calibration_flags: camera_toolbox_core::PANGBOT_CALIBRATION_FLAGS,
+            views: Vec::new(),
+        };
+
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 500.0),
+            )),
+            ..Default::default()
+        };
+        let output = context.run_ui(input, |ui| {
+            render_calibration_result(ui, Some(&solution), false, None, false);
+        });
+        let text = output
+            .platform_output
+            .accesskit_update
+            .unwrap()
+            .nodes
+            .into_iter()
+            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("FOV H"), "{text}");
+        assert!(text.contains("FOV V"), "{text}");
+        assert!(text.contains("Optical offset X"), "{text}");
+        assert!(text.contains("Optical offset Y"), "{text}");
+        assert!(text.contains("+2.8624°"), "{text}");
+        assert!(text.contains("-2.8624°"), "{text}");
     }
 
     #[test]
