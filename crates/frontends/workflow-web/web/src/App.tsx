@@ -229,14 +229,42 @@ function RtspSourceNode({ data, selected }: NodeProps) {
 }
 
 function ViewerNode({ data, selected }: NodeProps) {
-  const node = (data as FlowNodeData).workflowNode;
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
+  const previewUrl = nodeData.previewUrl;
+  const streamUrl = previewUrl
+    ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&fps=10&width=960`
+    : undefined;
+  const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(
+    streamUrl ? 'connecting' : 'error',
+  );
+  useEffect(() => {
+    setStreamState(streamUrl ? 'connecting' : 'error');
+  }, [streamUrl]);
+
+  const statusText = !streamUrl
+    ? 'No connected RTSP source'
+    : streamState === 'playing'
+      ? 'MJPEG preview via FFmpeg'
+      : streamState === 'connecting'
+        ? 'Connecting RTSP via FFmpeg...'
+        : 'Preview stream unavailable';
+
   return (
     <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>
       <Handle id="stream" type="target" position={Position.Left} className="stream-handle" />
       <NodeHeader node={node} />
-      <div className="viewer-preview">
-        <div className="preview-grid" />
-        <span>Video preview placeholder</span>
+      <div className={`viewer-preview ${streamState}`}>
+        {streamUrl && (
+          <img
+            src={streamUrl}
+            alt={`Preview from ${previewUrl}`}
+            onLoad={() => setStreamState('playing')}
+            onError={() => setStreamState('error')}
+          />
+        )}
+        {streamState !== 'playing' && <div className="preview-grid" />}
+        <span className="viewer-overlay">{statusText}</span>
       </div>
       <div className="node-body compact">
         <span>Fit: {String(node.config.fitMode ?? 'contain')}</span>
@@ -318,8 +346,20 @@ function toFlowNodes(graph: WorkflowGraph): FlowNode[] {
     id: node.id,
     type: node.kind,
     position: node.position,
-    data: { workflowNode: node },
+    data: {
+      workflowNode: node,
+      previewUrl: node.kind === 'viewer' ? incomingRtspUrl(graph, node.id) : undefined,
+    },
   }));
+}
+
+function incomingRtspUrl(graph: WorkflowGraph, viewerNodeId: string): string | undefined {
+  const incoming = graph.edges.find((edge) => edge.target.nodeId === viewerNodeId && edge.dataKind === 'rtsp-stream');
+  if (!incoming) {
+    return undefined;
+  }
+  const source = graph.nodes.find((node) => node.id === incoming.source.nodeId && node.kind === 'rtspSource');
+  return typeof source?.config.url === 'string' ? source.config.url : undefined;
 }
 
 function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {

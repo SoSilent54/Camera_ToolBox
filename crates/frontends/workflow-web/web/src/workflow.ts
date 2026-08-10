@@ -47,6 +47,7 @@ export interface PortEndpoint {
 
 export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
+  previewUrl?: string;
 }
 
 export interface FlowEdgeData extends Record<string, unknown> {
