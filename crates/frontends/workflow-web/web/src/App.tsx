@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Background,
   Controls,
@@ -324,12 +324,162 @@ function ViewerNode({ data, selected }: NodeProps) {
   const streamUrl = previewUrl
     ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&fps=30&width=960&height=540`
     : undefined;
-  const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(
-    streamUrl ? 'connecting' : 'error',
+  return (
+    <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>
+      <Handle id="stream" type="target" position={Position.Left} className="stream-handle" />
+      <NodeHeader node={node} />
+      <MjpegPreview streamUrl={streamUrl} previewUrl={previewUrl} />
+      <div className="node-body compact">
+        <span>Fit: {String(node.config.fitMode ?? 'contain')}</span>
+        <span>Overlay: {String(node.config.overlay ?? 'status')}</span>
+      </div>
+    </section>
   );
+}
+
+interface ViewerMetrics {
+  streamFps: number;
+  renderFps: number;
+  frameCount: number;
+  bytes: number;
+  lastFrameAgeMs: number | null;
+  error: string | null;
+}
+
+function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined; previewUrl: string | undefined }) {
+  const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(streamUrl ? 'connecting' : 'error');
+  const [frameUrl, setFrameUrl] = useState<string | undefined>();
+  const [metrics, setMetrics] = useState<ViewerMetrics>({
+    streamFps: 0,
+    renderFps: 0,
+    frameCount: 0,
+    bytes: 0,
+    lastFrameAgeMs: null,
+    error: null,
+  });
+  const objectUrlRef = useRef<string | undefined>();
+  const lastFrameAtRef = useRef<number | null>(null);
+
   useEffect(() => {
-    setStreamState(streamUrl ? 'connecting' : 'error');
+    let cancelled = false;
+    let animationFrame = 0;
+    let renderedFrames = 0;
+    let lastSampleAt = performance.now();
+    const tick = (now: number) => {
+      if (cancelled) {
+        return;
+      }
+      renderedFrames += 1;
+      if (now - lastSampleAt >= 1000) {
+        const elapsedSeconds = (now - lastSampleAt) / 1000;
+        const renderFps = renderedFrames / elapsedSeconds;
+        const lastFrameAt = lastFrameAtRef.current;
+        setMetrics((current) => ({
+          ...current,
+          renderFps,
+          lastFrameAgeMs: lastFrameAt === null ? null : now - lastFrameAt,
+        }));
+        renderedFrames = 0;
+        lastSampleAt = now;
+      }
+      animationFrame = requestAnimationFrame(tick);
+    };
+    animationFrame = requestAnimationFrame(tick);
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(animationFrame);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+      objectUrlRef.current = undefined;
+    }
+    if (!streamUrl) {
+      setStreamState('error');
+      setFrameUrl(undefined);
+      lastFrameAtRef.current = null;
+      setMetrics((current) => ({ ...current, streamFps: 0, frameCount: 0, bytes: 0, lastFrameAgeMs: null, error: null }));
+      return;
+    }
+
+    const abortController = new AbortController();
+    let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array();
+    let bytes = 0;
+    let frameCount = 0;
+    lastFrameAtRef.current = null;
+    let frameTimes: number[] = [];
+    setStreamState('connecting');
+    setFrameUrl(undefined);
+    setMetrics((current) => ({ ...current, streamFps: 0, frameCount: 0, bytes: 0, lastFrameAgeMs: null, error: null }));
+
+    void (async () => {
+      try {
+        const response = await fetch(streamUrl, { signal: abortController.signal });
+        if (!response.ok || !response.body) {
+          throw new Error(`stream request failed: ${response.status} ${response.statusText}`);
+        }
+        const reader = response.body.getReader();
+        while (!abortController.signal.aborted) {
+          const { value, done } = await reader.read();
+          if (done) {
+            break;
+          }
+          if (!value) {
+            continue;
+          }
+          bytes += value.byteLength;
+          buffer = appendBytes(buffer, value);
+          let jpeg: Uint8Array<ArrayBufferLike> | undefined;
+          while ((jpeg = takeJpegFrame(buffer))) {
+            const frameEnd = findJpegEnd(buffer);
+            buffer = frameEnd >= 0 ? buffer.slice(frameEnd + 2) : new Uint8Array();
+            const jpegPart = new Uint8Array(jpeg.byteLength);
+            jpegPart.set(jpeg);
+            const nextObjectUrl = URL.createObjectURL(new Blob([jpegPart.buffer], { type: 'image/jpeg' }));
+            if (objectUrlRef.current) {
+              URL.revokeObjectURL(objectUrlRef.current);
+            }
+            objectUrlRef.current = nextObjectUrl;
+            setFrameUrl(nextObjectUrl);
+            setStreamState('playing');
+            const now = performance.now();
+            frameCount += 1;
+            lastFrameAtRef.current = now;
+            frameTimes = [...frameTimes.filter((time) => now - time <= 2000), now];
+            const windowMs = frameTimes.length > 1 ? frameTimes[frameTimes.length - 1] - frameTimes[0] : 1000;
+            setMetrics((current) => ({
+              ...current,
+              streamFps: frameTimes.length > 1 ? ((frameTimes.length - 1) * 1000) / Math.max(windowMs, 1) : 0,
+              frameCount,
+              bytes,
+              lastFrameAgeMs: 0,
+              error: null,
+            }));
+          }
+        }
+      } catch (error) {
+        if (!abortController.signal.aborted) {
+          const message = error instanceof Error ? error.message : String(error);
+          setStreamState('error');
+          setMetrics((current) => ({ ...current, error: message }));
+        }
+      }
+    })();
+
+    return () => {
+      abortController.abort();
+    };
   }, [streamUrl]);
+
+  useEffect(() => {
+    return () => {
+      if (objectUrlRef.current) {
+        URL.revokeObjectURL(objectUrlRef.current);
+      }
+    };
+  }, []);
 
   const statusText = !streamUrl
     ? 'No connected RTSP source'
@@ -340,27 +490,64 @@ function ViewerNode({ data, selected }: NodeProps) {
         : 'Preview stream unavailable';
 
   return (
-    <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>
-      <Handle id="stream" type="target" position={Position.Left} className="stream-handle" />
-      <NodeHeader node={node} />
-      <div className={`viewer-preview ${streamState}`}>
-        {streamUrl && (
-          <img
-            src={streamUrl}
-            alt={`Preview from ${previewUrl}`}
-            onLoad={() => setStreamState('playing')}
-            onError={() => setStreamState('error')}
-          />
-        )}
-        {streamState !== 'playing' && <div className="preview-grid" />}
-        <span className="viewer-overlay">{statusText}</span>
-      </div>
-      <div className="node-body compact">
-        <span>Fit: {String(node.config.fitMode ?? 'contain')}</span>
-        <span>Overlay: {String(node.config.overlay ?? 'status')}</span>
-      </div>
-    </section>
+    <div className={`viewer-preview ${streamState}`}>
+      {frameUrl && <img src={frameUrl} alt={`Preview from ${previewUrl}`} />}
+      {streamState !== 'playing' && <div className="preview-grid" />}
+      <div className="viewer-overlay">{statusText}</div>
+      <dl className="viewer-metrics">
+        <div><dt>stream</dt><dd>{metrics.streamFps.toFixed(1)} fps</dd></div>
+        <div><dt>render</dt><dd>{metrics.renderFps.toFixed(1)} fps</dd></div>
+        <div><dt>frames</dt><dd>{metrics.frameCount}</dd></div>
+        <div><dt>bytes</dt><dd>{formatBytes(metrics.bytes)}</dd></div>
+        <div><dt>age</dt><dd>{metrics.lastFrameAgeMs === null ? 'n/a' : `${Math.round(metrics.lastFrameAgeMs)} ms`}</dd></div>
+        {metrics.error && <div className="metric-error"><dt>error</dt><dd>{metrics.error}</dd></div>}
+      </dl>
+    </div>
   );
+}
+
+function appendBytes(existing: Uint8Array<ArrayBufferLike>, incoming: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
+  const merged = new Uint8Array(existing.length + incoming.length);
+  merged.set(existing);
+  merged.set(incoming, existing.length);
+  return merged;
+}
+
+function takeJpegFrame(buffer: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBufferLike> | undefined {
+  const start = findJpegStart(buffer);
+  if (start < 0) {
+    return undefined;
+  }
+  const end = findJpegEnd(buffer, start + 2);
+  return end >= 0 ? buffer.slice(start, end + 2) : undefined;
+}
+
+function findJpegStart(buffer: Uint8Array<ArrayBufferLike>): number {
+  for (let index = 0; index + 1 < buffer.length; index += 1) {
+    if (buffer[index] === 0xff && buffer[index + 1] === 0xd8) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function findJpegEnd(buffer: Uint8Array<ArrayBufferLike>, start = 0): number {
+  for (let index = start; index + 1 < buffer.length; index += 1) {
+    if (buffer[index] === 0xff && buffer[index + 1] === 0xd9) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) {
+    return `${bytes} B`;
+  }
+  if (bytes < 1024 * 1024) {
+    return `${(bytes / 1024).toFixed(1)} KiB`;
+  }
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
 }
 
 function NodeHeader({ node }: { node: WorkflowNode }) {

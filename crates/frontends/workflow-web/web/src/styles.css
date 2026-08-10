@@ -290,7 +290,8 @@ button:hover {
   opacity: 0.4;
 }
 
-.viewer-preview span {
+.viewer-preview span,
+.viewer-preview dl {
   z-index: 1;
 }
 
@@ -304,6 +305,50 @@ button:hover {
   color: #bbf7d0;
   padding: 0.28rem 0.5rem;
   font-size: 0.7rem;
+}
+
+.viewer-metrics {
+  position: absolute;
+  left: 0.65rem;
+  top: 0.65rem;
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 0.18rem 0.45rem;
+  margin: 0;
+  padding: 0.45rem 0.55rem;
+  border: 1px solid rgba(96, 165, 250, 0.28);
+  border-radius: 12px;
+  background: rgba(2, 6, 23, 0.76);
+  color: #dbeafe;
+  font-size: 0.68rem;
+  line-height: 1.25;
+  pointer-events: none;
+}
+
+.viewer-metrics div {
+  display: contents;
+}
+
+.viewer-metrics dt,
+.viewer-metrics dd {
+  margin: 0;
+}
+
+.viewer-metrics dt {
+  color: #93c5fd;
+  text-transform: uppercase;
+}
+
+.viewer-metrics dd {
+  min-width: 3.8rem;
+  color: #f8fafc;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+.viewer-metrics .metric-error dt,
+.viewer-metrics .metric-error dd {
+  color: #fecaca;
 }
 
 .stream-handle {
