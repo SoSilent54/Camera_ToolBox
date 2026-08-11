@@ -1,23 +1,24 @@
 mod workflow;
 
 use std::{
+    fs,
     net::IpAddr,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     body::Body,
-    extract::Query,
-    http::{HeaderValue, StatusCode, header},
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
 };
 use bytes::Bytes;
 use camera_toolbox_adapters::media::{
@@ -35,7 +36,10 @@ use tokio::{
     time::{Instant, sleep, sleep_until},
 };
 use tower_http::services::{ServeDir, ServeFile};
-use workflow::{WorkflowGraph, seed_workflow_graph, validate_edge};
+use workflow::{
+    WorkflowGraph, node_catalog, normalize_workflow, seed_workflow_graph, validate_workflow,
+    workmode_templates,
+};
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -54,6 +58,19 @@ struct ServerArgs {
     /// 前端静态资源目录；默认使用本 crate 下的 web/dist。
     #[arg(long)]
     static_dir: Option<PathBuf>,
+
+    /// 工作流文件目录；保存为 .ctworkflow.json，运行时字段不会写入。
+    #[arg(long)]
+    workflow_dir: Option<PathBuf>,
+}
+
+#[derive(Clone)]
+struct AppState {
+    workflow_store: Arc<WorkflowStore>,
+}
+
+struct WorkflowStore {
+    dir: PathBuf,
 }
 
 #[derive(Debug, Serialize)]
@@ -61,6 +78,23 @@ struct ServerArgs {
 struct HealthResponse {
     service: &'static str,
     status: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkflowSummary {
+    id: String,
+    title: String,
+    revision: String,
+    node_count: usize,
+    edge_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ValidationResponse {
+    ok: bool,
+    error: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,7 +118,10 @@ async fn main() -> Result<()> {
     let _logging = camera_toolbox_logging::init();
     let args = ServerArgs::parse();
     let static_dir = args.static_dir.unwrap_or_else(default_static_dir);
+    let workflow_dir = args.workflow_dir.unwrap_or_else(default_workflow_dir);
     ensure_static_dir(&static_dir)?;
+    fs::create_dir_all(&workflow_dir)
+        .with_context(|| format!("failed to create workflow dir {}", workflow_dir.display()))?;
 
     let listener = TcpListener::bind((args.host, args.port))
         .await
@@ -92,26 +129,36 @@ async fn main() -> Result<()> {
     let local_addr = listener
         .local_addr()
         .context("failed to read listener address")?;
-    let router = app_router(static_dir.clone());
+    let router = app_router(static_dir.clone(), workflow_dir.clone());
 
     println!("Camera Toolbox Workflow Web listening on http://{local_addr}");
     println!("Serving frontend assets from {}", static_dir.display());
-    tracing::info!(operation = "workflow_web_start", address = %local_addr, static_dir = %static_dir.display());
+    println!("Saving workflows under {}", workflow_dir.display());
+    tracing::info!(operation = "workflow_web_start", address = %local_addr, static_dir = %static_dir.display(), workflow_dir = %workflow_dir.display());
 
     axum::serve(listener, router)
         .await
         .context("workflow web server stopped unexpectedly")
 }
 
-fn app_router(static_dir: PathBuf) -> Router {
+fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
     let index = static_dir.join("index.html");
     let frontend = ServeDir::new(static_dir).not_found_service(ServeFile::new(index));
+    let state = AppState {
+        workflow_store: Arc::new(WorkflowStore { dir: workflow_dir }),
+    };
 
     Router::new()
         .route("/api/health", get(health))
         .route("/api/workflow", get(workflow_graph))
+        .route("/api/node-catalog", get(node_catalog_api))
+        .route("/api/workmode-templates", get(workmode_templates_api))
+        .route("/api/workflows", get(list_workflows).post(create_workflow))
+        .route("/api/workflows/{id}", get(get_workflow).put(put_workflow))
+        .route("/api/workflows/{id}/validate", post(validate_workflow_api))
         .route("/api/streams/mjpeg", get(mjpeg_stream))
         .fallback_service(frontend)
+        .with_state(state)
 }
 
 async fn health() -> Json<HealthResponse> {
@@ -123,10 +170,103 @@ async fn health() -> Json<HealthResponse> {
 
 async fn workflow_graph() -> Json<WorkflowGraph> {
     let graph = seed_workflow_graph();
-    for edge in &graph.edges {
-        debug_assert!(validate_edge(&graph, edge).is_ok());
-    }
+    debug_assert!(validate_workflow(&graph).is_ok());
     Json(graph)
+}
+
+async fn node_catalog_api() -> Json<Vec<workflow::NodeDefinition>> {
+    Json(node_catalog())
+}
+
+async fn workmode_templates_api() -> Json<Vec<workflow::WorkmodeTemplate>> {
+    Json(workmode_templates())
+}
+
+async fn list_workflows(
+    State(state): State<AppState>,
+) -> std::result::Result<Json<Vec<WorkflowSummary>>, (StatusCode, String)> {
+    state.workflow_store.list().map(Json)
+}
+
+async fn create_workflow(
+    State(state): State<AppState>,
+    Json(mut graph): Json<WorkflowGraph>,
+) -> std::result::Result<(StatusCode, Json<WorkflowGraph>), (StatusCode, String)> {
+    if graph.id.trim().is_empty() {
+        graph.id = format!("workflow-{}", next_revision());
+    }
+    let revision = next_revision();
+    let graph = normalize_workflow(graph, revision).map_err(bad_request)?;
+    state.workflow_store.save(&graph)?;
+    Ok((StatusCode::CREATED, Json(graph)))
+}
+
+async fn get_workflow(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> std::result::Result<Json<WorkflowGraph>, (StatusCode, String)> {
+    state.workflow_store.load(&id).map(Json)
+}
+
+async fn put_workflow(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(mut graph): Json<WorkflowGraph>,
+) -> std::result::Result<Json<WorkflowGraph>, (StatusCode, String)> {
+    graph.id = id.clone();
+    if let Some(current) = state.workflow_store.load_optional(&id)? {
+        if_match_revision(&headers, &current.revision)?;
+    }
+    let graph = normalize_workflow(graph, next_revision()).map_err(bad_request)?;
+    state.workflow_store.save(&graph)?;
+    Ok(Json(graph))
+}
+
+async fn validate_workflow_api(
+    Json(graph): Json<WorkflowGraph>,
+) -> (StatusCode, Json<ValidationResponse>) {
+    match validate_workflow(&graph) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(ValidationResponse {
+                ok: true,
+                error: None,
+            }),
+        ),
+        Err(error) => (
+            StatusCode::BAD_REQUEST,
+            Json(ValidationResponse {
+                ok: false,
+                error: Some(error),
+            }),
+        ),
+    }
+}
+
+fn if_match_revision(
+    headers: &HeaderMap,
+    current_revision: &str,
+) -> std::result::Result<(), (StatusCode, String)> {
+    let Some(raw) = headers.get(header::IF_MATCH) else {
+        return Ok(());
+    };
+    let expected = raw
+        .to_str()
+        .map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid If-Match header".to_owned(),
+            )
+        })?
+        .trim_matches('"');
+    if expected != current_revision {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("workflow revision conflict: current `{current_revision}`, got `{expected}`"),
+        ));
+    }
+    Ok(())
 }
 
 async fn mjpeg_stream(
@@ -297,8 +437,111 @@ impl MjpegStreamConfig {
     }
 }
 
+impl WorkflowStore {
+    fn list(&self) -> std::result::Result<Vec<WorkflowSummary>, (StatusCode, String)> {
+        let mut summaries = Vec::new();
+        for entry in fs::read_dir(&self.dir).map_err(internal_error)? {
+            let entry = entry.map_err(internal_error)?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let graph = read_workflow_file(&path)?;
+            summaries.push(WorkflowSummary {
+                id: graph.id,
+                title: graph.title,
+                revision: graph.revision,
+                node_count: graph.nodes.len(),
+                edge_count: graph.edges.len(),
+            });
+        }
+        summaries.sort_by(|left, right| left.title.cmp(&right.title));
+        Ok(summaries)
+    }
+
+    fn load(&self, id: &str) -> std::result::Result<WorkflowGraph, (StatusCode, String)> {
+        self.load_optional(id)?
+            .ok_or_else(|| (StatusCode::NOT_FOUND, format!("workflow `{id}` not found")))
+    }
+
+    fn load_optional(
+        &self,
+        id: &str,
+    ) -> std::result::Result<Option<WorkflowGraph>, (StatusCode, String)> {
+        let path = self.path_for_id(id)?;
+        if !path.exists() {
+            return Ok(None);
+        }
+        read_workflow_file(&path).map(Some)
+    }
+
+    fn save(&self, graph: &WorkflowGraph) -> std::result::Result<(), (StatusCode, String)> {
+        let path = self.path_for_id(&graph.id)?;
+        fs::create_dir_all(&self.dir).map_err(internal_error)?;
+        let tmp = path.with_extension("json.tmp");
+        let content = serde_json::to_vec_pretty(graph).map_err(internal_error)?;
+        fs::write(&tmp, content).map_err(internal_error)?;
+        fs::rename(&tmp, path).map_err(internal_error)?;
+        Ok(())
+    }
+
+    fn path_for_id(&self, id: &str) -> std::result::Result<PathBuf, (StatusCode, String)> {
+        if !is_safe_workflow_id(id) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!("invalid workflow id `{id}`"),
+            ));
+        }
+        Ok(self.dir.join(format!("{id}.ctworkflow.json")))
+    }
+}
+
+fn read_workflow_file(path: &Path) -> std::result::Result<WorkflowGraph, (StatusCode, String)> {
+    let raw = fs::read(path).map_err(internal_error)?;
+    let graph: WorkflowGraph = serde_json::from_slice(&raw).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("failed to parse workflow `{}`: {error}", path.display()),
+        )
+    })?;
+    validate_workflow(&graph).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("invalid workflow `{}`: {error}", path.display()),
+        )
+    })?;
+    Ok(graph)
+}
+
+fn is_safe_workflow_id(id: &str) -> bool {
+    !id.is_empty()
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn next_revision() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("rev-{nanos}")
+}
+
+fn bad_request(error: String) -> (StatusCode, String) {
+    (StatusCode::BAD_REQUEST, error)
+}
+
+fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+}
+
 fn default_static_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("web/dist")
+}
+
+fn default_workflow_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".workflow-web/workflows")
 }
 
 fn ensure_static_dir(static_dir: &PathBuf) -> Result<()> {
@@ -320,6 +563,12 @@ mod tests {
     fn default_static_dir_points_to_web_dist() {
         let path = default_static_dir();
         assert!(path.ends_with("web/dist"));
+    }
+
+    #[test]
+    fn default_workflow_dir_points_to_crate_local_store() {
+        let path = default_workflow_dir();
+        assert!(path.ends_with(".workflow-web/workflows"));
     }
 
     #[test]
@@ -396,5 +645,28 @@ mod tests {
         .expect("valid RTSP URL");
         assert_eq!(source_rate.fps_limit, None);
         assert_eq!(source_rate.height, 540);
+    }
+
+    #[test]
+    fn workflow_store_roundtrips_normalized_graph() {
+        let dir = std::env::temp_dir().join(format!("workflow-store-test-{}", next_revision()));
+        let store = WorkflowStore { dir: dir.clone() };
+        let mut graph = seed_workflow_graph();
+        graph.id = "roundtrip".to_owned();
+        graph.revision = "rev-test".to_owned();
+        store.save(&graph).expect("workflow saved");
+
+        let loaded = store.load("roundtrip").expect("workflow loaded");
+        assert_eq!(loaded.id, "roundtrip");
+        assert_eq!(loaded.revision, "rev-test");
+        assert_eq!(loaded.nodes.len(), graph.nodes.len());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn unsafe_workflow_ids_are_rejected() {
+        assert!(!is_safe_workflow_id("../escape"));
+        assert!(!is_safe_workflow_id(""));
+        assert!(is_safe_workflow_id("camera_toolbox-1"));
     }
 }

@@ -6,6 +6,7 @@
 /.cargo/ffmpeg.local.toml
 /crates/frontends/workflow-web/web/node_modules/
 /crates/frontends/workflow-web/web/dist/
+/crates/frontends/workflow-web/.workflow-web/
 
 # Local project data and settings
 /local_data/

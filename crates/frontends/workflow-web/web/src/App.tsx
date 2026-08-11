@@ -18,14 +18,25 @@ import {
   type ReactFlowInstance,
 } from '@xyflow/react';
 import {
-  labelForDataKind,
+  WORKFLOW_SCHEMA_VERSION,
+  labelForPortKind,
+  listWorkflows,
+  loadNodeCatalog,
+  loadSavedWorkflow,
   loadWorkflow,
+  loadWorkmodeTemplates,
+  saveWorkflow,
+  validateConnectionKinds,
   type FlowEdgeData,
   type FlowNodeData,
+  type NodeDefinition,
   type NodeKind,
+  type PortKind,
+  type WorkflowEdge,
   type WorkflowGraph,
   type WorkflowNode,
   type WorkflowPort,
+  type WorkmodeTemplate,
 } from './workflow';
 
 type FlowNode = Node<FlowNodeData>;
@@ -35,21 +46,48 @@ type Selection =
   | { type: 'edge'; edge: FlowEdge }
   | { type: 'none' };
 
-const WORKFLOW_DRAFT_KEY = 'camera-toolbox-workflow-draft';
 const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
-
-const nodeLibrary: Array<{ kind: NodeKind; title: string; description: string }> = [
-  { kind: 'rtspSource', title: 'RTSP Input', description: '摄像头或板端 RTSP 流入口' },
-  { kind: 'viewer', title: 'Viewer', description: '显示输入流、图像和运行状态' },
+const GENERIC_NODE_KINDS: NodeKind[] = [
+  'localWorkspace',
+  'sftpWorkspace',
+  'fileBrowser',
+  'imageFileSource',
+  'sshSession',
+  'x5Device',
+  'x5RtspChannel',
+  'x5Snapshot',
+  'rtspDecoder',
+  'frameSampler',
+  'imageLayer',
+  'videoLayer',
+  'overlayComposer',
+  'chessboardDetector',
+  'datasetCollector',
+  'coverageAnalyzer',
+  'captureScorer',
+  'autoCaptureController',
+  'poseGuide',
+  'calibrationSolver',
+  'reprojectionInspector',
+  'calibrationExport',
+  'i2cBusDiscovery',
+  'i2cTransfer',
+  'eepromMapLoader',
+  'eepromProvision',
+  'resultView',
 ];
 
-const nodeTypes = {
-  rtspSource: RtspSourceNode,
-  viewer: ViewerNode,
-};
+const nodeTypes = Object.fromEntries([
+  ['rtspSource', RtspSourceNode],
+  ['viewer', ViewerNode],
+  ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
+]);
 
 export function App() {
   const [graph, setGraph] = useState<WorkflowGraph | null>(null);
+  const [catalog, setCatalog] = useState<NodeDefinition[]>([]);
+  const [templates, setTemplates] = useState<WorkmodeTemplate[]>([]);
+  const [savedWorkflows, setSavedWorkflows] = useState<Array<{ id: string; title: string; revision: string }>>([]);
   const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
@@ -57,36 +95,50 @@ export function App() {
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
 
   const pushEvent = useCallback((event: string) => {
-    setEvents((current) => [event, ...current].slice(0, 8));
+    setEvents((current) => [event, ...current].slice(0, 10));
   }, []);
+
+  const applyGraph = useCallback(
+    (nextGraph: WorkflowGraph, event: string) => {
+      setGraph(nextGraph);
+      setNodes(toFlowNodes(nextGraph));
+      setEdges(toFlowEdges(nextGraph));
+      setSelection({ type: 'none' });
+      setEvents([event, `节点 ${nextGraph.nodes.length} 个，连接 ${nextGraph.edges.length} 条`]);
+    },
+    [setEdges, setNodes],
+  );
+
+  const refreshSavedWorkflows = useCallback(() => {
+    listWorkflows()
+      .then((workflows) => setSavedWorkflows(workflows))
+      .catch((error: unknown) => pushEvent(`工作流列表失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [pushEvent]);
 
   const loadSeedWorkflow = useCallback(() => {
     loadWorkflow()
-      .then((loaded) => {
-        setGraph(loaded);
-        setNodes(toFlowNodes(loaded));
-        setEdges(toFlowEdges(loaded));
-        setSelection({ type: 'none' });
-        setEvents([
-          `已加载 ${loaded.title}`,
-          `节点 ${loaded.nodes.length} 个，连接 ${loaded.edges.length} 条`,
-        ]);
-      })
-      .catch((error: unknown) => {
-        const message = error instanceof Error ? error.message : String(error);
-        setEvents([`加载失败：${message}`]);
-      });
-  }, [setEdges, setNodes]);
+      .then((loaded) => applyGraph(loaded, `已加载 ${loaded.title}`))
+      .catch((error: unknown) => setEvents([`加载失败：${error instanceof Error ? error.message : String(error)}`]));
+  }, [applyGraph]);
 
   useEffect(() => {
     loadSeedWorkflow();
-  }, [loadSeedWorkflow]);
+    refreshSavedWorkflows();
+    Promise.all([loadNodeCatalog(), loadWorkmodeTemplates()])
+      .then(([loadedCatalog, loadedTemplates]) => {
+        setCatalog(loadedCatalog);
+        setTemplates(loadedTemplates);
+      })
+      .catch((error: unknown) => pushEvent(`节点目录加载失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [loadSeedWorkflow, pushEvent, refreshSavedWorkflows]);
 
   const nodeById = useMemo(() => {
     const map = new Map<string, WorkflowNode>();
     nodes.forEach((node) => map.set(node.id, node.data.workflowNode));
     return map;
   }, [nodes]);
+
+  const catalogByKind = useMemo(() => new Map(catalog.map((definition) => [definition.kind, definition])), [catalog]);
 
   const canConnect = useCallback(
     (connection: Connection): { ok: true; port: WorkflowPort } | { ok: false; reason: string } => {
@@ -106,11 +158,9 @@ export function App() {
       if (!sourcePort || !targetPort) {
         return { ok: false, reason: '必须从输出端口连接到输入端口' };
       }
-      if (sourcePort.dataKind !== targetPort.dataKind) {
-        return {
-          ok: false,
-          reason: `${labelForDataKind(sourcePort.dataKind)} 不能连接到 ${labelForDataKind(targetPort.dataKind)}`,
-        };
+      const reason = validateConnectionKinds(sourcePort, targetPort);
+      if (reason) {
+        return { ok: false, reason };
       }
       return { ok: true, port: sourcePort };
     },
@@ -131,8 +181,8 @@ export function App() {
             ...connection,
             id: edgeId,
             animated: true,
-            label: labelForDataKind(validation.port.dataKind),
-            data: { dataKind: validation.port.dataKind },
+            label: labelForPortKind(validation.port.kind),
+            data: { kind: validation.port.kind, schema: validation.port.schema },
             className: 'workflow-edge',
           },
           current.filter((edge) => edge.id !== edgeId),
@@ -171,15 +221,9 @@ export function App() {
         });
         return withViewerPreviews(updated, edges);
       });
-      setSelection((current) => {
-        if (current.type !== 'node' || current.node.id !== nodeId) {
-          return current;
-        }
-        return {
-          type: 'node',
-          node: { ...current.node, config: { ...current.node.config, url: trimmedUrl } },
-        };
-      });
+      setSelection((current) => current.type === 'node' && current.node.id === nodeId
+        ? { type: 'node', node: { ...current.node, config: { ...current.node.config, url: trimmedUrl } } }
+        : current);
       pushEvent(`RTSP URL 已更新：${trimmedUrl}`);
     },
     [edges, pushEvent, setNodes],
@@ -192,53 +236,41 @@ export function App() {
         pushEvent('节点标题不能为空');
         return;
       }
-      setNodes((current) =>
-        current.map((flowNode) => {
-          if (flowNode.id !== nodeId) {
-            return flowNode;
-          }
-          return {
-            ...flowNode,
-            data: {
-              ...flowNode.data,
-              workflowNode: { ...flowNode.data.workflowNode, title },
-            },
-          };
-        }),
-      );
-      setSelection((current) =>
-        current.type === 'node' && current.node.id === nodeId
-          ? { type: 'node', node: { ...current.node, title } }
-          : current,
-      );
+      setNodes((current) => current.map((flowNode) => flowNode.id === nodeId
+        ? { ...flowNode, data: { ...flowNode.data, workflowNode: { ...flowNode.data.workflowNode, title } } }
+        : flowNode));
+      setSelection((current) => current.type === 'node' && current.node.id === nodeId
+        ? { type: 'node', node: { ...current.node, title } }
+        : current);
       pushEvent(`节点已重命名：${title}`);
     },
     [pushEvent, setNodes],
   );
 
   useEffect(() => {
-    setNodes((current) =>
-      current.map((flowNode) =>
-        flowNode.data.onRtspUrlChange === handleRtspUrlChange
-          ? flowNode
-          : { ...flowNode, data: { ...flowNode.data, onRtspUrlChange: handleRtspUrlChange } },
-      ),
-    );
+    setNodes((current) => current.map((flowNode) => flowNode.data.onRtspUrlChange === handleRtspUrlChange
+      ? flowNode
+      : { ...flowNode, data: { ...flowNode.data, onRtspUrlChange: handleRtspUrlChange } }));
   }, [handleRtspUrlChange, nodes.length, setNodes]);
 
   const handleAddNode = useCallback(
     (kind: NodeKind) => {
+      const definition = catalogByKind.get(kind);
       const count = nodes.filter((node) => node.data.workflowNode.kind === kind).length + 1;
-      const workflowNode = createWorkflowNode(kind, count, {
-        x: 96 + (nodes.length % 4) * 56,
-        y: 96 + nodes.length * 36,
-      });
+      const workflowNode = createWorkflowNode(kind, count, { x: 96 + (nodes.length % 4) * 56, y: 96 + nodes.length * 36 }, definition);
       const flowNode = toFlowNode(workflowNode);
       setNodes((current) => withViewerPreviews([...current, flowNode], edges));
       setSelection({ type: 'node', node: workflowNode });
       pushEvent(`新增节点：${workflowNode.title}`);
     },
-    [edges, nodes, pushEvent, setNodes],
+    [catalogByKind, edges, nodes, pushEvent, setNodes],
+  );
+
+  const handleApplyTemplate = useCallback(
+    (template: WorkmodeTemplate) => {
+      applyGraph({ ...template.graph, id: createGraphId(), revision: 'draft' }, `已插入模板：${template.title}`);
+    },
+    [applyGraph],
   );
 
   const handleDeleteSelection = useCallback(() => {
@@ -284,39 +316,31 @@ export function App() {
     pushEvent(`复制节点：${duplicated.title}`);
   }, [edges, nodes, pushEvent, selection, setNodes]);
 
-  const handleSaveDraft = useCallback(() => {
-    const draft = toWorkflowGraph(nodes, edges, graph?.title ?? 'Workflow Draft');
-    localStorage.setItem(WORKFLOW_DRAFT_KEY, JSON.stringify(draft));
-    setGraph(draft);
-    pushEvent('草稿已保存到浏览器 localStorage');
-  }, [edges, graph?.title, nodes, pushEvent]);
+  const handleSaveWorkflow = useCallback(() => {
+    const draft = toWorkflowGraph(nodes, edges, graph ?? emptyWorkflowGraph());
+    saveWorkflow(draft)
+      .then((saved) => {
+        setGraph(saved);
+        refreshSavedWorkflows();
+        pushEvent(`工作流已保存：${saved.id} @ ${saved.revision}`);
+      })
+      .catch((error: unknown) => pushEvent(`保存失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [edges, graph, nodes, pushEvent, refreshSavedWorkflows]);
 
-  const handleLoadDraft = useCallback(() => {
-    const raw = localStorage.getItem(WORKFLOW_DRAFT_KEY);
-    if (!raw) {
-      pushEvent('没有已保存草稿');
+  const handleLoadSavedWorkflow = useCallback(() => {
+    const first = savedWorkflows[0];
+    if (!first) {
+      pushEvent('没有已保存工作流');
       return;
     }
-    try {
-      const draft = JSON.parse(raw) as WorkflowGraph;
-      setGraph(draft);
-      setNodes(toFlowNodes(draft));
-      setEdges(toFlowEdges(draft));
-      setSelection({ type: 'none' });
-      pushEvent(`已载入草稿：${draft.title}`);
-    } catch (error) {
-      pushEvent(`草稿解析失败：${error instanceof Error ? error.message : String(error)}`);
-    }
-  }, [pushEvent, setEdges, setNodes]);
+    loadSavedWorkflow(first.id)
+      .then((loaded) => applyGraph(loaded, `已载入保存工作流：${loaded.title}`))
+      .catch((error: unknown) => pushEvent(`载入失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [applyGraph, pushEvent, savedWorkflows]);
 
   const handleNewWorkflow = useCallback(() => {
-    const draft: WorkflowGraph = { id: createGraphId(), title: 'Untitled Workflow', nodes: [], edges: [] };
-    setGraph(draft);
-    setNodes([]);
-    setEdges([]);
-    setSelection({ type: 'none' });
-    pushEvent('已新建空白工作流');
-  }, [pushEvent, setEdges, setNodes]);
+    applyGraph(emptyWorkflowGraph(), '已新建空白工作流');
+  }, [applyGraph]);
 
   const handleFitView = useCallback(() => {
     void flowInstanceRef.current?.fitView({ padding: 0.2, duration: 180 });
@@ -362,8 +386,8 @@ export function App() {
         <nav className="top-menu" aria-label="Workflow menu">
           <div className="menu-group">
             <button onClick={handleNewWorkflow}>New</button>
-            <button onClick={handleSaveDraft}>Save</button>
-            <button onClick={handleLoadDraft}>Load</button>
+            <button onClick={handleSaveWorkflow}>Save</button>
+            <button onClick={handleLoadSavedWorkflow}>Load</button>
           </div>
           <div className="menu-group">
             <button onClick={loadSeedWorkflow}>Reset demo</button>
@@ -371,8 +395,8 @@ export function App() {
             <button onClick={handleDuplicateSelection}>Duplicate</button>
           </div>
           <div className="menu-group">
-            <button onClick={() => pushEvent('Run 占位：runtime graph 将在后续阶段接入')}>Run</button>
-            <button onClick={() => pushEvent('Stop 占位：runtime graph 将在后续阶段接入')}>Stop</button>
+            <button onClick={() => pushEvent('Run 占位：RuntimeGraph 尚未启动远程/写入动作')}>Run</button>
+            <button onClick={() => pushEvent('Stop 占位：RuntimeGraph 尚未启动远程/写入动作')}>Stop</button>
             <button onClick={handleFitView}>Fit</button>
           </div>
         </nav>
@@ -380,11 +404,21 @@ export function App() {
       </header>
 
       <aside className="left-rail">
-        <h2>Node Library</h2>
-        {nodeLibrary.map((item) => (
-          <NodeLibraryItem key={item.kind} {...item} onAdd={handleAddNode} />
+        <h2>Templates</h2>
+        {templates.map((template) => (
+          <button key={template.id} className="library-item" type="button" onClick={() => handleApplyTemplate(template)}>
+            <strong>{template.title}</strong>
+            <span>{template.description}</span>
+          </button>
         ))}
-        <div className="rail-note">点击节点库条目新增节点；拖拽端口创建连线；Delete/Backspace 删除选中项。</div>
+        <h2>Node Library</h2>
+        {groupCatalog(catalog).map(([category, definitions]) => (
+          <section key={category} className="library-group">
+            <h3>{category}</h3>
+            {definitions.map((item) => <NodeLibraryItem key={item.kind} definition={item} onAdd={handleAddNode} />)}
+          </section>
+        ))}
+        <div className="rail-note">模板只生成拓扑；SSH/X5/I²C/EEPROM 写入类节点必须后续在 Inspector 明确触发。</div>
       </aside>
 
       <main className="canvas-region">
@@ -429,11 +463,9 @@ export function App() {
 function RtspSourceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
-  const url = String(node.config.url ?? 'rtsp://');
+  const url = String(node.config.url ?? DEFAULT_RTSP_URL);
   const [draftUrl, setDraftUrl] = useState(url);
-  useEffect(() => {
-    setDraftUrl(url);
-  }, [url]);
+  useEffect(() => setDraftUrl(url), [url]);
   const applyUrl = () => nodeData.onRtspUrlChange?.(node.id, draftUrl);
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
@@ -456,21 +488,71 @@ function RtspSourceNode({ data, selected }: NodeProps) {
         />
         <span>Transport: {String(node.config.transport ?? 'tcp')}</span>
       </div>
-      <Handle id="stream" type="source" position={Position.Right} className="stream-handle" />
+      <PortHandles node={node} />
     </section>
   );
+}
+
+function GenericWorkflowNode({ data, selected }: NodeProps) {
+  const node = (data as FlowNodeData).workflowNode;
+  return (
+    <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
+      <NodeHeader node={node} />
+      <div className="node-body compact">
+        <span>Kind: {node.kind}</span>
+        <span>Category: {node.category}</span>
+        <span>In: {node.inputs.length}</span>
+        <span>Out: {node.outputs.length}</span>
+      </div>
+      <PortHandles node={node} />
+    </section>
+  );
+}
+
+function PortHandles({ node }: { node: WorkflowNode }) {
+  return (
+    <>
+      {node.inputs.map((port, index) => (
+        <Handle
+          key={`in-${port.id}`}
+          id={port.id}
+          type="target"
+          position={Position.Left}
+          className="stream-handle"
+          style={{ top: `${portOffset(index, node.inputs.length)}%` }}
+          title={`${port.label}: ${port.kind}`}
+        />
+      ))}
+      {node.outputs.map((port, index) => (
+        <Handle
+          key={`out-${port.id}`}
+          id={port.id}
+          type="source"
+          position={Position.Right}
+          className="stream-handle"
+          style={{ top: `${portOffset(index, node.outputs.length)}%` }}
+          title={`${port.label}: ${port.kind}`}
+        />
+      ))}
+    </>
+  );
+}
+
+function portOffset(index: number, total: number): number {
+  if (total <= 1) {
+    return 50;
+  }
+  return 24 + (index * 52) / (total - 1);
 }
 
 function ViewerNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const previewUrl = nodeData.previewUrl;
-  const streamUrl = previewUrl
-    ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&width=960&height=540`
-    : undefined;
+  const streamUrl = previewUrl ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&width=960&height=540` : undefined;
   return (
     <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>
-      <Handle id="stream" type="target" position={Position.Left} className="stream-handle" />
+      <PortHandles node={node} />
       <NodeHeader node={node} />
       <MjpegPreview streamUrl={streamUrl} previewUrl={previewUrl} />
       <div className="node-body compact">
@@ -505,12 +587,20 @@ interface MjpegPart {
   consumed: number;
 }
 
+interface ViewerTransform {
+  scale: number;
+  x: number;
+  y: number;
+}
+
 function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined; previewUrl: string | undefined }) {
   const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(streamUrl ? 'connecting' : 'error');
   const [frameUrl, setFrameUrl] = useState<string | undefined>();
   const [metrics, setMetrics] = useState<ViewerMetrics>(() => initialViewerMetrics());
+  const [transform, setTransform] = useState<ViewerTransform>({ scale: 1, x: 0, y: 0 });
   const objectUrlRef = useRef<string | undefined>();
   const lastFrameAtRef = useRef<number | null>(null);
+  const dragStartRef = useRef<{ pointerId: number; x: number; y: number; originX: number; originY: number } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -526,11 +616,7 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
         const elapsedSeconds = (now - lastSampleAt) / 1000;
         const renderFps = renderedFrames / elapsedSeconds;
         const lastFrameAt = lastFrameAtRef.current;
-        setMetrics((current) => ({
-          ...current,
-          renderFps,
-          lastFrameAgeMs: lastFrameAt === null ? null : now - lastFrameAt,
-        }));
+        setMetrics((current) => ({ ...current, renderFps, lastFrameAgeMs: lastFrameAt === null ? null : now - lastFrameAt }));
         renderedFrames = 0;
         lastSampleAt = now;
       }
@@ -648,17 +734,13 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
       }
     })();
 
-    return () => {
-      abortController.abort();
-    };
+    return () => abortController.abort();
   }, [streamUrl]);
 
-  useEffect(() => {
-    return () => {
-      if (objectUrlRef.current) {
-        URL.revokeObjectURL(objectUrlRef.current);
-      }
-    };
+  useEffect(() => () => {
+    if (objectUrlRef.current) {
+      URL.revokeObjectURL(objectUrlRef.current);
+    }
   }, []);
 
   const statusText = !streamUrl
@@ -669,11 +751,48 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
         ? 'Connecting RTSP via internal decoder...'
         : 'Preview stream unavailable';
 
+  const zoomBy = (ratio: number) => setTransform((current) => ({ ...current, scale: clamp(current.scale * ratio, 0.25, 4) }));
+  const fit = () => setTransform({ scale: 1, x: 0, y: 0 });
+
   return (
-    <div className="viewer-panel">
-      <div className={`viewer-preview ${streamState}`}>
-        {frameUrl && <img src={frameUrl} alt={`Preview from ${previewUrl}`} />}
+    <div className="viewer-panel nodrag nopan">
+      <div
+        className={`viewer-preview ${streamState}`}
+        onWheel={(event) => {
+          event.stopPropagation();
+          event.preventDefault();
+          zoomBy(event.deltaY < 0 ? 1.12 : 0.88);
+        }}
+        onDoubleClick={fit}
+        onPointerDown={(event) => {
+          dragStartRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: transform.x, originY: transform.y };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = dragStartRef.current;
+          if (!drag || drag.pointerId !== event.pointerId) {
+            return;
+          }
+          setTransform((current) => ({ ...current, x: drag.originX + event.clientX - drag.x, y: drag.originY + event.clientY - drag.y }));
+        }}
+        onPointerUp={() => {
+          dragStartRef.current = null;
+        }}
+      >
+        {frameUrl && (
+          <img
+            src={frameUrl}
+            alt={`Preview from ${previewUrl}`}
+            style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
+          />
+        )}
         {streamState !== 'playing' && <div className="preview-grid" />}
+      </div>
+      <div className="viewer-toolbar">
+        <button type="button" onClick={fit}>Fit</button>
+        <button type="button" onClick={() => setTransform((current) => ({ ...current, scale: 1 }))}>1:1</button>
+        <button type="button" onClick={() => zoomBy(1.2)}>Zoom +</button>
+        <button type="button" onClick={() => zoomBy(0.8)}>Zoom -</button>
       </div>
       <div className="viewer-status">{statusText}</div>
       <dl className="viewer-metrics">
@@ -822,21 +941,11 @@ function NodeHeader({ node }: { node: WorkflowNode }) {
   );
 }
 
-function NodeLibraryItem({
-  kind,
-  title,
-  description,
-  onAdd,
-}: {
-  kind: NodeKind;
-  title: string;
-  description: string;
-  onAdd: (kind: NodeKind) => void;
-}) {
+function NodeLibraryItem({ definition, onAdd }: { definition: NodeDefinition; onAdd: (kind: NodeKind) => void }) {
   return (
-    <button className="library-item" type="button" onClick={() => onAdd(kind)}>
-      <strong>{title}</strong>
-      <span>{description}</span>
+    <button className="library-item" type="button" onClick={() => onAdd(definition.kind)}>
+      <strong>{definition.title}</strong>
+      <span>{definition.description}</span>
     </button>
   );
 }
@@ -873,7 +982,8 @@ function Inspector({
         <KeyValue label="ID" value={selection.edge.id} />
         <KeyValue label="Source" value={`${selection.edge.source}:${selection.edge.sourceHandle ?? ''}`} />
         <KeyValue label="Target" value={`${selection.edge.target}:${selection.edge.targetHandle ?? ''}`} />
-        <KeyValue label="Data" value={labelForDataKind(selection.edge.data?.dataKind ?? 'rtsp-stream')} />
+        <KeyValue label="Kind" value={labelForPortKind(selection.edge.data?.kind ?? 'endpoint.rtsp')} />
+        <KeyValue label="Schema" value={selection.edge.data?.schema ?? 'n/a'} />
         <InspectorEvents events={events} />
       </div>
     );
@@ -900,14 +1010,11 @@ function Inspector({
         }}
       />
       <KeyValue label="Kind" value={node.kind} />
+      <KeyValue label="Category" value={node.category} />
       <KeyValue label="State" value={node.state} />
       <h3>Ports</h3>
       {[...node.inputs, ...node.outputs].map((port) => (
-        <KeyValue
-          key={`${port.direction}-${port.id}`}
-          label={`${port.direction}:${port.id}`}
-          value={labelForDataKind(port.dataKind)}
-        />
+        <KeyValue key={`${port.direction}-${port.id}`} label={`${port.direction}:${port.id}`} value={`${port.kind} / ${port.schema}`} />
       ))}
       <h3>Config</h3>
       <pre>{JSON.stringify(node.config, null, 2)}</pre>
@@ -921,9 +1028,7 @@ function InspectorEvents({ events }: { events: string[] }) {
     <section className="inspector-events">
       <h3>Events</h3>
       <ol>
-        {events.map((event, index) => (
-          <li key={`${event}-${index}`}>{event}</li>
-        ))}
+        {events.map((event, index) => <li key={`${event}-${index}`}>{event}</li>)}
       </ol>
     </section>
   );
@@ -951,12 +1056,29 @@ function toFlowNodes(graph: WorkflowGraph): FlowNode[] {
 }
 
 function incomingRtspUrl(graph: WorkflowGraph, viewerNodeId: string): string | undefined {
-  const incoming = graph.edges.find((edge) => edge.target.nodeId === viewerNodeId && edge.dataKind === 'rtsp-stream');
-  if (!incoming) {
+  const nodeMap = new Map(graph.nodes.map((node) => [node.id, node]));
+  const visited = new Set<string>();
+  const visit = (nodeId: string): string | undefined => {
+    if (visited.has(nodeId)) {
+      return undefined;
+    }
+    visited.add(nodeId);
+    const node = nodeMap.get(nodeId);
+    if (!node) {
+      return undefined;
+    }
+    if (node.kind === 'rtspSource' && typeof node.config.url === 'string') {
+      return node.config.url;
+    }
+    for (const edge of graph.edges.filter((candidate) => candidate.target.nodeId === nodeId)) {
+      const url = visit(edge.source.nodeId);
+      if (url) {
+        return url;
+      }
+    }
     return undefined;
-  }
-  const source = graph.nodes.find((node) => node.id === incoming.source.nodeId && node.kind === 'rtspSource');
-  return typeof source?.config.url === 'string' ? source.config.url : undefined;
+  };
+  return visit(viewerNodeId);
 }
 
 function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
@@ -967,8 +1089,8 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     target: edge.target.nodeId,
     targetHandle: edge.target.portId,
     animated: true,
-    label: labelForDataKind(edge.dataKind),
-    data: { workflowEdge: edge, dataKind: edge.dataKind },
+    label: labelForPortKind(edge.kind),
+    data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema },
     className: 'workflow-edge',
   }));
 }
@@ -981,68 +1103,77 @@ function createNodeId(kind: NodeKind): string {
   return `${kind}-${crypto.randomUUID()}`;
 }
 
-function createWorkflowNode(kind: NodeKind, count: number, position: { x: number; y: number }): WorkflowNode {
-  switch (kind) {
-    case 'rtspSource':
-      return {
-        id: createNodeId(kind),
-        kind,
-        title: `RTSP Input ${count}`,
-        position,
-        state: 'ready',
-        inputs: [],
-        outputs: [{ id: 'stream', label: 'RTSP stream', direction: 'output', dataKind: 'rtsp-stream' }],
-        config: { url: DEFAULT_RTSP_URL, transport: 'tcp' },
-      };
-    case 'viewer':
-      return {
-        id: createNodeId(kind),
-        kind,
-        title: `Viewer ${count}`,
-        position,
-        state: 'idle',
-        inputs: [{ id: 'stream', label: 'RTSP stream', direction: 'input', dataKind: 'rtsp-stream' }],
-        outputs: [],
-        config: { fitMode: 'contain', overlay: 'status' },
-      };
-  }
-}
-
-function toFlowNode(node: WorkflowNode): FlowNode {
+function createWorkflowNode(kind: NodeKind, count: number, position: { x: number; y: number }, definition: NodeDefinition | undefined): WorkflowNode {
   return {
-    id: node.id,
-    type: node.kind,
-    position: node.position,
-    data: { workflowNode: node },
+    id: createNodeId(kind),
+    kind,
+    title: `${definition?.title ?? kind} ${count}`,
+    position,
+    state: kind === 'rtspSource' || kind === 'localWorkspace' || kind === 'sshSession' || kind === 'x5Device' ? 'ready' : 'idle',
+    category: definition?.category ?? 'diagnostics',
+    inputs: definition?.inputs ?? [],
+    outputs: definition?.outputs ?? [],
+    config: definition?.defaultConfig ?? (kind === 'rtspSource' ? { url: DEFAULT_RTSP_URL, transport: 'tcp' } : {}),
   };
 }
 
-function toWorkflowGraph(nodes: FlowNode[], edges: FlowEdge[], title: string): WorkflowGraph {
+function toFlowNode(node: WorkflowNode): FlowNode {
+  return { id: node.id, type: node.kind, position: node.position, data: { workflowNode: node } };
+}
+
+function toWorkflowGraph(nodes: FlowNode[], edges: FlowEdge[], base: WorkflowGraph): WorkflowGraph {
   return {
-    id: createGraphId(),
-    title,
-    nodes: nodes.map((node) => ({
-      ...node.data.workflowNode,
-      position: { x: node.position.x, y: node.position.y },
-    })),
+    ...base,
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    nodes: nodes.map((node) => ({ ...node.data.workflowNode, position: { x: node.position.x, y: node.position.y } })),
     edges: edges.map((edge) => ({
       id: edge.id,
       source: { nodeId: String(edge.source), portId: String(edge.sourceHandle ?? '') },
       target: { nodeId: String(edge.target), portId: String(edge.targetHandle ?? '') },
-      dataKind: edge.data?.dataKind ?? 'rtsp-stream',
+      kind: edge.data?.kind ?? inferPortKind(nodes, String(edge.source), String(edge.sourceHandle ?? '')),
+      schema: edge.data?.schema ?? inferPortSchema(nodes, String(edge.source), String(edge.sourceHandle ?? '')),
+      schemaVersion: WORKFLOW_SCHEMA_VERSION,
     })),
   };
 }
 
 function withViewerPreviews(nodes: FlowNode[], edges: FlowEdge[]): FlowNode[] {
-  const workflowNodes = new Map(nodes.map((node) => [node.id, node.data.workflowNode]));
-  return nodes.map((node) => {
-    if (node.data.workflowNode.kind !== 'viewer') {
-      return node;
-    }
-    const incoming = edges.find((edge) => edge.target === node.id && edge.data?.dataKind === 'rtsp-stream');
-    const source = incoming ? workflowNodes.get(String(incoming.source)) : undefined;
-    const previewUrl = typeof source?.config.url === 'string' ? source.config.url : undefined;
-    return { ...node, data: { ...node.data, previewUrl } };
-  });
+  const graph = toWorkflowGraph(nodes, edges, emptyWorkflowGraph());
+  return nodes.map((node) => node.data.workflowNode.kind === 'viewer'
+    ? { ...node, data: { ...node.data, previewUrl: incomingRtspUrl(graph, node.id) } }
+    : node);
+}
+
+function inferPortKind(nodes: FlowNode[], nodeId: string, portId: string): PortKind {
+  const node = nodes.find((candidate) => candidate.id === nodeId)?.data.workflowNode;
+  return node?.outputs.find((port) => port.id === portId)?.kind ?? 'endpoint.rtsp';
+}
+
+function inferPortSchema(nodes: FlowNode[], nodeId: string, portId: string): string {
+  const node = nodes.find((candidate) => candidate.id === nodeId)?.data.workflowNode;
+  return node?.outputs.find((port) => port.id === portId)?.schema ?? 'media.rtsp.endpoint.v1';
+}
+
+function emptyWorkflowGraph(): WorkflowGraph {
+  return {
+    schemaVersion: WORKFLOW_SCHEMA_VERSION,
+    id: createGraphId(),
+    title: 'Untitled Workflow',
+    revision: 'draft',
+    nodes: [],
+    edges: [],
+    viewport: { x: 0, y: 0, zoom: 1 },
+  };
+}
+
+function groupCatalog(catalog: NodeDefinition[]): Array<[string, NodeDefinition[]]> {
+  const groups = new Map<string, NodeDefinition[]>();
+  for (const definition of catalog) {
+    groups.set(definition.category, [...(groups.get(definition.category) ?? []), definition]);
+  }
+  return [...groups.entries()];
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
