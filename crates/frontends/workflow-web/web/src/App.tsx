@@ -404,9 +404,9 @@ export function App() {
           maxZoom={1.8}
           proOptions={{ hideAttribution: true }}
         >
-          <Background color="#334155" gap={24} size={1} />
-          <MiniMap pannable zoomable nodeStrokeWidth={3} />
-          <Controls position="bottom-left" />
+          <Background color="#1e293b" gap={28} size={1} />
+          <MiniMap className="workflow-minimap" pannable zoomable nodeStrokeWidth={2} />
+          <Controls className="workflow-controls" position="bottom-left" />
           <Panel position="top-left" className="canvas-panel">
             {selection.type === 'none' ? 'Select a node or edge' : `${selection.type}: ${selection.type === 'node' ? selection.node.title : selection.edge.id}`}
           </Panel>
