@@ -36,12 +36,11 @@ button:hover {
   display: grid;
   width: 100vw;
   height: 100vh;
-  grid-template-rows: 72px minmax(0, 1fr) 132px;
+  grid-template-rows: 72px minmax(0, 1fr);
   grid-template-columns: 260px minmax(0, 1fr) 320px;
   grid-template-areas:
     "top top top"
-    "left canvas inspector"
-    "runtime runtime runtime";
+    "left canvas inspector";
 }
 
 .top-bar {
@@ -73,6 +72,17 @@ button:hover {
   display: flex;
   flex: 1;
   gap: 0.6rem;
+}
+
+.menu-group {
+  display: flex;
+  gap: 0.35rem;
+}
+
+.menu-group button {
+  border-radius: 4px;
+  padding: 0.42rem 0.58rem;
+  font-size: 0.78rem;
 }
 
 .service-pill {
@@ -118,13 +128,16 @@ button:hover {
 
 .library-item {
   display: flex;
+  width: 100%;
   flex-direction: column;
+  align-items: flex-start;
   gap: 0.35rem;
   margin-bottom: 0.75rem;
   border: 1px solid rgba(148, 163, 184, 0.2);
-  border-radius: 14px;
+  border-radius: 6px;
   background: rgba(15, 23, 42, 0.72);
   padding: 0.85rem;
+  text-align: left;
 }
 
 .library-item span,
@@ -154,6 +167,50 @@ button:hover {
   background: rgba(15, 23, 42, 0.78);
   padding: 0.45rem 0.8rem;
   font-size: 0.82rem;
+}
+
+.inspector-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.8rem;
+}
+
+.field-label {
+  display: block;
+  margin-bottom: 0.35rem;
+  color: #93c5fd;
+  font-size: 0.78rem;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.inspector-input {
+  width: 100%;
+  margin-bottom: 0.85rem;
+  border: 1px solid rgba(148, 163, 184, 0.28);
+  border-radius: 4px;
+  background: rgba(2, 6, 23, 0.6);
+  color: #e2e8f0;
+  font: inherit;
+  padding: 0.5rem 0.6rem;
+}
+
+.inspector-events ol {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.inspector-events li {
+  border: 1px solid rgba(148, 163, 184, 0.14);
+  border-radius: 4px;
+  background: rgba(2, 6, 23, 0.32);
+  color: #94a3b8;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  padding: 0.45rem;
 }
 
 .workflow-node {

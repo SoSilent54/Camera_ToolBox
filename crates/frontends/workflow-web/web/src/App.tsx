@@ -15,12 +15,14 @@ import {
   type Node,
   type NodeProps,
   type OnSelectionChangeParams,
+  type ReactFlowInstance,
 } from '@xyflow/react';
 import {
   labelForDataKind,
   loadWorkflow,
   type FlowEdgeData,
   type FlowNodeData,
+  type NodeKind,
   type WorkflowGraph,
   type WorkflowNode,
   type WorkflowPort,
@@ -33,6 +35,14 @@ type Selection =
   | { type: 'edge'; edge: FlowEdge }
   | { type: 'none' };
 
+const WORKFLOW_DRAFT_KEY = 'camera-toolbox-workflow-draft';
+const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
+
+const nodeLibrary: Array<{ kind: NodeKind; title: string; description: string }> = [
+  { kind: 'rtspSource', title: 'RTSP Input', description: '摄像头或板端 RTSP 流入口' },
+  { kind: 'viewer', title: 'Viewer', description: '显示输入流、图像和运行状态' },
+];
+
 const nodeTypes = {
   rtspSource: RtspSourceNode,
   viewer: ViewerNode,
@@ -44,33 +54,33 @@ export function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
+  const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
 
-  useEffect(() => {
-    let alive = true;
+  const pushEvent = useCallback((event: string) => {
+    setEvents((current) => [event, ...current].slice(0, 8));
+  }, []);
+
+  const loadSeedWorkflow = useCallback(() => {
     loadWorkflow()
       .then((loaded) => {
-        if (!alive) {
-          return;
-        }
         setGraph(loaded);
         setNodes(toFlowNodes(loaded));
         setEdges(toFlowEdges(loaded));
+        setSelection({ type: 'none' });
         setEvents([
           `已加载 ${loaded.title}`,
           `节点 ${loaded.nodes.length} 个，连接 ${loaded.edges.length} 条`,
         ]);
       })
       .catch((error: unknown) => {
-        if (!alive) {
-          return;
-        }
         const message = error instanceof Error ? error.message : String(error);
         setEvents([`加载失败：${message}`]);
       });
-    return () => {
-      alive = false;
-    };
   }, [setEdges, setNodes]);
+
+  useEffect(() => {
+    loadSeedWorkflow();
+  }, [loadSeedWorkflow]);
 
   const nodeById = useMemo(() => {
     const map = new Map<string, WorkflowNode>();
@@ -111,12 +121,12 @@ export function App() {
     (connection: Connection) => {
       const validation = canConnect(connection);
       if (!validation.ok) {
-        setEvents((current) => [`拒绝连接：${validation.reason}`, ...current].slice(0, 6));
+        pushEvent(`拒绝连接：${validation.reason}`);
         return;
       }
       const edgeId = `edge-${connection.source}-${connection.sourceHandle}-${connection.target}-${connection.targetHandle}`;
-      setEdges((current) =>
-        addEdge(
+      setEdges((current) => {
+        const nextEdges = addEdge(
           {
             ...connection,
             id: edgeId,
@@ -126,18 +136,20 @@ export function App() {
             className: 'workflow-edge',
           },
           current.filter((edge) => edge.id !== edgeId),
-        ),
-      );
-      setEvents((current) => [`新增连接：${edgeId}`, ...current].slice(0, 6));
+        );
+        setNodes((currentNodes) => withViewerPreviews(currentNodes, nextEdges));
+        return nextEdges;
+      });
+      pushEvent(`新增连接：${edgeId}`);
     },
-    [canConnect, setEdges],
+    [canConnect, pushEvent, setEdges, setNodes],
   );
 
   const handleRtspUrlChange = useCallback(
     (nodeId: string, nextUrl: string) => {
       const trimmedUrl = nextUrl.trim();
       if (!trimmedUrl.startsWith('rtsp://') && !trimmedUrl.startsWith('rtsps://')) {
-        setEvents((current) => [`拒绝 RTSP URL：必须使用 rtsp:// 或 rtsps://`, ...current].slice(0, 6));
+        pushEvent('拒绝 RTSP URL：必须使用 rtsp:// 或 rtsps://');
         return;
       }
       setNodes((current) => {
@@ -157,27 +169,7 @@ export function App() {
             },
           };
         });
-        const workflowNodes = new Map(updated.map((flowNode) => [flowNode.id, flowNode.data.workflowNode]));
-        return updated.map((flowNode) => {
-          if (flowNode.data.workflowNode.kind !== 'viewer') {
-            return {
-              ...flowNode,
-              data: { ...flowNode.data, onRtspUrlChange: handleRtspUrlChange },
-            };
-          }
-          const incoming = edges.find(
-            (edge) => edge.target === flowNode.id && edge.data?.dataKind === 'rtsp-stream',
-          );
-          const source = incoming ? workflowNodes.get(incoming.source) : undefined;
-          return {
-            ...flowNode,
-            data: {
-              ...flowNode.data,
-              previewUrl: typeof source?.config.url === 'string' ? source.config.url : undefined,
-              onRtspUrlChange: handleRtspUrlChange,
-            },
-          };
-        });
+        return withViewerPreviews(updated, edges);
       });
       setSelection((current) => {
         if (current.type !== 'node' || current.node.id !== nodeId) {
@@ -188,9 +180,40 @@ export function App() {
           node: { ...current.node, config: { ...current.node.config, url: trimmedUrl } },
         };
       });
-      setEvents((current) => [`RTSP URL 已更新：${trimmedUrl}`, ...current].slice(0, 6));
+      pushEvent(`RTSP URL 已更新：${trimmedUrl}`);
     },
-    [edges, setNodes],
+    [edges, pushEvent, setNodes],
+  );
+
+  const handleNodeTitleChange = useCallback(
+    (nodeId: string, nextTitle: string) => {
+      const title = nextTitle.trim();
+      if (!title) {
+        pushEvent('节点标题不能为空');
+        return;
+      }
+      setNodes((current) =>
+        current.map((flowNode) => {
+          if (flowNode.id !== nodeId) {
+            return flowNode;
+          }
+          return {
+            ...flowNode,
+            data: {
+              ...flowNode.data,
+              workflowNode: { ...flowNode.data.workflowNode, title },
+            },
+          };
+        }),
+      );
+      setSelection((current) =>
+        current.type === 'node' && current.node.id === nodeId
+          ? { type: 'node', node: { ...current.node, title } }
+          : current,
+      );
+      pushEvent(`节点已重命名：${title}`);
+    },
+    [pushEvent, setNodes],
   );
 
   useEffect(() => {
@@ -202,6 +225,118 @@ export function App() {
       ),
     );
   }, [handleRtspUrlChange, nodes.length, setNodes]);
+
+  const handleAddNode = useCallback(
+    (kind: NodeKind) => {
+      const count = nodes.filter((node) => node.data.workflowNode.kind === kind).length + 1;
+      const workflowNode = createWorkflowNode(kind, count, {
+        x: 96 + (nodes.length % 4) * 56,
+        y: 96 + nodes.length * 36,
+      });
+      const flowNode = toFlowNode(workflowNode);
+      setNodes((current) => withViewerPreviews([...current, flowNode], edges));
+      setSelection({ type: 'node', node: workflowNode });
+      pushEvent(`新增节点：${workflowNode.title}`);
+    },
+    [edges, nodes, pushEvent, setNodes],
+  );
+
+  const handleDeleteSelection = useCallback(() => {
+    if (selection.type === 'none') {
+      pushEvent('没有选中的节点或连线');
+      return;
+    }
+    if (selection.type === 'edge') {
+      const nextEdges = edges.filter((edge) => edge.id !== selection.edge.id);
+      setEdges(nextEdges);
+      setNodes((current) => withViewerPreviews(current, nextEdges));
+      setSelection({ type: 'none' });
+      pushEvent(`删除连线：${selection.edge.id}`);
+      return;
+    }
+    const nodeId = selection.node.id;
+    const nextEdges = edges.filter((edge) => edge.source !== nodeId && edge.target !== nodeId);
+    setEdges(nextEdges);
+    setNodes((current) => withViewerPreviews(current.filter((node) => node.id !== nodeId), nextEdges));
+    setSelection({ type: 'none' });
+    pushEvent(`删除节点：${selection.node.title}`);
+  }, [edges, pushEvent, selection, setEdges, setNodes]);
+
+  const handleDuplicateSelection = useCallback(() => {
+    if (selection.type !== 'node') {
+      pushEvent('只有节点可以复制');
+      return;
+    }
+    const source = nodes.find((node) => node.id === selection.node.id);
+    if (!source) {
+      pushEvent('选中节点不存在');
+      return;
+    }
+    const duplicated: WorkflowNode = {
+      ...source.data.workflowNode,
+      id: createNodeId(source.data.workflowNode.kind),
+      title: `${source.data.workflowNode.title} Copy`,
+      position: { x: source.position.x + 48, y: source.position.y + 48 },
+      config: { ...source.data.workflowNode.config },
+    };
+    setNodes((current) => withViewerPreviews([...current, toFlowNode(duplicated)], edges));
+    setSelection({ type: 'node', node: duplicated });
+    pushEvent(`复制节点：${duplicated.title}`);
+  }, [edges, nodes, pushEvent, selection, setNodes]);
+
+  const handleSaveDraft = useCallback(() => {
+    const draft = toWorkflowGraph(nodes, edges, graph?.title ?? 'Workflow Draft');
+    localStorage.setItem(WORKFLOW_DRAFT_KEY, JSON.stringify(draft));
+    setGraph(draft);
+    pushEvent('草稿已保存到浏览器 localStorage');
+  }, [edges, graph?.title, nodes, pushEvent]);
+
+  const handleLoadDraft = useCallback(() => {
+    const raw = localStorage.getItem(WORKFLOW_DRAFT_KEY);
+    if (!raw) {
+      pushEvent('没有已保存草稿');
+      return;
+    }
+    try {
+      const draft = JSON.parse(raw) as WorkflowGraph;
+      setGraph(draft);
+      setNodes(toFlowNodes(draft));
+      setEdges(toFlowEdges(draft));
+      setSelection({ type: 'none' });
+      pushEvent(`已载入草稿：${draft.title}`);
+    } catch (error) {
+      pushEvent(`草稿解析失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+  }, [pushEvent, setEdges, setNodes]);
+
+  const handleNewWorkflow = useCallback(() => {
+    const draft: WorkflowGraph = { id: createGraphId(), title: 'Untitled Workflow', nodes: [], edges: [] };
+    setGraph(draft);
+    setNodes([]);
+    setEdges([]);
+    setSelection({ type: 'none' });
+    pushEvent('已新建空白工作流');
+  }, [pushEvent, setEdges, setNodes]);
+
+  const handleFitView = useCallback(() => {
+    void flowInstanceRef.current?.fitView({ padding: 0.2, duration: 180 });
+    pushEvent('画布已适配视图');
+  }, [pushEvent]);
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) {
+        return;
+      }
+      if (event.key === 'Delete' || event.key === 'Backspace') {
+        event.preventDefault();
+        handleDeleteSelection();
+      }
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [handleDeleteSelection]);
 
   const onSelectionChange = useCallback((params: OnSelectionChangeParams) => {
     const firstNode = params.nodes[0] as FlowNode | undefined;
@@ -222,22 +357,34 @@ export function App() {
       <header className="top-bar">
         <div>
           <span className="eyebrow">Camera Toolbox</span>
-          <h1>Workflow Web</h1>
+          <h1>{graph?.title ?? 'Workflow Web'}</h1>
         </div>
         <nav className="top-menu" aria-label="Workflow menu">
-          <button>File</button>
-          <button>Workspace</button>
-          <button>Run</button>
-          <button>View</button>
+          <div className="menu-group">
+            <button onClick={handleNewWorkflow}>New</button>
+            <button onClick={handleSaveDraft}>Save</button>
+            <button onClick={handleLoadDraft}>Load</button>
+          </div>
+          <div className="menu-group">
+            <button onClick={loadSeedWorkflow}>Reset demo</button>
+            <button onClick={handleDeleteSelection}>Delete</button>
+            <button onClick={handleDuplicateSelection}>Duplicate</button>
+          </div>
+          <div className="menu-group">
+            <button onClick={() => pushEvent('Run 占位：runtime graph 将在后续阶段接入')}>Run</button>
+            <button onClick={() => pushEvent('Stop 占位：runtime graph 将在后续阶段接入')}>Stop</button>
+            <button onClick={handleFitView}>Fit</button>
+          </div>
         </nav>
-        <div className="service-pill">Browser service</div>
+        <div className="service-pill">{nodes.length} nodes / {edges.length} edges</div>
       </header>
 
       <aside className="left-rail">
         <h2>Node Library</h2>
-        <NodeLibraryItem title="RTSP Input" description="摄像头或板端 RTSP 流入口" />
-        <NodeLibraryItem title="Viewer" description="显示输入流和运行状态" />
-        <div className="rail-note">当前版本先固定 RTSP → Viewer，拖拽新增节点后续接入。</div>
+        {nodeLibrary.map((item) => (
+          <NodeLibraryItem key={item.kind} {...item} onAdd={handleAddNode} />
+        ))}
+        <div className="rail-note">点击节点库条目新增节点；拖拽端口创建连线；Delete/Backspace 删除选中项。</div>
       </aside>
 
       <main className="canvas-region">
@@ -249,6 +396,9 @@ export function App() {
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
           onSelectionChange={onSelectionChange}
+          onInit={(instance) => {
+            flowInstanceRef.current = instance;
+          }}
           fitView
           minZoom={0.2}
           maxZoom={1.8}
@@ -258,26 +408,20 @@ export function App() {
           <MiniMap pannable zoomable nodeStrokeWidth={3} />
           <Controls position="bottom-left" />
           <Panel position="top-left" className="canvas-panel">
-            {graph?.title ?? 'Loading workflow'}
+            {selection.type === 'none' ? 'Select a node or edge' : `${selection.type}: ${selection.type === 'node' ? selection.node.title : selection.edge.id}`}
           </Panel>
         </ReactFlow>
       </main>
 
       <aside className="inspector">
-        <Inspector selection={selection} />
+        <Inspector
+          events={events}
+          selection={selection}
+          onDeleteSelection={handleDeleteSelection}
+          onDuplicateSelection={handleDuplicateSelection}
+          onNodeTitleChange={handleNodeTitleChange}
+        />
       </aside>
-
-      <footer className="runtime-panel">
-        <div>
-          <strong>Runtime</strong>
-          <span>{nodes.length} nodes / {edges.length} edges</span>
-        </div>
-        <ol>
-          {events.map((event, index) => (
-            <li key={`${event}-${index}`}>{event}</li>
-          ))}
-        </ol>
-      </footer>
     </div>
   );
 }
@@ -678,21 +822,44 @@ function NodeHeader({ node }: { node: WorkflowNode }) {
   );
 }
 
-function NodeLibraryItem({ title, description }: { title: string; description: string }) {
+function NodeLibraryItem({
+  kind,
+  title,
+  description,
+  onAdd,
+}: {
+  kind: NodeKind;
+  title: string;
+  description: string;
+  onAdd: (kind: NodeKind) => void;
+}) {
   return (
-    <article className="library-item">
+    <button className="library-item" type="button" onClick={() => onAdd(kind)}>
       <strong>{title}</strong>
       <span>{description}</span>
-    </article>
+    </button>
   );
 }
 
-function Inspector({ selection }: { selection: Selection }) {
+function Inspector({
+  events,
+  selection,
+  onDeleteSelection,
+  onDuplicateSelection,
+  onNodeTitleChange,
+}: {
+  events: string[];
+  selection: Selection;
+  onDeleteSelection: () => void;
+  onDuplicateSelection: () => void;
+  onNodeTitleChange: (nodeId: string, title: string) => void;
+}) {
   if (selection.type === 'none') {
     return (
       <div>
         <h2>Inspector</h2>
         <p className="muted">选择节点或连线后显示参数。</p>
+        <InspectorEvents events={events} />
       </div>
     );
   }
@@ -700,10 +867,14 @@ function Inspector({ selection }: { selection: Selection }) {
     return (
       <div>
         <h2>Edge</h2>
+        <div className="inspector-actions">
+          <button type="button" onClick={onDeleteSelection}>Delete edge</button>
+        </div>
         <KeyValue label="ID" value={selection.edge.id} />
         <KeyValue label="Source" value={`${selection.edge.source}:${selection.edge.sourceHandle ?? ''}`} />
         <KeyValue label="Target" value={`${selection.edge.target}:${selection.edge.targetHandle ?? ''}`} />
         <KeyValue label="Data" value={labelForDataKind(selection.edge.data?.dataKind ?? 'rtsp-stream')} />
+        <InspectorEvents events={events} />
       </div>
     );
   }
@@ -711,6 +882,23 @@ function Inspector({ selection }: { selection: Selection }) {
   return (
     <div>
       <h2>{node.title}</h2>
+      <div className="inspector-actions">
+        <button type="button" onClick={onDuplicateSelection}>Duplicate</button>
+        <button type="button" onClick={onDeleteSelection}>Delete</button>
+      </div>
+      <label className="field-label" htmlFor={`${node.id}-title`}>Title</label>
+      <input
+        id={`${node.id}-title`}
+        className="inspector-input"
+        defaultValue={node.title}
+        onBlur={(event) => onNodeTitleChange(node.id, event.currentTarget.value)}
+        onKeyDown={(event) => {
+          if (event.key === 'Enter') {
+            onNodeTitleChange(node.id, event.currentTarget.value);
+            event.currentTarget.blur();
+          }
+        }}
+      />
       <KeyValue label="Kind" value={node.kind} />
       <KeyValue label="State" value={node.state} />
       <h3>Ports</h3>
@@ -723,7 +911,21 @@ function Inspector({ selection }: { selection: Selection }) {
       ))}
       <h3>Config</h3>
       <pre>{JSON.stringify(node.config, null, 2)}</pre>
+      <InspectorEvents events={events} />
     </div>
+  );
+}
+
+function InspectorEvents({ events }: { events: string[] }) {
+  return (
+    <section className="inspector-events">
+      <h3>Events</h3>
+      <ol>
+        {events.map((event, index) => (
+          <li key={`${event}-${index}`}>{event}</li>
+        ))}
+      </ol>
+    </section>
   );
 }
 
@@ -769,4 +971,78 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     data: { workflowEdge: edge, dataKind: edge.dataKind },
     className: 'workflow-edge',
   }));
+}
+
+function createGraphId(): string {
+  return `workflow-${crypto.randomUUID()}`;
+}
+
+function createNodeId(kind: NodeKind): string {
+  return `${kind}-${crypto.randomUUID()}`;
+}
+
+function createWorkflowNode(kind: NodeKind, count: number, position: { x: number; y: number }): WorkflowNode {
+  switch (kind) {
+    case 'rtspSource':
+      return {
+        id: createNodeId(kind),
+        kind,
+        title: `RTSP Input ${count}`,
+        position,
+        state: 'ready',
+        inputs: [],
+        outputs: [{ id: 'stream', label: 'RTSP stream', direction: 'output', dataKind: 'rtsp-stream' }],
+        config: { url: DEFAULT_RTSP_URL, transport: 'tcp' },
+      };
+    case 'viewer':
+      return {
+        id: createNodeId(kind),
+        kind,
+        title: `Viewer ${count}`,
+        position,
+        state: 'idle',
+        inputs: [{ id: 'stream', label: 'RTSP stream', direction: 'input', dataKind: 'rtsp-stream' }],
+        outputs: [],
+        config: { fitMode: 'contain', overlay: 'status' },
+      };
+  }
+}
+
+function toFlowNode(node: WorkflowNode): FlowNode {
+  return {
+    id: node.id,
+    type: node.kind,
+    position: node.position,
+    data: { workflowNode: node },
+  };
+}
+
+function toWorkflowGraph(nodes: FlowNode[], edges: FlowEdge[], title: string): WorkflowGraph {
+  return {
+    id: createGraphId(),
+    title,
+    nodes: nodes.map((node) => ({
+      ...node.data.workflowNode,
+      position: { x: node.position.x, y: node.position.y },
+    })),
+    edges: edges.map((edge) => ({
+      id: edge.id,
+      source: { nodeId: String(edge.source), portId: String(edge.sourceHandle ?? '') },
+      target: { nodeId: String(edge.target), portId: String(edge.targetHandle ?? '') },
+      dataKind: edge.data?.dataKind ?? 'rtsp-stream',
+    })),
+  };
+}
+
+function withViewerPreviews(nodes: FlowNode[], edges: FlowEdge[]): FlowNode[] {
+  const workflowNodes = new Map(nodes.map((node) => [node.id, node.data.workflowNode]));
+  return nodes.map((node) => {
+    if (node.data.workflowNode.kind !== 'viewer') {
+      return node;
+    }
+    const incoming = edges.find((edge) => edge.target === node.id && edge.data?.dataKind === 'rtsp-stream');
+    const source = incoming ? workflowNodes.get(String(incoming.source)) : undefined;
+    const previewUrl = typeof source?.config.url === 'string' ? source.config.url : undefined;
+    return { ...node, data: { ...node.data, previewUrl } };
+  });
 }
