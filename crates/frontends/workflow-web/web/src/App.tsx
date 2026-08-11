@@ -322,7 +322,7 @@ function ViewerNode({ data, selected }: NodeProps) {
   const node = nodeData.workflowNode;
   const previewUrl = nodeData.previewUrl;
   const streamUrl = previewUrl
-    ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&fps=30&width=960&height=540`
+    ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&width=960&height=540`
     : undefined;
   return (
     <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>

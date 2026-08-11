@@ -72,10 +72,9 @@ struct MjpegStreamQuery {
     height: Option<u16>,
 }
 
-#[derive(Debug, Clone)]
 struct MjpegStreamConfig {
     url: String,
-    fps: u16,
+    fps_limit: Option<u16>,
     width: u16,
     height: u16,
 }
@@ -161,7 +160,9 @@ async fn mjpeg_stream(
         )
     })?;
 
-    let frame_interval = Duration::from_secs_f64(1.0 / f64::from(config.fps));
+    let frame_interval = config
+        .fps_limit
+        .map(|fps| Duration::from_secs_f64(1.0 / f64::from(fps)));
     let body_stream = async_stream::stream! {
         let _decoder = decoder;
         let _cancellation = cancellation;
@@ -177,21 +178,23 @@ async fn mjpeg_stream(
             if let Some(frame) = latest_frame.latest()
                 && last_sequence != Some(frame.identity.frame_sequence)
             {
-                let now = Instant::now();
-                if now < next_frame_at {
-                    sleep_until(next_frame_at).await;
-                    continue;
+                if let Some(interval) = frame_interval {
+                    let now = Instant::now();
+                    if now < next_frame_at {
+                        sleep_until(next_frame_at).await;
+                        continue;
+                    }
+                    next_frame_at += interval;
+                    let now = Instant::now();
+                    while next_frame_at <= now {
+                        next_frame_at += interval;
+                    }
                 }
                 last_sequence = Some(frame.identity.frame_sequence);
                 let stats = _decoder.stats().snapshot();
                 match mjpeg_chunk(&frame, &stats) {
                     Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
                     Err(error) => yield Err(std::io::Error::other(error)),
-                }
-                next_frame_at += frame_interval;
-                let now = Instant::now();
-                while next_frame_at <= now {
-                    next_frame_at += frame_interval;
                 }
                 continue;
             }
@@ -286,7 +289,8 @@ impl MjpegStreamConfig {
             .clamp(90, 1080);
         Ok(Self {
             url: url.to_owned(),
-            fps: query.fps.unwrap_or(30).clamp(1, 30),
+            // 不传 fps 时跟随 RTSP/decoder 发布的新帧；显式传入时才做预览降采样。
+            fps_limit: query.fps.map(|fps| fps.clamp(1, 120)),
             width,
             height: query.height.unwrap_or(default_height).clamp(90, 1080),
         })
@@ -371,26 +375,26 @@ mod tests {
     }
 
     #[test]
-    fn mjpeg_config_clamps_preview_cost() {
-        let config = MjpegStreamConfig::from_query(MjpegStreamQuery {
+    fn mjpeg_config_preserves_source_rate_by_default() {
+        let explicit_limit = MjpegStreamConfig::from_query(MjpegStreamQuery {
             url: "rtsp://camera.local/stream".to_owned(),
-            fps: Some(120),
+            fps: Some(300),
             width: Some(4096),
             height: Some(4096),
         })
         .expect("valid RTSP URL");
-        assert_eq!(config.fps, 30);
-        assert_eq!(config.width, 1920);
-        assert_eq!(config.height, 1080);
+        assert_eq!(explicit_limit.fps_limit, Some(120));
+        assert_eq!(explicit_limit.width, 1920);
+        assert_eq!(explicit_limit.height, 1080);
 
-        let default_height = MjpegStreamConfig::from_query(MjpegStreamQuery {
+        let source_rate = MjpegStreamConfig::from_query(MjpegStreamQuery {
             url: "rtsp://camera.local/stream".to_owned(),
             fps: None,
             width: Some(960),
             height: None,
         })
         .expect("valid RTSP URL");
-        assert_eq!(default_height.fps, 30);
-        assert_eq!(default_height.height, 540);
+        assert_eq!(source_rate.fps_limit, None);
+        assert_eq!(source_rate.height, 540);
     }
 }
