@@ -339,24 +339,32 @@ function ViewerNode({ data, selected }: NodeProps) {
 
 interface ViewerMetrics {
   streamFps: number;
+  sentFps: number;
+  publishFps: number;
+  decodedFps: number;
   renderFps: number;
   frameCount: number;
   bytes: number;
   lastFrameAgeMs: number | null;
+  jpegBytes: number;
+  jpegEncodeMs: number | null;
+  codecMs: number | null;
+  scaleMs: number | null;
+  copyMs: number | null;
+  decoderFrames: number;
   error: string | null;
+}
+
+interface MjpegPart {
+  jpeg: Uint8Array<ArrayBufferLike>;
+  headers: Map<string, string>;
+  consumed: number;
 }
 
 function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined; previewUrl: string | undefined }) {
   const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(streamUrl ? 'connecting' : 'error');
   const [frameUrl, setFrameUrl] = useState<string | undefined>();
-  const [metrics, setMetrics] = useState<ViewerMetrics>({
-    streamFps: 0,
-    renderFps: 0,
-    frameCount: 0,
-    bytes: 0,
-    lastFrameAgeMs: null,
-    error: null,
-  });
+  const [metrics, setMetrics] = useState<ViewerMetrics>(() => initialViewerMetrics());
   const objectUrlRef = useRef<string | undefined>();
   const lastFrameAtRef = useRef<number | null>(null);
 
@@ -400,7 +408,7 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
       setStreamState('error');
       setFrameUrl(undefined);
       lastFrameAtRef.current = null;
-      setMetrics((current) => ({ ...current, streamFps: 0, frameCount: 0, bytes: 0, lastFrameAgeMs: null, error: null }));
+      setMetrics((current) => ({ ...initialViewerMetrics(), renderFps: current.renderFps }));
       return;
     }
 
@@ -408,11 +416,14 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
     let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array();
     let bytes = 0;
     let frameCount = 0;
-    lastFrameAtRef.current = null;
     let frameTimes: number[] = [];
+    let publishTimesNs: number[] = [];
+    let sentTimesNs: number[] = [];
+    let decoderSamples: Array<{ time: number; frames: number }> = [];
+    lastFrameAtRef.current = null;
     setStreamState('connecting');
     setFrameUrl(undefined);
-    setMetrics((current) => ({ ...current, streamFps: 0, frameCount: 0, bytes: 0, lastFrameAgeMs: null, error: null }));
+    setMetrics((current) => ({ ...initialViewerMetrics(), renderFps: current.renderFps }));
 
     void (async () => {
       try {
@@ -431,12 +442,14 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
           }
           bytes += value.byteLength;
           buffer = appendBytes(buffer, value);
-          let jpeg: Uint8Array<ArrayBufferLike> | undefined;
-          while ((jpeg = takeJpegFrame(buffer))) {
-            const frameEnd = findJpegEnd(buffer);
-            buffer = frameEnd >= 0 ? buffer.slice(frameEnd + 2) : new Uint8Array();
-            const jpegPart = new Uint8Array(jpeg.byteLength);
-            jpegPart.set(jpeg);
+          while (true) {
+            const part = takeMjpegPart(buffer);
+            if (!part) {
+              break;
+            }
+            buffer = buffer.slice(part.consumed);
+            const jpegPart = new Uint8Array(part.jpeg.byteLength);
+            jpegPart.set(part.jpeg);
             const nextObjectUrl = URL.createObjectURL(new Blob([jpegPart.buffer], { type: 'image/jpeg' }));
             if (objectUrlRef.current) {
               URL.revokeObjectURL(objectUrlRef.current);
@@ -448,13 +461,36 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
             frameCount += 1;
             lastFrameAtRef.current = now;
             frameTimes = [...frameTimes.filter((time) => now - time <= 2000), now];
+            const publishedNs = numberHeader(part.headers, 'x-frame-published-at-ns');
+            if (publishedNs !== null) {
+              publishTimesNs = [...publishTimesNs.filter((time) => publishedNs - time <= 2_000_000_000), publishedNs];
+            }
+            const sentNs = numberHeader(part.headers, 'x-mjpeg-sent-at-ns');
+            if (sentNs !== null) {
+              sentTimesNs = [...sentTimesNs.filter((time) => sentNs - time <= 2_000_000_000), sentNs];
+            }
+            const decoderFrames = numberHeader(part.headers, 'x-decoder-frames') ?? 0;
+            decoderSamples = [...decoderSamples.filter((sample) => now - sample.time <= 2000), { time: now, frames: decoderFrames }];
             const windowMs = frameTimes.length > 1 ? frameTimes[frameTimes.length - 1] - frameTimes[0] : 1000;
+            const publishWindowNs = publishTimesNs.length > 1 ? publishTimesNs[publishTimesNs.length - 1] - publishTimesNs[0] : 1_000_000_000;
+            const sentWindowNs = sentTimesNs.length > 1 ? sentTimesNs[sentTimesNs.length - 1] - sentTimesNs[0] : 1_000_000_000;
+            const decoderWindowMs = decoderSamples.length > 1 ? decoderSamples[decoderSamples.length - 1].time - decoderSamples[0].time : 1000;
+            const decoderFrameDelta = decoderSamples.length > 1 ? decoderSamples[decoderSamples.length - 1].frames - decoderSamples[0].frames : 0;
             setMetrics((current) => ({
               ...current,
               streamFps: frameTimes.length > 1 ? ((frameTimes.length - 1) * 1000) / Math.max(windowMs, 1) : 0,
+              sentFps: sentTimesNs.length > 1 ? ((sentTimesNs.length - 1) * 1_000_000_000) / Math.max(sentWindowNs, 1) : 0,
+              publishFps: publishTimesNs.length > 1 ? ((publishTimesNs.length - 1) * 1_000_000_000) / Math.max(publishWindowNs, 1) : 0,
+              decodedFps: decoderSamples.length > 1 ? (decoderFrameDelta * 1000) / Math.max(decoderWindowMs, 1) : 0,
               frameCount,
               bytes,
               lastFrameAgeMs: 0,
+              jpegBytes: numberHeader(part.headers, 'x-mjpeg-jpeg-bytes') ?? part.jpeg.byteLength,
+              jpegEncodeMs: nsToMs(numberHeader(part.headers, 'x-mjpeg-encode-ns')),
+              codecMs: averageStageMs(part.headers, 'x-decoder-codec-ns', decoderFrames),
+              scaleMs: averageStageMs(part.headers, 'x-decoder-scale-ns', decoderFrames),
+              copyMs: averageStageMs(part.headers, 'x-decoder-copy-ns', decoderFrames),
+              decoderFrames,
               error: null,
             }));
           }
@@ -490,20 +526,51 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
         : 'Preview stream unavailable';
 
   return (
-    <div className={`viewer-preview ${streamState}`}>
-      {frameUrl && <img src={frameUrl} alt={`Preview from ${previewUrl}`} />}
-      {streamState !== 'playing' && <div className="preview-grid" />}
-      <div className="viewer-overlay">{statusText}</div>
+    <div className="viewer-panel">
+      <div className={`viewer-preview ${streamState}`}>
+        {frameUrl && <img src={frameUrl} alt={`Preview from ${previewUrl}`} />}
+        {streamState !== 'playing' && <div className="preview-grid" />}
+      </div>
+      <div className="viewer-status">{statusText}</div>
       <dl className="viewer-metrics">
-        <div><dt>stream</dt><dd>{metrics.streamFps.toFixed(1)} fps</dd></div>
+        <div><dt>browser</dt><dd>{metrics.streamFps.toFixed(1)} fps</dd></div>
+        <div><dt>sent</dt><dd>{metrics.sentFps.toFixed(1)} fps</dd></div>
+        <div><dt>publish</dt><dd>{metrics.publishFps.toFixed(1)} fps</dd></div>
+        <div><dt>decoded</dt><dd>{metrics.decodedFps.toFixed(1)} fps</dd></div>
         <div><dt>ui raf</dt><dd>{metrics.renderFps.toFixed(1)} fps</dd></div>
-        <div><dt>frames</dt><dd>{metrics.frameCount}</dd></div>
+        <div><dt>parts</dt><dd>{metrics.frameCount}</dd></div>
+        <div><dt>decoded n</dt><dd>{metrics.decoderFrames}</dd></div>
+        <div><dt>jpeg</dt><dd>{formatBytes(metrics.jpegBytes)}</dd></div>
         <div><dt>bytes</dt><dd>{formatBytes(metrics.bytes)}</dd></div>
         <div><dt>age</dt><dd>{metrics.lastFrameAgeMs === null ? 'n/a' : `${Math.round(metrics.lastFrameAgeMs)} ms`}</dd></div>
+        <div><dt>enc</dt><dd>{formatMs(metrics.jpegEncodeMs)}</dd></div>
+        <div><dt>codec</dt><dd>{formatMs(metrics.codecMs)}</dd></div>
+        <div><dt>scale</dt><dd>{formatMs(metrics.scaleMs)}</dd></div>
+        <div><dt>copy</dt><dd>{formatMs(metrics.copyMs)}</dd></div>
         {metrics.error && <div className="metric-error"><dt>error</dt><dd>{metrics.error}</dd></div>}
       </dl>
     </div>
   );
+}
+
+function initialViewerMetrics(): ViewerMetrics {
+  return {
+    streamFps: 0,
+    sentFps: 0,
+    publishFps: 0,
+    decodedFps: 0,
+    renderFps: 0,
+    frameCount: 0,
+    bytes: 0,
+    lastFrameAgeMs: null,
+    jpegBytes: 0,
+    jpegEncodeMs: null,
+    codecMs: null,
+    scaleMs: null,
+    copyMs: null,
+    decoderFrames: 0,
+    error: null,
+  };
 }
 
 function appendBytes(existing: Uint8Array<ArrayBufferLike>, incoming: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
@@ -513,18 +580,48 @@ function appendBytes(existing: Uint8Array<ArrayBufferLike>, incoming: Uint8Array
   return merged;
 }
 
-function takeJpegFrame(buffer: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBufferLike> | undefined {
-  const start = findJpegStart(buffer);
-  if (start < 0) {
+function takeMjpegPart(buffer: Uint8Array<ArrayBufferLike>): MjpegPart | undefined {
+  const boundary = indexOfAscii(buffer, '--frame');
+  if (boundary < 0) {
     return undefined;
   }
-  const end = findJpegEnd(buffer, start + 2);
-  return end >= 0 ? buffer.slice(start, end + 2) : undefined;
+  const headerEnd = indexOfAscii(buffer, '\r\n\r\n', boundary);
+  if (headerEnd < 0) {
+    return undefined;
+  }
+  const headerBytes = buffer.slice(boundary, headerEnd);
+  const headers = parseMjpegHeaders(headerBytes);
+  const jpegStart = headerEnd + 4;
+  const contentLength = numberHeader(headers, 'content-length');
+  if (contentLength !== null) {
+    const jpegEnd = jpegStart + contentLength;
+    if (buffer.length < jpegEnd) {
+      return undefined;
+    }
+    const consumed = buffer[jpegEnd] === 13 && buffer[jpegEnd + 1] === 10 ? jpegEnd + 2 : jpegEnd;
+    return { jpeg: buffer.slice(jpegStart, jpegEnd), headers, consumed };
+  }
+  const end = findJpegEnd(buffer, jpegStart + 2);
+  return end >= 0 ? { jpeg: buffer.slice(jpegStart, end + 2), headers, consumed: end + 2 } : undefined;
 }
 
-function findJpegStart(buffer: Uint8Array<ArrayBufferLike>): number {
-  for (let index = 0; index + 1 < buffer.length; index += 1) {
-    if (buffer[index] === 0xff && buffer[index + 1] === 0xd8) {
+function parseMjpegHeaders(headerBytes: Uint8Array<ArrayBufferLike>): Map<string, string> {
+  const text = new TextDecoder('ascii').decode(headerBytes);
+  const headers = new Map<string, string>();
+  for (const line of text.split('\r\n')) {
+    const separator = line.indexOf(':');
+    if (separator <= 0) {
+      continue;
+    }
+    headers.set(line.slice(0, separator).trim().toLowerCase(), line.slice(separator + 1).trim());
+  }
+  return headers;
+}
+
+function indexOfAscii(buffer: Uint8Array<ArrayBufferLike>, needle: string, start = 0): number {
+  const bytes = [...needle].map((char) => char.charCodeAt(0));
+  for (let index = start; index + bytes.length <= buffer.length; index += 1) {
+    if (bytes.every((byte, offset) => buffer[index + offset] === byte)) {
       return index;
     }
   }
@@ -538,6 +635,28 @@ function findJpegEnd(buffer: Uint8Array<ArrayBufferLike>, start = 0): number {
     }
   }
   return -1;
+}
+
+function numberHeader(headers: Map<string, string>, key: string): number | null {
+  const raw = headers.get(key);
+  if (!raw) {
+    return null;
+  }
+  const parsed = Number(raw);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function averageStageMs(headers: Map<string, string>, key: string, frames: number): number | null {
+  const totalNs = numberHeader(headers, key);
+  return totalNs === null || frames <= 0 ? null : nsToMs(totalNs / frames);
+}
+
+function nsToMs(ns: number | null): number | null {
+  return ns === null ? null : ns / 1_000_000;
+}
+
+function formatMs(ms: number | null): string {
+  return ms === null ? 'n/a' : `${ms.toFixed(1)} ms`;
 }
 
 function formatBytes(bytes: number): string {

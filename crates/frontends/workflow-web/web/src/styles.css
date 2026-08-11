@@ -259,12 +259,17 @@ button:hover {
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.24);
 }
 
+.viewer-panel {
+  display: grid;
+  gap: 0.55rem;
+  margin: 0.9rem;
+}
+
 .viewer-preview {
   position: relative;
   display: grid;
   min-height: 170px;
   place-items: center;
-  margin: 0.9rem;
   overflow: hidden;
   border: 1px solid rgba(148, 163, 184, 0.2);
   border-radius: 14px;
@@ -290,48 +295,43 @@ button:hover {
   opacity: 0.4;
 }
 
-.viewer-preview span,
-.viewer-preview dl {
-  z-index: 1;
-}
-
-.viewer-overlay {
-  position: absolute;
-  right: 0.65rem;
-  bottom: 0.65rem;
+.viewer-status {
   border: 1px solid rgba(34, 197, 94, 0.28);
   border-radius: 999px;
   background: rgba(2, 6, 23, 0.72);
   color: #bbf7d0;
-  padding: 0.28rem 0.5rem;
+  padding: 0.28rem 0.55rem;
   font-size: 0.7rem;
+  width: fit-content;
 }
 
 .viewer-metrics {
-  position: absolute;
-  left: 0.65rem;
-  top: 0.65rem;
   display: grid;
-  grid-template-columns: auto auto;
-  gap: 0.18rem 0.45rem;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 0.35rem;
   margin: 0;
-  padding: 0.45rem 0.55rem;
-  border: 1px solid rgba(96, 165, 250, 0.28);
-  border-radius: 12px;
-  background: rgba(2, 6, 23, 0.76);
+  padding: 0;
   color: #dbeafe;
   font-size: 0.68rem;
   line-height: 1.25;
-  pointer-events: none;
 }
 
 .viewer-metrics div {
-  display: contents;
+  display: grid;
+  gap: 0.16rem;
+  min-width: 0;
+  padding: 0.36rem 0.42rem;
+  border: 1px solid rgba(96, 165, 250, 0.22);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.72);
 }
 
 .viewer-metrics dt,
 .viewer-metrics dd {
+  overflow: hidden;
   margin: 0;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .viewer-metrics dt {
@@ -340,10 +340,13 @@ button:hover {
 }
 
 .viewer-metrics dd {
-  min-width: 3.8rem;
   color: #f8fafc;
-  text-align: right;
   font-variant-numeric: tabular-nums;
+}
+
+.viewer-metrics .metric-error {
+  grid-column: 1 / -1;
+  border-color: rgba(248, 113, 113, 0.35);
 }
 
 .viewer-metrics .metric-error dt,

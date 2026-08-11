@@ -20,9 +20,12 @@ use axum::{
     routing::get,
 };
 use bytes::Bytes;
-use camera_toolbox_adapters::media::{FfmpegRtspDecoder, FfmpegRtspTransport};
+use camera_toolbox_adapters::media::{
+    FfmpegRtspDecoder, FfmpegRtspTransport, ffmpeg_rtsp::FfmpegRtspDecoderStatsSnapshot,
+};
 use camera_toolbox_app::{
-    DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, StreamCancellation, StreamSessionId,
+    DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, StreamCancellation,
+    StreamSessionId, host_monotonic_time_ns,
 };
 use clap::Parser;
 use image::{ColorType, codecs::jpeg::JpegEncoder};
@@ -180,7 +183,8 @@ async fn mjpeg_stream(
                     continue;
                 }
                 last_sequence = Some(frame.identity.frame_sequence);
-                match mjpeg_chunk(&frame) {
+                let stats = _decoder.stats().snapshot();
+                match mjpeg_chunk(&frame, &stats) {
                     Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
                     Err(error) => yield Err(std::io::Error::other(error)),
                 }
@@ -210,10 +214,29 @@ async fn mjpeg_stream(
     Ok(response)
 }
 
-fn mjpeg_chunk(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
+fn mjpeg_chunk(
+    frame: &DecodedVideoFrame,
+    stats: &FfmpegRtspDecoderStatsSnapshot,
+) -> Result<Vec<u8>, String> {
+    let encode_start = Instant::now();
     let jpeg = encode_rgba_as_jpeg(frame)?;
-    let mut chunk = Vec::with_capacity(jpeg.len() + 64);
-    chunk.extend_from_slice(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n");
+    let encode_ns = duration_nanos(encode_start.elapsed());
+    let sent_at_ns = host_monotonic_time_ns();
+    let headers = format!(
+        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Frame-Sequence: {}\r\nX-Frame-Published-At-Ns: {}\r\nX-Mjpeg-Sent-At-Ns: {}\r\nX-Decoder-Frames: {}\r\nX-Decoder-Codec-Ns: {}\r\nX-Decoder-Scale-Ns: {}\r\nX-Decoder-Copy-Ns: {}\r\nX-Mjpeg-Encode-Ns: {}\r\nX-Mjpeg-Jpeg-Bytes: {}\r\n\r\n",
+        jpeg.len(),
+        frame.identity.frame_sequence,
+        frame.identity.host_monotonic_time_ns,
+        sent_at_ns,
+        stats.decoded_frames,
+        stats.codec_stage_ns,
+        stats.scale_stage_ns,
+        stats.copy_stage_ns,
+        encode_ns,
+        jpeg.len(),
+    );
+    let mut chunk = Vec::with_capacity(headers.len() + jpeg.len() + 2);
+    chunk.extend_from_slice(headers.as_bytes());
     chunk.extend_from_slice(&jpeg);
     chunk.extend_from_slice(b"\r\n");
     Ok(chunk)
@@ -242,6 +265,10 @@ fn encode_rgba_as_jpeg(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
         .encode(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
         .map_err(|error| format!("JPEG encode failed: {error}"))?;
     Ok(jpeg)
+}
+
+fn duration_nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 impl MjpegStreamConfig {
@@ -300,6 +327,47 @@ mod tests {
             height: None,
         });
         assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
+    }
+
+    #[test]
+    fn mjpeg_chunk_includes_runtime_metrics_headers() {
+        let frame = DecodedVideoFrame {
+            width: 1,
+            height: 1,
+            rgba: vec![16, 32, 48, 255].into(),
+            identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
+                StreamSessionId::new("workflow-mjpeg-test").unwrap(),
+                0,
+                42,
+                "unit test",
+            ),
+        };
+        let stats = FfmpegRtspDecoderStatsSnapshot {
+            decoded_frames: 7,
+            io_bytes_available: false,
+            io_bytes: 0,
+            media_packet_bytes: 0,
+            codec_stage_ns: 10,
+            scale_stage_ns: 20,
+            copy_stage_ns: 30,
+        };
+
+        let chunk = mjpeg_chunk(&frame, &stats).unwrap();
+        let header_end = chunk
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("headers are terminated");
+        let headers = std::str::from_utf8(&chunk[..header_end]).unwrap();
+
+        assert!(headers.contains("Content-Type: image/jpeg"));
+        assert!(headers.contains("X-Frame-Sequence: 42"));
+        assert!(headers.contains("X-Mjpeg-Sent-At-Ns:"));
+        assert!(headers.contains("X-Decoder-Frames: 7"));
+        assert!(headers.contains("X-Decoder-Codec-Ns: 10"));
+        assert!(headers.contains("X-Decoder-Scale-Ns: 20"));
+        assert!(headers.contains("X-Decoder-Copy-Ns: 30"));
+        assert!(headers.contains("X-Mjpeg-Encode-Ns:"));
+        assert!(headers.contains("X-Mjpeg-Jpeg-Bytes:"));
     }
 
     #[test]
