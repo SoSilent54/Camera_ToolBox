@@ -111,6 +111,41 @@ pub enum NodeRuntimeState {
     Error,
 }
 
+/// Stage 7 运行时诊断快照；仅驻留服务进程内存，绝不写入 `WorkflowGraph`。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeGraphStatus {
+    pub graph_id: String,
+    pub running: bool,
+    pub nodes: Vec<RuntimeNodeStatus>,
+    pub events: Vec<RuntimeNodeEvent>,
+}
+
+/// 单个节点的运行时状态，使用节点 ID 与持久化拓扑关联。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeNodeStatus {
+    pub node_id: String,
+    pub state: NodeRuntimeState,
+    pub diagnostic: String,
+}
+
+/// 节点级诊断事件；Stage 7 不持有帧、套接字、日志或其他重型运行时数据。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeNodeEvent {
+    pub node_id: String,
+    pub level: RuntimeEventLevel,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeEventLevel {
+    Info,
+    Warning,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowPort {
@@ -387,7 +422,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "image.frame.v1",
                 Some(PortRole::Image),
             )],
-            json!({"reload": "manual"}),
+            json!({"relativePath": "", "reload": "manual"}),
         ),
         NodeKind::RtspSource => (
             NodeCategory::Source,
@@ -1024,7 +1059,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Status),
                 ),
             ],
-            json!({"address": "0x50", "mode": "read", "confirmWrites": true}),
+            json!({"profileId": "x5-lab", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
         ),
         NodeKind::EepromMapLoader => (
             NodeCategory::Control,
@@ -1079,7 +1114,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "i2c.transfer.v1",
                 Some(PortRole::Command),
             )],
-            json!({"confirmWrites": true, "verifyAfterWrite": true}),
+            json!({"profileId": "x5-lab", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "00", "pageSize": 16, "mapId": "x5_233_default", "confirmWrites": true, "verifyAfterWrite": true}),
         ),
         NodeKind::ResultView => (
             NodeCategory::Diagnostics,
@@ -1117,6 +1152,12 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
             graph: viewer_template_graph(),
         },
         WorkmodeTemplate {
+            id: "local-image",
+            title: "Local Image",
+            description: "Local Workspace → File Browser → Image File Source → Image Layer → Viewer",
+            graph: local_image_template_graph(),
+        },
+        WorkmodeTemplate {
             id: "calibration",
             title: "Calibration",
             description: "RTSP → Detector → Dataset/Coverage/AutoCapture/Solver",
@@ -1147,6 +1188,88 @@ pub fn validate_workflow(graph: &WorkflowGraph) -> Result<(), String> {
         validate_edge(graph, edge)?;
     }
     Ok(())
+}
+
+/// 构建 Stage 7 诊断运行时快照。此函数只标记可安全自动启动的纯媒体节点，
+/// 不创建 RTSP、SSH、X5 或 I²C 连接，也不执行校准或 EEPROM 操作。
+pub fn runtime_graph_status(graph: &WorkflowGraph, running: bool) -> RuntimeGraphStatus {
+    let nodes = graph
+        .nodes
+        .iter()
+        .map(|node| runtime_node_status(node, running))
+        .collect::<Vec<_>>();
+    let events = nodes
+        .iter()
+        .map(|node| RuntimeNodeEvent {
+            node_id: node.node_id.clone(),
+            level: match node.state {
+                NodeRuntimeState::Running => RuntimeEventLevel::Info,
+                _ => RuntimeEventLevel::Warning,
+            },
+            message: node.diagnostic.clone(),
+        })
+        .collect();
+
+    RuntimeGraphStatus {
+        graph_id: graph.id.clone(),
+        running,
+        nodes,
+        events,
+    }
+}
+
+fn runtime_node_status(node: &WorkflowNode, running: bool) -> RuntimeNodeStatus {
+    let (state, diagnostic) = if !running {
+        (NodeRuntimeState::Idle, "runtime stopped".to_owned())
+    } else if safe_auto_start_node(node.kind) {
+        (
+            NodeRuntimeState::Running,
+            "Stage 7 diagnostic session active; no external action was started".to_owned(),
+        )
+    } else if manual_node(node.kind) {
+        (
+            NodeRuntimeState::Idle,
+            "manual or dangerous node was not auto-executed".to_owned(),
+        )
+    } else {
+        (
+            NodeRuntimeState::Idle,
+            "no Stage 7 runtime executor is attached to this node".to_owned(),
+        )
+    };
+
+    RuntimeNodeStatus {
+        node_id: node.id.clone(),
+        state,
+        diagnostic,
+    }
+}
+
+fn safe_auto_start_node(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::RtspDecoder
+            | NodeKind::FrameSampler
+            | NodeKind::ImageLayer
+            | NodeKind::VideoLayer
+            | NodeKind::OverlayComposer
+            | NodeKind::Viewer
+            | NodeKind::ResultView
+    )
+}
+
+fn manual_node(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::SshSession
+            | NodeKind::X5Device
+            | NodeKind::X5RtspChannel
+            | NodeKind::X5Snapshot
+            | NodeKind::CalibrationSolver
+            | NodeKind::I2cBusDiscovery
+            | NodeKind::I2cTransfer
+            | NodeKind::EepromProvision
+    )
 }
 
 /// 标准化保存前的工作流图：修正 schema/revision，并拒绝运行时字段进入持久化文件。
@@ -1306,6 +1429,86 @@ fn viewer_template_graph() -> WorkflowGraph {
                 "video",
                 PortKind::LayerVideo,
                 "viewer.layer.video.v1",
+            ),
+        ],
+    )
+}
+
+/// 本地图像模板只声明 workspace 根和相对文件路径；不会扫描目录或自动读取文件。
+fn local_image_template_graph() -> WorkflowGraph {
+    let workspace = workflow_node(
+        "local-workspace-1",
+        NodeKind::LocalWorkspace,
+        "Local Workspace",
+        NodePosition { x: 80.0, y: 140.0 },
+    );
+    let browser = workflow_node(
+        "file-browser-1",
+        NodeKind::FileBrowser,
+        "File Browser",
+        NodePosition { x: 340.0, y: 140.0 },
+    );
+    let image_source = workflow_node(
+        "image-file-source-1",
+        NodeKind::ImageFileSource,
+        "Image File Source",
+        NodePosition { x: 620.0, y: 140.0 },
+    );
+    let layer = workflow_node(
+        "image-layer-1",
+        NodeKind::ImageLayer,
+        "Image Layer",
+        NodePosition { x: 900.0, y: 140.0 },
+    );
+    let viewer = workflow_node(
+        "viewer-1",
+        NodeKind::Viewer,
+        "Viewer",
+        NodePosition {
+            x: 1180.0,
+            y: 120.0,
+        },
+    );
+    graph(
+        "camera-toolbox-local-image-template",
+        "Local Image Workspace",
+        vec![workspace, browser, image_source, layer, viewer],
+        vec![
+            edge(
+                "local-image-e-workspace-browser",
+                "local-workspace-1",
+                "workspace",
+                "file-browser-1",
+                "local",
+                PortKind::WorkspaceLocal,
+                "workspace.local.v1",
+            ),
+            edge(
+                "local-image-e-browser-source",
+                "file-browser-1",
+                "file",
+                "image-file-source-1",
+                "file",
+                PortKind::ImageFrame,
+                "image.frame.v1",
+            ),
+            edge(
+                "local-image-e-source-layer",
+                "image-file-source-1",
+                "image",
+                "image-layer-1",
+                "image",
+                PortKind::ImageFrame,
+                "image.frame.v1",
+            ),
+            edge(
+                "local-image-e-layer-viewer",
+                "image-layer-1",
+                "layer",
+                "viewer-1",
+                "image",
+                PortKind::LayerImage,
+                "viewer.layer.image.v1",
             ),
         ],
     )

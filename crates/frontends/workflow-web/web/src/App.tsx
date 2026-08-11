@@ -22,21 +22,29 @@ import {
   labelForPortKind,
   listWorkflows,
   loadNodeCatalog,
+  loadRuntimeStatus,
   loadSavedWorkflow,
   loadWorkflow,
   loadWorkmodeTemplates,
+  previewEepromProvision,
+  previewI2cTransfer,
+  runWorkflowRuntime,
   saveWorkflow,
-  validateConnectionKinds,
+  stopWorkflowRuntime,
+  type ControlRequestPreview,
   type FlowEdgeData,
   type FlowNodeData,
   type NodeDefinition,
   type NodeKind,
   type PortKind,
+  type RuntimeGraphStatus,
   type WorkflowEdge,
   type WorkflowGraph,
   type WorkflowNode,
   type WorkflowPort,
   type WorkmodeTemplate,
+  type ViewerPreview,
+  validateConnectionKinds,
 } from './workflow';
 
 type FlowNode = Node<FlowNodeData>;
@@ -48,10 +56,8 @@ type Selection =
 
 const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
 const GENERIC_NODE_KINDS: NodeKind[] = [
-  'localWorkspace',
   'sftpWorkspace',
   'fileBrowser',
-  'imageFileSource',
   'sshSession',
   'x5Device',
   'x5RtspChannel',
@@ -79,6 +85,8 @@ const GENERIC_NODE_KINDS: NodeKind[] = [
 
 const nodeTypes = Object.fromEntries([
   ['rtspSource', RtspSourceNode],
+  ['localWorkspace', LocalWorkspaceNode],
+  ['imageFileSource', ImageFileSourceNode],
   ['viewer', ViewerNode],
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
 ]);
@@ -92,6 +100,7 @@ export function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeGraphStatus | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
 
   const pushEvent = useCallback((event: string) => {
@@ -105,6 +114,7 @@ export function App() {
       setEdges(toFlowEdges(nextGraph));
       setSelection({ type: 'none' });
       setEvents([event, `节点 ${nextGraph.nodes.length} 个，连接 ${nextGraph.edges.length} 条`]);
+      setRuntimeStatus(null);
     },
     [setEdges, setNodes],
   );
@@ -229,6 +239,40 @@ export function App() {
     [edges, pushEvent, setNodes],
   );
 
+  const handleLocalImageConfigChange = useCallback(
+    (nodeId: string, field: 'root' | 'relativePath', nextValue: string) => {
+      const value = nextValue.trim();
+      setNodes((current) => {
+        const updated = current.map((flowNode) => {
+          if (flowNode.id !== nodeId) {
+            return flowNode;
+          }
+          const workflowNode = flowNode.data.workflowNode;
+          const expectedKind = field === 'root' ? 'localWorkspace' : 'imageFileSource';
+          if (workflowNode.kind !== expectedKind) {
+            return flowNode;
+          }
+          return {
+            ...flowNode,
+            data: {
+              ...flowNode.data,
+              workflowNode: {
+                ...workflowNode,
+                config: { ...workflowNode.config, [field]: value },
+              },
+            },
+          };
+        });
+        return withViewerPreviews(updated, edges);
+      });
+      setSelection((current) => current.type === 'node' && current.node.id === nodeId
+        ? { type: 'node', node: { ...current.node, config: { ...current.node.config, [field]: value } } }
+        : current);
+      pushEvent(field === 'root' ? '本地 workspace 根目录已更新' : '本地图像相对路径已更新');
+    },
+    [edges, pushEvent, setNodes],
+  );
+
   const handleNodeTitleChange = useCallback(
     (nodeId: string, nextTitle: string) => {
       const title = nextTitle.trim();
@@ -247,11 +291,42 @@ export function App() {
     [pushEvent, setNodes],
   );
 
+  const handleNodeConfigChange = useCallback(
+    (nodeId: string, key: string, value: string | boolean) => {
+      setNodes((current) => current.map((flowNode) => flowNode.id === nodeId
+        ? {
+          ...flowNode,
+          data: {
+            ...flowNode.data,
+            workflowNode: {
+              ...flowNode.data.workflowNode,
+              config: { ...flowNode.data.workflowNode.config, [key]: value },
+            },
+          },
+        }
+        : flowNode));
+      setSelection((current) => current.type === 'node' && current.node.id === nodeId
+        ? { type: 'node', node: { ...current.node, config: { ...current.node.config, [key]: value } } }
+        : current);
+    },
+    [setNodes],
+  );
+
   useEffect(() => {
-    setNodes((current) => current.map((flowNode) => flowNode.data.onRtspUrlChange === handleRtspUrlChange
-      ? flowNode
-      : { ...flowNode, data: { ...flowNode.data, onRtspUrlChange: handleRtspUrlChange } }));
-  }, [handleRtspUrlChange, nodes.length, setNodes]);
+    setNodes((current) => current.map((flowNode) => (
+      flowNode.data.onRtspUrlChange === handleRtspUrlChange
+        && flowNode.data.onLocalImageConfigChange === handleLocalImageConfigChange
+        ? flowNode
+        : {
+          ...flowNode,
+          data: {
+            ...flowNode.data,
+            onRtspUrlChange: handleRtspUrlChange,
+            onLocalImageConfigChange: handleLocalImageConfigChange,
+          },
+        }
+    )));
+  }, [handleLocalImageConfigChange, handleRtspUrlChange, nodes.length, setNodes]);
 
   const handleAddNode = useCallback(
     (kind: NodeKind) => {
@@ -347,6 +422,46 @@ export function App() {
     pushEvent('画布已适配视图');
   }, [pushEvent]);
 
+  const handleRunWorkflow = useCallback(() => {
+    if (!graph) {
+      pushEvent('工作流尚未加载，无法启动运行时诊断');
+      return;
+    }
+    const draft = toWorkflowGraph(nodes, edges, graph);
+    runWorkflowRuntime(draft)
+      .then((status) => {
+        setRuntimeStatus(status);
+        pushEvent(`RuntimeGraph 已启动：${status.nodes.filter((node) => node.state === 'running').length} 个安全节点运行中`);
+      })
+      .catch((error: unknown) => pushEvent(`启动 RuntimeGraph 失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [edges, graph, nodes, pushEvent]);
+
+  const handleStopWorkflow = useCallback(() => {
+    if (!graph) {
+      pushEvent('工作流尚未加载，无法停止运行时诊断');
+      return;
+    }
+    stopWorkflowRuntime(graph.id)
+      .then((status) => {
+        setRuntimeStatus(status);
+        pushEvent('RuntimeGraph 已停止；所有节点均为空闲状态');
+      })
+      .catch((error: unknown) => pushEvent(`停止 RuntimeGraph 失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [graph, pushEvent]);
+
+  const refreshRuntimeStatus = useCallback(() => {
+    if (!graph) {
+      return;
+    }
+    loadRuntimeStatus(graph.id)
+      .then(setRuntimeStatus)
+      .catch(() => setRuntimeStatus(null));
+  }, [graph]);
+
+  useEffect(() => {
+    refreshRuntimeStatus();
+  }, [refreshRuntimeStatus]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -395,8 +510,8 @@ export function App() {
             <button onClick={handleDuplicateSelection}>Duplicate</button>
           </div>
           <div className="menu-group">
-            <button onClick={() => pushEvent('Run 占位：RuntimeGraph 尚未启动远程/写入动作')}>Run</button>
-            <button onClick={() => pushEvent('Stop 占位：RuntimeGraph 尚未启动远程/写入动作')}>Stop</button>
+            <button onClick={handleRunWorkflow}>Run</button>
+            <button onClick={handleStopWorkflow}>Stop</button>
             <button onClick={handleFitView}>Fit</button>
           </div>
         </nav>
@@ -452,8 +567,10 @@ export function App() {
           events={events}
           selection={selection}
           onDeleteSelection={handleDeleteSelection}
+          runtimeStatus={runtimeStatus}
           onDuplicateSelection={handleDuplicateSelection}
           onNodeTitleChange={handleNodeTitleChange}
+          onNodeConfigChange={handleNodeConfigChange}
         />
       </aside>
     </div>
@@ -487,6 +604,74 @@ function RtspSourceNode({ data, selected }: NodeProps) {
           }}
         />
         <span>Transport: {String(node.config.transport ?? 'tcp')}</span>
+      </div>
+      <PortHandles node={node} />
+    </section>
+  );
+}
+
+function LocalWorkspaceNode({ data, selected }: NodeProps) {
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
+  const root = typeof node.config.root === 'string' ? node.config.root : '';
+  const [draftRoot, setDraftRoot] = useState(root);
+  useEffect(() => setDraftRoot(root), [root]);
+  const applyRoot = () => nodeData.onLocalImageConfigChange?.(node.id, 'root', draftRoot);
+  return (
+    <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
+      <NodeHeader node={node} />
+      <div className="node-body">
+        <label htmlFor={`${node.id}-root`}>Workspace root</label>
+        <input
+          id={`${node.id}-root`}
+          className="rtsp-url-input nodrag"
+          value={draftRoot}
+          placeholder="/absolute/path/to/workspace"
+          spellCheck={false}
+          onChange={(event) => setDraftRoot(event.target.value)}
+          onBlur={applyRoot}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              applyRoot();
+              event.currentTarget.blur();
+            }
+          }}
+        />
+        <span>Explicit root; directories are never scanned.</span>
+      </div>
+      <PortHandles node={node} />
+    </section>
+  );
+}
+
+function ImageFileSourceNode({ data, selected }: NodeProps) {
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
+  const relativePath = typeof node.config.relativePath === 'string' ? node.config.relativePath : '';
+  const [draftPath, setDraftPath] = useState(relativePath);
+  useEffect(() => setDraftPath(relativePath), [relativePath]);
+  const applyPath = () => nodeData.onLocalImageConfigChange?.(node.id, 'relativePath', draftPath);
+  return (
+    <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
+      <NodeHeader node={node} />
+      <div className="node-body">
+        <label htmlFor={`${node.id}-relative-path`}>Image path</label>
+        <input
+          id={`${node.id}-relative-path`}
+          className="rtsp-url-input nodrag"
+          value={draftPath}
+          placeholder="images/example.png"
+          spellCheck={false}
+          onChange={(event) => setDraftPath(event.target.value)}
+          onBlur={applyPath}
+          onKeyDown={(event) => {
+            if (event.key === 'Enter') {
+              applyPath();
+              event.currentTarget.blur();
+            }
+          }}
+        />
+        <span>Path is relative to the connected Local Workspace.</span>
       </div>
       <PortHandles node={node} />
     </section>
@@ -548,13 +733,19 @@ function portOffset(index: number, total: number): number {
 function ViewerNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
-  const previewUrl = nodeData.previewUrl;
-  const streamUrl = previewUrl ? `/api/streams/mjpeg?url=${encodeURIComponent(previewUrl)}&width=960&height=540` : undefined;
+  const preview = nodeData.preview;
   return (
     <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>
       <PortHandles node={node} />
       <NodeHeader node={node} />
-      <MjpegPreview streamUrl={streamUrl} previewUrl={previewUrl} />
+      {preview?.kind === 'rtsp' && (
+        <MjpegPreview
+          streamUrl={`/api/streams/mjpeg?url=${encodeURIComponent(preview.url)}&width=960&height=540`}
+          previewUrl={preview.url}
+        />
+      )}
+      {preview?.kind === 'local-image' && <LocalImagePreview imageUrl={preview.url} />}
+      {!preview && <LocalImagePreview imageUrl={undefined} />}
       <div className="node-body compact">
         <span>Fit: {String(node.config.fitMode ?? 'contain')}</span>
         <span>Overlay: {String(node.config.overlay ?? 'status')}</span>
@@ -591,6 +782,65 @@ interface ViewerTransform {
   scale: number;
   x: number;
   y: number;
+}
+
+function LocalImagePreview({ imageUrl }: { imageUrl: string | undefined }) {
+  const [state, setState] = useState<'empty' | 'loading' | 'ready' | 'error'>(imageUrl ? 'loading' : 'empty');
+  const [transform, setTransform] = useState<ViewerTransform>({ scale: 1, x: 0, y: 0 });
+  const dragStartRef = useRef<{ pointerId: number; x: number; y: number; originX: number; originY: number } | null>(null);
+  useEffect(() => {
+    setState(imageUrl ? 'loading' : 'empty');
+    setTransform({ scale: 1, x: 0, y: 0 });
+  }, [imageUrl]);
+  const zoomBy = (ratio: number) => setTransform((current) => ({ ...current, scale: clamp(current.scale * ratio, 0.25, 4) }));
+  const fit = () => setTransform({ scale: 1, x: 0, y: 0 });
+  return (
+    <div className="viewer-panel nodrag nopan">
+      <div
+        className={`viewer-preview ${state}`}
+        onWheel={(event) => {
+          event.stopPropagation();
+          event.preventDefault();
+          zoomBy(event.deltaY < 0 ? 1.12 : 0.88);
+        }}
+        onDoubleClick={fit}
+        onPointerDown={(event) => {
+          dragStartRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: transform.x, originY: transform.y };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          const drag = dragStartRef.current;
+          if (!drag || drag.pointerId !== event.pointerId) {
+            return;
+          }
+          setTransform((current) => ({ ...current, x: drag.originX + event.clientX - drag.x, y: drag.originY + event.clientY - drag.y }));
+        }}
+        onPointerUp={() => {
+          dragStartRef.current = null;
+        }}
+      >
+        {imageUrl && (
+          <img
+            src={imageUrl}
+            alt="Local workspace image preview"
+            style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
+            onLoad={() => setState('ready')}
+            onError={() => setState('error')}
+          />
+        )}
+        {state !== 'ready' && <div className="preview-grid" />}
+      </div>
+      <div className="viewer-toolbar">
+        <button type="button" onClick={fit}>Fit</button>
+        <button type="button" onClick={() => setTransform((current) => ({ ...current, scale: 1 }))}>1:1</button>
+        <button type="button" onClick={() => zoomBy(1.2)}>Zoom +</button>
+        <button type="button" onClick={() => zoomBy(0.8)}>Zoom -</button>
+      </div>
+      <div className="viewer-status">
+        {state === 'ready' ? 'Local image via guarded workspace endpoint' : state === 'loading' ? 'Loading local image...' : state === 'error' ? 'Local image preview unavailable' : 'Connect a configured local image path'}
+      </div>
+    </div>
+  );
 }
 
 function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined; previewUrl: string | undefined }) {
@@ -953,21 +1203,26 @@ function NodeLibraryItem({ definition, onAdd }: { definition: NodeDefinition; on
 function Inspector({
   events,
   selection,
+  runtimeStatus,
   onDeleteSelection,
   onDuplicateSelection,
   onNodeTitleChange,
+  onNodeConfigChange,
 }: {
   events: string[];
   selection: Selection;
+  runtimeStatus: RuntimeGraphStatus | null;
   onDeleteSelection: () => void;
   onDuplicateSelection: () => void;
   onNodeTitleChange: (nodeId: string, title: string) => void;
+  onNodeConfigChange: (nodeId: string, key: string, value: string | boolean) => void;
 }) {
   if (selection.type === 'none') {
     return (
       <div>
         <h2>Inspector</h2>
         <p className="muted">选择节点或连线后显示参数。</p>
+        <RuntimeDiagnostics status={runtimeStatus} />
         <InspectorEvents events={events} />
       </div>
     );
@@ -984,11 +1239,13 @@ function Inspector({
         <KeyValue label="Target" value={`${selection.edge.target}:${selection.edge.targetHandle ?? ''}`} />
         <KeyValue label="Kind" value={labelForPortKind(selection.edge.data?.kind ?? 'endpoint.rtsp')} />
         <KeyValue label="Schema" value={selection.edge.data?.schema ?? 'n/a'} />
+        <RuntimeDiagnostics status={runtimeStatus} />
         <InspectorEvents events={events} />
       </div>
     );
   }
   const node = selection.node;
+  const nodeRuntime = runtimeStatus?.nodes.find((status) => status.nodeId === node.id);
   return (
     <div>
       <h2>{node.title}</h2>
@@ -1012,16 +1269,202 @@ function Inspector({
       <KeyValue label="Kind" value={node.kind} />
       <KeyValue label="Category" value={node.category} />
       <KeyValue label="State" value={node.state} />
+      <KeyValue label="Runtime" value={nodeRuntime?.state ?? 'not started'} />
+      {nodeRuntime && <KeyValue label="Runtime diagnostic" value={nodeRuntime.diagnostic} />}
       <h3>Ports</h3>
       {[...node.inputs, ...node.outputs].map((port) => (
         <KeyValue key={`${port.direction}-${port.id}`} label={`${port.direction}:${port.id}`} value={`${port.kind} / ${port.schema}`} />
       ))}
       <h3>Config</h3>
       <pre>{JSON.stringify(node.config, null, 2)}</pre>
+      {(node.kind === 'i2cTransfer' || node.kind === 'eepromProvision') && (
+        <ControlPreviewPanel node={node} onNodeConfigChange={onNodeConfigChange} />
+      )}
       <InspectorEvents events={events} />
+      <RuntimeDiagnostics status={runtimeStatus} nodeId={node.id} />
     </div>
   );
 }
+
+function RuntimeDiagnostics({ status, nodeId }: { status: RuntimeGraphStatus | null; nodeId?: string }) {
+  if (!status) {
+    return (
+      <section className="inspector-events">
+        <h3>Runtime</h3>
+        <p className="muted">尚未启动 RuntimeGraph。</p>
+      </section>
+    );
+  }
+  const events = nodeId
+    ? status.events.filter((event) => event.nodeId === nodeId)
+    : status.events;
+  return (
+    <section className="inspector-events">
+      <h3>Runtime</h3>
+      <KeyValue label="Session" value={status.running ? 'running' : 'stopped'} />
+      <ol>
+        {events.map((event) => <li key={`${event.nodeId}-${event.message}`}><strong>{event.level}</strong> · {event.nodeId}: {event.message}</li>)}
+      </ol>
+    </section>
+  );
+}
+
+function ControlPreviewPanel({
+  node,
+  onNodeConfigChange,
+}: {
+  node: WorkflowNode;
+  onNodeConfigChange: (nodeId: string, key: string, value: string | boolean) => void;
+}) {
+  const [preview, setPreview] = useState<ControlRequestPreview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+  const isEeprom = node.kind === 'eepromProvision';
+  const configText = (key: string, fallback: string): string => {
+    const value = node.config[key];
+    return typeof value === 'string' || typeof value === 'number' ? String(value) : fallback;
+  };
+
+  useEffect(() => {
+    setPreview(null);
+    setError(null);
+  }, [node.id]);
+
+  const requestPreview = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      const address = parseControlInteger(configText('address', '0x50'), 'Address');
+      const register = parseControlInteger(configText('register', '0x0000'), 'Register');
+      const pageSize = parseControlInteger(configText('pageSize', '16'), 'Page size');
+      const payload = parseHexPayload(configText('payload', ''));
+      const common = {
+        nodeId: node.id,
+        profileId: configText('profileId', ''),
+        bus: configText('bus', ''),
+        address,
+        register,
+        payload,
+        pageSize,
+      };
+      const result = isEeprom
+        ? await previewEepromProvision({
+          ...common,
+          mapId: configText('mapId', ''),
+          verifyAfterWrite: node.config.verifyAfterWrite === true,
+        })
+        : await previewI2cTransfer({
+          ...common,
+          operation: configText('mode', 'read') === 'write' ? 'write' : 'read',
+        });
+      setPreview(result);
+    } catch (previewError) {
+      setPreview(null);
+      setError(previewError instanceof Error ? previewError.message : String(previewError));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <section className="control-preview">
+      <h3>安全请求预览</h3>
+      <p className="muted">配置只会保存为节点轻量参数。点击预览只校验请求，绝不连接 SSH 或 I²C。</p>
+      <ControlConfigField id={`${node.id}-profile`} label="Session profile" value={configText('profileId', '')} onChange={(value) => onNodeConfigChange(node.id, 'profileId', value)} />
+      <ControlConfigField id={`${node.id}-bus`} label="I²C bus" value={configText('bus', 'i2c-1')} onChange={(value) => onNodeConfigChange(node.id, 'bus', value)} />
+      <ControlConfigField id={`${node.id}-address`} label="Address (hex)" value={configText('address', '0x50')} onChange={(value) => onNodeConfigChange(node.id, 'address', value)} />
+      <ControlConfigField id={`${node.id}-register`} label="Register (hex)" value={configText('register', '0x0000')} onChange={(value) => onNodeConfigChange(node.id, 'register', value)} />
+      <ControlConfigField id={`${node.id}-payload`} label="Payload (hex bytes)" value={configText('payload', '')} onChange={(value) => onNodeConfigChange(node.id, 'payload', value)} />
+      <ControlConfigField id={`${node.id}-page-size`} label="EEPROM page size" value={configText('pageSize', '16')} onChange={(value) => onNodeConfigChange(node.id, 'pageSize', value)} />
+      {isEeprom ? (
+        <>
+          <ControlConfigField id={`${node.id}-map`} label="EEPROM map" value={configText('mapId', '')} onChange={(value) => onNodeConfigChange(node.id, 'mapId', value)} />
+          <label className="control-checkbox">
+            <input type="checkbox" checked={node.config.verifyAfterWrite === true} onChange={(event) => onNodeConfigChange(node.id, 'verifyAfterWrite', event.currentTarget.checked)} />
+            Verify after write (preview only)
+          </label>
+        </>
+      ) : (
+        <label className="field-label" htmlFor={`${node.id}-mode`}>
+          Operation
+          <select id={`${node.id}-mode`} className="inspector-input" value={configText('mode', 'read')} onChange={(event) => onNodeConfigChange(node.id, 'mode', event.currentTarget.value)}>
+            <option value="read">Read</option>
+            <option value="write">Write</option>
+          </select>
+        </label>
+      )}
+      <div className="inspector-actions">
+        <button type="button" onClick={() => void requestPreview()} disabled={loading}>{loading ? 'Validating…' : 'Preview request'}</button>
+        <button type="button" disabled title="Execution is intentionally unavailable in Workflow Web">Execute disabled</button>
+      </div>
+      {error && <p className="control-preview-error">Preview rejected: {error}</p>}
+      {preview && (
+        <div className="control-preview-result">
+          <KeyValue label="Mode" value={preview.operation} />
+          <KeyValue label="Execution" value={preview.execution} />
+          <KeyValue label="Node" value={preview.target.nodeId} />
+          <KeyValue label="Profile" value={preview.target.profileId} />
+          <KeyValue label="Bus" value={preview.target.bus} />
+          <KeyValue label="Address" value={`0x${preview.target.address.toString(16).padStart(2, '0')}`} />
+          <KeyValue label="Register" value={`0x${preview.target.register.toString(16).padStart(4, '0')}`} />
+          <KeyValue label="Payload" value={preview.target.payload.map((byte) => byte.toString(16).padStart(2, '0')).join(' ') || '(empty)'} />
+          {preview.mapId && <KeyValue label="EEPROM map" value={preview.mapId} />}
+          {preview.verifyAfterWrite !== null && <KeyValue label="Verify after write" value={preview.verifyAfterWrite ? 'yes' : 'no'} />}
+          <KeyValue label="Page split" value={`${preview.pageSplitEstimate.writeCount} write(s), ${preview.pageSplitEstimate.pageSize} B/page`} />
+          {preview.pageSplitEstimate.segments.length > 0 && <pre>{JSON.stringify(preview.pageSplitEstimate.segments, null, 2)}</pre>}
+          {preview.requiresConfirmation && <p className="control-confirmation">Write-like operation: explicit confirmation is required before any future execution path.</p>}
+        </div>
+      )}
+    </section>
+  );
+}
+
+function ControlConfigField({
+  id,
+  label,
+  value,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="field-label" htmlFor={id}>
+      {label}
+      <input id={id} className="inspector-input" value={value} onChange={(event) => onChange(event.currentTarget.value)} />
+    </label>
+  );
+}
+
+/** 接受十进制或 0x 前缀十六进制，保留服务端的范围校验。 */
+function parseControlInteger(value: string, label: string): number {
+  const text = value.trim();
+  if (!/^(?:0x[0-9a-f]+|\d+)$/i.test(text)) {
+    throw new Error(`${label} must be a decimal or 0x-prefixed hexadecimal integer`);
+  }
+  const parsed = Number(text);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative integer`);
+  }
+  return parsed;
+}
+
+/** 将空格或逗号分隔的字节文本转换为 JSON 数组，避免把原始文本混入请求。 */
+function parseHexPayload(value: string): number[] {
+  const text = value.trim();
+  if (!text) {
+    return [];
+  }
+  return text.split(/[\s,]+/).map((token) => {
+    if (!/^(?:0x)?[0-9a-f]{1,2}$/i.test(token)) {
+      throw new Error(`Invalid payload byte: ${token}`);
+    }
+    return Number.parseInt(token.replace(/^0x/i, ''), 16);
+  });
+}
+
 
 function InspectorEvents({ events }: { events: string[] }) {
   return (
@@ -1050,35 +1493,66 @@ function toFlowNodes(graph: WorkflowGraph): FlowNode[] {
     position: node.position,
     data: {
       workflowNode: node,
-      previewUrl: node.kind === 'viewer' ? incomingRtspUrl(graph, node.id) : undefined,
+      preview: node.kind === 'viewer' ? viewerPreview(graph, node.id) : undefined,
     },
   }));
 }
 
-function incomingRtspUrl(graph: WorkflowGraph, viewerNodeId: string): string | undefined {
-  const nodeMap = new Map(graph.nodes.map((node) => [node.id, node]));
-  const visited = new Set<string>();
-  const visit = (nodeId: string): string | undefined => {
+/** 沿已连接的端口反向查找可预览的源；只把浏览器 URL 留在 React Flow 运行时状态。 */
+function viewerPreview(graph: WorkflowGraph, viewerNodeId: string): ViewerPreview | undefined {
+  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
+  const incoming = new Map<string, string[]>();
+  for (const edge of graph.edges) {
+    incoming.set(edge.target.nodeId, [...(incoming.get(edge.target.nodeId) ?? []), edge.source.nodeId]);
+  }
+  const workspaceRootFor = (nodeId: string, visited: Set<string>): string | undefined => {
     if (visited.has(nodeId)) {
       return undefined;
     }
     visited.add(nodeId);
-    const node = nodeMap.get(nodeId);
+    const node = nodes.get(nodeId);
     if (!node) {
       return undefined;
     }
-    if (node.kind === 'rtspSource' && typeof node.config.url === 'string') {
-      return node.config.url;
+    if (node.kind === 'localWorkspace' && typeof node.config.root === 'string' && node.config.root.trim()) {
+      return node.config.root.trim();
     }
-    for (const edge of graph.edges.filter((candidate) => candidate.target.nodeId === nodeId)) {
-      const url = visit(edge.source.nodeId);
-      if (url) {
-        return url;
+    for (const sourceNodeId of incoming.get(nodeId) ?? []) {
+      const root = workspaceRootFor(sourceNodeId, visited);
+      if (root) {
+        return root;
       }
     }
     return undefined;
   };
-  return visit(viewerNodeId);
+  const visit = (nodeId: string, visited: Set<string>): ViewerPreview | undefined => {
+    if (visited.has(nodeId)) {
+      return undefined;
+    }
+    visited.add(nodeId);
+    const node = nodes.get(nodeId);
+    if (!node) {
+      return undefined;
+    }
+    if (node.kind === 'rtspSource' && typeof node.config.url === 'string' && node.config.url.trim()) {
+      return { kind: 'rtsp', url: node.config.url.trim() };
+    }
+    if (node.kind === 'imageFileSource' && typeof node.config.relativePath === 'string' && node.config.relativePath.trim()) {
+      const workspaceRoot = workspaceRootFor(nodeId, new Set());
+      if (workspaceRoot) {
+        const query = new URLSearchParams({ workspaceRoot, relativePath: node.config.relativePath.trim() });
+        return { kind: 'local-image', url: `/api/images/local?${query}` };
+      }
+    }
+    for (const sourceNodeId of incoming.get(nodeId) ?? []) {
+      const preview = visit(sourceNodeId, visited);
+      if (preview) {
+        return preview;
+      }
+    }
+    return undefined;
+  };
+  return visit(viewerNodeId, new Set());
 }
 
 function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
@@ -1140,7 +1614,7 @@ function toWorkflowGraph(nodes: FlowNode[], edges: FlowEdge[], base: WorkflowGra
 function withViewerPreviews(nodes: FlowNode[], edges: FlowEdge[]): FlowNode[] {
   const graph = toWorkflowGraph(nodes, edges, emptyWorkflowGraph());
   return nodes.map((node) => node.data.workflowNode.kind === 'viewer'
-    ? { ...node, data: { ...node.data, previewUrl: incomingRtspUrl(graph, node.id) } }
+    ? { ...node, data: { ...node.data, preview: viewerPreview(graph, node.id) } }
     : node);
 }
 

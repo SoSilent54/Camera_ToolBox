@@ -1,11 +1,12 @@
 mod workflow;
 
 use std::{
+    collections::HashMap,
     fs,
     net::IpAddr,
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -15,7 +16,7 @@ use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     body::Body,
-    extract::{Path as AxumPath, Query, State},
+    extract::{Path as AxumPath, Query, State, rejection::JsonRejection},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -37,8 +38,8 @@ use tokio::{
 };
 use tower_http::services::{ServeDir, ServeFile};
 use workflow::{
-    WorkflowGraph, node_catalog, normalize_workflow, seed_workflow_graph, validate_workflow,
-    workmode_templates,
+    RuntimeGraphStatus, WorkflowGraph, node_catalog, normalize_workflow, runtime_graph_status,
+    seed_workflow_graph, validate_workflow, workmode_templates,
 };
 
 static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
@@ -67,6 +68,13 @@ struct ServerArgs {
 #[derive(Clone)]
 struct AppState {
     workflow_store: Arc<WorkflowStore>,
+    runtime_sessions: Arc<Mutex<HashMap<String, RuntimeGraphSession>>>,
+}
+
+/// 运行时会话只存于服务进程内存；其图副本用于 Stop 后生成节点级诊断。
+struct RuntimeGraphSession {
+    graph: WorkflowGraph,
+    status: RuntimeGraphStatus,
 }
 
 struct WorkflowStore {
@@ -97,6 +105,118 @@ struct ValidationResponse {
     error: Option<String>,
 }
 
+/// RuntimeGraph API 失败响应统一为 JSON，便于前端直接显示明确的诊断。
+#[derive(Debug, Serialize)]
+struct RuntimeApiError {
+    error: String,
+}
+
+type RuntimeApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<RuntimeApiError>)>;
+
+fn runtime_api_error(
+    status: StatusCode,
+    error: impl Into<String>,
+) -> (StatusCode, Json<RuntimeApiError>) {
+    (
+        status,
+        Json(RuntimeApiError {
+            error: error.into(),
+        }),
+    )
+}
+
+/// I²C 预览请求仅描述一次可能的传输；它从不打开设备或建立远程会话。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct I2cPreviewRequest {
+    node_id: String,
+    profile_id: String,
+    bus: String,
+    address: u8,
+    register: u16,
+    payload: Vec<u8>,
+    page_size: usize,
+    operation: I2cPreviewOperation,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum I2cPreviewOperation {
+    Read,
+    Write,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EepromPreviewRequest {
+    node_id: String,
+    profile_id: String,
+    bus: String,
+    address: u8,
+    register: u16,
+    payload: Vec<u8>,
+    page_size: usize,
+    map_id: String,
+    verify_after_write: bool,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlPreview {
+    target: ControlTarget,
+    operation: &'static str,
+    page_split_estimate: PageSplitEstimate,
+    requires_confirmation: bool,
+    execution: &'static str,
+    map_id: Option<String>,
+    verify_after_write: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ControlTarget {
+    node_id: String,
+    profile_id: String,
+    bus: String,
+    address: u8,
+    register: u16,
+    payload: Vec<u8>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageSplitEstimate {
+    page_size: usize,
+    write_count: usize,
+    segments: Vec<PageSplitSegment>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PageSplitSegment {
+    register: u16,
+    payload_length: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct PreviewApiError {
+    error: String,
+}
+
+impl PreviewApiError {
+    fn bad_request(error: impl Into<String>) -> Self {
+        Self {
+            error: error.into(),
+        }
+    }
+}
+
+impl IntoResponse for PreviewApiError {
+    fn into_response(self) -> Response {
+        (StatusCode::BAD_REQUEST, Json(self)).into_response()
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct MjpegStreamQuery {
@@ -111,6 +231,30 @@ struct MjpegStreamConfig {
     fps_limit: Option<u16>,
     width: u16,
     height: u16,
+}
+
+/// 本地图像预览只接受相对路径，并在解析符号链接后仍限定于声明的 workspace 根目录。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LocalImageQuery {
+    workspace_root: String,
+    relative_path: String,
+}
+
+#[derive(Debug, Serialize)]
+struct LocalImageApiError {
+    error: String,
+}
+
+impl LocalImageApiError {
+    fn new(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<Self>) {
+        (
+            status,
+            Json(Self {
+                error: error.into(),
+            }),
+        )
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -146,6 +290,7 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
     let frontend = ServeDir::new(static_dir).not_found_service(ServeFile::new(index));
     let state = AppState {
         workflow_store: Arc::new(WorkflowStore { dir: workflow_dir }),
+        runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
     };
 
     Router::new()
@@ -156,7 +301,22 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         .route("/api/workflows", get(list_workflows).post(create_workflow))
         .route("/api/workflows/{id}", get(get_workflow).put(put_workflow))
         .route("/api/workflows/{id}/validate", post(validate_workflow_api))
+        .route("/api/workflows/{id}/runtime", get(get_workflow_runtime))
+        .route(
+            "/api/workflows/{id}/runtime/run",
+            post(run_workflow_runtime),
+        )
+        .route(
+            "/api/workflows/{id}/runtime/stop",
+            post(stop_workflow_runtime),
+        )
+        .route("/api/control/i2c/preview", post(preview_i2c_transfer))
+        .route(
+            "/api/control/eeprom/preview",
+            post(preview_eeprom_provision),
+        )
         .route("/api/streams/mjpeg", get(mjpeg_stream))
+        .route("/api/images/local", get(local_image_preview))
         .fallback_service(frontend)
         .with_state(state)
 }
@@ -242,6 +402,342 @@ async fn validate_workflow_api(
             }),
         ),
     }
+}
+
+/// 启动纯内存的 Stage 7 诊断会话；不会连接 RTSP/SSH/X5/I²C，也不会写 EEPROM。
+async fn run_workflow_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    request: std::result::Result<Json<WorkflowGraph>, JsonRejection>,
+) -> RuntimeApiResult<RuntimeGraphStatus> {
+    let Json(graph) = request.map_err(|error| {
+        runtime_api_error(
+            StatusCode::BAD_REQUEST,
+            format!("invalid runtime graph request: {error}"),
+        )
+    })?;
+    if graph.id != id {
+        return Err(runtime_api_error(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "workflow ID in path `{id}` does not match request graph `{}`",
+                graph.id
+            ),
+        ));
+    }
+    validate_workflow(&graph).map_err(|error| runtime_api_error(StatusCode::BAD_REQUEST, error))?;
+
+    let status = runtime_graph_status(&graph, true);
+    let mut sessions = state.runtime_sessions.lock().map_err(|_| {
+        runtime_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime session state is unavailable",
+        )
+    })?;
+    sessions.insert(
+        id,
+        RuntimeGraphSession {
+            graph,
+            status: status.clone(),
+        },
+    );
+    Ok(Json(status))
+}
+
+/// 获取指定工作流的进程内诊断快照。工作流文件及其 revision 不会被读取或修改。
+async fn get_workflow_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> RuntimeApiResult<RuntimeGraphStatus> {
+    let sessions = state.runtime_sessions.lock().map_err(|_| {
+        runtime_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime session state is unavailable",
+        )
+    })?;
+    let status = sessions
+        .get(&id)
+        .map(|session| session.status.clone())
+        .ok_or_else(|| {
+            runtime_api_error(
+                StatusCode::NOT_FOUND,
+                format!("no runtime session exists for workflow `{id}`"),
+            )
+        })?;
+    Ok(Json(status))
+}
+
+/// 停止运行时标记并保留节点级 idle 诊断；不会执行外部停止命令。
+async fn stop_workflow_runtime(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> RuntimeApiResult<RuntimeGraphStatus> {
+    let mut sessions = state.runtime_sessions.lock().map_err(|_| {
+        runtime_api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "runtime session state is unavailable",
+        )
+    })?;
+    let session = sessions.get_mut(&id).ok_or_else(|| {
+        runtime_api_error(
+            StatusCode::NOT_FOUND,
+            format!("no runtime session exists for workflow `{id}`"),
+        )
+    })?;
+    let status = runtime_graph_status(&session.graph, false);
+    session.status = status.clone();
+    Ok(Json(status))
+}
+
+async fn local_image_preview(
+    Query(query): Query<LocalImageQuery>,
+) -> std::result::Result<Response, (StatusCode, Json<LocalImageApiError>)> {
+    let workspace_root = canonical_workspace_root(&query.workspace_root)?;
+    let relative_path = validate_relative_image_path(&query.relative_path)?;
+    let image_path = workspace_root.join(relative_path);
+    let image_path = fs::canonicalize(&image_path).map_err(|error| {
+        LocalImageApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("image file could not be resolved: {error}"),
+        )
+    })?;
+    if !image_path.starts_with(&workspace_root) {
+        return Err(LocalImageApiError::new(
+            StatusCode::FORBIDDEN,
+            "image path resolves outside the configured workspace root",
+        ));
+    }
+    if !image_path.is_file() {
+        return Err(LocalImageApiError::new(
+            StatusCode::BAD_REQUEST,
+            "image path must resolve to a regular file",
+        ));
+    }
+    let content_type = local_image_content_type(&image_path)?;
+    let bytes = fs::read(&image_path).map_err(|error| {
+        LocalImageApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to read image file: {error}"),
+        )
+    })?;
+    let mut response = Body::from(bytes).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    Ok(response)
+}
+
+fn canonical_workspace_root(
+    workspace_root: &str,
+) -> std::result::Result<PathBuf, (StatusCode, Json<LocalImageApiError>)> {
+    let workspace_root = workspace_root.trim();
+    if workspace_root.is_empty() {
+        return Err(LocalImageApiError::new(
+            StatusCode::BAD_REQUEST,
+            "workspaceRoot must not be empty",
+        ));
+    }
+    let workspace_root = fs::canonicalize(workspace_root).map_err(|error| {
+        LocalImageApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!("workspaceRoot could not be resolved: {error}"),
+        )
+    })?;
+    if !workspace_root.is_dir() {
+        return Err(LocalImageApiError::new(
+            StatusCode::BAD_REQUEST,
+            "workspaceRoot must resolve to a directory",
+        ));
+    }
+    Ok(workspace_root)
+}
+
+fn validate_relative_image_path(
+    relative_path: &str,
+) -> std::result::Result<&Path, (StatusCode, Json<LocalImageApiError>)> {
+    let relative_path = relative_path.trim();
+    if relative_path.is_empty() {
+        return Err(LocalImageApiError::new(
+            StatusCode::BAD_REQUEST,
+            "relativePath must not be empty",
+        ));
+    }
+    let path = Path::new(relative_path);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(LocalImageApiError::new(
+            StatusCode::BAD_REQUEST,
+            "relativePath must stay below workspaceRoot without `..` or an absolute prefix",
+        ));
+    }
+    Ok(path)
+}
+
+fn local_image_content_type(
+    image_path: &Path,
+) -> std::result::Result<&'static str, (StatusCode, Json<LocalImageApiError>)> {
+    let extension = image_path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match extension.as_str() {
+        "png" => Ok("image/png"),
+        "jpg" | "jpeg" => Ok("image/jpeg"),
+        "gif" => Ok("image/gif"),
+        "webp" => Ok("image/webp"),
+        _ => Err(LocalImageApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "only PNG, JPEG, GIF, and WebP image files can be previewed",
+        )),
+    }
+}
+
+async fn preview_i2c_transfer(
+    request: std::result::Result<Json<I2cPreviewRequest>, JsonRejection>,
+) -> std::result::Result<Json<ControlPreview>, PreviewApiError> {
+    let Json(request) = request.map_err(|error| {
+        PreviewApiError::bad_request(format!("invalid I²C preview request: {error}"))
+    })?;
+    let target = ControlTarget {
+        node_id: request.node_id,
+        profile_id: request.profile_id,
+        bus: request.bus,
+        address: request.address,
+        register: request.register,
+        payload: request.payload,
+    };
+    validate_preview_target(&target)?;
+    let is_write = matches!(request.operation, I2cPreviewOperation::Write);
+    if is_write && target.payload.is_empty() {
+        return Err(PreviewApiError::bad_request(
+            "I²C write preview requires at least one payload byte",
+        ));
+    }
+    if !is_write && !target.payload.is_empty() {
+        return Err(PreviewApiError::bad_request(
+            "I²C read preview must not include a write payload",
+        ));
+    }
+    let page_split_estimate =
+        page_split_estimate(target.register, target.payload.len(), request.page_size)?;
+    Ok(Json(ControlPreview {
+        target,
+        operation: if is_write { "write" } else { "read" },
+        page_split_estimate,
+        requires_confirmation: is_write,
+        execution: "preview-only",
+        map_id: None,
+        verify_after_write: None,
+    }))
+}
+
+async fn preview_eeprom_provision(
+    request: std::result::Result<Json<EepromPreviewRequest>, JsonRejection>,
+) -> std::result::Result<Json<ControlPreview>, PreviewApiError> {
+    let Json(request) = request.map_err(|error| {
+        PreviewApiError::bad_request(format!("invalid EEPROM preview request: {error}"))
+    })?;
+    if request.map_id.trim().is_empty() {
+        return Err(PreviewApiError::bad_request(
+            "EEPROM mapId must not be empty",
+        ));
+    }
+    let target = ControlTarget {
+        node_id: request.node_id,
+        profile_id: request.profile_id,
+        bus: request.bus,
+        address: request.address,
+        register: request.register,
+        payload: request.payload,
+    };
+    validate_preview_target(&target)?;
+    if target.payload.is_empty() {
+        return Err(PreviewApiError::bad_request(
+            "EEPROM provision preview requires at least one payload byte",
+        ));
+    }
+    let page_split_estimate =
+        page_split_estimate(target.register, target.payload.len(), request.page_size)?;
+    Ok(Json(ControlPreview {
+        target,
+        operation: "provision",
+        page_split_estimate,
+        requires_confirmation: true,
+        execution: "preview-only",
+        map_id: Some(request.map_id),
+        verify_after_write: Some(request.verify_after_write),
+    }))
+}
+
+fn validate_preview_target(target: &ControlTarget) -> std::result::Result<(), PreviewApiError> {
+    if target.node_id.trim().is_empty() {
+        return Err(PreviewApiError::bad_request("nodeId must not be empty"));
+    }
+    if target.profile_id.trim().is_empty() {
+        return Err(PreviewApiError::bad_request("profileId must not be empty"));
+    }
+    if target.bus.trim().is_empty() || target.bus.chars().any(char::is_control) {
+        return Err(PreviewApiError::bad_request(
+            "bus must be a non-empty printable identifier",
+        ));
+    }
+    if !(0x03..=0x77).contains(&target.address) {
+        return Err(PreviewApiError::bad_request(
+            "address must be a 7-bit I²C address in 0x03..=0x77",
+        ));
+    }
+    if target.payload.len() > 4096 {
+        return Err(PreviewApiError::bad_request(
+            "payload exceeds the 4096-byte preview limit",
+        ));
+    }
+    Ok(())
+}
+
+fn page_split_estimate(
+    register: u16,
+    payload_length: usize,
+    page_size: usize,
+) -> std::result::Result<PageSplitEstimate, PreviewApiError> {
+    if !(1..=256).contains(&page_size) {
+        return Err(PreviewApiError::bad_request(
+            "pageSize must be in 1..=256 bytes",
+        ));
+    }
+    let mut segments = Vec::new();
+    let mut next_register = usize::from(register);
+    let end_register = next_register
+        .checked_add(payload_length)
+        .ok_or_else(|| PreviewApiError::bad_request("payload register range overflows"))?;
+    if end_register > usize::from(u16::MAX) + 1 {
+        return Err(PreviewApiError::bad_request(
+            "payload exceeds the 16-bit register range",
+        ));
+    }
+    while next_register < end_register {
+        let page_remaining = page_size - (next_register % page_size);
+        let payload_length = page_remaining.min(end_register - next_register);
+        segments.push(PageSplitSegment {
+            register: next_register as u16,
+            payload_length,
+        });
+        next_register += payload_length;
+    }
+    Ok(PageSplitEstimate {
+        page_size,
+        write_count: segments.len(),
+        segments,
+    })
 }
 
 fn if_match_revision(

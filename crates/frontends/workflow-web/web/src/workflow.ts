@@ -148,10 +148,61 @@ export interface WorkflowSummary {
   edgeCount: number;
 }
 
+export type I2cPreviewOperation = 'read' | 'write';
+
+export interface I2cPreviewRequest {
+  nodeId: string;
+  profileId: string;
+  bus: string;
+  address: number;
+  register: number;
+  payload: number[];
+  pageSize: number;
+  operation: I2cPreviewOperation;
+}
+
+export interface EepromPreviewRequest {
+  nodeId: string;
+  profileId: string;
+  bus: string;
+  address: number;
+  register: number;
+  payload: number[];
+  pageSize: number;
+  mapId: string;
+  verifyAfterWrite: boolean;
+}
+
+export interface ControlRequestPreview {
+  target: {
+    nodeId: string;
+    profileId: string;
+    bus: string;
+    address: number;
+    register: number;
+    payload: number[];
+  };
+  operation: 'read' | 'write' | 'provision';
+  pageSplitEstimate: {
+    pageSize: number;
+    writeCount: number;
+    segments: Array<{ register: number; payloadLength: number }>;
+  };
+  requiresConfirmation: boolean;
+  execution: 'preview-only';
+  mapId: string | null;
+  verifyAfterWrite: boolean | null;
+}
+
+export type ViewerPreview =
+  | { kind: 'rtsp'; url: string }
+  | { kind: 'local-image'; url: string };
+
 export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
-  previewUrl?: string;
+  preview?: ViewerPreview;
   onRtspUrlChange?: (nodeId: string, url: string) => void;
+  onLocalImageConfigChange?: (nodeId: string, field: 'root' | 'relativePath', value: string) => void;
 }
 
 export interface FlowEdgeData extends Record<string, unknown> {
@@ -206,6 +257,48 @@ export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
   }
 }
 
+/** 仅用于 Inspector 的进程内运行时诊断；不会回写工作流。 */
+export interface RuntimeGraphStatus {
+  graphId: string;
+  running: boolean;
+  nodes: RuntimeNodeStatus[];
+  events: RuntimeNodeEvent[];
+}
+
+export interface RuntimeNodeStatus {
+  nodeId: string;
+  state: NodeRuntimeState;
+  diagnostic: string;
+}
+
+export interface RuntimeNodeEvent {
+  nodeId: string;
+  level: 'info' | 'warning';
+  message: string;
+}
+
+export async function loadRuntimeStatus(graphId: string): Promise<RuntimeGraphStatus> {
+  return fetchJson(`/api/workflows/${encodeURIComponent(graphId)}/runtime`);
+}
+
+export async function runWorkflowRuntime(graph: WorkflowGraph): Promise<RuntimeGraphStatus> {
+  return postJson(`/api/workflows/${encodeURIComponent(graph.id)}/runtime/run`, graph);
+}
+
+export async function stopWorkflowRuntime(graphId: string): Promise<RuntimeGraphStatus> {
+  return postJson(`/api/workflows/${encodeURIComponent(graphId)}/runtime/stop`);
+}
+
+/** 请求服务器校验 I²C 配置并返回预览；该端点不执行任何 I/O。 */
+export async function previewI2cTransfer(request: I2cPreviewRequest): Promise<ControlRequestPreview> {
+  return postJson('/api/control/i2c/preview', request);
+}
+
+/** 请求服务器校验 EEPROM 配置并返回预览；该端点不执行任何 I/O。 */
+export async function previewEepromProvision(request: EepromPreviewRequest): Promise<ControlRequestPreview> {
+  return postJson('/api/control/eeprom/preview', request);
+}
+
 export function labelForPortKind(kind: PortKind): string {
   return kind;
 }
@@ -224,6 +317,19 @@ async function fetchJson<T>(url: string): Promise<T> {
   const response = await fetch(url);
   if (!response.ok) {
     throw new Error(`request failed: ${response.status} ${response.statusText}`);
+  }
+  return (await response.json()) as T;
+}
+
+async function postJson<T>(url: string, body?: unknown): Promise<T> {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => null) as { error?: unknown } | null;
+    throw new Error(typeof error?.error === 'string' ? error.error : `request failed: ${response.status} ${response.statusText}`);
   }
   return (await response.json()) as T;
 }

@@ -527,3 +527,60 @@ pre {
 .workflow-controls svg {
   fill: currentColor;
 }
+
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.52;
+}
+
+.control-preview {
+  display: grid;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  border-top: 1px solid rgba(148, 163, 184, 0.16);
+  padding-top: 0.8rem;
+}
+
+.control-preview h3 {
+  margin: 0.3rem 0 0;
+}
+
+.control-preview .inspector-input {
+  margin: 0.3rem 0 0;
+}
+
+.control-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  color: #cbd5e1;
+  font-size: 0.82rem;
+}
+
+.control-preview-result {
+  border: 1px solid rgba(125, 211, 252, 0.25);
+  border-radius: 4px;
+  background: rgba(14, 116, 144, 0.08);
+  padding: 0.6rem;
+}
+
+.control-preview-result .key-value:last-of-type {
+  margin-bottom: 0;
+}
+
+.control-preview-error,
+.control-confirmation {
+  margin: 0;
+  border-left: 3px solid #f59e0b;
+  background: rgba(180, 83, 9, 0.13);
+  color: #fde68a;
+  font-size: 0.8rem;
+  line-height: 1.45;
+  padding: 0.45rem 0.55rem;
+}
+
+.control-preview-error {
+  border-left-color: #f87171;
+  color: #fecaca;
+}
