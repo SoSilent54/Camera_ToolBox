@@ -7,6 +7,7 @@ pub mod image_codec;
 pub mod local_raw;
 pub mod media;
 pub mod platform_registry;
+pub mod x5_tcp_client;
 pub mod platforms {
     #[cfg(feature = "platform-cv610")]
     pub mod hisilicon_cv610;

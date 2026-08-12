@@ -35,8 +35,8 @@ jobs:
           fi
           echo "release_version=${version}" >> "${GITHUB_OUTPUT}"
 
-  build-eeprom-helper-linux-aarch64:
-    name: Build static Linux AArch64 EEPROM helper
+  build-i2c-helper-linux-aarch64:
+    name: Build static Linux AArch64 I2C helper
     needs: validate-release
     runs-on: ubuntu-22.04-arm
     container:
@@ -63,26 +63,26 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-feature=+crt-static
         run: |
           cargo build --release --locked --target aarch64-unknown-linux-gnu \
-            --package camera-toolbox-eeprom-helper \
-            --bin camera-toolbox-eeprom-helper
-          helper=target/aarch64-unknown-linux-gnu/release/camera-toolbox-eeprom-helper
+            --package camera-i2c-helper \
+            --bin camera-i2c-helper
+          helper=target/aarch64-unknown-linux-gnu/release/camera-i2c-helper
           file "$helper" | grep -Eq 'ELF 64-bit LSB.*ARM aarch64'
           if readelf -l "$helper" | grep -q 'Requesting program interpreter'; then
-            echo 'EEPROM helper must be statically linked' >&2
+            echo 'I2C helper must be statically linked' >&2
             exit 1
           fi
       - name: Upload Linux AArch64 helper
         uses: actions/upload-artifact@v4
         with:
-          name: eeprom-helper-linux-aarch64
-          path: target/aarch64-unknown-linux-gnu/release/camera-toolbox-eeprom-helper
+          name: i2c-helper-linux-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/camera-i2c-helper
           if-no-files-found: error
 
   build-native:
     name: Build ${{ matrix.environment }}
     needs:
       - validate-release
-      - build-eeprom-helper-linux-aarch64
+      - build-i2c-helper-linux-aarch64
     runs-on: ${{ matrix.runner }}
     env:
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
@@ -102,10 +102,10 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
-      - name: Download Linux AArch64 EEPROM helper
+      - name: Download Linux AArch64 I2C helper
         uses: actions/download-artifact@v4
         with:
-          name: eeprom-helper-linux-aarch64
+          name: i2c-helper-linux-aarch64
           path: helper-sidecar
       - name: Install Python
         uses: actions/setup-python@v5
@@ -159,16 +159,19 @@ jobs:
           archive="camera-toolbox-${RELEASE_VERSION}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
-          install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
-            "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
+          install -m 755 "target/release/pangbot-calib-tool" "dist/${bundle}/"
+          install -m 755 "helper-sidecar/camera-i2c-helper" \
+            "dist/${bundle}/camera-i2c-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
           install -d "dist/${bundle}/config"
-          install -m 644 "crates/frontends/gui/assets/config/dataset_acceptance_default.yaml" \
+          install -m 644 "crates/frontends/camera-toolbox/assets/config/dataset_acceptance_default.yaml" \
             "dist/${bundle}/config/dataset-acceptance.yaml"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
             "dist/${bundle}/camera-toolbox" --help >/dev/null
+          env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
+            "dist/${bundle}/pangbot-calib-tool" --help >/dev/null
           tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
 
       - name: Package Windows release
@@ -181,15 +184,18 @@ jobs:
           $archive = "camera-toolbox-$env:RELEASE_VERSION-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
-          Copy-Item "helper-sidecar/camera-toolbox-eeprom-helper" "dist/$bundle/camera-toolbox-eeprom-helper-linux-aarch64"
+          Copy-Item "target/release/pangbot-calib-tool.exe" "dist/$bundle/"
+          Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper-linux-aarch64"
           Copy-Item README.md "dist/$bundle/"
           New-Item -ItemType Directory -Force -Path "dist/$bundle/config" | Out-Null
-          Copy-Item "crates/frontends/gui/assets/config/dataset_acceptance_default.yaml" "dist/$bundle/config/dataset-acceptance.yaml"
+          Copy-Item "crates/frontends/camera-toolbox/assets/config/dataset_acceptance_default.yaml" "dist/$bundle/config/dataset-acceptance.yaml"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
           & "dist/$bundle/camera-toolbox.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged camera-toolbox smoke failed" }
+          & "dist/$bundle/pangbot-calib-tool.exe" --help | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged pangbot-calib-tool smoke failed" }
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$archive.zip" -Force
 
       - name: Upload release archive
@@ -203,7 +209,7 @@ jobs:
     name: Build ${{ matrix.environment }}
     needs:
       - validate-release
-      - build-eeprom-helper-linux-aarch64
+      - build-i2c-helper-linux-aarch64
     runs-on: ${{ matrix.runner }}
     container:
       image: ubuntu:${{ matrix.ubuntu_version }}
@@ -268,10 +274,10 @@ jobs:
           python3 scripts/ffmpeg_dependency.py prepare
           --github-env "$GITHUB_ENV"
           --github-path "$GITHUB_PATH"
-      - name: Download Linux AArch64 EEPROM helper
+      - name: Download Linux AArch64 I2C helper
         uses: actions/download-artifact@v4
         with:
-          name: eeprom-helper-linux-aarch64
+          name: i2c-helper-linux-aarch64
           path: helper-sidecar
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
@@ -285,15 +291,17 @@ jobs:
           archive="camera-toolbox-${RELEASE_VERSION}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
-          install -m 755 "helper-sidecar/camera-toolbox-eeprom-helper" \
-            "dist/${bundle}/camera-toolbox-eeprom-helper-linux-aarch64"
+          install -m 755 "target/release/pangbot-calib-tool" "dist/${bundle}/"
+          install -m 755 "helper-sidecar/camera-i2c-helper" \
+            "dist/${bundle}/camera-i2c-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
           install -d "dist/${bundle}/config"
-          install -m 644 "crates/frontends/gui/assets/config/dataset_acceptance_default.yaml" \
+          install -m 644 "crates/frontends/camera-toolbox/assets/config/dataset_acceptance_default.yaml" \
             "dist/${bundle}/config/dataset-acceptance.yaml"
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
+          env -u LD_LIBRARY_PATH "dist/${bundle}/pangbot-calib-tool" --help >/dev/null
           tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
       - name: Upload release archive
         uses: actions/upload-artifact@v4

@@ -9,7 +9,7 @@ publish.workspace = true
 default = ["platform-all"]
 platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
 calibration-opencv = ["dep:opencv"]
-platform-local = []
+platform-local = ["dep:serde_json"]
 platform-cv610 = ["dep:sha2", "dep:socket2"]
 platform-ssh = [
     "dep:directories",
@@ -37,6 +37,7 @@ thiserror.workspace = true
 russh = { workspace = true, optional = true }
 russh-sftp = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+tracing.workspace = true
 secrecy = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }

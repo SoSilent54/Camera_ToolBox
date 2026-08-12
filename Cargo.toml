@@ -5,11 +5,13 @@ members = [
     "crates/adapters",
     "crates/logging",
     "crates/frontends/cli",
-    "crates/frontends/gui",
-    "crates/frontends/workflow-web",
-    "crates/eeprom-helper",
+    "crates/frontends/camera-toolbox",
+    "crates/frontends/pangbot-calib-tool",
+    "crates/frontends/camera-toolbox-web",
+    "crates/i2c-helper",
     "crates/ffmpeg-bridge",
 ]
+
 resolver = "3"
 
 [workspace.package]

@@ -526,6 +526,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "camera-i2c-helper"
+version = "0.1.0"
+dependencies = [
+ "camera-toolbox-app",
+ "camera-toolbox-core",
+ "fs2",
+ "i2cdev",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "camera-toolbox"
 version = "0.1.0"
 dependencies = [
@@ -569,6 +581,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]
@@ -605,18 +618,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "camera-toolbox-eeprom-helper"
-version = "0.1.0"
-dependencies = [
- "camera-toolbox-app",
- "camera-toolbox-core",
- "fs2",
- "i2cdev",
- "serde_json",
- "sha2 0.10.9",
-]
-
-[[package]]
 name = "camera-toolbox-ffmpeg-bridge"
 version = "0.1.0"
 dependencies = [
@@ -635,7 +636,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "camera-toolbox-workflow-web"
+name = "camera-toolbox-web"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -644,6 +645,7 @@ dependencies = [
  "bytes",
  "camera-toolbox-adapters",
  "camera-toolbox-app",
+ "camera-toolbox-core",
  "camera-toolbox-logging",
  "clap",
  "image",
@@ -3403,6 +3405,29 @@ dependencies = [
  "tokio",
  "windows",
  "windows-strings",
+]
+
+[[package]]
+name = "pangbot-calib-tool"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "camera-toolbox-adapters",
+ "camera-toolbox-app",
+ "camera-toolbox-cli",
+ "camera-toolbox-core",
+ "camera-toolbox-logging",
+ "clap",
+ "eframe",
+ "egui_extras",
+ "egui_plot",
+ "image",
+ "png 0.17.16",
+ "rfd",
+ "secrecy",
+ "serde_json",
+ "serde_yaml",
+ "tracing",
 ]
 
 [[package]]

@@ -30,11 +30,12 @@ usage() {
     cat <<'EOF'
 Usage: ./build.sh [profile]
 
-Builds one camera-toolbox executable for the current native host with Local,
-CV610, SSH-managed providers, pinned FFmpeg 8.1.2, and pinned OpenCV 5
-calibration enabled together. Verified native dependencies are cached under
-`.deps/ffmpeg` and `.deps/opencv5`; their runtime libraries are copied beside
-the executable. Set CAMERA_TOOLBOX_CALIBRATION=0 to omit only OpenCV.
+Builds the `camera-toolbox` and `pangbot-calib-tool` GUI executables for the
+current native host with Local, CV610, SSH-managed providers, pinned FFmpeg
+8.1.2, and pinned OpenCV 5 calibration enabled together. Verified native
+dependencies are cached under `.deps/ffmpeg` and `.deps/opencv5`; their runtime
+libraries are copied beside both executables. Set CAMERA_TOOLBOX_CALIBRATION=0
+to omit only OpenCV.
 
 Profiles:
   debug    Cargo dev profile (default)
@@ -95,14 +96,16 @@ opencv_dependency_tool="${project_root}/scripts/opencv5_dependency.py"
 
 configure_windows_msvc_linker
 
-printf 'Building camera-toolbox: features=%s profile=%s target_dir=%s\n' \
+printf 'Building GUI frontends: features=%s profile=%s target_dir=%s\n' \
     "$features" "$profile" "$target_dir"
 
-cargo_args=(
+frontend_args=(
     build
     --manifest-path "${project_root}/Cargo.toml"
     --package camera-toolbox
     --bin camera-toolbox
+    --package pangbot-calib-tool
+    --bin pangbot-calib-tool
     --no-default-features
     --features "$features"
     --locked
@@ -112,8 +115,8 @@ cargo_args=(
 helper_args=(
     build
     --manifest-path "${project_root}/Cargo.toml"
-    --package camera-toolbox-eeprom-helper
-    --bin camera-toolbox-eeprom-helper
+    --package camera-i2c-helper
+    --bin camera-i2c-helper
     --locked
     "${profile_args[@]}"
 )
@@ -123,13 +126,13 @@ if (( calibration_enabled )); then
     "$python_command" "$opencv_dependency_tool" prepare
 fi
 
-cargo "${cargo_args[@]}"
+cargo "${frontend_args[@]}"
 if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
         cargo "${helper_args[@]}" --target aarch64-unknown-linux-gnu
     install -m 755 \
-        "${target_dir}/aarch64-unknown-linux-gnu/${profile}/camera-toolbox-eeprom-helper" \
-        "${target_dir}/${profile}/camera-toolbox-eeprom-helper-linux-aarch64"
+        "${target_dir}/aarch64-unknown-linux-gnu/${profile}/camera-i2c-helper" \
+        "${target_dir}/${profile}/camera-i2c-helper-linux-aarch64"
 else
     cargo "${helper_args[@]}"
 fi

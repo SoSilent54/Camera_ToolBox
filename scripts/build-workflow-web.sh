@@ -2,7 +2,7 @@
 set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-web_dir="$repo_root/crates/frontends/workflow-web/web"
+web_dir="$repo_root/crates/frontends/camera-toolbox-web/web"
 
 cd "$web_dir"
 if [[ -f package-lock.json ]]; then
@@ -13,4 +13,4 @@ fi
 npm run build
 
 cd "$repo_root"
-cargo build -p camera-toolbox-workflow-web --release
+cargo build -p camera-toolbox-web --release

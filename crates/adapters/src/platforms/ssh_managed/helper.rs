@@ -11,7 +11,7 @@ use camera_toolbox_app::{DumpCancellation, RemoteOperationControl, RemoteTimeout
 use super::connection::{SshTransportError, SshTransportSession, TransportFileKind};
 use sha2::{Digest, Sha256};
 
-pub(super) const HELPER_PROGRAM: &str = "/usr/local/libexec/camera-toolbox-eeprom-helper";
+pub(super) const HELPER_PROGRAM: &str = "/usr/local/libexec/camera-i2c-helper";
 pub(super) const HELPER_INSTALL_PROGRAM: &str = "/bin/chmod";
 const HELPER_HASH_PROGRAM: &str = "/usr/bin/sha256sum";
 pub(super) const HELPER_INSTALL_OUTPUT_LIMIT: usize = 4096;
