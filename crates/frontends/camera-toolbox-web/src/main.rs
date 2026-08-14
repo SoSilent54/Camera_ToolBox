@@ -7,10 +7,7 @@ use std::{
     fs,
     net::IpAddr,
     path::{Component, Path, PathBuf},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -23,12 +20,8 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use bytes::Bytes;
 #[cfg(feature = "calibration-opencv")]
 use camera_toolbox_adapters::OpenCvCalibrationBackend;
-use camera_toolbox_adapters::media::{
-    FfmpegRtspDecoder, FfmpegRtspTransport, ffmpeg_rtsp::FfmpegRtspDecoderStatsSnapshot,
-};
 use camera_toolbox_adapters::platforms::ssh_managed::{
     CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, SshConnectionTarget,
     SshEepromProvisionService, SshI2cHelperService, SshTransportFactory,
@@ -39,8 +32,7 @@ use camera_toolbox_app::{
     EepromDeviceState, EepromHelperAction, EepromHelperResult, EepromProvisionOperation,
     EepromProvisionService, EepromProvisionServiceError, EepromSerialState, I2cHelperAction,
     I2cHelperOperation, I2cHelperResult, I2cHelperService, I2cMessageData, I2cMessageSpec,
-    I2cTransactionSpec, LatestDecodedFrameSlot, RemoteOperationControl, RemoteTimeouts,
-    RtspLatencyMode, StreamCancellation, StreamSessionId, host_monotonic_time_ns,
+    I2cTransactionSpec, RemoteOperationControl, RemoteTimeouts,
     validate_i2c_transfer_transactions,
 };
 use camera_toolbox_core::{
@@ -52,17 +44,12 @@ use clap::Parser;
 use image::{ColorType, codecs::jpeg::JpegEncoder};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use tokio::{
-    net::TcpListener,
-    time::{Instant, sleep, sleep_until},
-};
+use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use workflow::{
-    RuntimeGraphStatus, WorkflowGraph, node_catalog, normalize_workflow, runtime_graph_status,
-    seed_workflow_graph, validate_workflow, workmode_templates,
+    WorkflowGraph, node_catalog, normalize_workflow, seed_workflow_graph, validate_workflow,
+    workmode_templates,
 };
-
-static NEXT_STREAM_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "camera-toolbox-web")]
@@ -88,18 +75,11 @@ struct ServerArgs {
 #[derive(Clone)]
 struct AppState {
     workflow_store: Arc<WorkflowStore>,
-    runtime_sessions: Arc<Mutex<HashMap<String, RuntimeGraphSession>>>,
     control_runtime: Arc<ControlRuntime>,
     #[cfg(feature = "calibration-opencv")]
     calibration_backend: Arc<dyn CalibrationBackend>,
     eeprom_inspects: Arc<Mutex<HashMap<String, EepromInspectSnapshot>>>,
     engine_runtime: Arc<engine_api::EngineRuntime>,
-}
-
-/// 运行时会话只存于服务进程内；其图副本用于 Stop 后生成节点级诊断。
-struct RuntimeGraphSession {
-    graph: WorkflowGraph,
-    status: RuntimeGraphStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -780,25 +760,6 @@ struct ValidationResponse {
     error: Option<String>,
 }
 
-/// RuntimeGraph API 失败响应统一为 JSON，便于前端直接显示明确的诊断。
-#[derive(Debug, Serialize)]
-struct RuntimeApiError {
-    error: String,
-}
-
-type RuntimeApiResult<T> = std::result::Result<Json<T>, (StatusCode, Json<RuntimeApiError>)>;
-
-fn runtime_api_error(
-    status: StatusCode,
-    error: impl Into<String>,
-) -> (StatusCode, Json<RuntimeApiError>) {
-    (
-        status,
-        Json(RuntimeApiError {
-            error: error.into(),
-        }),
-    )
-}
 
 /// I²C 预览请求仅描述一次可能的传输；它从不打开设备或建立远程会话。
 #[derive(Debug, Deserialize)]
@@ -1126,22 +1087,6 @@ impl IntoResponse for PreviewApiError {
     }
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct MjpegStreamQuery {
-    url: String,
-    fps: Option<u16>,
-    width: Option<u16>,
-    height: Option<u16>,
-}
-
-struct MjpegStreamConfig {
-    url: String,
-    fps_limit: Option<u16>,
-    width: u16,
-    height: u16,
-}
-
 /// 本地图像预览只接受相对路径，并在解析符号链接后仍限定于声明的 workspace 根目录。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1288,7 +1233,6 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
     let frontend = ServeDir::new(static_dir).not_found_service(ServeFile::new(index));
     let state = AppState {
         workflow_store: Arc::new(WorkflowStore { dir: workflow_dir }),
-        runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
         control_runtime: Arc::new(ControlRuntime::production()),
         #[cfg(feature = "calibration-opencv")]
         calibration_backend: Arc::new(OpenCvCalibrationBackend),
@@ -1309,15 +1253,6 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         )
         .route("/api/workflows/{id}/export", get(export_workflow))
         .route("/api/workflows/{id}/validate", post(validate_workflow_api))
-        .route("/api/workflows/{id}/runtime", get(get_workflow_runtime))
-        .route(
-            "/api/workflows/{id}/runtime/run",
-            post(run_workflow_runtime),
-        )
-        .route(
-            "/api/workflows/{id}/runtime/stop",
-            post(stop_workflow_runtime),
-        )
         .route("/api/control/i2c/preview", post(preview_i2c_transfer))
         .route(
             "/api/control/eeprom/inspect",
@@ -1339,7 +1274,6 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         .route("/api/control/x5/start-rtsp", post(start_x5_rtsp_channel))
         .route("/api/control/x5/stop-rtsp", post(stop_x5_rtsp_channel))
         .route("/api/control/x5/snapshot", post(capture_x5_snapshot))
-        .route("/api/streams/mjpeg", get(mjpeg_stream))
         .route("/api/images/local", get(local_image_preview))
         .route("/api/files/local/list", get(files_api::list_local_files))
         .route("/api/runtime/run", post(engine_api::run_engine))
@@ -1602,90 +1536,6 @@ async fn create_or_replace_workflow(
     Ok(graph)
 }
 
-/// 启动纯内存的 Stage 7 诊断会话；不会连接 RTSP/SSH/X5/I²C，也不会写 EEPROM。
-async fn run_workflow_runtime(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    request: std::result::Result<Json<WorkflowGraph>, JsonRejection>,
-) -> RuntimeApiResult<RuntimeGraphStatus> {
-    let Json(graph) = request.map_err(|error| {
-        runtime_api_error(
-            StatusCode::BAD_REQUEST,
-            format!("invalid runtime graph request: {error}"),
-        )
-    })?;
-    if graph.id != id {
-        return Err(runtime_api_error(
-            StatusCode::BAD_REQUEST,
-            format!(
-                "workflow ID in path `{id}` does not match request graph `{}`",
-                graph.id
-            ),
-        ));
-    }
-    validate_workflow(&graph).map_err(|error| runtime_api_error(StatusCode::BAD_REQUEST, error))?;
-
-    let status = runtime_graph_status(&graph, true);
-    let mut sessions = state.runtime_sessions.lock().map_err(|_| {
-        runtime_api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime session state is unavailable",
-        )
-    })?;
-    sessions.insert(
-        id,
-        RuntimeGraphSession {
-            graph,
-            status: status.clone(),
-        },
-    );
-    Ok(Json(status))
-}
-
-/// 获取指定工作流的进程内诊断快照。工作流文件及其 revision 不会被读取或修改。
-async fn get_workflow_runtime(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> RuntimeApiResult<RuntimeGraphStatus> {
-    let sessions = state.runtime_sessions.lock().map_err(|_| {
-        runtime_api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime session state is unavailable",
-        )
-    })?;
-    let status = sessions
-        .get(&id)
-        .map(|session| session.status.clone())
-        .ok_or_else(|| {
-            runtime_api_error(
-                StatusCode::NOT_FOUND,
-                format!("no runtime session exists for workflow `{id}`"),
-            )
-        })?;
-    Ok(Json(status))
-}
-
-/// 停止运行时标记并保留节点级 idle 诊断；不会执行外部停止命令。
-async fn stop_workflow_runtime(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> RuntimeApiResult<RuntimeGraphStatus> {
-    let mut sessions = state.runtime_sessions.lock().map_err(|_| {
-        runtime_api_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "runtime session state is unavailable",
-        )
-    })?;
-    let session = sessions.get_mut(&id).ok_or_else(|| {
-        runtime_api_error(
-            StatusCode::NOT_FOUND,
-            format!("no runtime session exists for workflow `{id}`"),
-        )
-    })?;
-    let status = runtime_graph_status(&session.graph, false);
-    session.status = status.clone();
-    Ok(Json(status))
-}
 
 async fn local_image_preview(
     Query(query): Query<LocalImageQuery>,
@@ -2066,121 +1916,6 @@ fn if_match_revision(
     Ok(())
 }
 
-async fn mjpeg_stream(
-    Query(query): Query<MjpegStreamQuery>,
-) -> std::result::Result<Response, (StatusCode, String)> {
-    let config = MjpegStreamConfig::from_query(query)?;
-    let latest_frame = Arc::new(LatestDecodedFrameSlot::default());
-    let cancellation = StreamCancellation::default();
-    let session_id = StreamSessionId::new(format!(
-        "workflow-mjpeg-{}",
-        NEXT_STREAM_ID.fetch_add(1, Ordering::Relaxed)
-    ))
-    .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    let decoder = FfmpegRtspDecoder::start(
-        &config.url,
-        FfmpegRtspTransport::Tcp,
-        RtspLatencyMode::Low,
-        u32::from(config.width),
-        u32::from(config.height),
-        session_id,
-        0,
-        Arc::clone(&latest_frame),
-        Duration::from_secs(8),
-        false,
-        &cancellation,
-    )
-    .map_err(|error| {
-        (
-            StatusCode::BAD_GATEWAY,
-            format!("failed to start internal RTSP decoder: {error}"),
-        )
-    })?;
-
-    let frame_interval = config
-        .fps_limit
-        .map(|fps| Duration::from_secs_f64(1.0 / f64::from(fps)));
-    let body_stream = async_stream::stream! {
-        let _decoder = decoder;
-        let _cancellation = cancellation;
-        let mut last_sequence = None;
-        let mut next_frame_at = Instant::now();
-        loop {
-            if let Some(completion) = _decoder.completion() {
-                if let Err(error) = completion {
-                    tracing::debug!(operation = "mjpeg_internal_decoder", error = %error);
-                }
-                break;
-            }
-            if let Some(frame) = latest_frame.latest()
-                && last_sequence != Some(frame.identity.frame_sequence)
-            {
-                if let Some(interval) = frame_interval {
-                    let now = Instant::now();
-                    if now < next_frame_at {
-                        sleep_until(next_frame_at).await;
-                        continue;
-                    }
-                    next_frame_at += interval;
-                    let now = Instant::now();
-                    while next_frame_at <= now {
-                        next_frame_at += interval;
-                    }
-                }
-                last_sequence = Some(frame.identity.frame_sequence);
-                let stats = _decoder.stats().snapshot();
-                match mjpeg_chunk(&frame, &stats) {
-                    Ok(chunk) => yield Ok::<Bytes, std::io::Error>(Bytes::from(chunk)),
-                    Err(error) => yield Err(std::io::Error::other(error)),
-                }
-                continue;
-            }
-            sleep(Duration::from_millis(10)).await;
-        }
-    };
-
-    let mut response = Body::from_stream(body_stream).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("multipart/x-mixed-replace; boundary=frame"),
-    );
-    response.headers_mut().insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, no-cache, must-revalidate"),
-    );
-    response
-        .headers_mut()
-        .insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    Ok(response)
-}
-
-fn mjpeg_chunk(
-    frame: &DecodedVideoFrame,
-    stats: &FfmpegRtspDecoderStatsSnapshot,
-) -> Result<Vec<u8>, String> {
-    let encode_start = Instant::now();
-    let jpeg = encode_rgba_as_jpeg(frame)?;
-    let encode_ns = duration_nanos(encode_start.elapsed());
-    let sent_at_ns = host_monotonic_time_ns();
-    let headers = format!(
-        "--frame\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\nX-Frame-Sequence: {}\r\nX-Frame-Published-At-Ns: {}\r\nX-Mjpeg-Sent-At-Ns: {}\r\nX-Decoder-Frames: {}\r\nX-Decoder-Codec-Ns: {}\r\nX-Decoder-Scale-Ns: {}\r\nX-Decoder-Copy-Ns: {}\r\nX-Mjpeg-Encode-Ns: {}\r\nX-Mjpeg-Jpeg-Bytes: {}\r\n\r\n",
-        jpeg.len(),
-        frame.identity.frame_sequence,
-        frame.identity.host_monotonic_time_ns,
-        sent_at_ns,
-        stats.decoded_frames,
-        stats.codec_stage_ns,
-        stats.scale_stage_ns,
-        stats.copy_stage_ns,
-        encode_ns,
-        jpeg.len(),
-    );
-    let mut chunk = Vec::with_capacity(headers.len() + jpeg.len() + 2);
-    chunk.extend_from_slice(headers.as_bytes());
-    chunk.extend_from_slice(&jpeg);
-    chunk.extend_from_slice(b"\r\n");
-    Ok(chunk)
-}
 
 fn encode_rgba_as_jpeg(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
     let pixel_count = u64::from(frame.width)
@@ -2205,33 +1940,6 @@ fn encode_rgba_as_jpeg(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
         .encode(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
         .map_err(|error| format!("JPEG encode failed: {error}"))?;
     Ok(jpeg)
-}
-
-fn duration_nanos(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
-impl MjpegStreamConfig {
-    fn from_query(query: MjpegStreamQuery) -> std::result::Result<Self, (StatusCode, String)> {
-        let url = query.url.trim();
-        if !(url.starts_with("rtsp://") || url.starts_with("rtsps://")) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                "viewer stream URL must use rtsp:// or rtsps://".to_owned(),
-            ));
-        }
-        let width = query.width.unwrap_or(960).clamp(160, 1920);
-        let default_height = u16::try_from(u32::from(width).saturating_mul(9) / 16)
-            .unwrap_or(u16::MAX)
-            .clamp(90, 1080);
-        Ok(Self {
-            url: url.to_owned(),
-            // 不传 fps 时跟随 RTSP/decoder 发布的新帧；显式传入时才做预览降采样。
-            fps_limit: query.fps.map(|fps| fps.clamp(1, 120)),
-            width,
-            height: query.height.unwrap_or(default_height).clamp(90, 1080),
-        })
-    }
 }
 
 impl WorkflowStore {
@@ -2431,7 +2139,6 @@ mod tests {
             workflow_store: Arc::new(WorkflowStore {
                 dir: std::env::temp_dir(),
             }),
-            runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
             control_runtime: Arc::new(ControlRuntime::with_ssh_for_test(
                 resolver,
                 transport,
@@ -2456,81 +2163,6 @@ mod tests {
         assert!(path.ends_with(".workflow-web/workflows"));
     }
 
-    #[test]
-    fn mjpeg_config_rejects_non_rtsp_url() {
-        let result = MjpegStreamConfig::from_query(MjpegStreamQuery {
-            url: "http://camera.local/stream".to_owned(),
-            fps: None,
-            width: None,
-            height: None,
-        });
-        assert!(matches!(result, Err((StatusCode::BAD_REQUEST, _))));
-    }
-
-    #[test]
-    fn mjpeg_chunk_includes_runtime_metrics_headers() {
-        let frame = DecodedVideoFrame {
-            width: 1,
-            height: 1,
-            rgba: vec![16, 32, 48, 255].into(),
-            identity: camera_toolbox_app::StreamFrameIdentity::unavailable(
-                StreamSessionId::new("workflow-mjpeg-test").unwrap(),
-                0,
-                42,
-                "unit test",
-            ),
-        };
-        let stats = FfmpegRtspDecoderStatsSnapshot {
-            decoded_frames: 7,
-            io_bytes_available: false,
-            io_bytes: 0,
-            media_packet_bytes: 0,
-            codec_stage_ns: 10,
-            scale_stage_ns: 20,
-            copy_stage_ns: 30,
-        };
-
-        let chunk = mjpeg_chunk(&frame, &stats).unwrap();
-        let header_end = chunk
-            .windows(4)
-            .position(|window| window == b"\r\n\r\n")
-            .expect("headers are terminated");
-        let headers = std::str::from_utf8(&chunk[..header_end]).unwrap();
-
-        assert!(headers.contains("Content-Type: image/jpeg"));
-        assert!(headers.contains("X-Frame-Sequence: 42"));
-        assert!(headers.contains("X-Mjpeg-Sent-At-Ns:"));
-        assert!(headers.contains("X-Decoder-Frames: 7"));
-        assert!(headers.contains("X-Decoder-Codec-Ns: 10"));
-        assert!(headers.contains("X-Decoder-Scale-Ns: 20"));
-        assert!(headers.contains("X-Decoder-Copy-Ns: 30"));
-        assert!(headers.contains("X-Mjpeg-Encode-Ns:"));
-        assert!(headers.contains("X-Mjpeg-Jpeg-Bytes:"));
-    }
-
-    #[test]
-    fn mjpeg_config_preserves_source_rate_by_default() {
-        let explicit_limit = MjpegStreamConfig::from_query(MjpegStreamQuery {
-            url: "rtsp://camera.local/stream".to_owned(),
-            fps: Some(300),
-            width: Some(4096),
-            height: Some(4096),
-        })
-        .expect("valid RTSP URL");
-        assert_eq!(explicit_limit.fps_limit, Some(120));
-        assert_eq!(explicit_limit.width, 1920);
-        assert_eq!(explicit_limit.height, 1080);
-
-        let source_rate = MjpegStreamConfig::from_query(MjpegStreamQuery {
-            url: "rtsp://camera.local/stream".to_owned(),
-            fps: None,
-            width: Some(960),
-            height: None,
-        })
-        .expect("valid RTSP URL");
-        assert_eq!(source_rate.fps_limit, None);
-        assert_eq!(source_rate.height, 540);
-    }
 
     #[test]
     fn x5_binding_request_trims_host_and_preserves_port() {

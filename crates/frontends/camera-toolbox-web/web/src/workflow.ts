@@ -406,24 +406,6 @@ export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
   }
 }
 
-export interface RuntimeGraphStatus {
-  graphId: string;
-  running: boolean;
-  nodes: RuntimeNodeStatus[];
-  events: RuntimeNodeEvent[];
-}
-
-export interface RuntimeNodeStatus {
-  nodeId: string;
-  state: NodeRuntimeState;
-  diagnostic: string;
-}
-
-export interface RuntimeNodeEvent {
-  nodeId: string;
-  level: 'info' | 'warning';
-  message: string;
-}
 
 /** 执行一次显式 I²C 请求；写操作必须由调用者传入确认与 SSH 运行时绑定。 */
 export async function runI2cTransfer(request: I2cExecuteRequest): Promise<ControlExecutionResult> {
@@ -470,17 +452,6 @@ export async function captureX5Snapshot(request: X5SnapshotRequest): Promise<X5C
   return postJson('/api/control/x5/snapshot', request);
 }
 
-export async function loadRuntimeStatus(graphId: string): Promise<RuntimeGraphStatus> {
-  return fetchJson(`/api/workflows/${encodeURIComponent(graphId)}/runtime`);
-}
-
-export async function runWorkflowRuntime(graph: WorkflowGraph): Promise<RuntimeGraphStatus> {
-  return postJson(`/api/workflows/${encodeURIComponent(graph.id)}/runtime/run`, graph);
-}
-
-export async function stopWorkflowRuntime(graphId: string): Promise<RuntimeGraphStatus> {
-  return postJson(`/api/workflows/${encodeURIComponent(graphId)}/runtime/stop`);
-}
 
 /** 引擎节点状态快照。 */
 export interface EngineNodeStatus {

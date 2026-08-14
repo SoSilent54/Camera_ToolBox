@@ -111,40 +111,6 @@ pub enum NodeRuntimeState {
     Error,
 }
 
-/// Stage 7 运行时诊断快照；仅驻留服务进程内存，绝不写入 `WorkflowGraph`。
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeGraphStatus {
-    pub graph_id: String,
-    pub running: bool,
-    pub nodes: Vec<RuntimeNodeStatus>,
-    pub events: Vec<RuntimeNodeEvent>,
-}
-
-/// 单个节点的运行时状态，使用节点 ID 与持久化拓扑关联。
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeNodeStatus {
-    pub node_id: String,
-    pub state: NodeRuntimeState,
-    pub diagnostic: String,
-}
-
-/// 节点级诊断事件；Stage 7 不持有帧、套接字、日志或其他重型运行时数据。
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeNodeEvent {
-    pub node_id: String,
-    pub level: RuntimeEventLevel,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum RuntimeEventLevel {
-    Info,
-    Warning,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -1208,87 +1174,6 @@ pub fn validate_workflow(graph: &WorkflowGraph) -> Result<(), String> {
     Ok(())
 }
 
-/// 构建 Stage 7 诊断运行时快照。此函数只标记可安全自动启动的纯媒体节点，
-/// 不创建 RTSP、SSH、X5 或 I²C 连接，也不执行校准或 EEPROM 操作。
-pub fn runtime_graph_status(graph: &WorkflowGraph, running: bool) -> RuntimeGraphStatus {
-    let nodes = graph
-        .nodes
-        .iter()
-        .map(|node| runtime_node_status(node, running))
-        .collect::<Vec<_>>();
-    let events = nodes
-        .iter()
-        .map(|node| RuntimeNodeEvent {
-            node_id: node.node_id.clone(),
-            level: match node.state {
-                NodeRuntimeState::Running => RuntimeEventLevel::Info,
-                _ => RuntimeEventLevel::Warning,
-            },
-            message: node.diagnostic.clone(),
-        })
-        .collect();
-
-    RuntimeGraphStatus {
-        graph_id: graph.id.clone(),
-        running,
-        nodes,
-        events,
-    }
-}
-
-fn runtime_node_status(node: &WorkflowNode, running: bool) -> RuntimeNodeStatus {
-    let (state, diagnostic) = if !running {
-        (NodeRuntimeState::Idle, "runtime stopped".to_owned())
-    } else if safe_auto_start_node(node.kind) {
-        (
-            NodeRuntimeState::Running,
-            "Stage 7 diagnostic session active; no external action was started".to_owned(),
-        )
-    } else if manual_node(node.kind) {
-        (
-            NodeRuntimeState::Idle,
-            "manual or dangerous node was not auto-executed".to_owned(),
-        )
-    } else {
-        (
-            NodeRuntimeState::Idle,
-            "no Stage 7 runtime executor is attached to this node".to_owned(),
-        )
-    };
-
-    RuntimeNodeStatus {
-        node_id: node.id.clone(),
-        state,
-        diagnostic,
-    }
-}
-
-fn safe_auto_start_node(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::RtspDecoder
-            | NodeKind::FrameSampler
-            | NodeKind::ImageLayer
-            | NodeKind::VideoLayer
-            | NodeKind::OverlayComposer
-            | NodeKind::Viewer
-            | NodeKind::ResultView
-    )
-}
-
-fn manual_node(kind: NodeKind) -> bool {
-    matches!(
-        kind,
-        NodeKind::SftpWorkspace
-            | NodeKind::FileBrowser
-            | NodeKind::SshSession
-            | NodeKind::X5Snapshot
-            | NodeKind::CalibrationSolver
-            | NodeKind::I2cBusDiscovery
-            | NodeKind::I2cTransfer
-            | NodeKind::EepromProvision
-    )
-}
 
 /// 标准化保存前的工作流图：修正 schema/revision，并拒绝运行时字段进入持久化文件。
 pub fn normalize_workflow(

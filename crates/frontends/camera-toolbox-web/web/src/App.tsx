@@ -33,7 +33,6 @@ import {
   type NodeDefinition,
   type NodeKind,
   type PortKind,
-  type ViewerPreview,
   type WorkflowGraph,
   type WorkflowNode,
   type WorkflowPort,
@@ -45,7 +44,6 @@ import {
   LocalWorkspaceNode,
   SftpWorkspaceNode,
   SshSessionNode,
-  ViewerNode,
   X5DeviceNode,
   X5RtspChannelNode,
   X5SnapshotNode,
@@ -56,13 +54,17 @@ import {
   GenericWorkflowNode,
   NodeLibraryItem,
   RtspSourceNode,
+  ViewerNode,
 } from './nodes';
 import { Console } from './Console';
-import type { Selection } from './Inspector';
 import { useEngine } from './useEngine';
 
 type FlowNode = Node<FlowNodeData>;
 type FlowEdge = Edge<FlowEdgeData>;
+export type Selection =
+  | { type: 'node'; node: WorkflowNode }
+  | { type: 'edge'; edge: FlowEdge }
+  | { type: 'none' };
 const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
 const DND_NODE_KIND = 'application/x-camera-toolbox-node-kind';
 const GENERIC_NODE_KINDS: NodeKind[] = [
@@ -946,95 +948,8 @@ function toFlowNodes(graph: WorkflowGraph): FlowNode[] {
     position: node.position,
     data: {
       workflowNode: node,
-      preview: node.kind === 'viewer' ? viewerPreview(graph, node.id) : undefined,
     },
   }));
-}
-
-/** 沿已连接的端口反向查找可预览的源；只把浏览器 URL 留在 React Flow 运行时状态。 */
-function viewerPreview(graph: WorkflowGraph, viewerNodeId: string): ViewerPreview | undefined {
-  const nodes = new Map(graph.nodes.map((node) => [node.id, node]));
-  const incoming = new Map<string, string[]>();
-  for (const edge of graph.edges) {
-    incoming.set(edge.target.nodeId, [...(incoming.get(edge.target.nodeId) ?? []), edge.source.nodeId]);
-  }
-
-  const workspaceRootFor = (nodeId: string, visited: Set<string>): string | undefined => {
-    if (visited.has(nodeId)) {
-      return undefined;
-    }
-    visited.add(nodeId);
-    const node = nodes.get(nodeId);
-    if (!node) {
-      return undefined;
-    }
-    if (node.kind === 'localWorkspace' && typeof node.config.root === 'string' && node.config.root.trim()) {
-      return node.config.root.trim();
-    }
-    for (const sourceNodeId of incoming.get(nodeId) ?? []) {
-      const root = workspaceRootFor(sourceNodeId, visited);
-      if (root) {
-        return root;
-      }
-    }
-    return undefined;
-  };
-
-  const selectedPathFor = (nodeId: string, visited: Set<string>): string | undefined => {
-    if (visited.has(nodeId)) {
-      return undefined;
-    }
-    visited.add(nodeId);
-    const node = nodes.get(nodeId);
-    if (!node) {
-      return undefined;
-    }
-    if (node.kind === 'fileBrowser' && typeof node.config.selection === 'string' && node.config.selection.trim()) {
-      return node.config.selection.trim();
-    }
-    for (const sourceNodeId of incoming.get(nodeId) ?? []) {
-      const selection = selectedPathFor(sourceNodeId, visited);
-      if (selection) {
-        return selection;
-      }
-    }
-    return undefined;
-  };
-
-  const visit = (nodeId: string, visited: Set<string>): ViewerPreview | undefined => {
-    if (visited.has(nodeId)) {
-      return undefined;
-    }
-    visited.add(nodeId);
-    const node = nodes.get(nodeId);
-    if (!node) {
-      return undefined;
-    }
-    if (node.kind === 'rtspSource' && typeof node.config.url === 'string' && node.config.url.trim()) {
-      return { kind: 'rtsp', url: node.config.url.trim() };
-    }
-    if (node.kind === 'imageFileSource') {
-      const relativePath = typeof node.config.relativePath === 'string' && node.config.relativePath.trim()
-        ? node.config.relativePath.trim()
-        : selectedPathFor(nodeId, new Set());
-      if (relativePath) {
-        const workspaceRoot = workspaceRootFor(nodeId, new Set());
-        if (workspaceRoot) {
-          const query = new URLSearchParams({ workspaceRoot, relativePath });
-          return { kind: 'local-image', url: `/api/images/local?${query}` };
-        }
-      }
-    }
-    for (const sourceNodeId of incoming.get(nodeId) ?? []) {
-      const preview = visit(sourceNodeId, visited);
-      if (preview) {
-        return preview;
-      }
-    }
-    return undefined;
-  };
-
-  return visit(viewerNodeId, new Set());
 }
 
 function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
@@ -1180,11 +1095,9 @@ function toWorkflowGraph(nodes: FlowNode[], edges: FlowEdge[], base: WorkflowGra
   };
 }
 
-function withViewerPreviews(nodes: FlowNode[], edges: FlowEdge[]): FlowNode[] {
-  const graph = toWorkflowGraph(nodes, edges, emptyWorkflowGraph());
-  return nodes.map((node) => node.data.workflowNode.kind === 'viewer'
-    ? { ...node, data: { ...node.data, preview: viewerPreview(graph, node.id) } }
-    : node);
+/** 引擎接管 viewer 帧后不再需要 preview 注入；保留此函数维持调用点稳定。 */
+function withViewerPreviews(nodes: FlowNode[], _edges: FlowEdge[]): FlowNode[] {
+  return nodes;
 }
 
 function inferPortKind(nodes: FlowNode[], nodeId: string, portId: string): PortKind {
