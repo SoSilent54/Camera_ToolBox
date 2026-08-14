@@ -75,7 +75,11 @@ fn typed_dump_terminal_failure_reaches_a_failing_process_exit_status() {
         .expect("insert profile");
     store.save_to_path(&store_path).expect("save fixture store");
 
-    let mut command = Command::new(env!("CARGO_BIN_EXE_pangbot_calib_tool"));
+    let mut command = Command::new(
+        std::env::var("CARGO_BIN_EXE_pangbot-calib-tool")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_pangbot_calib_tool"))
+            .expect("shipping binary path"),
+    );
     command.args([
         "cv610",
         "dump",

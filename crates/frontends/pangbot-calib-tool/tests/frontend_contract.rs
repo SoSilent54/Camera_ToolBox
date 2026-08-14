@@ -45,17 +45,21 @@ fn local_unbound_platform_probe_uses_the_shipping_binary() {
         .save_to_path(&store_path)
         .expect("save fixture store");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_pangbot_calib_tool"))
-        .args([
-            "platform",
-            "probe",
-            "--profile-store",
-            store_path.to_str().expect("UTF-8 store path"),
-            "--platform",
-            "local",
-        ])
-        .output()
-        .expect("run shipping CLI process");
+    let output = Command::new(
+        std::env::var("CARGO_BIN_EXE_pangbot-calib-tool")
+            .or_else(|_| std::env::var("CARGO_BIN_EXE_pangbot_calib_tool"))
+            .expect("shipping binary path"),
+    )
+    .args([
+        "platform",
+        "probe",
+        "--profile-store",
+        store_path.to_str().expect("UTF-8 store path"),
+        "--platform",
+        "local",
+    ])
+    .output()
+    .expect("run shipping CLI process");
     assert!(
         output.status.success(),
         "platform probe failed: {}",
