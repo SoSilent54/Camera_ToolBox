@@ -30,12 +30,12 @@ usage() {
     cat <<'EOF'
 Usage: ./build.sh [profile]
 
-Builds the `camera-toolbox` and `pangbot-calib-tool` GUI executables for the
-current native host with Local, CV610, SSH-managed providers, pinned FFmpeg
-8.1.2, and pinned OpenCV 5 calibration enabled together. Verified native
-dependencies are cached under `.deps/ffmpeg` and `.deps/opencv5`; their runtime
-libraries are copied beside both executables. Set CAMERA_TOOLBOX_CALIBRATION=0
-to omit only OpenCV.
+Builds the `camera-toolbox`, `pangbot-calib-tool`, and `camera-toolbox-web`
+executables for the current native host with Local, CV610, SSH-managed
+providers, pinned FFmpeg 8.1.2, and pinned OpenCV 5 calibration enabled
+together. Verified native dependencies are cached under `.deps/ffmpeg` and
+`.deps/opencv5`; their runtime libraries are copied beside the GUI executables.
+Set CAMERA_TOOLBOX_CALIBRATION=0 to omit only OpenCV.
 
 Profiles:
   debug    Cargo dev profile (default)
@@ -96,7 +96,7 @@ opencv_dependency_tool="${project_root}/scripts/opencv5_dependency.py"
 
 configure_windows_msvc_linker
 
-printf 'Building GUI frontends: features=%s profile=%s target_dir=%s\n' \
+printf 'Building native frontends: features=%s profile=%s target_dir=%s\n' \
     "$features" "$profile" "$target_dir"
 
 frontend_args=(
@@ -106,6 +106,8 @@ frontend_args=(
     --bin camera-toolbox
     --package pangbot-calib-tool
     --bin pangbot-calib-tool
+    --package camera-toolbox-web
+    --bin camera-toolbox-web
     --no-default-features
     --features "$features"
     --locked
@@ -125,6 +127,17 @@ helper_args=(
 if (( calibration_enabled )); then
     "$python_command" "$opencv_dependency_tool" prepare
 fi
+
+printf 'Building web assets: profile=%s\n' "$profile"
+(
+    cd "${project_root}/crates/frontends/camera-toolbox-web/web"
+    if [[ -f package-lock.json ]]; then
+        npm ci
+    else
+        npm install
+    fi
+    npm run build
+)
 
 cargo "${frontend_args[@]}"
 if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then

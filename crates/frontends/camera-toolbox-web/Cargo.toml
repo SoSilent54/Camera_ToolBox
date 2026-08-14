@@ -8,9 +8,12 @@ autobins = false
 
 [features]
 default = ["platform-ssh", "calibration-opencv"]
-calibration-opencv = ["camera-toolbox-adapters/calibration-opencv"]
+product-all = ["platform-all", "calibration-opencv"]
+platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
+platform-local = ["camera-toolbox-adapters/platform-local"]
+platform-cv610 = ["camera-toolbox-adapters/platform-cv610"]
 platform-ssh = ["camera-toolbox-adapters/platform-ssh"]
-
+calibration-opencv = ["camera-toolbox-adapters/calibration-opencv"]
 [[bin]]
 name = "camera-toolbox-web"
 path = "src/main.rs"
