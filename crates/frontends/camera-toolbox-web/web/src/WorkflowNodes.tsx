@@ -266,15 +266,21 @@ export function ImageFileSourceNode({ data, selected }: NodeProps) {
 
 export function GenericWorkflowNode({ data, selected }: NodeProps) {
   const node = (data as FlowNodeData).workflowNode;
+  const params = Object.entries(node.config)
+    .filter(([, value]) => typeof value !== 'object' && value !== null && value !== undefined && value !== '')
+    .slice(0, 4);
   return (
     <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
       <PortHandles node={node} />
       <div className="node-body compact">
-        <span>Kind: {node.kind}</span>
-        <span>Category: {node.category}</span>
-        <span>In: {node.inputs.length}</span>
-        <span>Out: {node.outputs.length}</span>
+        {params.length === 0 ? (
+          <span className="node-hint">no config</span>
+        ) : params.map(([key, value]) => (
+          <span key={key} className="node-param">
+            <code>{key}</code>&nbsp;{String(value)}
+          </span>
+        ))}
       </div>
     </section>
   );

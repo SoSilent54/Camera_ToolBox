@@ -36,11 +36,12 @@ button:hover {
   display: grid;
   width: 100vw;
   height: 100vh;
-  grid-template-rows: 50px minmax(0, 1fr);
-  grid-template-columns: 228px minmax(0, 1fr) 300px;
+  grid-template-rows: 50px minmax(0, 1fr) auto;
+  grid-template-columns: 228px minmax(0, 1fr);
   grid-template-areas:
-    "top top top"
-    "left canvas inspector";
+    "top top"
+    "left canvas"
+    "console console";
 }
 
 .top-bar {
@@ -716,3 +717,121 @@ button:disabled {
 .port-label.port-tone-io { color: #5eead4; }
 .port-label.port-tone-status { color: #fcd34d; }
 .port-label.port-tone-default { color: #cbd5e1; }
+
+/* 底部可收起 Console */
+.console {
+  grid-area: console;
+  border-top: 1px solid #263040;
+  background: #0a0f18;
+  color: #cbd5e1;
+  font-size: 0.72rem;
+}
+
+.console-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.3rem 0.6rem;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+}
+
+.console.collapsed .console-header {
+  border-bottom: 0;
+}
+
+.console-toggle,
+.console-clear {
+  border-radius: 2px;
+  padding: 0.16rem 0.34rem;
+  font-size: 0.66rem;
+}
+
+.console-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.console-toggle .chevron {
+  font-size: 0.6rem;
+}
+
+.console-count {
+  color: #64748b;
+  font-size: 0.62rem;
+  margin-left: auto;
+}
+
+.console-log {
+  margin: 0;
+  padding: 0.4rem 0.6rem 0.5rem;
+  list-style: none;
+  max-height: 160px;
+  overflow: auto;
+  display: grid;
+  gap: 0.12rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+.console-log li {
+  padding: 0.05rem 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.05);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 节点参数摘要（GenericWorkflowNode） */
+.node-param {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 0.3rem;
+}
+
+.node-param code {
+  color: #7dd3fc;
+  font-size: 0.66rem;
+}
+
+.node-hint {
+  color: #64748b;
+  font-size: 0.66rem;
+  font-style: italic;
+}
+
+/* 节点右键菜单 */
+.context-menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+}
+
+.context-menu {
+  position: fixed;
+  z-index: 21;
+  min-width: 128px;
+  display: grid;
+  padding: 0.2rem;
+  border: 1px solid #263040;
+  border-radius: 4px;
+  background: #10161f;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.55);
+}
+
+.context-menu button {
+  text-align: left;
+  padding: 0.42rem 0.6rem;
+  border-radius: 3px;
+  font-size: 0.74rem;
+}
+
+.context-menu button:hover {
+  background: #18202d;
+}
+
+.context-menu button:last-child {
+  color: #fecaca;
+}

@@ -57,7 +57,8 @@ import {
   X5RtspChannelNode,
   X5SnapshotNode,
 } from './WorkflowNodes';
-import { Inspector, type Selection } from './Inspector';
+import { Console } from './Console';
+import type { Selection } from './Inspector';
 
 type FlowNode = Node<FlowNodeData>;
 type FlowEdge = Edge<FlowEdgeData>;
@@ -111,6 +112,7 @@ export function App() {
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeGraphStatus | null>(null);
+  const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
   const [marquee, setMarquee] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
@@ -606,6 +608,51 @@ export function App() {
     recordSnapshot();
   }, [recordSnapshot]);
 
+  const handleNodeContextMenu = useCallback((event: ReactMouseEvent, node: FlowNode) => {
+    event.preventDefault();
+    setContextMenu({ x: event.clientX, y: event.clientY, nodeId: node.id });
+  }, []);
+
+  const handleContextMenuAction = useCallback((action: 'rename' | 'duplicate' | 'delete') => {
+    setContextMenu((current) => {
+      if (!current) {
+        return null;
+      }
+      const nodeId = current.nodeId;
+      const node = nodesRef.current.find((candidate) => candidate.id === nodeId);
+      if (!node) {
+        return null;
+      }
+      const workflowNode = node.data.workflowNode;
+      if (action === 'rename') {
+        const title = window.prompt('节点重命名', workflowNode.title);
+        if (title && title.trim()) {
+          handleNodeTitleChange(nodeId, title);
+        }
+      } else if (action === 'delete') {
+        recordSnapshot();
+        const nextEdges = edgesRef.current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId);
+        setEdges(nextEdges);
+        setNodes((currentNodes) => withViewerPreviews(currentNodes.filter((candidate) => candidate.id !== nodeId), nextEdges));
+        setSelection({ type: 'none' });
+        pushEvent(`删除节点：${workflowNode.title}`);
+      } else if (action === 'duplicate') {
+        recordSnapshot();
+        const duplicated = {
+          ...workflowNode,
+          id: createNodeId(workflowNode.kind),
+          title: `${workflowNode.title} Copy`,
+          position: { x: node.position.x + 48, y: node.position.y + 48 },
+          config: { ...workflowNode.config },
+        };
+        setNodes((currentNodes) => withViewerPreviews([...currentNodes, toFlowNode(duplicated)], edgesRef.current));
+        setSelection({ type: 'node', node: duplicated });
+        pushEvent(`复制节点：${duplicated.title}`);
+      }
+      return null;
+    });
+  }, [handleNodeTitleChange, pushEvent, recordSnapshot, setEdges, setNodes]);
+
   const handleCanvasContextMenu = useCallback((event: ReactMouseEvent) => {
     event.preventDefault();
   }, []);
@@ -868,6 +915,7 @@ export function App() {
           onDrop={handleDropNode}
           onSelectionChange={onSelectionChange}
           onNodeDragStart={handleNodeDragStart}
+          onNodeContextMenu={handleNodeContextMenu}
           onInit={(instance) => {
             flowInstanceRef.current = instance;
           }}
@@ -892,17 +940,20 @@ export function App() {
         )}
       </main>
 
-      <aside className="inspector">
-        <Inspector
-          events={events}
-          selection={selection}
-          onDeleteSelection={handleDeleteSelection}
-          runtimeStatus={runtimeStatus}
-          onDuplicateSelection={handleDuplicateSelection}
-          onNodeTitleChange={handleNodeTitleChange}
-          onNodeConfigChange={handleNodeConfigChange}
-        />
-      </aside>
+      <Console events={events} onClear={() => setEvents([])} />
+      {contextMenu && (
+        <div className="context-menu-backdrop" onClick={() => setContextMenu(null)}>
+          <div
+            className="context-menu"
+            style={{ left: contextMenu.x, top: contextMenu.y }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button type="button" onClick={() => handleContextMenuAction('rename')}>重命名</button>
+            <button type="button" onClick={() => handleContextMenuAction('duplicate')}>复制</button>
+            <button type="button" onClick={() => handleContextMenuAction('delete')}>删除</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
