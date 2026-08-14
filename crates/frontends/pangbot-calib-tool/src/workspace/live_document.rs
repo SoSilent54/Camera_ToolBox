@@ -94,7 +94,7 @@ impl LiveStreamSource {
         .map_err(|error| error.to_string())
     }
 
-    fn channel(&self) -> u16 {
+    pub(crate) fn channel(&self) -> u16 {
         match self {
             Self::Cv610 { channel, .. } | Self::Rtsp { channel, .. } => *channel,
         }

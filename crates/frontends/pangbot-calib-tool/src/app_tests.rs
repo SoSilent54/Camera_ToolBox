@@ -1901,8 +1901,8 @@ fn pangbot_simplified_flavor_renders_chinese_step_flow() {
 
     assert!(visible.contains("pangbot-calib-tool · X5_233 简化标定"));
     assert!(visible.contains("第一步：连接设备并启动驱动"));
-    assert!(visible.contains("第二步：预览与通道确认"));
-    assert!(visible.contains("第三步：标定采集"));
+    assert!(visible.contains("第二步：双 viewer 预览与通道确认"));
+    assert!(visible.contains("第三步：双路数据集采集与筛选"));
     assert!(visible.contains("第四步：求解与检查"));
     assert!(visible.contains("第五步：写入并保存历史"));
     assert!(visible.contains("CH0 → RTSP 554 → i2c-4；CH3 → RTSP 557 → i2c-6"));

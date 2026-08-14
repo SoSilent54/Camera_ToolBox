@@ -16,11 +16,11 @@ use std::{
 use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvisionIntent};
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{
-    CalibrationExport, CalibrationProvisionRequest, CalibrationViewerOverlay,
-    CalibrationViewerPresentation, CalibrationWorkspaceKey, CalibrationWorkspaceManager,
-    ViewerDetectionOverlay, ViewerGuidedPoseArrowOverlay, ViewerGuidedPoseOverlay,
-    ViewerGuidedPoseRotationArcOverlay, ViewerGuidedPoseRotationRingsOverlay,
-    ViewerGuidedPoseStatusOverlay, ViewerPoseAxisOverlay,
+    CalibrationExport, CalibrationLiveWorkspaceSummary, CalibrationProvisionRequest,
+    CalibrationViewerOverlay, CalibrationViewerPresentation, CalibrationWorkspaceKey,
+    CalibrationWorkspaceManager, ViewerDetectionOverlay, ViewerGuidedPoseArrowOverlay,
+    ViewerGuidedPoseOverlay, ViewerGuidedPoseRotationArcOverlay,
+    ViewerGuidedPoseRotationRingsOverlay, ViewerGuidedPoseStatusOverlay, ViewerPoseAxisOverlay,
 };
 
 #[cfg(feature = "platform-ssh")]
@@ -1250,28 +1250,33 @@ struct X5233ChannelMapping {
     driver_channel: u16,
     rtsp_port: u16,
     label: &'static str,
+    i2c_bus: u16,
 }
 
 const X5_233_DRIVER_CHANNELS: [X5233ChannelMapping; 4] = [
     X5233ChannelMapping {
         driver_channel: 0,
         rtsp_port: 554,
+        i2c_bus: 4,
         label: "CH0 cam0 H",
     },
     X5233ChannelMapping {
         driver_channel: 1,
         rtsp_port: 555,
         label: "CH1 cam0 L",
+        i2c_bus: 5,
     },
     X5233ChannelMapping {
         driver_channel: 3,
         rtsp_port: 557,
         label: "CH3 cam1 H",
+        i2c_bus: 6,
     },
     X5233ChannelMapping {
         driver_channel: 4,
         rtsp_port: 558,
         label: "CH4 cam1 L",
+        i2c_bus: 7,
     },
 ];
 
@@ -2512,12 +2517,55 @@ impl CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         self.sync_active_calibration_live_document();
         #[cfg(feature = "calibration-opencv")]
-        let calibration_viewer_presentation = self.workspace.active_live().and_then(|document| {
-            self.calibration.live_viewer_presentation(
-                document.displayed_frame().map(Arc::as_ref),
-                Some(&document.source),
-            )
-        });
+        struct PangbotViewerCard {
+            document_id: Option<DocumentId>,
+            channel: u16,
+            rtsp_port: u16,
+            i2c_bus: u16,
+            title: String,
+            detail: String,
+            summary: Option<CalibrationLiveWorkspaceSummary>,
+            presentation: Option<CalibrationViewerPresentation>,
+        }
+
+        let calibration_viewer_cards = [0_u16, 3_u16]
+            .into_iter()
+            .map(|channel| {
+                let mapping = x5_233_channel_mapping(channel)
+                    .expect("pangbot simplified calibration channel is fixed");
+                if let Some(document) = self
+                    .workspace
+                    .live_documents()
+                    .iter()
+                    .find(|document| document.source.channel() == channel)
+                {
+                    PangbotViewerCard {
+                        document_id: Some(document.id),
+                        channel,
+                        rtsp_port: mapping.rtsp_port,
+                        i2c_bus: mapping.i2c_bus,
+                        title: document.source.title(),
+                        detail: document.source.detail(),
+                        summary: self.calibration.live_workspace_summary(&document.source),
+                        presentation: self.calibration.live_viewer_presentation(
+                            document.displayed_frame().map(Arc::as_ref),
+                            Some(&document.source),
+                        ),
+                    }
+                } else {
+                    PangbotViewerCard {
+                        document_id: None,
+                        channel,
+                        rtsp_port: mapping.rtsp_port,
+                        i2c_bus: mapping.i2c_bus,
+                        title: format!("CH{channel} viewer"),
+                        detail: "等待第一步启动驱动并建立 RTSP。".to_owned(),
+                        summary: None,
+                        presentation: None,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
         #[cfg(feature = "calibration-opencv")]
         let calibration_sftp_label: Result<String, String> = {
             #[cfg(feature = "platform-ssh")]
@@ -2594,14 +2642,87 @@ impl CameraToolboxApp {
                             .map_err(|error| error.as_str()),
                         has_live_inspection,
                         |ui| {
-                            let document = workspace.active_live_mut()?;
-                            let _ = Self::render_live_viewer(
-                                ui,
-                                document,
-                                true,
-                                calibration_viewer_presentation.as_ref(),
-                            );
+                            for (index, card) in calibration_viewer_cards.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(8.0);
+                                }
+                                ui.group(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.heading(format!("CH{} viewer", card.channel));
+                                        ui.separator();
+                                        ui.monospace(format!(
+                                            "RTSP {} · i2c-{}",
+                                            card.rtsp_port, card.i2c_bus
+                                        ));
+                                    });
+                                    ui.label(&card.title);
+                                    ui.label(&card.detail);
+                                    if let Some(summary) = card.summary.as_ref() {
+                                        ui.label(format!(
+                                            "数据集：{} 张",
+                                            summary.dataset_item_count
+                                        ));
+                                        if let Some(label) =
+                                            summary.selected_dataset_label.as_deref()
+                                        {
+                                            ui.label(format!("当前选中：{label}"));
+                                        } else {
+                                            ui.weak("当前没有选中数据集项。");
+                                        }
+                                        ui.label(format!("状态：{}", summary.status));
+                                    } else {
+                                        ui.weak("数据集：等待该路预览建立后初始化。");
+                                    }
+                                    if let Some(document_id) = card.document_id {
+                                        if let Some(document) = workspace.live_mut(document_id) {
+                                            let _ = Self::render_live_viewer(
+                                                ui,
+                                                document,
+                                                true,
+                                                card.presentation.as_ref(),
+                                            );
+                                        }
+                                    } else {
+                                        ui.weak("暂无画面。完成第一步后自动显示该路预览。");
+                                    }
+                                });
+                            }
                             None
+                        },
+                        |ui| {
+                            for (index, card) in calibration_viewer_cards.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(6.0);
+                                }
+                                ui.group(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.heading(format!("CH{} 数据集", card.channel));
+                                        ui.separator();
+                                        ui.monospace(format!(
+                                            "RTSP {} · i2c-{}",
+                                            card.rtsp_port, card.i2c_bus
+                                        ));
+                                    });
+                                    if let Some(summary) = card.summary.as_ref() {
+                                        ui.label(format!(
+                                            "已收入 {} 张",
+                                            summary.dataset_item_count
+                                        ));
+                                        if let Some(label) =
+                                            summary.selected_dataset_label.as_deref()
+                                        {
+                                            ui.label(format!("当前选中：{label}"));
+                                        } else {
+                                            ui.weak("当前没有选中数据集项。");
+                                        }
+                                        ui.label(format!("状态：{}", summary.status));
+                                    } else {
+                                        ui.weak("等待该路 viewer 建立后创建独立数据集。");
+                                    }
+                                });
+                            }
                         },
                     );
                     rect
@@ -2643,10 +2764,9 @@ impl CameraToolboxApp {
         ui: &mut egui::Ui,
     ) -> Option<LiveStreamOpenRequest> {
         let host_ready = !self.x5_233_driver.device_ip.trim().is_empty();
-        let driver_ready = host_ready
-            && self.x5_233_driver.last_tcp_status.is_some()
-            && self.active_x5_233_driver_bootstrap.is_none();
         let bootstrap_running = self.active_x5_233_driver_bootstrap.is_some();
+        let driver_running = self.x5_233_driver_is_running();
+        let driver_ready = host_ready && driver_running;
         let mut request = None;
 
         ui.group(|ui| {
@@ -2663,12 +2783,20 @@ impl CameraToolboxApp {
                 if ui
                     .add_enabled(
                         host_ready && !bootstrap_running,
-                        egui::Button::new("启动驱动并读取状态"),
+                        egui::Button::new(if driver_running {
+                            "读取驱动状态"
+                        } else {
+                            "检测驱动并必要时启动"
+                        }),
                     )
-                    .on_disabled_hover_text("先输入 X5_233 设备 IP；启动中请等待结果。")
+                    .on_disabled_hover_text(if bootstrap_running {
+                        "驱动启动中，请等待结果。"
+                    } else {
+                        "先输入 X5_233 设备 IP。"
+                    })
                     .clicked()
                 {
-                    self.start_x5_233_driver_bootstrap(context);
+                    self.refresh_or_bootstrap_x5_233_driver(context);
                 }
                 if ui
                     .add_enabled(
@@ -2687,8 +2815,7 @@ impl CameraToolboxApp {
                     }
                 }
             });
-            ui.weak("SSH 用户固定 root/root；GUI 会通过 SSH 在 /opt 自动执行 SC233_CALIBRATION_MODE=1 ./DEMO233，并等待 TCP 9073 可用。")
-            ;
+            ui.weak("SSH 用户固定 root/root；GUI 会先检测 TCP 9073 是否已有驱动在运行；未运行时才通过 SSH 在 /opt 自动执行 SC233_CALIBRATION_MODE=1 ./DEMO233，并等待 TCP 9073 可用。");
         });
 
         ui.add_space(8.0);
@@ -2700,7 +2827,7 @@ impl CameraToolboxApp {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(driver_ready, egui::Button::new("连接 CH0 / CH3 预览"))
-                    .on_disabled_hover_text("第一步启动驱动并读取到 TCP 状态后才能连接 RTSP 预览。")
+                    .on_disabled_hover_text("第一步确认驱动已开启后才能连接 RTSP 预览。")
                     .clicked()
                 {
                     request = Some(LiveStreamOpenRequest::X5233Selected);
@@ -2789,6 +2916,40 @@ impl CameraToolboxApp {
             "Capture route follows current workspace: {}",
             target.label()
         )
+    }
+
+    fn x5_233_driver_is_running(&self) -> bool {
+        self.active_x5_233_driver_bootstrap.is_none()
+            && self
+                .x5_233_driver
+                .last_tcp_status
+                .as_ref()
+                .is_some_and(|summary| summary.rtsp_started)
+    }
+
+    fn refresh_or_bootstrap_x5_233_driver(&mut self, context: &egui::Context) {
+        match x5_tcp_client::probe(&self.x5_233_driver.device_ip, self.x5_233_driver.tcp_port) {
+            Ok(summary) => {
+                let running = summary.rtsp_started;
+                if let Some(fps) = summary.fps {
+                    self.x5_233_driver.fps = fps;
+                }
+                if let Some(bitrate_kbps) = summary.bitrate_kbps {
+                    self.x5_233_driver.bitrate_kbps = bitrate_kbps;
+                }
+                self.x5_233_driver.last_tcp_status = Some(summary);
+                if running {
+                    self.x5_233_driver.last_status = Some("驱动已在运行。".to_owned());
+                    self.x5_233_driver.last_error = None;
+                } else {
+                    self.start_x5_233_driver_bootstrap(context);
+                }
+            }
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(error);
+                self.start_x5_233_driver_bootstrap(context);
+            }
+        }
     }
 
     fn x5_233_control_label(&self) -> Result<String, String> {

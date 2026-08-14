@@ -3485,6 +3485,7 @@ impl CalibrationWorkspaceManager {
         provision_target: Result<&str, &str>,
         has_live_inspection: bool,
         render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
+        render_dataset_summaries: impl FnMut(&mut egui::Ui),
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
         let has_live_inspection = has_live_inspection
             && self
@@ -3500,7 +3501,21 @@ impl CalibrationWorkspaceManager {
             provision_target,
             has_live_inspection,
             render_live_inspection,
+            render_dataset_summaries,
         )
+    }
+
+    pub(crate) fn live_workspace_summary(
+        &self,
+        source: &LiveStreamSource,
+    ) -> Option<CalibrationLiveWorkspaceSummary> {
+        let workspace = self.workspace_for_live_source(source)?;
+        Some(CalibrationLiveWorkspaceSummary {
+            channel: source.channel(),
+            dataset_item_count: workspace.dataset_item_count(),
+            selected_dataset_label: workspace.selected_dataset_label().map(str::to_owned),
+            status: workspace.status_text().to_owned(),
+        })
     }
 
     pub(crate) fn render_status(&self, ui: &mut egui::Ui) {
@@ -3511,6 +3526,14 @@ impl CalibrationWorkspaceManager {
         }
         self.active_workspace().render_status(ui);
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CalibrationLiveWorkspaceSummary {
+    pub(crate) channel: u16,
+    pub(crate) dataset_item_count: usize,
+    pub(crate) selected_dataset_label: Option<String>,
+    pub(crate) status: String,
 }
 
 impl CalibrationWorkspace {
@@ -5662,6 +5685,7 @@ impl CalibrationWorkspace {
         provision_target: Result<&str, &str>,
         has_live_inspection: bool,
         mut render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
+        mut render_dataset_summaries: impl FnMut(&mut egui::Ui),
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
         self.sync_coverage(context);
         let rect = ui.available_rect_before_wrap();
@@ -5669,58 +5693,26 @@ impl CalibrationWorkspace {
             .id_salt("pangbot_calibration_steps_scroll")
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                self.render_pangbot_simplified_controls(ui);
-
-                ui.add_space(8.0);
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
-                    ui.heading("预览与数据集");
-                    ui.horizontal(|ui| {
-                        ui.add_enabled_ui(has_live_inspection, |ui| {
-                            ui.selectable_value(
-                                &mut self.display_layer,
-                                CalibrationDisplayLayer::LiveStream,
-                                "实时预览",
-                            );
-                        });
-                        ui.selectable_value(
-                            &mut self.display_layer,
-                            CalibrationDisplayLayer::DatasetImage,
-                            "已采集图像",
-                        );
-                    });
-                    ui.allocate_ui_with_layout(
-                        egui::vec2(ui.available_width(), 320.0),
-                        egui::Layout::top_down(egui::Align::Min),
-                        |ui| {
-                            if has_live_inspection
-                                && self.display_layer == CalibrationDisplayLayer::LiveStream
-                            {
-                                let _ = render_live_inspection(ui);
-                            } else {
-                                self.render_inspection(ui);
-                            }
-                        },
-                    );
+                    ui.heading("第二步：双 viewer 预览与通道确认");
+                    ui.label("固定通道：CH0 → RTSP 554 → i2c-4；CH3 → RTSP 557 → i2c-6。");
+                    ui.label("每个 viewer card 直接显示其对应数据集摘要。");
+                    if has_live_inspection {
+                        let _ = render_live_inspection(ui);
+                    } else {
+                        ui.weak("当前尚未选中可检查的 live session；下方仍会列出 CH0 / CH3 viewer 卡片。");
+                    }
                 });
 
                 ui.add_space(8.0);
-                ui.group(|ui| {
-                    ui.set_width(ui.available_width());
-                    ui.heading(format!("数据集表（{} 张）", self.session.items().len()));
-                    egui::ScrollArea::vertical()
-                        .id_salt("pangbot_dataset_table")
-                        .max_height(220.0)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| self.render_dataset(ui, false));
-                });
+                self.render_pangbot_simplified_controls(ui, &mut render_dataset_summaries);
 
                 ui.add_space(8.0);
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
                     ui.heading("第五步：写入并保存历史");
-                    ui.label("固定映射：CH0 写入 i2c-4，CH3 写入 i2c-6。写入完成后沿用现有 EEPROM history 审计记录。")
-                    ;
+                    ui.label("固定映射：CH0 写入 i2c-4，CH3 写入 i2c-6。写入完成后沿用现有 EEPROM history 审计记录。");
                     self.render_calibration_result_panel(
                         context,
                         ui,
@@ -5751,6 +5743,23 @@ impl CalibrationWorkspace {
                 }
             }
         });
+    }
+
+    pub(crate) fn dataset_item_count(&self) -> usize {
+        self.session.items().len()
+    }
+
+    pub(crate) fn selected_dataset_label(&self) -> Option<&str> {
+        let selected = self.session.selected()?;
+        self.session
+            .items()
+            .iter()
+            .find(|item| item.id == selected)
+            .map(|item| item.display_name.as_str())
+    }
+
+    pub(crate) fn status_text(&self) -> &str {
+        &self.status
     }
 
     fn render_dataset_assessment(&self, ui: &mut egui::Ui, assessment: &AutoAdmissionAssessment) {
@@ -6001,7 +6010,11 @@ impl CalibrationWorkspace {
         );
     }
 
-    fn render_pangbot_simplified_controls(&mut self, ui: &mut egui::Ui) {
+    fn render_pangbot_simplified_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        render_dataset_summaries: &mut impl FnMut(&mut egui::Ui),
+    ) {
         if !self.intrinsics_value_editing {
             self.refresh_auto_intrinsics_fields();
         }
@@ -6018,7 +6031,10 @@ impl CalibrationWorkspace {
         );
         ui.group(|ui| {
             ui.set_width(ui.available_width());
-            ui.heading("第三步：标定采集");
+            ui.heading("第三步：双路数据集采集与筛选");
+            ui.label("CH0 / CH3 各自持有独立数据集；采集控制作用于当前选中的通道 session。");
+            render_dataset_summaries(ui);
+            ui.separator();
             ui.horizontal_wrapped(|ui| {
                 ui.add_enabled_ui(setup_editable, |ui| {
                     ui.label("棋盘内角点");
@@ -6061,7 +6077,7 @@ impl CalibrationWorkspace {
             } else if self.session.items().len() >= MAX_DATASET_ITEMS {
                 "数据集已满。"
             } else {
-                "先完成第二步预览，并等待一帧有效画面与 K/D12 绑定。"
+                "先完成第二步双 viewer 预览，并等待一帧有效画面与 K/D12 绑定。"
             };
             ui.horizontal_wrapped(|ui| {
                 match self.guided_capture.as_ref().map(|runtime| runtime.state) {
