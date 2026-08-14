@@ -26,6 +26,11 @@ pub enum NodeError {
     UnsupportedAction(String),
 }
 
+impl From<super::channel::ChannelFull> for NodeError {
+    fn from(_: super::channel::ChannelFull) -> Self {
+        Self::ChannelFull("output channel full".to_owned())
+    }
+}
 /// 节点级动作：连接/断开、一次触发、自动采集 arm/disarm，或自定义动作。
 #[derive(Debug, Clone)]
 pub enum NodeAction {
