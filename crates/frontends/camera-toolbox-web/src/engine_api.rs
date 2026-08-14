@@ -235,3 +235,30 @@ fn enum_str<T: serde::Serialize>(value: T) -> String {
         .and_then(|value| value.as_str().map(str::to_owned))
         .unwrap_or_default()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn to_engine_spec_projects_seed_graph() {
+        let graph = crate::workflow::seed_workflow_graph();
+        let spec = to_engine_spec(&graph);
+        assert_eq!(spec.nodes.len(), graph.nodes.len());
+        assert_eq!(spec.edges.len(), graph.edges.len());
+        // kind 序列化为 camelCase 字符串（与引擎 kinds 常量一致）。
+        assert!(spec
+            .nodes
+            .iter()
+            .any(|node| node.kind == "rtspSource"));
+        // 必需输入端口投影为 required。
+        for (engine_node, graph_node) in spec.nodes.iter().zip(&graph.nodes) {
+            for (engine_port, graph_port) in engine_node.inputs.iter().zip(&graph_node.inputs) {
+                assert_eq!(
+                    engine_port.required,
+                    graph_port.required && graph_port.direction == PortDirection::Input
+                );
+            }
+        }
+    }
+}
