@@ -32,8 +32,15 @@ impl NodeFactory for RtspSourceFactory {
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+        // 输出端口 id 跟随 web 图（rtspSource 输出 "endpoint"），避免硬编码导致接线断裂。
+        let output_port = spec
+            .outputs
+            .first()
+            .map(|port| port.id.clone())
+            .unwrap_or_else(|| "endpoint".to_owned());
         Ok(Box::new(RtspSourceNode {
             spec,
+            output_port,
             cancellation: None,
             pump_cancel: None,
         }))
@@ -42,6 +49,7 @@ impl NodeFactory for RtspSourceFactory {
 
 pub struct RtspSourceNode {
     spec: NodeSpec,
+    output_port: String,
     cancellation: Option<StreamCancellation>,
     pump_cancel: Option<Arc<AtomicBool>>,
 }
@@ -130,13 +138,12 @@ impl RtspSourceNode {
 
         let latest_frame = Arc::clone(&session.latest_frame);
         self.cancellation = Some(cancellation);
-
+        let output_port = self.output_port.clone();
         let pump_cancel = Arc::new(AtomicBool::new(false));
         let pump_cancel_flag = Arc::clone(&pump_cancel);
         rt.spawn(format!("rtsp-pump-{}", self.spec.id), move |ctx| {
-            pump_frames(latest_frame, ctx, pump_cancel_flag);
+            pump_frames(latest_frame, ctx, pump_cancel_flag, output_port);
         });
-        self.pump_cancel = Some(pump_cancel);
 
         rt.report_state(NodeRuntimeState::Running, "streaming");
         Ok(())
@@ -165,6 +172,7 @@ fn pump_frames(
     latest: Arc<LatestDecodedFrameSlot>,
     ctx: SpawnContext,
     cancel: Arc<AtomicBool>,
+    output_port: String,
 ) {
     let mut last_sequence: Option<u64> = None;
     while !cancel.load(Ordering::Acquire) {
@@ -172,12 +180,11 @@ fn pump_frames(
             && last_sequence != Some(frame.identity.frame_sequence)
         {
             last_sequence = Some(frame.identity.frame_sequence);
-            let _ = ctx.outputs.emit("frames", DataPacket::VideoFrame(frame));
+            let _ = ctx.outputs.emit(&output_port, DataPacket::VideoFrame(frame));
         }
         thread::sleep(Duration::from_millis(5));
     }
 }
-
 fn config_string(spec: &NodeSpec, key: &str, fallback: &str) -> String {
     spec.config
         .get(key)

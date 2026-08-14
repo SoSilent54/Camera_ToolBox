@@ -18,10 +18,10 @@ impl NodeFactory for RtspDecoderFactory {
         "rtspDecoder"
     }
 
-    fn instantiate(&self, _spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
         Ok(Box::new(PassThroughNode {
             kind: "rtspDecoder",
-            output_port: "frames",
+            output_port: output_port(&spec),
         }))
     }
 }
@@ -34,10 +34,10 @@ impl NodeFactory for VideoLayerFactory {
         "videoLayer"
     }
 
-    fn instantiate(&self, _spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
         Ok(Box::new(PassThroughNode {
             kind: "videoLayer",
-            output_port: "layer",
+            output_port: output_port(&spec),
         }))
     }
 }
@@ -50,10 +50,10 @@ impl NodeFactory for ImageLayerFactory {
         "imageLayer"
     }
 
-    fn instantiate(&self, _spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
         Ok(Box::new(PassThroughNode {
             kind: "imageLayer",
-            output_port: "layer",
+            output_port: output_port(&spec),
         }))
     }
 }
@@ -61,7 +61,15 @@ impl NodeFactory for ImageLayerFactory {
 /// pass-through 转换节点：原样转发视频/图像帧。
 pub struct PassThroughNode {
     kind: &'static str,
-    output_port: &'static str,
+    output_port: String,
+}
+
+/// 输出端口 id 跟随 web 图，避免硬编码导致接线断裂。
+fn output_port(spec: &NodeSpec) -> String {
+    spec.outputs
+        .first()
+        .map(|port| port.id.clone())
+        .unwrap_or_else(|| "frames".to_owned())
 }
 
 impl NodeInstance for PassThroughNode {
@@ -82,7 +90,7 @@ impl NodeInstance for PassThroughNode {
     ) -> Result<(), NodeError> {
         match packet {
             DataPacket::VideoFrame(_) | DataPacket::ImageFrame(_) => {
-                let _ = rt.emit(self.output_port, packet);
+                let _ = rt.emit(&self.output_port, packet);
                 Ok(())
             }
             _ => Ok(()),
