@@ -1,4 +1,5 @@
 mod engine_api;
+mod files_api;
 mod workflow;
 
 use std::{
@@ -1340,6 +1341,7 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         .route("/api/control/x5/snapshot", post(capture_x5_snapshot))
         .route("/api/streams/mjpeg", get(mjpeg_stream))
         .route("/api/images/local", get(local_image_preview))
+        .route("/api/files/local/list", get(files_api::list_local_files))
         .route("/api/runtime/run", post(engine_api::run_engine))
         .route("/api/runtime/stop", post(engine_api::stop_engine))
         .route(

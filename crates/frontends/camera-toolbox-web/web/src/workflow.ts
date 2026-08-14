@@ -319,9 +319,13 @@ export type ViewerPreview =
 export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
   preview?: ViewerPreview;
+  /** 引擎实时状态；缺省回退到节点的持久化 state。 */
+  runtimeState?: 'disabled' | 'idle' | 'ready' | 'running' | 'error';
   onRtspUrlChange?: (nodeId: string, url: string) => void;
   onLocalImageConfigChange?: (nodeId: string, field: 'root' | 'relativePath', value: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: string | boolean) => void;
+  /** 触发节点动作（connect/disconnect/trigger/arm/disarm）。 */
+  onNodeAction?: (nodeId: string, action: string) => void;
 }
 
 export interface FlowEdgeData extends Record<string, unknown> {
@@ -508,6 +512,26 @@ export async function fetchEngineStatus(): Promise<EngineNodeStatus[]> {
 /** viewer 节点最新帧的 JPEG 地址（可直接作为 <img> src）。 */
 export function viewerFrameUrl(nodeId: string): string {
   return `/api/runtime/viewer/${encodeURIComponent(nodeId)}/frame`;
+}
+
+/** 目录条目。 */
+export interface DirectoryEntry {
+  name: string;
+  path: string;
+  isDirectory: boolean;
+  size: number;
+}
+
+/** 目录列表响应。 */
+export interface FileListResponse {
+  path: string;
+  entries: DirectoryEntry[];
+}
+
+/** 列出本地工作区目录。 */
+export async function listLocalFiles(root: string, path: string): Promise<FileListResponse> {
+  const query = new URLSearchParams({ root, path });
+  return fetchJson(`/api/files/local/list?${query}`);
 }
 
 /** 请求服务器校验 I²C 配置并返回预览；该端点不执行任何 I/O。 */

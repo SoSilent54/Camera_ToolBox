@@ -1,42 +1,10 @@
-import { useEffect, useRef, useState, type DragEvent } from 'react';
-import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react';
-import type { FlowNodeData, NodeDefinition, NodeKind, PortKind, WorkflowNode } from './workflow';
+import { useEffect, useRef, useState } from 'react';
+import { NodeResizer, type NodeProps } from '@xyflow/react';
+import type { FlowNodeData } from './workflow';
 import { configText, normalizeSourcePathDraft } from './nodeConfig';
+import { NodeHeader, PortHandles } from './nodes/shared';
+import { FileBrowser } from './FileBrowser';
 
-const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
-
-export function RtspSourceNode({ data, selected }: NodeProps) {
-  const nodeData = data as FlowNodeData;
-  const node = nodeData.workflowNode;
-  const url = String(node.config.url ?? DEFAULT_RTSP_URL);
-  const [draftUrl, setDraftUrl] = useState(url);
-  useEffect(() => setDraftUrl(url), [url]);
-  const applyUrl = () => nodeData.onRtspUrlChange?.(node.id, draftUrl);
-  return (
-    <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} />
-      <PortHandles node={node} />
-      <div className="node-body">
-        <label htmlFor={`${node.id}-url`}>RTSP URL</label>
-        <input
-          id={`${node.id}-url`}
-          className="rtsp-url-input nodrag"
-          value={draftUrl}
-          spellCheck={false}
-          onChange={(event) => setDraftUrl(event.target.value)}
-          onBlur={applyUrl}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              applyUrl();
-              event.currentTarget.blur();
-            }
-          }}
-        />
-        <span>Transport: {String(node.config.transport ?? 'tcp')}</span>
-      </div>
-    </section>
-  );
-}
 
 export function LocalWorkspaceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
@@ -107,56 +75,44 @@ export function SftpWorkspaceNode({ data, selected }: NodeProps) {
     </section>
   );
 }
-
 export function FileBrowserNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
+  const root = configText(node, 'root', '');
   const directory = configText(node, 'directory', '');
   const selection = configText(node, 'selection', '');
-  const [draftDirectory, setDraftDirectory] = useState(directory);
-  const [draftSelection, setDraftSelection] = useState(selection);
-  useEffect(() => setDraftDirectory(directory), [directory]);
-  useEffect(() => setDraftSelection(selection), [selection]);
-  const applyDirectory = () => nodeData.onNodeConfigChange?.(node.id, 'directory', normalizeSourcePathDraft(draftDirectory));
-  const applySelection = () => nodeData.onNodeConfigChange?.(node.id, 'selection', normalizeSourcePathDraft(draftSelection));
+  const runtimeState = nodeData.runtimeState;
+  const [draftRoot, setDraftRoot] = useState(root);
+  useEffect(() => setDraftRoot(root), [root]);
+  const applyRoot = () => nodeData.onNodeConfigChange?.(node.id, 'root', draftRoot.trim());
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} />
+      <NodeHeader node={node} runtimeState={runtimeState} />
       <PortHandles node={node} />
       <div className="node-body">
-        <label htmlFor={`${node.id}-directory`}>Directory</label>
+        <label htmlFor={`${node.id}-root`}>Workspace root</label>
         <input
-          id={`${node.id}-directory`}
+          id={`${node.id}-root`}
           className="rtsp-url-input nodrag"
-          value={draftDirectory}
-          placeholder="datasets/session-a"
+          value={draftRoot}
+          placeholder="/absolute/path"
           spellCheck={false}
-          onChange={(event) => setDraftDirectory(event.target.value)}
-          onBlur={applyDirectory}
+          onChange={(event) => setDraftRoot(event.target.value)}
+          onBlur={applyRoot}
           onKeyDown={(event) => {
             if (event.key === 'Enter') {
-              applyDirectory();
+              applyRoot();
               event.currentTarget.blur();
             }
           }}
         />
-        <label htmlFor={`${node.id}-selection`}>Selected file</label>
-        <input
-          id={`${node.id}-selection`}
-          className="rtsp-url-input nodrag"
-          value={draftSelection}
-          placeholder="images/example.png"
-          spellCheck={false}
-          onChange={(event) => setDraftSelection(event.target.value)}
-          onBlur={applySelection}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              applySelection();
-              event.currentTarget.blur();
-            }
-          }}
+        <FileBrowser
+          root={root}
+          directory={directory}
+          selection={selection}
+          onDirectory={(path) => nodeData.onNodeConfigChange?.(node.id, 'directory', path)}
+          onSelection={(path) => nodeData.onNodeConfigChange?.(node.id, 'selection', path)}
         />
-        <span>Manual file ref selection; listing runtime is intentionally separate.</span>
       </div>
     </section>
   );
@@ -264,85 +220,6 @@ export function ImageFileSourceNode({ data, selected }: NodeProps) {
   );
 }
 
-export function GenericWorkflowNode({ data, selected }: NodeProps) {
-  const node = (data as FlowNodeData).workflowNode;
-  const params = Object.entries(node.config)
-    .filter(([, value]) => typeof value !== 'object' && value !== null && value !== undefined && value !== '')
-    .slice(0, 4);
-  return (
-    <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} />
-      <PortHandles node={node} />
-      <div className="node-body compact">
-        {params.length === 0 ? (
-          <span className="node-hint">no config</span>
-        ) : params.map(([key, value]) => (
-          <span key={key} className="node-param">
-            <code>{key}</code>&nbsp;{String(value)}
-          </span>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-
-
-function PortHandles({ node }: { node: WorkflowNode }) {
-  return (
-    <div className="node-ports">
-      <div className="port-group port-group-inputs">
-        {node.inputs.map((port) => (
-          <div key={`in-${port.id}`} className="port-row port-row-input">
-            <Handle
-              id={port.id}
-              type="target"
-              position={Position.Left}
-              className={`stream-handle ${portKindTone(port.kind)}`}
-              title={`${port.label}: ${port.kind}`}
-            />
-            <span
-              className={`port-label port-label-input ${portKindTone(port.kind)}`}
-              title={`${port.label} · ${port.kind}`}
-            >
-              {port.kind}
-            </span>
-          </div>
-        ))}
-      </div>
-      <div className="port-group port-group-outputs">
-        {node.outputs.map((port) => (
-          <div key={`out-${port.id}`} className="port-row port-row-output">
-            <span
-              className={`port-label port-label-output ${portKindTone(port.kind)}`}
-              title={`${port.label} · ${port.kind}`}
-            >
-              {port.kind}
-            </span>
-            <Handle
-              id={port.id}
-              type="source"
-              position={Position.Right}
-              className={`stream-handle ${portKindTone(port.kind)}`}
-              title={`${port.label}: ${port.kind}`}
-            />
-          </div>
-        ))}
-      </div>
-    </div>
-  );
-}
-
-function portKindTone(kind: PortKind): string {
-  if (kind.startsWith('workspace') || kind.startsWith('file')) return 'port-tone-workspace';
-  if (kind.startsWith('control')) return 'port-tone-control';
-  if (kind.startsWith('endpoint') || kind.startsWith('stream')) return 'port-tone-media';
-  if (kind.startsWith('image') || kind.startsWith('layer') || kind.startsWith('viewer')) return 'port-tone-image';
-  if (kind.startsWith('calib') || kind.startsWith('capture') || kind.startsWith('command')) return 'port-tone-calib';
-  if (kind.startsWith('i2c') || kind.startsWith('eeprom')) return 'port-tone-io';
-  if (kind.startsWith('status')) return 'port-tone-status';
-  return 'port-tone-default';
-}
 
 export function ViewerNode({ data, selected, width, height }: NodeProps) {
   const nodeData = data as FlowNodeData;
@@ -717,39 +594,4 @@ function formatBytes(bytes: number): string {
     return `${(bytes / 1024).toFixed(1)} KiB`;
   }
   return `${(bytes / (1024 * 1024)).toFixed(1)} MiB`;
-}
-
-function NodeHeader({ node }: { node: WorkflowNode }) {
-  return (
-    <header className="node-header">
-      <span>{node.title}</span>
-      <small className={`state-dot ${node.state}`}>{node.state}</small>
-    </header>
-  );
-}
-
-export function NodeLibraryItem({
-  definition,
-  onAdd,
-  onDragStart,
-}: {
-  definition: NodeDefinition;
-  onAdd: (kind: NodeKind) => void;
-  onDragStart: (event: DragEvent<HTMLElement>, kind: NodeKind) => void;
-}) {
-  return (
-    <button
-      className="library-item"
-      draggable
-      type="button"
-      title={`拖拽或点击添加：${definition.title}`}
-      onClick={() => onAdd(definition.kind)}
-      onDragStart={(event) => onDragStart(event, definition.kind)}
-      onDragEnd={(event) => event.currentTarget.blur()}
-    >
-      <strong>{definition.title}</strong>
-      <span>{definition.description}</span>
-      <code>{definition.kind}</code>
-    </button>
-  );
 }

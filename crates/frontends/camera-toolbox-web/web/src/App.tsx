@@ -26,17 +26,13 @@ import {
   loadSavedWorkflow,
   loadWorkflow,
   loadWorkmodeTemplates,
-  runWorkflowRuntime,
   saveWorkflow,
-  stopWorkflowRuntime,
   validateConnectionKinds,
   type FlowEdgeData,
   type FlowNodeData,
   type NodeDefinition,
   type NodeKind,
-  type NodeRuntimeState,
   type PortKind,
-  type RuntimeGraphStatus,
   type ViewerPreview,
   type WorkflowGraph,
   type WorkflowNode,
@@ -45,11 +41,8 @@ import {
 } from './workflow';
 import {
   FileBrowserNode,
-  GenericWorkflowNode,
   ImageFileSourceNode,
   LocalWorkspaceNode,
-  NodeLibraryItem,
-  RtspSourceNode,
   SftpWorkspaceNode,
   SshSessionNode,
   ViewerNode,
@@ -57,8 +50,16 @@ import {
   X5RtspChannelNode,
   X5SnapshotNode,
 } from './WorkflowNodes';
+import {
+  AutoCaptureNode,
+  CalibrationSolverNode,
+  GenericWorkflowNode,
+  NodeLibraryItem,
+  RtspSourceNode,
+} from './nodes';
 import { Console } from './Console';
 import type { Selection } from './Inspector';
+import { useEngine } from './useEngine';
 
 type FlowNode = Node<FlowNodeData>;
 type FlowEdge = Edge<FlowEdgeData>;
@@ -74,9 +75,7 @@ const GENERIC_NODE_KINDS: NodeKind[] = [
   'datasetCollector',
   'coverageAnalyzer',
   'captureScorer',
-  'autoCaptureController',
   'poseGuide',
-  'calibrationSolver',
   'reprojectionInspector',
   'calibrationExport',
   'i2cBusDiscovery',
@@ -97,6 +96,8 @@ const nodeTypes = Object.fromEntries([
   ['x5RtspChannel', X5RtspChannelNode],
   ['x5Snapshot', X5SnapshotNode],
   ['viewer', ViewerNode],
+  ['calibrationSolver', CalibrationSolverNode],
+  ['autoCaptureController', AutoCaptureNode],
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
 ]);
 
@@ -111,7 +112,7 @@ export function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
-  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeGraphStatus | null>(null);
+  const { nodeStates, loadGraph, sendAction } = useEngine();
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
@@ -190,9 +191,9 @@ export function App() {
       setEdges(toFlowEdges(nextGraph));
       setSelection({ type: 'none' });
       setEvents([event, `节点 ${nextGraph.nodes.length} 个，连接 ${nextGraph.edges.length} 条`]);
-      setRuntimeStatus(null);
+      loadGraph(nextGraph);
     },
-    [setEdges, setNodes],
+    [loadGraph, setEdges, setNodes],
   );
 
   const refreshSavedWorkflows = useCallback(() => {
@@ -227,8 +228,8 @@ export function App() {
   const catalogByKind = useMemo(() => new Map(catalog.map((definition) => [definition.kind, definition])), [catalog]);
 
   const runtimeNodeStates = useMemo(
-    () => new Map<string, NodeRuntimeState>(runtimeStatus?.nodes.map((node): [string, NodeRuntimeState] => [node.nodeId, node.state]) ?? []),
-    [runtimeStatus],
+    () => new Map<string, string>(Object.entries(nodeStates)),
+    [nodeStates],
   );
 
   const displayedEdges = useMemo(
@@ -403,22 +404,30 @@ export function App() {
   );
 
   useEffect(() => {
-    setNodes((current) => current.map((flowNode) => (
-      flowNode.data.onRtspUrlChange === handleRtspUrlChange
+    setNodes((current) => current.map((flowNode) => {
+      const runtimeState = nodeStates[flowNode.id];
+      if (
+        flowNode.data.onRtspUrlChange === handleRtspUrlChange
         && flowNode.data.onLocalImageConfigChange === handleLocalImageConfigChange
         && flowNode.data.onNodeConfigChange === handleNodeConfigChange
-        ? flowNode
-        : {
-          ...flowNode,
-          data: {
-            ...flowNode.data,
-            onRtspUrlChange: handleRtspUrlChange,
-            onLocalImageConfigChange: handleLocalImageConfigChange,
-            onNodeConfigChange: handleNodeConfigChange,
-          },
-        }
-    )));
-  }, [handleLocalImageConfigChange, handleNodeConfigChange, handleRtspUrlChange, nodes.length, setNodes]);
+        && flowNode.data.onNodeAction === sendAction
+        && flowNode.data.runtimeState === runtimeState
+      ) {
+        return flowNode;
+      }
+      return {
+        ...flowNode,
+        data: {
+          ...flowNode.data,
+          runtimeState,
+          onRtspUrlChange: handleRtspUrlChange,
+          onLocalImageConfigChange: handleLocalImageConfigChange,
+          onNodeConfigChange: handleNodeConfigChange,
+          onNodeAction: sendAction,
+        },
+      };
+    }));
+  }, [handleLocalImageConfigChange, handleNodeConfigChange, handleRtspUrlChange, nodeStates, nodes.length, sendAction, setNodes]);
 
   const createFlowNodeAt = useCallback(
     (kind: NodeKind, position: { x: number; y: number }): FlowNode => {
@@ -728,32 +737,6 @@ export function App() {
     }));
   }, [setNodes]);
 
-  const handleRunWorkflow = useCallback(() => {
-    if (!graph) {
-      pushEvent('工作流尚未加载，无法启动运行时诊断');
-      return;
-    }
-    const draft = toWorkflowGraph(nodes, edges, graph);
-    runWorkflowRuntime(draft)
-      .then((status) => {
-        setRuntimeStatus(status);
-        pushEvent(`RuntimeGraph 已启动：${status.nodes.filter((node) => node.state === 'running').length} 个安全节点运行中`);
-      })
-      .catch((error: unknown) => pushEvent(`启动 RuntimeGraph 失败：${error instanceof Error ? error.message : String(error)}`));
-  }, [edges, graph, nodes, pushEvent]);
-
-  const handleStopWorkflow = useCallback(() => {
-    if (!graph) {
-      pushEvent('工作流尚未加载，无法停止运行时诊断');
-      return;
-    }
-    stopWorkflowRuntime(graph.id)
-      .then((status) => {
-        setRuntimeStatus(status);
-        pushEvent('RuntimeGraph 已停止；所有节点均为空闲状态');
-      })
-      .catch((error: unknown) => pushEvent(`停止 RuntimeGraph 失败：${error instanceof Error ? error.message : String(error)}`));
-  }, [graph, pushEvent]);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -823,8 +806,6 @@ export function App() {
             <button onClick={handleDuplicateSelection}>Dup</button>
           </div>
           <div className="menu-group">
-            <button onClick={handleRunWorkflow}>Run</button>
-            <button onClick={handleStopWorkflow}>Stop</button>
             <button onClick={handleFitView}>Fit</button>
           </div>
         </nav>
@@ -1070,7 +1051,7 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
   }));
 }
 
-function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStates: Map<string, NodeRuntimeState>): FlowEdge[] {
+function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStates: Map<string, string>): FlowEdge[] {
   const outgoing = new Map<string, FlowEdge[]>();
   for (const edge of edges) {
     outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge]);
@@ -1108,7 +1089,7 @@ function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStat
   });
 }
 
-function isActiveSeedNode(node: WorkflowNode, runtimeNodeStates: Map<string, NodeRuntimeState>): boolean {
+function isActiveSeedNode(node: WorkflowNode, runtimeNodeStates: Map<string, string>): boolean {
   if (runtimeNodeStates.get(node.id) === 'running') {
     return true;
   }
