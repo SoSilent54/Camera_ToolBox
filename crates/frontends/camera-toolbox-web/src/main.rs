@@ -1,3 +1,4 @@
+mod engine_api;
 mod workflow;
 
 use std::{
@@ -91,6 +92,7 @@ struct AppState {
     #[cfg(feature = "calibration-opencv")]
     calibration_backend: Arc<dyn CalibrationBackend>,
     eeprom_inspects: Arc<Mutex<HashMap<String, EepromInspectSnapshot>>>,
+    engine_runtime: Arc<engine_api::EngineRuntime>,
 }
 
 /// 运行时会话只存于服务进程内；其图副本用于 Stop 后生成节点级诊断。
@@ -1290,6 +1292,7 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         #[cfg(feature = "calibration-opencv")]
         calibration_backend: Arc::new(OpenCvCalibrationBackend),
         eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
+        engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
     };
 
     Router::new()
@@ -1337,6 +1340,17 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         .route("/api/control/x5/snapshot", post(capture_x5_snapshot))
         .route("/api/streams/mjpeg", get(mjpeg_stream))
         .route("/api/images/local", get(local_image_preview))
+        .route("/api/runtime/run", post(engine_api::run_engine))
+        .route("/api/runtime/stop", post(engine_api::stop_engine))
+        .route(
+            "/api/runtime/nodes/{id}/action",
+            post(engine_api::node_action),
+        )
+        .route("/api/runtime/status", get(engine_api::engine_status))
+        .route(
+            "/api/runtime/viewer/{id}/frame",
+            get(engine_api::viewer_frame),
+        )
         .fallback_service(frontend)
         .with_state(state)
 }
@@ -2424,6 +2438,7 @@ mod tests {
             #[cfg(feature = "calibration-opencv")]
             calibration_backend: Arc::new(OpenCvCalibrationBackend),
             eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
+            engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
         }
     }
 

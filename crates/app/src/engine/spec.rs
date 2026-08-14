@@ -5,6 +5,8 @@
 
 use std::fmt;
 
+use serde::Serialize;
+
 /// 节点实例标识（引擎内唯一，对应前端 `WorkflowNode.id`）。
 pub type NodeId = String;
 /// 节点类型标识（`rtspSource`、`viewer`、`calibrationSolver`…）。
@@ -44,7 +46,8 @@ pub struct NodeSpec {
 }
 
 /// 节点运行时状态，由引擎根据「职责 + 前置输入连接 + 实例报告」推导。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum NodeRuntimeState {
     /// 前置输入未满足（缺失连接或上游不可用）。
     Disabled,
@@ -72,7 +75,8 @@ impl fmt::Display for NodeRuntimeState {
 }
 
 /// 节点状态快照，经引擎上报给前端。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeStatusReport {
     pub node_id: NodeId,
     pub state: NodeRuntimeState,
@@ -80,7 +84,8 @@ pub struct NodeStatusReport {
 }
 
 /// 节点级事件（日志/诊断），经引擎上报给前端 Console。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NodeEvent {
     pub node_id: NodeId,
     pub message: String,
