@@ -7,7 +7,7 @@ use std::{io, path::Path};
 use camera_toolbox_core::{RawEncoding, RawFrame, RawFrameError, RawProbeInput, RawSpec};
 use thiserror::Error;
 
-pub trait RawFrameLoader {
+pub trait RawFrameLoader: Send + Sync {
     /// 有界读取文件信息和分段样本，用于生成不具唯一性的参数候选。
     ///
     /// # Errors

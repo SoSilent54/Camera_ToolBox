@@ -59,6 +59,8 @@ pub enum NodeRuntimeState {
     Running,
     /// 执行失败。
     Error,
+    /// 非致命告警（与前端 `NodeRuntimeState::Warning` 对齐）。
+    Warning,
 }
 
 impl fmt::Display for NodeRuntimeState {
@@ -69,6 +71,7 @@ impl fmt::Display for NodeRuntimeState {
             Self::Ready => "ready",
             Self::Running => "running",
             Self::Error => "error",
+            Self::Warning => "warning",
         };
         f.write_str(label)
     }

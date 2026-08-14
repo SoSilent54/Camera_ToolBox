@@ -1,15 +1,11 @@
 export const WORKFLOW_SCHEMA_VERSION = 'workflow.v1';
 
 export type NodeKind =
-  | 'localWorkspace'
-  | 'sftpWorkspace'
-  | 'fileBrowser'
-  | 'imageFileSource'
+  | 'localFileSource'
+  | 'sftpFileSource'
   | 'rtspSource'
   | 'sshSession'
   | 'x5Device'
-  | 'x5RtspChannel'
-  | 'x5Snapshot'
   | 'rtspDecoder'
   | 'frameSampler'
   | 'imageLayer'
@@ -19,17 +15,11 @@ export type NodeKind =
   | 'chessboardDetector'
   | 'datasetCollector'
   | 'coverageAnalyzer'
-  | 'captureScorer'
   | 'autoCaptureController'
-  | 'poseGuide'
   | 'calibrationSolver'
-  | 'reprojectionInspector'
-  | 'calibrationExport'
-  | 'i2cBusDiscovery'
+  | 'poseGuide'
   | 'i2cTransfer'
-  | 'eepromMapLoader'
-  | 'eepromProvision'
-  | 'resultView';
+  | 'eepromProvision';
 
 export type NodeCategory = 'workspace' | 'source' | 'media' | 'viewer' | 'calibration' | 'control' | 'diagnostics';
 export type NodeRuntimeState = 'idle' | 'ready' | 'running' | 'warning' | 'error';
@@ -322,7 +312,6 @@ export interface FlowNodeData extends Record<string, unknown> {
   /** 引擎实时状态；缺省回退到节点的持久化 state。 */
   runtimeState?: 'disabled' | 'idle' | 'ready' | 'running' | 'error';
   onRtspUrlChange?: (nodeId: string, url: string) => void;
-  onLocalImageConfigChange?: (nodeId: string, field: 'root' | 'relativePath', value: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: string | boolean) => void;
   /** 触发节点动作（connect/disconnect/trigger/arm/disarm）。 */
   onNodeAction?: (nodeId: string, action: string) => void;
@@ -332,6 +321,7 @@ export interface FlowEdgeData extends Record<string, unknown> {
   workflowEdge?: WorkflowEdge;
   kind: PortKind;
   schema: string;
+  schemaVersion: string;
 }
 
 export async function loadWorkflow(): Promise<WorkflowGraph> {
@@ -470,6 +460,11 @@ export async function stopEngine(): Promise<{ running: boolean }> {
   return postJson('/api/runtime/stop');
 }
 
+/** 图级 run/start：一键启动所有可启动节点（尽力启动）。 */
+export async function startEngine(): Promise<{ started: boolean }> {
+  return postJson('/api/runtime/start');
+}
+
 /** 向引擎节点投递动作（connect/disconnect/trigger/arm/disarm）。 */
 export async function nodeAction(nodeId: string, action: string): Promise<{ ok: boolean }> {
   return postJson(`/api/runtime/nodes/${encodeURIComponent(nodeId)}/action`, { action });
@@ -519,6 +514,14 @@ export function labelForPortKind(kind: PortKind): string {
   return kind;
 }
 
+/**
+ * 校验 source→target 端口可连接性，对齐后端 `validate_edge`（workflow.rs）：
+ * - `source.kind != target.kind` → 拒绝（后端同款检查）
+ * - `source.schema != target.schema` → 拒绝（后端靠 `edge.schema == source.schema` 隐含，前端更严）
+ * 后端额外的 edge 级检查（`edge.kind == source.kind`、`edge.schema == source.schema`、
+ * `edge.schema_version == WORKFLOW_SCHEMA_VERSION`）由 onConnect 在构造 edge 时从 source
+ * 端口派生写入 + save 时 `toWorkflowGraph` 写入 schemaVersion，保证不出现「前端放行→后端拒绝」。
+ */
 export function validateConnectionKinds(source: WorkflowPort, target: WorkflowPort): string | null {
   if (source.kind !== target.kind) {
     return `${labelForPortKind(source.kind)} 不能连接到 ${labelForPortKind(target.kind)}`;

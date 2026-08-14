@@ -17,6 +17,7 @@ use camera_toolbox_app::engine::{
 };
 use camera_toolbox_app::platform::{RtspStreamConfig, StreamService};
 use camera_toolbox_adapters::media::FfmpegRtspStreamService;
+use camera_toolbox_adapters::{ImageRasterCodec, LocalRawLoader};
 
 use crate::{
     AppState,
@@ -61,7 +62,7 @@ impl StreamServiceFactory for FfmpegStreamServiceFactory {
     }
 }
 
-/// 装配引擎服务：流工厂 + 可选标定后端。
+/// 装配引擎服务：流工厂 + 可选标定后端 + RAW 加载器 + raster 编解码。
 fn build_services(state: &AppState) -> EngineServices {
     EngineServices {
         stream_factory: Some(Arc::new(FfmpegStreamServiceFactory)),
@@ -69,6 +70,10 @@ fn build_services(state: &AppState) -> EngineServices {
         calibration: Some(state.calibration_backend.clone()),
         #[cfg(not(feature = "calibration-opencv"))]
         calibration: None,
+        // 本地 RAW 加载与 raster 编解码始终可用（无 feature gate），
+        // 供 LocalFileSource 与 ChessboardDetector 等节点使用。
+        raw_loader: Some(Arc::new(LocalRawLoader)),
+        image_codec: Some(Arc::new(ImageRasterCodec)),
     }
 }
 
@@ -96,6 +101,20 @@ pub async fn stop_engine(State(state): State<AppState>) -> Json<serde_json::Valu
         engine.stop();
     }
     Json(json!({ "running": false }))
+}
+
+/// 图级 run/start：向所有可启动节点派发启动动作（尽力启动）。
+pub async fn start_engine(
+    State(state): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let engine = state.engine_runtime.engine();
+    let engine = engine
+        .as_ref()
+        .ok_or_else(|| (StatusCode::CONFLICT, "engine not running".to_owned()))?;
+    engine
+        .start_all()
+        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    Ok(Json(json!({ "started": true })))
 }
 
 /// 节点动作请求体。

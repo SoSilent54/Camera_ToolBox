@@ -70,15 +70,11 @@ impl Default for NodeCategory {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub enum NodeKind {
-    LocalWorkspace,
-    SftpWorkspace,
-    FileBrowser,
-    ImageFileSource,
+    LocalFileSource,
+    SftpFileSource,
     RtspSource,
     SshSession,
     X5Device,
-    X5RtspChannel,
-    X5Snapshot,
     RtspDecoder,
     FrameSampler,
     ImageLayer,
@@ -88,17 +84,11 @@ pub enum NodeKind {
     ChessboardDetector,
     DatasetCollector,
     CoverageAnalyzer,
-    CaptureScorer,
     AutoCaptureController,
-    PoseGuide,
     CalibrationSolver,
-    ReprojectionInspector,
-    CalibrationExport,
-    I2cBusDiscovery,
+    PoseGuide,
     I2cTransfer,
-    EepromMapLoader,
     EepromProvision,
-    ResultView,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -267,15 +257,11 @@ fn default_required() -> bool {
 
 pub fn node_catalog() -> Vec<NodeDefinition> {
     vec![
-        node_definition(NodeKind::LocalWorkspace),
-        node_definition(NodeKind::SftpWorkspace),
-        node_definition(NodeKind::FileBrowser),
-        node_definition(NodeKind::ImageFileSource),
+        node_definition(NodeKind::LocalFileSource),
+        node_definition(NodeKind::SftpFileSource),
         node_definition(NodeKind::RtspSource),
         node_definition(NodeKind::SshSession),
         node_definition(NodeKind::X5Device),
-        node_definition(NodeKind::X5RtspChannel),
-        node_definition(NodeKind::X5Snapshot),
         node_definition(NodeKind::RtspDecoder),
         node_definition(NodeKind::FrameSampler),
         node_definition(NodeKind::ImageLayer),
@@ -285,41 +271,55 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::ChessboardDetector),
         node_definition(NodeKind::DatasetCollector),
         node_definition(NodeKind::CoverageAnalyzer),
-        node_definition(NodeKind::CaptureScorer),
         node_definition(NodeKind::AutoCaptureController),
-        node_definition(NodeKind::PoseGuide),
         node_definition(NodeKind::CalibrationSolver),
-        node_definition(NodeKind::ReprojectionInspector),
-        node_definition(NodeKind::CalibrationExport),
-        node_definition(NodeKind::I2cBusDiscovery),
+        node_definition(NodeKind::PoseGuide),
         node_definition(NodeKind::I2cTransfer),
-        node_definition(NodeKind::EepromMapLoader),
         node_definition(NodeKind::EepromProvision),
-        node_definition(NodeKind::ResultView),
     ]
 }
 
 pub fn node_definition(kind: NodeKind) -> NodeDefinition {
     let (category, title, description, inputs, outputs, default_config) = match kind {
-        NodeKind::LocalWorkspace => (
+        // ① LocalFileSource（吸收 LocalWorkspace + FileBrowser + ImageFileSource）
+        NodeKind::LocalFileSource => (
             NodeCategory::Workspace,
-            "Local Workspace",
-            "本地 workspace 根目录或项目目录",
+            "Local File Source",
+            "浏览本地目录并加载单张图片帧（内嵌资源根、目录浏览、文件选择与 filter）",
             vec![],
-            vec![port(
-                "workspace",
-                "Workspace",
-                PortDirection::Output,
-                PortKind::WorkspaceLocal,
-                "workspace.local.v1",
-                Some(PortRole::Workspace),
-            )],
-            json!({"root": ""}),
+            vec![
+                port(
+                    "image",
+                    "Image",
+                    PortDirection::Output,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+                optional_port(
+                    "preview",
+                    "Preview",
+                    PortDirection::Output,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+                optional_port(
+                    "fileRef",
+                    "File Ref",
+                    PortDirection::Output,
+                    PortKind::FileRef,
+                    "file.ref.v1",
+                    Some(PortRole::Image),
+                ),
+            ],
+            json!({"root": "", "directory": "", "selection": "", "filter": "*.png;*.jpg;*.jpeg", "reload": "manual"}),
         ),
-        NodeKind::SftpWorkspace => (
+        // ② SftpFileSource（吸收 SftpWorkspace + FileBrowser remote）
+        NodeKind::SftpFileSource => (
             NodeCategory::Workspace,
-            "SFTP Workspace",
-            "通过 SSH/SFTP 暴露远程目录",
+            "SFTP File Source",
+            "通过 SSH/SFTP 暴露远程目录并加载图片（保留 workspace 可选输出供多消费者复用）",
             vec![port(
                 "ssh",
                 "SSH",
@@ -328,69 +328,33 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "control.ssh.v1",
                 Some(PortRole::Control),
             )],
-            vec![port(
-                "workspace",
-                "Remote Workspace",
-                PortDirection::Output,
-                PortKind::WorkspaceRemoteSftp,
-                "workspace.remote.sftp.v1",
-                Some(PortRole::Workspace),
-            )],
-            json!({"sourceId": "sftp-main", "remoteRoot": "/", "mountLabel": "Remote SFTP"}),
-        ),
-        NodeKind::FileBrowser => (
-            NodeCategory::Workspace,
-            "File Browser",
-            "浏览本地或远程 workspace 并选择文件",
             vec![
                 port(
-                    "local",
-                    "Local Workspace",
-                    PortDirection::Input,
-                    PortKind::WorkspaceLocal,
-                    "workspace.local.v1",
-                    Some(PortRole::Workspace),
+                    "image",
+                    "Image",
+                    PortDirection::Output,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
                 ),
                 optional_port(
-                    "remote",
+                    "fileRef",
+                    "File Ref",
+                    PortDirection::Output,
+                    PortKind::FileRef,
+                    "file.ref.v1",
+                    Some(PortRole::Image),
+                ),
+                optional_port(
+                    "workspace",
                     "Remote Workspace",
-                    PortDirection::Input,
+                    PortDirection::Output,
                     PortKind::WorkspaceRemoteSftp,
                     "workspace.remote.sftp.v1",
                     Some(PortRole::Workspace),
                 ),
             ],
-            vec![port(
-                "file",
-                "File Ref",
-                PortDirection::Output,
-                PortKind::FileRef,
-                "file.ref.v1",
-                Some(PortRole::Image),
-            )],
-            json!({"directory": "", "filter": "*.png;*.jpg;*.jpeg", "selection": ""}),
-        ),
-        NodeKind::ImageFileSource => (
-            NodeCategory::Source,
-            "Image File Source",
-            "从文件引用加载单张图片帧",
-            vec![port(
-                "file",
-                "Image File",
-                PortDirection::Input,
-                PortKind::FileRef,
-                "file.ref.v1",
-                Some(PortRole::Image),
-            )],
-            vec![port(
-                "image",
-                "Image",
-                PortDirection::Output,
-                PortKind::ImageFrame,
-                "image.frame.v1",
-                Some(PortRole::Image),
-            )],
-            json!({"relativePath": "", "reload": "manual"}),
+            json!({"sourceId": "sftp-main", "remoteRoot": "/", "mountLabel": "Remote SFTP", "selection": "", "filter": "*.png;*.jpg;*.jpeg"}),
         ),
         NodeKind::RtspSource => (
             NodeCategory::Source,
@@ -422,10 +386,11 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             )],
             json!({"profileId": "", "host": "", "port": "22", "username": "root", "autoConnect": false}),
         ),
+        // ③ X5Device（吸收 X5RtspChannel + X5Snapshot）
         NodeKind::X5Device => (
             NodeCategory::Control,
             "X5 Device",
-            "X5_233 TCP 控制与 RTSP 通道资源",
+            "X5_233 TCP 控制、RTSP 通道资源与抓帧（rtsp 多路 + snapshot/video 可选输出）",
             vec![optional_port(
                 "ssh",
                 "SSH",
@@ -451,62 +416,24 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     "media.rtsp.endpoint.v1",
                     Some(PortRole::Endpoint),
                 ),
-            ],
-            json!({"host": "10.21.12.108", "tcpPort": 9073, "fps": 60, "bitrateKbps": 12000}),
-        ),
-        NodeKind::X5RtspChannel => (
-            NodeCategory::Source,
-            "X5 RTSP Channel",
-            "从 X5 设备选择一个 RTSP 通道",
-            vec![optional_port(
-                "control",
-                "X5 TCP",
-                PortDirection::Input,
-                PortKind::ControlX5Tcp,
-                "control.x5tcp.v1",
-                Some(PortRole::Control),
-            )],
-            vec![port(
-                "endpoint",
-                "RTSP endpoint",
-                PortDirection::Output,
-                PortKind::EndpointRtsp,
-                "media.rtsp.endpoint.v1",
-                Some(PortRole::Endpoint),
-            )],
-            json!({"host": "10.21.12.108", "tcpPort": 9073, "channel": 0, "path": "/PRR"}),
-        ),
-        NodeKind::X5Snapshot => (
-            NodeCategory::Control,
-            "X5 Snapshot",
-            "手动或自动快门命令触发 X5 抓帧",
-            vec![
-                port(
-                    "control",
-                    "X5 TCP",
-                    PortDirection::Input,
-                    PortKind::ControlX5Tcp,
-                    "control.x5tcp.v1",
-                    Some(PortRole::Control),
+                optional_port(
+                    "snapshot",
+                    "Snapshot Image",
+                    PortDirection::Output,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
                 ),
                 optional_port(
-                    "command",
-                    "Capture Command",
-                    PortDirection::Input,
-                    PortKind::CommandCapture,
-                    "command.capture.v1",
-                    Some(PortRole::Command),
+                    "video",
+                    "Video Frames",
+                    PortDirection::Output,
+                    PortKind::StreamVideoFrame,
+                    "stream.video-frame.v1",
+                    Some(PortRole::Stream),
                 ),
             ],
-            vec![port(
-                "image",
-                "Image",
-                PortDirection::Output,
-                PortKind::ImageFrame,
-                "image.frame.v1",
-                Some(PortRole::Image),
-            )],
-            json!({"host": "10.21.12.108", "tcpPort": 9073, "channel": 0, "mode": "latest", "frameId": 0, "timestampNs": 0, "rtspPts90k": 0, "rtspPtsTolerance90k": 0}),
+            json!({"host": "10.21.12.108", "tcpPort": 9073, "fps": 60, "bitrateKbps": 12000, "channels": [0]}),
         ),
         NodeKind::RtspDecoder => (
             NodeCategory::Media,
@@ -775,12 +702,21 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             json!({"gridCols": 6, "gridRows": 4}),
         ),
-        NodeKind::CaptureScorer => (
+        // ⑥ AutoCaptureController（吸收 CaptureScorer）
+        NodeKind::AutoCaptureController => (
             NodeCategory::Calibration,
-            "Capture Scorer",
-            "根据检测和覆盖度给自动快门评分",
+            "Auto Capture",
+            "把评分、帧流和目标位姿转换为抓帧命令（内嵌评分，score 可选输出保留原始能力）",
             vec![
-                port(
+                optional_port(
+                    "frames",
+                    "Video Frames",
+                    PortDirection::Input,
+                    PortKind::StreamVideoFrame,
+                    "stream.video-frame.v1",
+                    Some(PortRole::Stream),
+                ),
+                optional_port(
                     "detection",
                     "Detection",
                     PortDirection::Input,
@@ -796,38 +732,6 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     "calib.coverage.v1",
                     Some(PortRole::Dataset),
                 ),
-            ],
-            vec![port(
-                "score",
-                "Capture Score",
-                PortDirection::Output,
-                PortKind::CaptureScore,
-                "capture.score.v1",
-                Some(PortRole::Status),
-            )],
-            json!({"strategy": "datasetGain"}),
-        ),
-        NodeKind::AutoCaptureController => (
-            NodeCategory::Calibration,
-            "Auto Capture",
-            "把评分、帧流和目标位姿转换为抓帧命令",
-            vec![
-                port(
-                    "score",
-                    "Capture Score",
-                    PortDirection::Input,
-                    PortKind::CaptureScore,
-                    "capture.score.v1",
-                    Some(PortRole::Status),
-                ),
-                optional_port(
-                    "frames",
-                    "Video Frames",
-                    PortDirection::Input,
-                    PortKind::StreamVideoFrame,
-                    "stream.video-frame.v1",
-                    Some(PortRole::Stream),
-                ),
                 optional_port(
                     "target",
                     "Capture Target",
@@ -837,15 +741,89 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Command),
                 ),
             ],
-            vec![port(
-                "command",
-                "Capture Command",
-                PortDirection::Output,
-                PortKind::CommandCapture,
-                "command.capture.v1",
-                Some(PortRole::Command),
-            )],
+            vec![
+                port(
+                    "command",
+                    "Capture Command",
+                    PortDirection::Output,
+                    PortKind::CommandCapture,
+                    "command.capture.v1",
+                    Some(PortRole::Command),
+                ),
+                optional_port(
+                    "score",
+                    "Capture Score",
+                    PortDirection::Output,
+                    PortKind::CaptureScore,
+                    "capture.score.v1",
+                    Some(PortRole::Status),
+                ),
+            ],
             json!({"armed": false, "strategy": "datasetGain", "cooldownMs": 800}),
+        ),
+        // ⑦ CalibrationSolver（吸收 ReprojectionInspector + CalibrationExport）
+        NodeKind::CalibrationSolver => (
+            NodeCategory::Calibration,
+            "Calibration Solver",
+            "手动触发标定求解（内嵌重投影检查与导出，reprojection/report/payload 可选输出）",
+            vec![port(
+                "dataset",
+                "Dataset",
+                PortDirection::Input,
+                PortKind::CalibDataset,
+                "calib.dataset.v1",
+                Some(PortRole::Dataset),
+            )],
+            vec![
+                port(
+                    "solution",
+                    "Solution",
+                    PortDirection::Output,
+                    PortKind::CalibSolution,
+                    "calib.solution.v1",
+                    Some(PortRole::Solution),
+                ),
+                optional_port(
+                    "reprojection",
+                    "Reprojection Overlay",
+                    PortDirection::Output,
+                    PortKind::LayerOverlay,
+                    "viewer.layer.overlay.v1",
+                    Some(PortRole::Overlay),
+                ),
+                optional_port(
+                    "report",
+                    "Report",
+                    PortDirection::Output,
+                    PortKind::CalibReport,
+                    "calib.report.v1",
+                    Some(PortRole::Solution),
+                ),
+                optional_port(
+                    "payload",
+                    "EEPROM Payload",
+                    PortDirection::Output,
+                    PortKind::EepromPayload,
+                    "eeprom.payload.v1",
+                    Some(PortRole::Command),
+                ),
+            ],
+            json!({
+                "model": "pinhole",
+                "trigger": "manual",
+                "boardCols": 8,
+                "boardRows": 11,
+                "squareSizeMm": 30.0,
+                "imageWidth": 1920,
+                "imageHeight": 1080,
+                "fx": 1234.56,
+                "fy": 1234.56,
+                "cx": 960.0,
+                "cy": 540.0,
+                "distortionCoefficients": vec![0.0; 12],
+                "maxResidualPx": 1.0,
+                "format": "yaml",
+            }),
         ),
         NodeKind::PoseGuide => (
             NodeCategory::Calibration,
@@ -879,131 +857,11 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             json!({"enabled": true}),
         ),
-        NodeKind::CalibrationSolver => (
-            NodeCategory::Calibration,
-            "Calibration Solver",
-            "手动触发标定求解",
-            vec![port(
-                "dataset",
-                "Dataset",
-                PortDirection::Input,
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-                Some(PortRole::Dataset),
-            )],
-            vec![port(
-                "solution",
-                "Solution",
-                PortDirection::Output,
-                PortKind::CalibSolution,
-                "calib.solution.v1",
-                Some(PortRole::Solution),
-            )],
-            json!({
-                "model": "pinhole",
-                "trigger": "manual",
-                "boardCols": 8,
-                "boardRows": 11,
-                "squareSizeMm": 30.0,
-                "imageWidth": 1920,
-                "imageHeight": 1080,
-                "fx": 1234.56,
-                "fy": 1234.56,
-                "cx": 960.0,
-                "cy": 540.0,
-                "distortionCoefficients": vec![0.0; 12],
-            }),
-        ),
-        NodeKind::ReprojectionInspector => (
-            NodeCategory::Calibration,
-            "Reprojection Inspector",
-            "从 solution 和 dataset 生成重投影 overlay/report",
-            vec![
-                port(
-                    "solution",
-                    "Solution",
-                    PortDirection::Input,
-                    PortKind::CalibSolution,
-                    "calib.solution.v1",
-                    Some(PortRole::Solution),
-                ),
-                port(
-                    "dataset",
-                    "Dataset",
-                    PortDirection::Input,
-                    PortKind::CalibDataset,
-                    "calib.dataset.v1",
-                    Some(PortRole::Dataset),
-                ),
-            ],
-            vec![
-                port(
-                    "overlay",
-                    "Overlay",
-                    PortDirection::Output,
-                    PortKind::LayerOverlay,
-                    "viewer.layer.overlay.v1",
-                    Some(PortRole::Overlay),
-                ),
-                port(
-                    "report",
-                    "Report",
-                    PortDirection::Output,
-                    PortKind::CalibReport,
-                    "calib.report.v1",
-                    Some(PortRole::Solution),
-                ),
-            ],
-            json!({"maxResidualPx": 1.0}),
-        ),
-        NodeKind::CalibrationExport => (
-            NodeCategory::Calibration,
-            "Calibration Export",
-            "导出标定结果或生成 EEPROM payload",
-            vec![port(
-                "solution",
-                "Solution",
-                PortDirection::Input,
-                PortKind::CalibSolution,
-                "calib.solution.v1",
-                Some(PortRole::Solution),
-            )],
-            vec![port(
-                "payload",
-                "EEPROM Payload",
-                PortDirection::Output,
-                PortKind::EepromPayload,
-                "eeprom.payload.v1",
-                Some(PortRole::Command),
-            )],
-            json!({"format": "yaml"}),
-        ),
-        NodeKind::I2cBusDiscovery => (
-            NodeCategory::Control,
-            "I²C Bus Discovery",
-            "手动刷新远端 Linux I²C bus 列表",
-            vec![port(
-                "ssh",
-                "SSH",
-                PortDirection::Input,
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-                Some(PortRole::Control),
-            )],
-            vec![port(
-                "bus",
-                "I²C Bus",
-                PortDirection::Output,
-                PortKind::I2cBus,
-                "i2c.bus.v1",
-                Some(PortRole::Control),
-            )],
-            json!({"trigger": "manual"}),
-        ),
+        // ④ I2cTransfer（吸收 I2cBusDiscovery）
         NodeKind::I2cTransfer => (
             NodeCategory::Control,
             "I²C Transfer",
-            "预览并手动执行 I²C 读写请求",
+            "预览并手动执行 I²C 读写请求（内嵌 bus 刷新，rawResps 可选输出原始响应）",
             vec![
                 port(
                     "ssh",
@@ -1013,7 +871,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     "control.ssh.v1",
                     Some(PortRole::Control),
                 ),
-                port(
+                optional_port(
                     "bus",
                     "I²C Bus",
                     PortDirection::Input,
@@ -1024,16 +882,16 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             vec![
                 port(
-                    "transfer",
-                    "Transfer",
-                    PortDirection::Output,
-                    PortKind::I2cTransfer,
-                    "i2c.transfer.v1",
-                    Some(PortRole::Command),
-                ),
-                port(
                     "result",
                     "Result",
+                    PortDirection::Output,
+                    PortKind::I2cResult,
+                    "i2c.result.v1",
+                    Some(PortRole::Status),
+                ),
+                optional_port(
+                    "rawResps",
+                    "Raw Responses",
                     PortDirection::Output,
                     PortKind::I2cResult,
                     "i2c.result.v1",
@@ -1042,27 +900,29 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             json!({"profileId": "x5-lab", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
         ),
-        NodeKind::EepromMapLoader => (
-            NodeCategory::Control,
-            "EEPROM Map Loader",
-            "加载内置或文件 EEPROM map",
-            vec![],
-            vec![port(
-                "map",
-                "EEPROM Map",
-                PortDirection::Output,
-                PortKind::EepromMap,
-                "eeprom.map.v1",
-                Some(PortRole::Command),
-            )],
-            json!({"mapId": "x5_233_default"}),
-        ),
+        // ⑤ EepromProvision（吸收 EepromMapLoader）
         NodeKind::EepromProvision => (
             NodeCategory::Control,
             "EEPROM Provision",
-            "根据 map/payload/bus 生成写入与校验动作",
+            "根据 map/payload/bus 生成写入与校验动作（内嵌 map 加载，transfer 可选输出）",
             vec![
                 port(
+                    "ssh",
+                    "SSH",
+                    PortDirection::Input,
+                    PortKind::ControlSsh,
+                    "control.ssh.v1",
+                    Some(PortRole::Command),
+                ),
+                port(
+                    "bus",
+                    "I²C Bus",
+                    PortDirection::Input,
+                    PortKind::I2cBus,
+                    "i2c.bus.v1",
+                    Some(PortRole::Control),
+                ),
+                optional_port(
                     "map",
                     "EEPROM Map",
                     PortDirection::Input,
@@ -1078,39 +938,26 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     "eeprom.payload.v1",
                     Some(PortRole::Command),
                 ),
+            ],
+            vec![
                 port(
-                    "bus",
-                    "I²C Bus",
-                    PortDirection::Input,
-                    PortKind::I2cBus,
-                    "i2c.bus.v1",
-                    Some(PortRole::Control),
+                    "result",
+                    "Result",
+                    PortDirection::Output,
+                    PortKind::I2cResult,
+                    "i2c.result.v1",
+                    Some(PortRole::Status),
+                ),
+                optional_port(
+                    "transfer",
+                    "Transfer",
+                    PortDirection::Output,
+                    PortKind::I2cTransfer,
+                    "i2c.transfer.v1",
+                    Some(PortRole::Command),
                 ),
             ],
-            vec![port(
-                "transfer",
-                "Transfer",
-                PortDirection::Output,
-                PortKind::I2cTransfer,
-                "i2c.transfer.v1",
-                Some(PortRole::Command),
-            )],
             json!({"profileId": "x5-lab", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "confirmWrites": true, "verifyAfterWrite": true}),
-        ),
-        NodeKind::ResultView => (
-            NodeCategory::Diagnostics,
-            "Result View",
-            "显示 I²C/EEPROM/诊断结果",
-            vec![port(
-                "result",
-                "Result",
-                PortDirection::Input,
-                PortKind::I2cResult,
-                "i2c.result.v1",
-                Some(PortRole::Status),
-            )],
-            vec![],
-            json!({"format": "table"}),
         ),
     };
     NodeDefinition {
@@ -1231,9 +1078,8 @@ pub fn validate_edge(graph: &WorkflowGraph, edge: &WorkflowEdge) -> Result<(), S
 fn validate_node_config(node: &WorkflowNode) -> Result<(), String> {
     match node.kind {
         NodeKind::SshSession => validate_ssh_session_config(node),
-        NodeKind::SftpWorkspace => validate_sftp_workspace_config(node),
-        NodeKind::FileBrowser => validate_file_browser_config(node),
-        NodeKind::ImageFileSource => validate_image_file_source_config(node),
+        NodeKind::SftpFileSource => validate_sftp_file_source_config(node),
+        NodeKind::LocalFileSource => validate_local_file_source_config(node),
         _ => Ok(()),
     }
 }
@@ -1260,7 +1106,7 @@ fn validate_ssh_session_config(node: &WorkflowNode) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_sftp_workspace_config(node: &WorkflowNode) -> Result<(), String> {
+fn validate_sftp_file_source_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
     let source_id = required_config_string(node, config, "sourceId")?;
     validate_file_source_id(node, "sourceId", source_id)?;
@@ -1272,8 +1118,11 @@ fn validate_sftp_workspace_config(node: &WorkflowNode) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_file_browser_config(node: &WorkflowNode) -> Result<(), String> {
+fn validate_local_file_source_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
+    if let Some(root) = config_string(config, "root") {
+        validate_source_relative_path(node, "root", root, true)?;
+    }
     if let Some(directory) = config_string(config, "directory") {
         validate_source_relative_path(node, "directory", directory, true)?;
     }
@@ -1282,14 +1131,6 @@ fn validate_file_browser_config(node: &WorkflowNode) -> Result<(), String> {
     }
     if let Some(filter) = config_string(config, "filter") {
         validate_printable_config_text(node, "filter", filter)?;
-    }
-    Ok(())
-}
-
-fn validate_image_file_source_config(node: &WorkflowNode) -> Result<(), String> {
-    let config = node_config_object(node)?;
-    if let Some(relative_path) = config_string(config, "relativePath") {
-        validate_source_relative_path(node, "relativePath", relative_path, true)?;
     }
     Ok(())
 }
@@ -1309,14 +1150,29 @@ fn reject_runtime_config(config: &serde_json::Value) -> Result<(), String> {
         "privateKey",
         "secret",
     ];
-    if let Some(object) = config.as_object() {
-        for key in FORBIDDEN_KEYS {
-            if object.contains_key(*key) {
-                return Err(format!("runtime field `{key}` must not be persisted"));
+    // 递归遍历所有嵌套 object 与数组元素，堵住 {"auth":{"password":...}} 这类落盘绕过；
+    // 旧实现只检查顶层 object，嵌套 secret 会原样写入 .ctworkflow.json。
+    fn walk(value: &serde_json::Value) -> Result<(), String> {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, child) in map {
+                    if FORBIDDEN_KEYS.contains(&key.as_str()) {
+                        return Err(format!("runtime field `{key}` must not be persisted"));
+                    }
+                    walk(child)?;
+                }
+                Ok(())
             }
+            serde_json::Value::Array(items) => {
+                for item in items {
+                    walk(item)?;
+                }
+                Ok(())
+            }
+            _ => Ok(()),
         }
     }
-    Ok(())
+    walk(config)
 }
 
 fn node_config_object(
@@ -1509,67 +1365,34 @@ fn viewer_template_graph() -> WorkflowGraph {
     )
 }
 
-/// 本地图像模板只声明 workspace 根和相对文件路径；不会扫描目录或自动读取文件。
+/// 本地图像模板：LocalFileSource 已吸收 workspace/浏览/加载，默认路径只需 source→layer→viewer。
 fn local_image_template_graph() -> WorkflowGraph {
-    let workspace = workflow_node(
-        "local-workspace-1",
-        NodeKind::LocalWorkspace,
-        "Local Workspace",
+    let source = workflow_node(
+        "local-file-source-1",
+        NodeKind::LocalFileSource,
+        "Local File Source",
         NodePosition { x: 80.0, y: 140.0 },
-    );
-    let browser = workflow_node(
-        "file-browser-1",
-        NodeKind::FileBrowser,
-        "File Browser",
-        NodePosition { x: 340.0, y: 140.0 },
-    );
-    let image_source = workflow_node(
-        "image-file-source-1",
-        NodeKind::ImageFileSource,
-        "Image File Source",
-        NodePosition { x: 620.0, y: 140.0 },
     );
     let layer = workflow_node(
         "image-layer-1",
         NodeKind::ImageLayer,
         "Image Layer",
-        NodePosition { x: 900.0, y: 140.0 },
+        NodePosition { x: 420.0, y: 140.0 },
     );
     let viewer = workflow_node(
         "viewer-1",
         NodeKind::Viewer,
         "Viewer",
-        NodePosition {
-            x: 1180.0,
-            y: 120.0,
-        },
+        NodePosition { x: 760.0, y: 120.0 },
     );
     graph(
         "camera-toolbox-local-image-template",
         "Local Image Workspace",
-        vec![workspace, browser, image_source, layer, viewer],
+        vec![source, layer, viewer],
         vec![
             edge(
-                "local-image-e-workspace-browser",
-                "local-workspace-1",
-                "workspace",
-                "file-browser-1",
-                "local",
-                PortKind::WorkspaceLocal,
-                "workspace.local.v1",
-            ),
-            edge(
-                "local-image-e-browser-source",
-                "file-browser-1",
-                "file",
-                "image-file-source-1",
-                "file",
-                PortKind::FileRef,
-                "file.ref.v1",
-            ),
-            edge(
                 "local-image-e-source-layer",
-                "image-file-source-1",
+                "local-file-source-1",
                 "image",
                 "image-layer-1",
                 "image",
@@ -1626,30 +1449,6 @@ fn calibration_template_graph() -> WorkflowGraph {
             NodeKind::CalibrationSolver,
             "Calibration Solver",
             NodePosition { x: 1540.0, y: 80.0 },
-        ),
-        workflow_node(
-            "calib-reprojection",
-            NodeKind::ReprojectionInspector,
-            "Reprojection Inspector",
-            NodePosition {
-                x: 1540.0,
-                y: 300.0,
-            },
-        ),
-        workflow_node(
-            "calib-export",
-            NodeKind::CalibrationExport,
-            "Calibration Export",
-            NodePosition {
-                x: 1540.0,
-                y: 520.0,
-            },
-        ),
-        workflow_node(
-            "calib-scorer",
-            NodeKind::CaptureScorer,
-            "Capture Scorer",
-            NodePosition { x: 940.0, y: 300.0 },
         ),
         workflow_node(
             "calib-autocapture",
@@ -1727,10 +1526,10 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "calib.detection.v1",
             ),
             edge(
-                "calib-e-detection-scorer",
+                "calib-e-detection-autocapture",
                 "calib-detector",
                 "detection",
-                "calib-scorer",
+                "calib-autocapture",
                 "detection",
                 PortKind::CalibDetection,
                 "calib.detection.v1",
@@ -1754,31 +1553,13 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "calib.dataset.v1",
             ),
             edge(
-                "calib-e-dataset-reprojection",
-                "calib-dataset",
-                "dataset",
-                "calib-reprojection",
-                "dataset",
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-            ),
-            edge(
-                "calib-e-coverage-scorer",
+                "calib-e-coverage-autocapture",
                 "calib-coverage",
                 "coverage",
-                "calib-scorer",
+                "calib-autocapture",
                 "coverage",
                 PortKind::CalibCoverage,
                 "calib.coverage.v1",
-            ),
-            edge(
-                "calib-e-score-autocapture",
-                "calib-scorer",
-                "score",
-                "calib-autocapture",
-                "score",
-                PortKind::CaptureScore,
-                "capture.score.v1",
             ),
             edge(
                 "calib-e-coverage-pose",
@@ -1799,22 +1580,13 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "capture.target.v1",
             ),
             edge(
-                "calib-e-solver-reprojection",
+                "calib-e-solver-reprojection-overlay",
                 "calib-solver",
-                "solution",
-                "calib-reprojection",
-                "solution",
-                PortKind::CalibSolution,
-                "calib.solution.v1",
-            ),
-            edge(
-                "calib-e-solver-export",
-                "calib-solver",
-                "solution",
-                "calib-export",
-                "solution",
-                PortKind::CalibSolution,
-                "calib.solution.v1",
+                "reprojection",
+                "calib-overlay",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
             ),
             edge(
                 "calib-e-video-overlay",
@@ -1828,15 +1600,6 @@ fn calibration_template_graph() -> WorkflowGraph {
             edge(
                 "calib-e-coverage-overlay",
                 "calib-coverage",
-                "overlay",
-                "calib-overlay",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
-            edge(
-                "calib-e-reprojection-overlay",
-                "calib-reprojection",
                 "overlay",
                 "calib-overlay",
                 "overlay",
@@ -1866,6 +1629,8 @@ fn calibration_template_graph() -> WorkflowGraph {
 }
 
 fn i2c_template_graph() -> WorkflowGraph {
+    // I2cBusDiscovery 已并入 I2cTransfer，EepromMapLoader 已并入 EepromProvision，
+    // ResultView 已删除（结果改节点内嵌 + 图级 Console）。
     graph(
         "camera-toolbox-i2c-template",
         "I²C Tools Workspace",
@@ -1877,49 +1642,19 @@ fn i2c_template_graph() -> WorkflowGraph {
                 NodePosition { x: 80.0, y: 120.0 },
             ),
             workflow_node(
-                "i2c-bus",
-                NodeKind::I2cBusDiscovery,
-                "I²C Bus Discovery",
-                NodePosition { x: 380.0, y: 120.0 },
-            ),
-            workflow_node(
                 "i2c-transfer",
                 NodeKind::I2cTransfer,
                 "I²C Transfer",
-                NodePosition { x: 700.0, y: 80.0 },
-            ),
-            workflow_node(
-                "i2c-eeprom-map",
-                NodeKind::EepromMapLoader,
-                "EEPROM Map",
-                NodePosition { x: 380.0, y: 320.0 },
+                NodePosition { x: 420.0, y: 80.0 },
             ),
             workflow_node(
                 "i2c-eeprom",
                 NodeKind::EepromProvision,
                 "EEPROM Provision",
-                NodePosition { x: 700.0, y: 320.0 },
-            ),
-            workflow_node(
-                "i2c-result",
-                NodeKind::ResultView,
-                "Result View",
-                NodePosition {
-                    x: 1040.0,
-                    y: 120.0,
-                },
+                NodePosition { x: 420.0, y: 320.0 },
             ),
         ],
         vec![
-            edge(
-                "i2c-e-ssh-bus",
-                "i2c-ssh",
-                "ssh",
-                "i2c-bus",
-                "ssh",
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-            ),
             edge(
                 "i2c-e-ssh-transfer",
                 "i2c-ssh",
@@ -1930,40 +1665,13 @@ fn i2c_template_graph() -> WorkflowGraph {
                 "control.ssh.v1",
             ),
             edge(
-                "i2c-e-bus-transfer",
-                "i2c-bus",
-                "bus",
-                "i2c-transfer",
-                "bus",
-                PortKind::I2cBus,
-                "i2c.bus.v1",
-            ),
-            edge(
-                "i2c-e-result-view",
-                "i2c-transfer",
-                "result",
-                "i2c-result",
-                "result",
-                PortKind::I2cResult,
-                "i2c.result.v1",
-            ),
-            edge(
-                "i2c-e-map-eeprom",
-                "i2c-eeprom-map",
-                "map",
+                "i2c-e-ssh-eeprom",
+                "i2c-ssh",
+                "ssh",
                 "i2c-eeprom",
-                "map",
-                PortKind::EepromMap,
-                "eeprom.map.v1",
-            ),
-            edge(
-                "i2c-e-bus-eeprom",
-                "i2c-bus",
-                "bus",
-                "i2c-eeprom",
-                "bus",
-                PortKind::I2cBus,
-                "i2c.bus.v1",
+                "ssh",
+                PortKind::ControlSsh,
+                "control.ssh.v1",
             ),
         ],
     )
@@ -1978,7 +1686,6 @@ fn workflow_node(id: &str, kind: NodeKind, title: &str, position: NodePosition) 
         position,
         state: match kind {
             NodeKind::RtspSource
-            | NodeKind::LocalWorkspace
             | NodeKind::SshSession
             | NodeKind::X5Device => NodeRuntimeState::Ready,
             _ => NodeRuntimeState::Idle,
@@ -2163,13 +1870,13 @@ mod tests {
             graph
                 .nodes
                 .iter()
-                .any(|node| node.kind == NodeKind::ReprojectionInspector)
+                .any(|node| node.kind == NodeKind::CalibrationSolver)
         );
         assert!(
             graph
                 .nodes
                 .iter()
-                .any(|node| node.kind == NodeKind::CalibrationExport)
+                .any(|node| node.kind == NodeKind::AutoCaptureController)
         );
         assert!(
             graph
@@ -2183,17 +1890,12 @@ mod tests {
                 .iter()
                 .any(|edge| edge.id == "calib-e-decoder-dataset-image")
         );
+        // 合并后 solver 的 reprojection 可选输出直接进 overlay，不再有独立 ReprojectionInspector。
         assert!(
             graph
                 .edges
                 .iter()
-                .any(|edge| edge.id == "calib-e-solver-reprojection")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "calib-e-solver-export")
+                .any(|edge| edge.id == "calib-e-solver-reprojection-overlay")
         );
         assert!(
             graph
@@ -2204,6 +1906,49 @@ mod tests {
     }
 
     #[test]
+    fn node_catalog_has_19_nodes() {
+        let catalog = node_catalog();
+        assert_eq!(catalog.len(), 19);
+        // 每个 kind 都能通过 node_definition 展开，且无重复。
+        let kinds: Vec<NodeKind> = catalog.iter().map(|def| def.kind).collect();
+        assert_eq!(kinds.len(), 19);
+    }
+
+    #[test]
+    fn merged_nodes_have_expanded_port_surface() {
+        // X5Device：control + rtsp(多路) + snapshot(可选 image) + video(可选 video-frame)。
+        let x5 = node_definition(NodeKind::X5Device);
+        assert_eq!(x5.outputs.len(), 4);
+        assert!(x5.outputs.iter().any(|p| p.id == "rtsp" && p.cardinality == PortCardinality::Many));
+        assert!(x5.outputs.iter().any(|p| p.id == "snapshot" && p.kind == PortKind::ImageFrame && !p.required));
+        assert!(x5.outputs.iter().any(|p| p.id == "video" && p.kind == PortKind::StreamVideoFrame));
+
+        // CalibrationSolver：solution + reprojection/report/payload 三个可选输出。
+        let solver = node_definition(NodeKind::CalibrationSolver);
+        assert_eq!(solver.outputs.len(), 4);
+        assert!(solver.outputs.iter().any(|p| p.id == "solution" && p.kind == PortKind::CalibSolution));
+        assert!(solver.outputs.iter().any(|p| p.id == "reprojection" && p.kind == PortKind::LayerOverlay && !p.required));
+        assert!(solver.outputs.iter().any(|p| p.id == "report" && p.kind == PortKind::CalibReport && !p.required));
+        assert!(solver.outputs.iter().any(|p| p.id == "payload" && p.kind == PortKind::EepromPayload && !p.required));
+
+        // AutoCaptureController：frames/detection/coverage/target 输入 + command/score 输出。
+        let auto = node_definition(NodeKind::AutoCaptureController);
+        assert_eq!(auto.inputs.len(), 4);
+        assert_eq!(auto.outputs.len(), 2);
+        assert!(auto.inputs.iter().any(|p| p.id == "detection"));
+        assert!(auto.inputs.iter().any(|p| p.id == "coverage"));
+        assert!(auto.outputs.iter().any(|p| p.id == "command"));
+        assert!(auto.outputs.iter().any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required));
+
+        // LocalFileSource：image + preview/fileRef 可选输出。
+        let local = node_definition(NodeKind::LocalFileSource);
+        assert_eq!(local.outputs.len(), 3);
+        assert!(local.outputs.iter().any(|p| p.id == "image" && p.kind == PortKind::ImageFrame));
+        assert!(local.outputs.iter().any(|p| p.id == "preview" && !p.required));
+        assert!(local.outputs.iter().any(|p| p.id == "fileRef" && p.kind == PortKind::FileRef && !p.required));
+    }
+
+    #[test]
     fn templates_generate_valid_graphs() {
         for template in workmode_templates() {
             validate_workflow(&template.graph).expect(template.id);
@@ -2211,21 +1956,18 @@ mod tests {
     }
 
     #[test]
-    fn file_browser_emits_file_ref_for_image_source() {
-        let browser = node_definition(NodeKind::FileBrowser);
-        let source = node_definition(NodeKind::ImageFileSource);
-        assert_eq!(browser.outputs[0].kind, PortKind::FileRef);
-        assert_eq!(browser.outputs[0].schema, "file.ref.v1");
-        assert_eq!(source.inputs[0].kind, PortKind::FileRef);
-        assert_eq!(source.inputs[0].schema, "file.ref.v1");
+    fn local_file_source_emits_image_and_file_ref() {
+        let source = node_definition(NodeKind::LocalFileSource);
+        assert!(source.outputs.iter().any(|p| p.kind == PortKind::ImageFrame));
+        assert!(source.outputs.iter().any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1"));
     }
 
     #[test]
-    fn sftp_workspace_config_rejects_unsafe_remote_root() {
+    fn sftp_file_source_config_rejects_unsafe_remote_root() {
         let mut graph = seed_workflow_graph();
         graph.nodes.push(workflow_node(
             "sftp-unsafe",
-            NodeKind::SftpWorkspace,
+            NodeKind::SftpFileSource,
             "Unsafe SFTP",
             NodePosition { x: 0.0, y: 0.0 },
         ));
@@ -2243,5 +1985,22 @@ mod tests {
         let error =
             normalize_workflow(graph, "next".to_owned()).expect_err("runtime fields are rejected");
         assert!(error.contains("objectUrl"));
+    }
+
+    #[test]
+    fn reject_runtime_config_rejects_nested_and_array_secrets() {
+        // 嵌套 object 中的 secret 必须被拒（旧实现只查顶层会漏）。
+        let nested = json!({"auth": {"password": "hunter2"}});
+        let error = reject_runtime_config(&nested).expect_err("nested secret must be rejected");
+        assert!(error.contains("password"));
+
+        // 数组元素里携带 secret 也必须被拒。
+        let array = json!({"tokens": [{"credentialRef": "key-file:/x"}]});
+        let error = reject_runtime_config(&array).expect_err("array secret must be rejected");
+        assert!(error.contains("credentialRef"));
+
+        // 合法嵌套（不含敏感键）应通过。
+        let benign = json!({"auth": {"host": "camera.local", "port": 22}});
+        assert!(reject_runtime_config(&benign).is_ok());
     }
 }

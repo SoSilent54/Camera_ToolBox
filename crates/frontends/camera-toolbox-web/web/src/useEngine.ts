@@ -1,33 +1,31 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import {
   fetchEngineStatus,
   nodeAction,
   runEngine,
+  startEngine,
   type WorkflowGraph,
 } from './workflow';
 
 export type EngineState = 'disabled' | 'idle' | 'ready' | 'running' | 'error';
 
 /**
- * 数据流引擎前端桥接：装载图、轮询节点状态、派发节点动作。
- *
- * 引擎是触发式的——没有全图级 run/stop；加载图即装载，节点各自 connect/trigger/arm。
+ * 数据流引擎前端桥接：装载图、轮询节点状态、派发节点动作、图级 run/start。
  */
 export function useEngine() {
   const [nodeStates, setNodeStates] = useState<Record<string, EngineState>>({});
-  const mountedRef = useRef(true);
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
 
   /** 装载图到引擎（后端会替换并停止旧图）。 */
   const loadGraph = useCallback((graph: WorkflowGraph) => {
     runEngine(graph).catch((error: unknown) => {
       console.warn('engine load failed', error);
+    });
+  }, []);
+
+  /** 图级 run/start：一键启动所有可启动节点。 */
+  const startAll = useCallback(() => {
+    startEngine().catch((error: unknown) => {
+      console.warn('engine start failed', error);
     });
   }, []);
 
@@ -66,5 +64,5 @@ export function useEngine() {
     };
   }, []);
 
-  return { nodeStates, loadGraph, sendAction };
+  return { nodeStates, loadGraph, startAll, sendAction };
 }

@@ -39,14 +39,10 @@ import {
   type WorkmodeTemplate,
 } from './workflow';
 import {
-  FileBrowserNode,
-  ImageFileSourceNode,
-  LocalWorkspaceNode,
-  SftpWorkspaceNode,
+  LocalFileSourceNode,
+  SftpFileSourceNode,
   SshSessionNode,
   X5DeviceNode,
-  X5RtspChannelNode,
-  X5SnapshotNode,
 } from './WorkflowNodes';
 import {
   AutoCaptureNode,
@@ -76,27 +72,17 @@ const GENERIC_NODE_KINDS: NodeKind[] = [
   'chessboardDetector',
   'datasetCollector',
   'coverageAnalyzer',
-  'captureScorer',
   'poseGuide',
-  'reprojectionInspector',
-  'calibrationExport',
-  'i2cBusDiscovery',
   'i2cTransfer',
-  'eepromMapLoader',
   'eepromProvision',
-  'resultView',
 ];
 
 const nodeTypes = Object.fromEntries([
   ['rtspSource', RtspSourceNode],
-  ['localWorkspace', LocalWorkspaceNode],
-  ['sftpWorkspace', SftpWorkspaceNode],
-  ['fileBrowser', FileBrowserNode],
-  ['imageFileSource', ImageFileSourceNode],
+  ['localFileSource', LocalFileSourceNode],
+  ['sftpFileSource', SftpFileSourceNode],
   ['sshSession', SshSessionNode],
   ['x5Device', X5DeviceNode],
-  ['x5RtspChannel', X5RtspChannelNode],
-  ['x5Snapshot', X5SnapshotNode],
   ['viewer', ViewerNode],
   ['calibrationSolver', CalibrationSolverNode],
   ['autoCaptureController', AutoCaptureNode],
@@ -114,7 +100,7 @@ export function App() {
   const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
-  const { nodeStates, loadGraph, sendAction } = useEngine();
+  const { nodeStates, loadGraph, startAll, sendAction } = useEngine();
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
@@ -140,7 +126,24 @@ export function App() {
   }, [edges]);
 
   const recordSnapshot = useCallback(() => {
-    pastRef.current.push({ nodes: nodesRef.current, edges: edgesRef.current });
+    // 深拷贝快照：React Flow 拖拽时 onNodesChange 会原位 mutate node 对象（position 字段），
+    // 若直接存 nodesRef.current 引用，撤销栈会与后续 state 串味。这里至少复制 position 与
+    // workflowNode；workflowNode.config 也可能被后续 setNodes 原地替换的浅层引用共享，
+    // 一并复制以避免撤销后 config 被污染。
+    pastRef.current.push({
+      nodes: nodesRef.current.map((node) => ({
+        ...node,
+        position: { ...node.position },
+        data: {
+          ...node.data,
+          workflowNode: {
+            ...node.data.workflowNode,
+            config: { ...node.data.workflowNode.config },
+          },
+        },
+      })),
+      edges: edgesRef.current.map((edge) => ({ ...edge })),
+    });
     if (pastRef.current.length > 50) {
       pastRef.current.shift();
     }
@@ -282,7 +285,7 @@ export function App() {
             id: edgeId,
             animated: false,
             label: labelForPortKind(validation.port.kind),
-            data: { kind: validation.port.kind, schema: validation.port.schema },
+            data: { kind: validation.port.kind, schema: validation.port.schema, schemaVersion: WORKFLOW_SCHEMA_VERSION },
             className: 'workflow-edge flow-inactive',
           },
           current.filter((edge) => edge.id !== edgeId),
@@ -302,6 +305,7 @@ export function App() {
         pushEvent('拒绝 RTSP URL：必须使用 rtsp:// 或 rtsps://');
         return;
       }
+      recordSnapshot();
       setNodes((current) => {
         const updated = current.map((flowNode) => {
           if (flowNode.id !== nodeId) {
@@ -326,41 +330,7 @@ export function App() {
         : current);
       pushEvent(`RTSP URL 已更新：${trimmedUrl}`);
     },
-    [edges, pushEvent, setNodes],
-  );
-
-  const handleLocalImageConfigChange = useCallback(
-    (nodeId: string, field: 'root' | 'relativePath', nextValue: string) => {
-      const value = nextValue.trim();
-      setNodes((current) => {
-        const updated = current.map((flowNode) => {
-          if (flowNode.id !== nodeId) {
-            return flowNode;
-          }
-          const workflowNode = flowNode.data.workflowNode;
-          const expectedKind = field === 'root' ? 'localWorkspace' : 'imageFileSource';
-          if (workflowNode.kind !== expectedKind) {
-            return flowNode;
-          }
-          return {
-            ...flowNode,
-            data: {
-              ...flowNode.data,
-              workflowNode: {
-                ...workflowNode,
-                config: { ...workflowNode.config, [field]: value },
-              },
-            },
-          };
-        });
-        return withViewerPreviews(updated, edges);
-      });
-      setSelection((current) => current.type === 'node' && current.node.id === nodeId
-        ? { type: 'node', node: { ...current.node, config: { ...current.node.config, [field]: value } } }
-        : current);
-      pushEvent(field === 'root' ? '本地 workspace 根目录已更新' : '本地图像相对路径已更新');
-    },
-    [edges, pushEvent, setNodes],
+    [edges, pushEvent, recordSnapshot, setNodes],
   );
 
   const handleNodeTitleChange = useCallback(
@@ -370,6 +340,7 @@ export function App() {
         pushEvent('节点标题不能为空');
         return;
       }
+      recordSnapshot();
       setNodes((current) => current.map((flowNode) => flowNode.id === nodeId
         ? { ...flowNode, data: { ...flowNode.data, workflowNode: { ...flowNode.data.workflowNode, title } } }
         : flowNode));
@@ -378,11 +349,12 @@ export function App() {
         : current);
       pushEvent(`节点已重命名：${title}`);
     },
-    [pushEvent, setNodes],
+    [pushEvent, recordSnapshot, setNodes],
   );
 
   const handleNodeConfigChange = useCallback(
     (nodeId: string, key: string, value: string | boolean) => {
+      recordSnapshot();
       setNodes((current) => {
         const updated = current.map((flowNode) => flowNode.id === nodeId
           ? {
@@ -402,7 +374,7 @@ export function App() {
         ? { type: 'node', node: { ...current.node, config: { ...current.node.config, [key]: value } } }
         : current);
     },
-    [edges, setNodes],
+    [edges, recordSnapshot, setNodes],
   );
 
   useEffect(() => {
@@ -410,7 +382,6 @@ export function App() {
       const runtimeState = nodeStates[flowNode.id];
       if (
         flowNode.data.onRtspUrlChange === handleRtspUrlChange
-        && flowNode.data.onLocalImageConfigChange === handleLocalImageConfigChange
         && flowNode.data.onNodeConfigChange === handleNodeConfigChange
         && flowNode.data.onNodeAction === sendAction
         && flowNode.data.runtimeState === runtimeState
@@ -423,13 +394,12 @@ export function App() {
           ...flowNode.data,
           runtimeState,
           onRtspUrlChange: handleRtspUrlChange,
-          onLocalImageConfigChange: handleLocalImageConfigChange,
           onNodeConfigChange: handleNodeConfigChange,
           onNodeAction: sendAction,
         },
       };
     }));
-  }, [handleLocalImageConfigChange, handleNodeConfigChange, handleRtspUrlChange, nodeStates, nodes.length, sendAction, setNodes]);
+  }, [handleNodeConfigChange, handleRtspUrlChange, nodeStates, nodes.length, sendAction, setNodes]);
 
   const createFlowNodeAt = useCallback(
     (kind: NodeKind, position: { x: number; y: number }): FlowNode => {
@@ -810,6 +780,9 @@ export function App() {
           <div className="menu-group">
             <button onClick={handleFitView}>Fit</button>
           </div>
+          <div className="menu-group">
+            <button type="button" onClick={startAll}>Run</button>
+          </div>
         </nav>
         <div className="service-pill">{nodes.length}N / {edges.length}E</div>
       </header>
@@ -961,7 +934,7 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     targetHandle: edge.target.portId,
     animated: false,
     label: labelForPortKind(edge.kind),
-    data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema },
+    data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema, schemaVersion: edge.schemaVersion },
     className: 'workflow-edge flow-inactive',
   }));
 }
@@ -1011,20 +984,14 @@ function isActiveSeedNode(node: WorkflowNode, runtimeNodeStates: Map<string, str
   if (node.kind === 'rtspSource') {
     return hasText(node.config.url);
   }
-  if (node.kind === 'imageFileSource') {
-    return hasText(node.config.relativePath);
+  if (node.kind === 'localFileSource') {
+    return hasText(node.config.root) || hasText(node.config.directory);
   }
-  if (node.kind === 'localWorkspace') {
-    return hasText(node.config.root);
-  }
-  if (node.kind === 'sftpWorkspace') {
+  if (node.kind === 'sftpFileSource') {
     return hasText(node.config.remoteRoot);
   }
   if (node.kind === 'x5Device') {
     return hasText(node.config.host) || hasText(node.config.tcpPort);
-  }
-  if (node.kind === 'x5RtspChannel') {
-    return hasText(node.config.path) || hasText(node.config.channel);
   }
   return false;
 }
@@ -1067,7 +1034,7 @@ function createWorkflowNode(kind: NodeKind, count: number, position: { x: number
     kind,
     title: `${definition?.title ?? kind} ${count}`,
     position,
-    state: kind === 'rtspSource' || kind === 'localWorkspace' || kind === 'sftpWorkspace' || kind === 'fileBrowser' || kind === 'sshSession' || kind === 'x5Device' ? 'ready' : 'idle',
+    state: kind === 'rtspSource' || kind === 'localFileSource' || kind === 'sftpFileSource' || kind === 'sshSession' || kind === 'x5Device' ? 'ready' : 'idle',
     category: definition?.category ?? 'diagnostics',
     inputs: definition?.inputs ?? [],
     outputs: definition?.outputs ?? [],
@@ -1090,7 +1057,7 @@ function toWorkflowGraph(nodes: FlowNode[], edges: FlowEdge[], base: WorkflowGra
       target: { nodeId: String(edge.target), portId: String(edge.targetHandle ?? '') },
       kind: edge.data?.kind ?? inferPortKind(nodes, String(edge.source), String(edge.sourceHandle ?? '')),
       schema: edge.data?.schema ?? inferPortSchema(nodes, String(edge.source), String(edge.sourceHandle ?? '')),
-      schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      schemaVersion: edge.data?.schemaVersion ?? WORKFLOW_SCHEMA_VERSION,
     })),
   };
 }

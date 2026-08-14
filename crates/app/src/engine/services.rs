@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use super::node::NodeError;
 use crate::platform::{RtspStreamConfig, StreamService};
-use crate::ports::CalibrationBackend;
+use crate::ports::{CalibrationBackend, RasterImageCodec, RawFrameLoader};
 
 /// 流服务工厂：按 URL 配置创建独立流服务。
 ///
@@ -20,6 +20,8 @@ pub trait StreamServiceFactory: Send + Sync {
 pub struct EngineServices {
     pub stream_factory: Option<Arc<dyn StreamServiceFactory>>,
     pub calibration: Option<Arc<dyn CalibrationBackend>>,
+    pub raw_loader: Option<Arc<dyn RawFrameLoader>>,
+    pub image_codec: Option<Arc<dyn RasterImageCodec>>,
 }
 
 impl EngineServices {
@@ -34,6 +36,20 @@ impl EngineServices {
     pub fn calibration_backend(&self) -> Result<Arc<dyn CalibrationBackend>, NodeError> {
         self.calibration.clone().ok_or_else(|| {
             NodeError::Precondition("calibration backend is not configured".to_owned())
+        })
+    }
+
+    /// 获取本地 RAW 帧加载器（LocalFileSource 等本地文件源节点使用）。
+    pub fn raw_loader(&self) -> Result<Arc<dyn RawFrameLoader>, NodeError> {
+        self.raw_loader.clone().ok_or_else(|| {
+            NodeError::Precondition("raw frame loader is not configured".to_owned())
+        })
+    }
+
+    /// 获取静态 raster 编解码器（图片加载/合成/检测转 PNG 时使用）。
+    pub fn image_codec(&self) -> Result<Arc<dyn RasterImageCodec>, NodeError> {
+        self.image_codec.clone().ok_or_else(|| {
+            NodeError::Precondition("raster image codec is not configured".to_owned())
         })
     }
 }

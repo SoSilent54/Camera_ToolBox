@@ -56,6 +56,7 @@ pub enum GraphBuildError {
 
 /// 节点 actor 句柄。
 struct EngineNodeHandle {
+    kind: String,
     mailbox: MailboxSender,
     handle: Option<JoinHandle<()>>,
 }
@@ -100,6 +101,8 @@ impl GraphEngine {
         }
 
         // 3. 接线（fan-out）：源输出端口 → 目标 mailbox。
+        //    先按 node_id 建规格索引，校验边的端口确实存在于声明的 inputs/outputs 上。
+        let node_specs: HashMap<&NodeId, &NodeSpec> = spec.nodes.iter().map(|node| (&node.id, node)).collect();
         let mut connected_inputs: HashMap<NodeId, HashSet<PortId>> = HashMap::new();
         for edge in &spec.edges {
             let (target_tx, _) = mailboxes
@@ -108,6 +111,28 @@ impl GraphEngine {
             let source_outputs = outputs
                 .get_mut(&edge.source.node_id)
                 .ok_or_else(|| GraphBuildError::MissingNode(edge.id.clone(), edge.source.node_id.clone()))?;
+            // 源输出端口必须存在于源节点声明的 outputs 上。
+            let source_spec = node_specs
+                .get(&edge.source.node_id)
+                .ok_or_else(|| GraphBuildError::MissingNode(edge.id.clone(), edge.source.node_id.clone()))?;
+            if !source_spec.outputs.iter().any(|port| port.id == edge.source.port_id) {
+                return Err(GraphBuildError::MissingPort(
+                    edge.id.clone(),
+                    edge.source.port_id.clone(),
+                    edge.source.node_id.clone(),
+                ));
+            }
+            // 目标输入端口必须存在于目标节点声明的 inputs 上。
+            let target_spec = node_specs
+                .get(&edge.target.node_id)
+                .ok_or_else(|| GraphBuildError::MissingNode(edge.id.clone(), edge.target.node_id.clone()))?;
+            if !target_spec.inputs.iter().any(|port| port.id == edge.target.port_id) {
+                return Err(GraphBuildError::MissingPort(
+                    edge.id.clone(),
+                    edge.target.port_id.clone(),
+                    edge.target.node_id.clone(),
+                ));
+            }
             source_outputs.connect(edge.source.port_id.clone(), target_tx.clone());
             connected_inputs
                 .entry(edge.target.node_id.clone())
@@ -152,6 +177,7 @@ impl GraphEngine {
             nodes.insert(
                 node.id.clone(),
                 EngineNodeHandle {
+                    kind: node.kind.clone(),
                     mailbox,
                     handle: Some(handle),
                 },
@@ -176,6 +202,29 @@ impl GraphEngine {
             .mailbox
             .send(NodeMessage::Action(action))
             .map_err(|_| NodeError::Execution(format!("node `{node_id}` mailbox closed")))
+    }
+
+    /// 图级 run/start：按 kind 对各节点派发启动动作（源 Connect、按钮 Trigger、auto Arm），
+    /// 其余 kind 无启动动作则跳过。尽力启动：先发完全部动作，再汇总错误，不因单节点失败阻断整图。
+    pub fn start_all(&self) -> Result<(), NodeError> {
+        let mut errors: Vec<String> = Vec::new();
+        for (node_id, handle) in &self.nodes {
+            let Some(action) = start_action_for_kind(&handle.kind) else {
+                continue;
+            };
+            if let Err(error) = handle.mailbox.send(NodeMessage::Action(action)) {
+                errors.push(format!("node `{node_id}`: {error:?}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(NodeError::Execution(format!(
+                "start_all: {} node(s) failed: {}",
+                errors.len(),
+                errors.join("; ")
+            )))
+        }
     }
 
     /// 非阻塞取回节点状态更新（web 层轮询后推 WebSocket）。
@@ -220,6 +269,16 @@ impl GraphEngine {
 impl Drop for GraphEngine {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+/// 图级启动：按 kind 映射到启动动作；无启动动作的 kind 返回 `None`（跳过）。
+fn start_action_for_kind(kind: &str) -> Option<NodeAction> {
+    match kind {
+        "rtspSource" | "localFileSource" => Some(NodeAction::Connect),
+        "calibrationSolver" => Some(NodeAction::Trigger),
+        "autoCaptureController" => Some(NodeAction::Arm),
+        _ => None,
     }
 }
 
@@ -436,6 +495,64 @@ mod tests {
     }
 
     #[test]
+    fn build_rejects_missing_source_port() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(PassthroughFactory));
+        let spec = GraphSpec {
+            nodes: vec![
+                node_spec("a", vec![], vec![port("out", false)]),
+                node_spec("b", vec![port("in", true)], vec![]),
+            ],
+            edges: vec![EdgeSpec {
+                id: "e".to_owned(),
+                source: PortEndpoint {
+                    node_id: "a".to_owned(),
+                    port_id: "nonexistent".to_owned(),
+                },
+                target: PortEndpoint {
+                    node_id: "b".to_owned(),
+                    port_id: "in".to_owned(),
+                },
+            }],
+        };
+        let result = GraphEngine::build(spec, &registry, EngineServices::default());
+        assert!(matches!(
+            result,
+            Err(GraphBuildError::MissingPort(id, port, node))
+                if id == "e" && port == "nonexistent" && node == "a"
+        ));
+    }
+
+    #[test]
+    fn build_rejects_missing_target_port() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(PassthroughFactory));
+        let spec = GraphSpec {
+            nodes: vec![
+                node_spec("a", vec![], vec![port("out", false)]),
+                node_spec("b", vec![port("in", true)], vec![]),
+            ],
+            edges: vec![EdgeSpec {
+                id: "e".to_owned(),
+                source: PortEndpoint {
+                    node_id: "a".to_owned(),
+                    port_id: "out".to_owned(),
+                },
+                target: PortEndpoint {
+                    node_id: "b".to_owned(),
+                    port_id: "nonexistent".to_owned(),
+                },
+            }],
+        };
+        let result = GraphEngine::build(spec, &registry, EngineServices::default());
+        assert!(matches!(
+            result,
+            Err(GraphBuildError::MissingPort(id, port, node))
+                if id == "e" && port == "nonexistent" && node == "b"
+        ));
+    }
+
+    #[test]
     fn action_reaches_node_instance() {
         let mut registry = NodeRegistry::new();
         registry.register(Box::new(PassthroughFactory));
@@ -447,6 +564,81 @@ mod tests {
         assert!(engine.send_action("a", NodeAction::Trigger).is_ok());
         assert!(engine.send_action("missing", NodeAction::Trigger).is_err());
         let _ = engine;
+    }
+
+    #[test]
+    fn start_action_maps_kinds_to_actions() {
+        // 源 → Connect、按钮 → Trigger、auto → Arm、其余 → 跳过。
+        assert!(matches!(
+            start_action_for_kind("rtspSource"),
+            Some(NodeAction::Connect)
+        ));
+        assert!(matches!(
+            start_action_for_kind("localFileSource"),
+            Some(NodeAction::Connect)
+        ));
+        assert!(matches!(
+            start_action_for_kind("calibrationSolver"),
+            Some(NodeAction::Trigger)
+        ));
+        assert!(matches!(
+            start_action_for_kind("autoCaptureController"),
+            Some(NodeAction::Arm)
+        ));
+        // 变换/图层/viewer/composite/skeleton 等无启动动作的 kind 跳过。
+        for skipped in [
+            "frameSampler",
+            "rtspDecoder",
+            "videoLayer",
+            "imageLayer",
+            "viewer",
+            "overlayComposer",
+            "datasetCollector",
+            "coverageAnalyzer",
+            "poseGuide",
+            "chessboardDetector",
+            "sftpFileSource",
+            "sshSession",
+            "x5Device",
+            "i2cTransfer",
+            "eepromProvision",
+            "passthrough",
+        ] {
+            assert!(matches!(start_action_for_kind(skipped), None), "{skipped} must be skipped");
+        }
+    }
+
+    #[test]
+    fn start_all_dispatches_to_live_nodes_without_error() {
+        // 用内置 registry 建一个含源/按钮/auto/变换的混合图；start_all 尽力派发应返回 Ok。
+        let mut registry = NodeRegistry::new();
+        crate::engine::register_builtin(&mut registry);
+
+        let spec = GraphSpec {
+            nodes: vec![
+                node_spec_with_kind("src", "rtspSource", vec![], vec![]),
+                node_spec_with_kind("solver", "calibrationSolver", vec![], vec![]),
+                node_spec_with_kind("auto", "autoCaptureController", vec![], vec![]),
+                node_spec_with_kind("sampler", "frameSampler", vec![], vec![]),
+            ],
+            edges: vec![],
+        };
+        let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
+        // rtspSource 的 Connect 会在 on_action 里因缺 stream_factory 报错，但那是 actor 内部事件，
+        // 不影响 start_all 的「投递成功」判定；只要 mailbox 存活即 Ok。
+        assert!(engine.start_all().is_ok());
+        let _ = engine;
+    }
+
+    fn node_spec_with_kind(id: &str, kind: &str, inputs: Vec<PortSpec>, outputs: Vec<PortSpec>) -> NodeSpec {
+        NodeSpec {
+            id: id.to_owned(),
+            kind: kind.to_owned(),
+            title: id.to_owned(),
+            inputs,
+            outputs,
+            config: serde_json::json!({}),
+        }
     }
 
     #[test]

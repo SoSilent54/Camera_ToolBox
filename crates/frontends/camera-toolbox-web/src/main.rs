@@ -55,8 +55,9 @@ use workflow::{
 #[command(name = "camera-toolbox-web")]
 #[command(about = "Camera Toolbox browser workflow canvas server")]
 struct ServerArgs {
-    /// Web 服务绑定地址；默认允许局域网设备访问，生产环境需要另加认证或防火墙。
-    #[arg(long, default_value = "0.0.0.0")]
+    /// Web 服务绑定地址；默认只监听本机回环地址，避免局域网设备未经认证直连控制端点。
+    /// 需要让局域网设备访问时，显式传入 `--host 0.0.0.0` 并自行加认证/防火墙。
+    #[arg(long, default_value = "127.0.0.1")]
     host: IpAddr,
 
     /// Web 服务端口；传 0 时由系统分配可用端口。
@@ -621,11 +622,27 @@ fn ssh_target_from_binding(
             "ssh.username must be a non-empty printable username",
         ));
     }
+    // 必须 pin 服务端 host key，拒绝「接受任意密钥」路径，消除 MITM 风险。
+    let expected_host_key = binding
+        .expected_host_key
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            PreviewApiError::bad_request(
+                "ssh.expectedHostKey must be pinned to the server's OpenSSH public key",
+            )
+        })?;
+    if expected_host_key.chars().any(char::is_control) {
+        return Err(PreviewApiError::bad_request(
+            "ssh.expectedHostKey must not contain control characters",
+        ));
+    }
     Ok(SshConnectionTarget {
         host: binding.host.trim().to_owned(),
         port: binding.port,
         username: binding.username.trim().to_owned(),
-        expected_host_key: None,
+        expected_host_key: Some(expected_host_key.to_owned()),
         command_subsystem: None,
         remote_event_subsystem: None,
     })
@@ -639,9 +656,12 @@ fn validate_credential_ref(reference: &str) -> std::result::Result<String, Previ
             "ssh.credentialRef must be a non-empty process-local credential reference",
         ));
     }
-    if !(reference.starts_with("session:") || reference.starts_with("key-file:/")) {
+    // 本 web 后端只接受 key-file 引用：凭据经 ProductionCredentialResolver 按 operation
+    // 读取私钥文件，密码不落盘。`session:` 引用依赖进程内预注册（Device Manager），
+    // 本服务没有对应注册路由，支持它只会制造「永远解析失败」的死路径，故显式拒绝。
+    if !reference.starts_with("key-file:/") {
         return Err(PreviewApiError::bad_request(
-            "ssh.credentialRef must use session:<id> or key-file:/absolute/path",
+            "ssh.credentialRef must use key-file:/absolute/path",
         ));
     }
     Ok(reference.to_owned())
@@ -814,6 +834,10 @@ struct SshExecutionBinding {
     #[serde(default = "default_ssh_username")]
     username: String,
     credential_ref: String,
+    /// 显式 pin 的服务端 host key（OpenSSH public key 字符串）。缺失时拒绝执行，
+    /// 避免无条件接受任意服务器密钥（MITM 防护）。
+    #[serde(default)]
+    expected_host_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1278,6 +1302,7 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         .route("/api/files/local/list", get(files_api::list_local_files))
         .route("/api/runtime/run", post(engine_api::run_engine))
         .route("/api/runtime/stop", post(engine_api::stop_engine))
+        .route("/api/runtime/start", post(engine_api::start_engine))
         .route(
             "/api/runtime/nodes/{id}/action",
             post(engine_api::node_action),
@@ -2104,7 +2129,10 @@ mod tests {
             host: "camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            credential_ref: "session:test".to_owned(),
+            credential_ref: "key-file:/tmp/test-key".to_owned(),
+            // 与 MemorySshTransport::new("host-key") 的 actual_host_key 对齐，
+            // 验证 host key 已从请求绑定透传而非无条件接受。
+            expected_host_key: Some("host-key".to_owned()),
         }
     }
 
@@ -2132,7 +2160,7 @@ mod tests {
 
     #[cfg(feature = "platform-ssh")]
     fn eeprom_state(memory: &Arc<MemorySshTransport>) -> AppState {
-        memory.allow_credential("session:test");
+        memory.allow_credential("key-file:/tmp/test-key");
         let resolver: Arc<dyn CredentialResolver> = memory.clone();
         let transport: Arc<dyn SshTransportFactory> = memory.clone();
         AppState {
@@ -2412,5 +2440,49 @@ mod tests {
         assert!(!is_safe_workflow_id("../escape"));
         assert!(!is_safe_workflow_id(""));
         assert!(is_safe_workflow_id("camera_toolbox-1"));
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn ssh_target_requires_pinned_host_key() {
+        // 缺失 expectedHostKey 必须拒绝，不再无条件接受任意服务器密钥。
+        let missing = SshExecutionBinding {
+            host: "camera.local".to_owned(),
+            port: 22,
+            username: "root".to_owned(),
+            credential_ref: "key-file:/tmp/k".to_owned(),
+            expected_host_key: None,
+        };
+        let error = ssh_target_from_binding(&missing).expect_err("missing host key must be rejected");
+        assert!(error.error.contains("expectedHostKey"));
+
+        // 提供空字符串同样拒绝（trim 后为空）。
+        let empty = SshExecutionBinding {
+            expected_host_key: Some("  ".to_owned()),
+            ..missing
+        };
+        let error = ssh_target_from_binding(&empty).expect_err("blank host key must be rejected");
+        assert!(error.error.contains("expectedHostKey"));
+
+        // 合法的 pin 透传到 target。
+        let pinned = SshExecutionBinding {
+            expected_host_key: Some("ssh-ed25519 AAAA".to_owned()),
+            ..empty
+        };
+        let target = ssh_target_from_binding(&pinned).expect("pinned host key accepted");
+        assert_eq!(
+            target.expected_host_key.as_deref(),
+            Some("ssh-ed25519 AAAA")
+        );
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn credential_ref_rejects_session_and_plaintext() {
+        // `session:` 是本服务无法解析的死路径，必须拒绝而非误导用户。
+        assert!(validate_credential_ref("session:test").is_err());
+        assert!(validate_credential_ref("password:secret").is_err());
+        assert!(validate_credential_ref("key-file:/tmp/id_ed25519").is_ok());
+        assert!(validate_credential_ref("key-file:/tmp/id\ninjected").is_err());
     }
 }

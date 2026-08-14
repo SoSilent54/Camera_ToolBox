@@ -23,7 +23,11 @@
 
 pub mod auto_capture;
 pub mod calibration_solver;
+pub mod composite;
+pub mod detection;
+pub mod local_source;
 pub mod rtsp_source;
+pub mod skeleton;
 pub mod transform;
 pub mod viewer;
 
@@ -31,7 +35,17 @@ use crate::engine::NodeRegistry;
 
 pub use auto_capture::{AutoCaptureFactory, AutoCaptureNode};
 pub use calibration_solver::{CalibrationSolverFactory, CalibrationSolverNode};
+pub use composite::{
+    CoverageAnalyzerFactory, CoverageAnalyzerNode, DatasetCollectorFactory, DatasetCollectorNode,
+    OverlayComposerFactory, OverlayComposerNode, PoseGuideFactory, PoseGuideNode,
+};
+pub use detection::{ChessboardDetectorFactory, ChessboardDetectorNode};
+pub use local_source::{LocalFileSourceFactory, LocalFileSourceNode};
 pub use rtsp_source::{RtspSourceFactory, RtspSourceNode};
+pub use skeleton::{
+    EepromProvisionFactory, I2cTransferFactory, SftpFileSourceFactory, SshSessionFactory,
+    X5DeviceFactory,
+};
 pub use transform::{
     FrameSamplerFactory, FrameSamplerNode, ImageLayerFactory, PassThroughNode, RtspDecoderFactory,
     VideoLayerFactory,
@@ -48,6 +62,17 @@ pub fn register_builtin(registry: &mut NodeRegistry) {
     registry.register(Box::new(ViewerFactory));
     registry.register(Box::new(CalibrationSolverFactory));
     registry.register(Box::new(AutoCaptureFactory));
+    registry.register(Box::new(OverlayComposerFactory));
+    registry.register(Box::new(DatasetCollectorFactory));
+    registry.register(Box::new(CoverageAnalyzerFactory));
+    registry.register(Box::new(PoseGuideFactory));
+    registry.register(Box::new(ChessboardDetectorFactory));
+    registry.register(Box::new(LocalFileSourceFactory));
+    registry.register(Box::new(SftpFileSourceFactory));
+    registry.register(Box::new(SshSessionFactory));
+    registry.register(Box::new(X5DeviceFactory));
+    registry.register(Box::new(I2cTransferFactory));
+    registry.register(Box::new(EepromProvisionFactory));
 }
 
 #[cfg(test)]
@@ -59,6 +84,7 @@ mod tests {
         let mut registry = NodeRegistry::new();
         register_builtin(&mut registry);
         let kinds: Vec<&str> = registry.kinds().collect();
+        // 全部 19 个 NodeKind 均已注册（含 localFileSource，t13 补齐）。
         for expected in [
             "rtspSource",
             "rtspDecoder",
@@ -68,6 +94,17 @@ mod tests {
             "viewer",
             "calibrationSolver",
             "autoCaptureController",
+            "overlayComposer",
+            "datasetCollector",
+            "coverageAnalyzer",
+            "poseGuide",
+            "chessboardDetector",
+            "localFileSource",
+            "sftpFileSource",
+            "sshSession",
+            "x5Device",
+            "i2cTransfer",
+            "eepromProvision",
         ] {
             assert!(kinds.contains(&expected), "missing node kind {expected}");
         }

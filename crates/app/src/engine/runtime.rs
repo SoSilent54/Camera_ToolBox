@@ -39,9 +39,12 @@ impl OutputRegistry {
         self.ports.get(port).map(Vec::as_slice)
     }
 
-    /// 向输出端口发布数据；无下游或全部通道满时返回 `ChannelFull`。
+    /// 向输出端口发布数据；无下游时视为 no-op 成功（未连接输出是合法状态，不算错误），
+    /// 仅当下游存在但全部通道满时返回 `ChannelFull`。
     pub fn emit(&self, port: &str, packet: DataPacket) -> Result<(), ChannelFull> {
-        let senders = self.ports.get(port).ok_or(ChannelFull)?;
+        let Some(senders) = self.ports.get(port) else {
+            return Ok(());
+        };
         let mut delivered = false;
         for sender in senders {
             if sender
@@ -169,5 +172,34 @@ impl NodeRuntime {
         for handle in self.handles.drain(..) {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::engine::packet::DataPacket;
+
+    #[test]
+    fn emit_without_downstream_is_noop_ok() {
+        let outputs = OutputRegistry::default();
+        let packet = DataPacket::Json(Arc::new(serde_json::json!({})));
+        // 未连接任何下游的输出端口不应被视为错误。
+        assert!(outputs.emit("unconnected", packet).is_ok());
+    }
+
+    #[test]
+    fn emit_delivers_to_connected_downstream() {
+        let mut outputs = OutputRegistry::default();
+        let (tx, rx) = crate::engine::channel::create_mailbox(1);
+        outputs.connect("out".to_owned(), tx);
+        let packet = DataPacket::Json(Arc::new(serde_json::json!({"k": 1})));
+        assert!(outputs.emit("out", packet).is_ok());
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(NodeMessage::Input { port, .. }) if port == "out"
+        ));
     }
 }
