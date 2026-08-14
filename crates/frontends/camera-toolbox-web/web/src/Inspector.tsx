@@ -8,11 +8,14 @@ import {
   previewEepromProvision,
   previewI2cTransfer,
   probeX5Control,
+  runCalibrationSolver,
   runEepromProvision,
   runI2cTransfer,
   startX5RtspChannel,
   statusX5Control,
   stopX5RtspChannel,
+  type CalibrationRequest,
+  type CalibrationSolution,
   type ControlExecutionResult,
   type ControlRequestPreview,
   type EepromInspectResponse,
@@ -118,6 +121,9 @@ export function Inspector({
       )}
       {(node.kind === 'i2cTransfer' || node.kind === 'eepromProvision') && (
         <ControlPreviewPanel node={node} onNodeConfigChange={onNodeConfigChange} />
+      )}
+      {node.kind === 'calibrationSolver' && (
+        <CalibrationSolverPanel node={node} onNodeConfigChange={onNodeConfigChange} />
       )}
       <InspectorEvents events={events} />
       <RuntimeDiagnostics status={runtimeStatus} nodeId={node.id} />
@@ -259,6 +265,99 @@ function RemoteConfigPanel({
         </>
       )}
       <p className="control-confirmation">Connect/list/read is not automatic. Future SFTP execution must bind this node to an explicit SSH runtime session.</p>
+    </section>
+  );
+}
+
+function CalibrationSolverPanel({
+  node,
+  onNodeConfigChange,
+}: {
+  node: WorkflowNode;
+  onNodeConfigChange: (nodeId: string, key: string, value: string | boolean) => void;
+}) {
+  const [imagePointsDraft, setImagePointsDraft] = useState('');
+  const [solution, setSolution] = useState<CalibrationSolution | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    setImagePointsDraft('');
+    setSolution(null);
+    setError(null);
+  }, [node.id]);
+
+  const configValue = (key: string, fallback: string): string => configText(node, key, fallback);
+  const updateConfig = (key: string, value: string) => onNodeConfigChange(node.id, key, value.trim());
+  const buildRequest = (): CalibrationRequest => {
+    const imageWidth = parseControlInteger(configValue('imageWidth', '1920'), 'Image width');
+    const imageHeight = parseControlInteger(configValue('imageHeight', '1080'), 'Image height');
+    const boardCols = parseControlInteger(configValue('boardCols', '8'), 'Board columns');
+    const boardRows = parseControlInteger(configValue('boardRows', '11'), 'Board rows');
+    const squareSizeMm = parseControlFloat(configValue('squareSizeMm', '30'), 'Square size mm');
+    const fx = parseControlFloat(configValue('fx', '900'), 'fx');
+    const fy = parseControlFloat(configValue('fy', '900'), 'fy');
+    const cx = parseControlFloat(configValue('cx', String(imageWidth / 2)), 'cx');
+    const cy = parseControlFloat(configValue('cy', String(imageHeight / 2)), 'cy');
+    return {
+      imageSize: { width: imageWidth, height: imageHeight },
+      board: { innerCols: boardCols, innerRows: boardRows, squareSize: squareSizeMm },
+      imagePoints: parseCalibrationImagePoints(imagePointsDraft),
+      initialIntrinsics: {
+        cameraMatrix: [fx, 0, cx, 0, fy, cy, 0, 0, 1],
+        distortionCoefficients: calibrationDistortionCoefficients(node),
+      },
+    };
+  };
+  const runSolver = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      setSolution(await runCalibrationSolver(buildRequest()));
+    } catch (solverError) {
+      setSolution(null);
+      setError(solverError instanceof Error ? solverError.message : String(solverError));
+    } finally {
+      setLoading(false);
+    }
+  };
+  return (
+    <section className="control-preview">
+      <h3>Calibration solver runtime</h3>
+      <p className="muted">Solver 只通过 HTTP/JSON 手动触发；imagePoints dataset 和 solution 只保留在当前 Inspector 运行态，不写入 WorkflowGraph。</p>
+      <ControlConfigField id={`${node.id}-board-cols`} label="Board inner cols" value={configValue('boardCols', '8')} onChange={(value) => updateConfig('boardCols', value)} />
+      <ControlConfigField id={`${node.id}-board-rows`} label="Board inner rows" value={configValue('boardRows', '11')} onChange={(value) => updateConfig('boardRows', value)} />
+      <ControlConfigField id={`${node.id}-square-size`} label="Square size mm" value={configValue('squareSizeMm', '30')} onChange={(value) => updateConfig('squareSizeMm', value)} />
+      <ControlConfigField id={`${node.id}-image-width`} label="Image width" value={configValue('imageWidth', '1920')} onChange={(value) => updateConfig('imageWidth', value)} />
+      <ControlConfigField id={`${node.id}-image-height`} label="Image height" value={configValue('imageHeight', '1080')} onChange={(value) => updateConfig('imageHeight', value)} />
+      <ControlConfigField id={`${node.id}-fx`} label="fx" value={configValue('fx', '900')} onChange={(value) => updateConfig('fx', value)} />
+      <ControlConfigField id={`${node.id}-fy`} label="fy" value={configValue('fy', '900')} onChange={(value) => updateConfig('fy', value)} />
+      <ControlConfigField id={`${node.id}-cx`} label="cx" value={configValue('cx', '960')} onChange={(value) => updateConfig('cx', value)} />
+      <ControlConfigField id={`${node.id}-cy`} label="cy" value={configValue('cy', '540')} onChange={(value) => updateConfig('cy', value)} />
+      <ControlConfigField id={`${node.id}-distortion`} label="D coefficients" value={calibrationDistortionText(node)} onChange={(value) => updateConfig('distortionCoefficients', value)} />
+      <label className="field-label" htmlFor={`${node.id}-image-points`}>
+        imagePoints JSON
+        <textarea
+          id={`${node.id}-image-points`}
+          className="inspector-input control-textarea"
+          value={imagePointsDraft}
+          placeholder={'[[{"x":120.5,"y":80.0}], [{"x":118.0,"y":82.0}]]'}
+          onChange={(event) => setImagePointsDraft(event.currentTarget.value)}
+        />
+      </label>
+      <div className="inspector-actions">
+        <button type="button" onClick={() => void runSolver()} disabled={loading}>{loading ? 'Solving…' : 'Run solver'}</button>
+      </div>
+      {error && <p className="control-preview-error">Calibration solver rejected: {error}</p>}
+      {solution && (
+        <div className="control-preview-result">
+          <KeyValue label="RMS" value={solution.rmsError.toFixed(4)} />
+          <KeyValue label="Views" value={String(solution.views.length)} />
+          <KeyValue label="Image size" value={`${solution.imageSize.width}x${solution.imageSize.height}`} />
+          <KeyValue label="Flags" value={String(solution.calibrationFlags)} />
+          <pre>{JSON.stringify(solution, null, 2)}</pre>
+        </div>
+      )}
     </section>
   );
 }
@@ -527,6 +626,64 @@ function parseControlInteger(value: string, label: string): number {
   }
   return parsed;
 }
+
+function parseControlFloat(value: string, label: string): number {
+  const parsed = Number(value.trim());
+  if (!Number.isFinite(parsed)) {
+    throw new Error(`${label} must be a finite number`);
+  }
+  return parsed;
+}
+
+function calibrationDistortionText(node: WorkflowNode): string {
+  const value = node.config.distortionCoefficients;
+  if (Array.isArray(value) && value.every((entry) => typeof entry === 'number')) {
+    return value.join(', ');
+  }
+  return configText(node, 'distortionCoefficients', '0,0,0,0,0,0,0,0,0,0,0,0');
+}
+
+function calibrationDistortionCoefficients(node: WorkflowNode): number[] {
+  return parseNumberList(calibrationDistortionText(node), 'D coefficients');
+}
+
+function parseNumberList(value: string, label: string): number[] {
+  const text = value.trim();
+  if (!text) {
+    throw new Error(`${label} must not be empty`);
+  }
+  return text.split(/[\s,]+/).map((token) => parseControlFloat(token, label));
+}
+
+function parseCalibrationImagePoints(value: string): CalibrationRequest['imagePoints'] {
+  const parsed: unknown = JSON.parse(value);
+  if (!Array.isArray(parsed)) {
+    throw new Error('imagePoints must be an array of views');
+  }
+  return parsed.map((view, viewIndex) => {
+    if (!Array.isArray(view)) {
+      throw new Error(`imagePoints[${viewIndex}] must be an array of points`);
+    }
+    return view.map((point, pointIndex) => {
+      if (!isCalibrationPoint(point)) {
+        throw new Error(`imagePoints[${viewIndex}][${pointIndex}] must contain finite x/y numbers`);
+      }
+      return point;
+    });
+  });
+}
+
+function isCalibrationPoint(value: unknown): value is { x: number; y: number } {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+  const record = value as Record<string, unknown>;
+  return typeof record.x === 'number'
+    && Number.isFinite(record.x)
+    && typeof record.y === 'number'
+    && Number.isFinite(record.y);
+}
+
 
 /** 将空格或逗号分隔的字节文本转换为 JSON 数组，避免把原始文本混入请求。 */
 function parseHexPayload(value: string): number[] {

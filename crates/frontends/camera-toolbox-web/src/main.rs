@@ -22,26 +22,29 @@ use axum::{
     routing::{get, post},
 };
 use bytes::Bytes;
+#[cfg(feature = "calibration-opencv")]
+use camera_toolbox_adapters::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::media::{
     FfmpegRtspDecoder, FfmpegRtspTransport, ffmpeg_rtsp::FfmpegRtspDecoderStatsSnapshot,
 };
-#[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::{
     CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, SshConnectionTarget,
     SshEepromProvisionService, SshI2cHelperService, SshTransportFactory,
 };
 use camera_toolbox_adapters::x5_tcp_client;
 use camera_toolbox_app::{
-    DecodedVideoFrame, DumpCancellation, EepromDeviceState, EepromHelperAction, EepromHelperResult,
-    EepromProvisionOperation, EepromProvisionService, EepromProvisionServiceError,
-    EepromSerialState, I2cHelperAction, I2cHelperOperation, I2cHelperResult, I2cHelperService,
-    I2cMessageData, I2cMessageSpec, I2cTransactionSpec, LatestDecodedFrameSlot,
-    RemoteOperationControl, RemoteTimeouts, RtspLatencyMode, StreamCancellation, StreamSessionId,
-    host_monotonic_time_ns, validate_i2c_transfer_transactions,
+    CalibrationBackend, CalibrationCancellation, DecodedVideoFrame, DumpCancellation,
+    EepromDeviceState, EepromHelperAction, EepromHelperResult, EepromProvisionOperation,
+    EepromProvisionService, EepromProvisionServiceError, EepromSerialState, I2cHelperAction,
+    I2cHelperOperation, I2cHelperResult, I2cHelperService, I2cMessageData, I2cMessageSpec,
+    I2cTransactionSpec, LatestDecodedFrameSlot, RemoteOperationControl, RemoteTimeouts,
+    RtspLatencyMode, StreamCancellation, StreamSessionId, host_monotonic_time_ns,
+    validate_i2c_transfer_transactions,
 };
 use camera_toolbox_core::{
-    EepromProvisionRequest, EepromProvisioningMode, EepromWriteSegment,
-    YG_STEREO_P24C64G_INTRINSICS_BYTES, YG_STEREO_P24C64G_V1_MAP_ID,
+    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
+    EepromProvisionRequest, EepromProvisioningMode, EepromWriteSegment, InitialIntrinsics,
+    ViewCalibrationResult, YG_STEREO_P24C64G_INTRINSICS_BYTES, YG_STEREO_P24C64G_V1_MAP_ID,
 };
 use clap::Parser;
 use image::{ColorType, codecs::jpeg::JpegEncoder};
@@ -85,6 +88,8 @@ struct AppState {
     workflow_store: Arc<WorkflowStore>,
     runtime_sessions: Arc<Mutex<HashMap<String, RuntimeGraphSession>>>,
     control_runtime: Arc<ControlRuntime>,
+    #[cfg(feature = "calibration-opencv")]
+    calibration_backend: Arc<dyn CalibrationBackend>,
     eeprom_inspects: Arc<Mutex<HashMap<String, EepromInspectSnapshot>>>,
 }
 
@@ -937,6 +942,82 @@ struct X5SnapshotRequest {
     #[serde(default)]
     rtsp_pts_tolerance_90k: Option<u64>,
 }
+#[cfg(feature = "calibration-opencv")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CalibrationSolverRequest {
+    image_size: CalibrationImageSize,
+    board: CalibrationBoardSpec,
+    image_points: Vec<Vec<CalibrationPoint>>,
+    initial_intrinsics: CalibrationInitialIntrinsics,
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CalibrationBoardSpec {
+    inner_cols: u16,
+    inner_rows: u16,
+    square_size: f64,
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct CalibrationInitialIntrinsics {
+    camera_matrix: [f64; 9],
+    distortion_coefficients: Vec<f64>,
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalibrationSolverResponse {
+    image_size: CalibrationImageSize,
+    camera_matrix: [f64; 9],
+    distortion_coefficients: Vec<f64>,
+    rms_error: f64,
+    calibration_flags: i32,
+    views: Vec<CalibrationViewResult>,
+}
+
+#[cfg(feature = "calibration-opencv")]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CalibrationViewResult {
+    rotation_vector: [f64; 3],
+    translation_vector: [f64; 3],
+    projected_points: Vec<CalibrationPoint>,
+    reprojection_rmse: f64,
+    max_reprojection_error: f64,
+}
+
+#[cfg(feature = "calibration-opencv")]
+impl From<ViewCalibrationResult> for CalibrationViewResult {
+    fn from(view: ViewCalibrationResult) -> Self {
+        Self {
+            rotation_vector: view.rotation_vector,
+            translation_vector: view.translation_vector,
+            projected_points: view.projected_points,
+            reprojection_rmse: view.reprojection_rmse,
+            max_reprojection_error: view.max_reprojection_error,
+        }
+    }
+}
+
+#[cfg(feature = "calibration-opencv")]
+impl From<CalibrationSolution> for CalibrationSolverResponse {
+    fn from(solution: CalibrationSolution) -> Self {
+        Self {
+            image_size: solution.image_size,
+            camera_matrix: solution.camera_matrix,
+            distortion_coefficients: solution.distortion_coefficients,
+            rms_error: solution.rms_error,
+            calibration_flags: solution.calibration_flags,
+            views: solution.views.into_iter().map(Into::into).collect(),
+        }
+    }
+}
 
 fn default_x5_tcp_port() -> u16 {
     9073
@@ -1206,6 +1287,8 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         workflow_store: Arc::new(WorkflowStore { dir: workflow_dir }),
         runtime_sessions: Arc::new(Mutex::new(HashMap::new())),
         control_runtime: Arc::new(ControlRuntime::production()),
+        #[cfg(feature = "calibration-opencv")]
+        calibration_backend: Arc::new(OpenCvCalibrationBackend),
         eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
     };
 
@@ -1237,6 +1320,10 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
             post(inspect_eeprom_provision),
         )
         .route("/api/control/i2c/run", post(run_i2c_transfer))
+        .route(
+            "/api/control/calibration/solver/run",
+            post(run_calibration_solver),
+        )
         .route("/api/control/eeprom/run", post(run_eeprom_provision))
         .route(
             "/api/control/eeprom/preview",
@@ -1767,6 +1854,49 @@ async fn run_eeprom_provision(
     }))
 }
 
+#[cfg(feature = "calibration-opencv")]
+async fn run_calibration_solver(
+    State(state): State<AppState>,
+    Json(request): Json<CalibrationSolverRequest>,
+) -> std::result::Result<Json<CalibrationSolverResponse>, PreviewApiError> {
+    let request = into_calibration_request(request)?;
+    let cancellation = CalibrationCancellation::default();
+    let solution = state
+        .calibration_backend
+        .calibrate(&request, &cancellation)
+        .map_err(|error| PreviewApiError::bad_request(error.to_string()))?;
+    Ok(Json(CalibrationSolverResponse::from(solution)))
+}
+
+#[cfg(feature = "calibration-opencv")]
+fn into_calibration_request(
+    request: CalibrationSolverRequest,
+) -> std::result::Result<CalibrationRequest, PreviewApiError> {
+    let image_size = CalibrationImageSize::new(request.image_size.width, request.image_size.height)
+        .map_err(|error| {
+            PreviewApiError::bad_request(format!("invalid calibration imageSize: {error}"))
+        })?;
+    let board = BoardSpec::new(
+        request.board.inner_cols,
+        request.board.inner_rows,
+        request.board.square_size,
+    )
+    .map_err(|error| PreviewApiError::bad_request(format!("invalid calibration board: {error}")))?;
+    let calibration_request = CalibrationRequest {
+        image_size,
+        board,
+        image_points: request.image_points,
+        initial_intrinsics: InitialIntrinsics {
+            camera_matrix: request.initial_intrinsics.camera_matrix,
+            distortion_coefficients: request.initial_intrinsics.distortion_coefficients,
+        },
+    };
+    calibration_request.validate().map_err(|error| {
+        PreviewApiError::bad_request(format!("invalid calibration solver request: {error}"))
+    })?;
+    Ok(calibration_request)
+}
+
 fn build_i2c_preview(
     request: I2cPreviewRequest,
 ) -> std::result::Result<ControlPreview, PreviewApiError> {
@@ -2291,6 +2421,8 @@ mod tests {
                 transport,
                 Arc::<[u8]>::from(b"test-helper".as_slice()),
             )),
+            #[cfg(feature = "calibration-opencv")]
+            calibration_backend: Arc::new(OpenCvCalibrationBackend),
             eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -2468,6 +2600,36 @@ mod tests {
             panic!("expected second page write");
         };
         assert_eq!(bytes, &[0x00, 0x10, 0xcc, 0xdd]);
+    }
+
+    #[cfg(feature = "calibration-opencv")]
+    #[test]
+    fn calibration_solver_request_is_validated_and_preserves_intrinsics() {
+        let request = CalibrationSolverRequest {
+            image_size: CalibrationImageSize {
+                width: 1920,
+                height: 1080,
+            },
+            board: CalibrationBoardSpec {
+                inner_cols: 8,
+                inner_rows: 11,
+                square_size: 30.0,
+            },
+            image_points: vec![vec![CalibrationPoint { x: 12.5, y: 34.5 }; 88]],
+            initial_intrinsics: CalibrationInitialIntrinsics {
+                camera_matrix: [1234.0, 0.0, 960.0, 0.0, 1234.0, 540.0, 0.0, 0.0, 1.0],
+                distortion_coefficients: vec![0.0; 12],
+            },
+        };
+
+        let request = into_calibration_request(request).expect("valid calibration request");
+
+        assert_eq!(request.image_size.width, 1920);
+        assert_eq!(request.board.inner_cols, 8);
+        assert_eq!(request.board.inner_rows, 11);
+        assert_eq!(request.image_points.len(), 1);
+        assert_eq!(request.initial_intrinsics.camera_matrix[0], 1234.0);
+        assert_eq!(request.initial_intrinsics.distortion_coefficients.len(), 12);
     }
 
     #[test]

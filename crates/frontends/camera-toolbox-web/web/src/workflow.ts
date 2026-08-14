@@ -195,6 +195,50 @@ export interface EepromExecuteRequest extends EepromPreviewRequest {
   expectedBeforeSha256?: string;
   ssh: SshExecutionBinding;
 }
+export interface CalibrationImageSize {
+  width: number;
+  height: number;
+}
+
+export interface BoardSpec {
+  innerCols: number;
+  innerRows: number;
+  squareSize: number;
+}
+
+export interface CalibrationPoint {
+  x: number;
+  y: number;
+}
+
+export interface InitialIntrinsics {
+  cameraMatrix: number[];
+  distortionCoefficients: number[];
+}
+
+export interface CalibrationRequest {
+  imageSize: CalibrationImageSize;
+  board: BoardSpec;
+  imagePoints: CalibrationPoint[][];
+  initialIntrinsics: InitialIntrinsics;
+}
+
+export interface ViewCalibrationResult {
+  rotationVector: number[];
+  translationVector: number[];
+  projectedPoints: CalibrationPoint[];
+  reprojectionRmse: number;
+  maxReprojectionError: number;
+}
+
+export interface CalibrationSolution {
+  imageSize: CalibrationImageSize;
+  cameraMatrix: number[];
+  distortionCoefficients: number[];
+  rmsError: number;
+  calibrationFlags: number;
+  views: ViewCalibrationResult[];
+}
 
 export interface X5BindingRequest {
   host: string;
@@ -222,7 +266,6 @@ export interface X5SnapshotRequest extends X5BindingRequest {
 }
 
 export type X5ControlResponse = Record<string, unknown>;
-
 
 export interface EepromInspectResponse {
   preview: ControlRequestPreview;
@@ -348,7 +391,6 @@ export async function deleteWorkflow(id: string): Promise<void> {
   }
 }
 
-
 export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
   const response = await fetch(`/api/workflows/${encodeURIComponent(graph.id)}/validate`, {
     method: 'POST',
@@ -359,6 +401,7 @@ export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
     throw new Error(await response.text());
   }
 }
+
 export interface RuntimeGraphStatus {
   graphId: string;
   running: boolean;
@@ -393,6 +436,10 @@ export async function runEepromProvision(request: EepromExecuteRequest): Promise
   return postJson('/api/control/eeprom/run', request);
 }
 
+/** 手动触发一次标定求解；请求体只包含原始 CalibrationRequest，不持久化到 WorkflowGraph。 */
+export async function runCalibrationSolver(request: CalibrationRequest): Promise<CalibrationSolution> {
+  return postJson('/api/control/calibration/solver/run', request);
+}
 
 /** X5 TCP 控制面只在显式按钮触发时连接设备；host/port 来自节点轻量配置。 */
 export async function probeX5Control(request: X5BindingRequest): Promise<X5ControlResponse> {
@@ -475,3 +522,4 @@ async function postJson<T>(url: string, body?: unknown): Promise<T> {
   }
   return (await response.json()) as T;
 }
+

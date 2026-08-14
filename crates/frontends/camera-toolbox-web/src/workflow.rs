@@ -752,11 +752,11 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             vec![
                 port(
                     "image",
-                    "Image",
+                    "Video Frames",
                     PortDirection::Input,
-                    PortKind::ImageFrame,
-                    "image.frame.v1",
-                    Some(PortRole::Image),
+                    PortKind::StreamVideoFrame,
+                    "stream.video-frame.v1",
+                    Some(PortRole::Stream),
                 ),
                 port(
                     "detection",
@@ -933,7 +933,20 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "calib.solution.v1",
                 Some(PortRole::Solution),
             )],
-            json!({"model": "pinhole", "trigger": "manual"}),
+            json!({
+                "model": "pinhole",
+                "trigger": "manual",
+                "boardCols": 8,
+                "boardRows": 11,
+                "squareSizeMm": 30.0,
+                "imageWidth": 1920,
+                "imageHeight": 1080,
+                "fx": 1234.56,
+                "fy": 1234.56,
+                "cx": 960.0,
+                "cy": 540.0,
+                "distortionCoefficients": vec![0.0; 12],
+            }),
         ),
         NodeKind::ReprojectionInspector => (
             NodeCategory::Calibration,
@@ -1162,7 +1175,7 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
         WorkmodeTemplate {
             id: "calibration",
             title: "Calibration",
-            description: "RTSP → Detector → Dataset/Coverage/AutoCapture/Solver",
+            description: "RTSP → Decoder → Detector → Dataset / Coverage / AutoCapture / Reprojection / Export / Solver",
             graph: calibration_template_graph(),
         },
         WorkmodeTemplate {
@@ -1692,7 +1705,7 @@ fn local_image_template_graph() -> WorkflowGraph {
 }
 
 fn calibration_template_graph() -> WorkflowGraph {
-    let mut nodes = vec![
+    let nodes = vec![
         workflow_node(
             "calib-rtsp-source",
             NodeKind::RtspSource,
@@ -1709,38 +1722,56 @@ fn calibration_template_graph() -> WorkflowGraph {
             "calib-detector",
             NodeKind::ChessboardDetector,
             "Chessboard Detector",
-            NodePosition { x: 600.0, y: 100.0 },
+            NodePosition { x: 620.0, y: 120.0 },
         ),
         workflow_node(
             "calib-dataset",
             NodeKind::DatasetCollector,
             "Dataset Collector",
-            NodePosition { x: 900.0, y: 80.0 },
+            NodePosition { x: 940.0, y: 80.0 },
         ),
         workflow_node(
             "calib-coverage",
             NodeKind::CoverageAnalyzer,
             "Coverage Analyzer",
-            NodePosition { x: 1180.0, y: 80.0 },
+            NodePosition { x: 1240.0, y: 80.0 },
         ),
         workflow_node(
             "calib-solver",
             NodeKind::CalibrationSolver,
             "Calibration Solver",
-            NodePosition { x: 1460.0, y: 80.0 },
+            NodePosition { x: 1540.0, y: 80.0 },
+        ),
+        workflow_node(
+            "calib-reprojection",
+            NodeKind::ReprojectionInspector,
+            "Reprojection Inspector",
+            NodePosition {
+                x: 1540.0,
+                y: 300.0,
+            },
+        ),
+        workflow_node(
+            "calib-export",
+            NodeKind::CalibrationExport,
+            "Calibration Export",
+            NodePosition {
+                x: 1540.0,
+                y: 520.0,
+            },
         ),
         workflow_node(
             "calib-scorer",
             NodeKind::CaptureScorer,
             "Capture Scorer",
-            NodePosition { x: 900.0, y: 300.0 },
+            NodePosition { x: 940.0, y: 300.0 },
         ),
         workflow_node(
             "calib-autocapture",
             NodeKind::AutoCaptureController,
             "Auto Capture",
             NodePosition {
-                x: 1180.0,
+                x: 1240.0,
                 y: 300.0,
             },
         ),
@@ -1749,20 +1780,26 @@ fn calibration_template_graph() -> WorkflowGraph {
             NodeKind::PoseGuide,
             "Pose Guide",
             NodePosition {
-                x: 1460.0,
+                x: 1540.0,
                 y: 300.0,
             },
         ),
+        workflow_node(
+            "calib-overlay",
+            NodeKind::OverlayComposer,
+            "Overlay Composer",
+            NodePosition { x: 940.0, y: 520.0 },
+        ),
+        workflow_node(
+            "calib-viewer",
+            NodeKind::Viewer,
+            "Viewer",
+            NodePosition {
+                x: 1240.0,
+                y: 520.0,
+            },
+        ),
     ];
-    nodes.push(workflow_node(
-        "calib-viewer",
-        NodeKind::Viewer,
-        "Viewer",
-        NodePosition {
-            x: 1180.0,
-            y: 520.0,
-        },
-    ));
     graph(
         "camera-toolbox-calibration-template",
         "Calibration Workspace",
@@ -1787,10 +1824,28 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "stream.video-frame.v1",
             ),
             edge(
+                "calib-e-decoder-dataset-image",
+                "calib-decoder",
+                "frames",
+                "calib-dataset",
+                "image",
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
+            ),
+            edge(
                 "calib-e-detection-dataset",
                 "calib-detector",
                 "detection",
                 "calib-dataset",
+                "detection",
+                PortKind::CalibDetection,
+                "calib.detection.v1",
+            ),
+            edge(
+                "calib-e-detection-scorer",
+                "calib-detector",
+                "detection",
+                "calib-scorer",
                 "detection",
                 PortKind::CalibDetection,
                 "calib.detection.v1",
@@ -1814,13 +1869,22 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "calib.dataset.v1",
             ),
             edge(
-                "calib-e-detection-scorer",
-                "calib-detector",
-                "detection",
+                "calib-e-dataset-reprojection",
+                "calib-dataset",
+                "dataset",
+                "calib-reprojection",
+                "dataset",
+                PortKind::CalibDataset,
+                "calib.dataset.v1",
+            ),
+            edge(
+                "calib-e-coverage-scorer",
+                "calib-coverage",
+                "coverage",
                 "calib-scorer",
-                "detection",
-                PortKind::CalibDetection,
-                "calib.detection.v1",
+                "coverage",
+                PortKind::CalibCoverage,
+                "calib.coverage.v1",
             ),
             edge(
                 "calib-e-score-autocapture",
@@ -1848,6 +1912,69 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "target",
                 PortKind::CaptureTarget,
                 "capture.target.v1",
+            ),
+            edge(
+                "calib-e-solver-reprojection",
+                "calib-solver",
+                "solution",
+                "calib-reprojection",
+                "solution",
+                PortKind::CalibSolution,
+                "calib.solution.v1",
+            ),
+            edge(
+                "calib-e-solver-export",
+                "calib-solver",
+                "solution",
+                "calib-export",
+                "solution",
+                PortKind::CalibSolution,
+                "calib.solution.v1",
+            ),
+            edge(
+                "calib-e-video-overlay",
+                "calib-detector",
+                "overlay",
+                "calib-overlay",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
+            ),
+            edge(
+                "calib-e-coverage-overlay",
+                "calib-coverage",
+                "overlay",
+                "calib-overlay",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
+            ),
+            edge(
+                "calib-e-reprojection-overlay",
+                "calib-reprojection",
+                "overlay",
+                "calib-overlay",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
+            ),
+            edge(
+                "calib-e-pose-overlay",
+                "calib-pose-guide",
+                "overlay",
+                "calib-overlay",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
+            ),
+            edge(
+                "calib-e-overlay-viewer",
+                "calib-overlay",
+                "scene",
+                "calib-viewer",
+                "scene",
+                PortKind::ViewerScene,
+                "viewer.scene.v1",
             ),
         ],
     )
@@ -2135,6 +2262,60 @@ mod tests {
         };
         graph.edges.push(bad.clone());
         assert!(validate_edge(&graph, &bad).is_err());
+    }
+
+    #[test]
+    fn calibration_template_contains_full_dataset_chain() {
+        let graph = calibration_template_graph();
+        validate_workflow(&graph).expect("calibration template is valid");
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::DatasetCollector)
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::ReprojectionInspector)
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::CalibrationExport)
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::OverlayComposer)
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id == "calib-e-decoder-dataset-image")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id == "calib-e-solver-reprojection")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id == "calib-e-solver-export")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id == "calib-e-overlay-viewer")
+        );
     }
 
     #[test]
