@@ -1,4 +1,25 @@
 //! 引擎内置节点实现。
+//!
+//! # 节点开发范式
+//!
+//! 新增一个节点（以「源/转换/按钮/自动」四类之一）的固定步骤：
+//!
+//! 1. 新建 `nodes/<name>.rs`，实现 `NodeFactory`（kind + `instantiate`）与 `NodeInstance`
+//!    （`on_start` / `on_input` / `on_action` / `on_stop`）。
+//! 2. 在 `register_builtin` 里 `registry.register(Box::new(YourFactory))`。
+//! 3. 若需要新的负载类型，在 `packet.rs` 的 `DataPacket` 增加变体。
+//!
+//! 四类节点触发语义（范式样板）：
+//!
+//! | 类别 | 样板 | 触发方式 | 关键方法 |
+//! |---|---|---|---|
+//! | 源 source | `rtsp_source.rs` | `on_action(Connect)` 启动生产循环 | `on_action` + `spawn` |
+//! | 转换 transform | `transform.rs` | 输入触发：`on_input` 变换后 `emit` | `on_input` |
+//! | 按钮 action | `calibration_solver.rs` | `on_action(Trigger)` 一次执行 | `on_action` + `services` |
+//! | 自动 auto | `auto_capture.rs` | `Arm` 后条件自动触发 | `on_action` + `on_input` |
+//!
+//! 节点只依赖 `NodeRuntime`（`emit`/`report_state`/`report_event`/`spawn`）与
+//! `EngineServices` 的 trait；外部 IO（RTSP/SSH/X5/标定）一律经服务注入，不在节点内构造具体适配器。
 
 pub mod auto_capture;
 pub mod calibration_solver;

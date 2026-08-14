@@ -478,6 +478,38 @@ export async function stopWorkflowRuntime(graphId: string): Promise<RuntimeGraph
   return postJson(`/api/workflows/${encodeURIComponent(graphId)}/runtime/stop`);
 }
 
+/** 引擎节点状态快照。 */
+export interface EngineNodeStatus {
+  nodeId: string;
+  state: 'disabled' | 'idle' | 'ready' | 'running' | 'error';
+  diagnostic: string;
+}
+
+/** 装载工作流图进数据流引擎（替换旧图）。 */
+export async function runEngine(graph: WorkflowGraph): Promise<{ running: boolean; nodes: number }> {
+  return postJson('/api/runtime/run', graph);
+}
+
+/** 停止并卸载引擎图。 */
+export async function stopEngine(): Promise<{ running: boolean }> {
+  return postJson('/api/runtime/stop');
+}
+
+/** 向引擎节点投递动作（connect/disconnect/trigger/arm/disarm）。 */
+export async function nodeAction(nodeId: string, action: string): Promise<{ ok: boolean }> {
+  return postJson(`/api/runtime/nodes/${encodeURIComponent(nodeId)}/action`, { action });
+}
+
+/** 非阻塞取回引擎节点状态更新。 */
+export async function fetchEngineStatus(): Promise<EngineNodeStatus[]> {
+  return fetchJson('/api/runtime/status');
+}
+
+/** viewer 节点最新帧的 JPEG 地址（可直接作为 <img> src）。 */
+export function viewerFrameUrl(nodeId: string): string {
+  return `/api/runtime/viewer/${encodeURIComponent(nodeId)}/frame`;
+}
+
 /** 请求服务器校验 I²C 配置并返回预览；该端点不执行任何 I/O。 */
 export async function previewI2cTransfer(request: I2cPreviewRequest): Promise<ControlRequestPreview> {
   return postJson('/api/control/i2c/preview', request);
