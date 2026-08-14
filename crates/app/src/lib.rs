@@ -2,6 +2,7 @@
 
 pub mod asset;
 pub mod calibration;
+pub mod engine;
 pub mod export;
 pub mod filesystem;
 pub mod image_io;
