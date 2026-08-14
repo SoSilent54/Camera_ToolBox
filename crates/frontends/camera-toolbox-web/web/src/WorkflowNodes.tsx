@@ -1,6 +1,6 @@
-import { useEffect, useRef, useState } from 'react';
-import { Handle, Position, type NodeProps } from '@xyflow/react';
-import type { FlowNodeData, NodeDefinition, NodeKind, WorkflowNode } from './workflow';
+import { useEffect, useRef, useState, type DragEvent } from 'react';
+import { Handle, NodeResizer, Position, type NodeProps } from '@xyflow/react';
+import type { FlowNodeData, NodeDefinition, NodeKind, PortKind, WorkflowNode } from './workflow';
 import { configText, normalizeSourcePathDraft } from './nodeConfig';
 
 const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
@@ -15,6 +15,7 @@ export function RtspSourceNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-url`}>RTSP URL</label>
         <input
@@ -33,7 +34,6 @@ export function RtspSourceNode({ data, selected }: NodeProps) {
         />
         <span>Transport: {String(node.config.transport ?? 'tcp')}</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -48,6 +48,7 @@ export function LocalWorkspaceNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-root`}>Workspace root</label>
         <input
@@ -67,7 +68,6 @@ export function LocalWorkspaceNode({ data, selected }: NodeProps) {
         />
         <span>Explicit root; directories are never scanned.</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -83,6 +83,7 @@ export function SftpWorkspaceNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-remote-root`}>Remote root</label>
         <input
@@ -103,7 +104,6 @@ export function SftpWorkspaceNode({ data, selected }: NodeProps) {
         <span>Source ID: {sourceId}</span>
         <span>Session-bound; no password or directory cache is persisted.</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -122,6 +122,7 @@ export function FileBrowserNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-directory`}>Directory</label>
         <input
@@ -157,7 +158,6 @@ export function FileBrowserNode({ data, selected }: NodeProps) {
         />
         <span>Manual file ref selection; listing runtime is intentionally separate.</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -171,13 +171,13 @@ export function SshSessionNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body compact">
         <span>Profile: {profileId || 'manual'}</span>
         <span>Host: {host || 'unset'}</span>
         <span>User: {username}</span>
         <span>Auto: {String(node.config.autoConnect === true)}</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -188,12 +188,12 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body compact">
         <span>Host: {configText(node, 'host', '10.21.12.108')}</span>
         <span>TCP: {configText(node, 'tcpPort', '9073')}</span>
         <span>Control: X5 TCP + RTSP channel catalog</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -204,12 +204,12 @@ export function X5RtspChannelNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body compact">
         <span>Channel: {configText(node, 'channel', '0')}</span>
         <span>Path: {configText(node, 'path', '/PRR')}</span>
         <span>Source: X5 device RTSP endpoint</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -220,12 +220,12 @@ export function X5SnapshotNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body compact">
         <span>Mode: {configText(node, 'mode', 'latest')}</span>
         <span>Capture: X5 TCP snapshot</span>
         <span>Output: image frame</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -240,6 +240,7 @@ export function ImageFileSourceNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-relative-path`}>Image path</label>
         <input
@@ -259,7 +260,6 @@ export function ImageFileSourceNode({ data, selected }: NodeProps) {
         />
         <span>Path is relative to the connected workspace/file ref.</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -269,13 +269,13 @@ export function GenericWorkflowNode({ data, selected }: NodeProps) {
   return (
     <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       <div className="node-body compact">
         <span>Kind: {node.kind}</span>
         <span>Category: {node.category}</span>
         <span>In: {node.inputs.length}</span>
         <span>Out: {node.outputs.length}</span>
       </div>
-      <PortHandles node={node} />
     </section>
   );
 }
@@ -284,48 +284,69 @@ export function GenericWorkflowNode({ data, selected }: NodeProps) {
 
 function PortHandles({ node }: { node: WorkflowNode }) {
   return (
-    <>
-      {node.inputs.map((port, index) => (
-        <Handle
-          key={`in-${port.id}`}
-          id={port.id}
-          type="target"
-          position={Position.Left}
-          className="stream-handle"
-          style={{ top: `${portOffset(index, node.inputs.length)}%` }}
-          title={`${port.label}: ${port.kind}`}
-        />
-      ))}
-      {node.outputs.map((port, index) => (
-        <Handle
-          key={`out-${port.id}`}
-          id={port.id}
-          type="source"
-          position={Position.Right}
-          className="stream-handle"
-          style={{ top: `${portOffset(index, node.outputs.length)}%` }}
-          title={`${port.label}: ${port.kind}`}
-        />
-      ))}
-    </>
+    <div className="node-ports">
+      <div className="port-group port-group-inputs">
+        {node.inputs.map((port) => (
+          <div key={`in-${port.id}`} className="port-row port-row-input">
+            <Handle
+              id={port.id}
+              type="target"
+              position={Position.Left}
+              className={`stream-handle ${portKindTone(port.kind)}`}
+              title={`${port.label}: ${port.kind}`}
+            />
+            <span
+              className={`port-label port-label-input ${portKindTone(port.kind)}`}
+              title={`${port.label} · ${port.kind}`}
+            >
+              {port.kind}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="port-group port-group-outputs">
+        {node.outputs.map((port) => (
+          <div key={`out-${port.id}`} className="port-row port-row-output">
+            <span
+              className={`port-label port-label-output ${portKindTone(port.kind)}`}
+              title={`${port.label} · ${port.kind}`}
+            >
+              {port.kind}
+            </span>
+            <Handle
+              id={port.id}
+              type="source"
+              position={Position.Right}
+              className={`stream-handle ${portKindTone(port.kind)}`}
+              title={`${port.label}: ${port.kind}`}
+            />
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 
-function portOffset(index: number, total: number): number {
-  if (total <= 1) {
-    return 50;
-  }
-  return 24 + (index * 52) / (total - 1);
+function portKindTone(kind: PortKind): string {
+  if (kind.startsWith('workspace') || kind.startsWith('file')) return 'port-tone-workspace';
+  if (kind.startsWith('control')) return 'port-tone-control';
+  if (kind.startsWith('endpoint') || kind.startsWith('stream')) return 'port-tone-media';
+  if (kind.startsWith('image') || kind.startsWith('layer') || kind.startsWith('viewer')) return 'port-tone-image';
+  if (kind.startsWith('calib') || kind.startsWith('capture') || kind.startsWith('command')) return 'port-tone-calib';
+  if (kind.startsWith('i2c') || kind.startsWith('eeprom')) return 'port-tone-io';
+  if (kind.startsWith('status')) return 'port-tone-status';
+  return 'port-tone-default';
 }
 
-export function ViewerNode({ data, selected }: NodeProps) {
+export function ViewerNode({ data, selected, width, height }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const preview = nodeData.preview;
   return (
-    <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}>
-      <PortHandles node={node} />
+    <section className={`workflow-node viewer-node ${selected ? 'selected' : ''}`} style={{ width, height }}>
+      <NodeResizer isVisible={selected} minWidth={260} minHeight={160} />
       <NodeHeader node={node} />
+      <PortHandles node={node} />
       {preview?.kind === 'rtsp' && (
         <MjpegPreview
           streamUrl={`/api/streams/mjpeg?url=${encodeURIComponent(preview.url)}&width=960&height=540`}
@@ -334,10 +355,6 @@ export function ViewerNode({ data, selected }: NodeProps) {
       )}
       {preview?.kind === 'local-image' && <LocalImagePreview imageUrl={preview.url} />}
       {!preview && <LocalImagePreview imageUrl={undefined} />}
-      <div className="node-body compact">
-        <span>Fit: {String(node.config.fitMode ?? 'contain')}</span>
-        <span>Overlay: {String(node.config.overlay ?? 'status')}</span>
-      </div>
     </section>
   );
 }
@@ -366,63 +383,23 @@ interface MjpegPart {
   consumed: number;
 }
 
-interface ViewerTransform {
-  scale: number;
-  x: number;
-  y: number;
-}
-
 function LocalImagePreview({ imageUrl }: { imageUrl: string | undefined }) {
   const [state, setState] = useState<'empty' | 'loading' | 'ready' | 'error'>(imageUrl ? 'loading' : 'empty');
-  const [transform, setTransform] = useState<ViewerTransform>({ scale: 1, x: 0, y: 0 });
-  const dragStartRef = useRef<{ pointerId: number; x: number; y: number; originX: number; originY: number } | null>(null);
   useEffect(() => {
     setState(imageUrl ? 'loading' : 'empty');
-    setTransform({ scale: 1, x: 0, y: 0 });
   }, [imageUrl]);
-  const zoomBy = (ratio: number) => setTransform((current) => ({ ...current, scale: clamp(current.scale * ratio, 0.25, 4) }));
-  const fit = () => setTransform({ scale: 1, x: 0, y: 0 });
   return (
     <div className="viewer-panel nodrag nopan">
-      <div
-        className={`viewer-preview ${state}`}
-        onWheel={(event) => {
-          event.stopPropagation();
-          event.preventDefault();
-          zoomBy(event.deltaY < 0 ? 1.12 : 0.88);
-        }}
-        onDoubleClick={fit}
-        onPointerDown={(event) => {
-          dragStartRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: transform.x, originY: transform.y };
-          event.currentTarget.setPointerCapture(event.pointerId);
-        }}
-        onPointerMove={(event) => {
-          const drag = dragStartRef.current;
-          if (!drag || drag.pointerId !== event.pointerId) {
-            return;
-          }
-          setTransform((current) => ({ ...current, x: drag.originX + event.clientX - drag.x, y: drag.originY + event.clientY - drag.y }));
-        }}
-        onPointerUp={() => {
-          dragStartRef.current = null;
-        }}
-      >
+      <div className={`viewer-preview ${state}`}>
         {imageUrl && (
           <img
             src={imageUrl}
             alt="Local workspace image preview"
-            style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
             onLoad={() => setState('ready')}
             onError={() => setState('error')}
           />
         )}
         {state !== 'ready' && <div className="preview-grid" />}
-      </div>
-      <div className="viewer-toolbar">
-        <button type="button" onClick={fit}>Fit</button>
-        <button type="button" onClick={() => setTransform((current) => ({ ...current, scale: 1 }))}>1:1</button>
-        <button type="button" onClick={() => zoomBy(1.2)}>Zoom +</button>
-        <button type="button" onClick={() => zoomBy(0.8)}>Zoom -</button>
       </div>
       <div className="viewer-status">
         {state === 'ready' ? 'Local image via guarded workspace endpoint' : state === 'loading' ? 'Loading local image...' : state === 'error' ? 'Local image preview unavailable' : 'Connect a configured local image path'}
@@ -435,10 +412,8 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
   const [streamState, setStreamState] = useState<'connecting' | 'playing' | 'error'>(streamUrl ? 'connecting' : 'error');
   const [frameUrl, setFrameUrl] = useState<string | undefined>();
   const [metrics, setMetrics] = useState<ViewerMetrics>(() => initialViewerMetrics());
-  const [transform, setTransform] = useState<ViewerTransform>({ scale: 1, x: 0, y: 0 });
   const objectUrlRef = useRef<string | undefined>();
   const lastFrameAtRef = useRef<number | null>(null);
-  const dragStartRef = useRef<{ pointerId: number; x: number; y: number; originX: number; originY: number } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -589,67 +564,35 @@ function MjpegPreview({ streamUrl, previewUrl }: { streamUrl: string | undefined
         ? 'Connecting RTSP via internal decoder...'
         : 'Preview stream unavailable';
 
-  const zoomBy = (ratio: number) => setTransform((current) => ({ ...current, scale: clamp(current.scale * ratio, 0.25, 4) }));
-  const fit = () => setTransform({ scale: 1, x: 0, y: 0 });
-
   return (
     <div className="viewer-panel nodrag nopan">
-      <div
-        className={`viewer-preview ${streamState}`}
-        onWheel={(event) => {
-          event.stopPropagation();
-          event.preventDefault();
-          zoomBy(event.deltaY < 0 ? 1.12 : 0.88);
-        }}
-        onDoubleClick={fit}
-        onPointerDown={(event) => {
-          dragStartRef.current = { pointerId: event.pointerId, x: event.clientX, y: event.clientY, originX: transform.x, originY: transform.y };
-          event.currentTarget.setPointerCapture(event.pointerId);
-        }}
-        onPointerMove={(event) => {
-          const drag = dragStartRef.current;
-          if (!drag || drag.pointerId !== event.pointerId) {
-            return;
-          }
-          setTransform((current) => ({ ...current, x: drag.originX + event.clientX - drag.x, y: drag.originY + event.clientY - drag.y }));
-        }}
-        onPointerUp={() => {
-          dragStartRef.current = null;
-        }}
-      >
+      <div className={`viewer-preview ${streamState}`}>
         {frameUrl && (
-          <img
-            src={frameUrl}
-            alt={`Preview from ${previewUrl}`}
-            style={{ transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})` }}
-          />
+          <img src={frameUrl} alt={`Preview from ${previewUrl}`} />
         )}
         {streamState !== 'playing' && <div className="preview-grid" />}
       </div>
-      <div className="viewer-toolbar">
-        <button type="button" onClick={fit}>Fit</button>
-        <button type="button" onClick={() => setTransform((current) => ({ ...current, scale: 1 }))}>1:1</button>
-        <button type="button" onClick={() => zoomBy(1.2)}>Zoom +</button>
-        <button type="button" onClick={() => zoomBy(0.8)}>Zoom -</button>
-      </div>
       <div className="viewer-status">{statusText}</div>
-      <dl className="viewer-metrics">
-        <div><dt>browser</dt><dd>{metrics.streamFps.toFixed(1)} fps</dd></div>
-        <div><dt>sent</dt><dd>{metrics.sentFps.toFixed(1)} fps</dd></div>
-        <div><dt>publish</dt><dd>{metrics.publishFps.toFixed(1)} fps</dd></div>
-        <div><dt>decoded</dt><dd>{metrics.decodedFps.toFixed(1)} fps</dd></div>
-        <div><dt>ui raf</dt><dd>{metrics.renderFps.toFixed(1)} fps</dd></div>
-        <div><dt>parts</dt><dd>{metrics.frameCount}</dd></div>
-        <div><dt>decoded n</dt><dd>{metrics.decoderFrames}</dd></div>
-        <div><dt>jpeg</dt><dd>{formatBytes(metrics.jpegBytes)}</dd></div>
-        <div><dt>bytes</dt><dd>{formatBytes(metrics.bytes)}</dd></div>
-        <div><dt>age</dt><dd>{metrics.lastFrameAgeMs === null ? 'n/a' : `${Math.round(metrics.lastFrameAgeMs)} ms`}</dd></div>
-        <div><dt>enc</dt><dd>{formatMs(metrics.jpegEncodeMs)}</dd></div>
-        <div><dt>codec</dt><dd>{formatMs(metrics.codecMs)}</dd></div>
-        <div><dt>scale</dt><dd>{formatMs(metrics.scaleMs)}</dd></div>
-        <div><dt>copy</dt><dd>{formatMs(metrics.copyMs)}</dd></div>
-        {metrics.error && <div className="metric-error"><dt>error</dt><dd>{metrics.error}</dd></div>}
-      </dl>
+      <details className="viewer-metrics">
+        <summary>Stream metrics</summary>
+        <dl>
+          <div><dt>browser</dt><dd>{metrics.streamFps.toFixed(1)} fps</dd></div>
+          <div><dt>sent</dt><dd>{metrics.sentFps.toFixed(1)} fps</dd></div>
+          <div><dt>publish</dt><dd>{metrics.publishFps.toFixed(1)} fps</dd></div>
+          <div><dt>decoded</dt><dd>{metrics.decodedFps.toFixed(1)} fps</dd></div>
+          <div><dt>ui raf</dt><dd>{metrics.renderFps.toFixed(1)} fps</dd></div>
+          <div><dt>parts</dt><dd>{metrics.frameCount}</dd></div>
+          <div><dt>decoded n</dt><dd>{metrics.decoderFrames}</dd></div>
+          <div><dt>jpeg</dt><dd>{formatBytes(metrics.jpegBytes)}</dd></div>
+          <div><dt>bytes</dt><dd>{formatBytes(metrics.bytes)}</dd></div>
+          <div><dt>age</dt><dd>{metrics.lastFrameAgeMs === null ? 'n/a' : `${Math.round(metrics.lastFrameAgeMs)} ms`}</dd></div>
+          <div><dt>enc</dt><dd>{formatMs(metrics.jpegEncodeMs)}</dd></div>
+          <div><dt>codec</dt><dd>{formatMs(metrics.codecMs)}</dd></div>
+          <div><dt>scale</dt><dd>{formatMs(metrics.scaleMs)}</dd></div>
+          <div><dt>copy</dt><dd>{formatMs(metrics.copyMs)}</dd></div>
+          {metrics.error && <div className="metric-error"><dt>error</dt><dd>{metrics.error}</dd></div>}
+        </dl>
+      </details>
     </div>
   );
 }
@@ -779,15 +722,28 @@ function NodeHeader({ node }: { node: WorkflowNode }) {
   );
 }
 
-export function NodeLibraryItem({ definition, onAdd }: { definition: NodeDefinition; onAdd: (kind: NodeKind) => void }) {
+export function NodeLibraryItem({
+  definition,
+  onAdd,
+  onDragStart,
+}: {
+  definition: NodeDefinition;
+  onAdd: (kind: NodeKind) => void;
+  onDragStart: (event: DragEvent<HTMLElement>, kind: NodeKind) => void;
+}) {
   return (
-    <button className="library-item" type="button" onClick={() => onAdd(definition.kind)}>
+    <button
+      className="library-item"
+      draggable
+      type="button"
+      title={`拖拽或点击添加：${definition.title}`}
+      onClick={() => onAdd(definition.kind)}
+      onDragStart={(event) => onDragStart(event, definition.kind)}
+      onDragEnd={(event) => event.currentTarget.blur()}
+    >
       <strong>{definition.title}</strong>
       <span>{definition.description}</span>
+      <code>{definition.kind}</code>
     </button>
   );
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
 }

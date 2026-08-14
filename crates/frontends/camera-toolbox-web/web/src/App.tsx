@@ -1,6 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent, type MouseEvent as ReactMouseEvent } from 'react';
 import {
   Background,
+  BackgroundVariant,
   Controls,
   MiniMap,
   Panel,
@@ -22,31 +23,26 @@ import {
   labelForPortKind,
   listWorkflows,
   loadNodeCatalog,
-  loadRuntimeStatus,
   loadSavedWorkflow,
   loadWorkflow,
   loadWorkmodeTemplates,
-  previewEepromProvision,
-  previewI2cTransfer,
   runWorkflowRuntime,
   saveWorkflow,
   stopWorkflowRuntime,
-  type ControlRequestPreview,
+  validateConnectionKinds,
   type FlowEdgeData,
   type FlowNodeData,
   type NodeDefinition,
   type NodeKind,
+  type NodeRuntimeState,
   type PortKind,
   type RuntimeGraphStatus,
-  type WorkflowEdge,
+  type ViewerPreview,
   type WorkflowGraph,
   type WorkflowNode,
   type WorkflowPort,
   type WorkmodeTemplate,
-  type ViewerPreview,
-  validateConnectionKinds,
 } from './workflow';
-import { Inspector, type Selection } from './Inspector';
 import {
   FileBrowserNode,
   GenericWorkflowNode,
@@ -61,10 +57,12 @@ import {
   X5RtspChannelNode,
   X5SnapshotNode,
 } from './WorkflowNodes';
+import { Inspector, type Selection } from './Inspector';
 
 type FlowNode = Node<FlowNodeData>;
 type FlowEdge = Edge<FlowEdgeData>;
 const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
+const DND_NODE_KIND = 'application/x-camera-toolbox-node-kind';
 const GENERIC_NODE_KINDS: NodeKind[] = [
   'rtspDecoder',
   'frameSampler',
@@ -100,7 +98,10 @@ const nodeTypes = Object.fromEntries([
   ['viewer', ViewerNode],
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
 ]);
+
 export function App() {
+
+
   const [graph, setGraph] = useState<WorkflowGraph | null>(null);
   const [catalog, setCatalog] = useState<NodeDefinition[]>([]);
   const [templates, setTemplates] = useState<WorkmodeTemplate[]>([]);
@@ -111,9 +112,73 @@ export function App() {
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeGraphStatus | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
+  const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
+  const [marquee, setMarquee] = useState<{ x: number; y: number; width: number; height: number } | null>(null);
+  const [historyVersion, setHistoryVersion] = useState(0);
+  const canvasRegionRef = useRef<HTMLElement | null>(null);
+  const marqueeRef = useRef({ startX: 0, startY: 0, curX: 0, curY: 0, active: false });
+  const pastRef = useRef<Array<{ nodes: FlowNode[]; edges: FlowEdge[] }>>([]);
+  const futureRef = useRef<Array<{ nodes: FlowNode[]; edges: FlowEdge[] }>>([]);
+  const nodesRef = useRef<FlowNode[]>(nodes);
+  const edgesRef = useRef<FlowEdge[]>(edges);
 
   const pushEvent = useCallback((event: string) => {
     setEvents((current) => [event, ...current].slice(0, 10));
+  }, []);
+  // 撤销/恢复：nodes/edges 快照同步 + 历史栈
+  useEffect(() => {
+    nodesRef.current = nodes;
+  }, [nodes]);
+
+  useEffect(() => {
+    edgesRef.current = edges;
+  }, [edges]);
+
+  const recordSnapshot = useCallback(() => {
+    pastRef.current.push({ nodes: nodesRef.current, edges: edgesRef.current });
+    if (pastRef.current.length > 50) {
+      pastRef.current.shift();
+    }
+    futureRef.current = [];
+    setHistoryVersion((version) => version + 1);
+  }, []);
+
+  const undo = useCallback(() => {
+    const snapshot = pastRef.current.pop();
+    if (!snapshot) {
+      return;
+    }
+    futureRef.current.push({ nodes: nodesRef.current, edges: edgesRef.current });
+    setNodes(snapshot.nodes);
+    setEdges(snapshot.edges);
+    setSelection({ type: 'none' });
+    setHistoryVersion((version) => version + 1);
+    pushEvent('已撤销');
+  }, [pushEvent, setEdges, setNodes]);
+
+  const redo = useCallback(() => {
+    const snapshot = futureRef.current.pop();
+    if (!snapshot) {
+      return;
+    }
+    pastRef.current.push({ nodes: nodesRef.current, edges: edgesRef.current });
+    setNodes(snapshot.nodes);
+    setEdges(snapshot.edges);
+    setSelection({ type: 'none' });
+    setHistoryVersion((version) => version + 1);
+    pushEvent('已恢复');
+  }, [pushEvent, setEdges, setNodes]);
+
+  const toggleCategory = useCallback((category: string) => {
+    setCollapsedCategories((current) => {
+      const next = new Set(current);
+      if (next.has(category)) {
+        next.delete(category);
+      } else {
+        next.add(category);
+      }
+      return next;
+    });
   }, []);
 
   const applyGraph = useCallback(
@@ -159,6 +224,16 @@ export function App() {
 
   const catalogByKind = useMemo(() => new Map(catalog.map((definition) => [definition.kind, definition])), [catalog]);
 
+  const runtimeNodeStates = useMemo(
+    () => new Map<string, NodeRuntimeState>(runtimeStatus?.nodes.map((node): [string, NodeRuntimeState] => [node.nodeId, node.state]) ?? []),
+    [runtimeStatus],
+  );
+
+  const displayedEdges = useMemo(
+    () => decorateFlowEdges(edges, nodes, runtimeNodeStates),
+    [edges, nodes, runtimeNodeStates],
+  );
+
   const canConnect = useCallback(
     (connection: Connection): { ok: true; port: WorkflowPort } | { ok: false; reason: string } => {
       if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle) {
@@ -193,16 +268,17 @@ export function App() {
         pushEvent(`拒绝连接：${validation.reason}`);
         return;
       }
+      recordSnapshot();
       const edgeId = `edge-${connection.source}-${connection.sourceHandle}-${connection.target}-${connection.targetHandle}`;
       setEdges((current) => {
         const nextEdges = addEdge(
           {
             ...connection,
             id: edgeId,
-            animated: true,
+            animated: false,
             label: labelForPortKind(validation.port.kind),
             data: { kind: validation.port.kind, schema: validation.port.schema },
-            className: 'workflow-edge',
+            className: 'workflow-edge flow-inactive',
           },
           current.filter((edge) => edge.id !== edgeId),
         );
@@ -211,7 +287,7 @@ export function App() {
       });
       pushEvent(`新增连接：${edgeId}`);
     },
-    [canConnect, pushEvent, setEdges, setNodes],
+    [canConnect, pushEvent, recordSnapshot, setEdges, setNodes],
   );
 
   const handleRtspUrlChange = useCallback(
@@ -342,17 +418,59 @@ export function App() {
     )));
   }, [handleLocalImageConfigChange, handleNodeConfigChange, handleRtspUrlChange, nodes.length, setNodes]);
 
-  const handleAddNode = useCallback(
-    (kind: NodeKind) => {
+  const createFlowNodeAt = useCallback(
+    (kind: NodeKind, position: { x: number; y: number }): FlowNode => {
       const definition = catalogByKind.get(kind);
       const count = nodes.filter((node) => node.data.workflowNode.kind === kind).length + 1;
-      const workflowNode = createWorkflowNode(kind, count, { x: 96 + (nodes.length % 4) * 56, y: 96 + nodes.length * 36 }, definition);
-      const flowNode = toFlowNode(workflowNode);
-      setNodes((current) => withViewerPreviews([...current, flowNode], edges));
-      setSelection({ type: 'node', node: workflowNode });
-      pushEvent(`新增节点：${workflowNode.title}`);
+      return toFlowNode(createWorkflowNode(kind, count, position, definition));
     },
-    [catalogByKind, edges, nodes, pushEvent, setNodes],
+    [catalogByKind, nodes],
+  );
+
+  const insertFlowNode = useCallback(
+    (flowNode: FlowNode, source: 'click' | 'drag') => {
+      recordSnapshot();
+      setNodes((current) => withViewerPreviews([...current, flowNode], edges));
+      setSelection({ type: 'node', node: flowNode.data.workflowNode });
+      pushEvent(`${source === 'drag' ? '拖入' : '新增'}节点：${flowNode.data.workflowNode.title}`);
+    },
+    [edges, pushEvent, recordSnapshot, setNodes],
+  );
+
+  const handleAddNode = useCallback(
+    (kind: NodeKind) => {
+      const viewportCenter = flowInstanceRef.current?.screenToFlowPosition({ x: window.innerWidth * 0.5, y: window.innerHeight * 0.5 })
+        ?? { x: 96 + (nodes.length % 4) * 56, y: 96 + nodes.length * 36 };
+      insertFlowNode(createFlowNodeAt(kind, viewportCenter), 'click');
+    },
+    [createFlowNodeAt, insertFlowNode, nodes.length],
+  );
+
+  const handleDragNodeStart = useCallback((event: DragEvent<HTMLElement>, kind: NodeKind) => {
+    event.dataTransfer.setData(DND_NODE_KIND, kind);
+    event.dataTransfer.effectAllowed = 'copy';
+  }, []);
+
+  const handleDragNodeOver = useCallback((event: DragEvent<HTMLElement>) => {
+    // 无条件 preventDefault：这是 React Flow 官方的拖放写法，避免依赖
+    // DataTransfer.types.includes 在不同浏览器（DOMStringList vs FrozenArray）上的差异。
+    // 真正校验（kind 是否来自节点库）放在 handleDropNode 里做。
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  }, []);
+
+  const handleDropNode = useCallback(
+    (event: DragEvent<HTMLElement>) => {
+      const kind = event.dataTransfer.getData(DND_NODE_KIND) as NodeKind;
+      if (!kind || !catalogByKind.has(kind)) {
+        return;
+      }
+      event.preventDefault();
+      const position = flowInstanceRef.current?.screenToFlowPosition({ x: event.clientX, y: event.clientY })
+        ?? { x: event.clientX, y: event.clientY };
+      insertFlowNode(createFlowNodeAt(kind, position), 'drag');
+    },
+    [catalogByKind, createFlowNodeAt, insertFlowNode],
   );
 
   const handleApplyTemplate = useCallback(
@@ -367,6 +485,7 @@ export function App() {
       pushEvent('没有选中的节点或连线');
       return;
     }
+    recordSnapshot();
     if (selection.type === 'edge') {
       const nextEdges = edges.filter((edge) => edge.id !== selection.edge.id);
       setEdges(nextEdges);
@@ -381,7 +500,7 @@ export function App() {
     setNodes((current) => withViewerPreviews(current.filter((node) => node.id !== nodeId), nextEdges));
     setSelection({ type: 'none' });
     pushEvent(`删除节点：${selection.node.title}`);
-  }, [edges, pushEvent, selection, setEdges, setNodes]);
+  }, [edges, pushEvent, recordSnapshot, selection, setEdges, setNodes]);
 
   const handleDuplicateSelection = useCallback(() => {
     if (selection.type !== 'node') {
@@ -393,6 +512,7 @@ export function App() {
       pushEvent('选中节点不存在');
       return;
     }
+    recordSnapshot();
     const duplicated: WorkflowNode = {
       ...source.data.workflowNode,
       id: createNodeId(source.data.workflowNode.kind),
@@ -403,7 +523,7 @@ export function App() {
     setNodes((current) => withViewerPreviews([...current, toFlowNode(duplicated)], edges));
     setSelection({ type: 'node', node: duplicated });
     pushEvent(`复制节点：${duplicated.title}`);
-  }, [edges, nodes, pushEvent, selection, setNodes]);
+  }, [edges, nodes, pushEvent, recordSnapshot, selection, setNodes]);
 
   const handleSaveWorkflow = useCallback(() => {
     const draft = toWorkflowGraph(nodes, edges, graph ?? emptyWorkflowGraph());
@@ -482,6 +602,84 @@ export function App() {
     void flowInstanceRef.current?.fitView({ padding: 0.2, duration: 180 });
     pushEvent('画布已适配视图');
   }, [pushEvent]);
+  const handleNodeDragStart = useCallback(() => {
+    recordSnapshot();
+  }, [recordSnapshot]);
+
+  const handleCanvasContextMenu = useCallback((event: ReactMouseEvent) => {
+    event.preventDefault();
+  }, []);
+
+  const handleCanvasMouseDown = useCallback((event: ReactMouseEvent) => {
+    if (event.button !== 2) {
+      return;
+    }
+    const bounds = canvasRegionRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return;
+    }
+    const startX = event.clientX - bounds.left;
+    const startY = event.clientY - bounds.top;
+    marqueeRef.current = { startX, startY, curX: startX, curY: startY, active: true };
+    setMarquee({ x: startX, y: startY, width: 0, height: 0 });
+  }, []);
+
+  const handleCanvasMouseMove = useCallback((event: ReactMouseEvent) => {
+    const current = marqueeRef.current;
+    if (!current.active) {
+      return;
+    }
+    const bounds = canvasRegionRef.current?.getBoundingClientRect();
+    if (!bounds) {
+      return;
+    }
+    current.curX = event.clientX - bounds.left;
+    current.curY = event.clientY - bounds.top;
+    setMarquee({
+      x: Math.min(current.startX, current.curX),
+      y: Math.min(current.startY, current.curY),
+      width: Math.abs(current.curX - current.startX),
+      height: Math.abs(current.curY - current.startY),
+    });
+  }, []);
+
+  const finishMarqueeSelection = useCallback((event: ReactMouseEvent) => {
+    const current = marqueeRef.current;
+    if (!current.active) {
+      return;
+    }
+    current.active = false;
+    setMarquee(null);
+    if (event.button !== 2) {
+      return;
+    }
+    const flow = flowInstanceRef.current;
+    const bounds = canvasRegionRef.current?.getBoundingClientRect();
+    if (!flow || !bounds) {
+      return;
+    }
+    if (Math.abs(current.curX - current.startX) < 5 && Math.abs(current.curY - current.startY) < 5) {
+      return;
+    }
+    const topLeft = flow.screenToFlowPosition({
+      x: bounds.left + Math.min(current.startX, current.curX),
+      y: bounds.top + Math.min(current.startY, current.curY),
+    });
+    const bottomRight = flow.screenToFlowPosition({
+      x: bounds.left + Math.max(current.startX, current.curX),
+      y: bounds.top + Math.max(current.startY, current.curY),
+    });
+    const minX = Math.min(topLeft.x, bottomRight.x);
+    const maxX = Math.max(topLeft.x, bottomRight.x);
+    const minY = Math.min(topLeft.y, bottomRight.y);
+    const maxY = Math.max(topLeft.y, bottomRight.y);
+    setNodes((currentNodes) => currentNodes.map((node) => {
+      const width = node.measured?.width ?? 180;
+      const height = node.measured?.height ?? 100;
+      const inside = node.position.x + width >= minX && node.position.x <= maxX && node.position.y + height >= minY && node.position.y <= maxY;
+      return { ...node, selected: inside };
+    }));
+  }, [setNodes]);
 
   const handleRunWorkflow = useCallback(() => {
     if (!graph) {
@@ -516,6 +714,20 @@ export function App() {
       if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) {
         return;
       }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') {
+        event.preventDefault();
+        if (event.shiftKey) {
+          redo();
+        } else {
+          undo();
+        }
+        return;
+      }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'y') {
+        event.preventDefault();
+        redo();
+        return;
+      }
       if (event.key === 'Delete' || event.key === 'Backspace') {
         event.preventDefault();
         handleDeleteSelection();
@@ -523,21 +735,21 @@ export function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [handleDeleteSelection]);
+  }, [handleDeleteSelection, redo, undo]);
 
   const onSelectionChange = useCallback((params: OnSelectionChangeParams) => {
     const firstNode = params.nodes[0] as FlowNode | undefined;
-    if (firstNode) {
+    if (firstNode && nodes.some((candidate) => candidate.id === firstNode.id)) {
       setSelection({ type: 'node', node: firstNode.data.workflowNode });
       return;
     }
     const firstEdge = params.edges[0] as FlowEdge | undefined;
-    if (firstEdge) {
+    if (firstEdge && edges.some((candidate) => candidate.id === firstEdge.id)) {
       setSelection({ type: 'edge', edge: firstEdge });
       return;
     }
     setSelection({ type: 'none' });
-  }, []);
+  }, [edges, nodes]);
 
   return (
     <div className="studio-shell">
@@ -555,9 +767,13 @@ export function App() {
             <button onClick={handleExportWorkflow}>Export</button>
           </div>
           <div className="menu-group">
-            <button onClick={loadSeedWorkflow}>Reset demo</button>
-            <button onClick={handleDeleteSelection}>Delete</button>
-            <button onClick={handleDuplicateSelection}>Duplicate</button>
+            <button type="button" onClick={undo} disabled={pastRef.current.length === 0}>Undo</button>
+            <button type="button" onClick={redo} disabled={futureRef.current.length === 0}>Redo</button>
+          </div>
+          <div className="menu-group">
+            <button onClick={loadSeedWorkflow}>Reset</button>
+            <button onClick={handleDeleteSelection}>Del</button>
+            <button onClick={handleDuplicateSelection}>Dup</button>
           </div>
           <div className="menu-group">
             <button onClick={handleRunWorkflow}>Run</button>
@@ -565,70 +781,115 @@ export function App() {
             <button onClick={handleFitView}>Fit</button>
           </div>
         </nav>
-        <div className="service-pill">{nodes.length} nodes / {edges.length} edges</div>
+        <div className="service-pill">{nodes.length}N / {edges.length}E</div>
       </header>
 
       <aside className="left-rail">
-        <h2>Templates</h2>
-        {templates.map((template) => (
-          <button key={template.id} className="library-item" type="button" onClick={() => handleApplyTemplate(template)}>
-            <strong>{template.title}</strong>
-            <span>{template.description}</span>
-          </button>
-        ))}
-        <h2>Saved Workflows</h2>
-        {savedWorkflows.length === 0 ? (
-          <div className="rail-note">没有保存的工作流</div>
-        ) : (
-          savedWorkflows.map((item) => (
-            <div key={item.id} className="saved-workflow-card">
-              <strong>{item.title}</strong>
-              <span>{item.id} · {item.revision}</span>
-              <div className="saved-workflow-actions">
-                <button type="button" onClick={() => loadSavedWorkflow(item.id).then((loaded) => applyGraph(loaded, `已载入保存工作流：${loaded.title}`)).catch((error: unknown) => pushEvent(`载入失败：${error instanceof Error ? error.message : String(error)}`))}>
-                  Load
-                </button>
-                <button type="button" onClick={() => deleteWorkflow(item.id).then(() => { pushEvent(`已删除工作流：${item.id}`); refreshSavedWorkflows(); }).catch((error: unknown) => pushEvent(`删除失败：${error instanceof Error ? error.message : String(error)}`))}>
-                  Delete
-                </button>
-              </div>
+        <section className="rail-section">
+          <h2>Templates</h2>
+          <div className="library-list compact-list">
+            {templates.map((template) => (
+              <button key={template.id} className="library-item template-item" type="button" onClick={() => handleApplyTemplate(template)}>
+                <strong>{template.title}</strong>
+                <span>{template.description}</span>
+              </button>
+            ))}
+          </div>
+        </section>
+        <section className="rail-section">
+          <h2>Saved</h2>
+          {savedWorkflows.length === 0 ? (
+            <div className="rail-note compact">No saved workflows</div>
+          ) : (
+            <div className="library-list compact-list">
+              {savedWorkflows.map((item) => (
+                <div key={item.id} className="saved-workflow-card">
+                  <strong>{item.title}</strong>
+                  <span>{item.id} · {item.revision}</span>
+                  <div className="saved-workflow-actions">
+                    <button type="button" onClick={() => loadSavedWorkflow(item.id).then((loaded) => applyGraph(loaded, `已载入保存工作流：${loaded.title}`)).catch((error: unknown) => pushEvent(`载入失败：${error instanceof Error ? error.message : String(error)}`))}>Load</button>
+                    <button type="button" onClick={() => deleteWorkflow(item.id).then(() => { pushEvent(`已删除工作流：${item.id}`); refreshSavedWorkflows(); }).catch((error: unknown) => pushEvent(`删除失败：${error instanceof Error ? error.message : String(error)}`))}>Delete</button>
+                  </div>
+                </div>
+              ))}
             </div>
-          ))
-        )}
-        <h2>Node Library</h2>
-        {groupCatalog(catalog).map(([category, definitions]) => (
-          <section key={category} className="library-group">
-            <h3>{category}</h3>
-            {definitions.map((item) => <NodeLibraryItem key={item.kind} definition={item} onAdd={handleAddNode} />)}
-          </section>
-        ))}
-        <div className="rail-note">模板只生成拓扑；SSH/X5/I²C/EEPROM 写入类节点必须后续在 Inspector 明确触发。</div>
+          )}
+        </section>
+        <section className="rail-section">
+          <h2>Node Library <span>drag or click</span></h2>
+          <div className="library-list">
+            {groupCatalog(catalog).map(([category, definitions]) => {
+              const collapsed = collapsedCategories.has(category);
+              return (
+                <section key={category} className={`library-group ${collapsed ? 'collapsed' : ''}`}>
+                  <button
+                    type="button"
+                    className="library-group-header"
+                    onClick={() => toggleCategory(category)}
+                    aria-expanded={!collapsed}
+                    title={collapsed ? '展开分类' : '折叠分类'}
+                  >
+                    <span className="chevron" aria-hidden="true">{collapsed ? '▸' : '▾'}</span>
+                    <span className="group-title">{category}</span>
+                    <span className="group-count">{definitions.length}</span>
+                  </button>
+                  {!collapsed && (
+                    <div className="library-group-items">
+                      {definitions.map((item) => (
+                        <NodeLibraryItem key={item.kind} definition={item} onAdd={handleAddNode} onDragStart={handleDragNodeStart} />
+                      ))}
+                    </div>
+                  )}
+                </section>
+              );
+            })}
+          </div>
+        </section>
+        <div className="rail-note compact">Runtime handles and secrets stay in Inspector/runtime only.</div>
       </aside>
 
-      <main className="canvas-region">
+      <main
+        className="canvas-region"
+        ref={canvasRegionRef}
+        onContextMenu={handleCanvasContextMenu}
+        onMouseDown={handleCanvasMouseDown}
+        onMouseMove={handleCanvasMouseMove}
+        onMouseUp={finishMarqueeSelection}
+        onMouseLeave={finishMarqueeSelection}
+      >
         <ReactFlow
           nodes={nodes}
-          edges={edges}
+          edges={displayedEdges}
           nodeTypes={nodeTypes}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
+          onDragOver={handleDragNodeOver}
+          onDrop={handleDropNode}
           onSelectionChange={onSelectionChange}
+          onNodeDragStart={handleNodeDragStart}
           onInit={(instance) => {
             flowInstanceRef.current = instance;
           }}
           fitView
+          fitViewOptions={{ padding: 0.18, duration: 260 }}
           minZoom={0.2}
           maxZoom={1.8}
+          zoomOnScroll
+          elevateEdgesOnSelect
+          deleteKeyCode={['Backspace', 'Delete']}
           proOptions={{ hideAttribution: true }}
         >
-          <Background color="#1e293b" gap={28} size={1} />
+          <Background variant={BackgroundVariant.Lines} color="#334155" gap={24} size={1.25} />
           <MiniMap className="workflow-minimap" pannable zoomable nodeStrokeWidth={2} />
           <Controls className="workflow-controls" position="bottom-left" />
           <Panel position="top-left" className="canvas-panel">
             {selection.type === 'none' ? 'Select a node or edge' : `${selection.type}: ${selection.type === 'node' ? selection.node.title : selection.edge.id}`}
           </Panel>
         </ReactFlow>
+        {marquee && (
+          <div className="selection-marquee" style={{ left: marquee.x, top: marquee.y, width: marquee.width, height: marquee.height }} />
+        )}
       </main>
 
       <aside className="inspector">
@@ -665,6 +926,7 @@ function viewerPreview(graph: WorkflowGraph, viewerNodeId: string): ViewerPrevie
   for (const edge of graph.edges) {
     incoming.set(edge.target.nodeId, [...(incoming.get(edge.target.nodeId) ?? []), edge.source.nodeId]);
   }
+
   const workspaceRootFor = (nodeId: string, visited: Set<string>): string | undefined => {
     if (visited.has(nodeId)) {
       return undefined;
@@ -685,6 +947,7 @@ function viewerPreview(graph: WorkflowGraph, viewerNodeId: string): ViewerPrevie
     }
     return undefined;
   };
+
   const selectedPathFor = (nodeId: string, visited: Set<string>): string | undefined => {
     if (visited.has(nodeId)) {
       return undefined;
@@ -705,6 +968,7 @@ function viewerPreview(graph: WorkflowGraph, viewerNodeId: string): ViewerPrevie
     }
     return undefined;
   };
+
   const visit = (nodeId: string, visited: Set<string>): ViewerPreview | undefined => {
     if (visited.has(nodeId)) {
       return undefined;
@@ -737,6 +1001,7 @@ function viewerPreview(graph: WorkflowGraph, viewerNodeId: string): ViewerPrevie
     }
     return undefined;
   };
+
   return visit(viewerNodeId, new Set());
 }
 
@@ -747,11 +1012,78 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     sourceHandle: edge.source.portId,
     target: edge.target.nodeId,
     targetHandle: edge.target.portId,
-    animated: true,
+    animated: false,
     label: labelForPortKind(edge.kind),
     data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema },
-    className: 'workflow-edge',
+    className: 'workflow-edge flow-inactive',
   }));
+}
+
+function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStates: Map<string, NodeRuntimeState>): FlowEdge[] {
+  const outgoing = new Map<string, FlowEdge[]>();
+  for (const edge of edges) {
+    outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge]);
+  }
+
+  const activeNodes = new Set<string>();
+  const queue: string[] = [];
+  for (const node of nodes) {
+    if (isActiveSeedNode(node.data.workflowNode, runtimeNodeStates)) {
+      activeNodes.add(node.id);
+      queue.push(node.id);
+    }
+  }
+
+  while (queue.length > 0) {
+    const sourceId = queue.shift() as string;
+    for (const edge of outgoing.get(sourceId) ?? []) {
+      if (activeNodes.has(edge.target)) {
+        continue;
+      }
+      activeNodes.add(edge.target);
+      queue.push(edge.target);
+    }
+  }
+
+  return edges.map((edge) => {
+    const active = activeNodes.has(edge.source)
+      || runtimeNodeStates.get(edge.source) === 'running'
+      || runtimeNodeStates.get(edge.target) === 'running';
+    return {
+      ...edge,
+      animated: active,
+      className: `workflow-edge ${active ? 'flow-active' : 'flow-inactive'}`,
+    };
+  });
+}
+
+function isActiveSeedNode(node: WorkflowNode, runtimeNodeStates: Map<string, NodeRuntimeState>): boolean {
+  if (runtimeNodeStates.get(node.id) === 'running') {
+    return true;
+  }
+  if (node.kind === 'rtspSource') {
+    return hasText(node.config.url);
+  }
+  if (node.kind === 'imageFileSource') {
+    return hasText(node.config.relativePath);
+  }
+  if (node.kind === 'localWorkspace') {
+    return hasText(node.config.root);
+  }
+  if (node.kind === 'sftpWorkspace') {
+    return hasText(node.config.remoteRoot);
+  }
+  if (node.kind === 'x5Device') {
+    return hasText(node.config.host) || hasText(node.config.tcpPort);
+  }
+  if (node.kind === 'x5RtspChannel') {
+    return hasText(node.config.path) || hasText(node.config.channel);
+  }
+  return false;
+}
+
+function hasText(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
 }
 
 function createGraphId(): string {
@@ -836,3 +1168,4 @@ function groupCatalog(catalog: NodeDefinition[]): Array<[string, NodeDefinition[
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
+
