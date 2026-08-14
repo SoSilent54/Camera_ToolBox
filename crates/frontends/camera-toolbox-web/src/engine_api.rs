@@ -12,8 +12,8 @@ use serde::Deserialize;
 use serde_json::json;
 
 use camera_toolbox_app::engine::{
-    EdgeSpec, EngineServices, GraphBuildError, GraphEngine, GraphSpec, NodeAction, NodeRegistry,
-    NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
+    DataPacket, EdgeSpec, EngineServices, GraphBuildError, GraphEngine, GraphSpec, NodeAction,
+    NodeRegistry, NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
 };
 use camera_toolbox_app::platform::{RtspStreamConfig, StreamService};
 use camera_toolbox_adapters::media::FfmpegRtspStreamService;
@@ -170,6 +170,53 @@ pub async fn viewer_frame(
         )
             .into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
+    }
+}
+
+/// 取回指定节点的最近输出负载（中间结果查看）。
+pub async fn node_output(
+    State(state): State<AppState>,
+    Path(node_id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let packet = {
+        let engine = state.engine_runtime.engine();
+        engine
+            .as_ref()
+            .and_then(|engine| engine.latest_output(&node_id))
+    };
+    let Some(packet) = packet else {
+        return Err((StatusCode::NOT_FOUND, "no output available".to_owned()));
+    };
+    Ok(Json(packet_to_json(&packet)))
+}
+
+/// 把 `DataPacket` 折叠成可序列化的 JSON：帧类只给元数据，其余（Detection/Solution/弱类型）直接序列化。
+fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
+    match packet {
+        DataPacket::VideoFrame(frame) => json!({
+            "type": "video-frame",
+            "width": frame.width,
+            "height": frame.height,
+            "sequence": frame.identity.frame_sequence,
+        }),
+        DataPacket::ImageFrame(frame) => json!({
+            "type": "image-frame",
+            "width": frame.width,
+            "height": frame.height,
+            "sequence": frame.identity.frame_sequence,
+        }),
+        DataPacket::Detection(detection) => {
+            serde_json::to_value(detection.as_ref()).unwrap_or(json!({ "type": "detection" }))
+        }
+        DataPacket::Solution(solution) => {
+            serde_json::to_value(solution.as_ref()).unwrap_or(json!({ "type": "solution" }))
+        }
+        DataPacket::Coverage(value)
+        | DataPacket::Dataset(value)
+        | DataPacket::Report(value)
+        | DataPacket::Score(value)
+        | DataPacket::Target(value)
+        | DataPacket::Json(value) => (**value).clone(),
     }
 }
 

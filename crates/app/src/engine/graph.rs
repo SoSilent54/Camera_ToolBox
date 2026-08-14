@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::AtomicBool, mpsc},
+    sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
     thread::JoinHandle,
 };
 
@@ -13,6 +13,7 @@ use crate::platform::LatestDecodedFrameSlot;
 use super::{
     channel::{MailboxReceiver, MailboxSender, NodeMessage, create_mailbox},
     node::{NodeAction, NodeError, NodeInstance},
+    packet::DataPacket,
     registry::NodeRegistry,
     runtime::{NodeReporter, NodeRuntime, OutputRegistry, SpawnContext},
     services::EngineServices,
@@ -66,6 +67,7 @@ pub struct GraphEngine {
     status_rx: mpsc::Receiver<NodeStatusReport>,
     event_rx: mpsc::Receiver<NodeEvent>,
     viewer_slots: HashMap<NodeId, Arc<LatestDecodedFrameSlot>>,
+    latest_outputs: Arc<Mutex<HashMap<NodeId, DataPacket>>>,
 }
 
 impl GraphEngine {
@@ -78,6 +80,9 @@ impl GraphEngine {
         let (status_tx, status_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
         let services = Arc::new(services);
+        // 节点最近输出缓存：emit 成功后由每个节点的 OutputRegistry 回灌，供中间结果查看。
+        let latest_outputs: Arc<Mutex<HashMap<NodeId, DataPacket>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         // 1. 实例化节点。
         let mut instances: HashMap<NodeId, Box<dyn NodeInstance>> = HashMap::new();
@@ -97,7 +102,16 @@ impl GraphEngine {
         for node in &spec.nodes {
             let (tx, rx) = create_mailbox(4);
             mailboxes.insert(node.id.clone(), (tx, rx));
-            outputs.insert(node.id.clone(), OutputRegistry::default());
+            let mut registry = OutputRegistry::default();
+            // 回灌最近输出到 latest_outputs（按 node_id 建 key），供 node_output 查询。
+            let node_id = node.id.clone();
+            let sink = Arc::clone(&latest_outputs);
+            registry.set_record(Arc::new(move |packet: DataPacket| {
+                sink.lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(node_id.clone(), packet);
+            }));
+            outputs.insert(node.id.clone(), registry);
         }
 
         // 3. 接线（fan-out）：源输出端口 → 目标 mailbox。
@@ -189,6 +203,7 @@ impl GraphEngine {
             status_rx,
             event_rx,
             viewer_slots,
+            latest_outputs,
         })
     }
 
@@ -251,6 +266,16 @@ impl GraphEngine {
     #[must_use]
     pub fn viewer_frame(&self, node_id: &str) -> Option<Arc<crate::platform::DecodedVideoFrame>> {
         self.viewer_slots.get(node_id)?.latest()
+    }
+
+    /// 获取任意节点的最近输出负载（中间结果查看）；未 emit 过返回 `None`。
+    #[must_use]
+    pub fn latest_output(&self, node_id: &str) -> Option<DataPacket> {
+        self.latest_outputs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(node_id)
+            .cloned()
     }
 
     /// 停止图：发 Stop 给所有 actor 并等待退出。
@@ -645,5 +670,20 @@ mod tests {
     fn packet_has_stable_port_kind() {
         let packet = DataPacket::Json(Arc::new(serde_json::json!({})));
         assert_eq!(packet.port_kind(), "status.metrics");
+    }
+
+    #[test]
+    fn latest_output_is_none_before_emit() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(PassthroughFactory));
+        let spec = GraphSpec {
+            nodes: vec![node_spec("a", vec![], vec![port("out", false)])],
+            edges: vec![],
+        };
+        let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
+        // 尚未有任何 emit，最近输出应为 None。
+        assert!(engine.latest_output("a").is_none());
+        assert!(engine.latest_output("missing").is_none());
+        let _ = engine;
     }
 }

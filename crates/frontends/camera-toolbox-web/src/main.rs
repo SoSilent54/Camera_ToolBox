@@ -1307,6 +1307,10 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
             "/api/runtime/nodes/{id}/action",
             post(engine_api::node_action),
         )
+        .route(
+            "/api/runtime/nodes/{id}/output",
+            get(engine_api::node_output),
+        )
         .route("/api/runtime/status", get(engine_api::engine_status))
         .route(
             "/api/runtime/viewer/{id}/frame",

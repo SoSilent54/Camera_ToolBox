@@ -20,9 +20,22 @@ use super::{
 };
 
 /// 输出端口注册表：`port_id -> 下游 mailbox 列表`（fan-out）。
-#[derive(Clone, Default)]
+///
+/// `record` 是一个可选回调，在 `emit` 成功（有下游投递或无下游 no-op）时被调用，
+/// 用于把「节点最近输出」回灌到引擎的 `latest_outputs` 缓存（中间结果查看）。
+#[derive(Clone)]
 pub struct OutputRegistry {
     ports: Arc<HashMap<PortId, Vec<MailboxSender>>>,
+    record: Arc<dyn Fn(DataPacket) + Send + Sync>,
+}
+
+impl Default for OutputRegistry {
+    fn default() -> Self {
+        Self {
+            ports: Arc::new(HashMap::new()),
+            record: Arc::new(|_packet| {}),
+        }
+    }
 }
 
 impl OutputRegistry {
@@ -34,6 +47,11 @@ impl OutputRegistry {
             .push(sender);
     }
 
+    /// 设置输出的最近负载记录回调（引擎在 build 时注入，把 packet 写进 `latest_outputs`）。
+    pub fn set_record(&mut self, record: Arc<dyn Fn(DataPacket) + Send + Sync>) {
+        self.record = record;
+    }
+
     #[must_use]
     pub fn senders(&self, port: &str) -> Option<&[MailboxSender]> {
         self.ports.get(port).map(Vec::as_slice)
@@ -43,6 +61,7 @@ impl OutputRegistry {
     /// 仅当下游存在但全部通道满时返回 `ChannelFull`。
     pub fn emit(&self, port: &str, packet: DataPacket) -> Result<(), ChannelFull> {
         let Some(senders) = self.ports.get(port) else {
+            (self.record)(packet);
             return Ok(());
         };
         let mut delivered = false;
@@ -58,6 +77,7 @@ impl OutputRegistry {
             }
         }
         if delivered {
+            (self.record)(packet);
             Ok(())
         } else {
             Err(ChannelFull)
@@ -177,7 +197,7 @@ impl NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::engine::packet::DataPacket;
@@ -201,5 +221,41 @@ mod tests {
             rx.try_recv(),
             Ok(NodeMessage::Input { port, .. }) if port == "out"
         ));
+    }
+
+    #[test]
+    fn emit_invokes_record_sink_with_packet() {
+        // 有下游时 emit 成功后应回调 record（中间结果查看的缓存回灌）。
+        let mut outputs = OutputRegistry::default();
+        let (tx, _rx) = crate::engine::channel::create_mailbox(1);
+        outputs.connect("out".to_owned(), tx);
+
+        let captured: Arc<Mutex<Vec<DataPacket>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        outputs.set_record(Arc::new(move |packet| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(packet);
+        }));
+
+        let packet = DataPacket::Json(Arc::new(serde_json::json!({"k": 1})));
+        assert!(outputs.emit("out", packet).is_ok());
+        let captured = captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(captured.len(), 1);
+    }
+
+    #[test]
+    fn emit_without_downstream_still_records() {
+        // 无下游 no-op 成功也回调 record，保证「未接线但已 emit」的节点最近输出也可查。
+        let mut outputs = OutputRegistry::default();
+        let captured: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let sink = Arc::clone(&captured);
+        outputs.set_record(Arc::new(move |_packet| {
+            *sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+        }));
+
+        let packet = DataPacket::Json(Arc::new(serde_json::json!({})));
+        assert!(outputs.emit("unconnected", packet).is_ok());
+        assert_eq!(*captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
     }
 }
