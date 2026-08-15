@@ -320,7 +320,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             NodeCategory::Workspace,
             "SFTP File Source",
             "通过 SSH/SFTP 暴露远程目录并加载图片（保留 workspace 可选输出供多消费者复用）",
-            vec![port(
+            vec![optional_port(
                 "ssh",
                 "SSH",
                 PortDirection::Input,
@@ -354,7 +354,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Workspace),
                 ),
             ],
-            json!({"sourceId": "sftp-main", "remoteRoot": "/", "mountLabel": "Remote SFTP", "selection": "", "filter": "*.png;*.jpg;*.jpeg"}),
+            json!({"sourceId": "sftp-main", "remoteRoot": "/", "mountLabel": "Remote SFTP", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "selection": "", "filter": "*.png;*.jpg;*.jpeg"}),
         ),
         NodeKind::RtspSource => (
             NodeCategory::Source,
@@ -376,15 +376,25 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             "SSH Session",
             "远程命令、SFTP、I²C helper 的控制会话",
             vec![],
-            vec![port(
-                "ssh",
-                "SSH",
-                PortDirection::Output,
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-                Some(PortRole::Control),
-            )],
-            json!({"profileId": "", "host": "", "port": "22", "username": "root", "autoConnect": false}),
+            vec![
+                port(
+                    "ssh",
+                    "SSH",
+                    PortDirection::Output,
+                    PortKind::ControlSsh,
+                    "control.ssh.v1",
+                    Some(PortRole::Control),
+                ),
+                optional_port(
+                    "result",
+                    "Command Result",
+                    PortDirection::Output,
+                    PortKind::I2cResult,
+                    "i2c.result.v1",
+                    Some(PortRole::Status),
+                ),
+            ],
+            json!({"profileId": "", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "recipeId": "", "autoConnect": false}),
         ),
         // ③ X5Device（吸收 X5RtspChannel + X5Snapshot）
         NodeKind::X5Device => (
@@ -898,7 +908,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Status),
                 ),
             ],
-            json!({"profileId": "x5-lab", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
+            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
         ),
         // ⑤ EepromProvision（吸收 EepromMapLoader）
         NodeKind::EepromProvision => (
@@ -957,7 +967,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Command),
                 ),
             ],
-            json!({"profileId": "x5-lab", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "confirmWrites": true, "verifyAfterWrite": true}),
+            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "mode": "inspect", "confirmWrites": true, "verifyAfterWrite": true}),
         ),
     };
     NodeDefinition {

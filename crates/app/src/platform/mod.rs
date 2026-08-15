@@ -1,6 +1,7 @@
 //! 平台 profile、候选能力与 Sensor/Mode 精确解析模型。
 
 mod capability;
+mod control;
 mod controller;
 mod eeprom;
 mod events;
@@ -23,6 +24,10 @@ pub use capability::{
     TargetResolutionSnapshot,
 };
 pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
+pub use control::{
+    ControlTargetSpec, EepromExecutor, I2cExecutor, SftpFileReader, SshCommandExecutor,
+    X5ControlClient,
+};
 pub use eeprom::{
     EEPROM_EXPERIMENTAL_PROVISION_WARNING, EEPROM_HELPER_SCHEMA_VERSION, EepromDeviceState,
     EepromHelperAction, EepromHelperFailure, EepromHelperOutput, EepromHelperRequest,

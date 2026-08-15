@@ -24,10 +24,10 @@
 pub mod auto_capture;
 pub mod calibration_solver;
 pub mod composite;
+pub mod control_nodes;
 pub mod detection;
 pub mod local_source;
 pub mod rtsp_source;
-pub mod skeleton;
 pub mod transform;
 pub mod viewer;
 
@@ -39,13 +39,14 @@ pub use composite::{
     CoverageAnalyzerFactory, CoverageAnalyzerNode, DatasetCollectorFactory, DatasetCollectorNode,
     OverlayComposerFactory, OverlayComposerNode, PoseGuideFactory, PoseGuideNode,
 };
+pub use control_nodes::{
+    EepromProvisionFactory, EepromProvisionNode, I2cTransferFactory, I2cTransferNode,
+    SftpFileSourceFactory, SftpFileSourceNode, SshSessionFactory, SshSessionNode, X5DeviceFactory,
+    X5DeviceNode,
+};
 pub use detection::{ChessboardDetectorFactory, ChessboardDetectorNode};
 pub use local_source::{LocalFileSourceFactory, LocalFileSourceNode};
 pub use rtsp_source::{RtspSourceFactory, RtspSourceNode};
-pub use skeleton::{
-    EepromProvisionFactory, I2cTransferFactory, SftpFileSourceFactory, SshSessionFactory,
-    X5DeviceFactory,
-};
 pub use transform::{
     FrameSamplerFactory, FrameSamplerNode, ImageLayerFactory, PassThroughNode, RtspDecoderFactory,
     VideoLayerFactory,

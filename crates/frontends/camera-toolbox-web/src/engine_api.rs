@@ -74,6 +74,27 @@ fn build_services(state: &AppState) -> EngineServices {
         // 供 LocalFileSource 与 ChessboardDetector 等节点使用。
         raw_loader: Some(Arc::new(LocalRawLoader)),
         image_codec: Some(Arc::new(ImageRasterCodec)),
+        // I²C / EEPROM 执行器：ControlRuntime 已实现 I2cExecutor/EepromExecutor，
+        // 内部复用 SshI2cHelperService/SshEepromProvisionService + helper payload。
+        #[cfg(feature = "platform-ssh")]
+        i2c_executor: Some(state.control_runtime.clone()),
+        #[cfg(feature = "platform-ssh")]
+        eeprom_executor: Some(state.control_runtime.clone()),
+        #[cfg(not(feature = "platform-ssh"))]
+        i2c_executor: None,
+        #[cfg(not(feature = "platform-ssh"))]
+        eeprom_executor: None,
+        // X5 控制客户端：纯 TCP（无 SSH），始终可用；ControlRuntime 无条件 impl X5ControlClient。
+        x5_client: Some(state.control_runtime.clone()),
+        // SFTP / SSH 命令执行器：ControlRuntime 已实现 SftpFileReader/SshCommandExecutor。
+        #[cfg(feature = "platform-ssh")]
+        sftp_reader: Some(state.control_runtime.clone()),
+        #[cfg(feature = "platform-ssh")]
+        ssh_command_executor: Some(state.control_runtime.clone()),
+        #[cfg(not(feature = "platform-ssh"))]
+        sftp_reader: None,
+        #[cfg(not(feature = "platform-ssh"))]
+        ssh_command_executor: None,
     }
 }
 

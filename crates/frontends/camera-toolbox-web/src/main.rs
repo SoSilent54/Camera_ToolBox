@@ -23,17 +23,19 @@ use axum::{
 #[cfg(feature = "calibration-opencv")]
 use camera_toolbox_adapters::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, SshConnectionTarget,
-    SshEepromProvisionService, SshI2cHelperService, SshTransportFactory,
+    CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, SshCommandService,
+    SshConnectionTarget, SshEepromProvisionService, SshI2cHelperService, SshTransportFactory,
+    production_recipe_registry_from_env,
 };
 use camera_toolbox_adapters::x5_tcp_client;
 use camera_toolbox_app::{
-    CalibrationBackend, CalibrationCancellation, DecodedVideoFrame, DumpCancellation,
-    EepromDeviceState, EepromHelperAction, EepromHelperResult, EepromProvisionOperation,
-    EepromProvisionService, EepromProvisionServiceError, EepromSerialState, I2cHelperAction,
+    CalibrationBackend, CalibrationCancellation, CommandResult, CommandService, ControlTargetSpec,
+    DecodedVideoFrame, DumpCancellation, EepromDeviceState, EepromExecutor, EepromHelperAction,
+    EepromHelperResult, EepromProvisionOperation, EepromProvisionService,
+    EepromProvisionServiceError, EepromSerialState, I2cExecutor, I2cHelperAction,
     I2cHelperOperation, I2cHelperResult, I2cHelperService, I2cMessageData, I2cMessageSpec,
-    I2cTransactionSpec, RemoteOperationControl, RemoteTimeouts,
-    validate_i2c_transfer_transactions,
+    I2cTransactionSpec, RemoteFileStat, RemoteOperationControl, RemoteTimeouts, SftpFileReader,
+    SshCommandExecutor, TypedCommandRequest, X5ControlClient, validate_i2c_transfer_transactions,
 };
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
@@ -229,6 +231,193 @@ impl ControlRuntime {
             .clone()
             .map(Ok)
             .unwrap_or_else(read_local_i2c_helper_payload)
+    }
+}
+
+#[cfg(feature = "platform-ssh")]
+fn ssh_target_from_spec(spec: &ControlTargetSpec) -> SshConnectionTarget {
+    SshConnectionTarget {
+        host: spec.host.clone(),
+        port: spec.port,
+        username: spec.username.clone(),
+        expected_host_key: spec.expected_host_key.clone(),
+        command_subsystem: None,
+        remote_event_subsystem: None,
+    }
+}
+
+/// 把 I²C executor 抽象接到真实的 SSH helper：每次操作按当前 spec 构造 service 并执行。
+#[cfg(feature = "platform-ssh")]
+impl I2cExecutor for ControlRuntime {
+    fn execute(
+        &self,
+        target: &ControlTargetSpec,
+        credential_ref: &str,
+        action: I2cHelperAction,
+        control: RemoteOperationControl,
+    ) -> std::result::Result<I2cHelperResult, String> {
+        let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
+        let service = SshI2cHelperService::new(
+            format!("workflow-web-i2c-{}", target.host),
+            ssh_target_from_spec(target),
+            credential_ref,
+            1_048_576,
+            self.helper_payload().map_err(|e| e.error)?,
+            Arc::clone(&self.credential_resolver),
+            Arc::clone(&self.ssh_transport),
+        )
+        .map_err(|error| format_i2c_service_error(&error))?;
+        service
+            .execute(I2cHelperOperation { action }, control)
+            .map_err(|error| format_i2c_service_error(&error))
+    }
+}
+
+/// 把 EEPROM executor 抽象接到真实的 SSH helper。
+#[cfg(feature = "platform-ssh")]
+impl EepromExecutor for ControlRuntime {
+    fn execute(
+        &self,
+        target: &ControlTargetSpec,
+        credential_ref: &str,
+        action: EepromHelperAction,
+        control: RemoteOperationControl,
+    ) -> std::result::Result<EepromHelperResult, String> {
+        let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
+        let service = SshEepromProvisionService::new(
+            format!("workflow-web-eeprom-{}", target.host),
+            ssh_target_from_spec(target),
+            credential_ref,
+            1_048_576,
+            // `i2c_bus` 不在 `EepromExecutor` trait 契约内（`ControlTargetSpec` 只承载
+            // host/port/username/expected_host_key），此处固定为 0；真实 bus pinning 需
+            // 后续把 bus 下钻进 spec 或 trait 后补上。map_id 已由 service 内部固定。
+            0,
+            self.helper_payload().map_err(|e| e.error)?,
+            Arc::clone(&self.credential_resolver),
+            Arc::clone(&self.ssh_transport),
+        )
+        .map_err(|error| format_eeprom_service_error(&error))?;
+        service
+            .execute(EepromProvisionOperation { action }, control)
+            .map_err(|error| format_eeprom_service_error(&error))
+    }
+}
+
+/// 把 X5 控制客户端抽象接到真实的 X5_233 TCP 模块（纯 TCP，无 SSH）。
+impl X5ControlClient for ControlRuntime {
+    fn probe(&self, host: &str, port: u16) -> std::result::Result<serde_json::Value, String> {
+        x5_tcp_client::probe(host, port)
+            .map(|summary| x5_probe_response(&summary))
+            .map_err(|error| error)
+    }
+
+    fn status(&self, host: &str, port: u16) -> std::result::Result<serde_json::Value, String> {
+        x5_tcp_client::status(host, port)
+            .map(|status| x5_status_response(&status))
+            .map_err(|error| error)
+    }
+
+    fn capture_snapshot(
+        &self,
+        host: &str,
+        port: u16,
+        channel: u16,
+    ) -> std::result::Result<serde_json::Value, String> {
+        x5_tcp_client::capture_yuv_snapshot(host, port, channel)
+            .map(|snapshot| x5_snapshot_response(&snapshot))
+            .map_err(|error| error)
+    }
+}
+
+/// 把 SFTP 文件读取抽象接到真实 SSH transport：每次操作按 spec 建立 session 后 stat/read。
+#[cfg(feature = "platform-ssh")]
+impl SftpFileReader for ControlRuntime {
+    fn stat(
+        &self,
+        target: &ControlTargetSpec,
+        credential_ref: &str,
+        remote_path: &str,
+        control: RemoteOperationControl,
+    ) -> Result<RemoteFileStat, String> {
+        let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
+        let credential = self
+            .credential_resolver
+            .resolve(&credential_ref)
+            .map_err(|e| e)?;
+        let mut session = self
+            .ssh_transport
+            .connect(&ssh_target_from_spec(target), credential, &control)
+            .map_err(|e| e.to_string())?;
+        session.stat(remote_path, &control).map_err(|e| e.to_string())
+    }
+
+    fn read(
+        &self,
+        target: &ControlTargetSpec,
+        credential_ref: &str,
+        remote_path: &str,
+        limit: usize,
+        control: RemoteOperationControl,
+    ) -> Result<Vec<u8>, String> {
+        let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
+        let credential = self
+            .credential_resolver
+            .resolve(&credential_ref)
+            .map_err(|e| e)?;
+        let mut session = self
+            .ssh_transport
+            .connect(&ssh_target_from_spec(target), credential, &control)
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        let mut total = 0_usize;
+        session
+            .read_file(remote_path, &control, &mut |chunk| {
+                total = total.saturating_add(chunk.len());
+                if total > limit {
+                    return Err(camera_toolbox_adapters::platforms::ssh_managed::SshTransportError::ReadLimitExceeded {
+                        requested: total as u64,
+                        limit: limit as u64,
+                    });
+                }
+                bytes.extend_from_slice(chunk);
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+}
+
+/// 把 SSH 命令执行抽象接到真实 SSH command service（allowlisted recipe）。
+#[cfg(feature = "platform-ssh")]
+impl SshCommandExecutor for ControlRuntime {
+    fn execute(
+        &self,
+        target: &ControlTargetSpec,
+        credential_ref: &str,
+        request: TypedCommandRequest,
+        control: RemoteOperationControl,
+    ) -> Result<CommandResult, String> {
+        let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
+        // recipe 注册表从环境变量加载；无部署 recipe 时退化为空注册表（execute 会报 RecipeNotAllowed）。
+        let recipes = std::sync::Arc::new(
+            production_recipe_registry_from_env()
+                .unwrap_or_else(|_| camera_toolbox_adapters::platforms::ssh_managed::CommandRecipeRegistry::new()),
+        );
+        let allowed_recipe_id = request.recipe_id.clone();
+        let service = SshCommandService::new(
+            format!("workflow-web-ssh-{}", target.host),
+            ssh_target_from_spec(target),
+            credential_ref,
+            allowed_recipe_id,
+            Arc::clone(&self.credential_resolver),
+            Arc::clone(&self.ssh_transport),
+            recipes,
+            1_048_576,
+        );
+        service
+            .execute(request, control)
+            .map_err(|e| e.to_string())
     }
 }
 
