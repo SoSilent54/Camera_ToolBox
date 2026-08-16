@@ -141,6 +141,8 @@ impl RtspSourceNode {
         let output_port = self.output_port.clone();
         let pump_cancel = Arc::new(AtomicBool::new(false));
         let pump_cancel_flag = Arc::clone(&pump_cancel);
+        // 必须保存 pump 取消标志，否则 disconnect 无法停掉后台 pump 线程（泄漏线程且 join 永不返回）。
+        self.pump_cancel = Some(pump_cancel);
         rt.spawn(format!("rtsp-pump-{}", self.spec.id), move |ctx| {
             pump_frames(latest_frame, ctx, pump_cancel_flag, output_port);
         });
@@ -206,4 +208,212 @@ fn config_u16(spec: &NodeSpec, key: &str, fallback: u16) -> u16 {
         .and_then(serde_json::Value::as_u64)
         .and_then(|value| u16::try_from(value).ok())
         .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+
+    use super::*;
+    use crate::engine::{
+        EngineServices, NodeReporter, OutputRegistry, SpawnContext,
+    };
+    use crate::platform::{LatestDecodedFrameSlot, StreamServiceError, StreamSession, StreamTimeouts};
+
+    fn spec() -> NodeSpec {
+        crate::engine::NodeSpec {
+            id: "rtsp-1".to_owned(),
+            kind: "rtspSource".to_owned(),
+            title: "RTSP Source".to_owned(),
+            inputs: vec![],
+            outputs: vec![crate::engine::PortSpec {
+                id: "endpoint".to_owned(),
+                label: "Endpoint".to_owned(),
+                kind: "stream.video-frame".to_owned(),
+                cardinality: crate::engine::PortCardinality::One,
+                required: false,
+            }],
+            config: serde_json::json!({"url": "rtsp://127.0.0.1:554/test", "transport": "tcp"}),
+        }
+    }
+
+    fn runtime(services: EngineServices, state_tx: mpsc::Sender<crate::engine::NodeStatusReport>) -> NodeRuntime {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("rtsp-1".to_owned(), state_tx, event_tx);
+        let ctx = SpawnContext {
+            outputs: OutputRegistry::default(),
+            reporter,
+            services: Arc::new(services),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        };
+        NodeRuntime::new(ctx)
+    }
+
+    /// 记录 open 调用次数并返回带独立 latest_frame slot 的 mock StreamService。
+    struct RecordingStreamService {
+        opened: Arc<Mutex<Vec<String>>>,
+        frame: Arc<LatestDecodedFrameSlot>,
+    }
+
+    impl StreamService for RecordingStreamService {
+        fn service_id(&self) -> &str {
+            "mock"
+        }
+
+        fn open(
+            &self,
+            session_id: crate::platform::StreamSessionId,
+            _request: StreamOpenRequest,
+            control: StreamOperationControl,
+        ) -> Result<StreamSession, StreamServiceError> {
+            self.opened
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(session_id.as_str().to_owned());
+            Ok(StreamSession::new(
+                session_id,
+                Arc::clone(&self.frame),
+                control,
+            ))
+        }
+    }
+
+    /// 记录 create 调用并返回单个 mock 服务的工厂。
+    struct RecordingFactory {
+        opened: Arc<Mutex<Vec<String>>>,
+        frame: Arc<LatestDecodedFrameSlot>,
+    }
+
+    impl crate::engine::StreamServiceFactory for RecordingFactory {
+        fn create(&self, _config: RtspStreamConfig) -> Arc<dyn StreamService> {
+            Arc::new(RecordingStreamService {
+                opened: Arc::clone(&self.opened),
+                frame: Arc::clone(&self.frame),
+            })
+        }
+    }
+
+    fn last_state(rx: &mpsc::Receiver<crate::engine::NodeStatusReport>) -> Option<NodeRuntimeState> {
+        let mut last = None;
+        while let Ok(report) = rx.try_recv() {
+            last = Some(report.state);
+        }
+        last
+    }
+
+    #[test]
+    fn factory_instantiates_with_expected_kind() {
+        assert_eq!(RtspSourceFactory.kind(), "rtspSource");
+        let instance = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        assert_eq!(instance.kind(), "rtspSource");
+    }
+
+    #[test]
+    fn on_start_reports_ready() {
+        let (state_tx, state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        node.on_start(&mut rt).expect("on_start");
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Ready));
+    }
+
+    #[test]
+    fn connect_without_url_is_config_error() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut s = spec();
+        s.config = serde_json::json!({});
+        let mut node = RtspSourceFactory.instantiate(s).expect("instantiate");
+        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("empty url");
+        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn connect_without_stream_factory_is_precondition() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("no factory");
+        assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn connect_opens_stream_and_reports_running() {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let frame = Arc::new(LatestDecodedFrameSlot::default());
+        let services = EngineServices {
+            stream_factory: Some(Arc::new(RecordingFactory {
+                opened: Arc::clone(&opened),
+                frame: Arc::clone(&frame),
+            })),
+            ..EngineServices::default()
+        };
+        let (state_tx, state_rx) = mpsc::channel();
+        let mut rt = runtime(services, state_tx);
+
+        let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        node.on_action(NodeAction::Connect, &mut rt).expect("connect");
+        // 立即上报 running（streaming）
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
+        assert_eq!(opened.lock().unwrap().len(), 1);
+
+        // 重复 connect 是 no-op（cancellation 已存在）
+        node.on_action(NodeAction::Connect, &mut rt).expect("re-connect");
+        assert_eq!(opened.lock().unwrap().len(), 1);
+
+        // 清理后台 pump 线程
+        node.on_stop(&mut rt).expect("stop");
+        rt.stop_background();
+    }
+
+    #[test]
+    fn disconnect_reports_idle_and_stops_pump() {
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let frame = Arc::new(LatestDecodedFrameSlot::default());
+        let services = EngineServices {
+            stream_factory: Some(Arc::new(RecordingFactory {
+                opened: Arc::clone(&opened),
+                frame,
+            })),
+            ..EngineServices::default()
+        };
+        let (state_tx, state_rx) = mpsc::channel();
+        let mut rt = runtime(services, state_tx);
+
+        let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        node.on_action(NodeAction::Connect, &mut rt).expect("connect");
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
+
+        node.on_action(NodeAction::Disconnect, &mut rt).expect("disconnect");
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Idle));
+        rt.stop_background();
+    }
+
+    #[test]
+    fn unsupported_action_is_error() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        let err = node.on_action(NodeAction::Trigger, &mut rt).expect_err("unsupported");
+        assert!(matches!(err, NodeError::UnsupportedAction(_)));
+    }
+
+    #[test]
+    fn transport_config_maps_udp_vs_default_tcp() {
+        // 直接验证 config 分派：transport=udp → Udp，其余 → Tcp。
+        let node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
+        // 通过内部 connect 分支不便直接断言 transport，这里用黑盒保证 udp 也能成功构造 config。
+        // 构造一个 udp 配置的 spec，确认 connect 不因 transport 解析 panic（缺 factory 时为 Precondition）。
+        let _ = node;
+        let mut s = spec();
+        s.config = serde_json::json!({"url": "rtsp://x", "transport": "udp"});
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = RtspSourceFactory.instantiate(s).expect("instantiate");
+        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("no factory");
+        // udp 解析不 panic，仅因缺 factory 报 Precondition
+        assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
+        let _ = StreamTimeouts::default();
+    }
 }

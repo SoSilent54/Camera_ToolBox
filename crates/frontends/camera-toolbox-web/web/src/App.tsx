@@ -978,26 +978,13 @@ function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStat
 }
 
 function isActiveSeedNode(node: WorkflowNode, runtimeNodeStates: Map<string, string>): boolean {
-  if (runtimeNodeStates.get(node.id) === 'running') {
+  // 连线是否「活跃」应只依据真实运行时状态（引擎 drain_status 上报），
+  // 不能只看 config 里有没有默认 URL/路径文本——否则默认 RTSP URL 会让整条链误显示为活跃。
+  const runtime = runtimeNodeStates.get(node.id);
+  if (runtime === 'running' || runtime === 'ready') {
     return true;
   }
-  if (node.kind === 'rtspSource') {
-    return hasText(node.config.url);
-  }
-  if (node.kind === 'localFileSource') {
-    return hasText(node.config.root) || hasText(node.config.directory);
-  }
-  if (node.kind === 'sftpFileSource') {
-    return hasText(node.config.remoteRoot);
-  }
-  if (node.kind === 'x5Device') {
-    return hasText(node.config.host) || hasText(node.config.tcpPort);
-  }
   return false;
-}
-
-function hasText(value: unknown): value is string {
-  return typeof value === 'string' && value.trim().length > 0;
 }
 
 /** 生成 RFC4122 v4 UUID；randomUUID 仅在 secure context（HTTPS/localhost）可用，非 HTTPS 非 localhost 时回退 getRandomValues。 */

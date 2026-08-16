@@ -483,6 +483,34 @@ button:hover {
   font-size: 0.76rem;
 }
 
+/* 节点状态点：右侧彩色圆点 + 状态文字，颜色按运行时状态区分 */
+.state-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  font-size: 0.6rem;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.state-dot::before {
+  content: "";
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 5px currentColor;
+}
+
+.state-dot.running { color: #38bdf8; }
+.state-dot.ready { color: #34d399; }
+.state-dot.idle { color: #94a3b8; }
+.state-dot.disabled { color: #64748b; }
+.state-dot.error { color: #f87171; }
+.state-dot.warning { color: #f59e0b; }
+
 /* 三段式连接区：标题 / 连接 / 内容（ComfyUI 风格） */
 .node-ports {
   display: flex;

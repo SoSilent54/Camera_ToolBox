@@ -153,3 +153,219 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
         .and_then(serde_json::Value::as_f64)
         .unwrap_or(fallback)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+
+    use super::*;
+    use camera_toolbox_core::ChessboardDetectionOutcome;
+    use crate::engine::{
+        EngineServices, NodeReporter, OutputRegistry, SpawnContext,
+    };
+    use crate::ports::{CalibrationBackend, CalibrationBackendError};
+
+    fn spec() -> NodeSpec {
+        NodeSpec {
+            id: "calib-1".to_owned(),
+            kind: "calibrationSolver".to_owned(),
+            title: "Calibration Solver".to_owned(),
+            inputs: vec![],
+            outputs: vec![crate::engine::PortSpec {
+                id: "solution".to_owned(),
+                label: "Solution".to_owned(),
+                kind: "calib.solution".to_owned(),
+                cardinality: crate::engine::PortCardinality::One,
+                required: false,
+            }],
+            config: serde_json::json!({
+                "imageWidth": 1920,
+                "imageHeight": 1080,
+                "boardCols": 8,
+                "boardRows": 11,
+                "squareSizeMm": 30.0,
+                "fx": 1234.56,
+                "fy": 1234.56,
+                "cx": 960.0,
+                "cy": 540.0,
+            }),
+        }
+    }
+
+    fn runtime(services: EngineServices, state_tx: mpsc::Sender<crate::engine::NodeStatusReport>) -> NodeRuntime {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("calib-1".to_owned(), state_tx, event_tx);
+        let ctx = SpawnContext {
+            outputs: OutputRegistry::default(),
+            reporter,
+            services: Arc::new(services),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        };
+        NodeRuntime::new(ctx)
+    }
+
+    struct RecordingBackend {
+        called: Arc<Mutex<usize>>,
+        solution: CalibrationSolution,
+    }
+
+    impl CalibrationBackend for RecordingBackend {
+        fn build_information(&self) -> Result<String, CalibrationBackendError> {
+            Ok("mock".to_owned())
+        }
+
+        fn detect_png(
+            &self,
+            _encoded_png: &[u8],
+            _expected_size: CalibrationImageSize,
+            _decoded_byte_limit: usize,
+            _board: BoardSpec,
+            _cancellation: &CalibrationCancellation,
+        ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError> {
+            unreachable!("not exercised in solver tests")
+        }
+
+        fn estimate_pose(
+            &self,
+            _detection: &camera_toolbox_core::ChessboardDetection,
+            _initial_intrinsics: &InitialIntrinsics,
+            _board: BoardSpec,
+            _cancellation: &CalibrationCancellation,
+        ) -> Result<camera_toolbox_core::ViewCalibrationResult, CalibrationBackendError> {
+            unreachable!("not exercised in solver tests")
+        }
+
+        fn calibrate(
+            &self,
+            _request: &CalibrationRequest,
+            _cancellation: &CalibrationCancellation,
+        ) -> Result<CalibrationSolution, CalibrationBackendError> {
+            *self.called.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            Ok(self.solution.clone())
+        }
+    }
+
+    fn solution_for(size: CalibrationImageSize) -> CalibrationSolution {
+        CalibrationSolution {
+            image_size: size,
+            camera_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+            rms_error: 0.0,
+            calibration_flags: 0,
+            views: vec![],
+        }
+    }
+
+    fn last_state(rx: &mpsc::Receiver<crate::engine::NodeStatusReport>) -> Option<NodeRuntimeState> {
+        let mut last = None;
+        while let Ok(report) = rx.try_recv() {
+            last = Some(report.state);
+        }
+        last
+    }
+
+    #[test]
+    fn factory_instantiates_with_expected_kind() {
+        assert_eq!(CalibrationSolverFactory.kind(), "calibrationSolver");
+        let instance = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        assert_eq!(instance.kind(), "calibrationSolver");
+    }
+
+    #[test]
+    fn on_start_reports_ready() {
+        let (state_tx, state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        node.on_start(&mut rt).expect("on_start");
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Ready));
+    }
+
+    #[test]
+    fn build_request_reads_config_defaults_and_distortion() {
+        let node = CalibrationSolverNode { spec: spec() };
+        let request = node.build_request().expect("build request");
+        assert_eq!(request.image_size.width, 1920);
+        assert_eq!(request.image_size.height, 1080);
+        assert_eq!(request.board.inner_cols, 8);
+        assert_eq!(request.board.inner_rows, 11);
+        // 未提供 distortionCoefficients → 默认 12 个 0
+        assert_eq!(request.initial_intrinsics.distortion_coefficients, vec![0.0; 12]);
+    }
+
+    #[test]
+    fn build_request_parses_distortion_coefficients() {
+        let mut s = spec();
+        s.config["distortionCoefficients"] = serde_json::json!([0.1, 0.2, 0.3]);
+        let node = CalibrationSolverNode { spec: s };
+        let request = node.build_request().expect("build request");
+        assert_eq!(request.initial_intrinsics.distortion_coefficients, vec![0.1, 0.2, 0.3]);
+    }
+
+    #[test]
+    fn trigger_without_backend_is_precondition() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        let err = node.on_action(NodeAction::Trigger, &mut rt).expect_err("no backend");
+        assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn trigger_solves_and_emits_solution() {
+        let size = CalibrationImageSize::new(1920, 1080).expect("size");
+        let backend = Arc::new(RecordingBackend {
+            called: Arc::new(Mutex::new(0)),
+            solution: solution_for(size),
+        });
+        let services = EngineServices {
+            calibration: Some(backend.clone()),
+            ..EngineServices::default()
+        };
+        let (state_tx, state_rx) = mpsc::channel();
+        let mut outputs = OutputRegistry::default();
+        let emitted: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let sink = Arc::clone(&emitted);
+        outputs.set_record(Arc::new(move |_| *sink.lock().unwrap() += 1));
+
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("calib-1".to_owned(), state_tx, event_tx);
+        let ctx = SpawnContext {
+            outputs: outputs.clone(),
+            reporter,
+            services: Arc::new(services),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        };
+        let mut rt = NodeRuntime::new(ctx);
+
+        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        node.on_action(NodeAction::Trigger, &mut rt).expect("trigger");
+
+        assert_eq!(*emitted.lock().unwrap(), 1, "solution must be emitted once");
+        assert_eq!(*backend.called.lock().unwrap(), 1, "backend.calibrate must be called once");
+        // 求解后回落到 idle
+        assert_eq!(
+            last_state(&state_rx).filter(|s| *s == NodeRuntimeState::Idle),
+            Some(NodeRuntimeState::Idle)
+        );
+    }
+
+    #[test]
+    fn unsupported_action_is_error() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("unsupported");
+        assert!(matches!(err, NodeError::UnsupportedAction(_)));
+    }
+
+    #[test]
+    fn on_stop_reports_idle() {
+        let (state_tx, state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        node.on_stop(&mut rt).expect("on_stop");
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Idle));
+    }
+}
