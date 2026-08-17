@@ -11,19 +11,22 @@ export function GenericWorkflowNode({ data, selected }: NodeProps) {
     .filter(([, value]) => typeof value !== 'object' && value !== null && value !== undefined && value !== '')
     .slice(0, 4);
   return (
-    <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+    <div className="workflow-node-shell">
+      <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
 
-      <PortHandles node={node} />
-      <div className="node-body compact">
-        {params.length === 0 ? (
-          <span className="node-hint">no config</span>
-        ) : params.map(([key, value]) => (
-          <span key={key} className="node-param">
-            <code>{key}</code>&nbsp;{String(value)}
-          </span>
-        ))}
-      </div>
-    </section>
+        <PortHandles node={node} />
+        <div className="node-body compact">
+          {params.length === 0 ? (
+            <span className="node-hint">no config</span>
+          ) : params.map(([key, value]) => (
+            <span key={key} className="node-param">
+              <code>{key}</code>&nbsp;{String(value)}
+            </span>
+          ))}
+        </div>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }

@@ -11,17 +11,21 @@ export function ViewerNode({ data, selected, width, height }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
-    <section
-      className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}
-      style={{ width, height }}
-    >
-      <NodeResizer isVisible={selected} minWidth={260} minHeight={160} />
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
-      <PortHandles node={node} />
-      <EngineFrame nodeId={node.id} />
-    </section>
+    <div className="workflow-node-shell">
+      <section
+        className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}
+        style={{ width, height }}
+      >
+        <NodeResizer isVisible={selected} minWidth={260} minHeight={160} />
+        <NodeHeader node={node} runtimeState={runtimeState} />
+        <PortHandles node={node} />
+        <EngineFrame nodeId={node.id} />
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }
+
 
 /** 订阅引擎 viewer 二进制 JPEG 帧；latest-wins，丢弃旧帧，无帧时保持上一帧（冻结）。 */
 function EngineFrame({ nodeId }: { nodeId: string }) {

@@ -22,39 +22,43 @@ export function LocalFileSourceNode({ data, selected }: NodeProps) {
   useEffect(() => setDraftRoot(root), [root]);
   const applyRoot = () => nodeData.onNodeConfigChange?.(node.id, 'root', draftRoot.trim());
   return (
-    <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+    <div className="workflow-node-shell">
+      <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
 
-      <PortHandles node={node} />
-      <div className="node-body">
-        <label htmlFor={`${node.id}-root`}>Workspace root</label>
-        <input
-          id={`${node.id}-root`}
-          className="rtsp-url-input nodrag"
-          value={draftRoot}
-          placeholder="/absolute/path/to/workspace"
-          spellCheck={false}
-          onChange={(event) => setDraftRoot(event.target.value)}
-          onBlur={applyRoot}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              applyRoot();
-              event.currentTarget.blur();
-            }
-          }}
-        />
-        <FileBrowser
-          root={root}
-          directory={directory}
-          selection={selection}
-          onDirectory={(path) => nodeData.onNodeConfigChange?.(node.id, 'directory', path)}
-          onSelection={(path) => nodeData.onNodeConfigChange?.(node.id, 'selection', path)}
-        />
-        <span>Filter: {filter}</span>
-      </div>
-    </section>
+        <PortHandles node={node} />
+        <div className="node-body">
+          <label htmlFor={`${node.id}-root`}>Workspace root</label>
+          <input
+            id={`${node.id}-root`}
+            className="rtsp-url-input nodrag"
+            value={draftRoot}
+            placeholder="/absolute/path/to/workspace"
+            spellCheck={false}
+            onChange={(event) => setDraftRoot(event.target.value)}
+            onBlur={applyRoot}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                applyRoot();
+                event.currentTarget.blur();
+              }
+            }}
+          />
+          <FileBrowser
+            root={root}
+            directory={directory}
+            selection={selection}
+            onDirectory={(path) => nodeData.onNodeConfigChange?.(node.id, 'directory', path)}
+            onSelection={(path) => nodeData.onNodeConfigChange?.(node.id, 'selection', path)}
+          />
+          <span>Filter: {filter}</span>
+        </div>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }
+
 
 /**
  * ② SftpFileSource（吸收 SftpWorkspace + FileBrowser remote）：
@@ -71,33 +75,36 @@ export function SftpFileSourceNode({ data, selected }: NodeProps) {
   useEffect(() => setDraftRoot(remoteRoot), [remoteRoot]);
   const applyRoot = () => nodeData.onNodeConfigChange?.(node.id, 'remoteRoot', draftRoot.trim() || '/');
   return (
-    <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+    <div className="workflow-node-shell">
+      <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
 
-
-      <div className="node-body">
-        <label htmlFor={`${node.id}-remote-root`}>Remote root</label>
-        <input
-          id={`${node.id}-remote-root`}
-          className="rtsp-url-input nodrag"
-          value={draftRoot}
-          placeholder="/data/captures"
-          spellCheck={false}
-          onChange={(event) => setDraftRoot(event.target.value)}
-          onBlur={applyRoot}
-          onKeyDown={(event) => {
-            if (event.key === 'Enter') {
-              applyRoot();
-              event.currentTarget.blur();
-            }
-          }}
-        />
-        <span>Source ID: {sourceId}</span>
-        <span>Session-bound; no password or directory cache is persisted.</span>
-      </div>
-    </section>
+        <div className="node-body">
+          <label htmlFor={`${node.id}-remote-root`}>Remote root</label>
+          <input
+            id={`${node.id}-remote-root`}
+            className="rtsp-url-input nodrag"
+            value={draftRoot}
+            placeholder="/data/captures"
+            spellCheck={false}
+            onChange={(event) => setDraftRoot(event.target.value)}
+            onBlur={applyRoot}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                applyRoot();
+                event.currentTarget.blur();
+              }
+            }}
+          />
+          <span>Source ID: {sourceId}</span>
+          <span>Session-bound; no password or directory cache is persisted.</span>
+        </div>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }
+
 
 /** SshSession：控制会话展示。SSH 参数编辑/expectedHostKey pin 属 M3（见 t8 遗留记录）。 */
 export function SshSessionNode({ data, selected }: NodeProps) {
@@ -110,20 +117,24 @@ export function SshSessionNode({ data, selected }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
-    <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+    <div className="workflow-node-shell">
+      <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
 
-      <PortHandles node={node} />
-      <div className="node-body compact">
-        <span>Profile: {profileId || 'manual'}</span>
-        <span>Host: {host || 'unset'}</span>
-        <span>User: {username}</span>
-        <span>Auto: {String(node.config.autoConnect === true)}</span>
-        {expectedHostKey && <span>HostKey: {expectedHostKey.slice(0, 16)}…</span>}
-      </div>
-    </section>
+        <PortHandles node={node} />
+        <div className="node-body compact">
+          <span>Profile: {profileId || 'manual'}</span>
+          <span>Host: {host || 'unset'}</span>
+          <span>User: {username}</span>
+          <span>Auto: {String(node.config.autoConnect === true)}</span>
+          {expectedHostKey && <span>HostKey: {expectedHostKey.slice(0, 16)}…</span>}
+        </div>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }
+
 
 /**
  * ③ X5Device（吸收 X5RtspChannel + X5Snapshot）：
@@ -136,16 +147,19 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
-    <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
-      <PortHandles node={node} />
-      <div className="node-body compact">
-        <span>Host: {configText(node, 'host', '10.21.12.108')}</span>
-        <span>TCP: {configText(node, 'tcpPort', '9073')}</span>
-        <span>FPS: {configText(node, 'fps', '60')}</span>
-        <span>Bitrate: {configText(node, 'bitrateKbps', '12000')} kbps</span>
-        <span>Channels: {channels}</span>
-      </div>
-    </section>
+    <div className="workflow-node-shell">
+      <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
+        <PortHandles node={node} />
+        <div className="node-body compact">
+          <span>Host: {configText(node, 'host', '10.21.12.108')}</span>
+          <span>TCP: {configText(node, 'tcpPort', '9073')}</span>
+          <span>FPS: {configText(node, 'fps', '60')}</span>
+          <span>Bitrate: {configText(node, 'bitrateKbps', '12000')} kbps</span>
+          <span>Channels: {channels}</span>
+        </div>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }

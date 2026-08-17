@@ -10,27 +10,30 @@ export function CalibrationSolverNode({ data, selected }: NodeProps) {
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const cfg = node.config;
   return (
-    <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+    <div className="workflow-node-shell">
+      <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
 
-      <PortHandles node={node} />
-      <div className="node-body compact">
-        <span className="node-param">
-          <code>board</code>&nbsp;{String(cfg.boardCols ?? 8)}×{String(cfg.boardRows ?? 11)}
-        </span>
-        <span className="node-param">
-          <code>square</code>&nbsp;{String(cfg.squareSizeMm ?? 30)}mm
-        </span>
-        <div className="node-actions">
-          <button
-            type="button"
-            disabled={runtimeState === 'disabled'}
-            onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}
-          >
-            {runtimeState === 'running' ? '求解中…' : '求解'}
-          </button>
+        <PortHandles node={node} />
+        <div className="node-body compact">
+          <span className="node-param">
+            <code>board</code>&nbsp;{String(cfg.boardCols ?? 8)}×{String(cfg.boardRows ?? 11)}
+          </span>
+          <span className="node-param">
+            <code>square</code>&nbsp;{String(cfg.squareSizeMm ?? 30)}mm
+          </span>
+          <div className="node-actions">
+            <button
+              type="button"
+              disabled={runtimeState === 'disabled'}
+              onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}
+            >
+              {runtimeState === 'running' ? '求解中…' : '求解'}
+            </button>
+          </div>
         </div>
-      </div>
-    </section>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
   );
 }
