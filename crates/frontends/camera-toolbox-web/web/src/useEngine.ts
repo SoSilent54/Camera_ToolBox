@@ -16,8 +16,9 @@ interface StatusPush {
  */
 export function useEngine() {
   const [nodeStates, setNodeStates] = useState<Record<string, EngineState>>({});
+  const [nodeDiagnostics, setNodeDiagnostics] = useState<Record<string, string>>({});
 
-  // 订阅 status 推送，按 nodeId 覆盖 state，合并进 nodeStates。
+  // 订阅 status 推送，按 nodeId 覆盖 state/diagnostic，合并进本地状态。
   useEffect(() => {
     return subscribeTopic('status', (payload) => {
       const status = payload as StatusPush;
@@ -25,6 +26,14 @@ export function useEngine() {
         return;
       }
       setNodeStates((current) => ({ ...current, [status.nodeId]: status.state }));
+      setNodeDiagnostics((current) => {
+        if (typeof status.diagnostic === 'string' && status.diagnostic.trim()) {
+          return { ...current, [status.nodeId]: status.diagnostic };
+        }
+        const next = { ...current };
+        delete next[status.nodeId];
+        return next;
+      });
     });
   }, []);
 
@@ -36,5 +45,5 @@ export function useEngine() {
     });
   }, []);
 
-  return { nodeStates, sendAction };
+  return { nodeStates, nodeDiagnostics, sendAction };
 }

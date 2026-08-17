@@ -7,10 +7,12 @@ export function CalibrationSolverNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const cfg = node.config;
   return (
     <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+
       <PortHandles node={node} />
       <div className="node-body compact">
         <span className="node-param">

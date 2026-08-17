@@ -369,7 +369,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "media.rtsp.endpoint.v1",
                 Some(PortRole::Endpoint),
             )],
-            json!({"url": DEFAULT_RTSP_URL, "transport": "tcp", "expectedWidth": 1920, "expectedHeight": 1080, "expectedFps": 60}),
+            json!({"url": DEFAULT_RTSP_URL, "transport": "tcp", "expectedWidth": 1920, "expectedHeight": 1080, "expectedFps": 60, "connectTimeoutMs": 8000, "idleTimeoutMs": 10000}),
         ),
         NodeKind::SshSession => (
             NodeCategory::Control,
@@ -1125,11 +1125,53 @@ pub fn validate_edge(graph: &WorkflowGraph, edge: &WorkflowEdge) -> Result<(), S
 
 fn validate_node_config(node: &WorkflowNode) -> Result<(), String> {
     match node.kind {
+        NodeKind::RtspSource => validate_rtsp_source_config(node),
         NodeKind::SshSession => validate_ssh_session_config(node),
         NodeKind::SftpFileSource => validate_sftp_file_source_config(node),
         NodeKind::LocalFileSource => validate_local_file_source_config(node),
         _ => Ok(()),
     }
+}
+
+fn validate_rtsp_source_config(node: &WorkflowNode) -> Result<(), String> {
+    let config = node_config_object(node)?;
+    if let Some(url) = config_string(config, "url") {
+        validate_printable_config_text(node, "url", url)?;
+        if !url.starts_with("rtsp://") && !url.starts_with("rtsps://") {
+            return Err(format!(
+                "node `{}` RTSP url must start with rtsp:// or rtsps://",
+                node.id
+            ));
+        }
+    }
+    validate_timeout_ms(node, config, "connectTimeoutMs")?;
+    validate_timeout_ms(node, config, "idleTimeoutMs")?;
+    Ok(())
+}
+
+fn validate_timeout_ms(
+    node: &WorkflowNode,
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<(), String> {
+    let Some(value) = config.get(key) else {
+        return Ok(());
+    };
+    let ms = value.as_u64().or_else(|| {
+        value
+            .as_str()
+            .and_then(|text| text.parse::<u64>().ok())
+    });
+    let Some(ms) = ms else {
+        return Err(format!("node `{}` config `{key}` must be milliseconds", node.id));
+    };
+    if ms == 0 || ms > 120_000 {
+        return Err(format!(
+            "node `{}` config `{key}` must be in 1..=120000 ms",
+            node.id
+        ));
+    }
+    Ok(())
 }
 
 fn validate_ssh_session_config(node: &WorkflowNode) -> Result<(), String> {

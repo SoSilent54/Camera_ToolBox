@@ -313,6 +313,8 @@ export interface FlowNodeData extends Record<string, unknown> {
   preview?: ViewerPreview;
   /** 引擎实时状态；缺省回退到节点的持久化 state。 */
   runtimeState?: 'disabled' | 'idle' | 'ready' | 'running' | 'warning' | 'error';
+  /** 引擎实时诊断；用于解释 error/warning 的根因。 */
+  runtimeDiagnostic?: string;
   onRtspUrlChange?: (nodeId: string, url: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: string | boolean) => void;
   /** 触发节点动作（connect/disconnect/trigger/arm/disarm）。 */

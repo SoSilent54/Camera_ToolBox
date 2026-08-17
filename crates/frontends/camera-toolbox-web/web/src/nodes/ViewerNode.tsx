@@ -9,13 +9,14 @@ export function ViewerNode({ data, selected, width, height }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
     <section
       className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}
       style={{ width, height }}
     >
       <NodeResizer isVisible={selected} minWidth={260} minHeight={160} />
-      <NodeHeader node={node} runtimeState={runtimeState} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
       <PortHandles node={node} />
       <EngineFrame nodeId={node.id} />
     </section>

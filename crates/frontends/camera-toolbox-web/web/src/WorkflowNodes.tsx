@@ -17,12 +17,14 @@ export function LocalFileSourceNode({ data, selected }: NodeProps) {
   const selection = configText(node, 'selection', '');
   const filter = configText(node, 'filter', '*.png;*.jpg;*.jpeg');
   const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const [draftRoot, setDraftRoot] = useState(root);
   useEffect(() => setDraftRoot(root), [root]);
   const applyRoot = () => nodeData.onNodeConfigChange?.(node.id, 'root', draftRoot.trim());
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+
       <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-root`}>Workspace root</label>
@@ -63,13 +65,16 @@ export function SftpFileSourceNode({ data, selected }: NodeProps) {
   const node = nodeData.workflowNode;
   const remoteRoot = configText(node, 'remoteRoot', '/');
   const sourceId = configText(node, 'sourceId', 'sftp-main');
+  const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const [draftRoot, setDraftRoot] = useState(remoteRoot);
   useEffect(() => setDraftRoot(remoteRoot), [remoteRoot]);
   const applyRoot = () => nodeData.onNodeConfigChange?.(node.id, 'remoteRoot', draftRoot.trim() || '/');
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} />
-      <PortHandles node={node} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+
+
       <div className="node-body">
         <label htmlFor={`${node.id}-remote-root`}>Remote root</label>
         <input
@@ -102,9 +107,12 @@ export function SshSessionNode({ data, selected }: NodeProps) {
   const profileId = configText(node, 'profileId', '');
   const username = configText(node, 'username', 'root');
   const expectedHostKey = configText(node, 'expectedHostKey', '');
+  const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+
       <PortHandles node={node} />
       <div className="node-body compact">
         <span>Profile: {profileId || 'manual'}</span>
@@ -125,9 +133,11 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const channels = configText(node, 'channels', '[0]');
+  const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
     <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
       <PortHandles node={node} />
       <div className="node-body compact">
         <span>Host: {configText(node, 'host', '10.21.12.108')}</span>

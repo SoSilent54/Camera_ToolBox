@@ -4,12 +4,13 @@ import type { NodeDefinition, NodeKind, PortKind, WorkflowNode } from '../workfl
 
 export const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
 /** 节点标题 + 实时状态点；状态优先取引擎实时值，回退到持久化 state。 */
-export function NodeHeader({ node, runtimeState }: { node: WorkflowNode; runtimeState?: string }) {
+export function NodeHeader({ node, runtimeState, runtimeDiagnostic }: { node: WorkflowNode; runtimeState?: string; runtimeDiagnostic?: string }) {
   const state = runtimeState ?? node.state;
   return (
     <header className="node-header">
       <span>{node.title}</span>
       <small className={`state-dot ${state}`}>{state}</small>
+      {runtimeDiagnostic ? <span className="node-diagnostic" title={runtimeDiagnostic}>{runtimeDiagnostic}</span> : null}
     </header>
   );
 }

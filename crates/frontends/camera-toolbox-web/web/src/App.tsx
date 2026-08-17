@@ -135,7 +135,7 @@ export function App() {
   const [edges, setEdges, onEdgesChangeBase] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待后端图快照...']);
-  const { nodeStates, sendAction } = useEngine();
+  const { nodeStates, nodeDiagnostics, sendAction } = useEngine();
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
@@ -146,6 +146,8 @@ export function App() {
   const edgesRef = useRef<FlowEdge[]>(edges);
   const [nodeCreateMenu, setNodeCreateMenu] = useState<NodeCreateMenuMode | null>(null);
   const connectionStartRef = useRef<OnConnectStartParams | null>(null);
+  const graphRef = useRef<WorkflowGraph | null>(null);
+  const draggingNodeIdRef = useRef<string | null>(null);
 
   const pushEvent = useCallback((event: string) => {
     setEvents((current) => [event, ...current].slice(0, 10));
@@ -160,11 +162,20 @@ export function App() {
   }, [edges]);
 
   const renderGraph = useCallback(
-    (nextGraph: WorkflowGraph, event?: string) => {
+    (nextGraph: WorkflowGraph, event?: string, options?: { source?: 'response' | 'snapshot' }) => {
+      const currentGraph = graphRef.current;
+      if (options?.source === 'snapshot') {
+        if (draggingNodeIdRef.current) {
+          return;
+        }
+        if (currentGraph && !isNewerGraphRevision(nextGraph.revision, currentGraph.revision)) {
+          return;
+        }
+      }
+      graphRef.current = nextGraph;
       setGraph(nextGraph);
-      setNodes(toFlowNodes(nextGraph));
-      setEdges(toFlowEdges(nextGraph));
-      setSelection({ type: 'none' });
+      setNodes((current) => mergeFlowNodes(current, nextGraph));
+      setEdges((current) => mergeFlowEdges(current, nextGraph));
       if (event) {
         setEvents([event, `节点 ${nextGraph.nodes.length} 个，连接 ${nextGraph.edges.length} 条`]);
       }
@@ -175,7 +186,7 @@ export function App() {
   const commitGraph = useCallback(
     (request: Promise<WorkflowGraph>, event: string) => {
       request
-        .then((nextGraph) => renderGraph(nextGraph, event))
+        .then((nextGraph) => renderGraph(nextGraph, event, { source: 'response' }))
         .catch((error: unknown) => pushEvent(`图更新失败：${error instanceof Error ? error.message : String(error)}`));
     },
     [pushEvent, renderGraph],
@@ -198,7 +209,7 @@ export function App() {
     if (!nextGraph || !Array.isArray(nextGraph.nodes) || !Array.isArray(nextGraph.edges)) {
       return;
     }
-    renderGraph(nextGraph, '已同步后端图快照');
+    renderGraph(nextGraph, '已同步后端图快照', { source: 'snapshot' });
   }), [renderGraph]);
 
   const refreshSavedWorkflows = useCallback(() => {
@@ -379,11 +390,13 @@ export function App() {
   useEffect(() => {
     setNodes((current) => current.map((flowNode) => {
       const runtimeState = nodeStates[flowNode.id];
+      const runtimeDiagnostic = nodeDiagnostics[flowNode.id];
       if (
         flowNode.data.onRtspUrlChange === handleRtspUrlChange
         && flowNode.data.onNodeConfigChange === handleNodeConfigChange
         && flowNode.data.onNodeAction === sendAction
         && flowNode.data.runtimeState === runtimeState
+        && flowNode.data.runtimeDiagnostic === runtimeDiagnostic
       ) {
         return flowNode;
       }
@@ -392,13 +405,14 @@ export function App() {
         data: {
           ...flowNode.data,
           runtimeState,
+          runtimeDiagnostic,
           onRtspUrlChange: handleRtspUrlChange,
           onNodeConfigChange: handleNodeConfigChange,
           onNodeAction: sendAction,
         },
       };
     }));
-  }, [handleNodeConfigChange, handleRtspUrlChange, nodeStates, nodes.length, sendAction, setNodes]);
+  }, [handleNodeConfigChange, handleRtspUrlChange, nodeDiagnostics, nodeStates, nodes.length, sendAction, setNodes]);
 
   const createFlowNodeAt = useCallback(
     (kind: NodeKind, position: { x: number; y: number }): FlowNode => {
@@ -648,7 +662,12 @@ export function App() {
     pushEvent('画布已适配视图');
   }, [pushEvent]);
 
+  const handleNodeDragStart = useCallback((_event: MouseEvent | TouchEvent, node: FlowNode) => {
+    draggingNodeIdRef.current = node.id;
+  }, []);
+
   const handleNodeDragStop = useCallback((_event: MouseEvent | TouchEvent, node: FlowNode) => {
+    draggingNodeIdRef.current = null;
     const workflowNode = node.data.workflowNode;
     if (workflowNode.position.x === node.position.x && workflowNode.position.y === node.position.y) {
       return;
@@ -915,6 +934,7 @@ export function App() {
           onDragOver={handleDragNodeOver}
           onDrop={handleDropNode}
           onSelectionChange={onSelectionChange}
+          onNodeDragStart={handleNodeDragStart}
           onNodeDragStop={handleNodeDragStop}
           onNodeContextMenu={handleNodeContextMenu}
           onInit={(instance) => {
@@ -992,6 +1012,57 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema, schemaVersion: edge.schemaVersion },
     className: 'workflow-edge flow-inactive',
   }));
+}
+
+function mergeFlowNodes(current: FlowNode[], graph: WorkflowGraph): FlowNode[] {
+  const currentById = new Map(current.map((node) => [node.id, node]));
+  return graph.nodes.map((workflowNode) => {
+    const existing = currentById.get(workflowNode.id);
+    if (!existing) {
+      return toFlowNode(workflowNode);
+    }
+    return {
+      ...existing,
+      type: workflowNode.kind,
+      position: workflowNode.position,
+      data: {
+        ...existing.data,
+        workflowNode,
+      },
+    };
+  });
+}
+
+function mergeFlowEdges(current: FlowEdge[], graph: WorkflowGraph): FlowEdge[] {
+  const currentById = new Map(current.map((edge) => [edge.id, edge]));
+  return graph.edges.map((workflowEdge) => {
+    const nextEdge = toFlowEdges({ ...graph, edges: [workflowEdge] })[0];
+    const existing = currentById.get(workflowEdge.id);
+    if (!existing) {
+      return nextEdge;
+    }
+    return {
+      ...existing,
+      source: nextEdge.source,
+      sourceHandle: nextEdge.sourceHandle,
+      target: nextEdge.target,
+      targetHandle: nextEdge.targetHandle,
+      label: nextEdge.label,
+      data: nextEdge.data,
+    };
+  });
+}
+
+function isNewerGraphRevision(nextRevision: string, currentRevision: string): boolean {
+  if (nextRevision === currentRevision) {
+    return false;
+  }
+  const next = Number(nextRevision.replace(/^rev-/, ''));
+  const current = Number(currentRevision.replace(/^rev-/, ''));
+  if (Number.isFinite(next) && Number.isFinite(current)) {
+    return next > current;
+  }
+  return nextRevision > currentRevision;
 }
 
 function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStates: Map<string, string>): FlowEdge[] {

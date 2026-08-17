@@ -8,6 +8,7 @@ export function RtspSourceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const runtimeState = nodeData.runtimeState;
+  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const url = String(node.config.url ?? DEFAULT_RTSP_URL);
   const [draftUrl, setDraftUrl] = useState(url);
   useEffect(() => setDraftUrl(url), [url]);
@@ -15,7 +16,8 @@ export function RtspSourceNode({ data, selected }: NodeProps) {
   const connected = runtimeState === 'running';
   return (
     <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
-      <NodeHeader node={node} runtimeState={runtimeState} />
+      <NodeHeader node={node} runtimeState={runtimeState} runtimeDiagnostic={runtimeDiagnostic} />
+
       <PortHandles node={node} />
       <div className="node-body">
         <label htmlFor={`${node.id}-url`}>RTSP URL</label>

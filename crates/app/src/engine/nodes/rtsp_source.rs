@@ -19,8 +19,8 @@ use crate::{
     platform::{
         LatestDecodedFrameSlot, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport,
         StreamCancellation, StreamOpenRequest, StreamOperationControl, StreamRecordingRequest,
-        StreamService, StreamServiceEvent, StreamSessionId, StreamStage, StreamTerminal,
-        StreamTimeouts,
+        StreamService, StreamServiceError, StreamServiceEvent, StreamSessionId, StreamStage,
+        StreamTerminal, StreamTimeouts,
     },
 };
 
@@ -128,16 +128,16 @@ impl RtspSourceNode {
             prefer_hardware_acceleration: false,
             recording: StreamRecordingRequest::default(),
         };
+        let timeouts = stream_timeouts_from_config(&self.spec)?;
         let cancellation = StreamCancellation::default();
         let pump_cancel = Arc::new(AtomicBool::new(false));
         let reporter = stream_reporter(rt, cancellation.clone(), Arc::clone(&pump_cancel));
-        let control =
-            StreamOperationControl::new(StreamTimeouts::default(), cancellation.clone(), reporter)
-                .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let control = StreamOperationControl::new(timeouts, cancellation.clone(), reporter)
+            .map_err(|error| NodeError::Execution(error.to_string()))?;
         let session = match service.open(session_id, request, control) {
             Ok(session) => session,
             Err(error) => {
-                rt.report_state(NodeRuntimeState::Error, format!("stream failed: {error}"));
+                rt.report_state(NodeRuntimeState::Error, stream_failure_diagnostic(&error));
                 return Err(NodeError::Execution(error.to_string()));
             }
         };
@@ -179,7 +179,7 @@ fn stream_reporter(
             StreamServiceEvent::Terminal(StreamTerminal::Failed(error)) => {
                 cancellation.cancel();
                 pump_cancel.store(true, Ordering::Release);
-                reporter.report_state(NodeRuntimeState::Error, format!("stream failed: {error}"));
+                reporter.report_state(NodeRuntimeState::Error, stream_failure_diagnostic(error));
             }
             StreamServiceEvent::Terminal(StreamTerminal::Forced {
                 remote_state_unknown,
@@ -235,6 +235,48 @@ fn pump_frames(
 
 /// 事件驱动 wait 的取消复查周期；仅用于无帧时的觉醒，非轮询节拍。
 const PUMP_CANCEL_POLL: Duration = Duration::from_millis(100);
+
+const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 8_000;
+const DEFAULT_IDLE_TIMEOUT_MS: u64 = 10_000;
+const MAX_TIMEOUT_MS: u64 = 120_000;
+
+fn stream_timeouts_from_config(spec: &NodeSpec) -> Result<StreamTimeouts, NodeError> {
+    let connect = config_duration_ms(spec, "connectTimeoutMs", DEFAULT_CONNECT_TIMEOUT_MS)?;
+    let idle = config_duration_ms(spec, "idleTimeoutMs", DEFAULT_IDLE_TIMEOUT_MS)?;
+    StreamTimeouts { connect, idle }
+        .validate()
+        .map_err(|error| NodeError::Config(error.to_string()))
+}
+
+fn config_duration_ms(spec: &NodeSpec, key: &str, fallback_ms: u64) -> Result<Duration, NodeError> {
+    let value_ms = spec
+        .config
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .unwrap_or(fallback_ms);
+    if value_ms == 0 || value_ms > MAX_TIMEOUT_MS {
+        return Err(NodeError::Config(format!(
+            "{key} must be in 1..={MAX_TIMEOUT_MS} ms"
+        )));
+    }
+    Ok(Duration::from_millis(value_ms))
+}
+
+fn stream_failure_diagnostic(error: &StreamServiceError) -> String {
+    match error {
+        StreamServiceError::ConnectTimeout { timeout_ms } => format!(
+            "stream failed before first decoded frame: connect timeout after {timeout_ms} ms; check RTSP URL/server/network or increase connectTimeoutMs for slow channels"
+        ),
+        StreamServiceError::IdleTimeout { timeout_ms, .. } => format!(
+            "stream failed after frames stopped: idle timeout after {timeout_ms} ms; check upstream encoder/network stability"
+        ),
+        _ => format!("stream failed: {error}"),
+    }
+}
 fn config_string(spec: &NodeSpec, key: &str, fallback: &str) -> String {
     spec.config
         .get(key)

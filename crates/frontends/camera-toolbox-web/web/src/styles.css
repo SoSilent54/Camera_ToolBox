@@ -483,6 +483,18 @@ button:hover {
   font-size: 0.76rem;
 }
 
+.node-diagnostic {
+  margin-left: auto;
+  color: #fbbf24;
+  font-size: 0.62rem;
+  line-height: 1.2;
+  max-width: 13rem;
+  text-align: right;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* 节点状态点：右侧彩色圆点 + 状态文字，颜色按运行时状态区分 */
 .state-dot {
   display: inline-flex;
