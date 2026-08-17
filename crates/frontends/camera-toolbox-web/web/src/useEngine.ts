@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
 import { subscribeTopic, wsRequest } from './useEngineSocket';
-import type { WorkflowGraph } from './workflow';
 
 export type EngineState = 'disabled' | 'idle' | 'ready' | 'running' | 'warning' | 'error';
 
@@ -12,8 +11,8 @@ interface StatusPush {
 }
 
 /**
- * 数据流引擎前端桥接：经单一 WebSocket 装载图、订阅节点状态、派发节点动作、图级 run/start。
- * 状态面由后端 status 推送驱动，不再轮询。
+ * 数据流引擎前端桥接：订阅节点状态、派发节点动作。
+ * 图结构由后端 authoritative snapshot 驱动，不暴露全局 run/start 状态。
  */
 export function useEngine() {
   const [nodeStates, setNodeStates] = useState<Record<string, EngineState>>({});
@@ -29,13 +28,6 @@ export function useEngine() {
     });
   }, []);
 
-  /** 装载图到引擎（后端会替换并停止旧图）；调用方负责决定何时把编辑图应用为运行图。 */
-  const loadGraph = useCallback((graph: WorkflowGraph) => wsRequest('runtime.run', graph).then(() => {
-    setNodeStates({});
-  }), []);
-
-  /** 图级 run/start：一键启动所有可启动节点。 */
-  const startAll = useCallback(() => wsRequest('runtime.start').then(() => undefined), []);
 
   /** 派发节点动作（connect/disconnect/trigger/arm/disarm）。 */
   const sendAction = useCallback((nodeId: string, action: string) => {
@@ -44,5 +36,5 @@ export function useEngine() {
     });
   }, []);
 
-  return { nodeStates, loadGraph, startAll, sendAction };
+  return { nodeStates, sendAction };
 }

@@ -10,13 +10,13 @@
 //!
 //! 返回值统一为 `Result<serde_json::Value, String>`：`Err` 的字符串即 response 信封的 `error`。
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
+use crate::AppState;
 use crate::engine_api;
 use crate::workflow::{
-    normalize_workflow, validate_workflow, WorkflowEdge, WorkflowGraph, WorkflowNode,
+    NodePosition, WorkflowEdge, WorkflowGraph, WorkflowNode, normalize_workflow, validate_workflow,
 };
-use crate::AppState;
 
 /// 分发一个 request 信封的 `path` + `payload`，返回 processor 的结果（`Err` 即 `error`）。
 ///
@@ -24,13 +24,15 @@ use crate::AppState;
 /// 由调用方（main.rs 的 `handle_ws_socket`）把返回值包装成 response 信封写回对应连接。
 pub fn dispatch(path: &str, payload: Value, state: &AppState) -> Result<Value, String> {
     match path {
-        // —— 图编辑增量命令（D6，走 t4 增量 API）——
+        // —— 后端权威图编辑命令：成功后返回并广播完整 graph snapshot ——
+        "graph.current" => graph_current(state),
+        "graph.replace" => graph_replace(payload, state),
         "graph.addNode" => graph_add_node(payload, state),
+        "graph.addNodeAndEdge" => graph_add_node_and_edge(payload, state),
         "graph.removeNode" => graph_remove_node(payload, state),
         "graph.addEdge" => graph_add_edge(payload, state),
         "graph.removeEdge" => graph_remove_edge(payload, state),
         "graph.updateNode" => graph_update_node(payload, state),
-
         // —— 运行时动作 ——
         "runtime.run" => runtime_run(payload, state),
         "runtime.start" => runtime_start(state),
@@ -63,48 +65,85 @@ pub fn dispatch(path: &str, payload: Value, state: &AppState) -> Result<Value, S
 }
 
 // ---------------------------------------------------------------------------
-// graph.* 增量命令
+// graph.* 权威图命令
 // ---------------------------------------------------------------------------
 
-fn engine_guard<'a>(
-    state: &'a AppState,
-    op: &str,
-) -> Result<std::sync::MutexGuard<'a, Option<camera_toolbox_app::engine::GraphEngine>>, String> {
-    let guard = state.engine_runtime.engine();
-    if guard.as_ref().is_none() {
-        return Err(format!(
-            "engine not running; load a workflow via runtime.run before {op}"
-        ));
-    }
-    Ok(guard)
+pub(crate) fn snapshot_envelope_text(state: &AppState) -> Result<String, String> {
+    let graph = authoritative_graph(state)?;
+    Ok(snapshot_envelope(&graph).to_string())
+}
+
+fn graph_current(state: &AppState) -> Result<Value, String> {
+    ensure_engine_loaded(state)?;
+    let graph = authoritative_graph(state)?;
+    serde_json::to_value(graph).map_err(|e| e.to_string())
+}
+
+fn graph_replace(payload: Value, state: &AppState) -> Result<Value, String> {
+    let graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
+    let graph = normalize_workflow(graph, crate::next_revision())?;
+    rebuild_engine_from_graph(&graph, state)?;
+    *state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = graph.clone();
+    publish_snapshot(state, &graph);
+    serde_json::to_value(graph).map_err(|e| e.to_string())
 }
 
 fn graph_add_node(payload: Value, state: &AppState) -> Result<Value, String> {
     let node: WorkflowNode = serde_json::from_value(payload).map_err(deser_err)?;
-    let spec = engine_api::to_node_spec(&node);
-    let mut guard = engine_guard(state, "graph.addNode")?;
-    let engine = guard
-        .as_mut()
-        .ok_or_else(|| "engine not running".to_owned())?;
-    engine
-        .add_node(spec, &state.engine_runtime.registry)
-        .map_err(|e| e.to_string())?;
-    Ok(Value::Object(Default::default()))
+    commit_graph_mutation(state, true, |graph| {
+        if graph.nodes.iter().any(|existing| existing.id == node.id) {
+            return Err(format!("node `{}` already exists", node.id));
+        }
+        graph.nodes.push(node);
+        Ok(())
+    })
+}
+
+fn graph_add_node_and_edge(payload: Value, state: &AppState) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Body {
+        node: WorkflowNode,
+        edge: WorkflowEdge,
+    }
+
+    let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
+    commit_graph_mutation(state, true, |graph| {
+        if graph
+            .nodes
+            .iter()
+            .any(|existing| existing.id == body.node.id)
+        {
+            return Err(format!("node `{}` already exists", body.node.id));
+        }
+        graph.nodes.push(body.node);
+        graph.edges.retain(|existing| existing.id != body.edge.id);
+        graph.edges.push(body.edge);
+        Ok(())
+    })
 }
 
 fn graph_remove_node(payload: Value, state: &AppState) -> Result<Value, String> {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Body {
-        #[serde(rename = "nodeId")]
         node_id: String,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let mut guard = engine_guard(state, "graph.removeNode")?;
-    let engine = guard
-        .as_mut()
-        .ok_or_else(|| "engine not running".to_owned())?;
-    engine.remove_node(&body.node_id).map_err(|e| e.to_string())?;
-    Ok(Value::Object(Default::default()))
+    commit_graph_mutation(state, true, |graph| {
+        let old_len = graph.nodes.len();
+        graph.nodes.retain(|node| node.id != body.node_id);
+        if graph.nodes.len() == old_len {
+            return Err(format!("node `{}` not found", body.node_id));
+        }
+        graph.edges.retain(|edge| {
+            edge.source.node_id != body.node_id && edge.target.node_id != body.node_id
+        });
+        Ok(())
+    })
 }
 
 fn graph_add_edge(payload: Value, state: &AppState) -> Result<Value, String> {
@@ -113,56 +152,115 @@ fn graph_add_edge(payload: Value, state: &AppState) -> Result<Value, String> {
         edge: WorkflowEdge,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let spec = engine_api::to_edge_spec(&body.edge);
-    let mut guard = engine_guard(state, "graph.addEdge")?;
-    let engine = guard
-        .as_mut()
-        .ok_or_else(|| "engine not running".to_owned())?;
-    engine.add_edge(spec).map_err(|e| e.to_string())?;
-    Ok(Value::Object(Default::default()))
+    commit_graph_mutation(state, true, |graph| {
+        graph.edges.retain(|existing| existing.id != body.edge.id);
+        graph.edges.push(body.edge);
+        Ok(())
+    })
 }
 
 fn graph_remove_edge(payload: Value, state: &AppState) -> Result<Value, String> {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Body {
-        #[serde(rename = "edgeId")]
         edge_id: String,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let mut guard = engine_guard(state, "graph.removeEdge")?;
-    let engine = guard
-        .as_mut()
-        .ok_or_else(|| "engine not running".to_owned())?;
-    engine.remove_edge(&body.edge_id).map_err(|e| e.to_string())?;
-    Ok(Value::Object(Default::default()))
+    commit_graph_mutation(state, true, |graph| {
+        let old_len = graph.edges.len();
+        graph.edges.retain(|edge| edge.id != body.edge_id);
+        if graph.edges.len() == old_len {
+            return Err(format!("edge `{}` not found", body.edge_id));
+        }
+        Ok(())
+    })
 }
 
 fn graph_update_node(payload: Value, state: &AppState) -> Result<Value, String> {
     #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
     struct Body {
-        #[serde(rename = "nodeId")]
         node_id: String,
         #[serde(default)]
-        config: Value,
+        node: Option<WorkflowNode>,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        position: Option<NodePosition>,
+        #[serde(default)]
+        config: Option<Value>,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let mut guard = engine_guard(state, "graph.updateNode")?;
-    let engine = guard
-        .as_mut()
-        .ok_or_else(|| "engine not running".to_owned())?;
-    engine
-        .update_node(&body.node_id, body.config)
-        .map_err(|e| e.to_string())?;
-    Ok(Value::Object(Default::default()))
+    let rebuild_engine = body.node.is_some() || body.config.is_some();
+    commit_graph_mutation(state, rebuild_engine, |graph| {
+        let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id) else {
+            return Err(format!("node `{}` not found", body.node_id));
+        };
+        if let Some(node) = body.node {
+            if node.id != body.node_id {
+                return Err(format!(
+                    "node id mismatch: `{}` != `{}`",
+                    node.id, body.node_id
+                ));
+            }
+            *existing = node;
+            return Ok(());
+        }
+        if let Some(title) = body.title {
+            existing.title = title;
+        }
+        if let Some(position) = body.position {
+            existing.position = position;
+        }
+        if let Some(config) = body.config {
+            existing.config = config;
+        }
+        Ok(())
+    })
 }
 
-// ---------------------------------------------------------------------------
-// runtime.*
-// ---------------------------------------------------------------------------
+fn commit_graph_mutation<F>(
+    state: &AppState,
+    rebuild_engine: bool,
+    mutate: F,
+) -> Result<Value, String>
+where
+    F: FnOnce(&mut WorkflowGraph) -> Result<(), String>,
+{
+    let current = authoritative_graph(state)?;
+    let mut next = current;
+    mutate(&mut next)?;
+    let next = normalize_workflow(next, crate::next_revision())?;
+    if rebuild_engine {
+        rebuild_engine_from_graph(&next, state)?;
+    }
+    *state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = next.clone();
+    publish_snapshot(state, &next);
+    serde_json::to_value(next).map_err(|e| e.to_string())
+}
 
-fn runtime_run(payload: Value, state: &AppState) -> Result<Value, String> {
-    let graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
-    let spec = engine_api::to_engine_spec(&graph);
+fn authoritative_graph(state: &AppState) -> Result<WorkflowGraph, String> {
+    state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())
+        .map(|graph| graph.clone())
+}
+
+fn ensure_engine_loaded(state: &AppState) -> Result<(), String> {
+    let needs_engine = state.engine_runtime.engine().as_ref().is_none();
+    if needs_engine {
+        let graph = authoritative_graph(state)?;
+        rebuild_engine_from_graph(&graph, state)?;
+    }
+    Ok(())
+}
+
+fn rebuild_engine_from_graph(graph: &WorkflowGraph, state: &AppState) -> Result<(), String> {
+    let spec = engine_api::to_engine_spec(graph);
     let services = engine_api::build_services(state);
     let engine = camera_toolbox_app::engine::GraphEngine::build(
         spec,
@@ -175,7 +273,39 @@ fn runtime_run(payload: Value, state: &AppState) -> Result<Value, String> {
         previous.stop();
     }
     *slot = Some(engine);
-    Ok(serde_json::json!({ "running": true, "nodes": graph.nodes.len() }))
+    Ok(())
+}
+
+fn publish_snapshot(state: &AppState, graph: &WorkflowGraph) {
+    state
+        .ws_hub
+        .broadcast_text(snapshot_envelope(graph).to_string());
+}
+
+fn snapshot_envelope(graph: &WorkflowGraph) -> Value {
+    json!({
+        "kind": "snapshot",
+        "payload": {
+            "graph": graph,
+            "statuses": [],
+        },
+    })
+}
+
+// ---------------------------------------------------------------------------
+// runtime.*
+// ---------------------------------------------------------------------------
+
+fn runtime_run(payload: Value, state: &AppState) -> Result<Value, String> {
+    let graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
+    let graph = normalize_workflow(graph, crate::next_revision())?;
+    rebuild_engine_from_graph(&graph, state)?;
+    *state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = graph.clone();
+    publish_snapshot(state, &graph);
+    Ok(json!({ "running": true, "nodes": graph.nodes.len(), "graph": graph }))
 }
 
 fn runtime_start(state: &AppState) -> Result<Value, String> {
@@ -213,6 +343,7 @@ fn runtime_node_action(payload: Value, state: &AppState) -> Result<Value, String
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
     let action = engine_api::parse_action_str(&body.action)?;
+    ensure_engine_loaded(state)?;
     let engine = state.engine_runtime.engine();
     let engine = engine
         .as_ref()
@@ -245,10 +376,7 @@ fn runtime_node_output(payload: Value, state: &AppState) -> Result<Value, String
 // ---------------------------------------------------------------------------
 
 fn workflow_list(state: &AppState) -> Result<Value, String> {
-    let summaries = state
-        .workflow_store
-        .list()
-        .map_err(|(_, msg)| msg)?;
+    let summaries = state.workflow_store.list().map_err(|(_, msg)| msg)?;
     Ok(serde_json::to_value(summaries).map_err(|e| e.to_string())?)
 }
 
@@ -294,18 +422,25 @@ fn workflow_save(payload: Value, state: &AppState) -> Result<Value, String> {
     }
 
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let existing = state
+    if let Some(existing) = state
         .workflow_store
-        .load(&body.graph.id)
-        .map_err(|(_, msg)| msg)?;
-    if existing.revision != body.revision {
-        return Err(format!(
-            "workflow revision conflict: expected `{}`, current `{}`",
-            body.revision, existing.revision
-        ));
+        .load_optional(&body.graph.id)
+        .map_err(|(_, msg)| msg)?
+    {
+        if existing.revision != body.revision {
+            return Err(format!(
+                "workflow revision conflict: expected `{}`, current `{}`",
+                body.revision, existing.revision
+            ));
+        }
     }
     let graph = normalize_workflow(body.graph, crate::next_revision())?;
     state.workflow_store.save(&graph).map_err(|(_, msg)| msg)?;
+    *state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = graph.clone();
+    publish_snapshot(state, &graph);
     Ok(serde_json::to_value(graph).map_err(|e| e.to_string())?)
 }
 
@@ -380,12 +515,16 @@ mod tests {
 
     #[test]
     fn workflow_save_requires_matching_revision() {
-        let dir = std::env::temp_dir().join(format!("ws-router-save-test-{}", crate::next_revision()));
+        let dir =
+            std::env::temp_dir().join(format!("ws-router-save-test-{}", crate::next_revision()));
         let state = test_state(dir.clone());
         let mut graph = crate::workflow::seed_workflow_graph();
         graph.id = "ws-save".to_owned();
         graph.revision = "rev-a".to_owned();
-        state.workflow_store.save(&graph).expect("seed workflow saved");
+        state
+            .workflow_store
+            .save(&graph)
+            .expect("seed workflow saved");
 
         let mut edited = graph.clone();
         edited.title = "Edited over WS".to_owned();
@@ -393,18 +532,25 @@ mod tests {
 
         let error = workflow_save(payload, &state).expect_err("stale revision must fail");
         assert!(error.contains("workflow revision conflict"));
-        assert_eq!(state.workflow_store.load("ws-save").unwrap().title, graph.title);
+        assert_eq!(
+            state.workflow_store.load("ws-save").unwrap().title,
+            graph.title
+        );
         std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
     fn workflow_save_updates_when_revision_matches() {
-        let dir = std::env::temp_dir().join(format!("ws-router-save-ok-test-{}", crate::next_revision()));
+        let dir =
+            std::env::temp_dir().join(format!("ws-router-save-ok-test-{}", crate::next_revision()));
         let state = test_state(dir.clone());
         let mut graph = crate::workflow::seed_workflow_graph();
         graph.id = "ws-save-ok".to_owned();
         graph.revision = "rev-a".to_owned();
-        state.workflow_store.save(&graph).expect("seed workflow saved");
+        state
+            .workflow_store
+            .save(&graph)
+            .expect("seed workflow saved");
 
         let mut edited = graph.clone();
         edited.title = "Edited over WS".to_owned();
@@ -413,7 +559,129 @@ mod tests {
         let out = workflow_save(payload, &state).expect("matching revision saves");
         assert_eq!(out["title"], "Edited over WS");
         assert_ne!(out["revision"], "rev-a");
-        assert_eq!(state.workflow_store.load("ws-save-ok").unwrap().title, "Edited over WS");
+        assert_eq!(
+            state.workflow_store.load("ws-save-ok").unwrap().title,
+            "Edited over WS"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_add_node_updates_authoritative_session_without_runtime_run() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-add-node-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let mut node = crate::workflow::seed_workflow_graph().nodes[0].clone();
+        node.id = "authoritative-added-node".to_owned();
+        node.title = "Authoritative Added".to_owned();
+
+        let out = dispatch(
+            "graph.addNode",
+            serde_json::to_value(&node).unwrap(),
+            &state,
+        )
+        .expect("graph.addNode succeeds without runtime.run");
+
+        assert!(
+            out["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["id"] == node.id)
+        );
+        assert!(
+            state
+                .graph_session
+                .lock()
+                .unwrap()
+                .nodes
+                .iter()
+                .any(|candidate| candidate.id == node.id)
+        );
+        assert!(state.engine_runtime.engine().as_ref().is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_add_node_and_edge_commits_as_one_authoritative_update() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-add-node-edge-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let template_edge = seed.edges.first().expect("seed graph has an edge").clone();
+        let mut node = seed
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == template_edge.target.node_id)
+            .expect("edge target exists")
+            .clone();
+        node.id = "authoritative-connected-node".to_owned();
+        node.title = "Authoritative Connected".to_owned();
+        let mut edge = template_edge;
+        edge.id = "edge-to-authoritative-connected-node".to_owned();
+        edge.target.node_id = node.id.clone();
+
+        let out = dispatch(
+            "graph.addNodeAndEdge",
+            serde_json::json!({ "node": node, "edge": edge }),
+            &state,
+        )
+        .expect("node and edge commit atomically");
+
+        assert!(
+            out["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["id"] == "authoritative-connected-node")
+        );
+        assert!(
+            out["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["id"] == "edge-to-authoritative-connected-node")
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_update_position_does_not_rebuild_engine_or_refresh_statuses() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-position-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let node_id = seed.nodes[0].id.clone();
+
+        dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = runtime_status(&state).expect("drain initial statuses");
+
+        let out = dispatch(
+            "graph.updateNode",
+            serde_json::json!({ "nodeId": node_id, "position": { "x": 123.0, "y": 456.0 } }),
+            &state,
+        )
+        .expect("position update succeeds");
+
+        let node = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == node_id)
+            .expect("node still present");
+        assert_eq!(
+            node["position"],
+            serde_json::json!({ "x": 123.0, "y": 456.0 })
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(runtime_status(&state).unwrap(), serde_json::json!([]));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -422,10 +690,17 @@ mod tests {
             workflow_store: std::sync::Arc::new(crate::WorkflowStore { dir }),
             control_runtime: std::sync::Arc::new(crate::ControlRuntime::production()),
             #[cfg(feature = "calibration-opencv")]
-            calibration_backend: std::sync::Arc::new(camera_toolbox_adapters::OpenCvCalibrationBackend),
-            eeprom_inspects: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            calibration_backend: std::sync::Arc::new(
+                camera_toolbox_adapters::OpenCvCalibrationBackend,
+            ),
+            eeprom_inspects: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
             engine_runtime: std::sync::Arc::new(crate::engine_api::EngineRuntime::new()),
             ws_hub: std::sync::Arc::new(crate::ws_hub::WsHub::new()),
+            graph_session: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::workflow::seed_workflow_graph(),
+            )),
         }
     }
 

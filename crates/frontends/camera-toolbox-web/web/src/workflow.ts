@@ -327,7 +327,43 @@ export interface FlowEdgeData extends Record<string, unknown> {
 }
 
 export async function loadWorkflow(): Promise<WorkflowGraph> {
+  return request('graph.current');
+}
+
+export async function loadSeedGraph(): Promise<WorkflowGraph> {
   return request('workflow.seed');
+}
+
+export async function addGraphNode(node: WorkflowNode): Promise<WorkflowGraph> {
+  return request('graph.addNode', node);
+}
+
+export async function addGraphNodeAndEdge(node: WorkflowNode, edge: WorkflowEdge): Promise<WorkflowGraph> {
+  return request('graph.addNodeAndEdge', { node, edge });
+}
+
+export async function addGraphEdge(edge: WorkflowEdge): Promise<WorkflowGraph> {
+  return request('graph.addEdge', { edge });
+}
+
+export async function removeGraphNode(nodeId: string): Promise<WorkflowGraph> {
+  return request('graph.removeNode', { nodeId });
+}
+
+export async function removeGraphEdge(edgeId: string): Promise<WorkflowGraph> {
+  return request('graph.removeEdge', { edgeId });
+}
+
+export async function updateGraphNode(node: WorkflowNode): Promise<WorkflowGraph> {
+  return request('graph.updateNode', { nodeId: node.id, node });
+}
+
+export async function updateGraphNodePosition(nodeId: string, position: NodePosition): Promise<WorkflowGraph> {
+  return request('graph.updateNode', { nodeId, position });
+}
+
+export async function replaceGraph(graph: WorkflowGraph): Promise<WorkflowGraph> {
+  return request('graph.replace', graph);
 }
 
 export async function loadNodeCatalog(): Promise<NodeDefinition[]> {
@@ -409,20 +445,6 @@ export async function captureX5Snapshot(requestBody: X5SnapshotRequest): Promise
 }
 
 
-/** 装载工作流图进数据流引擎（替换旧图）。 */
-export async function runEngine(graph: WorkflowGraph): Promise<{ running: boolean; nodes: number }> {
-  return request('runtime.run', graph);
-}
-
-/** 停止并卸载引擎图。 */
-export async function stopEngine(): Promise<{ running: boolean }> {
-  return request('runtime.stop');
-}
-
-/** 图级 run/start：一键启动所有可启动节点（尽力启动）。 */
-export async function startEngine(): Promise<{ started: boolean }> {
-  return request('runtime.start');
-}
 
 /** 向引擎节点投递动作（connect/disconnect/trigger/arm/disarm）。 */
 export async function nodeAction(nodeId: string, action: string): Promise<{ ok: boolean }> {

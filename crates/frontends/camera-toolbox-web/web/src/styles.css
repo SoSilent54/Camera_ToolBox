@@ -864,6 +864,85 @@ button:disabled {
   color: #fecaca;
 }
 
+/* 节点创建搜索菜单：右键自由添加和连线落空添加共用。 */
+.node-create-menu {
+  position: fixed;
+  z-index: 22;
+  width: 320px;
+  max-height: min(420px, calc(100vh - 16px));
+  display: grid;
+  grid-template-rows: auto auto minmax(0, 1fr);
+  gap: 0.35rem;
+  padding: 0.45rem;
+  border: 1px solid #2c384a;
+  border-radius: 6px;
+  background: #0f1722;
+  box-shadow: 0 16px 36px rgba(0, 0, 0, 0.58);
+}
+
+.node-create-menu-header {
+  display: grid;
+  gap: 0.12rem;
+}
+
+.node-create-menu-header strong {
+  font-size: 0.78rem;
+  color: #e2e8f0;
+}
+
+.node-create-menu-header span {
+  font-size: 0.68rem;
+  color: #93a4b8;
+}
+
+.node-create-menu input {
+  width: 100%;
+  border: 1px solid #334155;
+  border-radius: 4px;
+  background: #111827;
+  color: #e5e7eb;
+  padding: 0.38rem 0.48rem;
+  font-size: 0.74rem;
+}
+
+.node-create-menu-list {
+  display: grid;
+  gap: 0.2rem;
+  overflow: auto;
+  padding-right: 0.08rem;
+}
+
+.node-create-menu-list button {
+  display: grid;
+  gap: 0.1rem;
+  text-align: left;
+  padding: 0.42rem 0.5rem;
+  border-radius: 4px;
+  background: transparent;
+}
+
+.node-create-menu-list button:hover,
+.node-create-menu-list button.active {
+  background: #1b2636;
+}
+
+.node-create-menu-list strong {
+  color: #dbeafe;
+  font-size: 0.75rem;
+}
+
+.node-create-menu-list span,
+.node-create-menu-list em,
+.node-create-empty {
+  color: #9ca3af;
+  font-size: 0.67rem;
+  font-style: normal;
+}
+
+.node-create-empty {
+  padding: 0.6rem 0.4rem;
+}
+
 /* 内嵌文件浏览器 */
 .file-browser {
   display: grid;

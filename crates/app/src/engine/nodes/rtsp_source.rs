@@ -19,7 +19,8 @@ use crate::{
     platform::{
         LatestDecodedFrameSlot, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport,
         StreamCancellation, StreamOpenRequest, StreamOperationControl, StreamRecordingRequest,
-        StreamService, StreamServiceEvent, StreamSessionId, StreamTimeouts,
+        StreamService, StreamServiceEvent, StreamSessionId, StreamStage, StreamTerminal,
+        StreamTimeouts,
     },
 };
 
@@ -88,8 +89,12 @@ impl NodeInstance for RtspSourceNode {
 
 impl RtspSourceNode {
     fn connect(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        if self.cancellation.is_some() {
-            return Ok(());
+        if let Some(cancellation) = self.cancellation.as_ref() {
+            if !cancellation.is_cancelled() {
+                return Ok(());
+            }
+            self.cancellation.take();
+            self.pump_cancel.take();
         }
         let url = config_string(&self.spec, "url", "");
         if url.is_empty() {
@@ -124,21 +129,22 @@ impl RtspSourceNode {
             recording: StreamRecordingRequest::default(),
         };
         let cancellation = StreamCancellation::default();
-        let reporter = stream_reporter(rt);
-        let control = StreamOperationControl::new(
-            StreamTimeouts::default(),
-            cancellation.clone(),
-            reporter,
-        )
-        .map_err(|error| NodeError::Execution(error.to_string()))?;
-        let session = service
-            .open(session_id, request, control)
-            .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let pump_cancel = Arc::new(AtomicBool::new(false));
+        let reporter = stream_reporter(rt, cancellation.clone(), Arc::clone(&pump_cancel));
+        let control =
+            StreamOperationControl::new(StreamTimeouts::default(), cancellation.clone(), reporter)
+                .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let session = match service.open(session_id, request, control) {
+            Ok(session) => session,
+            Err(error) => {
+                rt.report_state(NodeRuntimeState::Error, format!("stream failed: {error}"));
+                return Err(NodeError::Execution(error.to_string()));
+            }
+        };
 
         let latest_frame = Arc::clone(&session.latest_frame);
         self.cancellation = Some(cancellation);
         let output_port = self.output_port.clone();
-        let pump_cancel = Arc::new(AtomicBool::new(false));
         let pump_cancel_flag = Arc::clone(&pump_cancel);
         // 必须保存 pump 取消标志，否则 disconnect 无法停掉后台 pump 线程（泄漏线程且 join 永不返回）。
         self.pump_cancel = Some(pump_cancel);
@@ -162,9 +168,44 @@ impl RtspSourceNode {
     }
 }
 
-fn stream_reporter(rt: &NodeRuntime) -> Arc<dyn Fn(StreamServiceEvent) + Send + Sync> {
+fn stream_reporter(
+    rt: &NodeRuntime,
+    cancellation: StreamCancellation,
+    pump_cancel: Arc<AtomicBool>,
+) -> Arc<dyn Fn(StreamServiceEvent) + Send + Sync> {
     let reporter = rt.context().reporter.clone();
     Arc::new(move |event| {
+        match &event {
+            StreamServiceEvent::Terminal(StreamTerminal::Failed(error)) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(NodeRuntimeState::Error, format!("stream failed: {error}"));
+            }
+            StreamServiceEvent::Terminal(StreamTerminal::Forced {
+                remote_state_unknown,
+            }) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(
+                    NodeRuntimeState::Error,
+                    format!("stream forced closed; remote_state_unknown={remote_state_unknown}"),
+                );
+            }
+            StreamServiceEvent::Terminal(StreamTerminal::BoundaryClosed) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(NodeRuntimeState::Idle, "stream boundary closed");
+            }
+            StreamServiceEvent::Terminal(StreamTerminal::Cancelled) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(NodeRuntimeState::Idle, "stream cancelled");
+            }
+            StreamServiceEvent::Stage(StreamStage::Playing) => {
+                reporter.report_state(NodeRuntimeState::Running, "streaming");
+            }
+            _ => {}
+        }
         reporter.report_event(format!("stream: {event:?}"));
     })
 }
@@ -180,7 +221,9 @@ fn pump_frames(
     while !cancel.load(Ordering::Acquire) {
         match latest.wait_latest_timeout(PUMP_CANCEL_POLL) {
             Some(frame) => {
-                let _ = ctx.outputs.emit(&output_port, DataPacket::VideoFrame(frame));
+                let _ = ctx
+                    .outputs
+                    .emit(&output_port, DataPacket::VideoFrame(frame));
             }
             None => {
                 // 超时且无新帧：循环回到顶部检查 cancel，避免 join 永不返回。
@@ -220,10 +263,10 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
-    use crate::engine::{
-        EngineServices, NodeReporter, OutputRegistry, SpawnContext,
+    use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
+    use crate::platform::{
+        LatestDecodedFrameSlot, StreamServiceError, StreamSession, StreamTimeouts,
     };
-    use crate::platform::{LatestDecodedFrameSlot, StreamServiceError, StreamSession, StreamTimeouts};
 
     fn spec() -> NodeSpec {
         crate::engine::NodeSpec {
@@ -242,7 +285,10 @@ mod tests {
         }
     }
 
-    fn runtime(services: EngineServices, state_tx: mpsc::Sender<crate::engine::NodeStatusReport>) -> NodeRuntime {
+    fn runtime(
+        services: EngineServices,
+        state_tx: mpsc::Sender<crate::engine::NodeStatusReport>,
+    ) -> NodeRuntime {
         let (event_tx, _event_rx) = mpsc::channel();
         let reporter = NodeReporter::new("rtsp-1".to_owned(), state_tx, event_tx);
         let ctx = SpawnContext {
@@ -299,7 +345,9 @@ mod tests {
         }
     }
 
-    fn last_state(rx: &mpsc::Receiver<crate::engine::NodeStatusReport>) -> Option<NodeRuntimeState> {
+    fn last_state(
+        rx: &mpsc::Receiver<crate::engine::NodeStatusReport>,
+    ) -> Option<NodeRuntimeState> {
         let mut last = None;
         while let Ok(report) = rx.try_recv() {
             last = Some(report.state);
@@ -330,7 +378,9 @@ mod tests {
         let mut s = spec();
         s.config = serde_json::json!({});
         let mut node = RtspSourceFactory.instantiate(s).expect("instantiate");
-        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("empty url");
+        let err = node
+            .on_action(NodeAction::Connect, &mut rt)
+            .expect_err("empty url");
         assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
     }
 
@@ -339,7 +389,9 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
         let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
-        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("no factory");
+        let err = node
+            .on_action(NodeAction::Connect, &mut rt)
+            .expect_err("no factory");
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
     }
 
@@ -358,13 +410,15 @@ mod tests {
         let mut rt = runtime(services, state_tx);
 
         let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
-        node.on_action(NodeAction::Connect, &mut rt).expect("connect");
+        node.on_action(NodeAction::Connect, &mut rt)
+            .expect("connect");
         // 立即上报 running（streaming）
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
         assert_eq!(opened.lock().unwrap().len(), 1);
 
         // 重复 connect 是 no-op（cancellation 已存在）
-        node.on_action(NodeAction::Connect, &mut rt).expect("re-connect");
+        node.on_action(NodeAction::Connect, &mut rt)
+            .expect("re-connect");
         assert_eq!(opened.lock().unwrap().len(), 1);
 
         // 清理后台 pump 线程
@@ -387,12 +441,31 @@ mod tests {
         let mut rt = runtime(services, state_tx);
 
         let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
-        node.on_action(NodeAction::Connect, &mut rt).expect("connect");
+        node.on_action(NodeAction::Connect, &mut rt)
+            .expect("connect");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
 
-        node.on_action(NodeAction::Disconnect, &mut rt).expect("disconnect");
+        node.on_action(NodeAction::Disconnect, &mut rt)
+            .expect("disconnect");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Idle));
         rt.stop_background();
+    }
+
+    #[test]
+    fn terminal_failed_reports_error_state() {
+        let (state_tx, state_rx) = mpsc::channel();
+        let rt = runtime(EngineServices::default(), state_tx);
+        let cancellation = StreamCancellation::default();
+        let pump_cancel = Arc::new(AtomicBool::new(false));
+        let reporter = stream_reporter(&rt, cancellation.clone(), Arc::clone(&pump_cancel));
+
+        reporter(StreamServiceEvent::Terminal(StreamTerminal::Failed(
+            StreamServiceError::ConnectTimeout { timeout_ms: 3000 },
+        )));
+
+        assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Error));
+        assert!(cancellation.is_cancelled());
+        assert!(pump_cancel.load(Ordering::Acquire));
     }
 
     #[test]
@@ -400,7 +473,9 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
         let mut node = RtspSourceFactory.instantiate(spec()).expect("instantiate");
-        let err = node.on_action(NodeAction::Trigger, &mut rt).expect_err("unsupported");
+        let err = node
+            .on_action(NodeAction::Trigger, &mut rt)
+            .expect_err("unsupported");
         assert!(matches!(err, NodeError::UnsupportedAction(_)));
     }
 
@@ -416,7 +491,9 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
         let mut node = RtspSourceFactory.instantiate(s).expect("instantiate");
-        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("no factory");
+        let err = node
+            .on_action(NodeAction::Connect, &mut rt)
+            .expect_err("no factory");
         // udp 解析不 panic，仅因缺 factory 报 Precondition
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
         let _ = StreamTimeouts::default();

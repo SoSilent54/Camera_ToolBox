@@ -84,6 +84,8 @@ struct AppState {
     eeprom_inspects: Arc<Mutex<HashMap<String, EepromInspectSnapshot>>>,
     engine_runtime: Arc<engine_api::EngineRuntime>,
     ws_hub: Arc<ws_hub::WsHub>,
+    /// 后端权威工作流图；前端只渲染该状态的 snapshot，不维护独立 draft graph。
+    graph_session: Arc<Mutex<WorkflowGraph>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -350,7 +352,9 @@ impl SftpFileReader for ControlRuntime {
             .ssh_transport
             .connect(&ssh_target_from_spec(target), credential, &control)
             .map_err(|e| e.to_string())?;
-        session.stat(remote_path, &control).map_err(|e| e.to_string())
+        session
+            .stat(remote_path, &control)
+            .map_err(|e| e.to_string())
     }
 
     fn read(
@@ -401,10 +405,10 @@ impl SshCommandExecutor for ControlRuntime {
     ) -> Result<CommandResult, String> {
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
         // recipe 注册表从环境变量加载；无部署 recipe 时退化为空注册表（execute 会报 RecipeNotAllowed）。
-        let recipes = std::sync::Arc::new(
-            production_recipe_registry_from_env()
-                .unwrap_or_else(|_| camera_toolbox_adapters::platforms::ssh_managed::CommandRecipeRegistry::new()),
-        );
+        let recipes =
+            std::sync::Arc::new(production_recipe_registry_from_env().unwrap_or_else(|_| {
+                camera_toolbox_adapters::platforms::ssh_managed::CommandRecipeRegistry::new()
+            }));
         let allowed_recipe_id = request.recipe_id.clone();
         let service = SshCommandService::new(
             format!("workflow-web-ssh-{}", target.host),
@@ -416,9 +420,7 @@ impl SshCommandExecutor for ControlRuntime {
             recipes,
             1_048_576,
         );
-        service
-            .execute(request, control)
-            .map_err(|e| e.to_string())
+        service.execute(request, control).map_err(|e| e.to_string())
     }
 }
 
@@ -963,8 +965,6 @@ struct WorkflowSummary {
     edge_count: usize,
 }
 
-
-
 /// I²C 预览请求仅描述一次可能的传输；它从不打开设备或建立远程会话。
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -1295,7 +1295,6 @@ impl IntoResponse for PreviewApiError {
     }
 }
 
-
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let _logging = camera_toolbox_logging::init();
@@ -1335,6 +1334,7 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
         engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
         ws_hub: Arc::new(ws_hub::WsHub::new()),
+        graph_session: Arc::new(Mutex::new(workflow::seed_workflow_graph())),
     };
 
     // 启动引擎桥接任务：状态/事件/帧持续经 ws_hub 广播（三个 tokio::spawn 循环）。
@@ -1397,12 +1397,14 @@ pub(crate) fn control_dispatch(
             .map_err(ws_ser_err)
         }
         "control.eeprom.preview" => {
-            let req: EepromPreviewRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let req: EepromPreviewRequest =
+                serde_json::from_value(payload).map_err(ws_deser_err)?;
             let preview = build_eeprom_preview(req).map_err(|e| e.error)?;
             serde_json::to_value(preview).map_err(ws_ser_err)
         }
         "control.eeprom.inspect" => {
-            let req: EepromInspectRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let req: EepromInspectRequest =
+                serde_json::from_value(payload).map_err(ws_deser_err)?;
             let preview = build_eeprom_preview(req.preview).map_err(|e| e.error)?;
             let target = eeprom_snapshot_target(&preview, &req.ssh).map_err(|e| e.error)?;
             let result = state
@@ -1431,7 +1433,8 @@ pub(crate) fn control_dispatch(
             serde_json::to_value(response).map_err(ws_ser_err)
         }
         "control.eeprom.run" => {
-            let req: EepromExecuteRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let req: EepromExecuteRequest =
+                serde_json::from_value(payload).map_err(ws_deser_err)?;
             let preview = build_eeprom_preview(req.preview).map_err(|e| e.error)?;
             if !req.confirm_execution {
                 return Err("EEPROM provision requires confirmExecution=true".to_owned());
@@ -1563,13 +1566,16 @@ pub(crate) fn control_dispatch(
                         .frame_id
                         .ok_or_else(|| "X5 frame_id snapshot requires frameId".to_owned())?;
                     x5_tcp_client::capture_yuv_snapshot_by_frame_id(
-                        &host, port, req.channel, frame_id,
+                        &host,
+                        port,
+                        req.channel,
+                        frame_id,
                     )
                 }
                 X5SnapshotMode::TimestampNs => {
-                    let timestamp_ns = req.timestamp_ns.ok_or_else(|| {
-                        "X5 timestamp snapshot requires timestampNs".to_owned()
-                    })?;
+                    let timestamp_ns = req
+                        .timestamp_ns
+                        .ok_or_else(|| "X5 timestamp snapshot requires timestampNs".to_owned())?;
                     x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
                         &host,
                         port,
@@ -1578,9 +1584,9 @@ pub(crate) fn control_dispatch(
                     )
                 }
                 X5SnapshotMode::RtspPts90k => {
-                    let rtsp_pts_90k = req.rtsp_pts_90k.ok_or_else(|| {
-                        "X5 rtsp_pts_90k snapshot requires rtspPts90k".to_owned()
-                    })?;
+                    let rtsp_pts_90k = req
+                        .rtsp_pts_90k
+                        .ok_or_else(|| "X5 rtsp_pts_90k snapshot requires rtspPts90k".to_owned())?;
                     x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
                         &host,
                         port,
@@ -1614,6 +1620,9 @@ async fn handle_ws_socket(socket: WebSocket, state: AppState) {
     // 出站：hub 广播 + 单连接 response 都写入 mpsc 无界通道，转发任务把消息送到 socket。
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
     let key = hub.register(tx.clone());
+    if let Ok(snapshot) = ws_router::snapshot_envelope_text(&state) {
+        let _ = tx.send(WsMessage::Text(snapshot.into()));
+    }
     let forward = tokio::spawn(async move {
         use futures_util::SinkExt;
         while let Some(msg) = rx.recv().await {
@@ -1648,7 +1657,10 @@ async fn handle_ws_socket(socket: WebSocket, state: AppState) {
                         "error": error,
                     }),
                 };
-                if tx.send(WsMessage::Text(response.to_string().into())).is_err() {
+                if tx
+                    .send(WsMessage::Text(response.to_string().into()))
+                    .is_err()
+                {
                     break; // 连接已关闭。
                 }
             }
@@ -1676,11 +1688,12 @@ fn parse_request_envelope(text: &str) -> Option<RequestEnvelope> {
     }
     let id = value.get("id")?.as_u64()?;
     let path = value.get("path")?.as_str()?.to_owned();
-    let payload = value.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    let payload = value
+        .get("payload")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     Some(RequestEnvelope { id, path, payload })
 }
-
-
 
 #[cfg(feature = "calibration-opencv")]
 fn into_calibration_request(
@@ -1839,9 +1852,6 @@ fn page_split_estimate(
     })
 }
 
-
-
-
 /// 编码一次 RGB 图像为 JPEG（engine_bridge viewer 帧推送复用）。
 fn encode_rgb_jpeg(rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     let mut jpeg = Vec::new();
@@ -1895,12 +1905,8 @@ pub(crate) fn encode_rgba_scaled_jpeg(
             frame.rgba.as_ref(),
         )
         .ok_or_else(|| "RGBA frame buffer invalid".to_owned())?;
-        let resized = image::imageops::resize(
-            &img,
-            out_w,
-            out_h,
-            image::imageops::FilterType::Triangle,
-        );
+        let resized =
+            image::imageops::resize(&img, out_w, out_h, image::imageops::FilterType::Triangle);
         let flat = resized.into_raw();
         let rgb_len = usize::try_from(u64::from(out_w) * u64::from(out_h) * 3)
             .map_err(|_| "RGB byte length overflows usize".to_owned())?;
@@ -2026,7 +2032,6 @@ pub(crate) fn next_revision() -> String {
     format!("rev-{nanos}")
 }
 
-
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
@@ -2144,6 +2149,7 @@ mod tests {
             eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
             engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
             ws_hub: Arc::new(ws_hub::WsHub::new()),
+            graph_session: Arc::new(Mutex::new(workflow::seed_workflow_graph())),
         }
     }
 
@@ -2158,7 +2164,6 @@ mod tests {
         let path = default_workflow_dir();
         assert!(path.ends_with(".workflow-web/workflows"));
     }
-
 
     #[test]
     fn x5_binding_request_trims_host_and_preserves_port() {
@@ -2433,7 +2438,8 @@ mod tests {
             credential_ref: "key-file:/tmp/k".to_owned(),
             expected_host_key: None,
         };
-        let error = ssh_target_from_binding(&missing).expect_err("missing host key must be rejected");
+        let error =
+            ssh_target_from_binding(&missing).expect_err("missing host key must be rejected");
         assert!(error.error.contains("expectedHostKey"));
 
         // 提供空字符串同样拒绝（trim 后为空）。
