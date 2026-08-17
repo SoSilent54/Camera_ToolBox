@@ -366,19 +366,23 @@ button:hover {
 }
 .workflow-node-shell {
   display: inline-flex;
+  position: relative;
   flex-direction: column;
-  gap: 0.14rem;
   align-items: stretch;
   overflow: visible;
 }
 
 .node-diagnostic-below {
+  position: absolute;
+  top: calc(100% + 0.14rem);
+  right: 0;
+  left: 0;
+  z-index: 1;
   min-width: 0;
   color: #fbbf24;
   font-size: 0.62rem;
   line-height: 1.2;
   overflow: hidden;
-  max-width: 13rem;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
