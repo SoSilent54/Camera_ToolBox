@@ -1028,6 +1028,44 @@ pub fn validate_workflow(graph: &WorkflowGraph) -> Result<(), String> {
     for edge in &graph.edges {
         validate_edge(graph, edge)?;
     }
+    validate_cardinality_constraints(graph)?;
+    Ok(())
+}
+
+/// D7 连接约束：统计每条边目标 `(nodeId, portId)` 的入边数，`cardinality=One` 的输入端口
+/// 超过 1 条入边即拒绝（允许 `Many` 多路 fan-in；输出端口 fan-out 不限）。
+///
+/// 与引擎侧 [`GraphEngine::build`/`add_edge`]（crates/app）的校验呼应：前端保存/装载路径先由
+/// 此处拦截，引擎增量路径再由 `add_edge` 兜底。
+pub fn validate_cardinality_constraints(graph: &WorkflowGraph) -> Result<(), String> {
+    use std::collections::HashMap;
+    // target (nodeId, portId) → 已见入边 id 列表。
+    let mut incoming: HashMap<(String, String), Vec<&str>> = HashMap::new();
+    for edge in &graph.edges {
+        incoming
+            .entry((edge.target.node_id.clone(), edge.target.port_id.clone()))
+            .or_default()
+            .push(&edge.id);
+    }
+    for node in &graph.nodes {
+        for port in &node.inputs {
+            if port.cardinality != PortCardinality::One {
+                continue;
+            }
+            let Some(edges) = incoming.get(&(node.id.clone(), port.id.clone())) else {
+                continue;
+            };
+            if edges.len() > 1 {
+                return Err(format!(
+                    "input port `{}` on node `{}` has cardinality=One but {} incoming edges: {}",
+                    port.id,
+                    node.id,
+                    edges.len(),
+                    edges.join(", ")
+                ));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1864,6 +1902,59 @@ mod tests {
         };
         graph.edges.push(bad.clone());
         assert!(validate_edge(&graph, &bad).is_err());
+    }
+
+    #[test]
+    fn validation_rejects_cardinality_one_second_incoming_edge() {
+        // D7：viewer-1.video 是 cardinality=One 输入端口，seed 图已有一条入边，
+        // 再加一条同目标的有效入边应被 validate_workflow 拒绝。
+        let mut graph = seed_workflow_graph();
+        let existing = graph
+            .edges
+            .iter()
+            .find(|edge| edge.id == "edge-layer-viewer")
+            .cloned()
+            .expect("seed graph contains the layer→viewer edge");
+        assert_eq!(existing.target.node_id, "viewer-1");
+        assert_eq!(existing.target.port_id, "video");
+
+        // 复制一条仅 id 不同的等价入边（kind/schema 与源端口一致，可通过 validate_edge）。
+        let mut duplicate = existing.clone();
+        duplicate.id = "edge-layer-viewer-duplicate".to_owned();
+        graph.edges.push(duplicate);
+
+        let err = validate_workflow(&graph).expect_err("second incoming edge to One port must fail");
+        assert!(err.contains("cardinality=One"), "unexpected error: {err}");
+        assert!(err.contains("viewer-1"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validation_allows_cardinality_many_fan_in() {
+        // 反向确认：`Many` 输入端口的 fan-in 不被 cardinality 校验拦截。
+        // 用 node_catalog 里 X5Device 的 `rtsp` Many 输出做对照属于 fan-out；此处直接验证
+        // validate_cardinality_constraints 对 Many 端口不计数报错（空图/多入边 many 不报）。
+        let mut graph = seed_workflow_graph();
+        // 把 viewer-1.video 的输入端口临时改为 Many，双入边应通过 cardinality 约束。
+        for node in &mut graph.nodes {
+            if node.id == "viewer-1" {
+                for port in &mut node.inputs {
+                    if port.id == "video" {
+                        port.cardinality = PortCardinality::Many;
+                    }
+                }
+            }
+        }
+        let existing = graph
+            .edges
+            .iter()
+            .find(|edge| edge.id == "edge-layer-viewer")
+            .cloned()
+            .unwrap();
+        let mut duplicate = existing;
+        duplicate.id = "edge-layer-viewer-duplicate".to_owned();
+        graph.edges.push(duplicate);
+
+        validate_cardinality_constraints(&graph).expect("Many port fan-in must be allowed");
     }
 
     #[test]

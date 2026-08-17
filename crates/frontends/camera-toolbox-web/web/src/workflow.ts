@@ -1,3 +1,5 @@
+import { wsRequest } from './useEngineSocket';
+
 export const WORKFLOW_SCHEMA_VERSION = 'workflow.v1';
 
 export type NodeKind =
@@ -310,7 +312,7 @@ export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
   preview?: ViewerPreview;
   /** 引擎实时状态；缺省回退到节点的持久化 state。 */
-  runtimeState?: 'disabled' | 'idle' | 'ready' | 'running' | 'error';
+  runtimeState?: 'disabled' | 'idle' | 'ready' | 'running' | 'warning' | 'error';
   onRtspUrlChange?: (nodeId: string, url: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: string | boolean) => void;
   /** 触发节点动作（connect/disconnect/trigger/arm/disarm）。 */
@@ -325,159 +327,106 @@ export interface FlowEdgeData extends Record<string, unknown> {
 }
 
 export async function loadWorkflow(): Promise<WorkflowGraph> {
-  return fetchJson('/api/workflow');
+  return request('workflow.seed');
 }
 
 export async function loadNodeCatalog(): Promise<NodeDefinition[]> {
-  return fetchJson('/api/node-catalog');
+  return request('workflow.nodeCatalog');
 }
 
 export async function loadWorkmodeTemplates(): Promise<WorkmodeTemplate[]> {
-  return fetchJson('/api/workmode-templates');
+  return request('workflow.workmodeTemplates');
 }
 
 export async function listWorkflows(): Promise<WorkflowSummary[]> {
-  return fetchJson('/api/workflows');
+  return request('workflow.list');
 }
 
 export async function loadSavedWorkflow(id: string): Promise<WorkflowGraph> {
-  return fetchJson(`/api/workflows/${encodeURIComponent(id)}`);
+  return request('workflow.get', { id });
 }
 
 export async function saveWorkflow(graph: WorkflowGraph): Promise<WorkflowGraph> {
-  const response = await fetch(`/api/workflows/${encodeURIComponent(graph.id)}`, {
-    method: 'PUT',
-    headers: {
-      'content-type': 'application/json',
-      'if-match': graph.revision,
-    },
-    body: JSON.stringify(graph),
-  });
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
-  return (await response.json()) as WorkflowGraph;
+  return request('workflow.save', { graph, revision: graph.revision });
 }
 
 export async function importWorkflow(graph: WorkflowGraph): Promise<WorkflowGraph> {
-  const response = await fetch('/api/workflows/import', {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(graph),
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => null) as { error?: unknown } | null;
-    throw new Error(typeof error?.error === 'string' ? error.error : `request failed: ${response.status} ${response.statusText}`);
-  }
-  return (await response.json()) as WorkflowGraph;
-}
-
-export async function exportWorkflow(id: string): Promise<WorkflowGraph> {
-  return fetchJson(`/api/workflows/${encodeURIComponent(id)}/export`);
+  return request('workflow.import', graph);
 }
 
 export async function deleteWorkflow(id: string): Promise<void> {
-  const response = await fetch(`/api/workflows/${encodeURIComponent(id)}`, {
-    method: 'DELETE',
-  });
-  if (!response.ok && response.status !== 204) {
-    throw new Error(await response.text());
-  }
+  await request('workflow.delete', { id });
 }
 
 export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
-  const response = await fetch(`/api/workflows/${encodeURIComponent(graph.id)}/validate`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(graph),
-  });
-  if (!response.ok) {
-    throw new Error(await response.text());
-  }
+  await request('workflow.validate', graph);
 }
 
 
 /** 执行一次显式 I²C 请求；写操作必须由调用者传入确认与 SSH 运行时绑定。 */
-export async function runI2cTransfer(request: I2cExecuteRequest): Promise<ControlExecutionResult> {
-  return postJson('/api/control/i2c/run', request);
+export async function runI2cTransfer(requestBody: I2cExecuteRequest): Promise<ControlExecutionResult> {
+  return request('control.i2c.run', requestBody);
 }
 
 /** EEPROM Inspect 会建立显式 SSH helper 会话，并把最新读回 hash 作为进程内写入门禁。 */
-export async function inspectEepromProvision(request: EepromInspectRequest): Promise<EepromInspectResponse> {
-  return postJson('/api/control/eeprom/inspect', request);
+export async function inspectEepromProvision(requestBody: EepromInspectRequest): Promise<EepromInspectResponse> {
+  return request('control.eeprom.inspect', requestBody);
 }
 
 /** EEPROM 写入必须复用同一进程内 Inspect 快照，并由 helper 执行字节级回读校验。 */
-export async function runEepromProvision(request: EepromExecuteRequest): Promise<ControlExecutionResult> {
-  return postJson('/api/control/eeprom/run', request);
+export async function runEepromProvision(requestBody: EepromExecuteRequest): Promise<ControlExecutionResult> {
+  return request('control.eeprom.run', requestBody);
 }
 
 /** 手动触发一次标定求解；请求体只包含原始 CalibrationRequest，不持久化到 WorkflowGraph。 */
-export async function runCalibrationSolver(request: CalibrationRequest): Promise<CalibrationSolution> {
-  return postJson('/api/control/calibration/solver/run', request);
+export async function runCalibrationSolver(requestBody: CalibrationRequest): Promise<CalibrationSolution> {
+  return request('control.calibration.solver.run', requestBody);
 }
 
 /** X5 TCP 控制面只在显式按钮触发时连接设备；host/port 来自节点轻量配置。 */
-export async function probeX5Control(request: X5BindingRequest): Promise<X5ControlResponse> {
-  return postJson('/api/control/x5/probe', request);
+export async function probeX5Control(requestBody: X5BindingRequest): Promise<X5ControlResponse> {
+  return request('control.x5.probe', requestBody);
 }
 
-export async function statusX5Control(request: X5BindingRequest): Promise<X5ControlResponse> {
-  return postJson('/api/control/x5/status', request);
+export async function statusX5Control(requestBody: X5BindingRequest): Promise<X5ControlResponse> {
+  return request('control.x5.status', requestBody);
 }
 
-export async function configureX5Rtsp(request: X5ConfigureRequest): Promise<X5ControlResponse> {
-  return postJson('/api/control/x5/configure-rtsp', request);
+export async function configureX5Rtsp(requestBody: X5ConfigureRequest): Promise<X5ControlResponse> {
+  return request('control.x5.configure-rtsp', requestBody);
 }
 
-export async function startX5RtspChannel(request: X5ChannelRequest): Promise<X5ControlResponse> {
-  return postJson('/api/control/x5/start-rtsp', request);
+export async function startX5RtspChannel(requestBody: X5ChannelRequest): Promise<X5ControlResponse> {
+  return request('control.x5.start-rtsp', requestBody);
 }
 
-export async function stopX5RtspChannel(request: X5ChannelRequest): Promise<X5ControlResponse> {
-  return postJson('/api/control/x5/stop-rtsp', request);
+export async function stopX5RtspChannel(requestBody: X5ChannelRequest): Promise<X5ControlResponse> {
+  return request('control.x5.stop-rtsp', requestBody);
 }
 
-export async function captureX5Snapshot(request: X5SnapshotRequest): Promise<X5ControlResponse> {
-  return postJson('/api/control/x5/snapshot', request);
+export async function captureX5Snapshot(requestBody: X5SnapshotRequest): Promise<X5ControlResponse> {
+  return request('control.x5.snapshot', requestBody);
 }
 
-
-/** 引擎节点状态快照。 */
-export interface EngineNodeStatus {
-  nodeId: string;
-  state: 'disabled' | 'idle' | 'ready' | 'running' | 'error';
-  diagnostic: string;
-}
 
 /** 装载工作流图进数据流引擎（替换旧图）。 */
 export async function runEngine(graph: WorkflowGraph): Promise<{ running: boolean; nodes: number }> {
-  return postJson('/api/runtime/run', graph);
+  return request('runtime.run', graph);
 }
 
 /** 停止并卸载引擎图。 */
 export async function stopEngine(): Promise<{ running: boolean }> {
-  return postJson('/api/runtime/stop');
+  return request('runtime.stop');
 }
 
 /** 图级 run/start：一键启动所有可启动节点（尽力启动）。 */
 export async function startEngine(): Promise<{ started: boolean }> {
-  return postJson('/api/runtime/start');
+  return request('runtime.start');
 }
 
 /** 向引擎节点投递动作（connect/disconnect/trigger/arm/disarm）。 */
 export async function nodeAction(nodeId: string, action: string): Promise<{ ok: boolean }> {
-  return postJson(`/api/runtime/nodes/${encodeURIComponent(nodeId)}/action`, { action });
-}
-
-/** 非阻塞取回引擎节点状态更新。 */
-export async function fetchEngineStatus(): Promise<EngineNodeStatus[]> {
-  return fetchJson('/api/runtime/status');
-}
-
-/** viewer 节点最新帧的 JPEG 地址（可直接作为 <img> src）。 */
-export function viewerFrameUrl(nodeId: string): string {
-  return `/api/runtime/viewer/${encodeURIComponent(nodeId)}/frame`;
+  return request('runtime.node.action', { nodeId, action });
 }
 
 /** 目录条目。 */
@@ -496,18 +445,17 @@ export interface FileListResponse {
 
 /** 列出本地工作区目录。 */
 export async function listLocalFiles(root: string, path: string): Promise<FileListResponse> {
-  const query = new URLSearchParams({ root, path });
-  return fetchJson(`/api/files/local/list?${query}`);
+  return request('file.local.list', { root, path });
 }
 
 /** 请求服务器校验 I²C 配置并返回预览；该端点不执行任何 I/O。 */
-export async function previewI2cTransfer(request: I2cPreviewRequest): Promise<ControlRequestPreview> {
-  return postJson('/api/control/i2c/preview', request);
+export async function previewI2cTransfer(requestBody: I2cPreviewRequest): Promise<ControlRequestPreview> {
+  return request('control.i2c.preview', requestBody);
 }
 
 /** 请求服务器校验 EEPROM 配置并返回预览；该端点不执行任何 I/O。 */
-export async function previewEepromProvision(request: EepromPreviewRequest): Promise<ControlRequestPreview> {
-  return postJson('/api/control/eeprom/preview', request);
+export async function previewEepromProvision(requestBody: EepromPreviewRequest): Promise<ControlRequestPreview> {
+  return request('control.eeprom.preview', requestBody);
 }
 
 export function labelForPortKind(kind: PortKind): string {
@@ -532,24 +480,6 @@ export function validateConnectionKinds(source: WorkflowPort, target: WorkflowPo
   return null;
 }
 
-async function fetchJson<T>(url: string): Promise<T> {
-  const response = await fetch(url);
-  if (!response.ok) {
-    throw new Error(`request failed: ${response.status} ${response.statusText}`);
-  }
-  return (await response.json()) as T;
+async function request<T>(path: string, payload?: unknown): Promise<T> {
+  return (await wsRequest(path, payload)) as T;
 }
-
-async function postJson<T>(url: string, body?: unknown): Promise<T> {
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => null) as { error?: unknown } | null;
-    throw new Error(typeof error?.error === 'string' ? error.error : `request failed: ${response.status} ${response.statusText}`);
-  }
-  return (await response.json()) as T;
-}
-

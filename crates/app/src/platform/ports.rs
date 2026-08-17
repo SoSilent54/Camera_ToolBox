@@ -2,7 +2,7 @@
 
 use std::{
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -706,6 +706,8 @@ pub struct DecodedVideoFrame {
 #[derive(Default)]
 pub struct LatestDecodedFrameSlot {
     frame: Mutex<Option<Arc<DecodedVideoFrame>>>,
+    /// 帧就绪通知：`publish` 唤醒一次 `wait_latest` 上阻塞的消费者。
+    changed: Condvar,
 }
 
 impl LatestDecodedFrameSlot {
@@ -714,6 +716,7 @@ impl LatestDecodedFrameSlot {
             .frame
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(frame));
+        self.changed.notify_all();
     }
 
     #[must_use]
@@ -729,6 +732,52 @@ impl LatestDecodedFrameSlot {
             .frame
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// 事件驱动读取：阻塞直到有帧可读，返回并取走该帧（consuming take）。
+    ///
+    /// 这是面向 pump 的「消费语义」：等待 `publish` 的 condvar 通知，醒来后强占当前帧，
+    /// 后续 `publish` 覆盖前该帧已被当前消费者取走，避免同一帧被重复处理。
+    #[must_use]
+    pub fn wait_latest(&self) -> Arc<DecodedVideoFrame> {
+        let mut guard = self
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(frame) = guard.take() {
+                return frame;
+            }
+            guard = self
+                .changed
+                .wait(guard)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    /// `wait_latest` 的可取消变体：无帧时按 `timeout` 唤醒一次以便调用方检查取消标志。
+    ///
+    /// 帧就绪则立即返回 `Some`（consuming take）；否则在 condvar 上等待至多 `timeout`，
+    /// 超时且仍无帧时返回 `None`，让 pump 循环得以复查 `cancel` 并干净退出（避免空转）。
+    #[must_use]
+    pub fn wait_latest_timeout(&self, timeout: Duration) -> Option<Arc<DecodedVideoFrame>> {
+        let mut guard = self
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(frame) = guard.take() {
+                return Some(frame);
+            }
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(guard, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+            if timed_out.timed_out() && guard.is_none() {
+                return None;
+            }
+        }
     }
 }
 

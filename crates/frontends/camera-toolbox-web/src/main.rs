@@ -1,12 +1,15 @@
 mod engine_api;
+mod engine_bridge;
 mod files_api;
 mod workflow;
+mod ws_hub;
+mod ws_router;
 
 use std::{
     collections::HashMap,
     fs,
     net::IpAddr,
-    path::{Component, Path, PathBuf},
+    path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -14,11 +17,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path as AxumPath, Query, State, rejection::JsonRejection},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::State,
+    extract::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+    http::StatusCode,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::get,
 };
 #[cfg(feature = "calibration-opencv")]
 use camera_toolbox_adapters::OpenCvCalibrationBackend;
@@ -48,10 +51,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
-use workflow::{
-    WorkflowGraph, node_catalog, normalize_workflow, seed_workflow_graph, validate_workflow,
-    workmode_templates,
-};
+use workflow::{WorkflowGraph, validate_workflow};
 
 #[derive(Debug, Parser)]
 #[command(name = "camera-toolbox-web")]
@@ -83,6 +83,7 @@ struct AppState {
     calibration_backend: Arc<dyn CalibrationBackend>,
     eeprom_inspects: Arc<Mutex<HashMap<String, EepromInspectSnapshot>>>,
     engine_runtime: Arc<engine_api::EngineRuntime>,
+    ws_hub: Arc<ws_hub::WsHub>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -962,12 +963,6 @@ struct WorkflowSummary {
     edge_count: usize,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ValidationResponse {
-    ok: bool,
-    error: Option<String>,
-}
 
 
 /// I²C 预览请求仅描述一次可能的传输；它从不打开设备或建立远程会话。
@@ -1300,118 +1295,6 @@ impl IntoResponse for PreviewApiError {
     }
 }
 
-/// 本地图像预览只接受相对路径，并在解析符号链接后仍限定于声明的 workspace 根目录。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct LocalImageQuery {
-    workspace_root: String,
-    relative_path: String,
-}
-
-#[derive(Debug, Serialize)]
-struct LocalImageApiError {
-    error: String,
-}
-
-impl LocalImageApiError {
-    fn new(status: StatusCode, error: impl Into<String>) -> (StatusCode, Json<Self>) {
-        (
-            status,
-            Json(Self {
-                error: error.into(),
-            }),
-        )
-    }
-}
-
-fn canonical_workspace_root(
-    workspace_root: &str,
-) -> std::result::Result<PathBuf, (StatusCode, Json<LocalImageApiError>)> {
-    let trimmed = workspace_root.trim();
-    if trimmed.is_empty() {
-        return Err(LocalImageApiError::new(
-            StatusCode::BAD_REQUEST,
-            "workspaceRoot must not be empty",
-        ));
-    }
-    let path = Path::new(trimmed);
-    if !path.is_absolute() {
-        return Err(LocalImageApiError::new(
-            StatusCode::BAD_REQUEST,
-            "workspaceRoot must be an absolute path",
-        ));
-    }
-    let canonical = fs::canonicalize(path).map_err(|error| {
-        LocalImageApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("workspace root could not be resolved: {error}"),
-        )
-    })?;
-    if !canonical.is_dir() {
-        return Err(LocalImageApiError::new(
-            StatusCode::BAD_REQUEST,
-            "workspaceRoot must resolve to a directory",
-        ));
-    }
-    Ok(canonical)
-}
-
-fn validate_relative_image_path(
-    relative_path: &str,
-) -> std::result::Result<PathBuf, (StatusCode, Json<LocalImageApiError>)> {
-    let trimmed = relative_path.trim();
-    if trimmed.is_empty() {
-        return Err(LocalImageApiError::new(
-            StatusCode::BAD_REQUEST,
-            "relativePath must not be empty",
-        ));
-    }
-    let mut normalized = PathBuf::new();
-    for component in Path::new(trimmed).components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir => continue,
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                return Err(LocalImageApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    "relativePath must stay inside the workspace root",
-                ));
-            }
-        }
-    }
-    if normalized.as_os_str().is_empty() {
-        return Err(LocalImageApiError::new(
-            StatusCode::BAD_REQUEST,
-            "relativePath must not resolve to the workspace root",
-        ));
-    }
-    Ok(normalized)
-}
-
-fn local_image_content_type(
-    image_path: &Path,
-) -> std::result::Result<&'static str, (StatusCode, Json<LocalImageApiError>)> {
-    let extension = image_path
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.to_ascii_lowercase());
-    let content_type = match extension.as_deref() {
-        Some("png") => "image/png",
-        Some("jpg") | Some("jpeg") => "image/jpeg",
-        Some("gif") => "image/gif",
-        Some("webp") => "image/webp",
-        Some("bmp") => "image/bmp",
-        Some("tif") | Some("tiff") => "image/tiff",
-        Some("avif") => "image/avif",
-        _ => {
-            return Err(LocalImageApiError::new(
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!("unsupported image format: {}", image_path.display()),
-            ));
-        }
-    };
-    Ok(content_type)
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
@@ -1451,60 +1334,15 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         calibration_backend: Arc::new(OpenCvCalibrationBackend),
         eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
         engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
+        ws_hub: Arc::new(ws_hub::WsHub::new()),
     };
+
+    // 启动引擎桥接任务：状态/事件/帧持续经 ws_hub 广播（三个 tokio::spawn 循环）。
+    engine_bridge::spawn(state.clone(), Arc::clone(&state.ws_hub));
 
     Router::new()
         .route("/api/health", get(health))
-        .route("/api/workflow", get(workflow_graph))
-        .route("/api/node-catalog", get(node_catalog_api))
-        .route("/api/workmode-templates", get(workmode_templates_api))
-        .route("/api/workflows", get(list_workflows).post(create_workflow))
-        .route("/api/workflows/import", post(import_workflow))
-        .route(
-            "/api/workflows/{id}",
-            get(get_workflow).put(put_workflow).delete(delete_workflow),
-        )
-        .route("/api/workflows/{id}/export", get(export_workflow))
-        .route("/api/workflows/{id}/validate", post(validate_workflow_api))
-        .route("/api/control/i2c/preview", post(preview_i2c_transfer))
-        .route(
-            "/api/control/eeprom/inspect",
-            post(inspect_eeprom_provision),
-        )
-        .route("/api/control/i2c/run", post(run_i2c_transfer))
-        .route(
-            "/api/control/calibration/solver/run",
-            post(run_calibration_solver),
-        )
-        .route("/api/control/eeprom/run", post(run_eeprom_provision))
-        .route(
-            "/api/control/eeprom/preview",
-            post(preview_eeprom_provision),
-        )
-        .route("/api/control/x5/probe", post(probe_x5_control))
-        .route("/api/control/x5/status", post(status_x5_control))
-        .route("/api/control/x5/configure-rtsp", post(configure_x5_rtsp))
-        .route("/api/control/x5/start-rtsp", post(start_x5_rtsp_channel))
-        .route("/api/control/x5/stop-rtsp", post(stop_x5_rtsp_channel))
-        .route("/api/control/x5/snapshot", post(capture_x5_snapshot))
-        .route("/api/images/local", get(local_image_preview))
-        .route("/api/files/local/list", get(files_api::list_local_files))
-        .route("/api/runtime/run", post(engine_api::run_engine))
-        .route("/api/runtime/stop", post(engine_api::stop_engine))
-        .route("/api/runtime/start", post(engine_api::start_engine))
-        .route(
-            "/api/runtime/nodes/{id}/action",
-            post(engine_api::node_action),
-        )
-        .route(
-            "/api/runtime/nodes/{id}/output",
-            get(engine_api::node_output),
-        )
-        .route("/api/runtime/status", get(engine_api::engine_status))
-        .route(
-            "/api/runtime/viewer/{id}/frame",
-            get(engine_api::viewer_frame),
-        )
+        .route("/api/ws", get(ws_upgrade))
         .fallback_service(frontend)
         .with_state(state)
 }
@@ -1516,441 +1354,333 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
-async fn workflow_graph() -> Json<WorkflowGraph> {
-    let graph = seed_workflow_graph();
-    debug_assert!(validate_workflow(&graph).is_ok());
-    Json(graph)
+/// WS 握手端点：升级连接后注册进 [`ws_hub::WsHub`]，并进入接收循环保持连接存活。
+///
+/// 本阶段（P0）只做回显/忽略——收到的文本消息原样回显，收到的其它帧类型直接忽略；
+/// 真正按信封 `path` 分发到命令处理器由 t5 的 `ws_router` 接管。连接存活期间，
+/// 出站通道注册进 hub 以便引擎桥接后续广播（状态/事件/帧）。
+async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> Response {
+    ws.on_upgrade(move |socket| handle_ws_socket(socket, state))
 }
 
-async fn node_catalog_api() -> Json<Vec<workflow::NodeDefinition>> {
-    Json(node_catalog())
-}
-
-async fn workmode_templates_api() -> Json<Vec<workflow::WorkmodeTemplate>> {
-    Json(workmode_templates())
-}
-
-async fn list_workflows(
-    State(state): State<AppState>,
-) -> std::result::Result<Json<Vec<WorkflowSummary>>, (StatusCode, String)> {
-    state.workflow_store.list().map(Json)
-}
-
-async fn create_workflow(
-    State(state): State<AppState>,
-    Json(mut graph): Json<WorkflowGraph>,
-) -> std::result::Result<(StatusCode, Json<WorkflowGraph>), (StatusCode, String)> {
-    if graph.id.trim().is_empty() {
-        graph.id = format!("workflow-{}", next_revision());
-    }
-    let revision = next_revision();
-    let graph = normalize_workflow(graph, revision).map_err(bad_request)?;
-    state.workflow_store.save(&graph)?;
-    Ok((StatusCode::CREATED, Json(graph)))
-}
-
-async fn import_workflow(
-    State(state): State<AppState>,
-    Json(graph): Json<WorkflowGraph>,
-) -> std::result::Result<(StatusCode, Json<WorkflowGraph>), (StatusCode, String)> {
-    create_or_replace_workflow(state, graph)
-        .await
-        .map(|graph| (StatusCode::CREATED, Json(graph)))
-}
-
-async fn export_workflow(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> std::result::Result<Response, (StatusCode, String)> {
-    let graph = state.workflow_store.load(&id)?;
-    let body = serde_json::to_vec_pretty(&graph).map_err(internal_error)?;
-    let mut response = Body::from(body).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json; charset=utf-8"),
-    );
-    response.headers_mut().insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!(
-            "attachment; filename=\"{}.ctworkflow.json\"",
-            graph.id
-        ))
-        .map_err(internal_error)?,
-    );
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(response)
-}
-
-async fn get_workflow(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> std::result::Result<Json<WorkflowGraph>, (StatusCode, String)> {
-    state.workflow_store.load(&id).map(Json)
-}
-
-async fn put_workflow(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-    headers: HeaderMap,
-    Json(mut graph): Json<WorkflowGraph>,
-) -> std::result::Result<Json<WorkflowGraph>, (StatusCode, String)> {
-    graph.id = id.clone();
-    if let Some(current) = state.workflow_store.load_optional(&id)? {
-        if_match_revision(&headers, &current.revision)?;
-    }
-    let graph = normalize_workflow(graph, next_revision()).map_err(bad_request)?;
-    state.workflow_store.save(&graph)?;
-    Ok(Json(graph))
-}
-
-async fn delete_workflow(
-    State(state): State<AppState>,
-    AxumPath(id): AxumPath<String>,
-) -> std::result::Result<StatusCode, (StatusCode, String)> {
-    state.workflow_store.delete(&id)?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-async fn validate_workflow_api(
-    Json(graph): Json<WorkflowGraph>,
-) -> (StatusCode, Json<ValidationResponse>) {
-    match validate_workflow(&graph) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(ValidationResponse {
-                ok: true,
-                error: None,
-            }),
-        ),
-        Err(error) => (
-            StatusCode::BAD_REQUEST,
-            Json(ValidationResponse {
-                ok: false,
-                error: Some(error),
-            }),
-        ),
-    }
-}
-
-async fn probe_x5_control(
-    request: std::result::Result<Json<X5ProbeRequest>, JsonRejection>,
-) -> std::result::Result<Json<Value>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid X5 probe request: {error}"))
-    })?;
-    let (host, port) = x5_binding_from_request(&request.binding)?;
-    let summary = x5_tcp_client::probe(&host, port).map_err(PreviewApiError::bad_request)?;
-    Ok(Json(x5_probe_response(&summary)))
-}
-
-async fn status_x5_control(
-    request: std::result::Result<Json<X5StatusRequest>, JsonRejection>,
-) -> std::result::Result<Json<Value>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid X5 status request: {error}"))
-    })?;
-    let (host, port) = x5_binding_from_request(&request.binding)?;
-    let status = x5_tcp_client::status(&host, port).map_err(PreviewApiError::bad_request)?;
-    Ok(Json(x5_status_response(&status)))
-}
-
-async fn configure_x5_rtsp(
-    request: std::result::Result<Json<X5ConfigureRequest>, JsonRejection>,
-) -> std::result::Result<Json<Value>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid X5 RTSP configure request: {error}"))
-    })?;
-    let (host, port) = x5_binding_from_request(&request.binding)?;
-    let summary = x5_tcp_client::configure_rtsp(
-        &host,
-        port,
-        x5_tcp_client::X5RtspEncoderConfig {
-            fps: request.fps,
-            bitrate_kbps: request.bitrate_kbps,
-        },
-    )
-    .map_err(PreviewApiError::bad_request)?;
-    Ok(Json(x5_rtsp_apply_response(&summary)))
-}
-
-async fn start_x5_rtsp_channel(
-    request: std::result::Result<Json<X5ChannelRequest>, JsonRejection>,
-) -> std::result::Result<Json<Value>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid X5 RTSP start request: {error}"))
-    })?;
-    let (host, port) = x5_binding_from_request(&request.binding)?;
-    let summary = x5_tcp_client::start_rtsp_channel(&host, port, request.channel)
-        .map_err(PreviewApiError::bad_request)?;
-    Ok(Json(x5_rtsp_stream_response(&summary)))
-}
-
-async fn stop_x5_rtsp_channel(
-    request: std::result::Result<Json<X5ChannelRequest>, JsonRejection>,
-) -> std::result::Result<Json<Value>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid X5 RTSP stop request: {error}"))
-    })?;
-    let (host, port) = x5_binding_from_request(&request.binding)?;
-    let summary = x5_tcp_client::stop_rtsp_channel(&host, port, request.channel)
-        .map_err(PreviewApiError::bad_request)?;
-    Ok(Json(x5_rtsp_stream_response(&summary)))
-}
-
-async fn capture_x5_snapshot(
-    request: std::result::Result<Json<X5SnapshotRequest>, JsonRejection>,
-) -> std::result::Result<Json<Value>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid X5 snapshot request: {error}"))
-    })?;
-    let (host, port) = x5_binding_from_request(&request.binding)?;
-    let snapshot = match request.mode {
-        X5SnapshotMode::Latest => x5_tcp_client::capture_yuv_snapshot(&host, port, request.channel),
-        X5SnapshotMode::FrameId => {
-            let frame_id = request.frame_id.ok_or_else(|| {
-                PreviewApiError::bad_request("X5 frame_id snapshot requires frameId")
-            })?;
-            x5_tcp_client::capture_yuv_snapshot_by_frame_id(&host, port, request.channel, frame_id)
+/// `control.*` 命令处理器（WS 路径分发复用）：把 payload 反序列化为既有请求结构体，
+/// 调用与本 crate HTTP 端点完全相同的辅助函数/执行逻辑，返回 `Result<Value, String>`。
+///
+/// 结构体/辅助函数均私有于 main.rs，故本分发器也置于此模块（ws_router 委托进来），
+/// 避免把十余个控制请求类型搬出做 `pub(crate)`。
+pub(crate) fn control_dispatch(
+    path: &str,
+    payload: serde_json::Value,
+    state: &AppState,
+) -> Result<serde_json::Value, String> {
+    match path {
+        "control.i2c.preview" => {
+            let req: I2cPreviewRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let preview = build_i2c_preview(req).map_err(|e| e.error)?;
+            serde_json::to_value(preview).map_err(ws_ser_err)
         }
-        X5SnapshotMode::TimestampNs => {
-            let timestamp_ns = request.timestamp_ns.ok_or_else(|| {
-                PreviewApiError::bad_request("X5 timestamp snapshot requires timestampNs")
-            })?;
-            x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
+        "control.i2c.run" => {
+            let req: I2cExecuteRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let preview = build_i2c_preview(req.preview).map_err(|e| e.error)?;
+            if preview.requires_confirmation && !req.confirm_execution {
+                return Err("I²C write execution requires confirmExecution=true".to_owned());
+            }
+            let result = state
+                .control_runtime
+                .execute_i2c(&preview, &req.ssh)
+                .map_err(|e| e.error)?;
+            serde_json::to_value(ControlExecutionResult {
+                preview,
+                execution: "completed",
+                result: ControlExecutionPayload::I2c(result),
+            })
+            .map_err(ws_ser_err)
+        }
+        "control.eeprom.preview" => {
+            let req: EepromPreviewRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let preview = build_eeprom_preview(req).map_err(|e| e.error)?;
+            serde_json::to_value(preview).map_err(ws_ser_err)
+        }
+        "control.eeprom.inspect" => {
+            let req: EepromInspectRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let preview = build_eeprom_preview(req.preview).map_err(|e| e.error)?;
+            let target = eeprom_snapshot_target(&preview, &req.ssh).map_err(|e| e.error)?;
+            let result = state
+                .control_runtime
+                .execute_eeprom(&preview, &req.ssh, EepromHelperAction::Inspect)
+                .map_err(|e| e.error)?;
+            let EepromHelperResult::Inspect(inspect) = &result else {
+                return Err("EEPROM inspect returned a non-inspect helper result".to_owned());
+            };
+            let key = target.node_id.clone();
+            let snapshot = EepromInspectSnapshot {
+                target: target.clone(),
+                image_sha256: inspect.state.image_sha256.clone(),
+                device: inspect.state.clone(),
+            };
+            let response = EepromInspectResponse {
+                preview,
+                snapshot: eeprom_snapshot_response(&key, &snapshot),
+                result,
+            };
+            state
+                .eeprom_inspects
+                .lock()
+                .map_err(|_| "EEPROM inspect snapshot state is unavailable".to_owned())?
+                .insert(key, snapshot);
+            serde_json::to_value(response).map_err(ws_ser_err)
+        }
+        "control.eeprom.run" => {
+            let req: EepromExecuteRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let preview = build_eeprom_preview(req.preview).map_err(|e| e.error)?;
+            if !req.confirm_execution {
+                return Err("EEPROM provision requires confirmExecution=true".to_owned());
+            }
+            let Some(expected_before_sha256) = req.expected_before_sha256.as_deref() else {
+                return Err(
+                    "EEPROM provision requires expectedBeforeSha256 from the latest inspect"
+                        .to_owned(),
+                );
+            };
+            if !is_sha256(expected_before_sha256) {
+                return Err(
+                    "expectedBeforeSha256 must contain 64 lowercase hex characters".to_owned(),
+                );
+            }
+            let target = eeprom_snapshot_target(&preview, &req.ssh).map_err(|e| e.error)?;
+            let snapshot = state
+                .eeprom_inspects
+                .lock()
+                .map_err(|_| "EEPROM inspect snapshot state is unavailable".to_owned())?
+                .get(&preview.target.node_id)
+                .cloned()
+                .ok_or_else(|| {
+                    "EEPROM provision requires a process-local inspect snapshot for this node"
+                        .to_owned()
+                })?;
+            if snapshot.target != target {
+                return Err(
+                    "EEPROM target changed after inspect; inspect the selected SSH/bus/map/address again"
+                        .to_owned(),
+                );
+            }
+            if snapshot.image_sha256 != expected_before_sha256 {
+                return Err(
+                    "expectedBeforeSha256 does not match the latest process-local inspect snapshot"
+                        .to_owned(),
+                );
+            }
+            let provision_request =
+                eeprom_provision_request_from_preview(&preview, &snapshot).map_err(|e| e.error)?;
+            let result = state
+                .control_runtime
+                .execute_eeprom(
+                    &preview,
+                    &req.ssh,
+                    EepromHelperAction::Provision {
+                        request: provision_request,
+                        expected_before_sha256: expected_before_sha256.to_owned(),
+                    },
+                )
+                .map_err(|e| e.error)?;
+            state
+                .eeprom_inspects
+                .lock()
+                .map_err(|_| "EEPROM inspect snapshot state is unavailable".to_owned())?
+                .remove(&preview.target.node_id);
+            serde_json::to_value(ControlExecutionResult {
+                preview,
+                execution: "completed",
+                result: ControlExecutionPayload::Eeprom(result),
+            })
+            .map_err(ws_ser_err)
+        }
+        #[cfg(feature = "calibration-opencv")]
+        "control.calibration.solver.run" => {
+            let req: CalibrationSolverRequest =
+                serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let request = into_calibration_request(req).map_err(|e| e.error)?;
+            let cancellation = CalibrationCancellation::default();
+            let solution = state
+                .calibration_backend
+                .calibrate(&request, &cancellation)
+                .map_err(|e| e.to_string())?;
+            serde_json::to_value(CalibrationSolverResponse::from(solution)).map_err(ws_ser_err)
+        }
+        #[cfg(not(feature = "calibration-opencv"))]
+        "control.calibration.solver.run" => {
+            Err("calibration solver not available in this build".to_owned())
+        }
+        "control.x5.probe" => {
+            let req: X5ProbeRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let (host, port) = x5_binding_from_request(&req.binding).map_err(|e| e.error)?;
+            let summary = x5_tcp_client::probe(&host, port).map_err(|e| e.to_string())?;
+            Ok(x5_probe_response(&summary))
+        }
+        "control.x5.status" => {
+            let req: X5StatusRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let (host, port) = x5_binding_from_request(&req.binding).map_err(|e| e.error)?;
+            let status = x5_tcp_client::status(&host, port).map_err(|e| e.to_string())?;
+            Ok(x5_status_response(&status))
+        }
+        "control.x5.configure-rtsp" => {
+            let req: X5ConfigureRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let (host, port) = x5_binding_from_request(&req.binding).map_err(|e| e.error)?;
+            let summary = x5_tcp_client::configure_rtsp(
                 &host,
                 port,
-                request.channel,
-                timestamp_ns,
+                x5_tcp_client::X5RtspEncoderConfig {
+                    fps: req.fps,
+                    bitrate_kbps: req.bitrate_kbps,
+                },
             )
+            .map_err(|e| e.to_string())?;
+            Ok(x5_rtsp_apply_response(&summary))
         }
-        X5SnapshotMode::RtspPts90k => {
-            let rtsp_pts_90k = request.rtsp_pts_90k.ok_or_else(|| {
-                PreviewApiError::bad_request("X5 rtsp_pts_90k snapshot requires rtspPts90k")
-            })?;
-            x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
-                &host,
-                port,
-                request.channel,
-                rtsp_pts_90k,
-                request.rtsp_pts_tolerance_90k.unwrap_or(0),
-            )
+        "control.x5.start-rtsp" => {
+            let req: X5ChannelRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let (host, port) = x5_binding_from_request(&req.binding).map_err(|e| e.error)?;
+            let summary = x5_tcp_client::start_rtsp_channel(&host, port, req.channel)
+                .map_err(|e| e.to_string())?;
+            Ok(x5_rtsp_stream_response(&summary))
+        }
+        "control.x5.stop-rtsp" => {
+            let req: X5ChannelRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let (host, port) = x5_binding_from_request(&req.binding).map_err(|e| e.error)?;
+            let summary = x5_tcp_client::stop_rtsp_channel(&host, port, req.channel)
+                .map_err(|e| e.to_string())?;
+            Ok(x5_rtsp_stream_response(&summary))
+        }
+        "control.x5.snapshot" => {
+            let req: X5SnapshotRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
+            let (host, port) = x5_binding_from_request(&req.binding).map_err(|e| e.error)?;
+            let snapshot = match req.mode {
+                X5SnapshotMode::Latest => {
+                    x5_tcp_client::capture_yuv_snapshot(&host, port, req.channel)
+                }
+                X5SnapshotMode::FrameId => {
+                    let frame_id = req
+                        .frame_id
+                        .ok_or_else(|| "X5 frame_id snapshot requires frameId".to_owned())?;
+                    x5_tcp_client::capture_yuv_snapshot_by_frame_id(
+                        &host, port, req.channel, frame_id,
+                    )
+                }
+                X5SnapshotMode::TimestampNs => {
+                    let timestamp_ns = req.timestamp_ns.ok_or_else(|| {
+                        "X5 timestamp snapshot requires timestampNs".to_owned()
+                    })?;
+                    x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
+                        &host,
+                        port,
+                        req.channel,
+                        timestamp_ns,
+                    )
+                }
+                X5SnapshotMode::RtspPts90k => {
+                    let rtsp_pts_90k = req.rtsp_pts_90k.ok_or_else(|| {
+                        "X5 rtsp_pts_90k snapshot requires rtspPts90k".to_owned()
+                    })?;
+                    x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
+                        &host,
+                        port,
+                        req.channel,
+                        rtsp_pts_90k,
+                        req.rtsp_pts_tolerance_90k.unwrap_or(0),
+                    )
+                }
+            }
+            .map_err(|e| e.to_string())?;
+            Ok(x5_snapshot_response(&snapshot))
+        }
+        other => Err(format!("unknown ws path `{other}`")),
+    }
+}
+
+fn ws_deser_err(error: impl std::fmt::Display) -> String {
+    format!("invalid payload: {error}")
+}
+
+fn ws_ser_err(error: impl std::fmt::Display) -> String {
+    format!("serialize response failed: {error}")
+}
+
+/// 单连接的生命周期：分出收发两半，出站半由独立转发任务绑定到 hub 注册的 mpsc 通道，
+/// 入站半循环读取 request 信封 → ws_router 分发 → response 信封写回本连接；循环退出时注销。
+async fn handle_ws_socket(socket: WebSocket, state: AppState) {
+    let hub = Arc::clone(&state.ws_hub);
+    let (mut sender, mut receiver) = socket.split();
+
+    // 出站：hub 广播 + 单连接 response 都写入 mpsc 无界通道，转发任务把消息送到 socket。
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<WsMessage>();
+    let key = hub.register(tx.clone());
+    let forward = tokio::spawn(async move {
+        use futures_util::SinkExt;
+        while let Some(msg) = rx.recv().await {
+            if sender.send(msg).await.is_err() {
+                // socket 已关闭，停止转发。
+                break;
+            }
+        }
+    });
+
+    // 入站：request 信封 `{id, kind:"request", path, payload}` → ws_router.dispatch → response 信封。
+    use futures_util::StreamExt;
+    while let Some(Ok(msg)) = receiver.next().await {
+        match msg {
+            WsMessage::Text(text) => {
+                let id = match parse_request_envelope(&text) {
+                    Some(envelope) => envelope,
+                    None => continue,
+                };
+                // 同步执行命令处理器；控制类命令（SSH/I2C/X5）本身就阻塞，与 HTTP 端点一致。
+                let response = match ws_router::dispatch(&id.path, id.payload, &state) {
+                    Ok(payload) => serde_json::json!({
+                        "id": id.id,
+                        "kind": "response",
+                        "ok": true,
+                        "payload": payload,
+                    }),
+                    Err(error) => serde_json::json!({
+                        "id": id.id,
+                        "kind": "response",
+                        "ok": false,
+                        "error": error,
+                    }),
+                };
+                if tx.send(WsMessage::Text(response.to_string().into())).is_err() {
+                    break; // 连接已关闭。
+                }
+            }
+            WsMessage::Close(_) => break,
+            _ => { /* 二进制/乒乓等帧：忽略（帧推送为出站方向） */ }
         }
     }
-    .map_err(PreviewApiError::bad_request)?;
-    Ok(Json(x5_snapshot_response(&snapshot)))
+
+    // 连接结束：摘除出站通道，并收尾转发任务。
+    hub.unregister(key);
+    forward.abort();
 }
 
-async fn create_or_replace_workflow(
-    state: AppState,
-    mut graph: WorkflowGraph,
-) -> std::result::Result<WorkflowGraph, (StatusCode, String)> {
-    if graph.id.trim().is_empty() {
-        graph.id = format!("workflow-{}", next_revision());
+/// 解析一条入站文本为 request 信封；非 request（如回显/探测）或缺字段则返回 `None`。
+struct RequestEnvelope {
+    id: u64,
+    path: String,
+    payload: serde_json::Value,
+}
+
+fn parse_request_envelope(text: &str) -> Option<RequestEnvelope> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    if value.get("kind")?.as_str()? != "request" {
+        return None;
     }
-    let graph = normalize_workflow(graph, next_revision()).map_err(bad_request)?;
-    state.workflow_store.save(&graph)?;
-    Ok(graph)
+    let id = value.get("id")?.as_u64()?;
+    let path = value.get("path")?.as_str()?.to_owned();
+    let payload = value.get("payload").cloned().unwrap_or(serde_json::Value::Null);
+    Some(RequestEnvelope { id, path, payload })
 }
 
 
-async fn local_image_preview(
-    Query(query): Query<LocalImageQuery>,
-) -> std::result::Result<Response, (StatusCode, Json<LocalImageApiError>)> {
-    let workspace_root = canonical_workspace_root(&query.workspace_root)?;
-    let relative_path = validate_relative_image_path(&query.relative_path)?;
-    let image_path = workspace_root.join(relative_path);
-    let image_path = fs::canonicalize(&image_path).map_err(|error| {
-        LocalImageApiError::new(
-            StatusCode::NOT_FOUND,
-            format!("image file could not be resolved: {error}"),
-        )
-    })?;
-    if !image_path.starts_with(&workspace_root) {
-        return Err(LocalImageApiError::new(
-            StatusCode::FORBIDDEN,
-            "image path resolves outside the configured workspace root",
-        ));
-    }
-    if !image_path.is_file() {
-        return Err(LocalImageApiError::new(
-            StatusCode::BAD_REQUEST,
-            "image path must resolve to a regular file",
-        ));
-    }
-    let content_type = local_image_content_type(&image_path)?;
-    let bytes = fs::read(&image_path).map_err(|error| {
-        LocalImageApiError::new(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed to read image file: {error}"),
-        )
-    })?;
-    let mut response = Body::from(bytes).into_response();
-    response
-        .headers_mut()
-        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    Ok(response)
-}
-async fn preview_i2c_transfer(
-    request: std::result::Result<Json<I2cPreviewRequest>, JsonRejection>,
-) -> std::result::Result<Json<ControlPreview>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid I²C preview request: {error}"))
-    })?;
-    build_i2c_preview(request).map(Json)
-}
-
-async fn run_i2c_transfer(
-    State(state): State<AppState>,
-    request: std::result::Result<Json<I2cExecuteRequest>, JsonRejection>,
-) -> std::result::Result<Json<ControlExecutionResult>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid I²C execution request: {error}"))
-    })?;
-    let preview = build_i2c_preview(request.preview)?;
-    if preview.requires_confirmation && !request.confirm_execution {
-        return Err(PreviewApiError::bad_request(
-            "I²C write execution requires confirmExecution=true",
-        ));
-    }
-    let result = state.control_runtime.execute_i2c(&preview, &request.ssh)?;
-    Ok(Json(ControlExecutionResult {
-        preview,
-        execution: "completed",
-        result: ControlExecutionPayload::I2c(result),
-    }))
-}
-
-async fn preview_eeprom_provision(
-    request: std::result::Result<Json<EepromPreviewRequest>, JsonRejection>,
-) -> std::result::Result<Json<ControlPreview>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid EEPROM preview request: {error}"))
-    })?;
-    build_eeprom_preview(request).map(Json)
-}
-
-async fn inspect_eeprom_provision(
-    State(state): State<AppState>,
-    request: std::result::Result<Json<EepromInspectRequest>, JsonRejection>,
-) -> std::result::Result<Json<EepromInspectResponse>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid EEPROM inspect request: {error}"))
-    })?;
-    let preview = build_eeprom_preview(request.preview)?;
-    let target = eeprom_snapshot_target(&preview, &request.ssh)?;
-    let result = state.control_runtime.execute_eeprom(
-        &preview,
-        &request.ssh,
-        EepromHelperAction::Inspect,
-    )?;
-    let EepromHelperResult::Inspect(inspect) = &result else {
-        return Err(PreviewApiError::bad_request(
-            "EEPROM inspect returned a non-inspect helper result",
-        ));
-    };
-    let key = target.node_id.clone();
-    let snapshot = EepromInspectSnapshot {
-        target: target.clone(),
-        image_sha256: inspect.state.image_sha256.clone(),
-        device: inspect.state.clone(),
-    };
-    let response = EepromInspectResponse {
-        preview,
-        snapshot: eeprom_snapshot_response(&key, &snapshot),
-        result,
-    };
-    state
-        .eeprom_inspects
-        .lock()
-        .map_err(|_| PreviewApiError::bad_request("EEPROM inspect snapshot state is unavailable"))?
-        .insert(key, snapshot);
-    Ok(Json(response))
-}
-
-async fn run_eeprom_provision(
-    State(state): State<AppState>,
-    request: std::result::Result<Json<EepromExecuteRequest>, JsonRejection>,
-) -> std::result::Result<Json<ControlExecutionResult>, PreviewApiError> {
-    let Json(request) = request.map_err(|error| {
-        PreviewApiError::bad_request(format!("invalid EEPROM execution request: {error}"))
-    })?;
-    let preview = build_eeprom_preview(request.preview)?;
-    if !request.confirm_execution {
-        return Err(PreviewApiError::bad_request(
-            "EEPROM provision requires confirmExecution=true",
-        ));
-    }
-    let Some(expected_before_sha256) = request.expected_before_sha256.as_deref() else {
-        return Err(PreviewApiError::bad_request(
-            "EEPROM provision requires expectedBeforeSha256 from the latest inspect",
-        ));
-    };
-    if !is_sha256(expected_before_sha256) {
-        return Err(PreviewApiError::bad_request(
-            "expectedBeforeSha256 must contain 64 lowercase hex characters",
-        ));
-    }
-    let target = eeprom_snapshot_target(&preview, &request.ssh)?;
-    let snapshot = state
-        .eeprom_inspects
-        .lock()
-        .map_err(|_| PreviewApiError::bad_request("EEPROM inspect snapshot state is unavailable"))?
-        .get(&preview.target.node_id)
-        .cloned()
-        .ok_or_else(|| {
-            PreviewApiError::bad_request(
-                "EEPROM provision requires a process-local inspect snapshot for this node",
-            )
-        })?;
-    if snapshot.target != target {
-        return Err(PreviewApiError::bad_request(
-            "EEPROM target changed after inspect; inspect the selected SSH/bus/map/address again",
-        ));
-    }
-    if snapshot.image_sha256 != expected_before_sha256 {
-        return Err(PreviewApiError::bad_request(
-            "expectedBeforeSha256 does not match the latest process-local inspect snapshot",
-        ));
-    }
-    let provision_request = eeprom_provision_request_from_preview(&preview, &snapshot)?;
-    let result = state.control_runtime.execute_eeprom(
-        &preview,
-        &request.ssh,
-        EepromHelperAction::Provision {
-            request: provision_request,
-            expected_before_sha256: expected_before_sha256.to_owned(),
-        },
-    )?;
-    state
-        .eeprom_inspects
-        .lock()
-        .map_err(|_| PreviewApiError::bad_request("EEPROM inspect snapshot state is unavailable"))?
-        .remove(&preview.target.node_id);
-    Ok(Json(ControlExecutionResult {
-        preview,
-        execution: "completed",
-        result: ControlExecutionPayload::Eeprom(result),
-    }))
-}
-
-#[cfg(feature = "calibration-opencv")]
-async fn run_calibration_solver(
-    State(state): State<AppState>,
-    Json(request): Json<CalibrationSolverRequest>,
-) -> std::result::Result<Json<CalibrationSolverResponse>, PreviewApiError> {
-    let request = into_calibration_request(request)?;
-    let cancellation = CalibrationCancellation::default();
-    let solution = state
-        .calibration_backend
-        .calibrate(&request, &cancellation)
-        .map_err(|error| PreviewApiError::bad_request(error.to_string()))?;
-    Ok(Json(CalibrationSolverResponse::from(solution)))
-}
 
 #[cfg(feature = "calibration-opencv")]
 fn into_calibration_request(
@@ -2109,33 +1839,26 @@ fn page_split_estimate(
     })
 }
 
-fn if_match_revision(
-    headers: &HeaderMap,
-    current_revision: &str,
-) -> std::result::Result<(), (StatusCode, String)> {
-    let Some(raw) = headers.get(header::IF_MATCH) else {
-        return Ok(());
-    };
-    let expected = raw
-        .to_str()
-        .map_err(|_| {
-            (
-                StatusCode::BAD_REQUEST,
-                "invalid If-Match header".to_owned(),
-            )
-        })?
-        .trim_matches('"');
-    if expected != current_revision {
-        return Err((
-            StatusCode::CONFLICT,
-            format!("workflow revision conflict: current `{current_revision}`, got `{expected}`"),
-        ));
-    }
-    Ok(())
+
+
+
+/// 编码一次 RGB 图像为 JPEG（engine_bridge viewer 帧推送复用）。
+fn encode_rgb_jpeg(rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
+    let mut jpeg = Vec::new();
+    JpegEncoder::new_with_quality(&mut jpeg, quality)
+        .encode(rgb, width, height, ColorType::Rgb8.into())
+        .map_err(|error| format!("JPEG encode failed: {error}"))?;
+    Ok(jpeg)
 }
 
-
-fn encode_rgba_as_jpeg(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
+/// 按目标最大宽度等比降采样后编码为 JPEG（宽高坍缩到 `max_width` 内）；返回 JPEG 与实际尺寸。
+///
+/// P2 的 viewer 帧推送用：1080p 全帧编码 200-500ms 不可接受，`viewer_encode_width=960` 降分辨率
+/// 后编码耗时显著下降且带宽可控。`max_width >= frame.width` 时不缩放，直接编码原尺寸。
+pub(crate) fn encode_rgba_scaled_jpeg(
+    frame: &DecodedVideoFrame,
+    max_width: u32,
+) -> Result<EncodedFrame, String> {
     let pixel_count = u64::from(frame.width)
         .checked_mul(u64::from(frame.height))
         .ok_or_else(|| "frame dimensions overflow".to_owned())?;
@@ -2147,17 +1870,60 @@ fn encode_rgba_as_jpeg(frame: &DecodedVideoFrame) -> Result<Vec<u8>, String> {
             frame.rgba.len()
         ));
     }
-    let rgb_len = usize::try_from(pixel_count.saturating_mul(3))
-        .map_err(|_| "RGB frame byte length overflows usize".to_owned())?;
-    let mut rgb = Vec::with_capacity(rgb_len);
-    for pixel in frame.rgba.chunks_exact(4) {
-        rgb.extend_from_slice(&pixel[..3]);
-    }
-    let mut jpeg = Vec::new();
-    JpegEncoder::new_with_quality(&mut jpeg, 82)
-        .encode(&rgb, frame.width, frame.height, ColorType::Rgb8.into())
-        .map_err(|error| format!("JPEG encode failed: {error}"))?;
-    Ok(jpeg)
+
+    // 目标尺寸：宽度不超过 max_width，等比缩放，不小于 1。
+    let (out_w, out_h) = if frame.width > max_width && max_width > 0 {
+        let ratio = f64::from(max_width) / f64::from(frame.width);
+        let h = (f64::from(frame.height) * ratio).round().max(1.0) as u32;
+        (max_width, h)
+    } else {
+        (frame.width, frame.height)
+    };
+
+    let rgb: Vec<u8> = if (out_w, out_h) == (frame.width, frame.height) {
+        let rgb_len = usize::try_from(pixel_count.saturating_mul(3))
+            .map_err(|_| "RGB byte length overflows usize".to_owned())?;
+        let mut rgb = Vec::with_capacity(rgb_len);
+        for pixel in frame.rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+        rgb
+    } else {
+        let img = image::ImageBuffer::<image::Rgba<u8>, &[u8]>::from_raw(
+            frame.width,
+            frame.height,
+            frame.rgba.as_ref(),
+        )
+        .ok_or_else(|| "RGBA frame buffer invalid".to_owned())?;
+        let resized = image::imageops::resize(
+            &img,
+            out_w,
+            out_h,
+            image::imageops::FilterType::Triangle,
+        );
+        let flat = resized.into_raw();
+        let rgb_len = usize::try_from(u64::from(out_w) * u64::from(out_h) * 3)
+            .map_err(|_| "RGB byte length overflows usize".to_owned())?;
+        let mut rgb = Vec::with_capacity(rgb_len);
+        for pixel in flat.chunks_exact(4) {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+        rgb
+    };
+
+    let jpeg = encode_rgb_jpeg(&rgb, out_w, out_h, 82)?;
+    Ok(EncodedFrame {
+        jpeg,
+        width: out_w,
+        height: out_h,
+    })
+}
+
+/// 一帧的编码产物：JPEG 字节 + 实际（可能已降采样）宽高，供 frame_meta 头回填尺寸。
+pub(crate) struct EncodedFrame {
+    pub(crate) jpeg: Vec<u8>,
+    pub(crate) width: u32,
+    pub(crate) height: u32,
 }
 
 impl WorkflowStore {
@@ -2252,7 +2018,7 @@ fn is_safe_workflow_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
-fn next_revision() -> String {
+pub(crate) fn next_revision() -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -2260,9 +2026,6 @@ fn next_revision() -> String {
     format!("rev-{nanos}")
 }
 
-fn bad_request(error: String) -> (StatusCode, String) {
-    (StatusCode::BAD_REQUEST, error)
-}
 
 fn internal_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
@@ -2330,6 +2093,17 @@ mod tests {
     }
 
     #[cfg(feature = "platform-ssh")]
+    fn eeprom_ssh_payload() -> serde_json::Value {
+        serde_json::json!({
+            "host": "camera.local",
+            "port": 22,
+            "username": "root",
+            "credentialRef": "key-file:/tmp/test-key",
+            "expectedHostKey": "host-key",
+        })
+    }
+
+    #[cfg(feature = "platform-ssh")]
     fn eeprom_device_state(hash: char) -> EepromDeviceState {
         EepromDeviceState {
             image_sha256: hash.to_string().repeat(64),
@@ -2369,6 +2143,7 @@ mod tests {
             calibration_backend: Arc::new(OpenCvCalibrationBackend),
             eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
             engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
+            ws_hub: Arc::new(ws_hub::WsHub::new()),
         }
     }
 
@@ -2428,7 +2203,7 @@ mod tests {
     fn workflow_store_roundtrips_normalized_graph() {
         let dir = std::env::temp_dir().join(format!("workflow-store-test-{}", next_revision()));
         let store = WorkflowStore { dir: dir.clone() };
-        let mut graph = seed_workflow_graph();
+        let mut graph = crate::workflow::seed_workflow_graph();
         graph.id = "roundtrip".to_owned();
         graph.revision = "rev-test".to_owned();
         store.save(&graph).expect("workflow saved");
@@ -2548,8 +2323,8 @@ mod tests {
     }
 
     #[cfg(feature = "platform-ssh")]
-    #[tokio::test]
-    async fn eeprom_inspect_then_provision_uses_same_snapshot_target() {
+    #[test]
+    fn eeprom_inspect_then_provision_uses_same_snapshot_target() {
         let memory = Arc::new(MemorySshTransport::new("host-key"));
         let state = eeprom_state(&memory);
         memory.set_command_output(eeprom_output(EepromHelperResult::Inspect(
@@ -2559,16 +2334,24 @@ mod tests {
             },
         )));
 
-        let inspect = inspect_eeprom_provision(
-            State(state.clone()),
-            Ok(Json(EepromInspectRequest {
-                preview: eeprom_preview_payload(),
-                ssh: eeprom_ssh_binding(),
-            })),
+        let inspect = control_dispatch(
+            "control.eeprom.inspect",
+            serde_json::json!({
+                "nodeId": "eeprom-node",
+                "profileId": "x5-lab",
+                "bus": "i2c-7",
+                "address": 0x50,
+                "register": 0x0010,
+                "payload": vec![0x42; YG_STEREO_P24C64G_INTRINSICS_BYTES],
+                "pageSize": 32,
+                "mapId": YG_STEREO_P24C64G_V1_MAP_ID,
+                "verifyAfterWrite": true,
+                "ssh": eeprom_ssh_payload(),
+            }),
+            &state,
         )
-        .await
         .expect("inspect succeeds");
-        assert_eq!(inspect.snapshot.image_sha256, "a".repeat(64));
+        assert_eq!(inspect["snapshot"]["imageSha256"], "a".repeat(64));
 
         memory.set_command_output(eeprom_output(EepromHelperResult::Provision(
             EepromWriteResult {
@@ -2580,23 +2363,27 @@ mod tests {
                 rollback: EepromRollbackState::NotRequired,
             },
         )));
-        let result = run_eeprom_provision(
-            State(state),
-            Ok(Json(EepromExecuteRequest {
-                preview: eeprom_preview_payload(),
-                confirm_execution: true,
-                expected_before_sha256: Some("a".repeat(64)),
-                ssh: eeprom_ssh_binding(),
-            })),
+        let result = control_dispatch(
+            "control.eeprom.run",
+            serde_json::json!({
+                "nodeId": "eeprom-node",
+                "profileId": "x5-lab",
+                "bus": "i2c-7",
+                "address": 0x50,
+                "register": 0x0010,
+                "payload": vec![0x42; YG_STEREO_P24C64G_INTRINSICS_BYTES],
+                "pageSize": 32,
+                "mapId": YG_STEREO_P24C64G_V1_MAP_ID,
+                "verifyAfterWrite": true,
+                "confirmExecution": true,
+                "expectedBeforeSha256": "a".repeat(64),
+                "ssh": eeprom_ssh_payload(),
+            }),
+            &state,
         )
-        .await
         .expect("provision succeeds");
 
-        assert_eq!(result.execution, "completed");
-        assert!(matches!(
-            result.result,
-            ControlExecutionPayload::Eeprom(EepromHelperResult::Provision(_))
-        ));
+        assert_eq!(result["execution"], "completed");
         let requests = memory.captured_stdin();
         assert_eq!(requests.len(), 2);
         let provision_request: EepromHelperRequest = serde_json::from_slice(&requests[1]).unwrap();
@@ -2617,7 +2404,7 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("workflow-store-delete-test-{}", next_revision()));
         let store = WorkflowStore { dir: dir.clone() };
-        let mut graph = seed_workflow_graph();
+        let mut graph = crate::workflow::seed_workflow_graph();
         graph.id = "delete-me".to_owned();
         graph.revision = "rev-test".to_owned();
         store.save(&graph).expect("workflow saved");

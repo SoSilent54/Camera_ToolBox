@@ -11,14 +11,15 @@ import {
   useNodesState,
   type Connection,
   type Edge,
+  type EdgeChange,
   type Node,
+  type NodeChange,
   type OnSelectionChangeParams,
   type ReactFlowInstance,
 } from '@xyflow/react';
 import {
   WORKFLOW_SCHEMA_VERSION,
   deleteWorkflow,
-  exportWorkflow,
   importWorkflow,
   labelForPortKind,
   listWorkflows,
@@ -33,6 +34,7 @@ import {
   type NodeDefinition,
   type NodeKind,
   type PortKind,
+  type WorkflowEdge,
   type WorkflowGraph,
   type WorkflowNode,
   type WorkflowPort,
@@ -54,6 +56,7 @@ import {
 } from './nodes';
 import { Console } from './Console';
 import { useEngine } from './useEngine';
+import { subscribeSnapshot, subscribeTopic } from './useEngineSocket';
 
 type FlowNode = Node<FlowNodeData>;
 type FlowEdge = Edge<FlowEdgeData>;
@@ -96,8 +99,8 @@ export function App() {
   const [catalog, setCatalog] = useState<NodeDefinition[]>([]);
   const [templates, setTemplates] = useState<WorkmodeTemplate[]>([]);
   const [savedWorkflows, setSavedWorkflows] = useState<Array<{ id: string; title: string; revision: string }>>([]);
-  const [nodes, setNodes, onNodesChange] = useNodesState<FlowNode>([]);
-  const [edges, setEdges, onEdgesChange] = useEdgesState<FlowEdge>([]);
+  const [nodes, setNodes, onNodesChangeBase] = useNodesState<FlowNode>([]);
+  const [edges, setEdges, onEdgesChangeBase] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待 Workflow API...']);
   const { nodeStates, loadGraph, startAll, sendAction } = useEngine();
@@ -113,9 +116,29 @@ export function App() {
   const nodesRef = useRef<FlowNode[]>(nodes);
   const edgesRef = useRef<FlowEdge[]>(edges);
 
+  const [runtimeGraph, setRuntimeGraph] = useState<{ id: string; revision: string } | null>(null);
+  const [draftDirtyFromRuntime, setDraftDirtyFromRuntime] = useState(false);
+
+  /** 编辑图与运行图分离：普通画布编辑只标记 draft dirty，不隐式改运行中的 GraphEngine。 */
+  const markDraftChanged = useCallback(() => {
+    setDraftDirtyFromRuntime((current) => current || runtimeGraph !== null);
+  }, [runtimeGraph]);
   const pushEvent = useCallback((event: string) => {
     setEvents((current) => [event, ...current].slice(0, 10));
   }, []);
+
+
+  // 订阅引擎真实事件（event topic 推送），叠加到 Console；本地 pushEvent 保留作回退。
+  useEffect(() => {
+    return subscribeTopic('event', (payload) => {
+      const event = payload as { nodeId?: string; message?: string } | null;
+      if (!event || typeof event.message !== 'string') {
+        return;
+      }
+      const prefix = typeof event.nodeId === 'string' && event.nodeId ? `[${event.nodeId}] ` : '';
+      pushEvent(`${prefix}${event.message}`);
+    });
+  }, [pushEvent]);
   // 撤销/恢复：nodes/edges 快照同步 + 历史栈
   useEffect(() => {
     nodesRef.current = nodes;
@@ -126,6 +149,7 @@ export function App() {
   }, [edges]);
 
   const recordSnapshot = useCallback(() => {
+    markDraftChanged();
     // 深拷贝快照：React Flow 拖拽时 onNodesChange 会原位 mutate node 对象（position 字段），
     // 若直接存 nodesRef.current 引用，撤销栈会与后续 state 串味。这里至少复制 position 与
     // workflowNode；workflowNode.config 也可能被后续 setNodes 原地替换的浅层引用共享，
@@ -149,7 +173,7 @@ export function App() {
     }
     futureRef.current = [];
     setHistoryVersion((version) => version + 1);
-  }, []);
+  }, [markDraftChanged]);
 
   const undo = useCallback(() => {
     const snapshot = pastRef.current.pop();
@@ -157,6 +181,7 @@ export function App() {
       return;
     }
     futureRef.current.push({ nodes: nodesRef.current, edges: edgesRef.current });
+    markDraftChanged();
     setNodes(snapshot.nodes);
     setEdges(snapshot.edges);
     setSelection({ type: 'none' });
@@ -170,6 +195,7 @@ export function App() {
       return;
     }
     pastRef.current.push({ nodes: nodesRef.current, edges: edgesRef.current });
+    markDraftChanged();
     setNodes(snapshot.nodes);
     setEdges(snapshot.edges);
     setSelection({ type: 'none' });
@@ -189,17 +215,51 @@ export function App() {
     });
   }, []);
 
+  const onNodesChange = useCallback((changes: NodeChange<FlowNode>[]) => {
+    if (changes.length > 0) {
+      markDraftChanged();
+    }
+    onNodesChangeBase(changes);
+  }, [markDraftChanged, onNodesChangeBase]);
+
+  const onEdgesChange = useCallback((changes: EdgeChange<FlowEdge>[]) => {
+    if (changes.length > 0) {
+      markDraftChanged();
+    }
+    onEdgesChangeBase(changes);
+  }, [markDraftChanged, onEdgesChangeBase]);
+
   const applyGraph = useCallback(
     (nextGraph: WorkflowGraph, event: string) => {
       setGraph(nextGraph);
       setNodes(toFlowNodes(nextGraph));
       setEdges(toFlowEdges(nextGraph));
       setSelection({ type: 'none' });
-      setEvents([event, `节点 ${nextGraph.nodes.length} 个，连接 ${nextGraph.edges.length} 条`]);
-      loadGraph(nextGraph);
+      setDraftDirtyFromRuntime(runtimeGraph !== null);
+      setEvents([event, `节点 ${nextGraph.nodes.length} 个，连接 ${nextGraph.edges.length} 条`, '仅更新编辑图；点击 Run 才会应用到运行图']);
     },
-    [loadGraph, setEdges, setNodes],
+    [runtimeGraph, setEdges, setNodes],
   );
+
+  // WS 重连后后端重推 snapshot。若本地草稿已偏离运行图，保留编辑图，避免旧运行图覆盖未应用修改。
+  useEffect(() => {
+    return subscribeSnapshot((snapshot) => {
+      const nextGraph = snapshot.payload.graph as WorkflowGraph | undefined;
+      if (!nextGraph || !Array.isArray(nextGraph.nodes) || !Array.isArray(nextGraph.edges)) {
+        return;
+      }
+      setRuntimeGraph({ id: nextGraph.id, revision: nextGraph.revision });
+      if (draftDirtyFromRuntime) {
+        pushEvent('收到运行图快照；当前编辑图未应用，已保留本地草稿');
+        return;
+      }
+      setGraph(nextGraph);
+      setNodes(toFlowNodes(nextGraph));
+      setEdges(toFlowEdges(nextGraph));
+      setSelection({ type: 'none' });
+      pushEvent('已从运行图快照对齐编辑图');
+    });
+  }, [draftDirtyFromRuntime, pushEvent, setEdges, setNodes]);
 
   const refreshSavedWorkflows = useCallback(() => {
     listWorkflows()
@@ -264,9 +324,18 @@ export function App() {
       if (reason) {
         return { ok: false, reason };
       }
+      // D7 cardinality 预检：One 输入端口只允许一条入边；Many 输入允许多入边；输出不限。
+      if (targetPort.cardinality === 'one') {
+        const alreadyConnected = edges.some(
+          (edge) => edge.target === connection.target && edge.targetHandle === connection.targetHandle,
+        );
+        if (alreadyConnected) {
+          return { ok: false, reason: `输入端口 ${targetPort.label} 只允许一条连接（cardinality=One）` };
+        }
+      }
       return { ok: true, port: sourcePort };
     },
-    [nodeById],
+    [edges, nodeById],
   );
 
   const onConnect = useCallback(
@@ -278,6 +347,14 @@ export function App() {
       }
       recordSnapshot();
       const edgeId = `edge-${connection.source}-${connection.sourceHandle}-${connection.target}-${connection.targetHandle}`;
+      const workflowEdge: WorkflowEdge = {
+        id: edgeId,
+        source: { nodeId: String(connection.source), portId: String(connection.sourceHandle) },
+        target: { nodeId: String(connection.target), portId: String(connection.targetHandle) },
+        kind: validation.port.kind,
+        schema: validation.port.schema,
+        schemaVersion: WORKFLOW_SCHEMA_VERSION,
+      };
       setEdges((current) => {
         const nextEdges = addEdge(
           {
@@ -285,7 +362,7 @@ export function App() {
             id: edgeId,
             animated: false,
             label: labelForPortKind(validation.port.kind),
-            data: { kind: validation.port.kind, schema: validation.port.schema, schemaVersion: WORKFLOW_SCHEMA_VERSION },
+            data: { workflowEdge, kind: validation.port.kind, schema: validation.port.schema, schemaVersion: WORKFLOW_SCHEMA_VERSION },
             className: 'workflow-edge flow-inactive',
           },
           current.filter((edge) => edge.id !== edgeId),
@@ -293,7 +370,7 @@ export function App() {
         setNodes((currentNodes) => withViewerPreviews(currentNodes, nextEdges));
         return nextEdges;
       });
-      pushEvent(`新增连接：${edgeId}`);
+      pushEvent(`新增连接：${edgeId}（编辑图未应用）`);
     },
     [canConnect, pushEvent, recordSnapshot, setEdges, setNodes],
   );
@@ -328,7 +405,7 @@ export function App() {
       setSelection((current) => current.type === 'node' && current.node.id === nodeId
         ? { type: 'node', node: { ...current.node, config: { ...current.node.config, url: trimmedUrl } } }
         : current);
-      pushEvent(`RTSP URL 已更新：${trimmedUrl}`);
+      pushEvent(`RTSP URL 已更新：${trimmedUrl}（编辑图未应用）`);
     },
     [edges, pushEvent, recordSnapshot, setNodes],
   );
@@ -347,7 +424,7 @@ export function App() {
       setSelection((current) => current.type === 'node' && current.node.id === nodeId
         ? { type: 'node', node: { ...current.node, title } }
         : current);
-      pushEvent(`节点已重命名：${title}`);
+      pushEvent(`节点已重命名：${title}（编辑图未应用）`);
     },
     [pushEvent, recordSnapshot, setNodes],
   );
@@ -373,8 +450,9 @@ export function App() {
       setSelection((current) => current.type === 'node' && current.node.id === nodeId
         ? { type: 'node', node: { ...current.node, config: { ...current.node.config, [key]: value } } }
         : current);
+      pushEvent(`节点配置已更新：${key}（编辑图未应用）`);
     },
-    [edges, recordSnapshot, setNodes],
+    [edges, pushEvent, recordSnapshot, setNodes],
   );
 
   useEffect(() => {
@@ -415,7 +493,7 @@ export function App() {
       recordSnapshot();
       setNodes((current) => withViewerPreviews([...current, flowNode], edges));
       setSelection({ type: 'node', node: flowNode.data.workflowNode });
-      pushEvent(`${source === 'drag' ? '拖入' : '新增'}节点：${flowNode.data.workflowNode.title}`);
+      pushEvent(`${source === 'drag' ? '拖入' : '新增'}节点：${flowNode.data.workflowNode.title}（编辑图未应用）`);
     },
     [edges, pushEvent, recordSnapshot, setNodes],
   );
@@ -470,11 +548,12 @@ export function App() {
     }
     recordSnapshot();
     if (selection.type === 'edge') {
-      const nextEdges = edges.filter((edge) => edge.id !== selection.edge.id);
+      const edgeId = selection.edge.id;
+      const nextEdges = edges.filter((edge) => edge.id !== edgeId);
       setEdges(nextEdges);
       setNodes((current) => withViewerPreviews(current, nextEdges));
       setSelection({ type: 'none' });
-      pushEvent(`删除连线：${selection.edge.id}`);
+      pushEvent(`删除连线：${edgeId}（编辑图未应用）`);
       return;
     }
     const nodeId = selection.node.id;
@@ -482,7 +561,7 @@ export function App() {
     setEdges(nextEdges);
     setNodes((current) => withViewerPreviews(current.filter((node) => node.id !== nodeId), nextEdges));
     setSelection({ type: 'none' });
-    pushEvent(`删除节点：${selection.node.title}`);
+    pushEvent(`删除节点：${selection.node.title}（编辑图未应用）`);
   }, [edges, pushEvent, recordSnapshot, selection, setEdges, setNodes]);
 
   const handleDuplicateSelection = useCallback(() => {
@@ -505,7 +584,7 @@ export function App() {
     };
     setNodes((current) => withViewerPreviews([...current, toFlowNode(duplicated)], edges));
     setSelection({ type: 'node', node: duplicated });
-    pushEvent(`复制节点：${duplicated.title}`);
+    pushEvent(`复制节点：${duplicated.title}（编辑图未应用）`);
   }, [edges, nodes, pushEvent, recordSnapshot, selection, setNodes]);
 
   const handleSaveWorkflow = useCallback(() => {
@@ -518,6 +597,19 @@ export function App() {
       })
       .catch((error: unknown) => pushEvent(`保存失败：${error instanceof Error ? error.message : String(error)}`));
   }, [edges, graph, nodes, pushEvent, refreshSavedWorkflows]);
+
+  const handleRunGraph = useCallback(() => {
+    const draft = toWorkflowGraph(nodes, edges, graph ?? emptyWorkflowGraph());
+    loadGraph(draft)
+      .then(() => startAll())
+      .then(() => {
+        setGraph(draft);
+        setRuntimeGraph({ id: draft.id, revision: draft.revision });
+        setDraftDirtyFromRuntime(false);
+        pushEvent(`运行图已应用并启动：${draft.title}`);
+      })
+      .catch((error: unknown) => pushEvent(`运行失败：${error instanceof Error ? error.message : String(error)}`));
+  }, [edges, graph, loadGraph, nodes, pushEvent, startAll]);
 
   const handleImportWorkflow = useCallback(() => {
     const raw = window.prompt('粘贴 .ctworkflow.json 内容');
@@ -540,30 +632,15 @@ export function App() {
   }, [applyGraph, pushEvent, refreshSavedWorkflows]);
 
   const handleExportWorkflow = useCallback(() => {
-    const fallbackGraph = graph ? toWorkflowGraph(nodes, edges, graph) : emptyWorkflowGraph();
-    const download = (workflow: WorkflowGraph) => {
-      const blob = new Blob([`${JSON.stringify(workflow, null, 2)}\n`], { type: 'application/json;charset=utf-8' });
-      const url = URL.createObjectURL(blob);
-      const anchor = document.createElement('a');
-      anchor.href = url;
-      anchor.download = `${workflow.id}.ctworkflow.json`;
-      anchor.click();
-      URL.revokeObjectURL(url);
-    };
-    if (!graph) {
-      download(fallbackGraph);
-      pushEvent('已下载本地草稿工作流');
-      return;
-    }
-    exportWorkflow(graph.id)
-      .then((exported) => {
-        download(exported);
-        pushEvent(`已导出工作流：${exported.id}`);
-      })
-      .catch((error: unknown) => {
-        download(fallbackGraph);
-        pushEvent(`导出失败，已下载本地草稿：${error instanceof Error ? error.message : String(error)}`);
-      });
+    const draft = graph ? toWorkflowGraph(nodes, edges, graph) : emptyWorkflowGraph();
+    const blob = new Blob([`${JSON.stringify(draft, null, 2)}\n`], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `${draft.id}.ctworkflow.json`;
+    anchor.click();
+    URL.revokeObjectURL(url);
+    pushEvent(`已导出当前编辑图：${draft.id}`);
   }, [edges, graph, nodes, pushEvent]);
 
   const handleLoadSavedWorkflow = useCallback(() => {
@@ -612,11 +689,12 @@ export function App() {
         }
       } else if (action === 'delete') {
         recordSnapshot();
+        const removedEdges = edgesRef.current.filter((edge) => edge.source === nodeId || edge.target === nodeId);
         const nextEdges = edgesRef.current.filter((edge) => edge.source !== nodeId && edge.target !== nodeId);
         setEdges(nextEdges);
         setNodes((currentNodes) => withViewerPreviews(currentNodes.filter((candidate) => candidate.id !== nodeId), nextEdges));
         setSelection({ type: 'none' });
-        pushEvent(`删除节点：${workflowNode.title}`);
+        pushEvent(`删除节点：${workflowNode.title}（编辑图未应用）`);
       } else if (action === 'duplicate') {
         recordSnapshot();
         const duplicated = {
@@ -628,7 +706,7 @@ export function App() {
         };
         setNodes((currentNodes) => withViewerPreviews([...currentNodes, toFlowNode(duplicated)], edgesRef.current));
         setSelection({ type: 'node', node: duplicated });
-        pushEvent(`复制节点：${duplicated.title}`);
+        pushEvent(`复制节点：${duplicated.title}（编辑图未应用）`);
       }
       return null;
     });
@@ -753,6 +831,12 @@ export function App() {
     setSelection({ type: 'none' });
   }, [edges, nodes]);
 
+  const runtimeLabel = runtimeGraph
+    ? draftDirtyFromRuntime
+      ? `Draft changed · runtime ${runtimeGraph.revision}`
+      : `Runtime ${runtimeGraph.revision}`
+    : 'Draft only';
+
   return (
     <div className="studio-shell">
       <header className="top-bar">
@@ -781,10 +865,10 @@ export function App() {
             <button onClick={handleFitView}>Fit</button>
           </div>
           <div className="menu-group">
-            <button type="button" onClick={startAll}>Run</button>
+            <button type="button" onClick={handleRunGraph}>Run</button>
           </div>
         </nav>
-        <div className="service-pill">{nodes.length}N / {edges.length}E</div>
+        <div className="service-pill">{nodes.length}N / {edges.length}E · {runtimeLabel}</div>
       </header>
 
       <aside className="left-rail">

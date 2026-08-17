@@ -2,8 +2,8 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use axum::{Json, extract::Query, http::StatusCode};
-use serde::{Deserialize, Serialize};
+use axum::http::StatusCode;
+use serde::Serialize;
 
 /// 目录条目。
 #[derive(Debug, Serialize)]
@@ -23,34 +23,25 @@ pub struct FileListResponse {
     pub entries: Vec<DirectoryEntry>,
 }
 
-/// 目录列表查询参数。
-#[derive(Debug, Deserialize)]
-pub struct FileListQuery {
-    /// 工作区根目录（绝对路径）。
-    pub root: String,
-    /// 相对根目录的子路径；空表示根目录。
-    #[serde(default)]
-    pub path: String,
-}
 
-/// 列出本地目录。
-pub async fn list_local_files(
-    Query(query): Query<FileListQuery>,
-) -> Result<Json<FileListResponse>, (StatusCode, String)> {
-    let root = resolve_root(&query.root)?;
-    let relative = resolve_relative(&query.path)?;
+/// 列目录核心逻辑（ws_router 的 `file.local.list` 复用；错误归一为字符串）。
+pub(crate) fn list_local_files_inner(
+    root: &str,
+    path: &str,
+) -> std::result::Result<FileListResponse, String> {
+    let root = resolve_root(root).map_err(|(_, msg)| msg)?;
+    let relative = resolve_relative(path).map_err(|(_, msg)| msg)?;
     let dir = root.join(relative);
     let dir = std::fs::canonicalize(&dir)
-        .map_err(|error| (StatusCode::NOT_FOUND, format!("directory not found: {error}")))?;
+        .map_err(|error| format!("directory not found: {error}"))?;
     if !dir.starts_with(&root) {
-        return Err((StatusCode::BAD_REQUEST, "path escapes workspace root".to_owned()));
+        return Err("path escapes workspace root".to_owned());
     }
 
     let mut entries = Vec::new();
-    let read = std::fs::read_dir(&dir)
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+    let read = std::fs::read_dir(&dir).map_err(|error| error.to_string())?;
     for entry in read {
-        let entry = entry.map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
+        let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().into_owned();
         let metadata = entry.metadata().ok();
@@ -78,10 +69,10 @@ pub async fn list_local_files(
             .then_with(|| left.name.cmp(&right.name))
     });
 
-    Ok(Json(FileListResponse {
-        path: query.path.trim_start_matches('/').to_owned(),
+    Ok(FileListResponse {
+        path: path.trim_start_matches('/').to_owned(),
         entries,
-    }))
+    })
 }
 
 fn resolve_root(root: &str) -> Result<PathBuf, (StatusCode, String)> {

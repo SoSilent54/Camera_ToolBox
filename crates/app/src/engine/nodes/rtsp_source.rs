@@ -8,7 +8,6 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
     time::Duration,
 };
 
@@ -176,17 +175,23 @@ fn pump_frames(
     cancel: Arc<AtomicBool>,
     output_port: String,
 ) {
-    let mut last_sequence: Option<u64> = None;
+    // 事件驱动：阻塞等待新帧的 condvar 通知，仅以短超时周期复查取消标志，
+    // 消除原先 5ms sleep 空转及其带来的突发丢帧（见 plan D4/P4）。
     while !cancel.load(Ordering::Acquire) {
-        if let Some(frame) = latest.latest()
-            && last_sequence != Some(frame.identity.frame_sequence)
-        {
-            last_sequence = Some(frame.identity.frame_sequence);
-            let _ = ctx.outputs.emit(&output_port, DataPacket::VideoFrame(frame));
+        match latest.wait_latest_timeout(PUMP_CANCEL_POLL) {
+            Some(frame) => {
+                let _ = ctx.outputs.emit(&output_port, DataPacket::VideoFrame(frame));
+            }
+            None => {
+                // 超时且无新帧：循环回到顶部检查 cancel，避免 join 永不返回。
+                continue;
+            }
         }
-        thread::sleep(Duration::from_millis(5));
     }
 }
+
+/// 事件驱动 wait 的取消复查周期；仅用于无帧时的觉醒，非轮询节拍。
+const PUMP_CANCEL_POLL: Duration = Duration::from_millis(100);
 fn config_string(spec: &NodeSpec, key: &str, fallback: &str) -> String {
     spec.config
         .get(key)

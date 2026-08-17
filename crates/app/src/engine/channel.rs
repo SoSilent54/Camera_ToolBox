@@ -3,7 +3,7 @@
 //! 每个节点 actor 只有一个 mailbox；上游输出与控制命令都投递到这里。
 //! 帧流在 mailbox 满时丢弃「新到」的帧（`try_send` 失败即丢新），控制命令用阻塞发送保证不丢。
 
-use std::sync::mpsc;
+use std::sync::{atomic::{AtomicU64, Ordering}, mpsc};
 
 use super::{node::NodeAction, packet::DataPacket, spec::PortId};
 
@@ -23,10 +23,23 @@ pub enum NodeMessage {
 pub struct ChannelFull;
 
 /// mailbox 发送端（可克隆，支持 fan-out）。
+///
+/// `id` 是进程内唯一通道标识，在 `create_mailbox` 时分配；克隆共享同一 `id`。
+/// `PartialEq`/`Eq` 按 `id` 比较：同一下游 mailbox 的克隆彼此相等，用于
+/// `OutputRegistry::disconnect` 按身份摘除，而非按值比较消息内容。
 #[derive(Clone)]
 pub struct MailboxSender {
     tx: mpsc::SyncSender<NodeMessage>,
+    id: u64,
 }
+
+impl PartialEq for MailboxSender {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for MailboxSender {}
 
 /// mailbox 接收端。
 pub struct MailboxReceiver {
@@ -60,9 +73,11 @@ impl MailboxReceiver {
 /// 创建 mailbox。`capacity` 为队列容量；帧流用较小值（如 4）配合消费端 drain 丢旧保新。
 #[must_use]
 pub fn create_mailbox(capacity: usize) -> (MailboxSender, MailboxReceiver) {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     let capacity = capacity.clamp(1, 256);
     let (tx, rx) = mpsc::sync_channel(capacity);
-    (MailboxSender { tx }, MailboxReceiver { rx })
+    let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+    (MailboxSender { tx, id }, MailboxReceiver { rx })
 }
 
 #[cfg(test)]

@@ -1,23 +1,15 @@
-//! 数据流引擎 HTTP 接入：把工作流图装载进引擎、驱动节点动作、暴露状态与 viewer 帧。
+//! 数据流引擎 WebSocket 接入辅助：运行时槽、图投影、节点动作解析与输出 JSON 投影。
 
 use std::sync::{Arc, Mutex};
 
-use axum::{
-    Json,
-    extract::{Path, State},
-    http::{StatusCode, header},
-    response::{IntoResponse, Response},
-};
-use serde::Deserialize;
-use serde_json::json;
-
 use camera_toolbox_app::engine::{
-    DataPacket, EdgeSpec, EngineServices, GraphBuildError, GraphEngine, GraphSpec, NodeAction,
-    NodeRegistry, NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
+    DataPacket, EdgeSpec, EngineServices, GraphEngine, GraphSpec, NodeAction, NodeRegistry,
+    NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
 };
 use camera_toolbox_app::platform::{RtspStreamConfig, StreamService};
 use camera_toolbox_adapters::media::FfmpegRtspStreamService;
 use camera_toolbox_adapters::{ImageRasterCodec, LocalRawLoader};
+use serde_json::json;
 
 use crate::{
     AppState,
@@ -43,7 +35,8 @@ impl EngineRuntime {
         }
     }
 
-    fn engine(&self) -> std::sync::MutexGuard<'_, Option<GraphEngine>> {
+    /// 访问当前已装载的引擎槽（`None` 表示引擎未运行）。ws_router 增量图命令复用。
+    pub(crate) fn engine(&self) -> std::sync::MutexGuard<'_, Option<GraphEngine>> {
         self.engine
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -63,7 +56,7 @@ impl StreamServiceFactory for FfmpegStreamServiceFactory {
 }
 
 /// 装配引擎服务：流工厂 + 可选标定后端 + RAW 加载器 + raster 编解码。
-fn build_services(state: &AppState) -> EngineServices {
+pub(crate) fn build_services(state: &AppState) -> EngineServices {
     EngineServices {
         stream_factory: Some(Arc::new(FfmpegStreamServiceFactory)),
         #[cfg(feature = "calibration-opencv")]
@@ -98,121 +91,9 @@ fn build_services(state: &AppState) -> EngineServices {
     }
 }
 
-/// 装载工作流图进引擎（替换旧图）。
-pub async fn run_engine(
-    State(state): State<AppState>,
-    Json(graph): Json<WorkflowGraph>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let spec = to_engine_spec(&graph);
-    let services = build_services(&state);
-    let engine = GraphEngine::build(spec, &state.engine_runtime.registry, services)
-        .map_err(|error: GraphBuildError| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    let mut slot = state.engine_runtime.engine();
-    if let Some(mut previous) = slot.take() {
-        previous.stop();
-    }
-    *slot = Some(engine);
-    Ok(Json(json!({ "running": true, "nodes": graph.nodes.len() })))
-}
-
-/// 停止并卸载当前引擎图。
-pub async fn stop_engine(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let mut slot = state.engine_runtime.engine();
-    if let Some(mut engine) = slot.take() {
-        engine.stop();
-    }
-    Json(json!({ "running": false }))
-}
-
-/// 图级 run/start：向所有可启动节点派发启动动作（尽力启动）。
-pub async fn start_engine(
-    State(state): State<AppState>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let engine = state.engine_runtime.engine();
-    let engine = engine
-        .as_ref()
-        .ok_or_else(|| (StatusCode::CONFLICT, "engine not running".to_owned()))?;
-    engine
-        .start_all()
-        .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()))?;
-    Ok(Json(json!({ "started": true })))
-}
-
-/// 节点动作请求体。
-#[derive(Debug, Deserialize)]
-pub struct ActionRequest {
-    pub action: String,
-}
-
-/// 向节点投递动作（connect/disconnect/trigger/arm/disarm）。
-pub async fn node_action(
-    State(state): State<AppState>,
-    Path(node_id): Path<String>,
-    Json(request): Json<ActionRequest>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let action = parse_action(&request.action)?;
-    let engine = state.engine_runtime.engine();
-    let engine = engine
-        .as_ref()
-        .ok_or_else(|| (StatusCode::CONFLICT, "engine not running".to_owned()))?;
-    engine
-        .send_action(&node_id, action)
-        .map_err(|error| (StatusCode::BAD_REQUEST, error.to_string()))?;
-    Ok(Json(json!({ "ok": true })))
-}
-
-/// 非阻塞取回节点状态更新。
-pub async fn engine_status(State(state): State<AppState>) -> Json<Vec<camera_toolbox_app::engine::NodeStatusReport>> {
-    let engine = state.engine_runtime.engine();
-    let statuses = engine
-        .as_ref()
-        .map(GraphEngine::drain_status)
-        .unwrap_or_default();
-    Json(statuses)
-}
-
-/// 取回 viewer 节点的最新帧并编码为 JPEG。
-pub async fn viewer_frame(
-    State(state): State<AppState>,
-    Path(node_id): Path<String>,
-) -> Response {
-    let frame = {
-        let engine = state.engine_runtime.engine();
-        engine.as_ref().and_then(|engine| engine.viewer_frame(&node_id))
-    };
-    let Some(frame) = frame else {
-        return (StatusCode::NOT_FOUND, "no frame available").into_response();
-    };
-    match encode_jpeg(&frame) {
-        Ok(jpeg) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "image/jpeg")],
-            jpeg,
-        )
-            .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error).into_response(),
-    }
-}
-
-/// 取回指定节点的最近输出负载（中间结果查看）。
-pub async fn node_output(
-    State(state): State<AppState>,
-    Path(node_id): Path<String>,
-) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let packet = {
-        let engine = state.engine_runtime.engine();
-        engine
-            .as_ref()
-            .and_then(|engine| engine.latest_output(&node_id))
-    };
-    let Some(packet) = packet else {
-        return Err((StatusCode::NOT_FOUND, "no output available".to_owned()));
-    };
-    Ok(Json(packet_to_json(&packet)))
-}
 
 /// 把 `DataPacket` 折叠成可序列化的 JSON：帧类只给元数据，其余（Detection/Solution/弱类型）直接序列化。
-fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
+pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
     match packet {
         DataPacket::VideoFrame(frame) => json!({
             "type": "video-frame",
@@ -241,32 +122,26 @@ fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
     }
 }
 
-fn parse_action(action: &str) -> Result<NodeAction, (StatusCode, String)> {
+pub(crate) fn parse_action_str(action: &str) -> Result<NodeAction, String> {
     match action {
         "connect" => Ok(NodeAction::Connect),
         "disconnect" => Ok(NodeAction::Disconnect),
         "trigger" => Ok(NodeAction::Trigger),
         "arm" => Ok(NodeAction::Arm),
         "disarm" => Ok(NodeAction::Disarm),
-        other => Err((
-            StatusCode::BAD_REQUEST,
-            format!("unknown action `{other}`"),
-        )),
+        other => Err(format!("unknown action `{other}`")),
     }
 }
 
-fn encode_jpeg(frame: &camera_toolbox_app::DecodedVideoFrame) -> Result<Vec<u8>, String> {
-    crate::encode_rgba_as_jpeg(frame)
-}
 
 /// 把持久化工作流图投影为引擎图规格。
-fn to_engine_spec(graph: &WorkflowGraph) -> GraphSpec {
+pub(crate) fn to_engine_spec(graph: &WorkflowGraph) -> GraphSpec {
     let nodes = graph.nodes.iter().map(to_node_spec).collect();
     let edges = graph.edges.iter().map(to_edge_spec).collect();
     GraphSpec { nodes, edges }
 }
 
-fn to_node_spec(node: &WorkflowNode) -> NodeSpec {
+pub(crate) fn to_node_spec(node: &WorkflowNode) -> NodeSpec {
     NodeSpec {
         id: node.id.clone(),
         kind: node_kind_str(node.kind),
@@ -294,7 +169,7 @@ fn to_cardinality(cardinality: crate::workflow::PortCardinality) -> PortCardinal
     }
 }
 
-fn to_edge_spec(edge: &WorkflowEdge) -> EdgeSpec {
+pub(crate) fn to_edge_spec(edge: &WorkflowEdge) -> EdgeSpec {
     EdgeSpec {
         id: edge.id.clone(),
         source: PortEndpoint {
