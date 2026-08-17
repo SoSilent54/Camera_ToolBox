@@ -56,7 +56,6 @@ impl StreamService for FfmpegRtspStreamService {
         let worker_prefer_hardware_acceleration = request.prefer_hardware_acceleration;
         let worker_control = control.clone();
         let worker_session = session_id.clone();
-        let monitor_latest = Arc::clone(&worker_latest);
         std::thread::Builder::new()
             .name(format!("rtsp-{}", session_id.as_str()))
             .spawn(move || {
@@ -83,7 +82,7 @@ impl StreamService for FfmpegRtspStreamService {
                     &worker_control.cancellation,
                 );
                 let terminal = match decoder {
-                    Ok(decoder) => monitor_rtsp_decoder(decoder, monitor_latest, &worker_control),
+                    Ok(decoder) => monitor_rtsp_decoder(decoder, &worker_control),
                     Err(error) => StreamTerminal::Failed(decoder_error(error)),
                 };
                 worker_control.finish(terminal);
@@ -95,11 +94,10 @@ impl StreamService for FfmpegRtspStreamService {
 
 fn monitor_rtsp_decoder(
     mut decoder: FfmpegRtspDecoder,
-    latest: Arc<LatestDecodedFrameSlot>,
     control: &StreamOperationControl,
 ) -> StreamTerminal {
     let started = Instant::now();
-    let mut observed_sequence = None;
+    let mut observed_decoded_frames = 0_u64;
     let mut last_frame = started;
     control.report(StreamServiceEvent::Metrics(StreamMetrics {
         decoder_backend: Some(decoder.backend().label().to_owned()),
@@ -113,11 +111,11 @@ fn monitor_rtsp_decoder(
             return StreamTerminal::Cancelled;
         }
         let now = Instant::now();
-        if let Some(frame) = latest.latest()
-            && observed_sequence != Some(frame.identity.frame_sequence)
-        {
-            let first_frame = observed_sequence.is_none();
-            observed_sequence = Some(frame.identity.frame_sequence);
+        let stats = decoder.stats().snapshot();
+        let decoded_frames = stats.decoded_frames;
+        if decoded_frames > observed_decoded_frames {
+            let first_frame = observed_decoded_frames == 0;
+            observed_decoded_frames = decoded_frames;
             last_frame = now;
             if first_frame {
                 control.report(camera_toolbox_app::StreamServiceEvent::Stage(
@@ -125,8 +123,6 @@ fn monitor_rtsp_decoder(
                 ));
             }
         }
-        let stats = decoder.stats().snapshot();
-        let decoded_frames = stats.decoded_frames;
         if now.saturating_duration_since(last_metric_at) >= Duration::from_millis(500) {
             let elapsed_ns =
                 u64::try_from(now.saturating_duration_since(last_metric_at).as_nanos())
@@ -179,14 +175,14 @@ fn monitor_rtsp_decoder(
             last_metric = stats;
         }
         if let Some(completion) = decoder.completion() {
-            let stage = if observed_sequence.is_some() {
+            let stage = if observed_decoded_frames > 0 {
                 StreamStage::Playing
             } else {
                 StreamStage::Connecting
             };
             decoder.shutdown();
             return match completion {
-                Ok(()) if observed_sequence.is_some() => StreamTerminal::BoundaryClosed,
+                Ok(()) if observed_decoded_frames > 0 => StreamTerminal::BoundaryClosed,
                 Ok(()) => StreamTerminal::Failed(StreamServiceError::Transport {
                     stage,
                     reason: "FFmpeg decoder stopped before publishing a frame".to_owned(),
@@ -196,7 +192,7 @@ fn monitor_rtsp_decoder(
                 }
             };
         }
-        if observed_sequence.is_none()
+        if observed_decoded_frames == 0
             && now.saturating_duration_since(started) >= control.timeouts.connect
         {
             decoder.shutdown();
@@ -204,7 +200,7 @@ fn monitor_rtsp_decoder(
                 timeout_ms: duration_millis(control.timeouts.connect),
             });
         }
-        if observed_sequence.is_some()
+        if observed_decoded_frames > 0
             && now.saturating_duration_since(last_frame) >= control.timeouts.idle
         {
             decoder.shutdown();
