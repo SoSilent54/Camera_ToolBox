@@ -86,6 +86,12 @@ export interface WorkflowNode {
   config: Record<string, unknown>;
 }
 
+/** 节点的交互式增量更新；`config` 只携带待合并的键，绝不替换完整配置对象。 */
+export interface WorkflowNodePatch {
+  title?: string;
+  config?: Record<string, unknown>;
+}
+
 export interface NodePosition {
   x: number;
   y: number;
@@ -356,8 +362,13 @@ export async function removeGraphEdge(edgeId: string): Promise<WorkflowGraph> {
   return request('graph.removeEdge', { edgeId });
 }
 
-export async function updateGraphNode(node: WorkflowNode): Promise<WorkflowGraph> {
-  return request('graph.updateNode', { nodeId: node.id, node });
+/**
+ * 提交单节点的字段级补丁。
+ *
+ * 服务端基于当前权威节点合并 `config`，避免陈旧客户端快照覆盖并发编辑。
+ */
+export async function patchGraphNode(nodeId: string, patch: WorkflowNodePatch): Promise<WorkflowGraph> {
+  return request('graph.patchNode', { nodeId, ...patch });
 }
 
 export async function updateGraphNodePosition(nodeId: string, position: NodePosition): Promise<WorkflowGraph> {

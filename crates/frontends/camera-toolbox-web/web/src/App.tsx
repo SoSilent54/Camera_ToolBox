@@ -37,7 +37,7 @@ import {
   removeGraphNode,
   replaceGraph,
   saveWorkflow,
-  updateGraphNode,
+  patchGraphNode,
   updateGraphNodePosition,
   validateConnectionKinds,
   type FlowEdgeData,
@@ -336,17 +336,6 @@ export function App() {
     [canConnect, commitGraph, pushEvent],
   );
 
-  const updateNode = useCallback(
-    (nodeId: string, updater: (node: WorkflowNode) => WorkflowNode, event: string) => {
-      const node = nodeById.get(nodeId);
-      if (!node) {
-        pushEvent(`节点不存在：${nodeId}`);
-        return;
-      }
-      commitGraph(updateGraphNode(updater(node)), event);
-    },
-    [commitGraph, nodeById, pushEvent],
-  );
 
   const handleRtspUrlChange = useCallback(
     (nodeId: string, nextUrl: string) => {
@@ -355,13 +344,12 @@ export function App() {
         pushEvent('拒绝 RTSP URL：必须使用 rtsp:// 或 rtsps://');
         return;
       }
-      updateNode(
-        nodeId,
-        (node) => ({ ...node, config: { ...node.config, url: trimmedUrl } }),
+      commitGraph(
+        patchGraphNode(nodeId, { config: { url: trimmedUrl } }),
         `RTSP URL 已更新：${trimmedUrl}`,
       );
     },
-    [pushEvent, updateNode],
+    [commitGraph, pushEvent],
   );
 
   const handleNodeTitleChange = useCallback(
@@ -371,20 +359,16 @@ export function App() {
         pushEvent('节点标题不能为空');
         return;
       }
-      updateNode(nodeId, (node) => ({ ...node, title }), `节点已重命名：${title}`);
+      commitGraph(patchGraphNode(nodeId, { title }), `节点已重命名：${title}`);
     },
-    [pushEvent, updateNode],
+    [commitGraph, pushEvent],
   );
 
   const handleNodeConfigChange = useCallback(
     (nodeId: string, key: string, value: string | boolean) => {
-      updateNode(
-        nodeId,
-        (node) => ({ ...node, config: { ...node.config, [key]: value } }),
-        `节点配置已更新：${key}`,
-      );
+      commitGraph(patchGraphNode(nodeId, { config: { [key]: value } }), `节点配置已更新：${key}`);
     },
-    [updateNode],
+    [commitGraph],
   );
 
   useEffect(() => {
@@ -999,6 +983,9 @@ function toFlowNodes(graph: WorkflowGraph): FlowNode[] {
     },
   }));
 }
+// 空闲边使用显式 SVG 样式，避免仅靠低对比度 CSS 而在深色画布上消失。
+const DORMANT_EDGE_STYLE = { stroke: '#94a3b8', strokeWidth: 2, opacity: 0.9 } as const;
+const ACTIVE_EDGE_STYLE = { stroke: '#38bdf8', strokeWidth: 2.25, opacity: 1 } as const;
 
 function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
   return graph.edges.map((edge) => ({
@@ -1008,6 +995,7 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     target: edge.target.nodeId,
     targetHandle: edge.target.portId,
     animated: false,
+    style: DORMANT_EDGE_STYLE,
     label: labelForPortKind(edge.kind),
     data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema, schemaVersion: edge.schemaVersion },
     className: 'workflow-edge flow-inactive',
@@ -1049,6 +1037,9 @@ function mergeFlowEdges(current: FlowEdge[], graph: WorkflowGraph): FlowEdge[] {
       targetHandle: nextEdge.targetHandle,
       label: nextEdge.label,
       data: nextEdge.data,
+      animated: nextEdge.animated,
+      style: nextEdge.style,
+      className: nextEdge.className,
     };
   });
 }
@@ -1098,6 +1089,7 @@ function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStat
     return {
       ...edge,
       animated: active,
+      style: active ? ACTIVE_EDGE_STYLE : DORMANT_EDGE_STYLE,
       className: `workflow-edge ${active ? 'flow-active' : 'flow-inactive'}`,
     };
   });

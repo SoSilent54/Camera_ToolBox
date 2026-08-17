@@ -33,6 +33,7 @@ pub fn dispatch(path: &str, payload: Value, state: &AppState) -> Result<Value, S
         "graph.addEdge" => graph_add_edge(payload, state),
         "graph.removeEdge" => graph_remove_edge(payload, state),
         "graph.updateNode" => graph_update_node(payload, state),
+        "graph.patchNode" => graph_patch_node(payload, state),
         // —— 运行时动作 ——
         "runtime.run" => runtime_run(payload, state),
         "runtime.start" => runtime_start(state),
@@ -214,6 +215,43 @@ fn graph_update_node(payload: Value, state: &AppState) -> Result<Value, String> 
         }
         if let Some(config) = body.config {
             existing.config = config;
+        }
+        Ok(())
+    })
+}
+
+/// 对既有节点执行字段级更新；配置补丁只覆盖提供的键。
+fn graph_patch_node(payload: Value, state: &AppState) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Body {
+        node_id: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        config: Option<serde_json::Map<String, Value>>,
+    }
+
+    let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
+    if body.title.is_none() && body.config.is_none() {
+        return Err("node patch must include title or config".to_owned());
+    }
+    let rebuild_engine = body.config.is_some();
+    commit_graph_mutation(state, rebuild_engine, |graph| {
+        let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id) else {
+            return Err(format!("node `{}` not found", body.node_id));
+        };
+        if let Some(title) = body.title {
+            existing.title = title;
+        }
+        if let Some(config_patch) = body.config {
+            let Some(config) = existing.config.as_object_mut() else {
+                return Err(format!(
+                    "node `{}` config must be a JSON object",
+                    body.node_id
+                ));
+            };
+            config.extend(config_patch);
         }
         Ok(())
     })
@@ -646,6 +684,102 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate["id"] == "edge-to-authoritative-connected-node")
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_patch_node_merges_config_without_overwriting_other_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-patch-merge-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let source = seed
+            .nodes
+            .iter()
+            .find(|node| node.id == "rtsp-source-1")
+            .expect("seed RTSP source exists");
+        let node_id = source.id.clone();
+        let expected_transport = source.config["transport"].clone();
+        let expected_width = source.config["expectedWidth"].clone();
+
+        let out = dispatch(
+            "graph.patchNode",
+            serde_json::json!({
+                "nodeId": node_id.clone(),
+                "title": "Patched RTSP Input",
+                "config": { "url": "rtsp://camera.example/live" }
+            }),
+            &state,
+        )
+        .expect("field patch succeeds");
+
+        let node = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == node_id)
+            .expect("patched node remains in graph");
+        assert_eq!(node["title"], "Patched RTSP Input");
+        assert_eq!(node["config"]["url"], "rtsp://camera.example/live");
+        assert_eq!(node["config"]["transport"], expected_transport);
+        assert_eq!(node["config"]["expectedWidth"], expected_width);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_patch_node_rejects_full_node_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-patch-reject-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let mut seed = crate::workflow::seed_workflow_graph();
+        let node = seed.nodes.remove(0);
+        let node_id = node.id.clone();
+
+        let error = dispatch(
+            "graph.patchNode",
+            serde_json::json!({ "nodeId": node_id, "node": node }),
+            &state,
+        )
+        .expect_err("full node payload is not a patch");
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("node"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_patch_title_does_not_rebuild_engine_or_refresh_statuses() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-patch-title-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let node_id = seed.nodes[0].id.clone();
+
+        dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = runtime_status(&state).expect("drain initial statuses");
+
+        let out = dispatch(
+            "graph.patchNode",
+            serde_json::json!({ "nodeId": node_id, "title": "Patched RTSP Input" }),
+            &state,
+        )
+        .expect("title patch succeeds");
+
+        assert!(
+            out["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["title"] == "Patched RTSP Input")
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(runtime_status(&state).unwrap(), serde_json::json!([]));
         std::fs::remove_dir_all(dir).ok();
     }
 
