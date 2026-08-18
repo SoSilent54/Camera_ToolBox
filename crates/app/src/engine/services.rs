@@ -49,9 +49,9 @@ impl EngineServices {
 
     /// 获取本地 RAW 帧加载器（LocalFileSource 等本地文件源节点使用）。
     pub fn raw_loader(&self) -> Result<Arc<dyn RawFrameLoader>, NodeError> {
-        self.raw_loader.clone().ok_or_else(|| {
-            NodeError::Precondition("raw frame loader is not configured".to_owned())
-        })
+        self.raw_loader
+            .clone()
+            .ok_or_else(|| NodeError::Precondition("raw frame loader is not configured".to_owned()))
     }
 
     /// 获取静态 raster 编解码器（图片加载/合成/检测转 PNG 时使用）。
@@ -63,16 +63,16 @@ impl EngineServices {
 
     /// 获取 I²C 执行器（I2cTransfer 节点执行读写时使用）。
     pub fn i2c_executor(&self) -> Result<Arc<dyn I2cExecutor>, NodeError> {
-        self.i2c_executor.clone().ok_or_else(|| {
-            NodeError::Precondition("i2c executor is not configured".to_owned())
-        })
+        self.i2c_executor
+            .clone()
+            .ok_or_else(|| NodeError::Precondition("i2c executor is not configured".to_owned()))
     }
 
     /// 获取 EEPROM 执行器（EepromProvision 节点 inspect/provision 时使用）。
     pub fn eeprom_executor(&self) -> Result<Arc<dyn EepromExecutor>, NodeError> {
-        self.eeprom_executor.clone().ok_or_else(|| {
-            NodeError::Precondition("eeprom executor is not configured".to_owned())
-        })
+        self.eeprom_executor
+            .clone()
+            .ok_or_else(|| NodeError::Precondition("eeprom executor is not configured".to_owned()))
     }
 
     /// 获取 X5 控制客户端（X5Device 节点 probe/status/snapshot 时使用）。
@@ -84,9 +84,9 @@ impl EngineServices {
 
     /// 获取 SFTP 文件读取器（SftpFileSource 节点加载远程图片时使用）。
     pub fn sftp_reader(&self) -> Result<Arc<dyn SftpFileReader>, NodeError> {
-        self.sftp_reader.clone().ok_or_else(|| {
-            NodeError::Precondition("sftp file reader is not configured".to_owned())
-        })
+        self.sftp_reader
+            .clone()
+            .ok_or_else(|| NodeError::Precondition("sftp file reader is not configured".to_owned()))
     }
 
     /// 获取 SSH 命令执行器（SshSession 节点执行远程命令时使用）。

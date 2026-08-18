@@ -95,7 +95,7 @@ fn graph_replace(payload: Value, state: &AppState) -> Result<Value, String> {
 
 fn graph_add_node(payload: Value, state: &AppState) -> Result<Value, String> {
     let node: WorkflowNode = serde_json::from_value(payload).map_err(deser_err)?;
-    let engine_node = engine_api::to_node_spec(&node);
+    let node_id = node.id.clone();
     commit_graph_mutation_with_loaded_engine(
         state,
         |graph| {
@@ -105,9 +105,17 @@ fn graph_add_node(payload: Value, state: &AppState) -> Result<Value, String> {
             graph.nodes.push(node);
             Ok(())
         },
-        |engine, _graph| {
+        |engine, graph| {
+            let engine_node = graph
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == node_id)
+                .ok_or_else(|| format!("normalized graph removed node `{node_id}`"))?;
             engine
-                .add_node(engine_node, &state.engine_runtime.registry)
+                .add_node(
+                    engine_api::to_node_spec(engine_node),
+                    &state.engine_runtime.registry,
+                )
                 .map_err(|e| e.to_string())
         },
     )
@@ -124,8 +132,6 @@ fn graph_add_node_and_edge(payload: Value, state: &AppState) -> Result<Value, St
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
     let node = body.node;
     let edge = body.edge;
-    let engine_node = engine_api::to_node_spec(&node);
-    let engine_edge = engine_api::to_edge_spec(&edge);
     let node_id = node.id.clone();
     let edge_id = edge.id.clone();
     let replaced_engine_edge = authoritative_graph(state)?
@@ -145,11 +151,27 @@ fn graph_add_node_and_edge(payload: Value, state: &AppState) -> Result<Value, St
             graph.edges.push(edge);
             Ok(())
         },
-        |engine, _graph| {
+        |engine, graph| {
+            let engine_node = graph
+                .nodes
+                .iter()
+                .find(|candidate| candidate.id == node_id)
+                .ok_or_else(|| format!("normalized graph removed node `{node_id}`"))?;
             engine
-                .add_node(engine_node, &state.engine_runtime.registry)
+                .add_node(
+                    engine_api::to_node_spec(engine_node),
+                    &state.engine_runtime.registry,
+                )
                 .map_err(|e| e.to_string())?;
             let _ = engine.remove_edge(&edge_id);
+            let Some(engine_edge) = graph
+                .edges
+                .iter()
+                .find(|candidate| candidate.id == edge_id)
+                .map(engine_api::to_edge_spec)
+            else {
+                return Ok(());
+            };
             if let Err(error) = engine.add_edge(engine_edge) {
                 let _ = engine.remove_node(&node_id);
                 if let Some(replaced_edge) = replaced_engine_edge {
@@ -250,7 +272,6 @@ fn graph_add_edge(payload: Value, state: &AppState) -> Result<Value, String> {
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
     let edge = body.edge;
-    let engine_edge = engine_api::to_edge_spec(&edge);
     let edge_id = edge.id.clone();
     let replaced_engine_edge = authoritative_graph(state)?
         .edges
@@ -265,8 +286,16 @@ fn graph_add_edge(payload: Value, state: &AppState) -> Result<Value, String> {
             graph.edges.push(edge);
             Ok(())
         },
-        |engine, _graph| {
+        |engine, graph| {
             let _ = engine.remove_edge(&edge_id);
+            let Some(engine_edge) = graph
+                .edges
+                .iter()
+                .find(|candidate| candidate.id == edge_id)
+                .map(engine_api::to_edge_spec)
+            else {
+                return Ok(());
+            };
             if let Err(error) = engine.add_edge(engine_edge) {
                 if let Some(replaced_edge) = replaced_engine_edge {
                     if let Err(restore_error) = engine.add_edge(replaced_edge) {

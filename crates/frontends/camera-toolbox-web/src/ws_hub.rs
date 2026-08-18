@@ -7,7 +7,10 @@
 //! 连接表用 [`std::sync::Mutex`] 包裹：广播路径短且只做「尝试发送 + 惰性清理」，不涉及 await，
 //! 在单线程 tokio runtime 中不会阻塞事件循环，也无需跨线程共享的 `tokio::sync::Mutex`。
 
-use std::sync::{Mutex, atomic::{AtomicUsize, Ordering}};
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use axum::extract::ws::Message;
 use tokio::sync::mpsc::UnboundedSender;
@@ -168,7 +171,9 @@ mod tests {
         // 再次广播只应送到连接 1，连接 2 已被清理（不 panic、不重复投递）。
         hub.broadcast_text("second");
         assert_eq!(
-            rx1.recv().await.expect("live connection should receive again"),
+            rx1.recv()
+                .await
+                .expect("live connection should receive again"),
             Message::Text("second".to_string().into())
         );
     }

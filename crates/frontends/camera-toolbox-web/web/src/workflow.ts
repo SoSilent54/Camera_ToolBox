@@ -190,6 +190,11 @@ export interface SshExecutionBinding {
   expectedHostKey?: string;
 }
 
+/** 密码只通过本机 WebSocket 写入服务端进程内凭据库；图中只保存返回的 session 引用。 */
+export interface SshPasswordRegistration {
+  credentialRef: string;
+}
+
 export interface I2cExecuteRequest extends I2cPreviewRequest {
   confirmExecution: boolean;
   ssh: SshExecutionBinding;
@@ -453,6 +458,11 @@ export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
 /** 拉取引擎记录的某节点最新输出；缺少输出时服务端返回错误。 */
 export async function loadRuntimeNodeOutput(nodeId: string): Promise<unknown> {
   return request('runtime.node.output', { nodeId });
+}
+
+/** 注册或替换一个仅存在于当前服务端进程的 SSH 密码。 */
+export async function registerSshPassword(nodeId: string, password: string): Promise<SshPasswordRegistration> {
+  return request('control.ssh.password', { nodeId, password });
 }
 
 

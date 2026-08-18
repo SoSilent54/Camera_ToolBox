@@ -9,11 +9,11 @@ export function GenericWorkflowNode({ data, selected }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const layerCapabilityNotice = node.kind === 'imageLayer'
-    ? '静态图片图层当前不会被 Web Viewer 渲染；visible/opacity 仅保存为图层声明。'
+    ? '图片帧会原样转发到 Viewer；visible/opacity 仅保存为图层声明，不参与合成。'
     : node.kind === 'videoLayer'
       ? '视频帧会原样转发；visible/opacity 仅保存为图层声明，不参与合成。'
       : node.kind === 'overlayComposer'
-        ? '接线声明会原样转发到 scene；不执行图层混合、静态图片或 overlay 光栅化，只有视频帧可显示。'
+        ? '帧类负载会原样转发到 scene；不执行图层混合或 overlay 光栅化。'
         : null;
   return (
     <div className="workflow-node-shell">

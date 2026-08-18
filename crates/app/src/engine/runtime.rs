@@ -275,7 +275,9 @@ mod tests {
 
         let packet = DataPacket::Json(Arc::new(serde_json::json!({"k": 1})));
         assert!(outputs.emit("out", packet).is_ok());
-        let captured = captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let captured = captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert_eq!(captured.len(), 1);
     }
 
@@ -286,12 +288,19 @@ mod tests {
         let captured: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let sink = Arc::clone(&captured);
         outputs.set_record(Arc::new(move |_packet| {
-            *sink.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *sink
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
         }));
 
         let packet = DataPacket::Json(Arc::new(serde_json::json!({})));
         assert!(outputs.emit("unconnected", packet).is_ok());
-        assert_eq!(*captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner), 1);
+        assert_eq!(
+            *captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            1
+        );
     }
 
     #[test]
@@ -353,11 +362,17 @@ mod tests {
         assert_eq!(outputs.fanout_count("out"), 1);
 
         outputs
-            .emit("out", DataPacket::Json(Arc::new(serde_json::json!({"k": 1}))))
+            .emit(
+                "out",
+                DataPacket::Json(Arc::new(serde_json::json!({"k": 1}))),
+            )
             .expect("emit");
         // 仍连接的下游收到，被摘除的下游收不到。
         assert!(matches!(rx1.try_recv(), Ok(NodeMessage::Input { .. })));
-        assert!(matches!(rx2.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            rx2.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ));
 
         // 摘掉最后一个下游后端口条目被删除（幂等，重复 disconnect 亦 no-op）。
         outputs.disconnect("out".to_owned(), &tx1);

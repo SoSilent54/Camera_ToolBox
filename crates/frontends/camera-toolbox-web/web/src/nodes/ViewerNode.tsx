@@ -11,7 +11,7 @@ export function ViewerNode({ data, selected, width, height }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   return (
-    <div className="workflow-node-shell">
+    <div className="workflow-node-shell viewer-node-shell">
       <section
         className={`workflow-node viewer-node ${selected ? 'selected' : ''}`}
         style={{ width, height }}
@@ -24,6 +24,9 @@ export function ViewerNode({ data, selected, width, height }: NodeProps) {
           runtimeState={runtimeState}
           runtimeDiagnostic={runtimeDiagnostic}
           runtimeOutput={nodeData.runtimeOutput}
+          actionPending={Boolean(nodeData.actionPending)}
+          captureAvailable={Boolean(nodeData.onNodeAction)}
+          onCapture={() => nodeData.onNodeAction?.(node.id, 'trigger')}
         />
       </section>
       {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
@@ -46,11 +49,17 @@ function EngineFrame({
   runtimeState,
   runtimeDiagnostic,
   runtimeOutput,
+  actionPending,
+  captureAvailable,
+  onCapture,
 }: {
   nodeId: string;
   runtimeState?: string;
   runtimeDiagnostic?: string;
   runtimeOutput: unknown;
+  actionPending: boolean;
+  captureAvailable: boolean;
+  onCapture: () => void;
 }) {
   const imgRef = useRef<HTMLImageElement>(null);
   const frameTimes = useRef<number[]>([]);
@@ -145,6 +154,18 @@ function EngineFrame({
           <RuntimeOutputSummary output={runtimeOutput} />
         </div>
       ) : null}
+      <div className="node-actions">
+        <button
+          type="button"
+          className="nodrag nowheel"
+          disabled={!captureAvailable || actionPending || !frame.lastFrameAt}
+          title="将当前引擎帧导出到 image.frame 输出端口"
+          onClick={onCapture}
+        >
+          {actionPending ? '捕获中…' : '捕获最新帧'}
+        </button>
+      </div>
+      <span className="node-hint">捕获的是当前引擎 RGBA 帧，不是缩放后的 JPEG 预览。</span>
     </div>
   );
 }

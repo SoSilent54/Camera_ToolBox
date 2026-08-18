@@ -350,9 +350,11 @@ button:hover {
 .workflow-node {
   display: grid;
   position: relative;
-  gap: 0.36rem;
-  min-width: 176px;
+  box-sizing: border-box;
+  inline-size: 232px;
+  min-width: 0;
   max-width: 232px;
+  gap: 0.36rem;
   border: 1px solid rgba(148, 163, 184, 0.34);
   border-radius: 2px;
   background: linear-gradient(180deg, rgba(15, 23, 42, 0.98), rgba(10, 15, 24, 0.98));
@@ -365,26 +367,41 @@ button:hover {
   box-shadow: 0 0 0 1px rgba(125, 211, 252, 0.2), 0 10px 24px rgba(2, 6, 23, 0.46);
 }
 .workflow-node-shell {
-  display: inline-flex;
   position: relative;
+  display: inline-flex;
   flex-direction: column;
   align-items: stretch;
+  inline-size: 232px;
+  max-inline-size: 232px;
   overflow: visible;
 }
 
+/* Viewer 的可调整宽高由 React Flow 写到内部 section；外壳随之收缩包裹。 */
+.workflow-node-shell.viewer-node-shell {
+  inline-size: fit-content;
+  max-inline-size: none;
+}
+
+/* 诊断位于节点外部；它必须沿用节点宽度，不能以长消息撑开或遮挡画布控件。 */
 .node-diagnostic-below {
   position: absolute;
   top: calc(100% + 0.14rem);
   right: 0;
   left: 0;
   z-index: 1;
+  box-sizing: border-box;
+  display: block;
+  inline-size: 100%;
+  max-inline-size: 100%;
   min-width: 0;
+  overflow: hidden;
   color: #fbbf24;
   font-size: 0.62rem;
   line-height: 1.2;
-  overflow: hidden;
+  text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
+  pointer-events: none;
 }
 
 
@@ -574,9 +591,10 @@ button:hover {
 /* 三段式连接区：标题 / 连接 / 内容（ComfyUI 风格） */
 .node-ports {
   display: flex;
-  justify-content: space-between;
   align-items: center;
+  justify-content: space-between;
   gap: 0.5rem;
+  min-width: 0;
   margin: 0 -0.5rem;
   padding: 0.22rem 0.5rem;
   border-top: 1px solid rgba(148, 163, 184, 0.12);
@@ -586,9 +604,11 @@ button:hover {
 
 .port-group {
   display: flex;
+  flex: 0 1 calc(50% - 0.25rem);
   flex-direction: column;
   gap: 0.16rem;
   min-width: 0;
+  max-inline-size: calc(50% - 0.25rem);
 }
 
 .port-group-inputs {
@@ -603,8 +623,9 @@ button:hover {
   position: relative;
   display: flex;
   align-items: center;
-  height: 0.85rem;
+  block-size: 0.85rem;
   min-width: 0;
+  max-inline-size: 100%;
 }
 
 .port-row-input {
@@ -620,6 +641,7 @@ button:hover {
 .node-body {
   display: grid;
   gap: 0.28rem;
+  min-width: 0;
 }
 
 .node-body.compact {
@@ -627,10 +649,12 @@ button:hover {
 }
 
 .node-capability-note {
+  min-width: 0;
   border-left: 2px solid rgba(251, 191, 36, 0.75);
   color: #fde68a;
   font-size: 0.62rem;
   line-height: 1.3;
+  overflow-wrap: anywhere;
   padding-left: 0.3rem;
 }
 
@@ -790,10 +814,16 @@ button:disabled {
 
 /* 端口类型标签 + 连接点按类型着色 */
 .port-label {
+  display: block;
+  min-width: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  color: inherit;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.56rem;
   line-height: 1;
   letter-spacing: 0.02em;
+  text-overflow: ellipsis;
   white-space: nowrap;
   pointer-events: none;
   user-select: none;
@@ -896,9 +926,11 @@ button:disabled {
 }
 
 .node-hint {
+  min-width: 0;
   color: #64748b;
   font-size: 0.66rem;
   font-style: italic;
+  overflow-wrap: anywhere;
 }
 
 /* 通用节点标量配置：草稿受控到输入框，blur/Enter 后按字段补丁提交。 */
@@ -941,7 +973,21 @@ button:disabled {
   margin: 0;
 }
 
+/* 专用节点的原生输入/选择控件同样不得用固有最小宽度撑破节点。 */
+.workflow-node .rtsp-url-input,
+.workflow-node select,
+.workflow-node textarea {
+  box-sizing: border-box;
+  inline-size: 100%;
+  min-width: 0;
+  max-inline-size: 100%;
+}
+
 .node-runtime-output {
+  box-sizing: border-box;
+  max-inline-size: 100%;
+  min-width: 0;
+  margin: 0;
   overflow: hidden;
   border-left: 2px solid rgba(74, 222, 128, 0.7);
   color: #bbf7d0;
@@ -949,6 +995,7 @@ button:disabled {
   font-size: 0.62rem;
   line-height: 1.3;
   overflow-wrap: anywhere;
+  white-space: pre-wrap;
   padding-left: 0.32rem;
 }
 
@@ -1154,17 +1201,23 @@ button:disabled {
   color: #fecaca;
 }
 
-/* 节点内触发按钮 */
+/* 节点内触发按钮：按钮过多时换行，不能把节点横向撑开。 */
 .node-actions {
   display: flex;
+  flex-wrap: wrap;
   gap: 0.25rem;
+  min-width: 0;
   margin-top: 0.25rem;
   border-top: 1px solid rgba(148, 163, 184, 0.1);
   padding-top: 0.3rem;
 }
 
 .node-actions button {
-  flex: 1;
+  flex: 1 1 4.5rem;
+  min-width: 0;
+  overflow: hidden;
   padding: 0.24rem 0.4rem;
   font-size: 0.7rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use serde_json::json;
 
-use crate::ws_hub::WsHub;
 use crate::AppState;
+use crate::ws_hub::WsHub;
 
 /// 状态/事件循环的轮询间隔（非阻塞 `try_recv`，间隔仅决定延迟上限）。
 const STATUS_POLL_MS: u64 = 50;
@@ -110,7 +110,13 @@ async fn frame_loop(state: AppState, hub: Arc<WsHub>) {
                     last_seen.insert(node_id.clone(), seq);
                     match crate::encode_rgba_scaled_jpeg(&frame, VIEWER_ENCODE_WIDTH) {
                         Ok(encoded) => {
-                            hub.publish_frame(node_id, seq, encoded.width, encoded.height, &encoded.jpeg);
+                            hub.publish_frame(
+                                node_id,
+                                seq,
+                                encoded.width,
+                                encoded.height,
+                                &encoded.jpeg,
+                            );
                         }
                         Err(error) => {
                             tracing::warn!(node_id = %node_id, seq, "viewer frame encode failed: {error}");
@@ -139,10 +145,7 @@ mod tests {
 
     #[test]
     fn prune_removes_inactive_viewers() {
-        let mut seen = HashMap::from([
-            ("v1".to_owned(), 1u64),
-            ("v2".to_owned(), 2u64),
-        ]);
+        let mut seen = HashMap::from([("v1".to_owned(), 1u64), ("v2".to_owned(), 2u64)]);
         let active = vec!["v1".to_owned()];
         prune_last_seen(&mut seen, &active);
         assert!(seen.contains_key("v1"));

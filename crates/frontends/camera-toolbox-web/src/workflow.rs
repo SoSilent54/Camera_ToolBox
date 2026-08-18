@@ -348,76 +348,38 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::SshSession => (
             NodeCategory::Control,
             "SSH Session",
-            "远程命令、SFTP、I²C helper 的控制会话",
+            "密码认证的远程命令会话；密码仅保留在当前服务端进程",
             vec![],
-            vec![
-                port(
-                    "ssh",
-                    "SSH",
-                    PortDirection::Output,
-                    PortKind::ControlSsh,
-                    "control.ssh.v1",
-                    Some(PortRole::Control),
-                ),
-                optional_port(
-                    "result",
-                    "Command Result",
-                    PortDirection::Output,
-                    PortKind::I2cResult,
-                    "i2c.result.v1",
-                    Some(PortRole::Status),
-                ),
-            ],
+            vec![optional_port(
+                "result",
+                "Command Result",
+                PortDirection::Output,
+                PortKind::I2cResult,
+                "i2c.result.v1",
+                Some(PortRole::Status),
+            )],
             json!({"profileId": "", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "recipeId": "", "autoConnect": false}),
         ),
-        // ③ X5Device（吸收 X5RtspChannel + X5Snapshot）
+        // X5 控制走独立 TCP 请求；当前快照响应只返回 NV12 元数据，不能伪装成图内 ImageFrame。
         NodeKind::X5Device => (
             NodeCategory::Control,
             "X5 Device",
-            "X5_233 TCP 控制、RTSP 通道资源与抓帧（rtsp 多路 + snapshot/video 可选输出）",
-            vec![optional_port(
-                "ssh",
-                "SSH",
-                PortDirection::Input,
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-                Some(PortRole::Control),
-            )],
-            vec![
-                port(
-                    "control",
-                    "X5 TCP",
-                    PortDirection::Output,
-                    PortKind::ControlX5Tcp,
-                    "control.x5tcp.v1",
-                    Some(PortRole::Control),
-                ),
-                many_port(
-                    "rtsp",
-                    "RTSP Channels",
-                    PortDirection::Output,
-                    PortKind::EndpointRtsp,
-                    "media.rtsp.endpoint.v1",
-                    Some(PortRole::Endpoint),
-                ),
-                optional_port(
-                    "snapshot",
-                    "Snapshot Image",
-                    PortDirection::Output,
-                    PortKind::ImageFrame,
-                    "image.frame.v1",
-                    Some(PortRole::Image),
-                ),
-                optional_port(
-                    "video",
-                    "Video Frames",
-                    PortDirection::Output,
-                    PortKind::StreamVideoFrame,
-                    "stream.video-frame.v1",
-                    Some(PortRole::Stream),
-                ),
-            ],
-            json!({"host": "10.21.12.108", "tcpPort": 9073, "fps": 60, "bitrateKbps": 12000, "channels": [0]}),
+            "X5_233 TCP control: RTSP encoder/channel management and NV12 snapshot metadata",
+            vec![],
+            vec![],
+            json!({
+                "host": "10.21.12.108",
+                "tcpPort": 9073,
+                "rtspChannel": 0,
+                "fps": 60,
+                "bitrateKbps": 12000,
+                "snapshotChannel": 0,
+                "snapshotMode": "latest",
+                "snapshotFrameId": "",
+                "snapshotTimestampNs": "",
+                "snapshotRtspPts90k": "",
+                "snapshotRtspPtsTolerance90k": 0
+            }),
         ),
         NodeKind::RtspDecoder => (
             NodeCategory::Media,
@@ -466,7 +428,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::ImageLayer => (
             NodeCategory::Viewer,
             "Image Layer",
-            "声明图片图层元数据并原样转发；当前 Web Viewer 不渲染静态图层，visible/opacity 仅保存声明",
+            "声明图片图层元数据并原样转发；Web Viewer 可显示该图像，visible/opacity 仅保存声明",
             vec![port(
                 "image",
                 "Image",
@@ -488,7 +450,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::VideoLayer => (
             NodeCategory::Viewer,
             "Video Layer",
-            "声明视频图层元数据并原样转发；当前不执行 visible/opacity 或 alpha 合成",
+            "声明视频图层元数据并原样转发；visible/opacity 当前不参与合成",
             vec![port(
                 "frames",
                 "Video Frames",
@@ -510,7 +472,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::OverlayComposer => (
             NodeCategory::Viewer,
             "Overlay Composer (pass-through only)",
-            "保留 video/image/overlay 接线声明，但不混合或光栅化；仅原样转发到 scene，只有视频帧可被当前 Viewer 显示",
+            "保留 video/image/overlay 接线声明，原样转发帧类负载到 scene；不混合、不光栅化 overlay",
             vec![
                 many_port(
                     "video",
@@ -522,7 +484,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
                 many_port(
                     "image",
-                    "Image Layers (not rendered)",
+                    "Image Layers",
                     PortDirection::Input,
                     PortKind::LayerImage,
                     "viewer.layer.image.v1",
@@ -530,7 +492,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
                 many_port(
                     "overlay",
-                    "Overlay Layers (not rendered)",
+                    "Overlay JSON",
                     PortDirection::Input,
                     PortKind::LayerOverlay,
                     "viewer.layer.overlay.v1",
@@ -539,7 +501,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             vec![port(
                 "scene",
-                "Pass-through Scene (video only displayable)",
+                "Pass-through Scene",
                 PortDirection::Output,
                 PortKind::ViewerScene,
                 "viewer.scene.v1",
@@ -550,11 +512,11 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::Viewer => (
             NodeCategory::Viewer,
             "Viewer",
-            "显示引擎推送的 JPEG 视频帧及 frame meta；不渲染静态图片、overlay 或图层混合",
+            "显示引擎推送的 JPEG 帧及 frame meta；Trigger 将当前引擎帧导出为 image.frame",
             vec![
                 optional_port(
                     "scene",
-                    "Video Scene (relay only)",
+                    "Scene",
                     PortDirection::Input,
                     PortKind::ViewerScene,
                     "viewer.scene.v1",
@@ -570,14 +532,21 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
                 optional_port(
                     "image",
-                    "Image Layer (not rendered)",
+                    "Image Layer",
                     PortDirection::Input,
                     PortKind::LayerImage,
                     "viewer.layer.image.v1",
                     Some(PortRole::Layer),
                 ),
             ],
-            vec![],
+            vec![optional_port(
+                "image",
+                "Captured Image",
+                PortDirection::Output,
+                PortKind::ImageFrame,
+                "image.frame.v1",
+                Some(PortRole::Image),
+            )],
             json!({}),
         ),
         NodeKind::ChessboardDetector => (
@@ -762,107 +731,37 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             json!({"enabled": true}),
         ),
-        // ④ I2cTransfer（吸收 I2cBusDiscovery）
+        // I²C 的 SSH/bus 均为节点内联配置；不声明引擎未消费的控制输入或虚假响应输出。
         NodeKind::I2cTransfer => (
             NodeCategory::Control,
             "I²C Transfer",
-            "预览并手动执行 I²C 读写请求（内嵌 bus 刷新，rawResps 可选输出原始响应）",
-            vec![
-                port(
-                    "ssh",
-                    "SSH",
-                    PortDirection::Input,
-                    PortKind::ControlSsh,
-                    "control.ssh.v1",
-                    Some(PortRole::Control),
-                ),
-                optional_port(
-                    "bus",
-                    "I²C Bus",
-                    PortDirection::Input,
-                    PortKind::I2cBus,
-                    "i2c.bus.v1",
-                    Some(PortRole::Control),
-                ),
-            ],
-            vec![
-                port(
-                    "result",
-                    "Result",
-                    PortDirection::Output,
-                    PortKind::I2cResult,
-                    "i2c.result.v1",
-                    Some(PortRole::Status),
-                ),
-                optional_port(
-                    "rawResps",
-                    "Raw Responses",
-                    PortDirection::Output,
-                    PortKind::I2cResult,
-                    "i2c.result.v1",
-                    Some(PortRole::Status),
-                ),
-            ],
+            "使用节点内联 SSH 配置预览并手动执行 I²C 读写请求",
+            vec![],
+            vec![port(
+                "result",
+                "Result",
+                PortDirection::Output,
+                PortKind::I2cResult,
+                "i2c.result.v1",
+                Some(PortRole::Status),
+            )],
             json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
         ),
-        // ⑤ EepromProvision（吸收 EepromMapLoader）
+        // EEPROM map/payload/bus 都由节点内联配置，避免展示无运行时实现的输入/输出端口。
         NodeKind::EepromProvision => (
             NodeCategory::Control,
             "EEPROM Provision",
-            "根据 map/payload/bus 生成写入与校验动作（内嵌 map 加载，transfer 可选输出）",
-            vec![
-                port(
-                    "ssh",
-                    "SSH",
-                    PortDirection::Input,
-                    PortKind::ControlSsh,
-                    "control.ssh.v1",
-                    Some(PortRole::Command),
-                ),
-                port(
-                    "bus",
-                    "I²C Bus",
-                    PortDirection::Input,
-                    PortKind::I2cBus,
-                    "i2c.bus.v1",
-                    Some(PortRole::Control),
-                ),
-                optional_port(
-                    "map",
-                    "EEPROM Map",
-                    PortDirection::Input,
-                    PortKind::EepromMap,
-                    "eeprom.map.v1",
-                    Some(PortRole::Command),
-                ),
-                optional_port(
-                    "payload",
-                    "Payload",
-                    PortDirection::Input,
-                    PortKind::EepromPayload,
-                    "eeprom.payload.v1",
-                    Some(PortRole::Command),
-                ),
-            ],
-            vec![
-                port(
-                    "result",
-                    "Result",
-                    PortDirection::Output,
-                    PortKind::I2cResult,
-                    "i2c.result.v1",
-                    Some(PortRole::Status),
-                ),
-                optional_port(
-                    "transfer",
-                    "Transfer",
-                    PortDirection::Output,
-                    PortKind::I2cTransfer,
-                    "i2c.transfer.v1",
-                    Some(PortRole::Command),
-                ),
-            ],
-            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "mode": "inspect", "confirmWrites": true, "verifyAfterWrite": true}),
+            "使用节点内联 SSH、map、payload 和 bus 配置执行 EEPROM 检查与写入",
+            vec![],
+            vec![port(
+                "result",
+                "Result",
+                PortDirection::Output,
+                PortKind::I2cResult,
+                "i2c.result.v1",
+                Some(PortRole::Status),
+            )],
+            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "verifyAfterWrite": true}),
         ),
     };
     NodeDefinition {
@@ -1031,6 +930,7 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
                     .entry("channel".to_owned())
                     .or_insert_with(|| json!(0));
             }
+            NodeKind::X5Device => normalize_x5_device_config(config),
             NodeKind::RtspDecoder => {
                 config.clear();
                 if node.title == "RTSP Decoder" {
@@ -1040,6 +940,27 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
             _ => {}
         }
     }
+
+    // SSH/I²C/EEPROM 控制端口从未参与引擎数据包流。节点已改为内联配置，保存旧图时删除
+    // 这些虚假连线，避免标准化后引用不存在的端口。
+    graph.edges.retain(|edge| {
+        !graph.nodes.iter().any(|node| {
+            (node.kind == NodeKind::SshSession
+                && node.id == edge.source.node_id
+                && edge.source.port_id == "ssh")
+                || (matches!(node.kind, NodeKind::I2cTransfer | NodeKind::EepromProvision)
+                    && node.id == edge.target.node_id)
+        })
+    });
+
+    // 旧 X5 的端口声称可直接输出 RTSP、视频帧或 ImageFrame；TCP 控制请求从未向图引擎交付
+    // 这些载荷。丢弃该不真实契约上的边，防止保存后留下无法执行的数据流。
+    graph.edges.retain(|edge| {
+        !graph.nodes.iter().any(|node| {
+            node.kind == NodeKind::X5Device
+                && (node.id == edge.source.node_id || node.id == edge.target.node_id)
+        })
+    });
 
     for edge in &mut graph.edges {
         let source_is_rtsp = graph
@@ -1061,6 +982,32 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
             edge.schema = "stream.video-frame.v1".to_owned();
         }
     }
+}
+/// 迁移旧的单一 `channel` / `channels` 配置到彼此独立的 RTSP 与快照通道。
+fn normalize_x5_device_config(config: &mut serde_json::Map<String, serde_json::Value>) {
+    let legacy_channel = config
+        .remove("channel")
+        .or_else(|| {
+            config.remove("channels").and_then(|value| {
+                value
+                    .as_array()
+                    .and_then(|channels| channels.first())
+                    .cloned()
+            })
+        })
+        .unwrap_or_else(|| json!(0));
+    config
+        .entry("rtspChannel".to_owned())
+        .or_insert_with(|| legacy_channel.clone());
+    config
+        .entry("snapshotChannel".to_owned())
+        .or_insert(legacy_channel);
+    config
+        .entry("snapshotMode".to_owned())
+        .or_insert_with(|| json!("latest"));
+    config
+        .entry("snapshotRtspPtsTolerance90k".to_owned())
+        .or_insert_with(|| json!(0));
 }
 
 /// 校验端口方向与类型，避免 UI 产生无法执行的数据流边。
@@ -1089,6 +1036,12 @@ pub fn validate_edge(graph: &WorkflowGraph, edge: &WorkflowEdge) -> Result<(), S
             edge.schema, source.schema
         ));
     }
+    if target.schema != edge.schema {
+        return Err(format!(
+            "edge schema `{}` does not match target schema `{}`",
+            edge.schema, target.schema
+        ));
+    }
     if edge.schema_version != WORKFLOW_SCHEMA_VERSION {
         return Err(format!(
             "edge schema version `{}` is unsupported",
@@ -1101,7 +1054,9 @@ pub fn validate_edge(graph: &WorkflowGraph, edge: &WorkflowEdge) -> Result<(), S
 fn validate_node_config(node: &WorkflowNode) -> Result<(), String> {
     match node.kind {
         NodeKind::RtspSource => validate_rtsp_source_config(node),
-        NodeKind::SshSession => validate_ssh_session_config(node),
+        NodeKind::SshSession | NodeKind::I2cTransfer | NodeKind::EepromProvision => {
+            validate_password_ssh_config(node)
+        }
         NodeKind::SftpFileSource => validate_sftp_file_source_config(node),
         NodeKind::LocalFileSource => validate_local_file_source_config(node),
         _ => Ok(()),
@@ -1189,7 +1144,8 @@ fn validate_integer_range(
     Ok(())
 }
 
-fn validate_ssh_session_config(node: &WorkflowNode) -> Result<(), String> {
+/// SSH Session、I²C 与 EEPROM 只接受密码注册端点生成的进程内 session 引用。
+fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
     if let Some(host) = config_string(config, "host") {
         validate_printable_config_text(node, "host", host)?;
@@ -1206,6 +1162,21 @@ fn validate_ssh_session_config(node: &WorkflowNode) -> Result<(), String> {
             .map_err(|_| format!("node `{}` SSH port must be in 1..=65535", node.id))?;
         if port == 0 {
             return Err(format!("node `{}` SSH port must be in 1..=65535", node.id));
+        }
+    }
+    if let Some(reference) = config_string(config, "credentialRef") {
+        let reference = reference.trim();
+        if !reference.is_empty()
+            && (!reference.starts_with("session:")
+                || reference.len() == "session:".len()
+                || !reference["session:".len()..]
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
+        {
+            return Err(format!(
+                "node `{}` credentialRef must be empty or a password session:<node-id> reference",
+                node.id
+            ));
         }
     }
     Ok(())
@@ -1692,51 +1663,25 @@ fn calibration_template_graph() -> WorkflowGraph {
 }
 
 fn i2c_template_graph() -> WorkflowGraph {
-    // I2cBusDiscovery 已并入 I2cTransfer，EepromMapLoader 已并入 EepromProvision，
-    // ResultView 已删除（结果改节点内嵌 + 图级 Console）。
+    // I²C 与 EEPROM 都使用节点内联 SSH/bus/map/payload 配置，模板不再伪造 SSH 输入边。
     graph(
         "camera-toolbox-i2c-template",
         "I²C Tools Workspace",
         vec![
             workflow_node(
-                "i2c-ssh",
-                NodeKind::SshSession,
-                "SSH Session",
-                NodePosition { x: 80.0, y: 120.0 },
-            ),
-            workflow_node(
                 "i2c-transfer",
                 NodeKind::I2cTransfer,
                 "I²C Transfer",
-                NodePosition { x: 420.0, y: 80.0 },
+                NodePosition { x: 100.0, y: 80.0 },
             ),
             workflow_node(
                 "i2c-eeprom",
                 NodeKind::EepromProvision,
                 "EEPROM Provision",
-                NodePosition { x: 420.0, y: 320.0 },
+                NodePosition { x: 100.0, y: 320.0 },
             ),
         ],
-        vec![
-            edge(
-                "i2c-e-ssh-transfer",
-                "i2c-ssh",
-                "ssh",
-                "i2c-transfer",
-                "ssh",
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-            ),
-            edge(
-                "i2c-e-ssh-eeprom",
-                "i2c-ssh",
-                "ssh",
-                "i2c-eeprom",
-                "ssh",
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-            ),
-        ],
+        vec![],
     )
 }
 
@@ -1925,6 +1870,53 @@ mod tests {
         assert_eq!(edge.target.port_id, "frames");
         assert_eq!(edge.kind, PortKind::StreamVideoFrame);
     }
+    #[test]
+    fn normalize_migrates_x5_channels_and_removes_unbacked_edges() {
+        let mut graph = seed_workflow_graph();
+        let mut x5 = workflow_node(
+            "x5-1",
+            NodeKind::X5Device,
+            "X5 Device",
+            NodePosition { x: 0.0, y: 0.0 },
+        );
+        x5.config = json!({"host": "10.21.12.108", "channels": [3]});
+        x5.outputs = vec![port(
+            "snapshot",
+            "Snapshot Image",
+            PortDirection::Output,
+            PortKind::ImageFrame,
+            "image.frame.v1",
+            Some(PortRole::Image),
+        )];
+        graph.nodes.push(x5);
+        graph.edges.push(WorkflowEdge {
+            id: "obsolete-x5-snapshot".to_owned(),
+            source: PortEndpoint {
+                node_id: "x5-1".to_owned(),
+                port_id: "snapshot".to_owned(),
+            },
+            target: PortEndpoint {
+                node_id: "viewer-1".to_owned(),
+                port_id: "video".to_owned(),
+            },
+            kind: PortKind::ImageFrame,
+            schema: "image.frame.v1".to_owned(),
+            schema_version: WORKFLOW_SCHEMA_VERSION.to_owned(),
+        });
+
+        let graph = normalize_workflow(graph, "next".to_owned()).expect("X5 graph migrates");
+        let x5 = graph
+            .nodes
+            .iter()
+            .find(|node| node.id == "x5-1")
+            .expect("X5 node remains");
+        assert_eq!(x5.config["rtspChannel"], json!(3));
+        assert_eq!(x5.config["snapshotChannel"], json!(3));
+        assert_eq!(x5.config["snapshotMode"], json!("latest"));
+        assert!(x5.inputs.is_empty());
+        assert!(x5.outputs.is_empty());
+        assert!(graph.edges.iter().all(|edge| edge.source.node_id != "x5-1"));
+    }
 
     #[test]
     fn validation_rejects_self_loop() {
@@ -1993,12 +1985,36 @@ mod tests {
     }
 
     #[test]
+    fn validation_rejects_incompatible_port_schemas() {
+        let mut graph = seed_workflow_graph();
+        let edge = graph
+            .edges
+            .iter()
+            .find(|edge| edge.id == "edge-layer-viewer")
+            .cloned()
+            .expect("seed layer→viewer edge exists");
+        let viewer = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.id == "viewer-1")
+            .expect("seed viewer exists");
+        let video = viewer
+            .inputs
+            .iter_mut()
+            .find(|port| port.id == "video")
+            .expect("viewer video input exists");
+        video.schema = "viewer.layer.video.v2".to_owned();
+
+        let error = validate_edge(&graph, &edge).expect_err("target schema mismatch is rejected");
+        assert!(error.contains("target schema"), "unexpected error: {error}");
+    }
+
+    #[test]
     fn validation_allows_cardinality_many_fan_in() {
         // 反向确认：`Many` 输入端口的 fan-in 不被 cardinality 校验拦截。
-        // 用 node_catalog 里 X5Device 的 `rtsp` Many 输出做对照属于 fan-out；此处直接验证
-        // validate_cardinality_constraints 对 Many 端口不计数报错（空图/多入边 many 不报）。
+        // 这里临时把 viewer 输入改为 Many，直接验证 validate_cardinality_constraints
+        // 对多条入边不报错。
         let mut graph = seed_workflow_graph();
-        // 把 viewer-1.video 的输入端口临时改为 Many，双入边应通过 cardinality 约束。
         for node in &mut graph.nodes {
             if node.id == "viewer-1" {
                 for port in &mut node.inputs {
@@ -2067,6 +2083,17 @@ mod tests {
     }
 
     #[test]
+    fn viewer_declares_real_image_capture_output() {
+        let viewer = node_definition(NodeKind::Viewer);
+        assert!(viewer.outputs.iter().any(|port| {
+            port.id == "image"
+                && port.kind == PortKind::ImageFrame
+                && port.schema == "image.frame.v1"
+                && port.direction == PortDirection::Output
+        }));
+    }
+
+    #[test]
     fn calibration_nodes_only_declare_implemented_ports() {
         let solver = node_definition(NodeKind::CalibrationSolver);
         assert_eq!(solver.inputs.len(), 1);
@@ -2109,6 +2136,61 @@ mod tests {
                 .iter()
                 .any(|p| p.id == "target" && p.label == "Image-grid Target")
         );
+    }
+
+    #[test]
+    fn control_nodes_only_declare_runtime_implemented_ports() {
+        let ssh = node_definition(NodeKind::SshSession);
+        assert!(ssh.inputs.is_empty());
+        assert_eq!(
+            ssh.outputs
+                .iter()
+                .map(|port| port.id.as_str())
+                .collect::<Vec<_>>(),
+            ["result"]
+        );
+
+        for kind in [NodeKind::I2cTransfer, NodeKind::EepromProvision] {
+            let definition = node_definition(kind);
+            assert!(
+                definition.inputs.is_empty(),
+                "{kind:?} must use inline configuration"
+            );
+            assert_eq!(
+                definition
+                    .outputs
+                    .iter()
+                    .map(|port| port.id.as_str())
+                    .collect::<Vec<_>>(),
+                ["result"]
+            );
+        }
+
+        let template = i2c_template_graph();
+        assert!(template.edges.is_empty());
+        assert_eq!(template.nodes.len(), 2);
+    }
+
+    #[test]
+    fn password_only_control_nodes_reject_key_file_references() {
+        for kind in [
+            NodeKind::SshSession,
+            NodeKind::I2cTransfer,
+            NodeKind::EepromProvision,
+        ] {
+            let mut node = workflow_node(
+                "password-only",
+                kind,
+                "Password only",
+                NodePosition { x: 0.0, y: 0.0 },
+            );
+            node.config["credentialRef"] = json!("key-file:/home/user/.ssh/id_ed25519");
+            let error = validate_node_config(&node).expect_err("key authentication is forbidden");
+            assert!(error.contains("password session"));
+
+            node.config["credentialRef"] = json!("session:password_only");
+            validate_node_config(&node).expect("password session reference is valid");
+        }
     }
 
     #[test]

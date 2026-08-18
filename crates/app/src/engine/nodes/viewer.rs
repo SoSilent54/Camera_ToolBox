@@ -12,7 +12,10 @@ use std::{
 };
 
 use crate::{
-    engine::{DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec},
+    engine::{
+        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
+        NodeRuntimeState, NodeSpec,
+    },
     platform::host_monotonic_time_ns,
 };
 
@@ -60,8 +63,9 @@ impl NodeInstance for ViewerNode {
         packet: DataPacket,
         rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
-        let DataPacket::VideoFrame(frame) = packet else {
-            return Ok(());
+        let frame = match packet {
+            DataPacket::VideoFrame(frame) | DataPacket::ImageFrame(frame) => frame,
+            _ => return Ok(()),
         };
         if let Some(slot) = rt.context().viewer_slot.as_ref() {
             // 帧数据零拷贝转移进槽位；仅当唯一引用时直接取出，否则克隆。
@@ -75,8 +79,25 @@ impl NodeInstance for ViewerNode {
         Ok(())
     }
 
-    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        Err(NodeError::UnsupportedAction(action.name().to_owned()))
+    fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        match action {
+            // 只导出引擎当前持有的最新完整 RGBA 帧；没有帧时明确失败，绝不伪造捕获成功。
+            NodeAction::Trigger => {
+                let frame = rt
+                    .context()
+                    .viewer_slot
+                    .as_ref()
+                    .and_then(|slot| slot.latest())
+                    .ok_or_else(|| {
+                        NodeError::Precondition("viewer has no frame to capture".to_owned())
+                    })?;
+                let sequence = frame.identity.frame_sequence;
+                rt.emit("image", DataPacket::ImageFrame(frame))?;
+                rt.report_event(format!("captured latest frame (sequence {sequence})"));
+                Ok(())
+            }
+            other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
+        }
     }
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -108,11 +129,14 @@ fn liveness_loop(
 
 #[cfg(test)]
 mod tests {
+    use parking_lot::Mutex;
     use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
     use super::*;
     use crate::engine::{NodeReporter, OutputRegistry, SpawnContext};
-    use crate::platform::{DecodedVideoFrame, LatestDecodedFrameSlot, StreamFrameIdentity, StreamSessionId};
+    use crate::platform::{
+        DecodedVideoFrame, LatestDecodedFrameSlot, StreamFrameIdentity, StreamSessionId,
+    };
 
     fn video_frame() -> DataPacket {
         let session = StreamSessionId::new("viewer-test").expect("session id");
@@ -124,7 +148,10 @@ mod tests {
         }))
     }
 
-    fn runtime_with_slot(slot: Arc<LatestDecodedFrameSlot>, state_tx: mpsc::Sender<crate::engine::NodeStatusReport>) -> NodeRuntime {
+    fn runtime_with_slot(
+        slot: Arc<LatestDecodedFrameSlot>,
+        state_tx: mpsc::Sender<crate::engine::NodeStatusReport>,
+    ) -> NodeRuntime {
         let (event_tx, _event_rx) = mpsc::channel();
         let reporter = NodeReporter::new("viewer-1".to_owned(), state_tx, event_tx);
         let ctx = SpawnContext {
@@ -137,7 +164,9 @@ mod tests {
         NodeRuntime::new(ctx)
     }
 
-    fn last_state(rx: &mpsc::Receiver<crate::engine::NodeStatusReport>) -> Option<NodeRuntimeState> {
+    fn last_state(
+        rx: &mpsc::Receiver<crate::engine::NodeStatusReport>,
+    ) -> Option<NodeRuntimeState> {
         let mut last = None;
         while let Ok(report) = rx.try_recv() {
             last = Some(report.state);
@@ -165,14 +194,16 @@ mod tests {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let (state_tx, state_rx) = mpsc::channel();
         let mut rt = runtime_with_slot(slot, state_tx);
-        let mut node = ViewerFactory.instantiate(crate::engine::NodeSpec {
-            id: "viewer-1".to_owned(),
-            kind: "viewer".to_owned(),
-            title: "Viewer".to_owned(),
-            inputs: vec![],
-            outputs: vec![],
-            config: serde_json::json!({}),
-        }).expect("instantiate");
+        let mut node = ViewerFactory
+            .instantiate(crate::engine::NodeSpec {
+                id: "viewer-1".to_owned(),
+                kind: "viewer".to_owned(),
+                title: "Viewer".to_owned(),
+                inputs: vec![],
+                outputs: vec![],
+                config: serde_json::json!({}),
+            })
+            .expect("instantiate");
 
         node.on_start(&mut rt).expect("on_start");
         rt.stop_background(); // 关闭 liveness 线程，避免测试泄漏
@@ -184,26 +215,80 @@ mod tests {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let (state_tx, state_rx) = mpsc::channel();
         let mut rt = runtime_with_slot(Arc::clone(&slot), state_tx);
-        let mut node = ViewerFactory.instantiate(crate::engine::NodeSpec {
-            id: "viewer-1".to_owned(),
-            kind: "viewer".to_owned(),
-            title: "Viewer".to_owned(),
-            inputs: vec![],
-            outputs: vec![],
-            config: serde_json::json!({}),
-        }).expect("instantiate");
+        let mut node = ViewerFactory
+            .instantiate(crate::engine::NodeSpec {
+                id: "viewer-1".to_owned(),
+                kind: "viewer".to_owned(),
+                title: "Viewer".to_owned(),
+                inputs: vec![],
+                outputs: vec![],
+                config: serde_json::json!({}),
+            })
+            .expect("instantiate");
 
-        node.on_input("video", video_frame(), &mut rt).expect("on_input");
-        assert!(slot.latest().is_some(), "frame should be published to viewer slot");
+        node.on_input("video", video_frame(), &mut rt)
+            .expect("on_input");
+        assert!(
+            slot.latest().is_some(),
+            "frame should be published to viewer slot"
+        );
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
 
         // 第二帧不重复上报 running（状态仍是 running，但 try_recv 之后应无新报告）
-        node.on_input("video", video_frame(), &mut rt).expect("on_input");
+        node.on_input("video", video_frame(), &mut rt)
+            .expect("on_input");
         let mut extra = None;
         while let Ok(report) = state_rx.try_recv() {
             extra = Some(report.state);
         }
-        assert_eq!(extra, None, "second frame must not emit a fresh running report");
+        assert_eq!(
+            extra, None,
+            "second frame must not emit a fresh running report"
+        );
+    }
+
+    #[test]
+    fn trigger_emits_latest_frame_as_image_frame() {
+        let slot = Arc::new(LatestDecodedFrameSlot::default());
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let mut outputs = OutputRegistry::default();
+        let record = Arc::clone(&emitted);
+        outputs.set_record(Arc::new(move |packet| record.lock().push(packet)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let ctx = SpawnContext {
+            outputs,
+            reporter: NodeReporter::new("viewer-1".to_owned(), state_tx, event_tx),
+            services: Arc::new(crate::engine::EngineServices::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: Some(Arc::clone(&slot)),
+        };
+        let mut rt = NodeRuntime::new(ctx);
+        let mut node = ViewerFactory
+            .instantiate(crate::engine::NodeSpec {
+                id: "viewer-1".to_owned(),
+                kind: "viewer".to_owned(),
+                title: "Viewer".to_owned(),
+                inputs: vec![],
+                outputs: vec![],
+                config: serde_json::json!({}),
+            })
+            .expect("instantiate");
+
+        let DataPacket::VideoFrame(frame) = video_frame() else {
+            panic!("test fixture must be a video frame");
+        };
+        node.on_input("image", DataPacket::ImageFrame(frame), &mut rt)
+            .expect("image frame accepted");
+        node.on_action(NodeAction::Trigger, &mut rt)
+            .expect("capture current frame");
+        let captured = emitted.lock();
+
+        assert_eq!(captured.len(), 1);
+        let DataPacket::ImageFrame(frame) = &captured[0] else {
+            panic!("viewer capture must emit image.frame");
+        };
+        assert_eq!(frame.identity.frame_sequence, 1);
     }
 
     #[test]
@@ -211,39 +296,53 @@ mod tests {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let (state_tx, state_rx) = mpsc::channel();
         let mut rt = runtime_with_slot(Arc::clone(&slot), state_tx);
-        let mut node = ViewerFactory.instantiate(crate::engine::NodeSpec {
-            id: "viewer-1".to_owned(),
-            kind: "viewer".to_owned(),
-            title: "Viewer".to_owned(),
-            inputs: vec![],
-            outputs: vec![],
-            config: serde_json::json!({}),
-        }).expect("instantiate");
+        let mut node = ViewerFactory
+            .instantiate(crate::engine::NodeSpec {
+                id: "viewer-1".to_owned(),
+                kind: "viewer".to_owned(),
+                title: "Viewer".to_owned(),
+                inputs: vec![],
+                outputs: vec![],
+                config: serde_json::json!({}),
+            })
+            .expect("instantiate");
 
-        node.on_input("video", DataPacket::Json(Arc::new(serde_json::json!({}))), &mut rt)
-            .expect("on_input");
+        node.on_input(
+            "video",
+            DataPacket::Json(Arc::new(serde_json::json!({}))),
+            &mut rt,
+        )
+        .expect("on_input");
         assert!(slot.latest().is_none(), "non-video packet must not publish");
         assert_eq!(last_state(&state_rx), None);
     }
 
     #[test]
-    fn on_stop_reports_idle_and_action_is_unsupported() {
+    fn trigger_without_frame_is_rejected_and_other_actions_stay_unsupported() {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let (state_tx, state_rx) = mpsc::channel();
         let mut rt = runtime_with_slot(slot, state_tx);
-        let mut node = ViewerFactory.instantiate(crate::engine::NodeSpec {
-            id: "viewer-1".to_owned(),
-            kind: "viewer".to_owned(),
-            title: "Viewer".to_owned(),
-            inputs: vec![],
-            outputs: vec![],
-            config: serde_json::json!({}),
-        }).expect("instantiate");
+        let mut node = ViewerFactory
+            .instantiate(crate::engine::NodeSpec {
+                id: "viewer-1".to_owned(),
+                kind: "viewer".to_owned(),
+                title: "Viewer".to_owned(),
+                inputs: vec![],
+                outputs: vec![],
+                config: serde_json::json!({}),
+            })
+            .expect("instantiate");
 
         node.on_stop(&mut rt).expect("on_stop");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Idle));
 
-        let err = node.on_action(NodeAction::Trigger, &mut rt).expect_err("unsupported");
+        let err = node
+            .on_action(NodeAction::Trigger, &mut rt)
+            .expect_err("no frame");
+        assert!(matches!(err, NodeError::Precondition(_)));
+        let err = node
+            .on_action(NodeAction::Connect, &mut rt)
+            .expect_err("unsupported");
         assert!(matches!(err, NodeError::UnsupportedAction(_)));
     }
 }

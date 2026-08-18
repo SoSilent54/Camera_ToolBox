@@ -362,6 +362,34 @@ mod tests {
     }
 
     #[test]
+    fn image_layer_relays_image_frames_without_retyping_them() {
+        let mut outputs = OutputRegistry::default();
+        let relayed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&relayed);
+        outputs.set_record(Arc::new(move |packet| sink.lock().push(packet)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(outputs, state_tx);
+        let mut node = PassThroughNode {
+            kind: "imageLayer",
+            output_port: "layer".to_owned(),
+            last_frame_at: Arc::new(AtomicU64::new(0)),
+        };
+        let DataPacket::VideoFrame(frame) = video_frame(7) else {
+            panic!("test fixture must be a video frame");
+        };
+
+        node.on_input("image", DataPacket::ImageFrame(frame), &mut rt)
+            .expect("image layer accepts image.frame");
+
+        let relayed = relayed.lock();
+        assert_eq!(relayed.len(), 1);
+        let DataPacket::ImageFrame(frame) = &relayed[0] else {
+            panic!("image layer must retain image.frame type");
+        };
+        assert_eq!(frame.identity.frame_sequence, 7);
+    }
+
+    #[test]
     fn pass_through_ignores_non_frame_packets() {
         let mut outputs = OutputRegistry::default();
         let relayed: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));

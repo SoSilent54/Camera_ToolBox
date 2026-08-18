@@ -5,11 +5,7 @@
 
 use thiserror::Error;
 
-use super::{
-    packet::DataPacket,
-    runtime::NodeRuntime,
-    spec::NodeSpec,
-};
+use super::{packet::DataPacket, runtime::NodeRuntime, spec::NodeSpec};
 
 /// 节点级错误。
 #[derive(Debug, Error)]
@@ -104,4 +100,3 @@ pub mod kinds {
     pub const FILE_BROWSER: &str = "fileBrowser";
     pub const SSH_SESSION: &str = "sshSession";
 }
-

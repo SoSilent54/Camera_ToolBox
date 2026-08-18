@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { NodeProps } from '@xyflow/react';
-import type { FlowNodeData, X5ControlResponse } from './workflow';
+import type { FlowNodeData, X5ControlResponse, X5SnapshotMode, X5SnapshotRequest } from './workflow';
 import {
   captureX5Snapshot,
   configureX5Rtsp,
@@ -8,10 +8,12 @@ import {
   previewEepromProvision,
   previewI2cTransfer,
   probeX5Control,
+  registerSshPassword,
   runEepromProvision,
   runI2cTransfer,
   startX5RtspChannel,
   statusX5Control,
+  stopX5RtspChannel,
   type EepromExecuteRequest,
   type EepromInspectRequest,
   type EepromPreviewRequest,
@@ -153,6 +155,29 @@ function Field({
   );
 }
 
+function SelectField({
+  id,
+  label,
+  value,
+  options,
+  onChange,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  options: readonly { value: string; label: string }[];
+  onChange: (value: string) => void;
+}) {
+  return (
+    <label className="node-config-field">
+      <code>{label}</code>
+      <select id={id} className="nodrag nowheel" value={value} onChange={(event) => onChange(event.target.value)}>
+        {options.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+      </select>
+    </label>
+  );
+}
+
 function configBool(node: FlowNodeData['workflowNode'], key: string, fallback: boolean): boolean {
   const value = node.config[key];
   return typeof value === 'boolean' ? value : fallback;
@@ -183,22 +208,20 @@ function RemoteFrame({ nodeData, selected, children }: { nodeData: FlowNodeData;
   );
 }
 
-/** SSH 参数可编辑，credentialRef 只接受 key-file:/ 或 session: 引用，不保存密码/私钥内容。 */
+/** SSH 节点只接受密码；密码写入服务端进程内凭据库，图仅保存 session 引用。 */
 export function SshSessionNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
-  const host = configText(node, 'host', '');
-  const credentialRef = configText(node, 'credentialRef', '');
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
-      <Field id={`${node.id}-host`} label="Host" value={host} onChange={(value) => set('host', value)} placeholder="camera.local" />
+      <Field id={`${node.id}-host`} label="Host" value={configText(node, 'host', '')} onChange={(value) => set('host', value)} placeholder="camera.local" />
       <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
       <Field id={`${node.id}-username`} label="User" value={configText(node, 'username', 'root')} onChange={(value) => set('username', value)} />
-      <Field id={`${node.id}-credential`} label="Credential ref" value={credentialRef} onChange={(value) => set('credentialRef', value)} placeholder="key-file:/absolute/path" />
+      <PasswordCredentialField nodeId={node.id} credentialRef={configText(node, 'credentialRef', '')} onCredentialRef={(value) => set('credentialRef', value)} />
       <Field id={`${node.id}-host-key`} label="Pinned host key" value={configText(node, 'expectedHostKey', '')} onChange={(value) => set('expectedHostKey', value)} placeholder="ssh-ed25519 AAAA…" />
       <Field id={`${node.id}-recipe`} label="Recipe ID" value={configText(node, 'recipeId', '')} onChange={(value) => set('recipeId', value)} placeholder="registered command recipe" />
-      <label className="node-hint">Only a credential reference is persisted; secret material never enters the workflow. Pin the host key before triggering.</label>
+      <label className="node-hint">Password authentication only. The password is never saved in the workflow; pin the host key before triggering.</label>
       <div className="node-actions">
         <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
       </div>
@@ -206,40 +229,150 @@ export function SshSessionNode({ data, selected }: NodeProps) {
   );
 }
 
-/** X5 control is explicit and side-effecting: every Probe/Status/RTSP/Snapshot click opens a TCP request. */
+/** X5 控制通过后端 TCP 请求执行；RTSP 编码和快照匹配参数分别持久化，避免互相污染。 */
 export function X5DeviceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const host = configText(node, 'host', '10.21.12.108');
   const tcpPort = numberValue(configText(node, 'tcpPort', '9073'), 9073);
-  const channel = numberValue(configText(node, 'channel', '0'));
+  const rtspChannel = x5Channel(node, 'rtspChannel');
+  const snapshotChannel = x5Channel(node, 'snapshotChannel');
+  const snapshotMode = x5SnapshotMode(configText(node, 'snapshotMode', 'latest'));
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<X5ControlResponse | string>();
+  const set = (key: string, value: string) => nodeData.onNodeConfigChange?.(node.id, key, value);
   const call = async (operation: () => Promise<X5ControlResponse>) => {
     setPending(true);
     try { setResult(await operation()); } catch (error) { setResult(String(error)); } finally { setPending(false); }
   };
   const binding = { host, tcpPort };
+  const snapshot = x5SnapshotRequest(node, binding, snapshotChannel, snapshotMode);
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
-      <Field id={`${node.id}-host`} label="Host" value={host} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'host', value)} />
-      <Field id={`${node.id}-tcp-port`} label="TCP port" value={configText(node, 'tcpPort', '9073')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'tcpPort', value)} type="number" />
-      <Field id={`${node.id}-channel`} label="Channel" value={configText(node, 'channel', '0')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'channel', value)} type="number" />
-      <Field id={`${node.id}-fps`} label="RTSP FPS" value={configText(node, 'fps', '60')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'fps', value)} type="number" />
-      <Field id={`${node.id}-bitrate`} label="RTSP kbps" value={configText(node, 'bitrateKbps', '12000')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'bitrateKbps', value)} type="number" />
+      <strong>Connection</strong>
+      <Field id={`${node.id}-host`} label="Host" value={host} onChange={(value) => set('host', value)} />
+      <Field id={`${node.id}-tcp-port`} label="TCP port" value={configText(node, 'tcpPort', '9073')} onChange={(value) => set('tcpPort', value)} type="number" />
+
+      <strong>RTSP stream</strong>
+      <Field id={`${node.id}-rtsp-channel`} label="RTSP channel" value={configText(node, 'rtspChannel', String(rtspChannel))} onChange={(value) => set('rtspChannel', value)} type="number" />
+      <Field id={`${node.id}-fps`} label="Encoder FPS" value={configText(node, 'fps', '60')} onChange={(value) => set('fps', value)} type="number" />
+      <Field id={`${node.id}-bitrate`} label="Encoder kbps" value={configText(node, 'bitrateKbps', '12000')} onChange={(value) => set('bitrateKbps', value)} type="number" />
       <div className="node-actions">
         <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => probeX5Control(binding))}>Probe</button>
         <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => statusX5Control(binding))}>Status</button>
         <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => configureX5Rtsp({ ...binding, fps: numberValue(configText(node, 'fps', '60'), 60), bitrateKbps: numberValue(configText(node, 'bitrateKbps', '12000'), 12000) }))}>Configure RTSP</button>
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => startX5RtspChannel({ ...binding, channel }))}>Start RTSP</button>
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => captureX5Snapshot({ ...binding, channel, mode: 'latest' }))}>Snapshot</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => startX5RtspChannel({ ...binding, channel: rtspChannel }))}>Start RTSP</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => stopX5RtspChannel({ ...binding, channel: rtspChannel }))}>Stop RTSP</button>
       </div>
-      <span className="node-hint">Snapshot/RTSP support depends on the connected X5 firmware; failed capability requests remain visible below.</span>
+
+      <strong>Snapshot</strong>
+      <Field id={`${node.id}-snapshot-channel`} label="Snapshot channel" value={configText(node, 'snapshotChannel', String(snapshotChannel))} onChange={(value) => set('snapshotChannel', value)} type="number" />
+      <SelectField
+        id={`${node.id}-snapshot-mode`}
+        label="Match mode"
+        value={snapshotMode}
+        options={X5_SNAPSHOT_MODES}
+        onChange={(value) => set('snapshotMode', value)}
+      />
+      {snapshotMode === 'frame_id' ? <Field id={`${node.id}-snapshot-frame-id`} label="Frame ID" value={configText(node, 'snapshotFrameId', '')} onChange={(value) => set('snapshotFrameId', value)} type="number" /> : null}
+      {snapshotMode === 'timestamp_ns' ? <Field id={`${node.id}-snapshot-timestamp`} label="Timestamp ns" value={configText(node, 'snapshotTimestampNs', '')} onChange={(value) => set('snapshotTimestampNs', value)} type="number" /> : null}
+      {snapshotMode === 'rtsp_pts_90k' ? <>
+        <Field id={`${node.id}-snapshot-rtsp-pts`} label="RTSP PTS (90 kHz)" value={configText(node, 'snapshotRtspPts90k', '')} onChange={(value) => set('snapshotRtspPts90k', value)} type="number" />
+        <Field id={`${node.id}-snapshot-rtsp-tolerance`} label="PTS tolerance (90 kHz)" value={configText(node, 'snapshotRtspPtsTolerance90k', '0')} onChange={(value) => set('snapshotRtspPtsTolerance90k', value)} type="number" />
+      </> : null}
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => snapshot instanceof Error ? Promise.reject(snapshot) : captureX5Snapshot(snapshot))}>Capture snapshot</button>
+      </div>
+      <span className="node-hint">Capture requests a real NV12 snapshot from the X5 TCP ring. The result reports verified metadata and byte count only; it does not emit an ImageFrame or fabricate a browser preview.</span>
       <ResultBox value={result} />
     </RemoteFrame>
   );
 }
 
+const X5_SNAPSHOT_MODES: readonly { value: X5SnapshotMode; label: string }[] = [
+  { value: 'latest', label: 'Latest frame' },
+  { value: 'frame_id', label: 'Exact frame ID' },
+  { value: 'timestamp_ns', label: 'Exact capture timestamp' },
+  { value: 'rtsp_pts_90k', label: 'RTSP PTS bridge' },
+];
+
+function x5SnapshotMode(value: string): X5SnapshotMode {
+  if (X5_SNAPSHOT_MODES.some((option) => option.value === value)) {
+    return value as X5SnapshotMode;
+  }
+  return 'latest';
+}
+
+function x5Channel(node: FlowNodeData['workflowNode'], key: 'rtspChannel' | 'snapshotChannel'): number {
+  const legacyChannels = node.config.channels;
+  const legacyChannel = Array.isArray(legacyChannels) && typeof legacyChannels[0] === 'number'
+    ? legacyChannels[0]
+    : numberValue(configText(node, 'channel', '0'));
+  const value = numberValue(configText(node, key, String(legacyChannel)), legacyChannel);
+  return Number.isInteger(value) && value >= 0 && value <= 65_535 ? value : legacyChannel;
+}
+
+function x5Unsigned(node: FlowNodeData['workflowNode'], key: string, label: string): number | Error {
+  const value = numberValue(configText(node, key, ''), Number.NaN);
+  return Number.isInteger(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER
+    ? value
+    : new Error(`${label} must be a non-negative integer`);
+}
+
+function x5SnapshotRequest(
+  node: FlowNodeData['workflowNode'],
+  binding: { host: string; tcpPort: number },
+  channel: number,
+  mode: X5SnapshotMode,
+): X5SnapshotRequest | Error {
+  const request: X5SnapshotRequest = { ...binding, channel, mode };
+  if (mode === 'frame_id') {
+    const frameId = x5Unsigned(node, 'snapshotFrameId', 'Frame ID');
+    return frameId instanceof Error ? frameId : { ...request, frameId };
+  }
+  if (mode === 'timestamp_ns') {
+    const timestampNs = x5Unsigned(node, 'snapshotTimestampNs', 'Timestamp ns');
+    return timestampNs instanceof Error ? timestampNs : { ...request, timestampNs };
+  }
+  if (mode === 'rtsp_pts_90k') {
+    const rtspPts90k = x5Unsigned(node, 'snapshotRtspPts90k', 'RTSP PTS');
+    const rtspPtsTolerance90k = x5Unsigned(node, 'snapshotRtspPtsTolerance90k', 'PTS tolerance');
+    return rtspPts90k instanceof Error ? rtspPts90k : rtspPtsTolerance90k instanceof Error ? rtspPtsTolerance90k : { ...request, rtspPts90k, rtspPtsTolerance90k };
+  }
+  return request;
+}
+
+/** 用密码替换当前节点对应的进程内 session；输入在服务端登记后立即清空。 */
+function PasswordCredentialField({ nodeId, credentialRef, onCredentialRef }: { nodeId: string; credentialRef: string; onCredentialRef: (value: string) => void }) {
+  const [password, setPassword] = useState('');
+  const [pending, setPending] = useState(false);
+  const [message, setMessage] = useState<string>();
+  const register = async () => {
+    setPending(true);
+    try {
+      const result = await registerSshPassword(nodeId, password);
+      onCredentialRef(result.credentialRef);
+      setPassword('');
+      setMessage('Password registered for this server process.');
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setPending(false);
+    }
+  };
+  return (
+    <>
+      <Field id={`${nodeId}-password`} label="Password" value={password} onChange={setPassword} type="password" placeholder="not saved" />
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={pending || !password} onClick={register}>Use password</button>
+      </div>
+      <span className="node-hint">{credentialRef ? 'Password is registered for this server process.' : 'Register a password before running remote operations.'}</span>
+      {message ? <span className="node-hint">{message}</span> : null}
+    </>
+  );
+}
+
+const I2C_BUS_OPTIONS = Array.from({ length: 8 }, (_, index) => ({ value: `i2c-${index}`, label: `I²C ${index}` }));
 function sshBinding(node: FlowNodeData['workflowNode']) {
   return {
     host: configText(node, 'host', ''),
@@ -308,15 +441,16 @@ function I2cForm({ data, selected, eeprom = false }: { data: NodeProps['data']; 
       <Field id={`${node.id}-host`} label="SSH host" value={ssh.host} onChange={(value) => set('host', value)} />
       <Field id={`${node.id}-port`} label="SSH port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
       <Field id={`${node.id}-user`} label="SSH user" value={ssh.username} onChange={(value) => set('username', value)} />
-      <Field id={`${node.id}-credential`} label="Credential ref" value={ssh.credentialRef} onChange={(value) => set('credentialRef', value)} placeholder="key-file:/absolute/path" />
+      <PasswordCredentialField nodeId={node.id} credentialRef={ssh.credentialRef} onCredentialRef={(value) => set('credentialRef', value)} />
       <Field id={`${node.id}-host-key`} label="Pinned host key" value={configText(node, 'expectedHostKey', '')} onChange={(value) => set('expectedHostKey', value)} />
-      <Field id={`${node.id}-bus`} label="I²C bus" value={base.bus} onChange={(value) => set('bus', value)} />
+      <SelectField id={`${node.id}-bus`} label="I²C bus" value={base.bus} options={I2C_BUS_OPTIONS} onChange={(value) => set('bus', value)} />
       <Field id={`${node.id}-address`} label="Address" value={configText(node, 'address', '0x50')} onChange={(value) => set('address', value)} />
       <Field id={`${node.id}-register`} label="Register" value={configText(node, 'register', '0x0000')} onChange={(value) => set('register', value)} />
       <Field id={`${node.id}-payload`} label="Payload bytes" value={configText(node, 'payload', '')} onChange={(value) => set('payload', value)} placeholder="0x01 0x02 …" />
       <Field id={`${node.id}-page-size`} label="Page size" value={configText(node, 'pageSize', '16')} onChange={(value) => set('pageSize', value)} type="number" />
-      {eeprom ? <Field id={`${node.id}-map`} label="EEPROM map" value={configText(node, 'mapId', 'yg-stereo-p24c64g-v1')} onChange={(value) => set('mapId', value)} /> : null}
-      {eeprom ? <label className="node-config-checkbox"><code>Verify after write</code><input className="nodrag nowheel" type="checkbox" checked={configBool(node, 'verifyAfterWrite', true)} onChange={(event) => set('verifyAfterWrite', event.target.checked)} /></label> : <Field id={`${node.id}-mode`} label="Mode" value={configText(node, 'mode', 'read')} onChange={(value) => set('mode', value === 'write' ? 'write' : 'read')} />}
+      {eeprom ? <SelectField id={`${node.id}-map`} label="EEPROM map" value={configText(node, 'mapId', 'yg-stereo-p24c64g-v1')} options={[{ value: 'yg-stereo-p24c64g-v1', label: 'YG Stereo P24C64G v1' }]} onChange={(value) => set('mapId', value)} /> : null}
+      {eeprom ? <label className="node-config-checkbox"><code>Verify after write</code><input className="nodrag nowheel" type="checkbox" checked={configBool(node, 'verifyAfterWrite', true)} onChange={(event) => set('verifyAfterWrite', event.target.checked)} /></label> : <SelectField id={`${node.id}-mode`} label="Mode" value={configText(node, 'mode', 'read')} options={[{ value: 'read', label: 'Read' }, { value: 'write', label: 'Write' }]} onChange={(value) => set('mode', value)} />}
+      <span className="node-hint">This node uses its inline SSH configuration; its hardware request is not driven by graph input ports.</span>
       <span className="node-hint">{warning}</span>
       <div className="node-actions">
         <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => run(() => eeprom ? previewEepromProvision(eepromPreview) : previewI2cTransfer(i2cPreview))}>Preview (no I/O)</button>

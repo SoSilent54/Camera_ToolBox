@@ -47,6 +47,7 @@ use camera_toolbox_core::{
 };
 use clap::Parser;
 use image::{ColorType, codecs::jpeg::JpegEncoder};
+use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -110,6 +111,9 @@ struct EepromSnapshotTarget {
 struct ControlRuntime {
     #[cfg(feature = "platform-ssh")]
     credential_resolver: Arc<dyn CredentialResolver>,
+    /// 密码注册接口仅写入此进程内 resolver；工作流只会持久化其 session 引用。
+    #[cfg(feature = "platform-ssh")]
+    password_credential_resolver: Arc<ProductionCredentialResolver>,
     #[cfg(feature = "platform-ssh")]
     ssh_transport: Arc<dyn SshTransportFactory>,
     #[cfg(feature = "platform-ssh")]
@@ -118,9 +122,13 @@ struct ControlRuntime {
 
 impl ControlRuntime {
     fn production() -> Self {
+        #[cfg(feature = "platform-ssh")]
+        let password_credential_resolver = Arc::new(ProductionCredentialResolver::new());
         Self {
             #[cfg(feature = "platform-ssh")]
-            credential_resolver: Arc::new(ProductionCredentialResolver::new()),
+            credential_resolver: password_credential_resolver.clone(),
+            #[cfg(feature = "platform-ssh")]
+            password_credential_resolver,
             #[cfg(feature = "platform-ssh")]
             ssh_transport: Arc::new(RusshTransportFactory),
             #[cfg(feature = "platform-ssh")]
@@ -136,12 +144,39 @@ impl ControlRuntime {
     ) -> Self {
         Self {
             credential_resolver,
+            password_credential_resolver: Arc::new(ProductionCredentialResolver::new()),
             ssh_transport,
             helper_payload: Some(helper_payload),
         }
     }
 }
 
+#[cfg(feature = "platform-ssh")]
+impl ControlRuntime {
+    /// 将一次 UI 密码替换为指定节点的进程内 session 引用；密码绝不进入工作流或响应体。
+    fn register_password(
+        &self,
+        node_id: &str,
+        password: String,
+    ) -> std::result::Result<String, PreviewApiError> {
+        if node_id.is_empty()
+            || node_id.len() > 128
+            || !node_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(PreviewApiError::bad_request(
+                "nodeId must contain only ASCII letters, digits, '-' or '_'",
+            ));
+        }
+        if password.is_empty() {
+            return Err(PreviewApiError::bad_request("password must not be empty"));
+        }
+        self.password_credential_resolver
+            .register_session_password(node_id, SecretString::from(password))
+            .map_err(PreviewApiError::bad_request)
+    }
+}
 impl ControlRuntime {
     fn execute_i2c(
         &self,
@@ -845,15 +880,14 @@ fn validate_credential_ref(reference: &str) -> std::result::Result<String, Previ
     let reference = reference.trim();
     if reference.is_empty() || reference.contains(['\0', '\n', '\r']) {
         return Err(PreviewApiError::bad_request(
-            "ssh.credentialRef must be a non-empty process-local credential reference",
+            "ssh.credentialRef must be a non-empty credential reference",
         ));
     }
-    // 本 web 后端只接受 key-file 引用：凭据经 ProductionCredentialResolver 按 operation
-    // 读取私钥文件，密码不落盘。`session:` 引用依赖进程内预注册（Device Manager），
-    // 本服务没有对应注册路由，支持它只会制造「永远解析失败」的死路径，故显式拒绝。
-    if !reference.starts_with("key-file:/") {
+    // 新建的 SSH / I²C / EEPROM 节点仅由 password 注册端点产生 session 引用；保留
+    // key-file 解析以兼容现有 SFTP 工作流，避免把该兼容路径重新暴露到这些节点的 UI。
+    if !reference.starts_with("session:") && !reference.starts_with("key-file:/") {
         return Err(PreviewApiError::bad_request(
-            "ssh.credentialRef must use key-file:/absolute/path",
+            "ssh.credentialRef must use session:<node-id> or key-file:/absolute/path",
         ));
     }
     Ok(reference.to_owned())
@@ -1022,6 +1056,19 @@ struct SshExecutionBinding {
     /// 避免无条件接受任意服务器密钥（MITM 防护）。
     #[serde(default)]
     expected_host_key: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SshPasswordRegistrationRequest {
+    node_id: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SshPasswordRegistrationResponse {
+    credential_ref: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1374,6 +1421,24 @@ pub(crate) fn control_dispatch(
     state: &AppState,
 ) -> Result<serde_json::Value, String> {
     match path {
+        "control.ssh.password" => {
+            let request: SshPasswordRegistrationRequest =
+                serde_json::from_value(payload).map_err(ws_deser_err)?;
+            #[cfg(feature = "platform-ssh")]
+            {
+                let credential_ref = state
+                    .control_runtime
+                    .register_password(&request.node_id, request.password)
+                    .map_err(|error| error.error)?;
+                return serde_json::to_value(SshPasswordRegistrationResponse { credential_ref })
+                    .map_err(ws_ser_err);
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                let _ = request;
+                return Err("workflow-web was built without platform-ssh support".to_owned());
+            }
+        }
         "control.i2c.preview" => {
             let req: I2cPreviewRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
             let preview = build_i2c_preview(req).map_err(|e| e.error)?;
@@ -2464,11 +2529,26 @@ mod tests {
 
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn credential_ref_rejects_session_and_plaintext() {
-        // `session:` 是本服务无法解析的死路径，必须拒绝而非误导用户。
-        assert!(validate_credential_ref("session:test").is_err());
+    fn credential_ref_accepts_session_or_legacy_sftp_key_reference() {
+        assert!(validate_credential_ref("session:test").is_ok());
         assert!(validate_credential_ref("password:secret").is_err());
         assert!(validate_credential_ref("key-file:/tmp/id_ed25519").is_ok());
         assert!(validate_credential_ref("key-file:/tmp/id\ninjected").is_err());
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn password_registration_returns_process_local_session_reference() {
+        let runtime = ControlRuntime::production();
+        let reference = runtime
+            .register_password("ssh-node", "password".to_owned())
+            .expect("password registers");
+        assert_eq!(reference, "session:ssh-node");
+        assert!(
+            runtime
+                .password_credential_resolver
+                .has_session(&reference)
+                .unwrap()
+        );
     }
 }

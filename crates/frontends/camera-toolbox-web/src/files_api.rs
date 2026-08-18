@@ -23,7 +23,6 @@ pub struct FileListResponse {
     pub entries: Vec<DirectoryEntry>,
 }
 
-
 /// 列目录核心逻辑（ws_router 的 `file.local.list` 复用；错误归一为字符串）。
 pub(crate) fn list_local_files_inner(
     root: &str,
@@ -32,8 +31,8 @@ pub(crate) fn list_local_files_inner(
     let root = resolve_root(root).map_err(|(_, msg)| msg)?;
     let relative = resolve_relative(path).map_err(|(_, msg)| msg)?;
     let dir = root.join(relative);
-    let dir = std::fs::canonicalize(&dir)
-        .map_err(|error| format!("directory not found: {error}"))?;
+    let dir =
+        std::fs::canonicalize(&dir).map_err(|error| format!("directory not found: {error}"))?;
     if !dir.starts_with(&root) {
         return Err("path escapes workspace root".to_owned());
     }
@@ -90,7 +89,10 @@ fn resolve_root(root: &str) -> Result<PathBuf, (StatusCode, String)> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|error| (StatusCode::NOT_FOUND, format!("root not found: {error}")))?;
     if !canonical.is_dir() {
-        return Err((StatusCode::BAD_REQUEST, "root must be a directory".to_owned()));
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "root must be a directory".to_owned(),
+        ));
     }
     Ok(canonical)
 }

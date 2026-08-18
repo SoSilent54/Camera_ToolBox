@@ -58,8 +58,8 @@ impl NodeInstance for ChessboardDetectorNode {
         rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
         // 只处理帧类输入；detection 等旁路输入忽略。
-        let (("image", DataPacket::ImageFrame(frame))
-        | ("frames", DataPacket::VideoFrame(frame))) = (port, packet)
+        let (("image", DataPacket::ImageFrame(frame)) | ("frames", DataPacket::VideoFrame(frame))) =
+            (port, packet)
         else {
             return Ok(());
         };
@@ -127,9 +127,7 @@ impl ChessboardDetectorNode {
                 Ok(())
             }
             ChessboardDetectionOutcome::NotFound { image_size } => {
-                rt.report_event(format!(
-                    "chessboard not found in {image_size:?} frame"
-                ));
+                rt.report_event(format!("chessboard not found in {image_size:?} frame"));
                 self.emit_overlay(rt, false)?;
                 rt.report_state(NodeRuntimeState::Idle, "not found");
                 Ok(())
@@ -281,9 +279,9 @@ mod tests {
         let mut node = ChessboardDetectorNode { spec: input };
         // 空帧在取任何 service 之前即被跳过，因此无需注入服务也应成功返回。
         let (mut rt, _outputs) = runtime(EngineServices::default());
-        assert!(node
-            .on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
-            .is_ok());
+        assert!(
+            node.on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
+                .is_ok()
+        );
     }
 }
-

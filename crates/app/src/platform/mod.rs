@@ -23,11 +23,11 @@ pub use capability::{
     SensorPlatformCapabilityCell, SensorPlatformCapabilityMatrix, SshManagedBindings,
     TargetResolutionSnapshot,
 };
-pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
 pub use control::{
     ControlTargetSpec, EepromExecutor, I2cExecutor, SftpFileReader, SshCommandExecutor,
     X5ControlClient,
 };
+pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
 pub use eeprom::{
     EEPROM_EXPERIMENTAL_PROVISION_WARNING, EEPROM_HELPER_SCHEMA_VERSION, EepromDeviceState,
     EepromHelperAction, EepromHelperFailure, EepromHelperOutput, EepromHelperRequest,

@@ -1,10 +1,8 @@
 //! I²C Transfer / EEPROM Provision 节点真实实现（依赖 app 层的 `I2cExecutor`/`EepromExecutor` trait）。
 //!
-//! 这两个节点不再走 skeleton，而是：
-//! - `on_action(Trigger)` 读 config 的连接字段（host/port/username/credentialRef/expectedHostKey）
-//!   → 构造 `ControlTargetSpec`；再读 bus/address/register/payload/mode 构造 `I2cHelperAction`
-//!   （或 `EepromHelperAction`），经 `rt.services().i2c_executor()?`（/`eeprom_executor()?`）执行，
-//!   result 序列化为 `DataPacket::Json` 从 `result` 端口输出。
+//! 这两个节点的真实 I/O 由 web control preview/inspect/confirm 端点驱动；GraphEngine
+//! `runtime.node.action` 不允许直接触发 I²C/EEPROM，避免绕过 UI 的写入确认与 EEPROM
+//! inspect hash 门禁。内部 `execute` 保留给测试和后续单一路径收敛使用。
 //! - 未注入 executor 或必需连接字段缺失 → `NodeError::Precondition`，不 panic。
 //!
 //! 真实 SSH helper 执行体（`SshI2cHelperService`/`SshEepromProvisionService` 适配为 executor）由
@@ -20,9 +18,12 @@ use crate::engine::{
     NodeSpec,
 };
 use crate::platform::{
-    CommandResult, ControlTargetSpec, DecodedVideoFrame, DumpCancellation, I2cHelperAction,
-    I2cHelperResult, I2cMessageData, I2cMessageSpec, I2cTransactionSpec, RemoteOperationControl,
+    CommandResult, ControlTargetSpec, DecodedVideoFrame, DumpCancellation, RemoteOperationControl,
     RemoteTimeouts, StreamFrameIdentity, StreamSessionId, TypedCommandRequest,
+};
+#[cfg(test)]
+use crate::platform::{
+    I2cHelperAction, I2cHelperResult, I2cMessageData, I2cMessageSpec, I2cTransactionSpec,
 };
 use crate::ports::RasterFormat;
 
@@ -43,6 +44,7 @@ impl NodeFactory for I2cTransferFactory {
 }
 
 pub struct I2cTransferNode {
+    #[cfg_attr(not(test), allow(dead_code))]
     spec: NodeSpec,
 }
 
@@ -52,7 +54,10 @@ impl NodeInstance for I2cTransferNode {
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Ready, "trigger to execute I2C transfer");
+        rt.report_state(
+            NodeRuntimeState::Ready,
+            "use preview/run controls to execute I2C",
+        );
         Ok(())
     }
 
@@ -65,11 +70,8 @@ impl NodeInstance for I2cTransferNode {
         Ok(())
     }
 
-    fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        match action {
-            NodeAction::Trigger => self.execute(rt),
-            other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
-        }
+    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        Err(NodeError::UnsupportedAction(action.name().to_owned()))
     }
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -78,6 +80,7 @@ impl NodeInstance for I2cTransferNode {
     }
 }
 
+#[cfg(test)]
 impl I2cTransferNode {
     fn execute(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         let target = self.target()?;
@@ -195,6 +198,7 @@ impl NodeFactory for EepromProvisionFactory {
 }
 
 pub struct EepromProvisionNode {
+    #[cfg_attr(not(test), allow(dead_code))]
     spec: NodeSpec,
 }
 
@@ -206,7 +210,7 @@ impl NodeInstance for EepromProvisionNode {
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         rt.report_state(
             NodeRuntimeState::Ready,
-            "trigger to inspect/provision EEPROM",
+            "use inspect/provision controls to execute EEPROM",
         );
         Ok(())
     }
@@ -220,11 +224,8 @@ impl NodeInstance for EepromProvisionNode {
         Ok(())
     }
 
-    fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        match action {
-            NodeAction::Trigger => self.execute(rt),
-            other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
-        }
+    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        Err(NodeError::UnsupportedAction(action.name().to_owned()))
     }
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -233,6 +234,7 @@ impl NodeInstance for EepromProvisionNode {
     }
 }
 
+#[cfg(test)]
 impl EepromProvisionNode {
     fn execute(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         let target = self.target()?;
@@ -355,6 +357,7 @@ fn non_empty(value: String) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 /// 解析 `i2c-N` 或十进制数字为 u32。
 fn parse_i2c_bus(bus: &str) -> Result<u32, NodeError> {
     let digits = bus.trim().strip_prefix("i2c-").unwrap_or(bus.trim());
@@ -363,6 +366,7 @@ fn parse_i2c_bus(bus: &str) -> Result<u32, NodeError> {
         .map_err(|_| NodeError::Config("config `bus` must be `i2c-N` or decimal N".to_owned()))
 }
 
+#[cfg(test)]
 /// 解析 `0x..` 十六进制为 u16（address / register）。
 fn parse_hex_u16(value: &str) -> Result<u16, NodeError> {
     let trimmed = value.trim();
@@ -374,6 +378,7 @@ fn parse_hex_u16(value: &str) -> Result<u16, NodeError> {
         .map_err(|_| NodeError::Config(format!("config value `{value}` must be a hex u16")))
 }
 
+#[cfg(test)]
 /// 解析十六进制字符串（可含 `0x` 前缀）为字节。
 fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, NodeError> {
     let trimmed = value.trim();
@@ -397,6 +402,7 @@ fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, NodeError> {
         .map_err(|_| NodeError::Config("config `payload` must be valid hex".to_owned()))
 }
 
+#[cfg(test)]
 fn config_usize(spec: &NodeSpec, key: &str, fallback: usize) -> usize {
     spec.config
         .get(key)
@@ -405,6 +411,7 @@ fn config_usize(spec: &NodeSpec, key: &str, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
+#[cfg(test)]
 /// 按 pageSize 把 payload 分段成多个写 transaction（每段 register 地址 + chunk，写后 settle 5ms）。
 /// 与 main.rs 的 `page_write_transactions` 语义一致，保证 EEPROM page-write 周期正确分页。
 fn page_write_transactions(
@@ -442,6 +449,7 @@ fn page_write_transactions(
     Ok(transactions)
 }
 
+#[cfg(test)]
 /// 把可序列化结果 emit 到 `result` 端口（若声明）；序列化为 Json 负载。
 fn emit_json_result<T: serde::Serialize>(
     rt: &NodeRuntime,
@@ -458,8 +466,8 @@ fn emit_json_result<T: serde::Serialize>(
 // X5 Device 节点
 // ---------------------------------------------------------------------------
 
-/// X5_233 设备控制节点：经 `X5ControlClient` 执行 probe / status / snapshot，
-/// 输出设备状态到 `control` 端口、抓帧元数据到 `snapshot` 端口。
+/// X5_233 设备控制节点：仅作为图内控制配置节点执行 probe/status/snapshot 副作用，
+/// 结果通过状态/事件报告；不向未声明的数据端口伪造输出。
 pub struct X5DeviceFactory;
 
 impl NodeFactory for X5DeviceFactory {
@@ -487,12 +495,10 @@ impl X5DeviceNode {
         s.parse::<u16>().unwrap_or(9073)
     }
 
-    fn channel(&self) -> u16 {
+    fn snapshot_channel(&self) -> u16 {
         self.spec
             .config
-            .get("channels")
-            .and_then(serde_json::Value::as_array)
-            .and_then(|arr| arr.first())
+            .get("snapshotChannel")
             .and_then(serde_json::Value::as_u64)
             .map(|v| v as u16)
             .unwrap_or(0)
@@ -523,26 +529,27 @@ impl NodeInstance for X5DeviceNode {
         let host = self.host()?;
         let port = self.port();
         match action {
-            // Trigger：读取设备状态（probe + status），结果 emit 到 control 端口。
+            // Trigger：读取设备状态；X5Device 当前无图数据输出端口，只报告执行结果。
             NodeAction::Trigger => {
-                let status = client.status(&host, port).map_err(NodeError::Execution)?;
                 rt.report_state(NodeRuntimeState::Running, "querying X5 status");
-                let _ = rt.emit("control", DataPacket::Json(Arc::new(status)));
+                let _status = client.status(&host, port).map_err(NodeError::Execution)?;
+                rt.report_event("x5 status ready".to_owned());
                 rt.report_state(NodeRuntimeState::Idle, "x5 status ready");
                 Ok(())
             }
             // Custom "probe"：仅探针。
             NodeAction::Custom { name, .. } if name == "probe" => {
-                let summary = client.probe(&host, port).map_err(NodeError::Execution)?;
-                let _ = rt.emit("control", DataPacket::Json(Arc::new(summary)));
+                let _summary = client.probe(&host, port).map_err(NodeError::Execution)?;
+                rt.report_event("x5 probe ready".to_owned());
                 Ok(())
             }
-            // Custom "snapshot"：抓帧，元数据 emit 到 snapshot 端口。
+            // Custom "snapshot"：抓取当前 snapshotChannel；响应是 NV12 元数据，不是 ImageFrame。
             NodeAction::Custom { name, .. } if name == "snapshot" => {
-                let snapshot = client
-                    .capture_snapshot(&host, port, self.channel())
+                let channel = self.snapshot_channel();
+                let _snapshot = client
+                    .capture_snapshot(&host, port, channel)
                     .map_err(NodeError::Execution)?;
-                let _ = rt.emit("snapshot", DataPacket::Json(Arc::new(snapshot)));
+                rt.report_event(format!("x5 snapshot ready on channel {channel}"));
                 Ok(())
             }
             other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
@@ -849,11 +856,13 @@ fn control_timeout(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
+
+    use parking_lot::Mutex;
 
     use super::*;
     use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
-    use crate::platform::{EepromExecutor, I2cExecutor};
+    use crate::platform::{EepromExecutor, I2cExecutor, X5ControlClient};
 
     fn i2c_spec() -> NodeSpec {
         NodeSpec {
@@ -872,7 +881,7 @@ mod tests {
                 "host": "camera.local",
                 "port": "22",
                 "username": "root",
-                "credentialRef": "key-file:/x",
+                "credentialRef": "session:test",
                 "expectedHostKey": "",
                 "bus": "i2c-8",
                 "address": "0x50",
@@ -881,6 +890,21 @@ mod tests {
                 "pageSize": 16,
                 "mode": "read",
                 "confirmWrites": true,
+            }),
+        }
+    }
+
+    fn x5_spec() -> NodeSpec {
+        NodeSpec {
+            id: "x5-1".to_owned(),
+            kind: "x5Device".to_owned(),
+            title: "X5 Device".to_owned(),
+            inputs: vec![],
+            outputs: vec![],
+            config: serde_json::json!({
+                "host": "camera.local",
+                "tcpPort": 9073,
+                "snapshotChannel": 3,
             }),
         }
     }
@@ -900,7 +924,6 @@ mod tests {
         (NodeRuntime::new(ctx), outputs)
     }
 
-    /// 记录调用并返回固定 BusList 结果的 mock I2cExecutor。
     struct RecordingI2cExecutor {
         called: Arc<Mutex<usize>>,
     }
@@ -913,19 +936,56 @@ mod tests {
             _action: I2cHelperAction,
             _control: RemoteOperationControl,
         ) -> Result<I2cHelperResult, String> {
-            *self.called.lock().unwrap() += 1;
+            *self.called.lock() += 1;
             Ok(I2cHelperResult::Transfer {
                 transactions: vec![],
             })
         }
     }
 
+    struct RecordingX5Client {
+        snapshot_channel: Arc<Mutex<Option<u16>>>,
+    }
+
+    impl X5ControlClient for RecordingX5Client {
+        fn probe(&self, _host: &str, _port: u16) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        fn status(&self, _host: &str, _port: u16) -> Result<serde_json::Value, String> {
+            Ok(serde_json::json!({"ok": true}))
+        }
+
+        fn capture_snapshot(
+            &self,
+            _host: &str,
+            _port: u16,
+            channel: u16,
+        ) -> Result<serde_json::Value, String> {
+            *self.snapshot_channel.lock() = Some(channel);
+            Ok(serde_json::json!({"channel": channel, "payloadBytes": 3110400}))
+        }
+    }
+
     #[test]
-    fn missing_executor_is_precondition() {
+    fn raw_i2c_runtime_trigger_is_disabled() {
         let mut node = I2cTransferNode { spec: i2c_spec() };
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let err = node
             .on_action(NodeAction::Trigger, &mut rt)
+            .expect_err("raw runtime trigger must not bypass control confirmation");
+        assert!(
+            matches!(err, NodeError::UnsupportedAction(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_executor_is_precondition_for_internal_execute() {
+        let node = I2cTransferNode { spec: i2c_spec() };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let err = node
+            .execute(&mut rt)
             .expect_err("missing i2c_executor must be a precondition");
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
     }
@@ -934,8 +994,7 @@ mod tests {
     fn missing_host_is_precondition_before_executor() {
         let mut spec = i2c_spec();
         spec.config["host"] = serde_json::json!("");
-        spec.config["credentialRef"] = serde_json::json!("key-file:/x");
-        let mut node = I2cTransferNode { spec };
+        let node = I2cTransferNode { spec };
         let executor_called = Arc::new(Mutex::new(0));
         let services = EngineServices {
             i2c_executor: Some(Arc::new(RecordingI2cExecutor {
@@ -945,15 +1004,15 @@ mod tests {
         };
         let (mut rt, _outputs) = runtime(services);
         let err = node
-            .on_action(NodeAction::Trigger, &mut rt)
+            .execute(&mut rt)
             .expect_err("missing host must be precondition");
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
-        assert_eq!(*executor_called.lock().unwrap(), 0);
+        assert_eq!(*executor_called.lock(), 0);
     }
 
     #[test]
     fn executor_is_invoked_and_result_emitted() {
-        let mut node = I2cTransferNode { spec: i2c_spec() };
+        let node = I2cTransferNode { spec: i2c_spec() };
         let executor_called = Arc::new(Mutex::new(0));
         let services = EngineServices {
             i2c_executor: Some(Arc::new(RecordingI2cExecutor {
@@ -962,9 +1021,45 @@ mod tests {
             ..EngineServices::default()
         };
         let (mut rt, _outputs) = runtime(services);
-        // 输出端口 result 未接线（无下游 emit 为 no-op 成功），触发应成功返回。
-        assert!(node.on_action(NodeAction::Trigger, &mut rt).is_ok());
-        assert_eq!(*executor_called.lock().unwrap(), 1);
+        assert!(node.execute(&mut rt).is_ok());
+        assert_eq!(*executor_called.lock(), 1);
+    }
+
+    #[test]
+    fn raw_eeprom_runtime_trigger_is_disabled() {
+        let mut node = EepromProvisionNode { spec: i2c_spec() };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let err = node
+            .on_action(NodeAction::Trigger, &mut rt)
+            .expect_err("raw runtime trigger must not bypass inspect/provision gate");
+        assert!(
+            matches!(err, NodeError::UnsupportedAction(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn x5_snapshot_uses_snapshot_channel_without_declared_outputs() {
+        let snapshot_channel = Arc::new(Mutex::new(None));
+        let mut node = X5DeviceNode { spec: x5_spec() };
+        let services = EngineServices {
+            x5_client: Some(Arc::new(RecordingX5Client {
+                snapshot_channel: Arc::clone(&snapshot_channel),
+            })),
+            ..EngineServices::default()
+        };
+        let (mut rt, _outputs) = runtime(services);
+
+        node.on_action(
+            NodeAction::Custom {
+                name: "snapshot".to_owned(),
+                payload: serde_json::json!({}),
+            },
+            &mut rt,
+        )
+        .expect("snapshot action uses x5 client");
+
+        assert_eq!(*snapshot_channel.lock(), Some(3));
     }
 
     #[test]
@@ -975,10 +1070,9 @@ mod tests {
         assert_eq!(parse_i2c_bus("8").unwrap(), 8);
         assert_eq!(parse_hex_bytes("0x00ab").unwrap(), vec![0x00, 0xab]);
         assert_eq!(parse_hex_bytes("").unwrap(), Vec::<u8>::new());
-        assert!(parse_hex_bytes("0x0").is_err()); // 奇数长度
+        assert!(parse_hex_bytes("0x0").is_err());
     }
 
-    // 避免 EepromExecutor 未使用告警：即便本任务只深入测 i2c，也确保 trait 可被引用。
     #[allow(dead_code)]
     fn _eeprom_executor_is_importable() -> Option<Arc<dyn EepromExecutor>> {
         None
