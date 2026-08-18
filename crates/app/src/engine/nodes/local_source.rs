@@ -6,8 +6,8 @@
 //! - `.jpg`/`.jpeg` → `RasterImageCodec::decode_rgba8(Jpeg)`
 //! - `.raw` 或其他 → 上报「RAW/后续」事件，不 demosaic、不 panic。
 //!
-//! 解码出的 `Rgba8Frame` 转为 `DecodedVideoFrame` 后经 `image`（及可选 `preview`）端口输出
-//! `ImageFrame`；`fileRef` 可选输出携带解析后的绝对路径（`Json`）。
+//! 解码出的 `Rgba8Frame` 转为带显式 RGBA8 格式的 `ImageFrame` 后经 `image`（及可选
+//! `preview`）端口输出；`fileRef` 可选输出携带解析后的绝对路径（`Json`）。
 //!
 //! 未注入 `image_codec`、路径为空或读取失败时按前置/执行条件失败，不 panic。
 
@@ -16,10 +16,10 @@ use std::sync::Arc;
 
 use crate::{
     engine::{
-        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
-        NodeRuntimeState, NodeSpec, PortSpec,
+        DataPacket, ImageFrame, ImageFrameIdentity, NodeAction, NodeError, NodeFactory,
+        NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
     },
-    platform::{DecodedVideoFrame, StreamFrameIdentity, StreamSessionId},
+    platform::{StreamFrameIdentity, StreamSessionId},
     ports::{RasterFormat, RasterImageCodec},
 };
 
@@ -102,23 +102,24 @@ impl LocalFileSourceNode {
             .decode_rgba8(format, &bytes, DECODED_IMAGE_BYTE_LIMIT)
             .map_err(|error| NodeError::Execution(error.to_string()))?;
 
-        // Rgba8Frame 可能带 stride；DecodedVideoFrame 要求紧密排列 RGBA，统一复制紧凑像素。
+        // Rgba8Frame 可能带 stride；ImageFrame 以紧密排列的 RGBA8 单平面承载。
         let compact = compact_rgba(&rgba)?;
-        let frame = Arc::new(DecodedVideoFrame {
-            width: rgba.width,
-            height: rgba.height,
-            rgba: compact,
-            identity: StreamFrameIdentity::unavailable(
-                StreamSessionId::new(format!("local-{}", self.spec.id)).map_err(|_| {
-                    NodeError::Execution("invalid local stream session id".to_owned())
-                })?,
-                0,
-                0,
-                "local-file-source".to_owned(),
-            ),
-        });
-
-        rt.emit("image", DataPacket::ImageFrame(Arc::clone(&frame)))?;
+        let identity = StreamFrameIdentity::unavailable(
+            StreamSessionId::new(format!("local-{}", self.spec.id))
+                .map_err(|_| NodeError::Execution("invalid local stream session id".to_owned()))?,
+            0,
+            0,
+            "local-file-source".to_owned(),
+        );
+        let frame = Arc::new(
+            ImageFrame::rgba8(
+                rgba.width,
+                rgba.height,
+                compact,
+                ImageFrameIdentity::from(&identity),
+            )
+            .map_err(|error| NodeError::Execution(error.to_string()))?,
+        );
         if has_output_port(&self.spec, "preview") {
             rt.emit("preview", DataPacket::ImageFrame(Arc::clone(&frame)))?;
         }

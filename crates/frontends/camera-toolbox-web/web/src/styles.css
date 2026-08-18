@@ -623,7 +623,7 @@ button:hover {
   position: relative;
   display: flex;
   align-items: center;
-  block-size: 0.85rem;
+  min-block-size: 1rem;
   min-width: 0;
   max-inline-size: 100%;
 }
@@ -814,19 +814,53 @@ button:disabled {
 
 /* 端口类型标签 + 连接点按类型着色 */
 .port-label {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 0.08rem;
   min-width: 0;
   max-inline-size: 100%;
   overflow: hidden;
   color: inherit;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.56rem;
-  line-height: 1;
-  letter-spacing: 0.02em;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  font-size: 0.54rem;
+  line-height: 1.08;
   pointer-events: none;
   user-select: none;
+}
+
+.port-label-output {
+  justify-items: end;
+  text-align: right;
+}
+
+.port-label-name,
+.port-label-kind,
+.port-format-hint {
+  min-width: 0;
+  max-inline-size: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.port-label-name {
+  color: #e2e8f0;
+  font-weight: 650;
+}
+
+.port-label-kind {
+  opacity: 0.82;
+}
+
+.port-format-hint {
+  inline-size: fit-content;
+  max-inline-size: 100%;
+  border: 1px solid currentColor;
+  border-radius: 2px;
+  padding: 0 0.16rem;
+  font-size: 0.48rem;
+  line-height: 1.25;
+  opacity: 0.9;
 }
 
 .stream-handle.port-tone-media { background: #38bdf8; }

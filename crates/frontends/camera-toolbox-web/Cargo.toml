@@ -14,6 +14,7 @@ platform-local = ["camera-toolbox-adapters/platform-local"]
 platform-cv610 = ["camera-toolbox-adapters/platform-cv610"]
 platform-ssh = ["camera-toolbox-adapters/platform-ssh"]
 calibration-opencv = ["camera-toolbox-adapters/calibration-opencv"]
+hex-arm-control = ["camera-toolbox-adapters/hex-arm-control"]
 [[bin]]
 name = "camera-toolbox-web"
 path = "src/main.rs"

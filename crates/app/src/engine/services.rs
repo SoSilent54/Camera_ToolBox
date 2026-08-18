@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use super::node::NodeError;
 use crate::platform::{
-    EepromExecutor, I2cExecutor, RtspStreamConfig, SftpFileReader, SshCommandExecutor,
-    StreamService, X5ControlClient,
+    EepromExecutor, HexArmControlClient, I2cExecutor, RtspStreamConfig, SftpFileReader,
+    SshCommandExecutor, StreamService, X5ControlClient,
 };
 use crate::ports::{CalibrationBackend, RasterImageCodec, RawFrameLoader};
 
@@ -28,6 +28,7 @@ pub struct EngineServices {
     pub i2c_executor: Option<Arc<dyn I2cExecutor>>,
     pub eeprom_executor: Option<Arc<dyn EepromExecutor>>,
     pub x5_client: Option<Arc<dyn X5ControlClient>>,
+    pub hex_arm_client: Option<Arc<dyn HexArmControlClient>>,
     pub sftp_reader: Option<Arc<dyn SftpFileReader>>,
     pub ssh_command_executor: Option<Arc<dyn SshCommandExecutor>>,
 }
@@ -75,10 +76,17 @@ impl EngineServices {
             .ok_or_else(|| NodeError::Precondition("eeprom executor is not configured".to_owned()))
     }
 
-    /// 获取 X5 控制客户端（X5Device 节点 probe/status/snapshot 时使用）。
+    /// 获取 X5_233 Driver 控制客户端（状态查询和 `command.capture.request.v1` 时使用）。
     pub fn x5_client(&self) -> Result<Arc<dyn X5ControlClient>, NodeError> {
         self.x5_client.clone().ok_or_else(|| {
             NodeError::Precondition("x5 control client is not configured".to_owned())
+        })
+    }
+
+    /// 获取 Hex Arm 控制客户端（HexArmDevice 节点执行控制动作时使用）。
+    pub fn hex_arm_client(&self) -> Result<Arc<dyn HexArmControlClient>, NodeError> {
+        self.hex_arm_client.clone().ok_or_else(|| {
+            NodeError::Precondition("hex arm control client is not configured".to_owned())
         })
     }
 

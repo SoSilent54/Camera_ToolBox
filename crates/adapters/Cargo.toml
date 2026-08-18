@@ -10,6 +10,13 @@ default = ["platform-all"]
 platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
 calibration-opencv = ["dep:opencv"]
 platform-local = ["dep:serde_json"]
+hex-arm-control = [
+    "dep:futures-util",
+    "dep:prost",
+    "dep:serde_json",
+    "dep:tokio",
+    "dep:tokio-tungstenite",
+]
 platform-cv610 = ["dep:sha2", "dep:socket2"]
 platform-ssh = [
     "dep:directories",
@@ -41,6 +48,13 @@ tracing.workspace = true
 secrecy = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
+futures-util = { version = "0.3", default-features = false, optional = true, features = ["sink", "std"] }
+prost = { version = "0.13", optional = true }
+tokio-tungstenite = { version = "0.26", default-features = false, optional = true, features = ["connect"] }
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3"
+
 
 [dev-dependencies]
 sha2.workspace = true

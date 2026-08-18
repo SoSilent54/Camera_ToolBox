@@ -143,7 +143,7 @@ impl GraphEngine {
             );
         }
 
-        // 3. 接线（fan-out）：源输出端口 → 目标 mailbox。
+        // 3. 接线（fan-out）：源输出端口 → 目标 mailbox 的目标输入端口。
         //    先按 node_id 建规格索引，校验边的端口确实存在于声明的 inputs/outputs 上，
         //    并执行 D7 cardinality 判重：One 输入端口只允许一条入边。
         let node_specs: HashMap<&NodeId, &NodeSpec> =
@@ -157,7 +157,11 @@ impl GraphEngine {
             let source_outputs = outputs
                 .get_mut(&edge.source.node_id)
                 .expect("source node validated to exist");
-            source_outputs.connect(edge.source.port_id.clone(), target_tx.clone());
+            source_outputs.connect(
+                edge.source.port_id.clone(),
+                edge.target.port_id.clone(),
+                target_tx.clone(),
+            );
         }
 
         // 4. spawn actor，并推导初始状态。
@@ -386,14 +390,18 @@ impl GraphEngine {
             for (id, edge) in &related {
                 if edge.source.node_id == node_id {
                     if let Some(target) = inner.nodes.get(&edge.target.node_id) {
-                        handle
-                            .outputs
-                            .disconnect(edge.source.port_id.clone(), &target.mailbox);
+                        handle.outputs.disconnect(
+                            edge.source.port_id.clone(),
+                            &edge.target.port_id,
+                            &target.mailbox,
+                        );
                     }
                 } else if let Some(source) = inner.nodes.get_mut(&edge.source.node_id) {
-                    source
-                        .outputs
-                        .disconnect(edge.source.port_id.clone(), &handle.mailbox);
+                    source.outputs.disconnect(
+                        edge.source.port_id.clone(),
+                        &edge.target.port_id,
+                        &handle.mailbox,
+                    );
                 }
                 inner.edges.remove(id);
             }
@@ -451,7 +459,11 @@ impl GraphEngine {
             .get_mut(&edge.source.node_id)
             .expect("source validated")
             .outputs
-            .connect(edge.source.port_id.clone(), target_mailbox);
+            .connect(
+                edge.source.port_id.clone(),
+                edge.target.port_id.clone(),
+                target_mailbox,
+            );
         inner.edges.insert(edge.id.clone(), edge);
         Ok(())
     }
@@ -475,15 +487,17 @@ impl GraphEngine {
             .map(|handle| handle.mailbox.clone());
         if let Some(target_mailbox) = target_mailbox {
             if let Some(source) = inner.nodes.get_mut(&edge.source.node_id) {
-                source
-                    .outputs
-                    .disconnect(edge.source.port_id.clone(), &target_mailbox);
+                source.outputs.disconnect(
+                    edge.source.port_id.clone(),
+                    &edge.target.port_id,
+                    &target_mailbox,
+                );
             }
         }
         Ok(())
     }
 
-    /// 增量：更新节点 config（本阶段为 config 替换），保留其余 spec 字段不动。
+    /// 增量：更新节点 config，并在 actor 线程完成节点专属安全重配置后提交。
     pub fn update_node(
         &self,
         node_id: &str,
@@ -496,6 +510,33 @@ impl GraphEngine {
         let handle = inner.nodes.get_mut(node_id).ok_or_else(|| {
             GraphBuildError::MissingNode(format!("update node `{node_id}`"), node_id.to_owned())
         })?;
+        let (result_tx, result_rx) = mpsc::sync_channel(0);
+        handle
+            .mailbox
+            .send(NodeMessage::ConfigUpdate {
+                config: config.clone(),
+                result: result_tx,
+            })
+            .map_err(|_| {
+                GraphBuildError::MissingNode(
+                    format!("update node `{node_id}` actor closed"),
+                    node_id.to_owned(),
+                )
+            })?;
+        result_rx
+            .recv()
+            .map_err(|_| {
+                GraphBuildError::MissingNode(
+                    format!("update node `{node_id}` actor closed"),
+                    node_id.to_owned(),
+                )
+            })?
+            .map_err(|error| {
+                GraphBuildError::MissingNode(
+                    format!("update node `{node_id}` rejected config: {error}"),
+                    node_id.to_owned(),
+                )
+            })?;
         handle.spec.config = config;
         Ok(())
     }
@@ -596,6 +637,10 @@ fn spawn_node_actor(
                         if let Err(error) = instance.on_action(action, &mut rt) {
                             reporter.report_event(format!("action failed: {error}"));
                         }
+                    }
+                    Ok(NodeMessage::ConfigUpdate { config, result }) => {
+                        let outcome = instance.on_config_update(config, &mut rt);
+                        let _ = result.send(outcome);
                     }
                     Ok(NodeMessage::Stop) | Err(_) => break,
                 }

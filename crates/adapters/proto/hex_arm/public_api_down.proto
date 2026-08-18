@@ -1,0 +1,48 @@
+syntax = "proto3";
+
+import "public_api_types.proto"; 
+
+// All messages sent to the robot are in this format.
+// Different robot types have different command fields.
+// 所有发送给机器人的消息都是这个格式。
+// 不同机器人类型有不同的命令字段。
+message APIDown {
+    // Single command makes mpsc model easier to implement.
+    oneof down{
+        // Base robots will use this field.
+        // 底盘机器人会使用这个字段。
+        BaseCommand base_command = 1;
+        // Linear lifts will use this field.
+        // 线性升降机会使用这个字段。
+        LinearLiftCommand linear_lift_command = 2;
+        // Arms will use this field.
+        // 机械臂会使用这个字段。
+        ArmCommand arm_command = 3;
+        // Rotational lifts will use this field.
+        // 旋转升降机会使用这个字段。
+        RotateLiftCommand rotate_lift_command = 4;
+        // Sets report frequency for THIS connection. Will not affect other connections.
+        // 设置本连接的报告频率。不会影响其他连接。
+        ReportFrequency set_report_frequency = 5;
+        // There might be multiple secondary devices. Send commands to different devices separately.
+        // 可能有多台次级设备。请分别发送命令到不同的设备。
+        SecondaryDeviceCommand secondary_device_command = 7;
+        // Turn On the KCP connection.
+        // Please remember to change websocket Report Frequency to Rf1Hz, if you want to use KCP.
+        // And do not kill websocket connection, if you want to use KCP.
+        // Why? This is learned from https://github.com/skywind3000/kcp/wiki/Cooperate-With-Tcp-Server
+        // Basically, we consider KCP connection dead, if websocket connection is dead.
+        // After sending this, and you find kcp_config in APIUp, you can start to send data to the robot using KCP.
+        // The server will NOT send data before it receives the first message from the client, using KCP.
+        EnableKcp enable_kcp = 8;
+        // Only available for RtPureForwardOnlyV2 robot type.
+        // Sending arbitrary CAN frames to the robot's CAN bus. Other robots will ignore this message.
+        HexCanApiCanAnyFrame hex_can_api_can_any_frame = 9;
+        // This is a placeholder message. This message will be ignored by the server, but server still considers getting stuff from client.
+        // Can be used to start KCP connection, since server will not start sending until it receives the first message from the client, using KCP.
+        bool placeholder_message = 100;
+    }
+    // Deprecated fields.
+    // 弃用的字段。
+    reserved 6;
+}

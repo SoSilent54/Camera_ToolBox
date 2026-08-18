@@ -5,7 +5,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Duration,
@@ -13,14 +13,14 @@ use std::{
 
 use crate::{
     engine::{
-        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
-        NodeRuntimeState, NodeSpec, SpawnContext,
+        CaptureMode, CaptureRequest, CaptureTarget, DataPacket, ImageFrame, NodeAction, NodeError,
+        NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, SpawnContext,
     },
     platform::{
         LatestDecodedFrameSlot, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport,
-        StreamCancellation, StreamOpenRequest, StreamOperationControl, StreamRecordingRequest,
-        StreamService, StreamServiceError, StreamServiceEvent, StreamSession, StreamSessionId,
-        StreamStage, StreamTerminal, StreamTimeouts,
+        SourcePts, StreamCancellation, StreamOpenRequest, StreamOperationControl,
+        StreamRecordingRequest, StreamService, StreamServiceError, StreamServiceEvent,
+        StreamSession, StreamSessionId, StreamStage, StreamTerminal, StreamTimeouts,
     },
 };
 
@@ -32,15 +32,18 @@ impl NodeFactory for RtspSourceFactory {
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        // 输出端口 id 跟随 web 图（rtspSource 输出 "frames"），避免硬编码导致接线断裂。
+        // `snapshot` 与 `frames` 并存时必须按 id 选择连续流出口，不能依赖端口排序。
         let output_port = spec
             .outputs
-            .first()
+            .iter()
+            .find(|port| port.id == "frames")
+            .or_else(|| spec.outputs.first())
             .map(|port| port.id.clone())
             .unwrap_or_else(|| "frames".to_owned());
         Ok(Box::new(RtspSourceNode {
             spec,
             output_port,
+            latest_image: Arc::new(Mutex::new(None)),
             cancellation: None,
             pump_cancel: None,
             session: None,
@@ -51,6 +54,8 @@ impl NodeFactory for RtspSourceFactory {
 pub struct RtspSourceNode {
     spec: NodeSpec,
     output_port: String,
+    /// Pump 转换出的最近已解码 RGBA 帧；capture 从这里取帧，避免消费 stream slot 后丢失快照。
+    latest_image: Arc<Mutex<Option<Arc<ImageFrame>>>>,
     cancellation: Option<StreamCancellation>,
     session: Option<StreamSession>,
     pump_cancel: Option<Arc<AtomicBool>>,
@@ -68,10 +73,20 @@ impl NodeInstance for RtspSourceNode {
 
     fn on_input(
         &mut self,
-        _port: &str,
-        _packet: DataPacket,
-        _rt: &mut NodeRuntime,
+        port: &str,
+        packet: DataPacket,
+        rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
+        if port != "capture" {
+            return Ok(());
+        }
+        let DataPacket::CaptureRequest(request) = packet else {
+            return Err(NodeError::Precondition(
+                "rtspSource.capture requires command.capture.request.v1".to_owned(),
+            ));
+        };
+        let frame = self.match_cached_frame(&request)?;
+        rt.emit("snapshot", DataPacket::ImageFrame(frame))?;
         Ok(())
     }
 
@@ -156,11 +171,18 @@ impl RtspSourceNode {
         self.session = Some(session);
         self.cancellation = Some(cancellation);
         let output_port = self.output_port.clone();
+        let latest_image = Arc::clone(&self.latest_image);
         let pump_cancel_flag = Arc::clone(&pump_cancel);
         // 必须保存 pump 取消标志，否则 disconnect 无法停掉后台 pump 线程（泄漏线程且 join 永不返回）。
         self.pump_cancel = Some(pump_cancel);
         rt.spawn(format!("rtsp-pump-{}", self.spec.id), move |ctx| {
-            pump_frames(latest_frame, ctx, pump_cancel_flag, output_port);
+            pump_frames(
+                latest_frame,
+                latest_image,
+                ctx,
+                pump_cancel_flag,
+                output_port,
+            );
         });
 
         rt.report_state(NodeRuntimeState::Running, "streaming");
@@ -177,9 +199,84 @@ impl RtspSourceNode {
         if let Some(cancel) = self.pump_cancel.take() {
             cancel.store(true, Ordering::Release);
         }
+        *self
+            .latest_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         rt.report_state(NodeRuntimeState::Idle, "disconnected");
         Ok(())
     }
+
+    /// 只按当前已解码帧中的实际元数据匹配；RTSP 节点绝不调用设备 TCP 抓图旁路。
+    fn match_cached_frame(&self, request: &CaptureRequest) -> Result<Arc<ImageFrame>, NodeError> {
+        let frame = self
+            .latest_image
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or_else(|| {
+                NodeError::Precondition(
+                    "RTSP capture requires a decoded frame; connect and wait for the first frame"
+                        .to_owned(),
+                )
+            })?;
+        let stream_identity = frame.identity.stream_identity().ok_or_else(|| {
+            NodeError::Precondition("RTSP capture cache lacks stream provenance".to_owned())
+        })?;
+        match request.target {
+            CaptureTarget::Yuv { channel } if channel == stream_identity.channel => {}
+            CaptureTarget::Yuv { channel } => {
+                return Err(capture_miss("channel", u64::from(channel)));
+            }
+            CaptureTarget::Raw { .. } => {
+                return Err(NodeError::Precondition(
+                    "RTSP capture only snapshots decoded RGBA8 frames; RAW requires X5_233 Driver"
+                        .to_owned(),
+                ));
+            }
+        }
+        if request
+            .source_identity
+            .as_ref()
+            .is_some_and(|identity| identity != &frame.identity)
+        {
+            return Err(NodeError::Precondition(
+                "RTSP capture cache does not match the requested source identity".to_owned(),
+            ));
+        }
+        match request.mode {
+            CaptureMode::Latest => Ok(frame),
+            CaptureMode::FrameId(expected) => (frame.identity.frame_sequence == expected)
+                .then_some(frame)
+                .ok_or_else(|| capture_miss("frame_id", expected)),
+            CaptureMode::TimestampNs(expected) => (frame.identity.host_monotonic_time_ns
+                == expected)
+                .then_some(frame)
+                .ok_or_else(|| capture_miss("timestamp_ns", expected)),
+            CaptureMode::RtspPts90k { pts, tolerance } => {
+                let matches = matches!(
+                    &frame.identity.source_pts,
+                    SourcePts::Known {
+                        ticks,
+                        time_base_numerator: 1,
+                        time_base_denominator: 90_000,
+                        ..
+                    } if u64::try_from(*ticks)
+                        .ok()
+                        .is_some_and(|actual| actual.abs_diff(pts) <= tolerance)
+                );
+                matches
+                    .then_some(frame)
+                    .ok_or_else(|| capture_miss("rtsp_pts_90k", pts))
+            }
+        }
+    }
+}
+
+fn capture_miss(field: &str, expected: u64) -> NodeError {
+    NodeError::Precondition(format!(
+        "RTSP capture cache has no decoded frame matching {field}={expected}"
+    ))
 }
 
 fn stream_reporter(
@@ -226,6 +323,7 @@ fn stream_reporter(
 
 fn pump_frames(
     latest: Arc<LatestDecodedFrameSlot>,
+    latest_image: Arc<Mutex<Option<Arc<ImageFrame>>>>,
     ctx: SpawnContext,
     cancel: Arc<AtomicBool>,
     output_port: String,
@@ -235,9 +333,13 @@ fn pump_frames(
     while !cancel.load(Ordering::Acquire) {
         match latest.wait_latest_timeout(PUMP_CANCEL_POLL) {
             Some(frame) => {
+                let image = Arc::new(ImageFrame::from(frame.as_ref()));
+                *latest_image
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&image));
                 let _ = ctx
                     .outputs
-                    .emit(&output_port, DataPacket::VideoFrame(frame));
+                    .emit(&output_port, DataPacket::ImageFrame(image));
             }
             None => {
                 // 超时且无新帧：循环回到顶部检查 cancel，避免 join 永不返回。
@@ -319,9 +421,12 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
-    use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
+    use crate::engine::{
+        EngineServices, ImageFrameIdentity, NodeReporter, OutputRegistry, SpawnContext,
+    };
     use crate::platform::{
-        LatestDecodedFrameSlot, StreamServiceError, StreamSession, StreamTimeouts,
+        DecodedVideoFrame, LatestDecodedFrameSlot, SourcePts, SourcePtsProvenance,
+        StreamFrameIdentity, StreamServiceError, StreamSession, StreamSessionId, StreamTimeouts,
     };
 
     fn spec() -> NodeSpec {
@@ -329,14 +434,29 @@ mod tests {
             id: "rtsp-1".to_owned(),
             kind: "rtspSource".to_owned(),
             title: "RTSP Source".to_owned(),
-            inputs: vec![],
-            outputs: vec![crate::engine::PortSpec {
-                id: "frames".to_owned(),
-                label: "Decoded Video Frames".to_owned(),
-                kind: "stream.video-frame".to_owned(),
+            inputs: vec![crate::engine::PortSpec {
+                id: "capture".to_owned(),
+                label: "Capture".to_owned(),
+                kind: "command.capture.request.v1".to_owned(),
                 cardinality: crate::engine::PortCardinality::One,
                 required: false,
             }],
+            outputs: vec![
+                crate::engine::PortSpec {
+                    id: "frames".to_owned(),
+                    label: "Decoded Video Frames".to_owned(),
+                    kind: "stream.video-frame".to_owned(),
+                    cardinality: crate::engine::PortCardinality::One,
+                    required: false,
+                },
+                crate::engine::PortSpec {
+                    id: "snapshot".to_owned(),
+                    label: "Snapshot".to_owned(),
+                    kind: "image.frame".to_owned(),
+                    cardinality: crate::engine::PortCardinality::One,
+                    required: false,
+                },
+            ],
             config: serde_json::json!({"url": "rtsp://127.0.0.1:554/test", "transport": "tcp"}),
         }
     }
@@ -355,6 +475,74 @@ mod tests {
             viewer_slot: None,
         };
         NodeRuntime::new(ctx)
+    }
+
+    fn runtime_with_packets(
+        services: EngineServices,
+        state_tx: mpsc::Sender<crate::engine::NodeStatusReport>,
+    ) -> (NodeRuntime, Arc<Mutex<Vec<DataPacket>>>) {
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("rtsp-1".to_owned(), state_tx, event_tx);
+        let packets = Arc::new(Mutex::new(Vec::new()));
+        let recorded_packets = Arc::clone(&packets);
+        let mut outputs = OutputRegistry::default();
+        outputs.set_record(Arc::new(move |packet| {
+            recorded_packets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(packet);
+        }));
+        let ctx = SpawnContext {
+            outputs,
+            reporter,
+            services: Arc::new(services),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        };
+        (NodeRuntime::new(ctx), packets)
+    }
+
+    fn decoded_frame(sequence: u64, timestamp_ns: u64, pts: i64) -> Arc<ImageFrame> {
+        let identity = StreamFrameIdentity::known_at(
+            StreamSessionId::new("rtsp-test").expect("valid session id"),
+            2,
+            sequence,
+            SourcePts::Known {
+                ticks: pts,
+                time_base_numerator: 1,
+                time_base_denominator: 90_000,
+                provenance: SourcePtsProvenance::FfmpegDecodedFrame,
+            },
+            timestamp_ns,
+        );
+        Arc::new(ImageFrame::from(&DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: Arc::from([3_u8; 16]),
+            identity,
+        }))
+    }
+
+    fn capture_request(
+        mode: CaptureMode,
+        source_identity: Option<ImageFrameIdentity>,
+    ) -> DataPacket {
+        DataPacket::CaptureRequest(Arc::new(CaptureRequest {
+            target: CaptureTarget::Yuv { channel: 2 },
+            mode,
+            source_identity,
+        }))
+    }
+
+    fn node_with_cached_frame(frame: Option<Arc<ImageFrame>>) -> RtspSourceNode {
+        RtspSourceNode {
+            spec: spec(),
+            output_port: "frames".to_owned(),
+            latest_image: Arc::new(Mutex::new(frame)),
+            cancellation: None,
+            session: None,
+            pump_cancel: None,
+        }
     }
 
     /// 记录 open 调用次数并返回带独立 latest_frame slot 的 mock StreamService。
@@ -409,6 +597,157 @@ mod tests {
             last = Some(report.state);
         }
         last
+    }
+
+    #[test]
+    fn pump_emits_rgba_image_frame_and_keeps_snapshot_cache() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let (rt, packets) = runtime_with_packets(EngineServices::default(), state_tx);
+        let source = Arc::new(LatestDecodedFrameSlot::default());
+        let cache = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let ctx = rt.context().clone();
+        let thread_source = Arc::clone(&source);
+        let thread_cache = Arc::clone(&cache);
+        let thread_cancel = Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
+            pump_frames(
+                thread_source,
+                thread_cache,
+                ctx,
+                thread_cancel,
+                "frames".to_owned(),
+            );
+        });
+
+        let frame = decoded_frame(7, 8_000, 9_000);
+        let decoded = frame.decoded_rgba_frame().expect("stream RGBA frame");
+        source.publish(decoded);
+        for _ in 0..50 {
+            if !packets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+            {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        cancel.store(true, Ordering::Release);
+        handle.join().expect("pump exits");
+
+        let packets = packets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let DataPacket::ImageFrame(emitted) = &packets[0] else {
+            panic!(
+                "RTSP frames output must be ImageFrame, got {:?}",
+                packets[0]
+            );
+        };
+        assert_eq!(emitted.format, crate::engine::ImageFrameFormat::Rgba8);
+        assert_eq!(emitted.identity.frame_sequence, 7);
+        assert_eq!(
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref(),
+            Some(emitted)
+        );
+    }
+
+    #[test]
+    fn capture_latest_emits_cached_rgba_with_identity() {
+        let frame = decoded_frame(7, 8_000, 9_000);
+        let identity = frame.identity.clone();
+        let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let (mut rt, packets) = runtime_with_packets(EngineServices::default(), state_tx);
+        node.on_input(
+            "capture",
+            capture_request(CaptureMode::Latest, Some(identity.clone())),
+            &mut rt,
+        )
+        .expect("latest capture");
+        let packets = packets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let DataPacket::ImageFrame(snapshot) = &packets[0] else {
+            panic!("snapshot output must be ImageFrame");
+        };
+        assert_eq!(snapshot.format, crate::engine::ImageFrameFormat::Rgba8);
+        assert_eq!(snapshot.identity, identity);
+        assert!(Arc::ptr_eq(
+            &snapshot.planes[0].bytes,
+            &frame.planes[0].bytes
+        ));
+    }
+
+    #[test]
+    fn capture_exact_modes_emit_only_matching_cached_metadata() {
+        let frame = decoded_frame(7, 8_000, 9_000);
+        let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let (mut rt, packets) = runtime_with_packets(EngineServices::default(), state_tx);
+        for mode in [
+            CaptureMode::FrameId(7),
+            CaptureMode::TimestampNs(8_000),
+            CaptureMode::RtspPts90k {
+                pts: 9_001,
+                tolerance: 1,
+            },
+        ] {
+            node.on_input("capture", capture_request(mode, None), &mut rt)
+                .expect("cached metadata matches capture request");
+        }
+        assert_eq!(
+            packets
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .len(),
+            3
+        );
+    }
+
+    #[test]
+    fn capture_without_frame_or_exact_cache_match_is_precondition_error() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let (mut rt, _packets) = runtime_with_packets(EngineServices::default(), state_tx);
+        let mut empty = node_with_cached_frame(None);
+        let error = empty
+            .on_input(
+                "capture",
+                capture_request(CaptureMode::Latest, None),
+                &mut rt,
+            )
+            .expect_err("missing decoded frame");
+        assert!(matches!(error, NodeError::Precondition(_)));
+
+        let frame = decoded_frame(7, 8_000, 9_000);
+        for mode in [
+            CaptureMode::FrameId(8),
+            CaptureMode::TimestampNs(8_001),
+            CaptureMode::RtspPts90k {
+                pts: 9_001,
+                tolerance: 0,
+            },
+        ] {
+            let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
+            let error = node
+                .on_input("capture", capture_request(mode, None), &mut rt)
+                .expect_err("exact cache miss");
+            assert!(matches!(error, NodeError::Precondition(_)), "got {error:?}");
+        }
+        let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
+        let raw_request = DataPacket::CaptureRequest(Arc::new(CaptureRequest {
+            target: CaptureTarget::Raw { camera: 0 },
+            mode: CaptureMode::Latest,
+            source_identity: None,
+        }));
+        let error = node
+            .on_input("capture", raw_request, &mut rt)
+            .expect_err("RTSP cannot satisfy a RAW capture request");
+        assert!(matches!(error, NodeError::Precondition(_)));
     }
 
     #[test]

@@ -18,6 +18,11 @@ pub enum NodeMessage {
     Input { port: PortId, packet: DataPacket },
     /// 控制动作（连接/断开/触发/arm/disarm）。
     Action(NodeAction),
+    /// 在 actor 线程安全应用配置；sender 用于同步返回钩子结果。
+    ConfigUpdate {
+        config: serde_json::Value,
+        result: mpsc::SyncSender<Result<(), super::node::NodeError>>,
+    },
     /// 停止信号。
     Stop,
 }

@@ -3,6 +3,8 @@
 #[cfg(feature = "calibration-opencv")]
 pub mod calibration;
 pub mod filesystem;
+#[cfg(feature = "hex-arm-control")]
+pub mod hex_arm;
 pub mod image_codec;
 pub mod local_raw;
 pub mod media;

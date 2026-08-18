@@ -7,14 +7,18 @@ export type NodeKind =
   | 'sftpFileSource'
   | 'rtspSource'
   | 'sshSession'
-  | 'x5Device'
+  | 'x5233Driver'
+  | 'hexArmDevice'
   | 'rtspDecoder'
+  | 'demosaic'
   | 'frameSampler'
   | 'imageLayer'
   | 'videoLayer'
   | 'overlayComposer'
   | 'viewer'
   | 'chessboardDetector'
+  | 'gainScorer'
+  | 'captureGate'
   | 'datasetCollector'
   | 'coverageAnalyzer'
   | 'autoCaptureController'
@@ -35,6 +39,7 @@ export type PortKind =
   | 'file.ref'
   | 'control.ssh'
   | 'control.x5tcp'
+  | 'control.hexarm'
   | 'endpoint.rtsp'
   | 'stream.encoded-video'
   | 'stream.video-frame'
@@ -114,6 +119,8 @@ export interface WorkflowPort {
   kind: PortKind;
   schema: string;
   role?: PortRole;
+  /** 图像像素格式提示；不改变统一的 image.frame 数据类型。 */
+  formatHint?: string;
   required: boolean;
   cardinality: PortCardinality;
 }
@@ -333,8 +340,23 @@ export type ViewerPreview =
 /** 可持久化的通用节点标量配置值。 */
 export type ScalarConfigValue = string | number | boolean;
 
-/** 后端 `runtime.node.action` 当前支持的通用节点动作。 */
-export type NodeActionName = 'connect' | 'disconnect' | 'trigger' | 'arm' | 'disarm' | 'clear';
+/** 后端 `runtime.node.action` 当前支持的节点动作。 */
+export type NodeActionName =
+  | 'connect'
+  | 'disconnect'
+  | 'trigger'
+  | 'arm'
+  | 'disarm'
+  | 'clear'
+  | 'probe'
+  | 'status'
+  | 'capture_yuv'
+  | 'capture_raw'
+  | 'initialize_api_control'
+  | 'calibrate'
+  | 'clear_parking_stop'
+  | 'zero_current'
+  | 'send_joint_positions';
 
 /** 节点显式声明的可用动作；未声明时 GenericWorkflowNode 不渲染动作按钮。 */
 export interface NodeActionControl {
@@ -357,7 +379,7 @@ export interface FlowNodeData extends Record<string, unknown> {
   availableActions?: readonly NodeActionControl[];
   onRtspUrlChange?: (nodeId: string, url: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: ScalarConfigValue) => void;
-  /** 触发节点动作（connect/disconnect/trigger/arm/disarm/clear）。 */
+  /** 触发节点动作；Hex Arm 的关节弧度保留在已校验的节点 config，动作本身不携带任意 payload。 */
   onNodeAction?: (nodeId: string, action: NodeActionName) => void;
   /** 拉取节点最近一次输出；无输出时保留当前摘要。 */
   onRefreshNodeOutput?: (nodeId: string) => void;

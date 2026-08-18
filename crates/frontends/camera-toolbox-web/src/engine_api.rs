@@ -2,6 +2,8 @@
 
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "hex-arm-control")]
+use camera_toolbox_adapters::hex_arm::HexArmWebSocketClient;
 use camera_toolbox_adapters::media::FfmpegRtspStreamService;
 use camera_toolbox_adapters::{ImageRasterCodec, LocalRawLoader};
 use camera_toolbox_app::engine::{
@@ -78,6 +80,11 @@ pub(crate) fn build_services(state: &AppState) -> EngineServices {
         eeprom_executor: None,
         // X5 控制客户端：纯 TCP（无 SSH），始终可用；ControlRuntime 无条件 impl X5ControlClient。
         x5_client: Some(state.control_runtime.clone()),
+        // Hex Arm 协议客户端只有显式启用 feature 后才注入；默认构建不保留网络控制能力。
+        #[cfg(feature = "hex-arm-control")]
+        hex_arm_client: Some(Arc::new(HexArmWebSocketClient::default())),
+        #[cfg(not(feature = "hex-arm-control"))]
+        hex_arm_client: None,
         // SFTP / SSH 命令执行器：ControlRuntime 已实现 SftpFileReader/SshCommandExecutor。
         #[cfg(feature = "platform-ssh")]
         sftp_reader: Some(state.control_runtime.clone()),
@@ -103,10 +110,19 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
             "type": "image-frame",
             "width": frame.width,
             "height": frame.height,
+            "format": frame.format.to_string(),
             "sequence": frame.identity.frame_sequence,
         }),
         DataPacket::Detection(detection) => {
-            serde_json::to_value(detection.as_ref()).unwrap_or(json!({ "type": "detection" }))
+            let mut value = serde_json::to_value(detection.detection.as_ref())
+                .unwrap_or(json!({ "type": "detection" }));
+            if let serde_json::Value::Object(object) = &mut value {
+                object.insert(
+                    "frameSequence".to_owned(),
+                    json!(detection.frame_identity.frame_sequence),
+                );
+            }
+            value
         }
         DataPacket::Solution(solution) => {
             serde_json::to_value(solution.as_ref()).unwrap_or(json!({ "type": "solution" }))
@@ -114,9 +130,19 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
         DataPacket::Coverage(value)
         | DataPacket::Dataset(value)
         | DataPacket::Report(value)
-        | DataPacket::Score(value)
         | DataPacket::Target(value)
         | DataPacket::Json(value) => (**value).clone(),
+        DataPacket::Score(score) => json!({
+            "type": "capture.score",
+            "gain": score.gain,
+            "frameSequence": score.frame_identity.frame_sequence,
+        }),
+        DataPacket::CaptureRequest(request) => json!({
+            "type": "command.capture.request.v1",
+            "target": format!("{:?}", request.target),
+            "mode": format!("{:?}", request.mode),
+            "frameSequence": request.source_identity.as_ref().map(|identity| identity.frame_sequence),
+        }),
     }
 }
 
@@ -127,8 +153,17 @@ pub(crate) fn parse_action_str(action: &str) -> Result<NodeAction, String> {
         "trigger" => Ok(NodeAction::Trigger),
         "arm" => Ok(NodeAction::Arm),
         "disarm" => Ok(NodeAction::Disarm),
-        "clear" => Ok(NodeAction::Custom {
-            name: "clear".to_owned(),
+        "clear"
+        | "probe"
+        | "status"
+        | "capture_yuv"
+        | "capture_raw"
+        | "initialize_api_control"
+        | "calibrate"
+        | "clear_parking_stop"
+        | "zero_current"
+        | "send_joint_positions" => Ok(NodeAction::Custom {
+            name: action.to_owned(),
             payload: serde_json::Value::Null,
         }),
         other => Err(format!("unknown action `{other}`")),
@@ -210,7 +245,7 @@ mod tests {
         assert_eq!(spec.nodes.len(), graph.nodes.len());
         assert_eq!(spec.edges.len(), graph.edges.len());
         // kind 序列化为 camelCase 字符串（与引擎 kinds 常量一致）。
-        assert!(spec.nodes.iter().any(|node| node.kind == "rtspSource"));
+        assert!(spec.nodes.iter().any(|node| node.kind == "x5233Driver"));
         // 必需输入端口投影为 required。
         for (engine_node, graph_node) in spec.nodes.iter().zip(&graph.nodes) {
             for (engine_port, graph_port) in engine_node.inputs.iter().zip(&graph_node.inputs) {
@@ -228,5 +263,23 @@ mod tests {
             parse_action_str("clear"),
             Ok(NodeAction::Custom { ref name, .. }) if name == "clear"
         ));
+    }
+
+    #[test]
+    fn hex_arm_actions_map_to_explicit_custom_actions() {
+        for action in [
+            "probe",
+            "status",
+            "initialize_api_control",
+            "calibrate",
+            "clear_parking_stop",
+            "zero_current",
+            "send_joint_positions",
+        ] {
+            assert!(matches!(
+                parse_action_str(action),
+                Ok(NodeAction::Custom { name, .. }) if name == action
+            ));
+        }
     }
 }

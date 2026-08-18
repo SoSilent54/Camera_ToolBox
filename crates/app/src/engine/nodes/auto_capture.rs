@@ -61,10 +61,7 @@ impl NodeInstance for AutoCaptureNode {
                 "autoCaptureController.score requires capture.score".to_owned(),
             ));
         };
-        let gain = score
-            .get("gain")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0);
+        let gain = score.gain;
         let threshold = config_f64(&self.spec, "triggerThreshold", 0.5);
         if gain < threshold {
             return Ok(());
@@ -136,8 +133,13 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
-    use crate::engine::{NodeReporter, OutputRegistry, PortCardinality, PortSpec, SpawnContext};
-
+    use crate::{
+        engine::{
+            GainScore, ImageFrameIdentity, NodeReporter, OutputRegistry, PortCardinality, PortSpec,
+            SpawnContext,
+        },
+        platform::{StreamFrameIdentity, StreamSessionId},
+    };
     fn spec() -> NodeSpec {
         NodeSpec {
             id: "auto-1".to_owned(),
@@ -188,7 +190,16 @@ mod tests {
     }
 
     fn score(gain: f64) -> DataPacket {
-        DataPacket::Score(Arc::new(serde_json::json!({"gain": gain})))
+        let stream_identity = StreamFrameIdentity::unavailable(
+            StreamSessionId::new("auto-capture-test").expect("valid session id"),
+            0,
+            0,
+            "test identity".to_owned(),
+        );
+        DataPacket::Score(Arc::new(GainScore {
+            gain,
+            frame_identity: ImageFrameIdentity::from(&stream_identity),
+        }))
     }
 
     #[test]

@@ -1,8 +1,7 @@
 import { useEffect, useState, type ReactNode } from 'react';
 import type { NodeProps } from '@xyflow/react';
-import type { FlowNodeData, X5ControlResponse, X5SnapshotMode, X5SnapshotRequest } from './workflow';
+import type { FlowNodeData, NodeActionName, X5ControlResponse, X5SnapshotMode } from './workflow';
 import {
-  captureX5Snapshot,
   configureX5Rtsp,
   inspectEepromProvision,
   previewEepromProvision,
@@ -229,8 +228,8 @@ export function SshSessionNode({ data, selected }: NodeProps) {
   );
 }
 
-/** X5 控制通过后端 TCP 请求执行；RTSP 编码和快照匹配参数分别持久化，避免互相污染。 */
-export function X5DeviceNode({ data, selected }: NodeProps) {
+/** X5_233 Driver 通过后端 TCP 请求执行；RTSP 编码和快照匹配参数分别持久化，避免互相污染。 */
+export function X5233DriverNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const host = configText(node, 'host', '10.21.12.108');
@@ -238,6 +237,9 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
   const rtspChannel = x5Channel(node, 'rtspChannel');
   const snapshotChannel = x5Channel(node, 'snapshotChannel');
   const snapshotMode = x5SnapshotMode(configText(node, 'snapshotMode', 'latest'));
+  const rawCamera = numberValue(configText(node, 'rawCamera', '0'), 0);
+  const rawBayerPattern = configText(node, 'rawBayerPattern', 'rggb');
+  const rawBitsPerSample = configText(node, 'rawBitsPerSample', '12');
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<X5ControlResponse | string>();
   const set = (key: string, value: string) => nodeData.onNodeConfigChange?.(node.id, key, value);
@@ -246,7 +248,9 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
     try { setResult(await operation()); } catch (error) { setResult(String(error)); } finally { setPending(false); }
   };
   const binding = { host, tcpPort };
-  const snapshot = x5SnapshotRequest(node, binding, snapshotChannel, snapshotMode);
+  const actionPending = Boolean(nodeData.actionPending);
+  const captureDisabled = !nodeData.onNodeAction || actionPending;
+  const capture = (action: 'capture_yuv' | 'capture_raw') => nodeData.onNodeAction?.(node.id, action);
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
       <strong>Connection</strong>
@@ -265,11 +269,11 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
         <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => stopX5RtspChannel({ ...binding, channel: rtspChannel }))}>Stop RTSP</button>
       </div>
 
-      <strong>Snapshot</strong>
-      <Field id={`${node.id}-snapshot-channel`} label="Snapshot channel" value={configText(node, 'snapshotChannel', String(snapshotChannel))} onChange={(value) => set('snapshotChannel', value)} type="number" />
+      <strong>Manual Capture</strong>
+      <Field id={`${node.id}-snapshot-channel`} label="YUV channel" value={configText(node, 'snapshotChannel', String(snapshotChannel))} onChange={(value) => set('snapshotChannel', value)} type="number" />
       <SelectField
         id={`${node.id}-snapshot-mode`}
-        label="Match mode"
+        label="YUV match mode"
         value={snapshotMode}
         options={X5_SNAPSHOT_MODES}
         onChange={(value) => set('snapshotMode', value)}
@@ -280,20 +284,109 @@ export function X5DeviceNode({ data, selected }: NodeProps) {
         <Field id={`${node.id}-snapshot-rtsp-pts`} label="RTSP PTS (90 kHz)" value={configText(node, 'snapshotRtspPts90k', '')} onChange={(value) => set('snapshotRtspPts90k', value)} type="number" />
         <Field id={`${node.id}-snapshot-rtsp-tolerance`} label="PTS tolerance (90 kHz)" value={configText(node, 'snapshotRtspPtsTolerance90k', '0')} onChange={(value) => set('snapshotRtspPtsTolerance90k', value)} type="number" />
       </> : null}
+      <Field id={`${node.id}-raw-camera`} label="RAW camera" value={configText(node, 'rawCamera', String(rawCamera))} onChange={(value) => set('rawCamera', value)} type="number" />
+      <SelectField
+        id={`${node.id}-raw-bayer`}
+        label="RAW Bayer"
+        value={rawBayerPattern}
+        options={X5_RAW_BAYER_PATTERNS}
+        onChange={(value) => set('rawBayerPattern', value)}
+      />
+      <Field id={`${node.id}-raw-bits`} label="RAW bits" value={rawBitsPerSample} onChange={(value) => set('rawBitsPerSample', value)} type="number" />
       <div className="node-actions">
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => snapshot instanceof Error ? Promise.reject(snapshot) : captureX5Snapshot(snapshot))}>Capture snapshot</button>
+        <button type="button" className="nodrag nowheel" disabled={captureDisabled} onClick={() => capture('capture_yuv')}>{actionPending ? '采集中…' : 'Capture YUV'}</button>
+        <button type="button" className="nodrag nowheel" disabled={captureDisabled} onClick={() => capture('capture_raw')}>{actionPending ? '采集中…' : 'Capture RAW'}</button>
       </div>
-      <span className="node-hint">Capture requests a real NV12 snapshot from the X5 TCP ring. The result reports verified metadata and byte count only; it does not emit an ImageFrame or fabricate a browser preview.</span>
+      <span className="node-hint">手动采集属于 X5_233 Driver：YUV 走 snapshotChannel/mode，RAW 只支持 latest 且需要 RAW Bayer/bit depth；结果从 yuvCh0/yuvCh3 或 rawCam0/rawCam1 输出到图。</span>
+      <RuntimeOutputSummary output={nodeData.runtimeOutput} />
       <ResultBox value={result} />
     </RemoteFrame>
   );
 }
+
+/** Hex Arm 仅通过工作流节点动作控制；所有关节值以逗号分隔的弧度保存，运动按钮必须经过双重门禁。 */
+export function HexArmDeviceNode({ data, selected }: NodeProps) {
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
+  const [jointDraft, setJointDraft] = useState(configText(node, 'jointPositions', ''));
+  useEffect(() => setJointDraft(configText(node, 'jointPositions', '')), [node.config.jointPositions]);
+  const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
+  const jointPositionsValid = jointDraft.split(',').map((item) => item.trim()).every((item) => item.length > 0 && Number.isFinite(Number(item)));
+  const jointPositionsPersisted = configText(node, 'jointPositions', '').trim() === jointDraft.trim();
+  const transport = configText(node, 'transport', 'websocket');
+  const controlEnabled = configBool(node, 'controlEnabled', false);
+  const transportSupported = transport === 'websocket';
+  const actionsDisabled = !nodeData.onNodeAction || !transportSupported;
+  const send = (action: NodeActionName) => nodeData.onNodeAction?.(node.id, action);
+  const applyJointPositions = () => {
+    if (jointPositionsValid) set('jointPositions', jointDraft.trim());
+  };
+  return (
+    <RemoteFrame nodeData={nodeData} selected={selected}>
+      <strong>Connection</strong>
+      <Field id={`${node.id}-host`} label="Host" value={configText(node, 'host', '127.0.0.1')} onChange={(value) => set('host', value)} />
+      <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '8439')} onChange={(value) => set('port', value)} type="number" />
+      <SelectField
+        id={`${node.id}-transport`}
+        label="Transport"
+        value={transportSupported ? transport : 'websocket'}
+        options={[{ value: 'websocket', label: 'WebSocket binary protobuf' }]}
+        onChange={(value) => set('transport', value)}
+      />
+      {!transportSupported ? <span className="node-hint">KCP is unsupported and will not fall back to WebSocket; save a WebSocket transport before sending commands.</span> : null}
+      <Field id={`${node.id}-command-timeout`} label="Command timeout ms" value={configText(node, 'commandTimeoutMs', '200')} onChange={(value) => set('commandTimeoutMs', value)} type="number" />
+      <Field id={`${node.id}-connect-timeout`} label="Connect timeout ms" value={configText(node, 'connectTimeoutMs', '3000')} onChange={(value) => set('connectTimeoutMs', value)} type="number" />
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('probe')}>Probe</button>
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('status')}>Status</button>
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('connect')}>Connect</button>
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('disconnect')}>Disconnect</button>
+      </div>
+      <strong>API control</strong>
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('initialize_api_control')}>Initialize API control</button>
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('calibrate')}>Calibrate</button>
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('clear_parking_stop')}>Clear parking stop</button>
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled} onClick={() => send('zero_current')}>Zero current</button>
+      </div>
+      <strong>Motion</strong>
+      <label className="node-config-checkbox"><code>Enable motion control</code><input className="nodrag nowheel" type="checkbox" checked={controlEnabled} onChange={(event) => set('controlEnabled', event.target.checked)} /></label>
+      <label className="node-config-field">
+        <code>Joint radians</code>
+        <input
+          id={`${node.id}-joint-radians`}
+          className="nodrag nowheel"
+          value={jointDraft}
+          placeholder="0.0, -1.57, …"
+          onChange={(event) => setJointDraft(event.target.value)}
+          onBlur={applyJointPositions}
+          onKeyDown={(event) => { if (event.key === 'Enter') { applyJointPositions(); event.currentTarget.blur(); } }}
+        />
+      </label>
+      {!jointPositionsValid ? <span className="node-hint">Enter a non-empty comma-separated list of finite joint radians before sending motion.</span> : null}
+      {!jointPositionsPersisted ? <span className="node-hint">Apply the edited joint radians before sending motion.</span> : null}
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={actionsDisabled || !controlEnabled || !jointPositionsValid || !jointPositionsPersisted} onClick={() => send('send_joint_positions')}>Send joint positions</button>
+      </div>
+      <span className="node-hint">Motion is off by default. Sending positions requires this checkbox and finite radians; the backend independently requires enabled control, an active connection, and initialized API control.</span>
+      <RuntimeOutputSummary output={nodeData.runtimeOutput} />
+    </RemoteFrame>
+  );
+}
+
 
 const X5_SNAPSHOT_MODES: readonly { value: X5SnapshotMode; label: string }[] = [
   { value: 'latest', label: 'Latest frame' },
   { value: 'frame_id', label: 'Exact frame ID' },
   { value: 'timestamp_ns', label: 'Exact capture timestamp' },
   { value: 'rtsp_pts_90k', label: 'RTSP PTS bridge' },
+];
+
+const X5_RAW_BAYER_PATTERNS: readonly { value: string; label: string }[] = [
+  { value: 'rggb', label: 'RGGB' },
+  { value: 'bggr', label: 'BGGR' },
+  { value: 'grbg', label: 'GRBG' },
+  { value: 'gbrg', label: 'GBRG' },
 ];
 
 function x5SnapshotMode(value: string): X5SnapshotMode {
@@ -312,35 +405,6 @@ function x5Channel(node: FlowNodeData['workflowNode'], key: 'rtspChannel' | 'sna
   return Number.isInteger(value) && value >= 0 && value <= 65_535 ? value : legacyChannel;
 }
 
-function x5Unsigned(node: FlowNodeData['workflowNode'], key: string, label: string): number | Error {
-  const value = numberValue(configText(node, key, ''), Number.NaN);
-  return Number.isInteger(value) && value >= 0 && value <= Number.MAX_SAFE_INTEGER
-    ? value
-    : new Error(`${label} must be a non-negative integer`);
-}
-
-function x5SnapshotRequest(
-  node: FlowNodeData['workflowNode'],
-  binding: { host: string; tcpPort: number },
-  channel: number,
-  mode: X5SnapshotMode,
-): X5SnapshotRequest | Error {
-  const request: X5SnapshotRequest = { ...binding, channel, mode };
-  if (mode === 'frame_id') {
-    const frameId = x5Unsigned(node, 'snapshotFrameId', 'Frame ID');
-    return frameId instanceof Error ? frameId : { ...request, frameId };
-  }
-  if (mode === 'timestamp_ns') {
-    const timestampNs = x5Unsigned(node, 'snapshotTimestampNs', 'Timestamp ns');
-    return timestampNs instanceof Error ? timestampNs : { ...request, timestampNs };
-  }
-  if (mode === 'rtsp_pts_90k') {
-    const rtspPts90k = x5Unsigned(node, 'snapshotRtspPts90k', 'RTSP PTS');
-    const rtspPtsTolerance90k = x5Unsigned(node, 'snapshotRtspPtsTolerance90k', 'PTS tolerance');
-    return rtspPts90k instanceof Error ? rtspPts90k : rtspPtsTolerance90k instanceof Error ? rtspPtsTolerance90k : { ...request, rtspPts90k, rtspPtsTolerance90k };
-  }
-  return request;
-}
 
 /** 用密码替换当前节点对应的进程内 session；输入在服务端登记后立即清空。 */
 function PasswordCredentialField({ nodeId, credentialRef, onCredentialRef }: { nodeId: string; credentialRef: string; onCredentialRef: (value: string) => void }) {

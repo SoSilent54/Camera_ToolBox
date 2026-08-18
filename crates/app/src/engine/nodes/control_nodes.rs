@@ -14,12 +14,15 @@ use std::time::Duration;
 use camera_toolbox_core::Rgba8Frame;
 
 use crate::engine::{
-    DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState,
-    NodeSpec,
+    BayerPattern, CaptureMode, CaptureRequest, CaptureTarget, DataPacket, FrameProvenance,
+    ImageFrame, ImageFrameFormat, ImageFrameIdentity, ImagePlane, NodeAction, NodeError,
+    NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, RawMetadata,
 };
 use crate::platform::{
-    CommandResult, ControlTargetSpec, DecodedVideoFrame, DumpCancellation, RemoteOperationControl,
-    RemoteTimeouts, StreamFrameIdentity, StreamSessionId, TypedCommandRequest,
+    CommandResult, ControlTargetSpec, DumpCancellation, HexArmJointPositionsRequest,
+    HexArmTargetConfig, HexArmTransport, RemoteOperationControl, RemoteTimeouts, SourcePts,
+    StreamFrameIdentity, StreamSessionId, TypedCommandRequest, X5233CapturePayload,
+    host_monotonic_time_ns,
 };
 #[cfg(test)]
 use crate::platform::{
@@ -463,55 +466,492 @@ fn emit_json_result<T: serde::Serialize>(
 }
 
 // ---------------------------------------------------------------------------
-// X5 Device 节点
+// X5_233 Driver 节点
 // ---------------------------------------------------------------------------
 
-/// X5_233 设备控制节点：仅作为图内控制配置节点执行 probe/status/snapshot 副作用，
-/// 结果通过状态/事件报告；不向未声明的数据端口伪造输出。
-pub struct X5DeviceFactory;
+/// X5_233 专用驱动适配器；只发布真实帧与状态，不把 RTSP endpoint 当作图数据输出。
+pub struct X5233DriverFactory;
 
-impl NodeFactory for X5DeviceFactory {
+impl NodeFactory for X5233DriverFactory {
     fn kind(&self) -> &'static str {
-        "x5Device"
+        "x5233Driver"
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(X5DeviceNode { spec }))
+        Ok(Box::new(X5233DriverNode { spec }))
     }
 }
 
-pub struct X5DeviceNode {
+pub struct X5233DriverNode {
     spec: NodeSpec,
 }
 
-impl X5DeviceNode {
+impl X5233DriverNode {
     fn host(&self) -> Result<String, NodeError> {
-        non_empty(config_string(&self.spec, "host"))
-            .ok_or_else(|| NodeError::Precondition("x5Device host must be configured".to_owned()))
+        non_empty(config_string(&self.spec, "host")).ok_or_else(|| {
+            NodeError::Precondition("x5233Driver host must be configured".to_owned())
+        })
     }
 
     fn port(&self) -> u16 {
-        let s = config_string(&self.spec, "tcpPort");
-        s.parse::<u16>().unwrap_or(9073)
+        self.config_u16("tcpPort", 9073)
     }
 
-    fn snapshot_channel(&self) -> u16 {
-        self.spec
-            .config
-            .get("snapshotChannel")
-            .and_then(serde_json::Value::as_u64)
-            .map(|v| v as u16)
-            .unwrap_or(0)
+    fn yuv_capture_request(&self) -> Result<CaptureRequest, NodeError> {
+        Ok(CaptureRequest {
+            target: CaptureTarget::Yuv {
+                channel: self.config_u16("snapshotChannel", 0),
+            },
+            mode: self.capture_mode()?,
+            source_identity: None,
+        })
+    }
+
+    fn raw_capture_request(&self) -> CaptureRequest {
+        CaptureRequest {
+            target: CaptureTarget::Raw {
+                camera: self.config_u16("rawCamera", 0),
+            },
+            mode: CaptureMode::Latest,
+            source_identity: None,
+        }
+    }
+
+    fn capture_mode(&self) -> Result<CaptureMode, NodeError> {
+        match config_string(&self.spec, "snapshotMode").as_str() {
+            "" | "latest" => Ok(CaptureMode::Latest),
+            "frame_id" => self
+                .required_config_u64("snapshotFrameId", "snapshotFrameId")
+                .map(CaptureMode::FrameId),
+            "timestamp_ns" => self
+                .required_config_u64("snapshotTimestampNs", "snapshotTimestampNs")
+                .map(CaptureMode::TimestampNs),
+            "rtsp_pts_90k" => {
+                let pts = self.required_config_u64("snapshotRtspPts90k", "snapshotRtspPts90k")?;
+                let tolerance = self.config_u64("snapshotRtspPtsTolerance90k").unwrap_or(0);
+                Ok(CaptureMode::RtspPts90k { pts, tolerance })
+            }
+            value => Err(NodeError::Config(format!(
+                "x5233Driver snapshotMode `{value}` is unsupported"
+            ))),
+        }
+    }
+
+    fn config_u16(&self, key: &str, fallback: u16) -> u16 {
+        self.config_u64(key)
+            .and_then(|value| u16::try_from(value).ok())
+            .unwrap_or(fallback)
+    }
+
+    fn config_u64(&self, key: &str) -> Option<u64> {
+        let value = self.spec.config.get(key)?;
+        if let Some(number) = value.as_u64() {
+            return Some(number);
+        }
+        value.as_str()?.trim().parse::<u64>().ok()
+    }
+
+    fn required_config_u64(&self, key: &str, label: &str) -> Result<u64, NodeError> {
+        self.config_u64(key).ok_or_else(|| {
+            NodeError::Config(format!(
+                "x5233Driver {label} must be a non-negative integer"
+            ))
+        })
+    }
+
+    fn raw_metadata(&self) -> Result<RawMetadata, NodeError> {
+        let bayer_pattern = match config_string(&self.spec, "rawBayerPattern").as_str() {
+            "rggb" => BayerPattern::Rggb,
+            "bggr" => BayerPattern::Bggr,
+            "grbg" => BayerPattern::Grbg,
+            "gbrg" => BayerPattern::Gbrg,
+            "" => {
+                return Err(NodeError::Precondition(
+                    "x5233Driver RAW capture requires config rawBayerPattern".to_owned(),
+                ));
+            }
+            value => {
+                return Err(NodeError::Config(format!(
+                    "x5233Driver rawBayerPattern `{value}` is unsupported"
+                )));
+            }
+        };
+        let bits_per_sample = self
+            .config_u64("rawBitsPerSample")
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| (1..=16).contains(value))
+            .ok_or_else(|| {
+                NodeError::Precondition(
+                    "x5233Driver RAW capture requires rawBitsPerSample in 1..=16".to_owned(),
+                )
+            })?;
+        Ok(RawMetadata {
+            bayer_pattern,
+            bits_per_sample,
+            black_level: None,
+            white_level: None,
+        })
+    }
+
+    fn capture(&self, request: &CaptureRequest, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        if matches!(request.target, CaptureTarget::Raw { .. })
+            && !matches!(request.mode, CaptureMode::Latest)
+        {
+            return Err(NodeError::Precondition(
+                "X5_233 RAW capture only supports mode=latest; the device exposes no RAW frame ring"
+                    .to_owned(),
+            ));
+        }
+        let host = self.host()?;
+        let payload = rt
+            .services()
+            .x5_client()?
+            .capture(&host, self.port(), request)
+            .map_err(NodeError::Execution)?;
+        let (output, frame) = match payload {
+            X5233CapturePayload::Nv12 {
+                channel,
+                width,
+                height,
+                y_len,
+                uv_len,
+                frame_id,
+                timestamp_ns,
+                rtsp_pts_90k,
+                match_rtsp_pts_delta_90k,
+                payload,
+            } => {
+                if request.target != (CaptureTarget::Yuv { channel }) {
+                    return Err(NodeError::Execution(
+                        "X5_233 YUV response target does not match capture request".to_owned(),
+                    ));
+                }
+                let output = match channel {
+                    0 => "yuvCh0",
+                    3 => "yuvCh3",
+                    _ => {
+                        return Err(NodeError::Precondition(format!(
+                            "X5_233 only exposes YUV channels 0 and 3, got {channel}"
+                        )));
+                    }
+                };
+                let y_stride = plane_stride(y_len, height, "Y")?;
+                let uv_stride = plane_stride(uv_len, height / 2, "UV")?;
+                let y_end = y_len;
+                let uv_end = y_len.checked_add(uv_len).ok_or_else(|| {
+                    NodeError::Execution("X5_233 NV12 payload length overflow".to_owned())
+                })?;
+                if payload.len() != uv_end {
+                    return Err(NodeError::Execution(format!(
+                        "X5_233 NV12 payload has {} bytes, expected {uv_end}",
+                        payload.len()
+                    )));
+                }
+                let identity =
+                    x5233_identity(channel, None, frame_id, timestamp_ns, Some(rtsp_pts_90k));
+                let frame = ImageFrame::new(
+                    width,
+                    height,
+                    ImageFrameFormat::Nv12,
+                    vec![
+                        ImagePlane::new(Arc::from(&payload[..y_end]), y_stride),
+                        ImagePlane::new(Arc::from(&payload[y_end..uv_end]), uv_stride),
+                    ],
+                    identity,
+                    None,
+                    None,
+                )
+                .map_err(|error| {
+                    NodeError::Execution(format!("invalid X5_233 NV12 frame: {error}"))
+                })?;
+                if matches!(request.mode, CaptureMode::RtspPts90k { .. })
+                    && match_rtsp_pts_delta_90k.is_none()
+                {
+                    return Err(NodeError::Execution(
+                        "X5_233 PTS bridge response omitted match delta".to_owned(),
+                    ));
+                }
+                (output, frame)
+            }
+            X5233CapturePayload::BayerRaw {
+                camera,
+                width,
+                height,
+                stride_bytes,
+                frame_id,
+                timestamp_ns,
+                payload,
+                ..
+            } => {
+                if request.target != (CaptureTarget::Raw { camera }) {
+                    return Err(NodeError::Execution(
+                        "X5_233 RAW response target does not match capture request".to_owned(),
+                    ));
+                }
+                let output = match camera {
+                    0 => "rawCam0",
+                    1 => "rawCam1",
+                    _ => {
+                        return Err(NodeError::Precondition(format!(
+                            "X5_233 only exposes RAW cameras 0 and 1, got {camera}"
+                        )));
+                    }
+                };
+                let raw = self.raw_metadata()?;
+                let identity = x5233_identity(camera, Some(camera), frame_id, timestamp_ns, None);
+                let frame = ImageFrame::new(
+                    width,
+                    height,
+                    ImageFrameFormat::BayerRaw,
+                    vec![ImagePlane::new(payload, stride_bytes)],
+                    identity,
+                    None,
+                    Some(raw),
+                )
+                .map_err(|error| {
+                    NodeError::Execution(format!("invalid X5_233 RAW frame: {error}"))
+                })?;
+                (output, frame)
+            }
+        };
+        rt.emit(output, DataPacket::ImageFrame(Arc::new(frame)))?;
+        rt.report_event(format!("x5_233 capture published on {output}"));
+        Ok(())
     }
 }
 
-impl NodeInstance for X5DeviceNode {
+impl NodeInstance for X5233DriverNode {
     fn kind(&self) -> &'static str {
-        "x5Device"
+        "x5233Driver"
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Ready, "trigger to probe X5 status");
+        rt.report_state(
+            NodeRuntimeState::Ready,
+            "trigger to query X5_233 driver status",
+        );
+        Ok(())
+    }
+
+    fn on_input(
+        &mut self,
+        port: &str,
+        packet: DataPacket,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        if port != "capture" {
+            return Ok(());
+        }
+        let DataPacket::CaptureRequest(request) = packet else {
+            return Err(NodeError::Precondition(
+                "x5233Driver.capture requires command.capture.request.v1".to_owned(),
+            ));
+        };
+        self.capture(&request, rt)
+    }
+
+    fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        match action {
+            NodeAction::Trigger => {
+                let status = rt
+                    .services()
+                    .x5_client()?
+                    .status(&self.host()?, self.port())
+                    .map_err(NodeError::Execution)?;
+                rt.emit("status", DataPacket::Json(Arc::new(status)))?;
+                rt.report_state(NodeRuntimeState::Idle, "x5_233 status ready");
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "probe" => {
+                let summary = rt
+                    .services()
+                    .x5_client()?
+                    .probe(&self.host()?, self.port())
+                    .map_err(NodeError::Execution)?;
+                rt.emit("status", DataPacket::Json(Arc::new(summary)))?;
+                rt.report_event("x5_233 probe ready".to_owned());
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "snapshot" || name == "capture_yuv" => {
+                let request = self.yuv_capture_request()?;
+                self.capture(&request, rt)
+            }
+            NodeAction::Custom { name, .. } if name == "capture_raw" => {
+                self.capture(&self.raw_capture_request(), rt)
+            }
+            other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
+        }
+    }
+
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        rt.report_state(NodeRuntimeState::Idle, "stopped");
+        Ok(())
+    }
+}
+
+fn plane_stride(length: usize, rows: u32, plane: &str) -> Result<u32, NodeError> {
+    let rows = usize::try_from(rows)
+        .map_err(|_| NodeError::Execution(format!("X5_233 {plane} plane rows do not fit usize")))?;
+    if rows == 0 || length % rows != 0 {
+        return Err(NodeError::Execution(format!(
+            "X5_233 {plane} plane length {length} is not an exact row extent"
+        )));
+    }
+    u32::try_from(length / rows)
+        .map_err(|_| NodeError::Execution(format!("X5_233 {plane} stride does not fit u32")))
+}
+
+fn x5233_identity(
+    channel: u16,
+    camera: Option<u16>,
+    frame_id: u64,
+    timestamp_ns: u64,
+    rtsp_pts_90k: Option<u64>,
+) -> ImageFrameIdentity {
+    ImageFrameIdentity {
+        provenance: FrameProvenance::Device {
+            driver: "x5_233".to_owned(),
+            channel,
+            camera,
+            timestamp_ns,
+            rtsp_pts_90k,
+        },
+        frame_sequence: frame_id,
+        source_pts: SourcePts::Unavailable {
+            reason: "X5_233 device timestamp is not a decoded RTSP frame identity".to_owned(),
+        },
+        host_monotonic_time_ns: host_monotonic_time_ns(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Hex Arm Device 节点
+// ---------------------------------------------------------------------------
+
+/// Hex Arm 控制节点：显式维护本节点建立的会话与 API 控制初始化状态。
+///
+/// probe/status 不需要运动许可；其他控制动作必须经过 connect → initialize_api_control，
+/// 且 `controlEnabled` 为真。这样工作流恢复和未知会话状态都不能直接驱动机械臂。
+pub struct HexArmDeviceFactory;
+
+impl NodeFactory for HexArmDeviceFactory {
+    fn kind(&self) -> &'static str {
+        "hexArmDevice"
+    }
+
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+        Ok(Box::new(HexArmDeviceNode {
+            spec,
+            connected: false,
+            api_control_initialized: false,
+        }))
+    }
+}
+
+pub struct HexArmDeviceNode {
+    spec: NodeSpec,
+    connected: bool,
+    api_control_initialized: bool,
+}
+
+impl HexArmDeviceNode {
+    fn target(&self) -> Result<HexArmTargetConfig, NodeError> {
+        let mut target = HexArmTargetConfig {
+            host: non_empty(config_string(&self.spec, "host")).ok_or_else(|| {
+                NodeError::Precondition("hexArmDevice host must be configured".to_owned())
+            })?,
+            ..HexArmTargetConfig::default()
+        };
+        target.port = config_u16(&self.spec, "port", target.port)?;
+        target.command_timeout_ms =
+            config_positive_u64(&self.spec, "commandTimeoutMs", target.command_timeout_ms)?;
+        target.connect_timeout_ms =
+            config_positive_u64(&self.spec, "connectTimeoutMs", target.connect_timeout_ms)?;
+        target.control_enabled = config_bool(&self.spec, "controlEnabled", false)?;
+        target.transport = match config_string(&self.spec, "transport").trim() {
+            "" | "websocket" => HexArmTransport::WebSocket,
+            "kcp" => HexArmTransport::Kcp,
+            value => {
+                return Err(NodeError::Config(format!(
+                    "config `transport` must be `websocket` or `kcp`, got `{value}`"
+                )));
+            }
+        };
+        Ok(target)
+    }
+
+    /// 校验本节点创建的控制会话，避免未初始化或恢复出的节点执行运动相关命令。
+    fn require_control_session(&self, target: &HexArmTargetConfig) -> Result<(), NodeError> {
+        if !target.control_enabled {
+            return Err(NodeError::Precondition(
+                "hex arm control is disabled; set controlEnabled=true before control actions"
+                    .to_owned(),
+            ));
+        }
+        if !self.connected {
+            return Err(NodeError::Precondition(
+                "hex arm session is not connected; connect first".to_owned(),
+            ));
+        }
+        if !self.api_control_initialized {
+            return Err(NodeError::Precondition(
+                "hex arm API control is not initialized; initialize_api_control first".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn joint_positions(&self) -> Result<HexArmJointPositionsRequest, NodeError> {
+        let values = match self.spec.config.get("jointPositions") {
+            Some(serde_json::Value::String(text)) => text
+                .split(',')
+                .map(str::trim)
+                .map(|value| {
+                    value.parse::<f64>().map_err(|_| {
+                        NodeError::Config(
+                            "config `jointPositions` must be a comma-separated radian list"
+                                .to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            Some(serde_json::Value::Array(values)) => values
+                .iter()
+                .map(|value| {
+                    value.as_f64().ok_or_else(|| {
+                        NodeError::Config(
+                            "config `jointPositions` must contain only numeric radians".to_owned(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => {
+                return Err(NodeError::Precondition(
+                    "config `jointPositions` must be a non-empty radian list".to_owned(),
+                ));
+            }
+        };
+        if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+            return Err(NodeError::Precondition(
+                "joint positions must be non-empty finite radians".to_owned(),
+            ));
+        }
+        Ok(HexArmJointPositionsRequest {
+            joint_positions_radians: values,
+        })
+    }
+}
+
+impl NodeInstance for HexArmDeviceNode {
+    fn kind(&self) -> &'static str {
+        "hexArmDevice"
+    }
+
+    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        rt.report_state(
+            NodeRuntimeState::Ready,
+            "connect before initializing Hex Arm API control",
+        );
         Ok(())
     }
 
@@ -525,40 +965,197 @@ impl NodeInstance for X5DeviceNode {
     }
 
     fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        let client = rt.services().x5_client()?;
-        let host = self.host()?;
-        let port = self.port();
+        let client = rt.services().hex_arm_client()?;
+        let target = self.target()?;
         match action {
-            // Trigger：读取设备状态；X5Device 当前无图数据输出端口，只报告执行结果。
+            NodeAction::Connect => {
+                rt.report_state(NodeRuntimeState::Running, "connecting Hex Arm");
+                client.connect(&target).map_err(NodeError::Execution)?;
+                self.connected = true;
+                self.api_control_initialized = false;
+                rt.report_event("hex arm connected".to_owned());
+                rt.report_state(
+                    NodeRuntimeState::Idle,
+                    "connected; initialize API control next",
+                );
+                Ok(())
+            }
+            NodeAction::Disconnect => {
+                if !self.connected {
+                    return Err(NodeError::Precondition(
+                        "hex arm session is not connected; refusing untracked disconnect"
+                            .to_owned(),
+                    ));
+                }
+                client.disconnect(&target).map_err(NodeError::Execution)?;
+                self.connected = false;
+                self.api_control_initialized = false;
+                rt.report_event("hex arm disconnected".to_owned());
+                rt.report_state(NodeRuntimeState::Idle, "disconnected");
+                Ok(())
+            }
             NodeAction::Trigger => {
-                rt.report_state(NodeRuntimeState::Running, "querying X5 status");
-                let _status = client.status(&host, port).map_err(NodeError::Execution)?;
-                rt.report_event("x5 status ready".to_owned());
-                rt.report_state(NodeRuntimeState::Idle, "x5 status ready");
+                client.status(&target).map_err(NodeError::Execution)?;
+                rt.report_event("hex arm status ready".to_owned());
                 Ok(())
             }
-            // Custom "probe"：仅探针。
-            NodeAction::Custom { name, .. } if name == "probe" => {
-                let _summary = client.probe(&host, port).map_err(NodeError::Execution)?;
-                rt.report_event("x5 probe ready".to_owned());
+            NodeAction::Custom { name, .. } if name == "status" => {
+                client.status(&target).map_err(NodeError::Execution)?;
+                rt.report_event("hex arm status ready".to_owned());
                 Ok(())
             }
-            // Custom "snapshot"：抓取当前 snapshotChannel；响应是 NV12 元数据，不是 ImageFrame。
-            NodeAction::Custom { name, .. } if name == "snapshot" => {
-                let channel = self.snapshot_channel();
-                let _snapshot = client
-                    .capture_snapshot(&host, port, channel)
+            NodeAction::Custom { name, .. } if name == "initialize_api_control" => {
+                if !target.control_enabled {
+                    return Err(NodeError::Precondition(
+                        "hex arm control is disabled; set controlEnabled=true before control actions"
+                            .to_owned(),
+                    ));
+                }
+                if !self.connected {
+                    return Err(NodeError::Precondition(
+                        "hex arm session is not connected; connect first".to_owned(),
+                    ));
+                }
+                client
+                    .initialize_api_control(&target)
                     .map_err(NodeError::Execution)?;
-                rt.report_event(format!("x5 snapshot ready on channel {channel}"));
+                self.api_control_initialized = true;
+                rt.report_event("hex arm API control initialized".to_owned());
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "calibrate" => {
+                self.require_control_session(&target)?;
+                client.calibrate(&target).map_err(NodeError::Execution)?;
+                rt.report_event("hex arm calibration requested".to_owned());
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "clear_parking_stop" => {
+                self.require_control_session(&target)?;
+                client
+                    .clear_parking_stop(&target)
+                    .map_err(NodeError::Execution)?;
+                rt.report_event("hex arm parking stop cleared".to_owned());
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "zero_current" => {
+                self.require_control_session(&target)?;
+                client.zero_current(&target).map_err(NodeError::Execution)?;
+                rt.report_event("hex arm current zeroed".to_owned());
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "send_joint_positions" => {
+                self.require_control_session(&target)?;
+                let request = self.joint_positions()?;
+                client
+                    .send_joint_positions(&target, &request)
+                    .map_err(NodeError::Execution)?;
+                rt.report_event("hex arm joint positions sent".to_owned());
                 Ok(())
             }
             other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
         }
     }
 
-    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Idle, "stopped");
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let mut updated_spec = self.spec.clone();
+        updated_spec.config = config;
+        // 先解析新目标，拒绝明显无效配置而不改变当前会话。
+        let candidate = HexArmDeviceNode {
+            spec: updated_spec.clone(),
+            connected: false,
+            api_control_initialized: false,
+        };
+        let candidate_target = candidate.target()?;
+        let (should_disconnect, old_target) = if self.connected {
+            let old_target = self.target()?;
+            let should_disconnect = old_target.host != candidate_target.host
+                || old_target.port != candidate_target.port
+                || old_target.transport != candidate_target.transport
+                || (old_target.control_enabled && !candidate_target.control_enabled);
+            (should_disconnect, Some(old_target))
+        } else {
+            (false, None)
+        };
+        let disconnect_result = if should_disconnect {
+            match rt.services().hex_arm_client() {
+                Ok(client) => client
+                    .disconnect(old_target.as_ref().expect("connected target is present"))
+                    .map(|_| ())
+                    .map_err(NodeError::Execution),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(())
+        };
+        if should_disconnect {
+            // 主机/传输/禁用控制的变更必须先安全断开；失败时清除本地会话状态。
+            self.connected = false;
+            self.api_control_initialized = false;
+        }
+        disconnect_result?;
+        self.spec = updated_spec;
+        rt.report_event("hex arm configuration updated".to_owned());
         Ok(())
+    }
+
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        let disconnect_result = if self.connected {
+            let client = rt.services().hex_arm_client()?;
+            let target = self.target()?;
+            client
+                .disconnect(&target)
+                .map(|_| ())
+                .map_err(NodeError::Execution)
+        } else {
+            Ok(())
+        };
+        self.connected = false;
+        self.api_control_initialized = false;
+        rt.report_state(NodeRuntimeState::Idle, "stopped");
+        disconnect_result
+    }
+}
+
+/// 读取正整数配置；允许 Web UI 写入 number 或文本字段。
+fn config_positive_u64(spec: &NodeSpec, key: &str, fallback: u64) -> Result<u64, NodeError> {
+    let Some(value) = spec.config.get(key) else {
+        return Ok(fallback);
+    };
+    let parsed = match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(value) => value.trim().parse::<u64>().ok(),
+        _ => None,
+    }
+    .filter(|value| *value > 0)
+    .ok_or_else(|| NodeError::Config(format!("config `{key}` must be a positive integer")))?;
+    Ok(parsed)
+}
+
+fn config_u16(spec: &NodeSpec, key: &str, fallback: u16) -> Result<u16, NodeError> {
+    let value = config_positive_u64(spec, key, u64::from(fallback))?;
+    u16::try_from(value).map_err(|_| NodeError::Config(format!("config `{key}` must fit in u16")))
+}
+
+fn config_bool(spec: &NodeSpec, key: &str, fallback: bool) -> Result<bool, NodeError> {
+    let Some(value) = spec.config.get(key) else {
+        return Ok(fallback);
+    };
+    match value {
+        serde_json::Value::Bool(value) => Ok(*value),
+        serde_json::Value::String(value) => match value.trim() {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => Err(NodeError::Config(format!(
+                "config `{key}` must be a boolean"
+            ))),
+        },
+        _ => Err(NodeError::Config(format!(
+            "config `{key}` must be a boolean"
+        ))),
     }
 }
 
@@ -700,18 +1297,15 @@ impl SftpFileSourceNode {
 
         let (width, height) = (rgba.width, rgba.height);
         let compact = compact_rgba8(&rgba, width, height)?;
-        let frame = DecodedVideoFrame {
-            width,
-            height,
-            rgba: compact,
-            identity: StreamFrameIdentity::unavailable(
-                StreamSessionId::new(format!("sftp-{}", self.spec.id))
-                    .map_err(|_| NodeError::Execution("invalid session id".to_owned()))?,
-                0,
-                0,
-                "sftp file source",
-            ),
-        };
+        let identity = StreamFrameIdentity::unavailable(
+            StreamSessionId::new(format!("sftp-{}", self.spec.id))
+                .map_err(|_| NodeError::Execution("invalid session id".to_owned()))?,
+            0,
+            0,
+            "sftp file source",
+        );
+        let frame = ImageFrame::rgba8(width, height, compact, ImageFrameIdentity::from(&identity))
+            .map_err(|error| NodeError::Execution(error.to_string()))?;
         rt.emit("image", DataPacket::ImageFrame(Arc::new(frame)))?;
         rt.report_state(NodeRuntimeState::Idle, "remote image ready");
         Ok(())
@@ -862,7 +1456,7 @@ mod tests {
 
     use super::*;
     use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
-    use crate::platform::{EepromExecutor, I2cExecutor, X5ControlClient};
+    use crate::platform::{EepromExecutor, HexArmControlClient, I2cExecutor, X5ControlClient};
 
     fn i2c_spec() -> NodeSpec {
         NodeSpec {
@@ -897,15 +1491,95 @@ mod tests {
     fn x5_spec() -> NodeSpec {
         NodeSpec {
             id: "x5-1".to_owned(),
-            kind: "x5Device".to_owned(),
-            title: "X5 Device".to_owned(),
+            kind: "x5233Driver".to_owned(),
+            title: "X5_233 Driver".to_owned(),
             inputs: vec![],
             outputs: vec![],
             config: serde_json::json!({
                 "host": "camera.local",
                 "tcpPort": 9073,
                 "snapshotChannel": 3,
+                "rawBayerPattern": "rggb",
+                "rawBitsPerSample": 12,
             }),
+        }
+    }
+
+    fn hex_arm_spec(control_enabled: bool, positions: &str) -> NodeSpec {
+        NodeSpec {
+            id: "hex-arm-1".to_owned(),
+            kind: "hexArmDevice".to_owned(),
+            title: "Hex Arm".to_owned(),
+            inputs: vec![],
+            outputs: vec![],
+            config: serde_json::json!({
+                "host": "hex-arm.local",
+                "port": 8439,
+                "transport": "websocket",
+                "controlEnabled": control_enabled,
+                "jointPositions": positions,
+            }),
+        }
+    }
+
+    struct RecordingHexArmClient {
+        calls: Arc<Mutex<Vec<String>>>,
+        positions: Arc<Mutex<Option<Vec<f64>>>>,
+    }
+
+    impl RecordingHexArmClient {
+        fn record(&self, name: &str) {
+            self.calls.lock().push(name.to_owned());
+        }
+    }
+
+    impl HexArmControlClient for RecordingHexArmClient {
+        fn probe(&self, _target: &HexArmTargetConfig) -> Result<serde_json::Value, String> {
+            self.record("probe");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn status(&self, _target: &HexArmTargetConfig) -> Result<serde_json::Value, String> {
+            self.record("status");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn connect(&self, _target: &HexArmTargetConfig) -> Result<serde_json::Value, String> {
+            self.record("connect");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn initialize_api_control(
+            &self,
+            _target: &HexArmTargetConfig,
+        ) -> Result<serde_json::Value, String> {
+            self.record("initialize_api_control");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn calibrate(&self, _target: &HexArmTargetConfig) -> Result<serde_json::Value, String> {
+            self.record("calibrate");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn clear_parking_stop(
+            &self,
+            _target: &HexArmTargetConfig,
+        ) -> Result<serde_json::Value, String> {
+            self.record("clear_parking_stop");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn zero_current(&self, _target: &HexArmTargetConfig) -> Result<serde_json::Value, String> {
+            self.record("zero_current");
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn send_joint_positions(
+            &self,
+            _target: &HexArmTargetConfig,
+            request: &HexArmJointPositionsRequest,
+        ) -> Result<serde_json::Value, String> {
+            self.record("send_joint_positions");
+            *self.positions.lock() = Some(request.joint_positions_radians.clone());
+            Ok(serde_json::json!({"ok": true}))
+        }
+        fn disconnect(&self, _target: &HexArmTargetConfig) -> Result<serde_json::Value, String> {
+            self.record("disconnect");
+            Ok(serde_json::json!({"ok": true}))
         }
     }
 
@@ -922,6 +1596,24 @@ mod tests {
             viewer_slot: None,
         };
         (NodeRuntime::new(ctx), outputs)
+    }
+
+    fn runtime_with_record(
+        services: EngineServices,
+        recorded: Arc<Mutex<Vec<DataPacket>>>,
+    ) -> NodeRuntime {
+        let (status_tx, _status_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("x5233-1".to_owned(), status_tx, event_tx);
+        let mut outputs = OutputRegistry::default();
+        outputs.set_record(Arc::new(move |packet| recorded.lock().push(packet)));
+        NodeRuntime::new(SpawnContext {
+            outputs,
+            reporter,
+            services: Arc::new(services),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        })
     }
 
     struct RecordingI2cExecutor {
@@ -944,7 +1636,8 @@ mod tests {
     }
 
     struct RecordingX5Client {
-        snapshot_channel: Arc<Mutex<Option<u16>>>,
+        requests: Arc<Mutex<Vec<CaptureRequest>>>,
+        payload: X5233CapturePayload,
     }
 
     impl X5ControlClient for RecordingX5Client {
@@ -956,14 +1649,14 @@ mod tests {
             Ok(serde_json::json!({"ok": true}))
         }
 
-        fn capture_snapshot(
+        fn capture(
             &self,
             _host: &str,
             _port: u16,
-            channel: u16,
-        ) -> Result<serde_json::Value, String> {
-            *self.snapshot_channel.lock() = Some(channel);
-            Ok(serde_json::json!({"channel": channel, "payloadBytes": 3110400}))
+            request: &CaptureRequest,
+        ) -> Result<X5233CapturePayload, String> {
+            self.requests.lock().push(request.clone());
+            Ok(self.payload.clone())
         }
     }
 
@@ -1038,28 +1731,335 @@ mod tests {
         );
     }
 
+    fn yuv_payload(channel: u16) -> X5233CapturePayload {
+        X5233CapturePayload::Nv12 {
+            channel,
+            width: 2,
+            height: 2,
+            y_len: 4,
+            uv_len: 2,
+            frame_id: 42,
+            timestamp_ns: 123_456,
+            rtsp_pts_90k: 9_000,
+            match_rtsp_pts_delta_90k: Some(0),
+            payload: Arc::from([1_u8, 2, 3, 4, 5, 6]),
+        }
+    }
+
     #[test]
-    fn x5_snapshot_uses_snapshot_channel_without_declared_outputs() {
-        let snapshot_channel = Arc::new(Mutex::new(None));
-        let mut node = X5DeviceNode { spec: x5_spec() };
+    fn capture_request_emits_nv12_with_driver_identity_and_pts_bridge_provenance() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
         let services = EngineServices {
             x5_client: Some(Arc::new(RecordingX5Client {
-                snapshot_channel: Arc::clone(&snapshot_channel),
+                requests: Arc::clone(&requests),
+                payload: yuv_payload(3),
+            })),
+            ..EngineServices::default()
+        };
+        let mut rt = runtime_with_record(services, Arc::clone(&emitted));
+        let mut node = X5233DriverNode { spec: x5_spec() };
+        let request = CaptureRequest {
+            target: CaptureTarget::Yuv { channel: 3 },
+            mode: CaptureMode::RtspPts90k {
+                pts: 9_000,
+                tolerance: 0,
+            },
+            source_identity: None,
+        };
+
+        node.on_input(
+            "capture",
+            DataPacket::CaptureRequest(Arc::new(request.clone())),
+            &mut rt,
+        )
+        .expect("X5 NV12 capture");
+
+        assert_eq!(requests.lock().as_slice(), [request]);
+        let packets = emitted.lock();
+        let DataPacket::ImageFrame(frame) = &packets[0] else {
+            panic!("capture must emit image.frame");
+        };
+        assert_eq!(frame.format, ImageFrameFormat::Nv12);
+        assert_eq!(frame.identity.frame_sequence, 42);
+        assert!(matches!(
+            &frame.identity.provenance,
+            FrameProvenance::Device {
+                driver,
+                channel: 3,
+                camera: None,
+                timestamp_ns: 123_456,
+                rtsp_pts_90k: Some(9_000),
+            } if driver == "x5_233"
+        ));
+        assert!(matches!(
+            frame.identity.source_pts,
+            SourcePts::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn capture_yuv_action_uses_capture_request_path() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            x5_client: Some(Arc::new(RecordingX5Client {
+                requests: Arc::clone(&requests),
+                payload: yuv_payload(3),
             })),
             ..EngineServices::default()
         };
         let (mut rt, _outputs) = runtime(services);
-
+        let mut node = X5233DriverNode { spec: x5_spec() };
         node.on_action(
             NodeAction::Custom {
-                name: "snapshot".to_owned(),
-                payload: serde_json::json!({}),
+                name: "capture_yuv".to_owned(),
+                payload: serde_json::Value::Null,
             },
             &mut rt,
         )
-        .expect("snapshot action uses x5 client");
+        .expect("capture_yuv action");
+        assert!(matches!(
+            requests.lock().as_slice(),
+            [CaptureRequest {
+                target: CaptureTarget::Yuv { channel: 3 },
+                mode: CaptureMode::Latest,
+                ..
+            }]
+        ));
+    }
 
-        assert_eq!(*snapshot_channel.lock(), Some(3));
+    #[test]
+    fn capture_raw_action_uses_raw_camera_path() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            x5_client: Some(Arc::new(RecordingX5Client {
+                requests: Arc::clone(&requests),
+                payload: X5233CapturePayload::BayerRaw {
+                    camera: 1,
+                    width: 2,
+                    height: 1,
+                    stride_bytes: 4,
+                    format_code: 24,
+                    frame_id: 8,
+                    timestamp_ns: 456_789,
+                    payload: Arc::from([0_u8, 1, 2, 3]),
+                },
+            })),
+            ..EngineServices::default()
+        };
+        let (mut rt, _outputs) = runtime(services);
+        let mut node = X5233DriverNode {
+            spec: NodeSpec {
+                id: "x5-1".to_owned(),
+                kind: "x5233Driver".to_owned(),
+                title: "X5_233 Driver".to_owned(),
+                inputs: vec![],
+                outputs: vec![],
+                config: serde_json::json!({
+                    "host": "10.21.12.108",
+                    "tcpPort": 9073,
+                    "rawCamera": 1,
+                    "rawBayerPattern": "bggr",
+                    "rawBitsPerSample": 12,
+                }),
+            },
+        };
+        node.on_action(
+            NodeAction::Custom {
+                name: "capture_raw".to_owned(),
+                payload: serde_json::Value::Null,
+            },
+            &mut rt,
+        )
+        .expect("capture_raw action");
+        assert!(matches!(
+            requests.lock().as_slice(),
+            [CaptureRequest {
+                target: CaptureTarget::Raw { camera: 1 },
+                mode: CaptureMode::Latest,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn raw_capture_emits_bayer_frame_with_explicit_metadata() {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            x5_client: Some(Arc::new(RecordingX5Client {
+                requests: Arc::clone(&requests),
+                payload: X5233CapturePayload::BayerRaw {
+                    camera: 0,
+                    width: 2,
+                    height: 1,
+                    stride_bytes: 4,
+                    format_code: 24,
+                    frame_id: 8,
+                    timestamp_ns: 456_789,
+                    payload: Arc::from([0_u8, 1, 2, 3]),
+                },
+            })),
+            ..EngineServices::default()
+        };
+        let mut rt = runtime_with_record(services, Arc::clone(&emitted));
+        let mut node = X5233DriverNode { spec: x5_spec() };
+        node.on_input(
+            "capture",
+            DataPacket::CaptureRequest(Arc::new(CaptureRequest {
+                target: CaptureTarget::Raw { camera: 0 },
+                mode: CaptureMode::Latest,
+                source_identity: None,
+            })),
+            &mut rt,
+        )
+        .expect("X5 RAW capture");
+
+        assert!(matches!(
+            requests.lock().as_slice(),
+            [CaptureRequest {
+                target: CaptureTarget::Raw { camera: 0 },
+                mode: CaptureMode::Latest,
+                ..
+            }]
+        ));
+        let packets = emitted.lock();
+        let DataPacket::ImageFrame(frame) = &packets[0] else {
+            panic!("RAW capture must emit image.frame");
+        };
+        assert_eq!(frame.format, ImageFrameFormat::BayerRaw);
+        assert!(matches!(
+            frame.raw,
+            Some(RawMetadata {
+                bayer_pattern: BayerPattern::Rggb,
+                bits_per_sample: 12,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_exact_capture_is_explicit_precondition_without_device_support() {
+        let mut node = X5233DriverNode { spec: x5_spec() };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let error = node
+            .on_input(
+                "capture",
+                DataPacket::CaptureRequest(Arc::new(CaptureRequest {
+                    target: CaptureTarget::Raw { camera: 0 },
+                    mode: CaptureMode::FrameId(42),
+                    source_identity: None,
+                })),
+                &mut rt,
+            )
+            .expect_err("RAW exact capture has no X5 executor support");
+        assert!(matches!(error, NodeError::Precondition(_)), "got {error:?}");
+    }
+
+    #[test]
+    fn capture_without_x5_client_is_precondition() {
+        let mut node = X5233DriverNode { spec: x5_spec() };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let error = node
+            .on_input(
+                "capture",
+                DataPacket::CaptureRequest(Arc::new(CaptureRequest {
+                    target: CaptureTarget::Yuv { channel: 0 },
+                    mode: CaptureMode::Latest,
+                    source_identity: None,
+                })),
+                &mut rt,
+            )
+            .expect_err("X5 client is required");
+        assert!(matches!(error, NodeError::Precondition(_)), "got {error:?}");
+    }
+
+    fn hex_services(
+        calls: Arc<Mutex<Vec<String>>>,
+        positions: Arc<Mutex<Option<Vec<f64>>>>,
+    ) -> EngineServices {
+        EngineServices {
+            hex_arm_client: Some(Arc::new(RecordingHexArmClient { calls, positions })),
+            ..EngineServices::default()
+        }
+    }
+
+    #[test]
+    fn hex_arm_missing_service_is_precondition() {
+        let mut node = HexArmDeviceNode {
+            spec: hex_arm_spec(true, "0.1"),
+            connected: false,
+            api_control_initialized: false,
+        };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let error = node
+            .on_action(
+                NodeAction::Custom {
+                    name: "status".to_owned(),
+                    payload: serde_json::Value::Null,
+                },
+                &mut rt,
+            )
+            .expect_err("missing Hex Arm service must be a precondition");
+        assert!(matches!(error, NodeError::Precondition(_)));
+    }
+
+    #[test]
+    fn hex_arm_motion_requires_control_enabled() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let positions = Arc::new(Mutex::new(None));
+        let mut node = HexArmDeviceNode {
+            spec: hex_arm_spec(false, "0.1"),
+            connected: true,
+            api_control_initialized: true,
+        };
+        let (mut rt, _outputs) = runtime(hex_services(Arc::clone(&calls), positions));
+        let error = node
+            .on_action(
+                NodeAction::Custom {
+                    name: "send_joint_positions".to_owned(),
+                    payload: serde_json::Value::Null,
+                },
+                &mut rt,
+            )
+            .expect_err("motion must be disabled when controlEnabled=false");
+        assert!(matches!(error, NodeError::Precondition(_)));
+        assert!(calls.lock().is_empty());
+    }
+
+    #[test]
+    fn hex_arm_config_update_disconnects_only_for_target_changes() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let positions = Arc::new(Mutex::new(None));
+        let mut node = HexArmDeviceNode {
+            spec: hex_arm_spec(true, "0.1"),
+            connected: true,
+            api_control_initialized: true,
+        };
+        let (mut rt, _outputs) = runtime(hex_services(Arc::clone(&calls), Arc::clone(&positions)));
+
+        let updated = hex_arm_spec(true, "0.2,0.3").config;
+        node.on_config_update(updated, &mut rt)
+            .expect("joint-only update must preserve session");
+        assert!(calls.lock().is_empty());
+        node.on_action(
+            NodeAction::Custom {
+                name: "send_joint_positions".to_owned(),
+                payload: serde_json::Value::Null,
+            },
+            &mut rt,
+        )
+        .unwrap();
+        assert_eq!(*positions.lock(), Some(vec![0.2, 0.3]));
+
+        let mut host_changed = hex_arm_spec(true, "0.2,0.3").config;
+        host_changed["host"] = serde_json::json!("new-hex-arm.local");
+        node.on_config_update(host_changed, &mut rt)
+            .expect("host update must disconnect old session");
+        assert_eq!(
+            calls.lock().as_slice(),
+            ["send_joint_positions", "disconnect"]
+        );
     }
 
     #[test]

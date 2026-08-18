@@ -925,21 +925,19 @@ mod tests {
         ));
         let state = test_state(dir.clone());
         let seed = crate::workflow::seed_workflow_graph();
-        let source = seed
+        let driver = seed
             .nodes
             .iter()
-            .find(|node| node.id == "rtsp-source-1")
-            .expect("seed RTSP source exists");
-        let node_id = source.id.clone();
-        let expected_transport = source.config["transport"].clone();
-        let expected_width = source.config["expectedWidth"].clone();
+            .find(|node| node.id == "x5233-driver-1")
+            .expect("seed X5_233 driver exists");
+        let node_id = driver.id.clone();
+        let expected_tcp_port = driver.config["tcpPort"].clone();
 
         let out = dispatch(
             "graph.patchNode",
             serde_json::json!({
                 "nodeId": node_id.clone(),
-                "title": "Patched RTSP Input",
-                "config": { "url": "rtsp://camera.example/live" }
+                "config": { "host": "x5.example" }
             }),
             &state,
         )
@@ -951,10 +949,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate["id"] == node_id)
             .expect("patched node remains in graph");
-        assert_eq!(node["title"], "Patched RTSP Input");
-        assert_eq!(node["config"]["url"], "rtsp://camera.example/live");
-        assert_eq!(node["config"]["transport"], expected_transport);
-        assert_eq!(node["config"]["expectedWidth"], expected_width);
+        assert_eq!(node["config"]["host"], "x5.example");
+        assert_eq!(node["config"]["tcpPort"], expected_tcp_port);
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -988,15 +984,20 @@ mod tests {
         ));
         let state = test_state(dir.clone());
         let seed = crate::workflow::seed_workflow_graph();
-        let node_id = seed.nodes[0].id.clone();
 
-        dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
+        let node_id = seed
+            .nodes
+            .iter()
+            .find(|node| node.id == "viewer-1")
+            .expect("seed viewer exists")
+            .id
+            .clone();
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = runtime_status(&state).expect("drain initial statuses");
 
         let out = dispatch(
             "graph.patchNode",
-            serde_json::json!({ "nodeId": node_id, "title": "Patched RTSP Input" }),
+            serde_json::json!({ "nodeId": node_id, "title": "Patched Viewer" }),
             &state,
         )
         .expect("title patch succeeds");
@@ -1006,7 +1007,7 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|candidate| candidate["title"] == "Patched RTSP Input")
+                .any(|candidate| candidate["title"] == "Patched Viewer")
         );
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert_eq!(runtime_status(&state).unwrap(), serde_json::json!([]));
@@ -1024,8 +1025,8 @@ mod tests {
         let node = seed
             .nodes
             .iter()
-            .find(|candidate| candidate.id == "rtsp-source-1")
-            .expect("seed RTSP source exists");
+            .find(|candidate| candidate.id == "x5233-driver-1")
+            .expect("seed X5_233 driver exists");
         let node_id = node.id.clone();
 
         dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
@@ -1035,8 +1036,7 @@ mod tests {
             "graph.updateNode",
             serde_json::json!({
                 "nodeId": node_id.clone(),
-                "title": "Updated RTSP Source",
-                "config": { "url": "rtsp://camera.example/live" }
+                "config": { "host": "x5.example", "tcpPort": 9073 }
             }),
             &state,
         )
@@ -1048,8 +1048,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate["id"] == node_id)
             .expect("node remains in graph");
-        assert_eq!(updated["title"], "Updated RTSP Source");
-        assert_eq!(updated["config"]["url"], "rtsp://camera.example/live");
+        assert_eq!(updated["title"], "X5_233 Driver");
+        assert_eq!(updated["config"]["host"], "x5.example");
         assert!(state.engine_runtime.engine().as_ref().is_some());
         std::fs::remove_dir_all(dir).ok();
     }

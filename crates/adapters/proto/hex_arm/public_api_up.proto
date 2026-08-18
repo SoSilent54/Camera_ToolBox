@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+import "public_api_types.proto"; 
+
+// All messages from the robot are in this format.
+// Different robot types have different status fields.
+// 所有机器人发给上位机的消息都是这个格式。
+// 不同机器人类型有不同的状态字段。
+message APIUp {
+    // This field indicates the robot type.
+    // 这个字段表示机器人类型。
+    RobotType robot_type = 1;
+    // Rolls with potential breaking changes. e.g. Refactoring the message structure, removing deprecated robot types, etc.
+    // 变更意味着 breaking change。
+    uint32 protocol_major_version = 17; // Current value is 1.
+    // Rolls with potential non-breaking changes. e.g. adding new robot types.
+    uint32 protocol_minor_version = 18;
+    // Status of main device.
+    // 主设备的状态。
+    oneof status{
+        // Base robots will use this field.
+        // 底盘机器人会使用这个字段。
+        BaseStatus base_status = 2;
+        // Linear lifts will use this field.
+        // 线性升降机会使用这个字段。
+        LinearLiftStatus linear_lift_status = 3;
+        // Rotational lifts will use this field.
+        // 旋转升降机会使用这个字段。
+        RotateLiftStatus rotate_lift_status = 5;
+        // Arms will use this field.
+        // 机械臂会使用这个字段。
+        ArmStatus arm_status = 4;
+        // Only available for RtPureForwardOnlyV2 robot type.
+        // Will forward all CAN frames to the client.
+        // Underlaying hardware will only report at max frequency 1000Hz. So all frames in 1ms will be packed into one message.
+        // KCP is mandatory for this. Websocket can only send can messages, but will never get can messages from the robot.
+        // Also, please make sure only one connection is using this robot type. (KCP + Websocket pair is counted as one connection)
+        HexCanApiCanAnyFrames hex_can_api_can_any_frames = 22;
+    }
+    // Secondary device status. Optional. Including Imu, Hand, Gamepad, etc.
+    // 次级设备状态。可选。包括 Imu, Hand, Gamepad 等。
+    // Expect Major Device Id to be:
+    // 1. End Controller: Can be hand, hello end controller, etc.
+    // 2. Imu: 
+    // 3. Gamepad:
+    repeated SecondaryDeviceStatus secondary_device_status = 16;
+    // Optional log message. Unless you are interested in the log, you can ignore this field.
+    // 可选的日志消息。除非您对日志感兴趣，否则可以忽略这个字段不解析。
+    optional string log = 14;
+
+    // Current report frequency. This field is connection independent. A single robot might have multiple websocket connections. Each connection might have a different report frequency.
+    // 当前的报告频率。这个字段与连接无关。一个机器人可能有多个 websocket 连接。每个连接可能有不同的报告频率。
+    ReportFrequency report_frequency = 12;
+    // Identifies different websocket connections. Value will not be zero.
+    // 识别不同的 websocket 连接。值不会为零。
+    uint32 session_id = 15;
+
+    // If KCP connection is enabled, this field will be present.
+    // This field will not change after connection is established.
+    optional KcpServerStatus kcp_server_status = 19;
+
+    // Our products allow using PTP (IEEE 1588) to achieve high-precision sub-millisecond time synchronization.
+    // Check calibrated field in PtpTimeStamp to see if the time is calibrated.
+    optional TimeStamp time_stamp = 20;
+
+    // Bus voltage in volts.
+    optional float main_bus_voltage = 21;
+
+    // Deprecated fields.
+    // 弃用的字段。
+    reserved 10,11,13;
+}

@@ -30,8 +30,14 @@ use super::{
 /// 二者不破坏彼此的一致性。`Clone` 仍为廉价 `Arc` 克隆，所有克隆共享同一张下游表。
 #[derive(Clone)]
 pub struct OutputRegistry {
-    ports: Arc<RwLock<HashMap<PortId, Vec<MailboxSender>>>>,
+    ports: Arc<RwLock<HashMap<PortId, Vec<Downstream>>>>,
     record: Arc<dyn Fn(DataPacket) + Send + Sync>,
+}
+
+#[derive(Clone)]
+struct Downstream {
+    target_port: PortId,
+    sender: MailboxSender,
 }
 
 impl Default for OutputRegistry {
@@ -44,29 +50,33 @@ impl Default for OutputRegistry {
 }
 
 impl OutputRegistry {
-    /// 把一个下游 mailbox 挂到输出端口上（fan-out 追加，增量 add_edge 亦可安全调用）。
-    pub fn connect(&self, port: PortId, sender: MailboxSender) {
+    /// 把一个下游 mailbox 挂到输出端口上；投递时使用边的目标输入端口。
+    pub fn connect(&self, source_port: PortId, target_port: PortId, sender: MailboxSender) {
         self.ports
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(port)
+            .entry(source_port)
             .or_default()
-            .push(sender);
+            .push(Downstream {
+                target_port,
+                sender,
+            });
     }
 
-    /// 从一个输出端口摘除指定下游 mailbox（增量 remove_edge）。
+    /// 从一个输出端口摘除指定下游 mailbox + 目标输入端口（增量 remove_edge）。
     ///
-    /// 按 `MailboxSender` 的通道身份（`PartialEq`）精确移除目标下游，不误删其他 fan-out 分支；
-    /// 该端口移除后为空则清掉端口项。缺失的下游或端口视为 no-op（幂等）。
-    pub fn disconnect(&self, port: PortId, sender: &MailboxSender) {
+    /// 同一源端口可连到同一节点的不同输入端口；因此 disconnect 必须同时匹配 mailbox 与 target port。
+    pub fn disconnect(&self, source_port: PortId, target_port: &str, sender: &MailboxSender) {
         let mut ports = self
             .ports
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(senders) = ports.get_mut(&port) {
-            senders.retain(|existing| existing != sender);
+        if let Some(senders) = ports.get_mut(&source_port) {
+            senders.retain(|existing| {
+                existing.target_port != target_port || existing.sender != *sender
+            });
             if senders.is_empty() {
-                ports.remove(&port);
+                ports.remove(&source_port);
             }
         }
     }
@@ -99,10 +109,11 @@ impl OutputRegistry {
             return Ok(());
         };
         let mut delivered = false;
-        for sender in senders {
-            if sender
+        for downstream in senders {
+            if downstream
+                .sender
                 .try_send(NodeMessage::Input {
-                    port: port.to_owned(),
+                    port: downstream.target_port.clone(),
                     packet: packet.clone(),
                 })
                 .is_ok()
@@ -249,12 +260,12 @@ mod tests {
     fn emit_delivers_to_connected_downstream() {
         let outputs = OutputRegistry::default();
         let (tx, rx) = crate::engine::channel::create_mailbox(1);
-        outputs.connect("out".to_owned(), tx);
+        outputs.connect("out".to_owned(), "in".to_owned(), tx);
         let packet = DataPacket::Json(Arc::new(serde_json::json!({"k": 1})));
         assert!(outputs.emit("out", packet).is_ok());
         assert!(matches!(
             rx.try_recv(),
-            Ok(NodeMessage::Input { port, .. }) if port == "out"
+            Ok(NodeMessage::Input { port, .. }) if port == "in"
         ));
     }
 
@@ -263,7 +274,7 @@ mod tests {
         // 有下游时 emit 成功后应回调 record（中间结果查看的缓存回灌）。
         let mut outputs = OutputRegistry::default();
         let (tx, _rx) = crate::engine::channel::create_mailbox(1);
-        outputs.connect("out".to_owned(), tx);
+        outputs.connect("out".to_owned(), "out".to_owned(), tx);
 
         let captured: Arc<Mutex<Vec<DataPacket>>> = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&captured);
@@ -310,17 +321,17 @@ mod tests {
         let (tx1, rx1) = crate::engine::channel::create_mailbox(1);
         let (tx2, rx2) = crate::engine::channel::create_mailbox(1);
         let (tx3, rx3) = crate::engine::channel::create_mailbox(1);
-        outputs.connect("out".to_owned(), tx1);
-        outputs.connect("out".to_owned(), tx2);
-        outputs.connect("out".to_owned(), tx3);
+        outputs.connect("out".to_owned(), "in".to_owned(), tx1);
+        outputs.connect("out".to_owned(), "in".to_owned(), tx2);
+        outputs.connect("out".to_owned(), "in".to_owned(), tx3);
 
         let packet = DataPacket::Json(Arc::new(serde_json::json!({"k": 1})));
         assert!(outputs.emit("out", packet).is_ok());
 
-        // 三个下游都必须收到同一端口 "out" 的数据。
-        assert!(matches!(rx1.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "out"));
-        assert!(matches!(rx2.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "out"));
-        assert!(matches!(rx3.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "out"));
+        // 三个下游都必须收到目标输入端口 "in" 的数据。
+        assert!(matches!(rx1.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
+        assert!(matches!(rx2.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
+        assert!(matches!(rx3.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
     }
 
     #[test]
@@ -328,15 +339,29 @@ mod tests {
         // 多合1：两个不同的源节点各自连到同一个目标 mailbox 的不同端口（fan-in）。
         let (target_tx, target_rx) = crate::engine::channel::create_mailbox(4);
         let src_a = OutputRegistry::default();
-        src_a.connect("image".to_owned(), target_tx.clone());
+        src_a.connect(
+            "image_out".to_owned(),
+            "image".to_owned(),
+            target_tx.clone(),
+        );
         let src_b = OutputRegistry::default();
-        src_b.connect("video".to_owned(), target_tx.clone());
+        src_b.connect(
+            "video_out".to_owned(),
+            "video".to_owned(),
+            target_tx.clone(),
+        );
 
         src_a
-            .emit("image", DataPacket::Json(Arc::new(serde_json::json!("A"))))
+            .emit(
+                "image_out",
+                DataPacket::Json(Arc::new(serde_json::json!("A"))),
+            )
             .expect("src_a emit");
         src_b
-            .emit("video", DataPacket::Json(Arc::new(serde_json::json!("B"))))
+            .emit(
+                "video_out",
+                DataPacket::Json(Arc::new(serde_json::json!("B"))),
+            )
             .expect("src_b emit");
 
         // 目标 mailbox 收到两个不同端口的 Input，端口区分正确。
@@ -354,11 +379,11 @@ mod tests {
         let outputs = OutputRegistry::default();
         let (tx1, rx1) = crate::engine::channel::create_mailbox(1);
         let (tx2, rx2) = crate::engine::channel::create_mailbox(1);
-        outputs.connect("out".to_owned(), tx1.clone());
-        outputs.connect("out".to_owned(), tx2.clone());
+        outputs.connect("out".to_owned(), "in1".to_owned(), tx1.clone());
+        outputs.connect("out".to_owned(), "in2".to_owned(), tx2.clone());
         assert_eq!(outputs.fanout_count("out"), 2);
 
-        outputs.disconnect("out".to_owned(), &tx2);
+        outputs.disconnect("out".to_owned(), "in2", &tx2);
         assert_eq!(outputs.fanout_count("out"), 1);
 
         outputs
@@ -375,9 +400,9 @@ mod tests {
         ));
 
         // 摘掉最后一个下游后端口条目被删除（幂等，重复 disconnect 亦 no-op）。
-        outputs.disconnect("out".to_owned(), &tx1);
+        outputs.disconnect("out".to_owned(), "in1", &tx1);
         assert_eq!(outputs.fanout_count("out"), 0);
-        outputs.disconnect("out".to_owned(), &tx1); // idempotent no-op
+        outputs.disconnect("out".to_owned(), "in1", &tx1); // idempotent no-op
         assert_eq!(outputs.fanout_count("out"), 0);
     }
 }

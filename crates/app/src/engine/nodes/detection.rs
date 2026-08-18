@@ -15,8 +15,8 @@ use camera_toolbox_core::{
 
 use crate::{
     engine::{
-        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
-        NodeRuntimeState, NodeSpec, PortSpec,
+        DataPacket, DetectionPacket, ImageFrame, ImageFrameFormat, NodeAction, NodeError,
+        NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
     },
     ports::CalibrationCancellation,
 };
@@ -57,13 +57,15 @@ impl NodeInstance for ChessboardDetectorNode {
         packet: DataPacket,
         rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
-        // 只处理帧类输入；detection 等旁路输入忽略。
-        let (("image", DataPacket::ImageFrame(frame)) | ("frames", DataPacket::VideoFrame(frame))) =
-            (port, packet)
-        else {
-            return Ok(());
-        };
-        self.detect(&frame, rt)
+        // 兼容仍以 DecodedVideoFrame 表示的 RTSP stream；ImageFrame 已显式保留格式与身份。
+        match (port, packet) {
+            ("image", DataPacket::ImageFrame(frame))
+            | ("frames", DataPacket::ImageFrame(frame)) => self.detect(&frame, rt),
+            ("frames", DataPacket::VideoFrame(frame)) => {
+                self.detect(&ImageFrame::from(frame.as_ref()), rt)
+            }
+            _ => Ok(()),
+        }
     }
 
     fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -77,17 +79,31 @@ impl NodeInstance for ChessboardDetectorNode {
 }
 
 impl ChessboardDetectorNode {
-    fn detect(
-        &self,
-        frame: &crate::platform::DecodedVideoFrame,
-        rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        // 空帧（宽/高/数据任一为零或长度不匹配）直接按无结果处理，避免编码或检测 panic。
-        if frame.width == 0
-            || frame.height == 0
-            || frame.rgba.is_empty()
-            || frame.rgba.len() != rgba_len(frame.width, frame.height)?
-        {
+    fn detect(&self, frame: &ImageFrame, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        // 空帧先按无结果处理，避免 malformed carrier 在格式分派前触发 panic 或服务依赖。
+        if frame.width == 0 || frame.height == 0 {
+            rt.report_event("skipped empty or malformed frame");
+            return self.emit_overlay(rt, false);
+        }
+        // 只有 RGB/Gray 格式可以安全交给检测器；NV12 与 Bayer 必须在图上显式转换。
+        let rgba_pixels = match frame.format {
+            ImageFrameFormat::Rgba8 => compact_plane_rgba(frame)?,
+            ImageFrameFormat::Gray8 => gray8_to_rgba(frame)?,
+            ImageFrameFormat::Gray16Le => gray16_to_rgba(frame)?,
+            ImageFrameFormat::Nv12 => {
+                return Err(NodeError::Precondition(
+                    "chessboardDetector does not accept NV12; use Image Convert/luma first"
+                        .to_owned(),
+                ));
+            }
+            ImageFrameFormat::BayerRaw => {
+                return Err(NodeError::Precondition(
+                    "chessboardDetector does not accept BayerRaw; use Demosaic explicitly"
+                        .to_owned(),
+                ));
+            }
+        };
+        if rgba_pixels.is_empty() {
             rt.report_event("skipped empty or malformed frame");
             return self.emit_overlay(rt, false);
         }
@@ -99,8 +115,7 @@ impl ChessboardDetectorNode {
             .map_err(|error| NodeError::Config(error.to_string()))?;
         let decoded_byte_limit = decoded_byte_limit(expected_size)?;
 
-        // DecodedVideoFrame 已是紧密排列 RGBA，直接构造 Rgba8Frame 再编码 PNG。
-        let rgba = Rgba8Frame::tight(frame.width, frame.height, frame.rgba.clone())
+        let rgba = Rgba8Frame::tight(frame.width, frame.height, rgba_pixels)
             .map_err(|error| NodeError::Execution(error.to_string()))?;
         let mut png = Vec::new();
         image_codec
@@ -121,7 +136,13 @@ impl ChessboardDetectorNode {
 
         match outcome {
             ChessboardDetectionOutcome::Found(detection) => {
-                rt.emit("detection", DataPacket::Detection(Arc::new(detection)))?;
+                rt.emit(
+                    "detection",
+                    DataPacket::Detection(Arc::new(DetectionPacket {
+                        detection: Arc::new(detection),
+                        frame_identity: frame.identity.clone(),
+                    })),
+                )?;
                 self.emit_overlay(rt, true)?;
                 rt.report_state(NodeRuntimeState::Idle, "detected");
                 Ok(())
@@ -169,13 +190,106 @@ fn decoded_byte_limit(size: CalibrationImageSize) -> Result<usize, NodeError> {
         .map_err(|_| NodeError::Execution("image byte budget exceeds usize".to_owned()))
 }
 
-/// 紧密排列 RGBA 帧的字节长度：`width * height * 4`。
-fn rgba_len(width: u32, height: u32) -> Result<usize, NodeError> {
-    let len = u64::from(width)
-        .checked_mul(u64::from(height))
-        .and_then(|pixels| pixels.checked_mul(4))
+/// 复制去除 RGBA 行 padding；紧密排列时只复制一次像素句柄供后续 codec 使用。
+fn compact_plane_rgba(frame: &ImageFrame) -> Result<Arc<[u8]>, NodeError> {
+    let plane = frame.rgba8_plane().ok_or_else(|| {
+        NodeError::Precondition("RGBA8 image is missing its pixel plane".to_owned())
+    })?;
+    let row_bytes = usize::try_from(frame.width)
+        .ok()
+        .and_then(|width| width.checked_mul(4))
         .ok_or_else(|| NodeError::Execution("frame dimensions overflow".to_owned()))?;
-    usize::try_from(len).map_err(|_| NodeError::Execution("frame length exceeds usize".to_owned()))
+    if usize::try_from(plane.stride_bytes).ok() == Some(row_bytes) {
+        return Ok(Arc::clone(&plane.bytes));
+    }
+    compact_rows(
+        plane.bytes.as_ref(),
+        plane.stride_bytes,
+        frame.height,
+        row_bytes,
+    )
+}
+
+fn gray8_to_rgba(frame: &ImageFrame) -> Result<Arc<[u8]>, NodeError> {
+    let plane = frame.planes.first().ok_or_else(|| {
+        NodeError::Precondition("Gray8 image is missing its pixel plane".to_owned())
+    })?;
+    let values = compact_rows(
+        plane.bytes.as_ref(),
+        plane.stride_bytes,
+        frame.height,
+        usize::try_from(frame.width)
+            .map_err(|_| NodeError::Execution("frame width overflow".to_owned()))?,
+    )?;
+    let mut rgba = Vec::with_capacity(
+        values
+            .len()
+            .checked_mul(4)
+            .ok_or_else(|| NodeError::Execution("frame dimensions overflow".to_owned()))?,
+    );
+    for value in values.iter().copied() {
+        rgba.extend_from_slice(&[value, value, value, u8::MAX]);
+    }
+    Ok(rgba.into())
+}
+
+fn gray16_to_rgba(frame: &ImageFrame) -> Result<Arc<[u8]>, NodeError> {
+    let plane = frame.planes.first().ok_or_else(|| {
+        NodeError::Precondition("Gray16Le image is missing its pixel plane".to_owned())
+    })?;
+    let row_bytes = usize::try_from(frame.width)
+        .ok()
+        .and_then(|width| width.checked_mul(2))
+        .ok_or_else(|| NodeError::Execution("frame dimensions overflow".to_owned()))?;
+    let values = compact_rows(
+        plane.bytes.as_ref(),
+        plane.stride_bytes,
+        frame.height,
+        row_bytes,
+    )?;
+    let mut rgba = Vec::with_capacity(
+        values
+            .len()
+            .checked_mul(2)
+            .ok_or_else(|| NodeError::Execution("frame dimensions overflow".to_owned()))?,
+    );
+    for gray16 in values.chunks_exact(2) {
+        let value = gray16[1];
+        rgba.extend_from_slice(&[value, value, value, u8::MAX]);
+    }
+    Ok(rgba.into())
+}
+
+fn compact_rows(
+    bytes: &[u8],
+    stride_bytes: u32,
+    height: u32,
+    row_bytes: usize,
+) -> Result<Arc<[u8]>, NodeError> {
+    let stride = usize::try_from(stride_bytes)
+        .map_err(|_| NodeError::Execution("frame stride overflow".to_owned()))?;
+    let total = row_bytes
+        .checked_mul(
+            usize::try_from(height)
+                .map_err(|_| NodeError::Execution("frame height overflow".to_owned()))?,
+        )
+        .ok_or_else(|| NodeError::Execution("frame dimensions overflow".to_owned()))?;
+    let mut compact = Vec::with_capacity(total);
+    for row in 0..usize::try_from(height)
+        .map_err(|_| NodeError::Execution("frame height overflow".to_owned()))?
+    {
+        let start = row
+            .checked_mul(stride)
+            .ok_or_else(|| NodeError::Execution("frame stride overflow".to_owned()))?;
+        let end = start
+            .checked_add(row_bytes)
+            .ok_or_else(|| NodeError::Execution("frame stride overflow".to_owned()))?;
+        let row = bytes
+            .get(start..end)
+            .ok_or_else(|| NodeError::Execution("frame plane layout is inconsistent".to_owned()))?;
+        compact.extend_from_slice(row);
+    }
+    Ok(compact.into())
 }
 
 fn has_output_port(spec: &NodeSpec, id: &str) -> bool {
@@ -199,11 +313,13 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool, mpsc};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
-    use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
-    use crate::platform::{DecodedVideoFrame, StreamFrameIdentity, StreamSessionId};
+    use crate::engine::{
+        EngineServices, ImageFrameIdentity, NodeReporter, OutputRegistry, SpawnContext,
+    };
+    use crate::platform::{StreamFrameIdentity, StreamSessionId};
 
     fn spec() -> NodeSpec {
         NodeSpec {
@@ -237,19 +353,34 @@ mod tests {
         (NodeRuntime::new(ctx), outputs)
     }
 
-    fn frame(width: u32, height: u32) -> Arc<DecodedVideoFrame> {
+    fn frame(width: u32, height: u32) -> Arc<ImageFrame> {
+        let identity = StreamFrameIdentity::unavailable(
+            StreamSessionId::new("test").expect("valid session id"),
+            0,
+            0,
+            "unavailable".to_owned(),
+        );
+        if width == 0 || height == 0 {
+            return Arc::new(ImageFrame {
+                width,
+                height,
+                format: ImageFrameFormat::Rgba8,
+                planes: Vec::new(),
+                identity: ImageFrameIdentity::from(&identity),
+                color: None,
+                raw: None,
+            });
+        }
         let len = (width as usize) * (height as usize) * 4;
-        Arc::new(DecodedVideoFrame {
-            width,
-            height,
-            rgba: vec![0u8; len].into(),
-            identity: StreamFrameIdentity::unavailable(
-                StreamSessionId::new("test").expect("valid session id"),
-                0,
-                0,
-                "unavailable".to_owned(),
-            ),
-        })
+        Arc::new(
+            ImageFrame::rgba8(
+                width,
+                height,
+                vec![0u8; len].into(),
+                ImageFrameIdentity::from(&identity),
+            )
+            .expect("test frame layout is valid"),
+        )
     }
 
     #[test]
@@ -283,5 +414,53 @@ mod tests {
             node.on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn rtsp_frames_image_frame_triggers_detection_path() {
+        let input = spec();
+        let mut node = ChessboardDetectorNode { spec: input };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let err = node
+            .on_input("frames", DataPacket::ImageFrame(frame(2, 2)), &mut rt)
+            .expect_err(
+                "RTSP frames as ImageFrame must reach detection and fail on missing services",
+            );
+        assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn overlay_output_records_found_state() {
+        let record: Arc<Mutex<Vec<DataPacket>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&record);
+        let mut outputs = OutputRegistry::default();
+        outputs.set_record(Arc::new(move |packet| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(packet);
+        }));
+        let (status_tx, _status_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("detector-1".to_owned(), status_tx, event_tx);
+        let rt = NodeRuntime::new(SpawnContext {
+            outputs,
+            reporter,
+            services: Arc::new(EngineServices::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        });
+        let node = ChessboardDetectorNode { spec: spec() };
+
+        node.emit_overlay(&rt, true).expect("overlay emits");
+
+        let guard = record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 1);
+        let DataPacket::Json(value) = &guard[0] else {
+            panic!("overlay must be JSON");
+        };
+        assert_eq!(value["kind"], "overlay");
+        assert_eq!(value["found"], true);
     }
 }

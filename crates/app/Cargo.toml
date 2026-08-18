@@ -5,6 +5,11 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
+
+[features]
+default = []
+hex-arm-control = []
+
 [dependencies]
 camera-toolbox-core.workspace = true
 thiserror.workspace = true

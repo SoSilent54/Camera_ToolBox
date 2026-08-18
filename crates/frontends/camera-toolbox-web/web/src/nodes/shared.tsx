@@ -14,7 +14,7 @@ export function NodeHeader({ node, runtimeState }: { node: WorkflowNode; runtime
   );
 }
 
-/** 三段式连接区：输入/输出端口 + 类型标签。 */
+/** 三段式连接区：端口名称、负载契约和可选图像格式提示均来自后端图定义。 */
 export function PortHandles({ node }: { node: WorkflowNode }) {
   return (
     <div className="node-ports">
@@ -26,38 +26,45 @@ export function PortHandles({ node }: { node: WorkflowNode }) {
               type="target"
               position={Position.Left}
               className={`stream-handle ${portKindTone(port.kind)}`}
-              title={`${port.label}: ${port.kind}`}
+              title={portTitle(port)}
             />
-            <span
-              className={`port-label port-label-input ${portKindTone(port.kind)}`}
-              title={`${port.label} · ${port.kind}`}
-            >
-              {port.kind}
-            </span>
+            <PortLabel port={port} side="input" />
           </div>
         ))}
       </div>
       <div className="port-group port-group-outputs">
         {node.outputs.map((port) => (
           <div key={`out-${port.id}`} className="port-row port-row-output">
-            <span
-              className={`port-label port-label-output ${portKindTone(port.kind)}`}
-              title={`${port.label} · ${port.kind}`}
-            >
-              {port.kind}
-            </span>
+            <PortLabel port={port} side="output" />
             <Handle
               id={port.id}
               type="source"
               position={Position.Right}
               className={`stream-handle ${portKindTone(port.kind)}`}
-              title={`${port.label}: ${port.kind}`}
+              title={portTitle(port)}
             />
           </div>
         ))}
       </div>
     </div>
   );
+}
+
+function PortLabel({ port, side }: { port: WorkflowNode['inputs'][number]; side: 'input' | 'output' }) {
+  return (
+    <span
+      className={`port-label port-label-${side} ${portKindTone(port.kind)}`}
+      title={portTitle(port)}
+    >
+      <span className="port-label-name">{port.label}</span>
+      <span className="port-label-kind">{port.kind}</span>
+      {port.formatHint ? <span className="port-format-hint">{port.formatHint}</span> : null}
+    </span>
+  );
+}
+
+function portTitle(port: WorkflowNode['inputs'][number]): string {
+  return [port.label, port.kind, port.schema, port.formatHint].filter(Boolean).join(' · ');
 }
 
 export function portKindTone(kind: PortKind): string {

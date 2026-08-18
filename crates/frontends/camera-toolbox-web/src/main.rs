@@ -31,6 +31,7 @@ use camera_toolbox_adapters::platforms::ssh_managed::{
     production_recipe_registry_from_env,
 };
 use camera_toolbox_adapters::x5_tcp_client;
+use camera_toolbox_app::engine::{CaptureMode, CaptureTarget};
 use camera_toolbox_app::{
     CalibrationBackend, CalibrationCancellation, CommandResult, CommandService, ControlTargetSpec,
     DecodedVideoFrame, DumpCancellation, EepromDeviceState, EepromExecutor, EepromHelperAction,
@@ -38,7 +39,8 @@ use camera_toolbox_app::{
     EepromProvisionServiceError, EepromSerialState, I2cExecutor, I2cHelperAction,
     I2cHelperOperation, I2cHelperResult, I2cHelperService, I2cMessageData, I2cMessageSpec,
     I2cTransactionSpec, RemoteFileStat, RemoteOperationControl, RemoteTimeouts, SftpFileReader,
-    SshCommandExecutor, TypedCommandRequest, X5ControlClient, validate_i2c_transfer_transactions,
+    SshCommandExecutor, TypedCommandRequest, X5ControlClient, X5233CapturePayload,
+    validate_i2c_transfer_transactions,
 };
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
@@ -342,7 +344,7 @@ impl EepromExecutor for ControlRuntime {
     }
 }
 
-/// 把 X5 控制客户端抽象接到真实的 X5_233 TCP 模块（纯 TCP，无 SSH）。
+/// 把 X5 控制客户端抽象接到真实的 X5_233 TCP 模块（纯 TCP）。
 impl X5ControlClient for ControlRuntime {
     fn probe(&self, host: &str, port: u16) -> std::result::Result<serde_json::Value, String> {
         x5_tcp_client::probe(host, port)
@@ -356,15 +358,65 @@ impl X5ControlClient for ControlRuntime {
             .map_err(|error| error)
     }
 
-    fn capture_snapshot(
+    fn capture(
         &self,
         host: &str,
         port: u16,
-        channel: u16,
-    ) -> std::result::Result<serde_json::Value, String> {
-        x5_tcp_client::capture_yuv_snapshot(host, port, channel)
-            .map(|snapshot| x5_snapshot_response(&snapshot))
-            .map_err(|error| error)
+        request: &camera_toolbox_app::engine::CaptureRequest,
+    ) -> std::result::Result<X5233CapturePayload, String> {
+        match (request.target, request.mode) {
+            (CaptureTarget::Yuv { channel }, CaptureMode::Latest) => {
+                x5_tcp_client::capture_yuv_snapshot(host, port, channel)
+            }
+            (CaptureTarget::Yuv { channel }, CaptureMode::FrameId(frame_id)) => {
+                x5_tcp_client::capture_yuv_snapshot_by_frame_id(host, port, channel, frame_id)
+            }
+            (CaptureTarget::Yuv { channel }, CaptureMode::TimestampNs(timestamp_ns)) => {
+                x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
+                    host,
+                    port,
+                    channel,
+                    timestamp_ns,
+                )
+            }
+            (CaptureTarget::Yuv { channel }, CaptureMode::RtspPts90k { pts, tolerance }) => {
+                x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
+                    host, port, channel, pts, tolerance,
+                )
+            }
+            (CaptureTarget::Raw { camera }, CaptureMode::Latest) => {
+                let snapshot = x5_tcp_client::capture_raw_snapshot(host, port, camera, 3_000)?;
+                return Ok(X5233CapturePayload::BayerRaw {
+                    camera: snapshot.camera,
+                    width: snapshot.width,
+                    height: snapshot.height,
+                    stride_bytes: u32::try_from(snapshot.stride)
+                        .map_err(|_| "X5 RAW stride does not fit u32".to_owned())?,
+                    format_code: snapshot.format_code,
+                    frame_id: snapshot.frame_id,
+                    timestamp_ns: snapshot.timestamp_ns,
+                    payload: Arc::from(snapshot.payload),
+                });
+            }
+            (CaptureTarget::Raw { .. }, _) => {
+                return Err(
+                    "X5_233 RAW capture only supports mode=latest; no RAW frame ring is available"
+                        .to_owned(),
+                );
+            }
+        }
+        .map(|snapshot| X5233CapturePayload::Nv12 {
+            channel: snapshot.channel,
+            width: snapshot.width,
+            height: snapshot.height,
+            y_len: snapshot.y_len,
+            uv_len: snapshot.uv_len,
+            frame_id: snapshot.frame_id,
+            timestamp_ns: snapshot.timestamp_ns,
+            rtsp_pts_90k: snapshot.rtsp_pts_90k,
+            match_rtsp_pts_delta_90k: snapshot.match_rtsp_pts_delta_90k,
+            payload: Arc::from(snapshot.payload),
+        })
     }
 }
 

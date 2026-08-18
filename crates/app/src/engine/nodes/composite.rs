@@ -144,7 +144,7 @@ impl NodeInstance for DatasetCollectorNode {
         };
         let max_samples = config_usize(&self.spec, "maxSamples", 80);
         if self.samples.len() < max_samples {
-            self.samples.push(detection);
+            self.samples.push(Arc::clone(&detection.detection));
         }
         Ok(())
     }

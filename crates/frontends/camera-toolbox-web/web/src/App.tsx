@@ -61,7 +61,8 @@ import {
   LocalFileSourceNode,
   SftpFileSourceNode,
   SshSessionNode,
-  X5DeviceNode,
+  X5233DriverNode,
+  HexArmDeviceNode,
 } from './WorkflowNodes';
 import {
   AutoCaptureNode,
@@ -116,6 +117,7 @@ const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
 const DND_NODE_KIND = 'application/x-camera-toolbox-node-kind';
 const GENERIC_NODE_KINDS: NodeKind[] = [
   'rtspDecoder',
+  'demosaic',
   'frameSampler',
   'imageLayer',
   'videoLayer',
@@ -127,13 +129,16 @@ const nodeTypes = Object.fromEntries([
   ['localFileSource', LocalFileSourceNode],
   ['sftpFileSource', SftpFileSourceNode],
   ['sshSession', SshSessionNode],
-  ['x5Device', X5DeviceNode],
+  ['x5233Driver', X5233DriverNode],
+  ['hexArmDevice', HexArmDeviceNode],
   ['i2cTransfer', I2cTransferNode],
   ['eepromProvision', EepromProvisionNode],
   ['viewer', ViewerNode],
   ['calibrationSolver', CalibrationSolverNode],
   ['autoCaptureController', AutoCaptureNode],
   ['chessboardDetector', CalibrationWorkflowNode],
+  ['gainScorer', CalibrationWorkflowNode],
+  ['captureGate', CalibrationWorkflowNode],
   ['datasetCollector', CalibrationWorkflowNode],
   ['coverageAnalyzer', CalibrationWorkflowNode],
   ['poseGuide', CalibrationWorkflowNode],
@@ -1235,7 +1240,14 @@ function createWorkflowNode(kind: NodeKind, count: number, position: { x: number
     kind,
     title: `${definition?.title ?? kind} ${count}`,
     position,
-    state: kind === 'rtspSource' || kind === 'localFileSource' || kind === 'sftpFileSource' || kind === 'sshSession' || kind === 'x5Device' ? 'ready' : 'idle',
+    state: kind === 'rtspSource'
+      || kind === 'localFileSource'
+      || kind === 'sftpFileSource'
+      || kind === 'sshSession'
+      || kind === 'x5233Driver'
+      || kind === 'hexArmDevice'
+      ? 'ready'
+      : 'idle',
     category: definition?.category ?? 'diagnostics',
     inputs: definition?.inputs ?? [],
     outputs: definition?.outputs ?? [],

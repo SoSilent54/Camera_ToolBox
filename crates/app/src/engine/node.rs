@@ -87,6 +87,15 @@ pub trait NodeInstance: Send {
     fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError>;
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError>;
+
+    /// 在 actor 线程应用增量配置；需要释放外部会话的节点可覆盖此钩子。
+    fn on_config_update(
+        &mut self,
+        _config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        Ok(())
+    }
 }
 
 /// 节点 kind 常量，与前端 `NodeKind` camelCase 序列化一致。

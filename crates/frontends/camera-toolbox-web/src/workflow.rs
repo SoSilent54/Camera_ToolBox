@@ -74,14 +74,19 @@ pub enum NodeKind {
     SftpFileSource,
     RtspSource,
     SshSession,
-    X5Device,
+    #[serde(alias = "x5Device")]
+    X5233Driver,
+    HexArmDevice,
     RtspDecoder,
+    Demosaic,
     FrameSampler,
     ImageLayer,
     VideoLayer,
     OverlayComposer,
     Viewer,
     ChessboardDetector,
+    GainScorer,
+    CaptureGate,
     DatasetCollector,
     CoverageAnalyzer,
     AutoCaptureController,
@@ -109,6 +114,9 @@ pub struct WorkflowPort {
     pub direction: PortDirection,
     pub kind: PortKind,
     pub schema: String,
+    /// 图像格式提示只用于工作流编排和 UI 呈现；数据契约仍统一为 `image.frame`。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub format_hint: Option<String>,
     #[serde(default)]
     pub role: Option<PortRole>,
     #[serde(default = "default_required")]
@@ -136,6 +144,8 @@ pub enum PortKind {
     ControlSsh,
     #[serde(rename = "control.x5tcp")]
     ControlX5Tcp,
+    #[serde(rename = "control.hexarm")]
+    ControlHexArm,
     #[serde(rename = "endpoint.rtsp")]
     EndpointRtsp,
     #[serde(rename = "stream.encoded-video")]
@@ -255,19 +265,21 @@ fn default_required() -> bool {
 }
 
 pub fn node_catalog() -> Vec<NodeDefinition> {
-    vec![
+    let catalog = vec![
         node_definition(NodeKind::LocalFileSource),
         node_definition(NodeKind::SftpFileSource),
         node_definition(NodeKind::RtspSource),
         node_definition(NodeKind::SshSession),
-        node_definition(NodeKind::X5Device),
+        node_definition(NodeKind::X5233Driver),
         node_definition(NodeKind::RtspDecoder),
+        node_definition(NodeKind::Demosaic),
         node_definition(NodeKind::FrameSampler),
         node_definition(NodeKind::ImageLayer),
         node_definition(NodeKind::VideoLayer),
-        node_definition(NodeKind::OverlayComposer),
         node_definition(NodeKind::Viewer),
         node_definition(NodeKind::ChessboardDetector),
+        node_definition(NodeKind::GainScorer),
+        node_definition(NodeKind::CaptureGate),
         node_definition(NodeKind::DatasetCollector),
         node_definition(NodeKind::CoverageAnalyzer),
         node_definition(NodeKind::AutoCaptureController),
@@ -275,7 +287,18 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::PoseGuide),
         node_definition(NodeKind::I2cTransfer),
         node_definition(NodeKind::EepromProvision),
-    ]
+    ];
+    // 默认构建不会向画布暴露无法实例化的硬件控制节点；启用功能后再加入目录。
+    #[cfg(feature = "hex-arm-control")]
+    {
+        let mut catalog = catalog;
+        catalog.push(node_definition(NodeKind::HexArmDevice));
+        catalog
+    }
+    #[cfg(not(feature = "hex-arm-control"))]
+    {
+        catalog
+    }
 }
 
 pub fn node_definition(kind: NodeKind) -> NodeDefinition {
@@ -333,16 +356,26 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::RtspSource => (
             NodeCategory::Source,
             "RTSP Input",
-            "连接 RTSP 并直接输出已解码视频帧；无需独立解码步骤",
-            vec![],
-            vec![port(
-                "frames",
-                "Decoded Video Frames",
-                PortDirection::Output,
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-                Some(PortRole::Stream),
+            "连接 RTSP 并直接输出已解码视频帧；Capture Request 可输出当前缓存快照",
+            vec![optional_port(
+                "capture",
+                "Capture Request",
+                PortDirection::Input,
+                PortKind::CommandCapture,
+                "command.capture.request.v1",
+                Some(PortRole::Command),
             )],
+            vec![
+                port(
+                    "frames",
+                    "Decoded Video Frames",
+                    PortDirection::Output,
+                    PortKind::StreamVideoFrame,
+                    "stream.video-frame.v1",
+                    Some(PortRole::Stream),
+                ),
+                image_port("snapshot", "Snapshot", PortDirection::Output, "Rgba8"),
+            ],
             json!({"url": DEFAULT_RTSP_URL, "transport": "tcp", "channel": 0, "width": 1920, "height": 1080, "connectTimeoutMs": 8000, "idleTimeoutMs": 10000}),
         ),
         NodeKind::SshSession => (
@@ -360,13 +393,55 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             )],
             json!({"profileId": "", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "recipeId": "", "autoConnect": false}),
         ),
-        // X5 控制走独立 TCP 请求；当前快照响应只返回 NV12 元数据，不能伪装成图内 ImageFrame。
-        NodeKind::X5Device => (
+        // X5_233 Driver 的图端口是运行时实现的正式契约；手动快照和 capture 输入必须收敛到同一路径。
+        NodeKind::X5233Driver => (
             NodeCategory::Control,
-            "X5 Device",
-            "X5_233 TCP control: RTSP encoder/channel management and NV12 snapshot metadata",
-            vec![],
-            vec![],
+            "X5_233 Driver",
+            "X5_233 TCP driver: multi-channel video, NV12/RAW capture, and status output",
+            vec![optional_port(
+                "capture",
+                "Capture Request",
+                PortDirection::Input,
+                PortKind::CommandCapture,
+                "command.capture.request.v1",
+                Some(PortRole::Command),
+            )],
+            vec![
+                format_hint_port(
+                    port(
+                        "videoCh0",
+                        "Video CH0",
+                        PortDirection::Output,
+                        PortKind::StreamVideoFrame,
+                        "stream.video-frame.v1",
+                        Some(PortRole::Stream),
+                    ),
+                    "Rgba8",
+                ),
+                format_hint_port(
+                    port(
+                        "videoCh3",
+                        "Video CH3",
+                        PortDirection::Output,
+                        PortKind::StreamVideoFrame,
+                        "stream.video-frame.v1",
+                        Some(PortRole::Stream),
+                    ),
+                    "Rgba8",
+                ),
+                image_port("yuvCh0", "YUV CH0", PortDirection::Output, "Nv12"),
+                image_port("yuvCh3", "YUV CH3", PortDirection::Output, "Nv12"),
+                image_port("rawCam0", "RAW CAM0", PortDirection::Output, "BayerRaw"),
+                image_port("rawCam1", "RAW CAM1", PortDirection::Output, "BayerRaw"),
+                port(
+                    "status",
+                    "Status",
+                    PortDirection::Output,
+                    PortKind::StatusMetrics,
+                    "status.metrics.v1",
+                    Some(PortRole::Status),
+                ),
+            ],
             json!({
                 "host": "10.21.12.108",
                 "tcpPort": 9073,
@@ -378,7 +453,27 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "snapshotFrameId": "",
                 "snapshotTimestampNs": "",
                 "snapshotRtspPts90k": "",
-                "snapshotRtspPtsTolerance90k": 0
+                "snapshotRtspPtsTolerance90k": 0,
+                "rawCamera": 0,
+                "rawBayerPattern": "rggb",
+                "rawBitsPerSample": 12
+            }),
+        ),
+        // Hex Arm 只声明实际存在的独立控制面；它不在图内伪造帧或状态数据包。
+        NodeKind::HexArmDevice => (
+            NodeCategory::Control,
+            "Hex Arm Device",
+            "WebSocket protobuf control for Hex Arm; motion remains disabled until explicitly enabled",
+            vec![],
+            vec![],
+            json!({
+                "host": "127.0.0.1",
+                "port": 8439,
+                "transport": "websocket",
+                "controlEnabled": false,
+                "commandTimeoutMs": 200,
+                "connectTimeoutMs": 3000,
+                "jointPositions": "0,0,0,0,0,0"
             }),
         ),
         NodeKind::RtspDecoder => (
@@ -402,6 +497,34 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 Some(PortRole::Stream),
             )],
             json!({}),
+        ),
+        NodeKind::Demosaic => (
+            NodeCategory::Media,
+            "Demosaic",
+            "显式 BayerRaw → Rgba8 转换；RAW 进入 Viewer/Detector 前必须经过该节点",
+            vec![format_hint_port(
+                port(
+                    "raw",
+                    "Bayer RAW",
+                    PortDirection::Input,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+                "BayerRaw",
+            )],
+            vec![format_hint_port(
+                port(
+                    "image",
+                    "Demosaiced Image",
+                    PortDirection::Output,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+                "Rgba8",
+            )],
+            json!({"algorithm": "bilinear", "outputFormat": "rgba"}),
         ),
         NodeKind::FrameSampler => (
             NodeCategory::Media,
@@ -428,22 +551,28 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::ImageLayer => (
             NodeCategory::Viewer,
             "Image Layer",
-            "声明图片图层元数据并原样转发；Web Viewer 可显示该图像，visible/opacity 仅保存声明",
-            vec![port(
-                "image",
-                "Image",
-                PortDirection::Input,
-                PortKind::ImageFrame,
-                "image.frame.v1",
-                Some(PortRole::Image),
+            "原样转发 Rgba8/Gray8/Gray16Le/Nv12 图像；BayerRaw 必须先经过显式 Demosaic，visible/opacity 仅保存声明",
+            vec![format_hint_port(
+                port(
+                    "image",
+                    "Image",
+                    PortDirection::Input,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+                "Rgba8 | Gray8 | Gray16Le | Nv12",
             )],
-            vec![port(
-                "layer",
-                "Image Layer",
-                PortDirection::Output,
-                PortKind::LayerImage,
-                "viewer.layer.image.v1",
-                Some(PortRole::Layer),
+            vec![format_hint_port(
+                port(
+                    "layer",
+                    "Image Layer",
+                    PortDirection::Output,
+                    PortKind::LayerImage,
+                    "viewer.layer.image.v1",
+                    Some(PortRole::Layer),
+                ),
+                "Rgba8 | Gray8 | Gray16Le | Nv12",
             )],
             json!({"visible": true, "opacity": 1.0}),
         ),
@@ -471,8 +600,8 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         ),
         NodeKind::OverlayComposer => (
             NodeCategory::Viewer,
-            "Overlay Composer (pass-through only)",
-            "保留 video/image/overlay 接线声明，原样转发帧类负载到 scene；不混合、不光栅化 overlay",
+            "Overlay Composer (legacy pass-through)",
+            "过渡性 fan-in 节点：仅把 video/image/overlay 负载原样转发到 scene；当前默认模板不再依赖它",
             vec![
                 many_port(
                     "video",
@@ -512,41 +641,40 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::Viewer => (
             NodeCategory::Viewer,
             "Viewer",
-            "显示引擎推送的 JPEG 帧及 frame meta；Trigger 将当前引擎帧导出为 image.frame",
+            "直接预览 video/image/overlay；BayerRaw 必须经显式 Demosaic。设备侧 RAW/YUV 采集由 X5_233 Driver 触发",
             vec![
-                optional_port(
-                    "scene",
-                    "Scene",
-                    PortDirection::Input,
-                    PortKind::ViewerScene,
-                    "viewer.scene.v1",
-                    Some(PortRole::Layer),
+                format_hint_port(
+                    optional_port(
+                        "video",
+                        "Video Frames",
+                        PortDirection::Input,
+                        PortKind::StreamVideoFrame,
+                        "stream.video-frame.v1",
+                        Some(PortRole::Stream),
+                    ),
+                    "Rgba8",
                 ),
-                optional_port(
-                    "video",
-                    "Video Layer",
-                    PortDirection::Input,
-                    PortKind::LayerVideo,
-                    "viewer.layer.video.v1",
-                    Some(PortRole::Layer),
+                format_hint_port(
+                    optional_port(
+                        "image",
+                        "Image",
+                        PortDirection::Input,
+                        PortKind::ImageFrame,
+                        "image.frame.v1",
+                        Some(PortRole::Image),
+                    ),
+                    "Rgba8 | Gray8 | Gray16Le | Nv12",
                 ),
-                optional_port(
-                    "image",
-                    "Image Layer",
+                many_port(
+                    "overlay",
+                    "Overlay JSON",
                     PortDirection::Input,
-                    PortKind::LayerImage,
-                    "viewer.layer.image.v1",
-                    Some(PortRole::Layer),
+                    PortKind::LayerOverlay,
+                    "viewer.layer.overlay.v1",
+                    Some(PortRole::Overlay),
                 ),
             ],
-            vec![optional_port(
-                "image",
-                "Captured Image",
-                PortDirection::Output,
-                PortKind::ImageFrame,
-                "image.frame.v1",
-                Some(PortRole::Image),
-            )],
+            vec![],
             json!({}),
         ),
         NodeKind::ChessboardDetector => (
@@ -590,6 +718,50 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
             ],
             json!({"boardRows": 11, "boardCols": 8, "squareSizeMm": 30.0}),
+        ),
+        NodeKind::GainScorer => (
+            NodeCategory::Calibration,
+            "Gain Scorer",
+            "将棋盘角点完整度归一化为带原始帧身份的 capture score",
+            vec![port(
+                "detection",
+                "Detection",
+                PortDirection::Input,
+                PortKind::CalibDetection,
+                "calib.detection.v1",
+                Some(PortRole::Dataset),
+            )],
+            vec![port(
+                "score",
+                "Capture Score",
+                PortDirection::Output,
+                PortKind::CaptureScore,
+                "capture.score.v1",
+                Some(PortRole::Status),
+            )],
+            json!({"expectedCorners": 88}),
+        ),
+        NodeKind::CaptureGate => (
+            NodeCategory::Calibration,
+            "Capture Gate",
+            "达到最小 gain 并连续稳定 holdFrames 帧后，构造带来源身份的 Capture Request",
+            vec![port(
+                "score",
+                "Capture Score",
+                PortDirection::Input,
+                PortKind::CaptureScore,
+                "capture.score.v1",
+                Some(PortRole::Status),
+            )],
+            vec![port(
+                "capture",
+                "Capture Request",
+                PortDirection::Output,
+                PortKind::CommandCapture,
+                "command.capture.request.v1",
+                Some(PortRole::Command),
+            )],
+            json!({"minimumGain": 0.4, "holdFrames": 3, "mode": "latest", "channel": 0, "camera": 0, "target": "yuv", "rtspPtsTolerance90k": 0}),
         ),
         NodeKind::DatasetCollector => (
             NodeCategory::Calibration,
@@ -778,33 +950,51 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
 pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
     vec![
         WorkmodeTemplate {
-            id: "viewer",
-            title: "Viewer",
-            description: "RTSP/X5 channel → Decoder → VideoLayer → Viewer",
-            graph: viewer_template_graph(),
+            id: "x5233-preview",
+            title: "X5_233 Preview",
+            description: "X5_233 Driver YUV snapshot → Viewer image (image.frame.v1/Nv12)",
+            graph: x5233_preview_template_graph(),
+        },
+        WorkmodeTemplate {
+            id: "rtsp-snapshot",
+            title: "RTSP Snapshot",
+            description: "RTSP Input video/snapshot → Viewer direct video/image",
+            graph: rtsp_snapshot_template_graph(),
+        },
+        WorkmodeTemplate {
+            id: "calibration",
+            title: "Calibration Capture",
+            description: "RTSP Detection → Gain Scorer → Capture Gate → X5_233 capture request",
+            graph: calibration_template_graph(),
+        },
+        WorkmodeTemplate {
+            id: "x5233-yuv-capture",
+            title: "X5_233 YUV Capture",
+            description: "Authoritative NV12 capture request path with frame identity preserved",
+            graph: x5233_yuv_template_graph(),
+        },
+        WorkmodeTemplate {
+            id: "x5233-raw-diagnostic",
+            title: "X5_233 RAW Diagnostic",
+            description: "X5_233 Driver BayerRaw diagnostic output; add explicit Demosaic before viewing",
+            graph: x5233_raw_template_graph(),
         },
         WorkmodeTemplate {
             id: "local-image",
             title: "Local Image",
-            description: "Local Workspace → File Browser → Image File Source → Image Layer → Viewer",
+            description: "Local File Source → ImageFrame → Viewer",
             graph: local_image_template_graph(),
-        },
-        WorkmodeTemplate {
-            id: "calibration",
-            title: "Calibration",
-            description: "RTSP → Decoder → Detector → Dataset → Coverage / Solver；Pose Guide 仅给出图像栅格提示",
-            graph: calibration_template_graph(),
         },
         WorkmodeTemplate {
             id: "i2c-tools",
             title: "I²C Tools",
-            description: "SSH → I²C bus discovery/transfer/EEPROM provision",
+            description: "Inline SSH config → I²C Transfer / EEPROM Provision",
             graph: i2c_template_graph(),
         },
     ]
 }
 
-/// 生成默认演示图；使用完整端口类型链路，Viewer 仍通过 RTSP 源派生 MJPEG fallback。
+/// 生成默认演示图；使用 X5_233 统一 `image.frame.v1` 预览链路。
 pub fn seed_workflow_graph() -> WorkflowGraph {
     viewer_template_graph()
 }
@@ -815,6 +1005,17 @@ pub fn validate_workflow(graph: &WorkflowGraph) -> Result<(), String> {
             "unsupported workflow schema `{}`",
             graph.schema_version
         ));
+    }
+    let hex_arm_count = graph
+        .nodes
+        .iter()
+        .filter(|node| node.kind == NodeKind::HexArmDevice)
+        .count();
+    if hex_arm_count > 1 {
+        return Err(
+            "workflow may contain at most one hexArmDevice; the shared control session is single-owner"
+                .to_owned(),
+        );
     }
     for node in &graph.nodes {
         validate_node_config(node)?;
@@ -878,10 +1079,25 @@ pub fn normalize_workflow(
         node.inputs = definition.inputs;
         node.outputs = definition.outputs;
     }
+    drop_invalid_legacy_x5233_edges(&mut graph);
     validate_workflow(&graph)?;
     Ok(graph)
 }
 
+/// 旧 X5 图的端口在标准化后可能已不存在或类型已变化；只丢弃这些失效边，避免破坏其他校验路径。
+fn drop_invalid_legacy_x5233_edges(graph: &mut WorkflowGraph) {
+    let edges = std::mem::take(&mut graph.edges);
+    graph.edges = edges
+        .into_iter()
+        .filter(|edge| {
+            let touches_x5233 = graph.nodes.iter().any(|node| {
+                node.kind == NodeKind::X5233Driver
+                    && (node.id == edge.source.node_id || node.id == edge.target.node_id)
+            });
+            !touches_x5233 || validate_edge(graph, edge).is_ok()
+        })
+        .collect();
+}
 /// 将旧图收敛到 source 已直接输出解码帧的当前契约，避免保存后断开已有 RTSP 连线。
 fn normalize_source_contracts(graph: &mut WorkflowGraph) {
     for node in &mut graph.nodes {
@@ -930,7 +1146,11 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
                     .entry("channel".to_owned())
                     .or_insert_with(|| json!(0));
             }
-            NodeKind::X5Device => normalize_x5_device_config(config),
+            NodeKind::X5233Driver => {
+                normalize_x5233_driver_config(config);
+                node.title = "X5_233 Driver".to_owned();
+            }
+            NodeKind::HexArmDevice => normalize_hex_arm_device_config(config),
             NodeKind::RtspDecoder => {
                 config.clear();
                 if node.title == "RTSP Decoder" {
@@ -953,13 +1173,26 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
         })
     });
 
-    // 旧 X5 的端口声称可直接输出 RTSP、视频帧或 ImageFrame；TCP 控制请求从未向图引擎交付
-    // 这些载荷。丢弃该不真实契约上的边，防止保存后留下无法执行的数据流。
+    // 旧 X5 图可能包含当前契约不存在的端口。只移除这些失效边，保留已迁移图上的有效 capture
+    // 输入与多通道输出连接。
+    let x5233_driver = node_definition(NodeKind::X5233Driver);
     graph.edges.retain(|edge| {
-        !graph.nodes.iter().any(|node| {
-            node.kind == NodeKind::X5Device
-                && (node.id == edge.source.node_id || node.id == edge.target.node_id)
-        })
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.kind == NodeKind::X5233Driver)
+            .all(|node| {
+                (node.id != edge.source.node_id
+                    || x5233_driver
+                        .outputs
+                        .iter()
+                        .any(|port| port.id == edge.source.port_id))
+                    && (node.id != edge.target.node_id
+                        || x5233_driver
+                            .inputs
+                            .iter()
+                            .any(|port| port.id == edge.target.port_id))
+            })
     });
 
     for edge in &mut graph.edges {
@@ -984,7 +1217,7 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
     }
 }
 /// 迁移旧的单一 `channel` / `channels` 配置到彼此独立的 RTSP 与快照通道。
-fn normalize_x5_device_config(config: &mut serde_json::Map<String, serde_json::Value>) {
+fn normalize_x5233_driver_config(config: &mut serde_json::Map<String, serde_json::Value>) {
     let legacy_channel = config
         .remove("channel")
         .or_else(|| {
@@ -1008,6 +1241,40 @@ fn normalize_x5_device_config(config: &mut serde_json::Map<String, serde_json::V
     config
         .entry("snapshotRtspPtsTolerance90k".to_owned())
         .or_insert_with(|| json!(0));
+    config
+        .entry("rawCamera".to_owned())
+        .or_insert_with(|| json!(0));
+    config
+        .entry("rawBayerPattern".to_owned())
+        .or_insert_with(|| json!("rggb"));
+    config
+        .entry("rawBitsPerSample".to_owned())
+        .or_insert_with(|| json!(12));
+}
+
+/// 未配置的旧 Hex Arm 节点保持不可运动；不为 KCP 等未实现传输路径提供隐式回退。
+fn normalize_hex_arm_device_config(config: &mut serde_json::Map<String, serde_json::Value>) {
+    config
+        .entry("host".to_owned())
+        .or_insert_with(|| json!("127.0.0.1"));
+    config
+        .entry("port".to_owned())
+        .or_insert_with(|| json!(8439));
+    config
+        .entry("transport".to_owned())
+        .or_insert_with(|| json!("websocket"));
+    config
+        .entry("controlEnabled".to_owned())
+        .or_insert_with(|| json!(false));
+    config
+        .entry("commandTimeoutMs".to_owned())
+        .or_insert_with(|| json!(200));
+    config
+        .entry("connectTimeoutMs".to_owned())
+        .or_insert_with(|| json!(3000));
+    config
+        .entry("jointPositions".to_owned())
+        .or_insert_with(|| json!("0,0,0,0,0,0"));
 }
 
 /// 校验端口方向与类型，避免 UI 产生无法执行的数据流边。
@@ -1059,6 +1326,7 @@ fn validate_node_config(node: &WorkflowNode) -> Result<(), String> {
         }
         NodeKind::SftpFileSource => validate_sftp_file_source_config(node),
         NodeKind::LocalFileSource => validate_local_file_source_config(node),
+        NodeKind::HexArmDevice => validate_hex_arm_device_config(node),
         _ => Ok(()),
     }
 }
@@ -1087,6 +1355,64 @@ fn validate_rtsp_source_config(node: &WorkflowNode) -> Result<(), String> {
     validate_integer_range(node, config, "height", 1, 16_384)?;
     validate_timeout_ms(node, config, "connectTimeoutMs")?;
     validate_timeout_ms(node, config, "idleTimeoutMs")?;
+    Ok(())
+}
+
+/// Hex Arm 传输仅支持 WebSocket；运动关由布尔配置显式保存，jointPositions 仅接受有限弧度数值。
+fn validate_hex_arm_device_config(node: &WorkflowNode) -> Result<(), String> {
+    let config = node_config_object(node)?;
+    let host = config_string(config, "host").ok_or_else(|| {
+        format!(
+            "node `{}` config `host` must be a non-empty printable host",
+            node.id
+        )
+    })?;
+    validate_printable_config_text(node, "host", host)?;
+    if host.trim().is_empty() {
+        return Err(format!(
+            "node `{}` config `host` must be a non-empty printable host",
+            node.id
+        ));
+    }
+    validate_integer_range(node, config, "port", 1, u16::MAX.into())?;
+    if let Some(transport) = config_string(config, "transport") {
+        if transport != "websocket" {
+            return Err(format!(
+                "node `{}` config `transport` must be websocket; KCP is unsupported",
+                node.id
+            ));
+        }
+    }
+    if let Some(enabled) = config.get("controlEnabled") {
+        if !enabled.is_boolean() {
+            return Err(format!(
+                "node `{}` config `controlEnabled` must be boolean",
+                node.id
+            ));
+        }
+    }
+    validate_timeout_ms(node, config, "commandTimeoutMs")?;
+    validate_timeout_ms(node, config, "connectTimeoutMs")?;
+    let joints = config_string(config, "jointPositions").ok_or_else(|| {
+        format!(
+            "node `{}` config `jointPositions` must be a non-empty comma-separated finite radians list",
+            node.id
+        )
+    })?;
+    let joints = joints.trim();
+    if joints.is_empty()
+        || joints.split(',').any(|joint| {
+            joint
+                .trim()
+                .parse::<f64>()
+                .map_or(true, |radians| !radians.is_finite())
+        })
+    {
+        return Err(format!(
+            "node `{}` config `jointPositions` must be a non-empty comma-separated finite radians list",
+            node.id
+        ));
+    }
     Ok(())
 }
 
@@ -1389,71 +1715,80 @@ fn find_port<'a>(
         })
 }
 
-fn viewer_template_graph() -> WorkflowGraph {
+fn x5233_preview_template_graph() -> WorkflowGraph {
+    let driver = workflow_node(
+        "x5233-driver-1",
+        NodeKind::X5233Driver,
+        "X5_233 Driver",
+        NodePosition { x: 80.0, y: 140.0 },
+    );
+    let viewer = workflow_node(
+        "viewer-1",
+        NodeKind::Viewer,
+        "Viewer",
+        NodePosition { x: 520.0, y: 120.0 },
+    );
+    graph(
+        "camera-toolbox-x5233-preview-template",
+        "X5_233 Preview Workspace",
+        vec![driver, viewer],
+        vec![edge(
+            "x5233-preview-yuv-viewer",
+            "x5233-driver-1",
+            "yuvCh0",
+            "viewer-1",
+            "image",
+            PortKind::ImageFrame,
+            "image.frame.v1",
+        )],
+    )
+}
+
+fn rtsp_snapshot_template_graph() -> WorkflowGraph {
     let rtsp = workflow_node(
         "rtsp-source-1",
         NodeKind::RtspSource,
         "RTSP Input",
         NodePosition { x: 80.0, y: 140.0 },
     );
-    let decoder = workflow_node(
-        "rtsp-decoder-1",
-        NodeKind::RtspDecoder,
-        "Decoded Frame Relay",
-        NodePosition { x: 380.0, y: 140.0 },
-    );
-    let layer = workflow_node(
-        "video-layer-1",
-        NodeKind::VideoLayer,
-        "Video Layer",
-        NodePosition { x: 700.0, y: 140.0 },
-    );
     let viewer = workflow_node(
         "viewer-1",
         NodeKind::Viewer,
         "Viewer",
-        NodePosition {
-            x: 1000.0,
-            y: 120.0,
-        },
+        NodePosition { x: 520.0, y: 120.0 },
     );
     graph(
-        "camera-toolbox-demo-workflow",
-        "RTSP Preview Workspace",
-        vec![rtsp, decoder, layer, viewer],
+        "camera-toolbox-rtsp-snapshot-template",
+        "RTSP Snapshot Workspace",
+        vec![rtsp, viewer],
         vec![
             edge(
-                "edge-rtsp-decoder",
+                "rtsp-snapshot-video-viewer",
                 "rtsp-source-1",
                 "frames",
-                "rtsp-decoder-1",
-                "frames",
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-            ),
-            edge(
-                "edge-decoder-layer",
-                "rtsp-decoder-1",
-                "frames",
-                "video-layer-1",
-                "frames",
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-            ),
-            edge(
-                "edge-layer-viewer",
-                "video-layer-1",
-                "layer",
                 "viewer-1",
                 "video",
-                PortKind::LayerVideo,
-                "viewer.layer.video.v1",
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
+            ),
+            edge(
+                "rtsp-snapshot-image-viewer",
+                "rtsp-source-1",
+                "snapshot",
+                "viewer-1",
+                "image",
+                PortKind::ImageFrame,
+                "image.frame.v1",
             ),
         ],
     )
 }
 
-/// 本地图像模板：LocalFileSource 已吸收 workspace/浏览/加载，默认路径只需 source→layer→viewer。
+fn viewer_template_graph() -> WorkflowGraph {
+    x5233_preview_template_graph()
+}
+
+/// 本地图像模板：LocalFileSource 直接输出统一 ImageFrame，Viewer 直接消费 image。
 fn local_image_template_graph() -> WorkflowGraph {
     let source = workflow_node(
         "local-file-source-1",
@@ -1461,40 +1796,118 @@ fn local_image_template_graph() -> WorkflowGraph {
         "Local File Source",
         NodePosition { x: 80.0, y: 140.0 },
     );
-    let layer = workflow_node(
-        "image-layer-1",
-        NodeKind::ImageLayer,
-        "Image Layer",
-        NodePosition { x: 420.0, y: 140.0 },
-    );
     let viewer = workflow_node(
         "viewer-1",
         NodeKind::Viewer,
         "Viewer",
-        NodePosition { x: 760.0, y: 120.0 },
+        NodePosition { x: 520.0, y: 120.0 },
     );
     graph(
         "camera-toolbox-local-image-template",
         "Local Image Workspace",
-        vec![source, layer, viewer],
+        vec![source, viewer],
+        vec![edge(
+            "local-image-source-viewer",
+            "local-file-source-1",
+            "image",
+            "viewer-1",
+            "image",
+            PortKind::ImageFrame,
+            "image.frame.v1",
+        )],
+    )
+}
+
+fn x5233_yuv_template_graph() -> WorkflowGraph {
+    let driver = workflow_node(
+        "x5233-driver-yuv",
+        NodeKind::X5233Driver,
+        "X5_233 Driver",
+        NodePosition { x: 80.0, y: 140.0 },
+    );
+    let viewer = workflow_node(
+        "x5233-yuv-viewer",
+        NodeKind::Viewer,
+        "Viewer",
+        NodePosition { x: 520.0, y: 120.0 },
+    );
+    graph(
+        "camera-toolbox-x5233-yuv-capture-template",
+        "X5_233 YUV Capture Workspace",
+        vec![driver, viewer],
+        vec![edge(
+            "x5233-yuv-capture-viewer",
+            "x5233-driver-yuv",
+            "yuvCh0",
+            "x5233-yuv-viewer",
+            "image",
+            PortKind::ImageFrame,
+            "image.frame.v1",
+        )],
+    )
+}
+
+fn x5233_raw_template_graph() -> WorkflowGraph {
+    let driver = workflow_node(
+        "x5233-driver-raw",
+        NodeKind::X5233Driver,
+        "X5_233 Driver",
+        NodePosition { x: 520.0, y: 140.0 },
+    );
+    let demosaic = workflow_node(
+        "x5233-raw-demosaic",
+        NodeKind::Demosaic,
+        "Demosaic",
+        NodePosition { x: 940.0, y: 140.0 },
+    );
+    let viewer = workflow_node(
+        "x5233-raw-viewer",
+        NodeKind::Viewer,
+        "Viewer",
+        NodePosition {
+            x: 1260.0,
+            y: 120.0,
+        },
+    );
+    let mut gate = workflow_node(
+        "x5233-raw-gate",
+        NodeKind::CaptureGate,
+        "Capture Gate",
+        NodePosition { x: 80.0, y: 140.0 },
+    );
+    gate.config["target"] = json!("raw");
+    gate.config["camera"] = json!(0);
+    graph(
+        "camera-toolbox-x5233-raw-diagnostic-template",
+        "X5_233 RAW Diagnostic Workspace",
+        vec![gate, driver, demosaic, viewer],
         vec![
             edge(
-                "local-image-e-source-layer",
-                "local-file-source-1",
-                "image",
-                "image-layer-1",
-                "image",
+                "x5233-raw-gate-driver",
+                "x5233-raw-gate",
+                "capture",
+                "x5233-driver-raw",
+                "capture",
+                PortKind::CommandCapture,
+                "command.capture.request.v1",
+            ),
+            edge(
+                "x5233-raw-driver-demosaic",
+                "x5233-driver-raw",
+                "rawCam0",
+                "x5233-raw-demosaic",
+                "raw",
                 PortKind::ImageFrame,
                 "image.frame.v1",
             ),
             edge(
-                "local-image-e-layer-viewer",
-                "image-layer-1",
-                "layer",
-                "viewer-1",
+                "x5233-raw-demosaic-viewer",
+                "x5233-raw-demosaic",
                 "image",
-                PortKind::LayerImage,
-                "viewer.layer.image.v1",
+                "x5233-raw-viewer",
+                "image",
+                PortKind::ImageFrame,
+                "image.frame.v1",
             ),
         ],
     )
@@ -1506,157 +1919,109 @@ fn calibration_template_graph() -> WorkflowGraph {
             "calib-rtsp-source",
             NodeKind::RtspSource,
             "RTSP Input",
-            NodePosition { x: 60.0, y: 120.0 },
-        ),
-        workflow_node(
-            "calib-decoder",
-            NodeKind::RtspDecoder,
-            "Decoded Frame Relay",
-            NodePosition { x: 320.0, y: 120.0 },
+            NodePosition { x: 60.0, y: 140.0 },
         ),
         workflow_node(
             "calib-detector",
             NodeKind::ChessboardDetector,
             "Chessboard Detector",
-            NodePosition { x: 620.0, y: 120.0 },
+            NodePosition { x: 360.0, y: 140.0 },
         ),
         workflow_node(
-            "calib-dataset",
-            NodeKind::DatasetCollector,
-            "Dataset Collector",
-            NodePosition { x: 940.0, y: 80.0 },
+            "calib-gain",
+            NodeKind::GainScorer,
+            "Gain Scorer",
+            NodePosition { x: 660.0, y: 140.0 },
         ),
         workflow_node(
-            "calib-coverage",
-            NodeKind::CoverageAnalyzer,
-            "Coverage Analyzer",
-            NodePosition { x: 1240.0, y: 80.0 },
+            "calib-gate",
+            NodeKind::CaptureGate,
+            "Capture Gate",
+            NodePosition { x: 960.0, y: 140.0 },
         ),
         workflow_node(
-            "calib-solver",
-            NodeKind::CalibrationSolver,
-            "Calibration Solver",
-            NodePosition { x: 1540.0, y: 80.0 },
-        ),
-        workflow_node(
-            "calib-pose-guide",
-            NodeKind::PoseGuide,
-            "Pose Guide",
+            "calib-x5233-driver",
+            NodeKind::X5233Driver,
+            "X5_233 Driver",
             NodePosition {
-                x: 1540.0,
-                y: 300.0,
+                x: 1260.0,
+                y: 140.0,
             },
-        ),
-        workflow_node(
-            "calib-overlay",
-            NodeKind::OverlayComposer,
-            "Overlay Composer",
-            NodePosition { x: 940.0, y: 520.0 },
         ),
         workflow_node(
             "calib-viewer",
             NodeKind::Viewer,
             "Viewer",
-            NodePosition {
-                x: 1240.0,
-                y: 520.0,
-            },
+            NodePosition { x: 660.0, y: 380.0 },
         ),
     ];
     graph(
         "camera-toolbox-calibration-template",
-        "Calibration Workspace",
+        "Calibration Capture Workspace",
         nodes,
         vec![
             edge(
-                "calib-e-rtsp-decoder",
+                "calib-rtsp-detector",
                 "calib-rtsp-source",
                 "frames",
-                "calib-decoder",
-                "frames",
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-            ),
-            edge(
-                "calib-e-decoder-detector",
-                "calib-decoder",
-                "frames",
                 "calib-detector",
                 "frames",
                 PortKind::StreamVideoFrame,
                 "stream.video-frame.v1",
             ),
             edge(
-                "calib-e-detection-dataset",
+                "calib-rtsp-viewer",
+                "calib-rtsp-source",
+                "frames",
+                "calib-viewer",
+                "video",
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
+            ),
+            edge(
+                "calib-detection-gain",
                 "calib-detector",
                 "detection",
-                "calib-dataset",
+                "calib-gain",
                 "detection",
                 PortKind::CalibDetection,
                 "calib.detection.v1",
             ),
             edge(
-                "calib-e-dataset-coverage",
-                "calib-dataset",
-                "dataset",
-                "calib-coverage",
-                "dataset",
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-            ),
-            edge(
-                "calib-e-dataset-solver",
-                "calib-dataset",
-                "dataset",
-                "calib-solver",
-                "dataset",
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-            ),
-            edge(
-                "calib-e-coverage-pose",
-                "calib-coverage",
-                "coverage",
-                "calib-pose-guide",
-                "coverage",
-                PortKind::CalibCoverage,
-                "calib.coverage.v1",
-            ),
-            edge(
-                "calib-e-video-overlay",
+                "calib-detector-overlay-viewer",
                 "calib-detector",
                 "overlay",
-                "calib-overlay",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
-            edge(
-                "calib-e-coverage-overlay",
-                "calib-coverage",
-                "overlay",
-                "calib-overlay",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
-            edge(
-                "calib-e-pose-overlay",
-                "calib-pose-guide",
-                "overlay",
-                "calib-overlay",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
-            edge(
-                "calib-e-overlay-viewer",
-                "calib-overlay",
-                "scene",
                 "calib-viewer",
-                "scene",
-                PortKind::ViewerScene,
-                "viewer.scene.v1",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
+            ),
+            edge(
+                "calib-gain-gate",
+                "calib-gain",
+                "score",
+                "calib-gate",
+                "score",
+                PortKind::CaptureScore,
+                "capture.score.v1",
+            ),
+            edge(
+                "calib-gate-x5233-capture",
+                "calib-gate",
+                "capture",
+                "calib-x5233-driver",
+                "capture",
+                PortKind::CommandCapture,
+                "command.capture.request.v1",
+            ),
+            edge(
+                "calib-rtsp-snapshot-viewer",
+                "calib-rtsp-source",
+                "snapshot",
+                "calib-viewer",
+                "image",
+                PortKind::ImageFrame,
+                "image.frame.v1",
             ),
         ],
     )
@@ -1693,9 +2058,10 @@ fn workflow_node(id: &str, kind: NodeKind, title: &str, position: NodePosition) 
         title: title.to_owned(),
         position,
         state: match kind {
-            NodeKind::RtspSource | NodeKind::SshSession | NodeKind::X5Device => {
-                NodeRuntimeState::Ready
-            }
+            NodeKind::RtspSource
+            | NodeKind::SshSession
+            | NodeKind::X5233Driver
+            | NodeKind::HexArmDevice => NodeRuntimeState::Ready,
             _ => NodeRuntimeState::Idle,
         },
         category: definition.category,
@@ -1767,6 +2133,7 @@ fn port(
         direction,
         kind,
         schema: schema.to_owned(),
+        format_hint: None,
         role,
         required: true,
         cardinality: PortCardinality::One,
@@ -1801,31 +2168,64 @@ fn many_port(
     }
 }
 
+/// 为非 `image.frame` 图端口保留像素格式契约，不改变端口 kind 或 schema。
+fn format_hint_port(port: WorkflowPort, format_hint: &str) -> WorkflowPort {
+    WorkflowPort {
+        format_hint: Some(format_hint.to_owned()),
+        ..port
+    }
+}
+
+/// 创建带有像素格式提示的统一 `image.frame` 端口。
+fn image_port(id: &str, label: &str, direction: PortDirection, format_hint: &str) -> WorkflowPort {
+    WorkflowPort {
+        format_hint: Some(format_hint.to_owned()),
+        ..port(
+            id,
+            label,
+            direction,
+            PortKind::ImageFrame,
+            "image.frame.v1",
+            Some(PortRole::Image),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn seed_graph_contains_only_valid_edges() {
+    fn seed_graph_is_x5233_preview_with_unified_image_contract() {
         let graph = seed_workflow_graph();
         validate_workflow(&graph).expect("seed graph is valid");
         assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.kind == PortKind::StreamVideoFrame)
+            graph.nodes.iter().any(|node| {
+                node.kind == NodeKind::X5233Driver && node.title == "X5_233 Driver"
+            })
         );
         assert!(
-            graph
-                .edges
+            graph.edges.iter().any(|edge| {
+                edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1"
+            })
+        );
+        assert!(
+            !graph
+                .nodes
                 .iter()
-                .any(|edge| edge.kind == PortKind::LayerVideo)
+                .any(|node| node.kind == NodeKind::OverlayComposer)
         );
     }
 
     #[test]
     fn normalize_migrates_legacy_rtsp_fields_and_ports() {
-        let mut graph = viewer_template_graph();
+        let mut graph = rtsp_snapshot_template_graph();
+        graph.nodes.push(workflow_node(
+            "legacy-decoder",
+            NodeKind::RtspDecoder,
+            "RTSP Decoder",
+            NodePosition { x: 320.0, y: 120.0 },
+        ));
         let source = graph
             .nodes
             .iter_mut()
@@ -1841,10 +2241,11 @@ mod tests {
         let decoder = graph
             .nodes
             .iter_mut()
-            .find(|node| node.kind == NodeKind::RtspDecoder)
+            .find(|node| node.id == "legacy-decoder")
             .expect("RTSP relay exists");
         decoder.config = json!({"transport": "tcp"});
         let edge = graph.edges.first_mut().expect("source relay edge exists");
+        edge.target.node_id = "legacy-decoder".to_owned();
         edge.source.port_id = "endpoint".to_owned();
         edge.target.port_id = "endpoint".to_owned();
         edge.kind = PortKind::EndpointRtsp;
@@ -1871,14 +2272,18 @@ mod tests {
         assert_eq!(edge.kind, PortKind::StreamVideoFrame);
     }
     #[test]
-    fn normalize_migrates_x5_channels_and_removes_unbacked_edges() {
+    fn normalize_migrates_legacy_x5_device_to_x5233_driver_contract() {
         let mut graph = seed_workflow_graph();
-        let mut x5 = workflow_node(
+        let mut serialized = serde_json::to_value(workflow_node(
             "x5-1",
-            NodeKind::X5Device,
+            NodeKind::X5233Driver,
             "X5 Device",
             NodePosition { x: 0.0, y: 0.0 },
-        );
+        ))
+        .expect("serialize legacy X5 fixture");
+        serialized["kind"] = json!("x5Device");
+        let mut x5: WorkflowNode =
+            serde_json::from_value(serialized).expect("saved x5Device graph deserializes");
         x5.config = json!({"host": "10.21.12.108", "channels": [3]});
         x5.outputs = vec![port(
             "snapshot",
@@ -1889,6 +2294,18 @@ mod tests {
             Some(PortRole::Image),
         )];
         graph.nodes.push(x5);
+        graph.nodes.push(workflow_node(
+            "x5-image-layer",
+            NodeKind::ImageLayer,
+            "X5 Image Layer",
+            NodePosition { x: 120.0, y: 0.0 },
+        ));
+        graph.nodes.push(workflow_node(
+            "x5-capture-gate",
+            NodeKind::CaptureGate,
+            "Capture Gate",
+            NodePosition { x: 240.0, y: 0.0 },
+        ));
         graph.edges.push(WorkflowEdge {
             id: "obsolete-x5-snapshot".to_owned(),
             source: PortEndpoint {
@@ -1903,24 +2320,117 @@ mod tests {
             schema: "image.frame.v1".to_owned(),
             schema_version: WORKFLOW_SCHEMA_VERSION.to_owned(),
         });
+        graph.edges.push(WorkflowEdge {
+            id: "x5-yuv-to-image-layer".to_owned(),
+            source: PortEndpoint {
+                node_id: "x5-1".to_owned(),
+                port_id: "yuvCh0".to_owned(),
+            },
+            target: PortEndpoint {
+                node_id: "x5-image-layer".to_owned(),
+                port_id: "image".to_owned(),
+            },
+            kind: PortKind::ImageFrame,
+            schema: "image.frame.v1".to_owned(),
+            schema_version: WORKFLOW_SCHEMA_VERSION.to_owned(),
+        });
+        graph.edges.push(edge(
+            "x5-capture-request",
+            "x5-capture-gate",
+            "capture",
+            "x5-1",
+            "capture",
+            PortKind::CommandCapture,
+            "command.capture.request.v1",
+        ));
 
-        let graph = normalize_workflow(graph, "next".to_owned()).expect("X5 graph migrates");
+        let graph = normalize_workflow(graph, "next".to_owned()).expect("legacy X5 graph migrates");
         let x5 = graph
             .nodes
             .iter()
             .find(|node| node.id == "x5-1")
             .expect("X5 node remains");
+        assert_eq!(x5.kind, NodeKind::X5233Driver);
+        assert_eq!(x5.title, "X5_233 Driver");
         assert_eq!(x5.config["rtspChannel"], json!(3));
         assert_eq!(x5.config["snapshotChannel"], json!(3));
         assert_eq!(x5.config["snapshotMode"], json!("latest"));
-        assert!(x5.inputs.is_empty());
-        assert!(x5.outputs.is_empty());
-        assert!(graph.edges.iter().all(|edge| edge.source.node_id != "x5-1"));
+        assert!(x5.inputs.iter().any(|port| {
+            port.id == "capture"
+                && port.kind == PortKind::CommandCapture
+                && port.schema == "command.capture.request.v1"
+                && !port.required
+        }));
+        assert!(x5.outputs.iter().any(|port| {
+            port.id == "yuvCh0"
+                && port.kind == PortKind::ImageFrame
+                && port.format_hint.as_deref() == Some("Nv12")
+        }));
+        assert!(x5.outputs.iter().any(|port| {
+            port.id == "rawCam0"
+                && port.kind == PortKind::ImageFrame
+                && port.format_hint.as_deref() == Some("BayerRaw")
+        }));
+        assert!(x5.outputs.iter().any(|port| {
+            port.id == "status"
+                && port.kind == PortKind::StatusMetrics
+                && port.schema == "status.metrics.v1"
+        }));
+        assert!(
+            graph
+                .edges
+                .iter()
+                .all(|edge| edge.id != "obsolete-x5-snapshot")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id == "x5-yuv-to-image-layer")
+        );
+        assert!(
+            graph
+                .edges
+                .iter()
+                .any(|edge| edge.id == "x5-capture-request")
+        );
+    }
+
+    #[test]
+    fn x5_device_serde_alias_serializes_as_x5233_driver() {
+        let kind: NodeKind = serde_json::from_value(json!("x5Device")).expect("legacy kind parses");
+        assert_eq!(kind, NodeKind::X5233Driver);
+        assert_eq!(
+            serde_json::to_value(kind).expect("kind serializes"),
+            json!("x5233Driver")
+        );
+    }
+
+    #[test]
+    fn rtsp_input_declares_optional_capture_and_rgba_snapshot() {
+        let rtsp = node_definition(NodeKind::RtspSource);
+        assert!(rtsp.inputs.iter().any(|port| {
+            port.id == "capture"
+                && port.kind == PortKind::CommandCapture
+                && port.schema == "command.capture.request.v1"
+                && !port.required
+        }));
+        assert!(rtsp.outputs.iter().any(|port| {
+            port.id == "snapshot"
+                && port.kind == PortKind::ImageFrame
+                && port.format_hint.as_deref() == Some("Rgba8")
+        }));
+        let snapshot_template = rtsp_snapshot_template_graph();
+        assert!(snapshot_template.edges.iter().any(|edge| {
+            edge.id == "rtsp-snapshot-image-viewer"
+                && edge.kind == PortKind::ImageFrame
+                && edge.schema == "image.frame.v1"
+        }));
     }
 
     #[test]
     fn validation_rejects_self_loop() {
-        let graph = seed_workflow_graph();
+        let graph = rtsp_snapshot_template_graph();
         let edge = WorkflowEdge {
             id: "self-loop".to_owned(),
             source: PortEndpoint {
@@ -1944,15 +2454,15 @@ mod tests {
         let bad = WorkflowEdge {
             id: "bad-kind".to_owned(),
             source: PortEndpoint {
-                node_id: "rtsp-source-1".to_owned(),
-                port_id: "frames".to_owned(),
+                node_id: "x5233-driver-1".to_owned(),
+                port_id: "yuvCh0".to_owned(),
             },
             target: PortEndpoint {
                 node_id: "viewer-1".to_owned(),
                 port_id: "video".to_owned(),
             },
-            kind: PortKind::StreamVideoFrame,
-            schema: "stream.video-frame.v1".to_owned(),
+            kind: PortKind::ImageFrame,
+            schema: "image.frame.v1".to_owned(),
             schema_version: WORKFLOW_SCHEMA_VERSION.to_owned(),
         };
         graph.edges.push(bad.clone());
@@ -1961,21 +2471,18 @@ mod tests {
 
     #[test]
     fn validation_rejects_cardinality_one_second_incoming_edge() {
-        // D7：viewer-1.video 是 cardinality=One 输入端口，seed 图已有一条入边，
-        // 再加一条同目标的有效入边应被 validate_workflow 拒绝。
         let mut graph = seed_workflow_graph();
         let existing = graph
             .edges
             .iter()
-            .find(|edge| edge.id == "edge-layer-viewer")
+            .find(|edge| edge.id == "x5233-preview-yuv-viewer")
             .cloned()
-            .expect("seed graph contains the layer→viewer edge");
+            .expect("seed graph contains the driver→viewer edge");
         assert_eq!(existing.target.node_id, "viewer-1");
-        assert_eq!(existing.target.port_id, "video");
+        assert_eq!(existing.target.port_id, "image");
 
-        // 复制一条仅 id 不同的等价入边（kind/schema 与源端口一致，可通过 validate_edge）。
         let mut duplicate = existing.clone();
-        duplicate.id = "edge-layer-viewer-duplicate".to_owned();
+        duplicate.id = "x5233-preview-yuv-viewer-duplicate".to_owned();
         graph.edges.push(duplicate);
 
         let err =
@@ -1990,20 +2497,20 @@ mod tests {
         let edge = graph
             .edges
             .iter()
-            .find(|edge| edge.id == "edge-layer-viewer")
+            .find(|edge| edge.id == "x5233-preview-yuv-viewer")
             .cloned()
-            .expect("seed layer→viewer edge exists");
+            .expect("seed driver→viewer edge exists");
         let viewer = graph
             .nodes
             .iter_mut()
             .find(|node| node.id == "viewer-1")
             .expect("seed viewer exists");
-        let video = viewer
+        let image = viewer
             .inputs
             .iter_mut()
-            .find(|port| port.id == "video")
-            .expect("viewer video input exists");
-        video.schema = "viewer.layer.video.v2".to_owned();
+            .find(|port| port.id == "image")
+            .expect("viewer image input exists");
+        image.schema = "image.frame.v2".to_owned();
 
         let error = validate_edge(&graph, &edge).expect_err("target schema mismatch is rejected");
         assert!(error.contains("target schema"), "unexpected error: {error}");
@@ -2011,14 +2518,11 @@ mod tests {
 
     #[test]
     fn validation_allows_cardinality_many_fan_in() {
-        // 反向确认：`Many` 输入端口的 fan-in 不被 cardinality 校验拦截。
-        // 这里临时把 viewer 输入改为 Many，直接验证 validate_cardinality_constraints
-        // 对多条入边不报错。
         let mut graph = seed_workflow_graph();
         for node in &mut graph.nodes {
             if node.id == "viewer-1" {
                 for port in &mut node.inputs {
-                    if port.id == "video" {
+                    if port.id == "image" {
                         port.cardinality = PortCardinality::Many;
                     }
                 }
@@ -2027,44 +2531,51 @@ mod tests {
         let existing = graph
             .edges
             .iter()
-            .find(|edge| edge.id == "edge-layer-viewer")
+            .find(|edge| edge.id == "x5233-preview-yuv-viewer")
             .cloned()
             .unwrap();
         let mut duplicate = existing;
-        duplicate.id = "edge-layer-viewer-duplicate".to_owned();
+        duplicate.id = "x5233-preview-yuv-viewer-duplicate".to_owned();
         graph.edges.push(duplicate);
 
         validate_cardinality_constraints(&graph).expect("Many port fan-in must be allowed");
     }
 
     #[test]
-    fn calibration_template_contains_dataset_to_solver_chain_without_fake_autocapture_loop() {
+    fn calibration_template_uses_identity_preserving_capture_chain() {
         let graph = calibration_template_graph();
         validate_workflow(&graph).expect("calibration template is valid");
         assert!(
             graph
                 .nodes
                 .iter()
-                .any(|node| node.kind == NodeKind::DatasetCollector)
+                .any(|node| node.kind == NodeKind::X5233Driver)
         );
         assert!(
             graph
                 .nodes
                 .iter()
-                .any(|node| node.kind == NodeKind::CalibrationSolver)
+                .any(|node| node.kind == NodeKind::GainScorer)
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::CaptureGate)
         );
         assert!(
             !graph
                 .nodes
                 .iter()
-                .any(|node| node.kind == NodeKind::AutoCaptureController)
+                .any(|node| node.kind == NodeKind::OverlayComposer)
         );
         for edge_id in [
-            "calib-e-detection-dataset",
-            "calib-e-dataset-coverage",
-            "calib-e-dataset-solver",
-            "calib-e-coverage-pose",
-            "calib-e-overlay-viewer",
+            "calib-rtsp-detector",
+            "calib-detection-gain",
+            "calib-gain-gate",
+            "calib-gate-x5233-capture",
+            "calib-rtsp-viewer",
+            "calib-rtsp-snapshot-viewer",
         ] {
             assert!(
                 graph.edges.iter().any(|edge| edge.id == edge_id),
@@ -2074,22 +2585,107 @@ mod tests {
     }
 
     #[test]
-    fn node_catalog_has_19_nodes() {
+    fn node_catalog_exposes_hex_arm_only_when_feature_enabled() {
         let catalog = node_catalog();
-        assert_eq!(catalog.len(), 19);
-        // 每个 kind 都能通过 node_definition 展开，且无重复。
-        let kinds: Vec<NodeKind> = catalog.iter().map(|def| def.kind).collect();
-        assert_eq!(kinds.len(), 19);
+        #[cfg(feature = "hex-arm-control")]
+        assert!(
+            catalog
+                .iter()
+                .any(|definition| definition.kind == NodeKind::HexArmDevice)
+        );
+        #[cfg(not(feature = "hex-arm-control"))]
+        assert!(
+            !catalog
+                .iter()
+                .any(|definition| definition.kind == NodeKind::HexArmDevice)
+        );
     }
 
     #[test]
-    fn viewer_declares_real_image_capture_output() {
+    fn hex_arm_config_rejects_unsupported_transport_and_non_finite_joints() {
+        let mut node = workflow_node(
+            "hex-arm-1",
+            NodeKind::HexArmDevice,
+            "Hex Arm Device",
+            NodePosition { x: 0.0, y: 0.0 },
+        );
+        node.config["transport"] = json!("kcp");
+        let error = validate_node_config(&node).expect_err("KCP must be rejected");
+        assert!(error.contains("KCP is unsupported"));
+
+        node.config["transport"] = json!("websocket");
+        node.config["jointPositions"] = json!("0.0, not-a-radian");
+        let error = validate_node_config(&node).expect_err("joint radians must be finite");
+        assert!(error.contains("finite radians"));
+
+        node.config["jointPositions"] = json!("0.0, 1.57");
+        node.config["controlEnabled"] = json!(true);
+        validate_node_config(&node).expect("valid WebSocket Hex Arm config");
+    }
+
+    #[test]
+    fn validation_rejects_multiple_hex_arm_session_owners() {
+        let mut graph = seed_workflow_graph();
+        graph.nodes.push(workflow_node(
+            "hex-arm-1",
+            NodeKind::HexArmDevice,
+            "Hex Arm One",
+            NodePosition { x: 0.0, y: 0.0 },
+        ));
+        graph.nodes.push(workflow_node(
+            "hex-arm-2",
+            NodeKind::HexArmDevice,
+            "Hex Arm Two",
+            NodePosition { x: 100.0, y: 0.0 },
+        ));
+        let error = validate_workflow(&graph).expect_err("Hex Arm session must have one owner");
+        assert!(error.contains("at most one hexArmDevice"));
+    }
+
+    #[test]
+    fn node_catalog_has_feature_dependent_nodes() {
+        let catalog = node_catalog();
+        assert_eq!(
+            catalog.len(),
+            if cfg!(feature = "hex-arm-control") {
+                22
+            } else {
+                21
+            }
+        );
+        assert!(
+            !catalog
+                .iter()
+                .any(|definition| definition.kind == NodeKind::OverlayComposer),
+            "OverlayComposer is legacy-only; new graphs should connect overlays directly to Viewer"
+        );
+        // 每个 kind 都能通过 node_definition 展开，且无重复。
+        let kinds: Vec<NodeKind> = catalog.iter().map(|def| def.kind).collect();
+        assert_eq!(kinds.len(), catalog.len());
+    }
+
+    #[test]
+    fn viewer_declares_preview_only_contracts() {
         let viewer = node_definition(NodeKind::Viewer);
-        assert!(viewer.outputs.iter().any(|port| {
+        assert!(viewer.outputs.is_empty());
+        assert!(viewer.inputs.iter().any(|port| {
+            port.id == "video"
+                && port.kind == PortKind::StreamVideoFrame
+                && port.schema == "stream.video-frame.v1"
+                && port.format_hint.as_deref() == Some("Rgba8")
+        }));
+        assert!(viewer.inputs.iter().any(|port| {
             port.id == "image"
                 && port.kind == PortKind::ImageFrame
                 && port.schema == "image.frame.v1"
-                && port.direction == PortDirection::Output
+                && port.direction == PortDirection::Input
+                && port.format_hint.as_deref() == Some("Rgba8 | Gray8 | Gray16Le | Nv12")
+        }));
+        assert!(viewer.inputs.iter().any(|port| {
+            port.id == "overlay"
+                && port.kind == PortKind::LayerOverlay
+                && port.schema == "viewer.layer.overlay.v1"
+                && port.direction == PortDirection::Input
         }));
     }
 
@@ -2130,6 +2726,31 @@ mod tests {
                 .any(|p| p.id == "command" && p.kind == PortKind::CommandCapture)
         );
 
+        let gain = node_definition(NodeKind::GainScorer);
+        assert_eq!(gain.inputs[0].kind, PortKind::CalibDetection);
+        assert_eq!(gain.outputs[0].kind, PortKind::CaptureScore);
+
+        let gate = node_definition(NodeKind::CaptureGate);
+        assert_eq!(gate.inputs[0].kind, PortKind::CaptureScore);
+        assert!(gate.outputs.iter().any(|port| {
+            port.id == "capture"
+                && port.kind == PortKind::CommandCapture
+                && port.schema == "command.capture.request.v1"
+        }));
+
+        let demosaic = node_definition(NodeKind::Demosaic);
+        assert!(demosaic.inputs.iter().any(|port| {
+            port.id == "raw"
+                && port.kind == PortKind::ImageFrame
+                && port.schema == "image.frame.v1"
+                && port.format_hint.as_deref() == Some("BayerRaw")
+        }));
+        assert!(demosaic.outputs.iter().any(|port| {
+            port.id == "image"
+                && port.kind == PortKind::ImageFrame
+                && port.schema == "image.frame.v1"
+                && port.format_hint.as_deref() == Some("Rgba8")
+        }));
         let pose = node_definition(NodeKind::PoseGuide);
         assert!(
             pose.outputs
@@ -2198,6 +2819,65 @@ mod tests {
         for template in workmode_templates() {
             validate_workflow(&template.graph).expect(template.id);
         }
+    }
+
+    #[test]
+    fn templates_cover_x5233_rtsp_yuv_and_raw_contracts() {
+        let templates = workmode_templates();
+        for template in &templates {
+            for node in &template.graph.nodes {
+                if node.kind == NodeKind::X5233Driver {
+                    assert_eq!(node.title, "X5_233 Driver");
+                }
+            }
+        }
+        let find = |id: &str| {
+            templates
+                .iter()
+                .find(|template| template.id == id)
+                .expect("required workmode template")
+        };
+        let x5233_preview = find("x5233-preview");
+        assert!(
+            x5233_preview.graph.edges.iter().any(|edge| {
+                edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1"
+            })
+        );
+        let rtsp_snapshot = find("rtsp-snapshot");
+        assert!(rtsp_snapshot.graph.edges.iter().any(|edge| {
+            edge.id == "rtsp-snapshot-image-viewer" && edge.kind == PortKind::ImageFrame
+        }));
+        let calibration = find("calibration");
+        assert!(calibration.graph.edges.iter().any(|edge| {
+            edge.id == "calib-detector-overlay-viewer"
+                && edge.kind == PortKind::LayerOverlay
+                && edge.schema == "viewer.layer.overlay.v1"
+        }));
+        let yuv = find("x5233-yuv-capture");
+        assert!(yuv.graph.nodes.iter().any(|node| {
+            node.outputs.iter().any(|port| {
+                port.id == "yuvCh0"
+                    && port.schema == "image.frame.v1"
+                    && port.format_hint.as_deref() == Some("Nv12")
+            })
+        }));
+        let raw = find("x5233-raw-diagnostic");
+        assert!(raw.graph.nodes.iter().any(|node| {
+            node.outputs.iter().any(|port| {
+                port.id == "rawCam0"
+                    && port.schema == "image.frame.v1"
+                    && port.format_hint.as_deref() == Some("BayerRaw")
+            })
+        }));
+        assert!(
+            raw.graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::Demosaic)
+        );
+        assert!(raw.graph.edges.iter().any(|edge| {
+            edge.id == "x5233-raw-driver-demosaic" && edge.kind == PortKind::ImageFrame
+        }));
     }
 
     #[test]

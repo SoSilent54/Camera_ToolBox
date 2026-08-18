@@ -24,8 +24,9 @@ pub use capability::{
     TargetResolutionSnapshot,
 };
 pub use control::{
-    ControlTargetSpec, EepromExecutor, I2cExecutor, SftpFileReader, SshCommandExecutor,
-    X5ControlClient,
+    ControlTargetSpec, EepromExecutor, HexArmControlClient, HexArmJointPositionsRequest,
+    HexArmTargetConfig, HexArmTransport, I2cExecutor, SftpFileReader, SshCommandExecutor,
+    X5ControlClient, X5233CapturePayload,
 };
 pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
 pub use eeprom::{

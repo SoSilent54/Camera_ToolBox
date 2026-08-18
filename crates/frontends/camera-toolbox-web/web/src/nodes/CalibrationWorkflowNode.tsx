@@ -46,6 +46,10 @@ function nodeHint(kind: string): string {
   switch (kind) {
     case 'chessboardDetector':
       return '随输入帧检测棋盘格';
+    case 'gainScorer':
+      return '按角点完整度计算 gain，并保留帧身份';
+    case 'captureGate':
+      return '满足阈值并稳定保持后发出抓帧请求';
     case 'datasetCollector':
       return '累积 detection，手动输出或清空';
     case 'coverageAnalyzer':

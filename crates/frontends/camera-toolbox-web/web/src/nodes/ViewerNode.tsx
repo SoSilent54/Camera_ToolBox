@@ -21,12 +21,10 @@ export function ViewerNode({ data, selected, width, height }: NodeProps) {
         <PortHandles node={node} />
         <EngineFrame
           nodeId={node.id}
+          imageFormatHint={node.inputs.find((port) => port.id === 'image')?.formatHint}
           runtimeState={runtimeState}
           runtimeDiagnostic={runtimeDiagnostic}
           runtimeOutput={nodeData.runtimeOutput}
-          actionPending={Boolean(nodeData.actionPending)}
-          captureAvailable={Boolean(nodeData.onNodeAction)}
-          onCapture={() => nodeData.onNodeAction?.(node.id, 'trigger')}
         />
       </section>
       {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
@@ -46,21 +44,18 @@ type FrameSnapshot = {
 /** 订阅 latest-wins JPEG；只以 `frame_meta` 的实际编码尺寸/序号显示状态，不推断源端参数。 */
 function EngineFrame({
   nodeId,
+  imageFormatHint,
   runtimeState,
   runtimeDiagnostic,
   runtimeOutput,
-  actionPending,
-  captureAvailable,
-  onCapture,
 }: {
   nodeId: string;
+  imageFormatHint?: string;
   runtimeState?: string;
   runtimeDiagnostic?: string;
   runtimeOutput: unknown;
-  actionPending: boolean;
-  captureAvailable: boolean;
-  onCapture: () => void;
 }) {
+
   const imgRef = useRef<HTMLImageElement>(null);
   const frameTimes = useRef<number[]>([]);
   const lastUiUpdateAt = useRef(0);
@@ -154,18 +149,9 @@ function EngineFrame({
           <RuntimeOutputSummary output={runtimeOutput} />
         </div>
       ) : null}
-      <div className="node-actions">
-        <button
-          type="button"
-          className="nodrag nowheel"
-          disabled={!captureAvailable || actionPending || !frame.lastFrameAt}
-          title="将当前引擎帧导出到 image.frame 输出端口"
-          onClick={onCapture}
-        >
-          {actionPending ? '捕获中…' : '捕获最新帧'}
-        </button>
-      </div>
-      <span className="node-hint">捕获的是当前引擎 RGBA 帧，不是缩放后的 JPEG 预览。</span>
+      <span className="node-hint">
+        Viewer 只负责预览和显示状态；支持 {imageFormatHint ?? 'Rgba8 | Gray8 | Gray16Le | Nv12'}。BayerRaw 必须先经过显式 Demosaic；RAW/YUV 设备采集请在 X5_233 Driver 上触发。
+      </span>
     </div>
   );
 }

@@ -17,7 +17,11 @@ pub use channel::{ChannelFull, MailboxReceiver, MailboxSender, NodeMessage, crea
 pub use graph::{EdgeSpec, GraphBuildError, GraphEngine, GraphSpec, PortEndpoint};
 pub use node::{NodeAction, NodeError, NodeFactory, NodeInstance, kinds};
 pub use nodes::register_builtin;
-pub use packet::DataPacket;
+pub use packet::{
+    BayerPattern, CaptureMode, CaptureRequest, CaptureTarget, ColorMetadata, ColorSpace,
+    DataPacket, DetectionPacket, FrameProvenance, GainScore, ImageFrame, ImageFrameError,
+    ImageFrameFormat, ImageFrameIdentity, ImagePlane, RawMetadata,
+};
 pub use registry::NodeRegistry;
 pub use runtime::{NodeReporter, NodeRuntime, OutputRegistry, SpawnContext};
 pub use services::{EngineServices, StreamServiceFactory};
