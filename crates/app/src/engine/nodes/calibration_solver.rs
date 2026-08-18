@@ -7,11 +7,14 @@ use std::sync::Arc;
 
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
-    InitialIntrinsics,
+    ChessboardDetection, InitialIntrinsics,
 };
 
 use crate::{
-    engine::{DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec},
+    engine::{
+        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
+        NodeRuntimeState, NodeSpec,
+    },
     ports::CalibrationCancellation,
 };
 
@@ -23,12 +26,16 @@ impl NodeFactory for CalibrationSolverFactory {
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(CalibrationSolverNode { spec }))
+        Ok(Box::new(CalibrationSolverNode {
+            spec,
+            dataset: None,
+        }))
     }
 }
 
 pub struct CalibrationSolverNode {
     spec: NodeSpec,
+    dataset: Option<Vec<ChessboardDetection>>,
 }
 
 impl NodeInstance for CalibrationSolverNode {
@@ -43,10 +50,28 @@ impl NodeInstance for CalibrationSolverNode {
 
     fn on_input(
         &mut self,
-        _port: &str,
-        _packet: DataPacket,
+        port: &str,
+        packet: DataPacket,
         _rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
+        if port != "dataset" {
+            return Ok(());
+        }
+        let DataPacket::Dataset(dataset) = packet else {
+            return Err(NodeError::Precondition(
+                "calibrationSolver.dataset requires calib.dataset".to_owned(),
+            ));
+        };
+        if dataset.get("kind").and_then(serde_json::Value::as_str) != Some("calib.dataset.v1") {
+            return Err(NodeError::Precondition(
+                "dataset payload kind must be calib.dataset.v1".to_owned(),
+            ));
+        }
+        let samples = serde_json::from_value(dataset.get("samples").cloned().unwrap_or_default())
+            .map_err(|error| {
+            NodeError::Precondition(format!("invalid dataset samples: {error}"))
+        })?;
+        self.dataset = Some(samples);
         Ok(())
     }
 
@@ -88,36 +113,41 @@ impl CalibrationSolverNode {
             config_f64(&self.spec, "squareSizeMm", 30.0),
         )
         .map_err(|error| NodeError::Config(error.to_string()))?;
+
+        let image_points: Vec<Vec<CalibrationPoint>> = if let Some(samples) = &self.dataset {
+            if samples.is_empty() {
+                return Err(NodeError::Precondition(
+                    "calibration dataset is empty".to_owned(),
+                ));
+            }
+            let mut points = Vec::with_capacity(samples.len());
+            for (index, detection) in samples.iter().enumerate() {
+                if detection.image_size != image_size {
+                    return Err(NodeError::Config(format!(
+                        "dataset sample {index} image size {:?} does not match configured {:?}",
+                        detection.image_size, image_size
+                    )));
+                }
+                detection.validate(board).map_err(|error| {
+                    NodeError::Precondition(format!("dataset sample {index} is invalid: {error}"))
+                })?;
+                points.push(detection.corners.clone());
+            }
+            points
+        } else {
+            self.spec
+                .config
+                .get("imagePoints")
+                .and_then(|value| serde_json::from_value(value.clone()).ok())
+                .unwrap_or_default()
+        };
+
         let fx = config_f64(&self.spec, "fx", 1234.56);
         let fy = config_f64(&self.spec, "fy", 1234.56);
         let cx = config_f64(&self.spec, "cx", 960.0);
         let cy = config_f64(&self.spec, "cy", 540.0);
         let camera_matrix = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0];
-
-        let distortion_coefficients: Vec<f64> = self
-            .spec
-            .config
-            .get("distortionCoefficients")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(serde_json::Value::as_f64)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let distortion_coefficients = if distortion_coefficients.is_empty() {
-            vec![0.0; 12]
-        } else {
-            distortion_coefficients
-        };
-
-        let image_points: Vec<Vec<CalibrationPoint>> = self
-            .spec
-            .config
-            .get("imagePoints")
-            .and_then(|value| serde_json::from_value(value.clone()).ok())
-            .unwrap_or_default();
+        let distortion_coefficients = vec![0.0; 12];
 
         Ok(CalibrationRequest {
             image_size,
@@ -159,11 +189,9 @@ mod tests {
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
-    use camera_toolbox_core::ChessboardDetectionOutcome;
-    use crate::engine::{
-        EngineServices, NodeReporter, OutputRegistry, SpawnContext,
-    };
+    use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
     use crate::ports::{CalibrationBackend, CalibrationBackendError};
+    use camera_toolbox_core::ChessboardDetectionOutcome;
 
     fn spec() -> NodeSpec {
         NodeSpec {
@@ -192,7 +220,10 @@ mod tests {
         }
     }
 
-    fn runtime(services: EngineServices, state_tx: mpsc::Sender<crate::engine::NodeStatusReport>) -> NodeRuntime {
+    fn runtime(
+        services: EngineServices,
+        state_tx: mpsc::Sender<crate::engine::NodeStatusReport>,
+    ) -> NodeRuntime {
         let (event_tx, _event_rx) = mpsc::channel();
         let reporter = NodeReporter::new("calib-1".to_owned(), state_tx, event_tx);
         let ctx = SpawnContext {
@@ -241,7 +272,10 @@ mod tests {
             _request: &CalibrationRequest,
             _cancellation: &CalibrationCancellation,
         ) -> Result<CalibrationSolution, CalibrationBackendError> {
-            *self.called.lock().unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+            *self
+                .called
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
             Ok(self.solution.clone())
         }
     }
@@ -257,7 +291,9 @@ mod tests {
         }
     }
 
-    fn last_state(rx: &mpsc::Receiver<crate::engine::NodeStatusReport>) -> Option<NodeRuntimeState> {
+    fn last_state(
+        rx: &mpsc::Receiver<crate::engine::NodeStatusReport>,
+    ) -> Option<NodeRuntimeState> {
         let mut last = None;
         while let Ok(report) = rx.try_recv() {
             last = Some(report.state);
@@ -268,7 +304,9 @@ mod tests {
     #[test]
     fn factory_instantiates_with_expected_kind() {
         assert_eq!(CalibrationSolverFactory.kind(), "calibrationSolver");
-        let instance = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        let instance = CalibrationSolverFactory
+            .instantiate(spec())
+            .expect("instantiate");
         assert_eq!(instance.kind(), "calibrationSolver");
     }
 
@@ -276,38 +314,68 @@ mod tests {
     fn on_start_reports_ready() {
         let (state_tx, state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
-        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        let mut node = CalibrationSolverFactory
+            .instantiate(spec())
+            .expect("instantiate");
         node.on_start(&mut rt).expect("on_start");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Ready));
     }
 
     #[test]
-    fn build_request_reads_config_defaults_and_distortion() {
-        let node = CalibrationSolverNode { spec: spec() };
+    fn build_request_reads_scalar_config_defaults() {
+        let node = CalibrationSolverNode {
+            spec: spec(),
+            dataset: None,
+        };
         let request = node.build_request().expect("build request");
         assert_eq!(request.image_size.width, 1920);
         assert_eq!(request.image_size.height, 1080);
         assert_eq!(request.board.inner_cols, 8);
         assert_eq!(request.board.inner_rows, 11);
-        // 未提供 distortionCoefficients → 默认 12 个 0
-        assert_eq!(request.initial_intrinsics.distortion_coefficients, vec![0.0; 12]);
+        assert_eq!(
+            request.initial_intrinsics.distortion_coefficients,
+            vec![0.0; 12]
+        );
     }
 
     #[test]
-    fn build_request_parses_distortion_coefficients() {
-        let mut s = spec();
-        s.config["distortionCoefficients"] = serde_json::json!([0.1, 0.2, 0.3]);
-        let node = CalibrationSolverNode { spec: s };
+    fn dataset_input_becomes_calibration_image_points() {
+        let detection = ChessboardDetection {
+            image_size: CalibrationImageSize::new(1920, 1080).expect("image size"),
+            corners: vec![CalibrationPoint::new(12.0, 24.0); 88],
+        };
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverNode {
+            spec: spec(),
+            dataset: None,
+        };
+        node.on_input(
+            "dataset",
+            DataPacket::Dataset(Arc::new(serde_json::json!({
+                "kind": "calib.dataset.v1",
+                "samples": [detection],
+            }))),
+            &mut rt,
+        )
+        .expect("accept dataset");
         let request = node.build_request().expect("build request");
-        assert_eq!(request.initial_intrinsics.distortion_coefficients, vec![0.1, 0.2, 0.3]);
+        assert_eq!(
+            request.image_points,
+            vec![vec![CalibrationPoint::new(12.0, 24.0); 88]]
+        );
     }
 
     #[test]
     fn trigger_without_backend_is_precondition() {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
-        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
-        let err = node.on_action(NodeAction::Trigger, &mut rt).expect_err("no backend");
+        let mut node = CalibrationSolverFactory
+            .instantiate(spec())
+            .expect("instantiate");
+        let err = node
+            .on_action(NodeAction::Trigger, &mut rt)
+            .expect_err("no backend");
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
     }
 
@@ -339,11 +407,18 @@ mod tests {
         };
         let mut rt = NodeRuntime::new(ctx);
 
-        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
-        node.on_action(NodeAction::Trigger, &mut rt).expect("trigger");
+        let mut node = CalibrationSolverFactory
+            .instantiate(spec())
+            .expect("instantiate");
+        node.on_action(NodeAction::Trigger, &mut rt)
+            .expect("trigger");
 
         assert_eq!(*emitted.lock().unwrap(), 1, "solution must be emitted once");
-        assert_eq!(*backend.called.lock().unwrap(), 1, "backend.calibrate must be called once");
+        assert_eq!(
+            *backend.called.lock().unwrap(),
+            1,
+            "backend.calibrate must be called once"
+        );
         // 求解后回落到 idle
         assert_eq!(
             last_state(&state_rx).filter(|s| *s == NodeRuntimeState::Idle),
@@ -355,8 +430,12 @@ mod tests {
     fn unsupported_action_is_error() {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
-        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
-        let err = node.on_action(NodeAction::Connect, &mut rt).expect_err("unsupported");
+        let mut node = CalibrationSolverFactory
+            .instantiate(spec())
+            .expect("instantiate");
+        let err = node
+            .on_action(NodeAction::Connect, &mut rt)
+            .expect_err("unsupported");
         assert!(matches!(err, NodeError::UnsupportedAction(_)));
     }
 
@@ -364,7 +443,9 @@ mod tests {
     fn on_stop_reports_idle() {
         let (state_tx, state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
-        let mut node = CalibrationSolverFactory.instantiate(spec()).expect("instantiate");
+        let mut node = CalibrationSolverFactory
+            .instantiate(spec())
+            .expect("instantiate");
         node.on_stop(&mut rt).expect("on_stop");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Idle));
     }

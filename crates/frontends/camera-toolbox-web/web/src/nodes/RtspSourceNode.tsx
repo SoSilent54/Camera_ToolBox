@@ -1,9 +1,13 @@
 import { useEffect, useState } from 'react';
 import type { NodeProps } from '@xyflow/react';
 import type { FlowNodeData } from '../workflow';
-import { DEFAULT_RTSP_URL, NodeHeader, PortHandles } from './shared';
+import { DEFAULT_RTSP_URL, NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './shared';
 
-/** RTSP 源节点：编辑 URL + Connect/Disconnect 触发引擎连接。 */
+function numericConfig(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/** RTSP 源节点：连接时由 StreamService 解码为视频帧，公开后端实际读取的连接参数。 */
 export function RtspSourceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
@@ -14,6 +18,15 @@ export function RtspSourceNode({ data, selected }: NodeProps) {
   useEffect(() => setDraftUrl(url), [url]);
   const applyUrl = () => nodeData.onRtspUrlChange?.(node.id, draftUrl);
   const connected = runtimeState === 'running';
+  const actionPending = Boolean(nodeData.actionPending);
+  const streamConfig = {
+    transport: String(node.config.transport ?? 'tcp'),
+    channel: numericConfig(node.config.channel, 0),
+    width: numericConfig(node.config.width, 1920),
+    height: numericConfig(node.config.height, 1080),
+    connectTimeoutMs: numericConfig(node.config.connectTimeoutMs, 8000),
+    idleTimeoutMs: numericConfig(node.config.idleTimeoutMs, 10000),
+  };
   return (
     <div className="workflow-node-shell">
       <section className={`workflow-node source-node ${selected ? 'selected' : ''}`}>
@@ -36,14 +49,21 @@ export function RtspSourceNode({ data, selected }: NodeProps) {
               }
             }}
           />
-          <span>Transport: {String(node.config.transport ?? 'tcp')}</span>
+          <ScalarConfigFields
+            nodeId={node.id}
+            config={streamConfig}
+            onChange={nodeData.onNodeConfigChange}
+          />
+          <span className="node-hint">输出已解码的视频帧；channel、尺寸与超时在下次连接时生效。</span>
+          <RuntimeOutputSummary output={nodeData.runtimeOutput} />
           <div className="node-actions">
             <button
               type="button"
-              disabled={runtimeState === 'disabled'}
+              className="nodrag nowheel"
+              disabled={runtimeState === 'disabled' || actionPending}
               onClick={() => nodeData.onNodeAction?.(node.id, connected ? 'disconnect' : 'connect')}
             >
-              {connected ? '断开' : '连接'}
+              {actionPending ? '处理中…' : connected ? '断开' : '连接'}
             </button>
           </div>
         </div>

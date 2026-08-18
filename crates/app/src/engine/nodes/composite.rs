@@ -1,16 +1,17 @@
-//! 纯数据流组合节点：fan-in 聚合、数据集累积、覆盖度/姿态占位。
+//! 纯数据流组合节点：fan-in 聚合、数据集累积、图像栅格覆盖与采集引导。
 //!
-//! 这四个 factory 只依赖 `NodeRuntime`（`emit`/`report_state`/`report_event`），不注入任何
-//! `EngineServices`，因此可在 M2 第一档单独落地。未强类型化的负载（dataset/coverage/target/scene）
-//! 复用 `DataPacket::Json` 承载（packet 变体扩充留待 M2-c）。
+//! 除 `OverlayComposer` 外，标定节点使用与端口 kind 对应的 `DataPacket` 变体，避免 JSON
+//! 负载与声明端口脱节：检测被累积为 dataset，coverage 从角点中心计算实际占用栅格，
+//! `PoseGuide` 仅输出图像栅格目标，绝不冒充相机 6DoF 位姿。
 //!
 //! - `OverlayComposer`：多路 video/image/overlay 输入 → 聚合 `scene` 输出（fan-in pass-through）。
-//! - `DatasetCollector`：`detection`/`image` 累积，`Trigger` 动作一次性输出 `dataset`。
-//! - `CoverageAnalyzer`：`dataset` → `coverage`（+ 可选 `overlay`），轻量占位统计。
-//! - `PoseGuide`：`coverage` → `target`（+ 可选 `overlay`），占位 pass-through。
+//! - `DatasetCollector`：累积 `detection`，`Trigger` 输出 `dataset`，`clear` 清空内存样本。
+//! - `CoverageAnalyzer`：`dataset` → 以棋盘角点中心统计的 `coverage`（+ overlay）。
+//! - `PoseGuide`：`coverage` → 下一个未覆盖的图像栅格 `target`（+ overlay）。
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
+use camera_toolbox_core::ChessboardDetection;
 use serde_json::json;
 
 use crate::engine::{
@@ -94,7 +95,7 @@ impl NodeInstance for OverlayComposerNode {
 }
 
 // ---------------------------------------------------------------------------
-// DatasetCollector：detection/image 累积，Trigger 输出 dataset
+// DatasetCollector：detection 累积，Trigger 输出 dataset
 // ---------------------------------------------------------------------------
 
 pub struct DatasetCollectorFactory;
@@ -114,7 +115,7 @@ impl NodeFactory for DatasetCollectorFactory {
 
 pub struct DatasetCollectorNode {
     spec: NodeSpec,
-    samples: Vec<serde_json::Value>,
+    samples: Vec<Arc<ChessboardDetection>>,
 }
 
 impl NodeInstance for DatasetCollectorNode {
@@ -133,14 +134,17 @@ impl NodeInstance for DatasetCollectorNode {
         packet: DataPacket,
         _rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
-        // 仅累积 detection 输入；image 帧属可选旁路，暂不纳入样本（占位阶段）。
         if port != "detection" {
             return Ok(());
         }
-        let value = packet_to_json(packet);
+        let DataPacket::Detection(detection) = packet else {
+            return Err(NodeError::Precondition(
+                "datasetCollector.detection requires calib.detection".to_owned(),
+            ));
+        };
         let max_samples = config_usize(&self.spec, "maxSamples", 80);
         if self.samples.len() < max_samples {
-            self.samples.push(value);
+            self.samples.push(detection);
         }
         Ok(())
     }
@@ -148,13 +152,18 @@ impl NodeInstance for DatasetCollectorNode {
     fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         match action {
             NodeAction::Trigger => {
+                let samples: Vec<&ChessboardDetection> =
+                    self.samples.iter().map(Arc::as_ref).collect();
                 let dataset = json!({
-                    "kind": "dataset",
-                    "samples": self.samples.clone(),
+                    "kind": "calib.dataset.v1",
+                    "samples": samples,
                     "count": self.samples.len(),
                 });
-                emit_json(rt, "dataset", dataset)?;
-                rt.report_event(format!("emitted dataset with {} samples", self.samples.len()));
+                rt.emit("dataset", DataPacket::Dataset(Arc::new(dataset)))?;
+                rt.report_event(format!(
+                    "emitted dataset with {} samples",
+                    self.samples.len()
+                ));
                 Ok(())
             }
             NodeAction::Custom { name, .. } if name == "clear" => {
@@ -211,32 +220,23 @@ impl NodeInstance for CoverageAnalyzerNode {
         if port != "dataset" {
             return Ok(());
         }
-        let dataset = packet_to_json(packet);
-        // 占位统计：以样本计数近似覆盖度（真实格点覆盖统计属 M2 后续算法适配）。
-        let count = dataset
-            .get("samples")
-            .and_then(serde_json::Value::as_array)
-            .map_or(0, Vec::len);
-        let (grid_cols, grid_rows) = self.grid();
-        emit_json(
-            rt,
-            "coverage",
-            json!({
-                "kind": "coverage",
-                "sampleCount": count,
-                "occupied": count,
-                "gridCols": grid_cols,
-                "gridRows": grid_rows,
-            }),
-        )?;
-        // overlay 为可选输出；未在规格中声明则跳过。
+        let DataPacket::Dataset(dataset) = packet else {
+            return Err(NodeError::Precondition(
+                "coverageAnalyzer.dataset requires calib.dataset".to_owned(),
+            ));
+        };
+        let samples = dataset_samples(&dataset)?;
+        let (grid_cols, grid_rows) = self.grid()?;
+        let coverage = grid_coverage(&samples, grid_cols, grid_rows)?;
+        rt.emit("coverage", DataPacket::Coverage(Arc::new(coverage.clone())))?;
         if find_output_port(&self.spec, "overlay").is_some() {
             emit_json(
                 rt,
                 "overlay",
-                json!({"kind": "overlay", "coverage": count, "gridCols": grid_cols, "gridRows": grid_rows}),
+                json!({"kind": "overlay", "coverage": coverage}),
             )?;
         }
+        rt.report_event(format!("coverage: {} samples", samples.len()));
         Ok(())
     }
 
@@ -251,11 +251,17 @@ impl NodeInstance for CoverageAnalyzerNode {
 }
 
 impl CoverageAnalyzerNode {
-    fn grid(&self) -> (u64, u64) {
-        (
-            config_u64(&self.spec, "gridCols", 6),
-            config_u64(&self.spec, "gridRows", 4),
-        )
+    fn grid(&self) -> Result<(u64, u64), NodeError> {
+        let cols = config_u64(&self.spec, "gridCols", 6);
+        let rows = config_u64(&self.spec, "gridRows", 4);
+        if cols == 0 || rows == 0 {
+            return Err(NodeError::Config(
+                "gridCols and gridRows must be positive".to_owned(),
+            ));
+        }
+        cols.checked_mul(rows)
+            .ok_or_else(|| NodeError::Config("coverage grid is too large".to_owned()))?;
+        Ok((cols, rows))
     }
 }
 
@@ -298,16 +304,34 @@ impl NodeInstance for PoseGuideNode {
         if port != "coverage" {
             return Ok(());
         }
-        let coverage = packet_to_json(packet);
-        // 占位：由 coverage 生成单个 guided target（真实姿态求解属 M2 后续算法适配）。
-        emit_json(
-            rt,
-            "target",
-            json!({"kind": "target", "basedOn": coverage, "enabled": true}),
-        )?;
-        if find_output_port(&self.spec, "overlay").is_some() {
-            emit_json(rt, "overlay", json!({"kind": "overlay", "poseGuide": true}))?;
+        if !config_bool(&self.spec, "enabled", true) {
+            rt.report_event("pose guide disabled");
+            return Ok(());
         }
+        let DataPacket::Coverage(coverage) = packet else {
+            return Err(NodeError::Precondition(
+                "poseGuide.coverage requires calib.coverage".to_owned(),
+            ));
+        };
+        let Some((col, row)) = first_missing_cell(&coverage) else {
+            rt.report_event("coverage complete; no image-grid target");
+            return Ok(());
+        };
+        let target = json!({
+            "kind": "capture.target.v1",
+            "gridCol": col,
+            "gridRow": row,
+            "reason": "uncovered-image-grid-cell",
+        });
+        rt.emit("target", DataPacket::Target(Arc::new(target.clone())))?;
+        if find_output_port(&self.spec, "overlay").is_some() {
+            emit_json(
+                rt,
+                "overlay",
+                json!({"kind": "overlay", "nextTarget": target}),
+            )?;
+        }
+        rt.report_event(format!("guided next image-grid cell ({col}, {row})"));
         Ok(())
     }
 
@@ -321,41 +345,84 @@ impl NodeInstance for PoseGuideNode {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 工具
-// ---------------------------------------------------------------------------
-
-/// 把 `DataPacket` 折叠成 JSON 值（用于占位阶段的弱类型负载承载）。
-fn packet_to_json(packet: DataPacket) -> serde_json::Value {
-    match packet {
-        DataPacket::Json(value) => (*value).clone(),
-        DataPacket::Coverage(value)
-        | DataPacket::Dataset(value)
-        | DataPacket::Report(value)
-        | DataPacket::Score(value)
-        | DataPacket::Target(value) => (*value).clone(),
-        DataPacket::VideoFrame(frame) => json!({
-            "type": "video-frame",
-            "width": frame.width,
-            "height": frame.height,
-            "sequence": frame.identity.frame_sequence,
-        }),
-        DataPacket::ImageFrame(frame) => json!({
-            "type": "image-frame",
-            "width": frame.width,
-            "height": frame.height,
-        }),
-        DataPacket::Detection(detection) => json!({
-            "type": "detection",
-            "imageSize": detection.image_size,
-            "cornerCount": detection.corners.len(),
-        }),
-        DataPacket::Solution(solution) => json!({
-            "type": "solution",
-            "rms": solution.rms_error,
-            "views": solution.views.len(),
-        }),
+/// 解码 DatasetCollector 唯一产生的 payload，拒绝手工拼接的弱类型数据。
+fn dataset_samples(dataset: &serde_json::Value) -> Result<Vec<ChessboardDetection>, NodeError> {
+    if dataset.get("kind").and_then(serde_json::Value::as_str) != Some("calib.dataset.v1") {
+        return Err(NodeError::Precondition(
+            "dataset payload kind must be calib.dataset.v1".to_owned(),
+        ));
     }
+    serde_json::from_value(dataset.get("samples").cloned().unwrap_or_default())
+        .map_err(|error| NodeError::Precondition(format!("invalid dataset samples: {error}")))
+}
+
+/// 以每帧棋盘格角点的图像中心，计算其在图像二维栅格中的实际占用位置。
+fn grid_coverage(
+    samples: &[ChessboardDetection],
+    grid_cols: u64,
+    grid_rows: u64,
+) -> Result<serde_json::Value, NodeError> {
+    let mut occupied = BTreeSet::new();
+    for (index, detection) in samples.iter().enumerate() {
+        if detection.image_size.width == 0
+            || detection.image_size.height == 0
+            || detection.corners.is_empty()
+        {
+            return Err(NodeError::Precondition(format!(
+                "dataset sample {index} has no usable image geometry"
+            )));
+        }
+        let (sum_x, sum_y) =
+            detection
+                .corners
+                .iter()
+                .try_fold((0.0_f64, 0.0_f64), |(x, y), corner| {
+                    if !corner.is_finite() {
+                        return Err(NodeError::Precondition(format!(
+                            "dataset sample {index} contains non-finite corner"
+                        )));
+                    }
+                    Ok((x + f64::from(corner.x), y + f64::from(corner.y)))
+                })?;
+        let count = detection.corners.len() as f64;
+        let normalized_x = (sum_x / count / f64::from(detection.image_size.width)).clamp(0.0, 1.0);
+        let normalized_y = (sum_y / count / f64::from(detection.image_size.height)).clamp(0.0, 1.0);
+        let col = (normalized_x * grid_cols as f64).floor() as u64;
+        let row = (normalized_y * grid_rows as f64).floor() as u64;
+        occupied.insert((col.min(grid_cols - 1), row.min(grid_rows - 1)));
+    }
+    let total_cells = grid_cols * grid_rows;
+    let missing_cells = (0..grid_rows)
+        .flat_map(|row| (0..grid_cols).map(move |col| (col, row)))
+        .filter(|cell| !occupied.contains(cell))
+        .map(|(col, row)| json!({"col": col, "row": row}))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "kind": "calib.coverage.v1",
+        "sampleCount": samples.len(),
+        "occupiedCells": occupied.len(),
+        "totalCells": total_cells,
+        "coverageRatio": occupied.len() as f64 / total_cells as f64,
+        "gridCols": grid_cols,
+        "gridRows": grid_rows,
+        "missingCells": missing_cells,
+    }))
+}
+
+fn first_missing_cell(coverage: &serde_json::Value) -> Option<(u64, u64)> {
+    let cell = coverage
+        .get("missingCells")?
+        .as_array()?
+        .first()?
+        .as_object()?;
+    Some((cell.get("col")?.as_u64()?, cell.get("row")?.as_u64()?))
+}
+
+fn config_bool(spec: &NodeSpec, key: &str, fallback: bool) -> bool {
+    spec.config
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(fallback)
 }
 
 fn config_u64(spec: &NodeSpec, key: &str, fallback: u64) -> u64 {
@@ -377,6 +444,7 @@ fn config_usize(spec: &NodeSpec, key: &str, fallback: usize) -> usize {
 mod tests {
     use super::*;
     use crate::engine::PortCardinality;
+    use camera_toolbox_core::{CalibrationImageSize, CalibrationPoint};
 
     fn port(id: &str) -> PortSpec {
         PortSpec {
@@ -422,14 +490,26 @@ mod tests {
     fn coverage_grid_defaults_are_locked() {
         let spec = node_spec("coverageAnalyzer", vec![], vec![]);
         let node = CoverageAnalyzerNode { spec };
-        assert_eq!(node.grid(), (6, 4));
+        assert_eq!(node.grid().expect("default grid"), (6, 4));
     }
 
     #[test]
-    fn packet_folds_detection_to_json() {
-        // 仅验证 Json 变体往返，避免依赖 camera_toolbox_core 的构造细节。
-        let value = serde_json::json!({"k": 1});
-        let folded = packet_to_json(DataPacket::Json(Arc::new(value.clone())));
-        assert_eq!(folded, value);
+    fn coverage_is_based_on_distinct_detected_grid_cells() {
+        let sample = |x, y| ChessboardDetection {
+            image_size: CalibrationImageSize::new(100, 100).expect("image size"),
+            corners: vec![CalibrationPoint::new(x, y)],
+        };
+        let coverage =
+            grid_coverage(&[sample(10.0, 10.0), sample(90.0, 10.0)], 2, 2).expect("coverage");
+        assert_eq!(coverage["sampleCount"], 2);
+        assert_eq!(coverage["occupiedCells"], 2);
+        assert_eq!(coverage["totalCells"], 4);
+        assert_eq!(coverage["coverageRatio"], 0.5);
+        assert_eq!(first_missing_cell(&coverage), Some((0, 1)));
+    }
+
+    #[test]
+    fn dataset_payload_requires_declared_kind() {
+        assert!(dataset_samples(&serde_json::json!({"samples": []})).is_err());
     }
 }

@@ -1,27 +1,27 @@
 import type { NodeProps } from '@xyflow/react';
-import type { FlowNodeData } from '../workflow';
+import type { FlowNodeData, NodeActionControl } from '../workflow';
 import { NodeActionButtons, NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './shared';
 
-/** 通用节点：复用标量 config 编辑、显式动作与运行时输出摘要基础设施。 */
-export function GenericWorkflowNode({ data, selected }: NodeProps) {
+const DATASET_ACTIONS: readonly NodeActionControl[] = [
+  { action: 'trigger', label: '输出数据集' },
+  { action: 'clear', label: '清空样本' },
+];
+
+/** 标定辅助节点：只暴露实际实现的配置、动作和运行时输出，避免把输入驱动节点伪装成完整自动闭环。 */
+export function CalibrationWorkflowNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
-  const layerCapabilityNotice = node.kind === 'imageLayer'
-    ? '静态图片图层当前不会被 Web Viewer 渲染；visible/opacity 仅保存为图层声明。'
-    : node.kind === 'videoLayer'
-      ? '视频帧会原样转发；visible/opacity 仅保存为图层声明，不参与合成。'
-      : node.kind === 'overlayComposer'
-        ? '接线声明会原样转发到 scene；不执行图层混合、静态图片或 overlay 光栅化，只有视频帧可显示。'
-        : null;
+  const actions = node.kind === 'datasetCollector' ? DATASET_ACTIONS : undefined;
+
   return (
     <div className="workflow-node-shell">
       <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
         <NodeHeader node={node} runtimeState={runtimeState} />
         <PortHandles node={node} />
         <div className="node-body compact">
-          {layerCapabilityNotice ? <div className="node-capability-note">{layerCapabilityNotice}</div> : null}
+          <span className="node-hint">{nodeHint(node.kind)}</span>
           <ScalarConfigFields
             nodeId={node.id}
             config={node.config}
@@ -30,7 +30,7 @@ export function GenericWorkflowNode({ data, selected }: NodeProps) {
           <RuntimeOutputSummary output={nodeData.runtimeOutput} />
           <NodeActionButtons
             nodeId={node.id}
-            actions={nodeData.availableActions}
+            actions={actions}
             pending={nodeData.actionPending}
             onAction={nodeData.onNodeAction}
             onRefreshOutput={nodeData.onRefreshNodeOutput}
@@ -40,4 +40,19 @@ export function GenericWorkflowNode({ data, selected }: NodeProps) {
       {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
     </div>
   );
+}
+
+function nodeHint(kind: string): string {
+  switch (kind) {
+    case 'chessboardDetector':
+      return '随输入帧检测棋盘格';
+    case 'datasetCollector':
+      return '累积 detection，手动输出或清空';
+    case 'coverageAnalyzer':
+      return '按棋盘中心栅格统计覆盖度';
+    case 'poseGuide':
+      return '提示下一个未覆盖图像栅格';
+    default:
+      return '输入驱动';
+  }
 }

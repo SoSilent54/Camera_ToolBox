@@ -61,11 +61,11 @@ type TopicHandler = (payload: unknown) => void;
 /** 快照处理器：连接就绪/重连后后端重推 snapshot 时回调（全量图 + 全量状态）。 */
 type SnapshotHandler = (snapshot: WsSnapshotEnvelope) => void;
 
-/** 二进制帧处理器：收到 JPEG 帧（Blob）时回调；订阅者按 nodeId 区分。 */
-type FrameHandler = (blob: Blob) => void;
+/** 二进制帧处理器：收到 JPEG 帧及其紧邻的元数据时回调。单参回调仍可忽略 metadata。 */
+type FrameHandler = (blob: Blob, meta: ViewerFrameMeta) => void;
 
-/** frame_meta 推送的节点 ID 头：{ nodeId, seq, width, height }。 */
-interface FrameMetaPush {
+/** 后端 frame_meta：JPEG 实际编码尺寸与来源帧序号，不代表源流协商参数。 */
+export interface ViewerFrameMeta {
   nodeId: string;
   seq?: number;
   width?: number;
@@ -92,11 +92,10 @@ const snapshotHandlers = new Set<SnapshotHandler>();
 
 /**
  * frame_meta 头与本帧二进制正文的配对约定：后端对每个 viewer 先推一条 frame_meta
- * （JSON，含 nodeId/seq/width/height），紧接一条独立的 JPEG 二进制帧。此处记住最近
- * 一次 frame_meta 的 nodeId，二进制消息到达时路由到该节点（单线程 bridge 循环保证
- * meta 先于其二进制帧）。
+ * （JSON，含 nodeId/seq/width/height），紧接一条独立的 JPEG 二进制帧。二进制帧消费后
+ * 立即清空配对状态，防止缺少 meta 的帧误路由到上一次 viewer。
  */
-let pendingFrameNodeId: string | null = null;
+let pendingFrameMeta: ViewerFrameMeta | null = null;
 
 /** 订阅某个 topic 的推送；返回取消订阅函数。 */
 export function subscribeTopic(topic: EngineTopic, handler: TopicHandler): () => void {
@@ -228,11 +227,11 @@ function dispatchMessage(raw: string): void {
   }
 
   if (message.kind === 'push') {
-    // frame_meta 头：记录节点 ID，供紧随其后的二进制帧路由；同时照常分发给 topic 订阅者。
+    // frame_meta 头：记录元数据，供紧随其后的二进制帧路由；同时照常分发 topic 订阅者。
     if (message.topic === 'frame_meta') {
-      const meta = message.payload as FrameMetaPush;
+      const meta = message.payload as ViewerFrameMeta;
       if (meta && typeof meta.nodeId === 'string') {
-        pendingFrameNodeId = meta.nodeId;
+        pendingFrameMeta = meta;
       }
     }
     const handlers = topicHandlers.get(message.topic);
@@ -246,18 +245,19 @@ function dispatchMessage(raw: string): void {
   }
 }
 
-/** 分发二进制帧：路由到最近一次 frame_meta 声明的节点；无归属则丢弃。 */
+/** 分发二进制帧：路由到最近一次 frame_meta 声明的节点；消费后清空，避免陈旧归属。 */
 function dispatchBinaryFrame(data: Blob): void {
-  const nodeId = pendingFrameNodeId;
-  if (!nodeId) {
+  const meta = pendingFrameMeta;
+  pendingFrameMeta = null;
+  if (!meta) {
     return;
   }
-  const handlers = frameHandlers.get(nodeId);
+  const handlers = frameHandlers.get(meta.nodeId);
   if (!handlers) {
     return;
   }
   for (const handler of handlers) {
-    handler(data);
+    handler(data, meta);
   }
 }
 

@@ -10,6 +10,8 @@
 //!
 //! 返回值统一为 `Result<serde_json::Value, String>`：`Err` 的字符串即 response 信封的 `error`。
 
+use std::collections::BTreeSet;
+
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -30,14 +32,13 @@ pub fn dispatch(path: &str, payload: Value, state: &AppState) -> Result<Value, S
         "graph.addNode" => graph_add_node(payload, state),
         "graph.addNodeAndEdge" => graph_add_node_and_edge(payload, state),
         "graph.removeNode" => graph_remove_node(payload, state),
+        "graph.removeSelection" => graph_remove_selection(payload, state),
         "graph.addEdge" => graph_add_edge(payload, state),
         "graph.removeEdge" => graph_remove_edge(payload, state),
         "graph.updateNode" => graph_update_node(payload, state),
+        "graph.updateNodePositions" => graph_update_node_positions(payload, state),
         "graph.patchNode" => graph_patch_node(payload, state),
         // —— 运行时动作 ——
-        "runtime.run" => runtime_run(payload, state),
-        "runtime.start" => runtime_start(state),
-        "runtime.stop" => runtime_stop(state),
         "runtime.status" => runtime_status(state),
         "runtime.node.action" => runtime_node_action(payload, state),
         "runtime.node.output" => runtime_node_output(payload, state),
@@ -94,13 +95,22 @@ fn graph_replace(payload: Value, state: &AppState) -> Result<Value, String> {
 
 fn graph_add_node(payload: Value, state: &AppState) -> Result<Value, String> {
     let node: WorkflowNode = serde_json::from_value(payload).map_err(deser_err)?;
-    commit_graph_mutation(state, true, |graph| {
-        if graph.nodes.iter().any(|existing| existing.id == node.id) {
-            return Err(format!("node `{}` already exists", node.id));
-        }
-        graph.nodes.push(node);
-        Ok(())
-    })
+    let engine_node = engine_api::to_node_spec(&node);
+    commit_graph_mutation_with_loaded_engine(
+        state,
+        |graph| {
+            if graph.nodes.iter().any(|existing| existing.id == node.id) {
+                return Err(format!("node `{}` already exists", node.id));
+            }
+            graph.nodes.push(node);
+            Ok(())
+        },
+        |engine, _graph| {
+            engine
+                .add_node(engine_node, &state.engine_runtime.registry)
+                .map_err(|e| e.to_string())
+        },
+    )
 }
 
 fn graph_add_node_and_edge(payload: Value, state: &AppState) -> Result<Value, String> {
@@ -112,19 +122,49 @@ fn graph_add_node_and_edge(payload: Value, state: &AppState) -> Result<Value, St
     }
 
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    commit_graph_mutation(state, true, |graph| {
-        if graph
-            .nodes
-            .iter()
-            .any(|existing| existing.id == body.node.id)
-        {
-            return Err(format!("node `{}` already exists", body.node.id));
-        }
-        graph.nodes.push(body.node);
-        graph.edges.retain(|existing| existing.id != body.edge.id);
-        graph.edges.push(body.edge);
-        Ok(())
-    })
+    let node = body.node;
+    let edge = body.edge;
+    let engine_node = engine_api::to_node_spec(&node);
+    let engine_edge = engine_api::to_edge_spec(&edge);
+    let node_id = node.id.clone();
+    let edge_id = edge.id.clone();
+    let replaced_engine_edge = authoritative_graph(state)?
+        .edges
+        .into_iter()
+        .find(|existing| existing.id == edge_id)
+        .as_ref()
+        .map(engine_api::to_edge_spec);
+    commit_graph_mutation_with_loaded_engine(
+        state,
+        |graph| {
+            if graph.nodes.iter().any(|existing| existing.id == node.id) {
+                return Err(format!("node `{}` already exists", node.id));
+            }
+            graph.nodes.push(node);
+            graph.edges.retain(|existing| existing.id != edge.id);
+            graph.edges.push(edge);
+            Ok(())
+        },
+        |engine, _graph| {
+            engine
+                .add_node(engine_node, &state.engine_runtime.registry)
+                .map_err(|e| e.to_string())?;
+            let _ = engine.remove_edge(&edge_id);
+            if let Err(error) = engine.add_edge(engine_edge) {
+                let _ = engine.remove_node(&node_id);
+                if let Some(replaced_edge) = replaced_engine_edge {
+                    if let Err(restore_error) = engine.add_edge(replaced_edge) {
+                        return Err(format!(
+                            "{}; failed to restore previous edge `{}`: {}",
+                            error, edge_id, restore_error
+                        ));
+                    }
+                }
+                return Err(error.to_string());
+            }
+            Ok(())
+        },
+    )
 }
 
 fn graph_remove_node(payload: Value, state: &AppState) -> Result<Value, String> {
@@ -134,17 +174,73 @@ fn graph_remove_node(payload: Value, state: &AppState) -> Result<Value, String> 
         node_id: String,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    commit_graph_mutation(state, true, |graph| {
-        let old_len = graph.nodes.len();
-        graph.nodes.retain(|node| node.id != body.node_id);
-        if graph.nodes.len() == old_len {
-            return Err(format!("node `{}` not found", body.node_id));
-        }
-        graph.edges.retain(|edge| {
-            edge.source.node_id != body.node_id && edge.target.node_id != body.node_id
-        });
-        Ok(())
-    })
+    let removed_node_id = body.node_id;
+    commit_graph_mutation_with_loaded_engine(
+        state,
+        |graph| {
+            let old_len = graph.nodes.len();
+            graph.nodes.retain(|node| node.id != removed_node_id);
+            if graph.nodes.len() == old_len {
+                return Err(format!("node `{}` not found", removed_node_id));
+            }
+            graph.edges.retain(|edge| {
+                edge.source.node_id != removed_node_id && edge.target.node_id != removed_node_id
+            });
+            Ok(())
+        },
+        |engine, _graph| {
+            engine
+                .remove_node(&removed_node_id)
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
+fn graph_remove_selection(payload: Value, state: &AppState) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Body {
+        #[serde(default)]
+        node_ids: Vec<String>,
+        #[serde(default)]
+        edge_ids: Vec<String>,
+    }
+
+    let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
+    if body.node_ids.is_empty() && body.edge_ids.is_empty() {
+        return Err("selection delete must include nodeIds or edgeIds".to_owned());
+    }
+    let node_ids: BTreeSet<String> = body.node_ids.into_iter().collect();
+    let edge_ids: BTreeSet<String> = body.edge_ids.into_iter().collect();
+    let engine_node_ids = node_ids.clone();
+    let engine_edge_ids = edge_ids.clone();
+
+    commit_graph_mutation_with_loaded_engine(
+        state,
+        move |graph| {
+            let old_node_len = graph.nodes.len();
+            let old_edge_len = graph.edges.len();
+            graph.nodes.retain(|node| !node_ids.contains(&node.id));
+            graph.edges.retain(|edge| {
+                !edge_ids.contains(&edge.id)
+                    && !node_ids.contains(&edge.source.node_id)
+                    && !node_ids.contains(&edge.target.node_id)
+            });
+            if graph.nodes.len() == old_node_len && graph.edges.len() == old_edge_len {
+                return Err("selected graph items were not found".to_owned());
+            }
+            Ok(())
+        },
+        move |engine, _graph| {
+            for edge_id in &engine_edge_ids {
+                let _ = engine.remove_edge(edge_id);
+            }
+            for node_id in &engine_node_ids {
+                engine.remove_node(node_id).map_err(|e| e.to_string())?;
+            }
+            Ok(())
+        },
+    )
 }
 
 fn graph_add_edge(payload: Value, state: &AppState) -> Result<Value, String> {
@@ -153,11 +249,38 @@ fn graph_add_edge(payload: Value, state: &AppState) -> Result<Value, String> {
         edge: WorkflowEdge,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    commit_graph_mutation(state, true, |graph| {
-        graph.edges.retain(|existing| existing.id != body.edge.id);
-        graph.edges.push(body.edge);
-        Ok(())
-    })
+    let edge = body.edge;
+    let engine_edge = engine_api::to_edge_spec(&edge);
+    let edge_id = edge.id.clone();
+    let replaced_engine_edge = authoritative_graph(state)?
+        .edges
+        .into_iter()
+        .find(|existing| existing.id == edge_id)
+        .as_ref()
+        .map(engine_api::to_edge_spec);
+    commit_graph_mutation_with_loaded_engine(
+        state,
+        |graph| {
+            graph.edges.retain(|existing| existing.id != edge.id);
+            graph.edges.push(edge);
+            Ok(())
+        },
+        |engine, _graph| {
+            let _ = engine.remove_edge(&edge_id);
+            if let Err(error) = engine.add_edge(engine_edge) {
+                if let Some(replaced_edge) = replaced_engine_edge {
+                    if let Err(restore_error) = engine.add_edge(replaced_edge) {
+                        return Err(format!(
+                            "{}; failed to restore previous edge `{}`: {}",
+                            error, edge_id, restore_error
+                        ));
+                    }
+                }
+                return Err(error.to_string());
+            }
+            Ok(())
+        },
+    )
 }
 
 fn graph_remove_edge(payload: Value, state: &AppState) -> Result<Value, String> {
@@ -167,11 +290,53 @@ fn graph_remove_edge(payload: Value, state: &AppState) -> Result<Value, String> 
         edge_id: String,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    commit_graph_mutation(state, true, |graph| {
-        let old_len = graph.edges.len();
-        graph.edges.retain(|edge| edge.id != body.edge_id);
-        if graph.edges.len() == old_len {
-            return Err(format!("edge `{}` not found", body.edge_id));
+    let removed_edge_id = body.edge_id;
+    commit_graph_mutation_with_loaded_engine(
+        state,
+        |graph| {
+            let old_len = graph.edges.len();
+            graph.edges.retain(|edge| edge.id != removed_edge_id);
+            if graph.edges.len() == old_len {
+                return Err(format!("edge `{}` not found", removed_edge_id));
+            }
+            Ok(())
+        },
+        |engine, _graph| {
+            engine
+                .remove_edge(&removed_edge_id)
+                .map_err(|e| e.to_string())
+        },
+    )
+}
+
+fn graph_update_node_positions(payload: Value, state: &AppState) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Body {
+        nodes: Vec<NodePositionUpdate>,
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct NodePositionUpdate {
+        node_id: String,
+        position: NodePosition,
+    }
+
+    let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
+    if body.nodes.is_empty() {
+        return Err("position batch must include at least one node".to_owned());
+    }
+    commit_graph_mutation(state, move |graph| {
+        for update in body.nodes {
+            let Some(existing) = graph
+                .nodes
+                .iter_mut()
+                .find(|node| node.id == update.node_id)
+            else {
+                return Err(format!("node `{}` not found", update.node_id));
+            };
+            existing.position = update.position;
         }
         Ok(())
     })
@@ -179,11 +344,9 @@ fn graph_remove_edge(payload: Value, state: &AppState) -> Result<Value, String> 
 
 fn graph_update_node(payload: Value, state: &AppState) -> Result<Value, String> {
     #[derive(serde::Deserialize)]
-    #[serde(rename_all = "camelCase")]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
     struct Body {
         node_id: String,
-        #[serde(default)]
-        node: Option<WorkflowNode>,
         #[serde(default)]
         title: Option<String>,
         #[serde(default)]
@@ -192,32 +355,46 @@ fn graph_update_node(payload: Value, state: &AppState) -> Result<Value, String> 
         config: Option<Value>,
     }
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let rebuild_engine = body.node.is_some() || body.config.is_some();
-    commit_graph_mutation(state, rebuild_engine, |graph| {
-        let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id) else {
-            return Err(format!("node `{}` not found", body.node_id));
-        };
-        if let Some(node) = body.node {
-            if node.id != body.node_id {
-                return Err(format!(
-                    "node id mismatch: `{}` != `{}`",
-                    node.id, body.node_id
-                ));
+    if body.title.is_none() && body.position.is_none() && body.config.is_none() {
+        return Err("node update must include title, position, or config".to_owned());
+    }
+    let node_id = body.node_id.clone();
+    let updates_runtime_config = body.config.is_some();
+    if updates_runtime_config {
+        commit_graph_mutation_with_loaded_engine(
+            state,
+            |graph| {
+                let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id)
+                else {
+                    return Err(format!("node `{}` not found", body.node_id));
+                };
+                if let Some(title) = body.title {
+                    existing.title = title;
+                }
+                if let Some(position) = body.position {
+                    existing.position = position;
+                }
+                if let Some(config) = body.config {
+                    existing.config = config;
+                }
+                Ok(())
+            },
+            |engine, graph| update_engine_node_config(engine, graph, &node_id),
+        )
+    } else {
+        commit_graph_mutation(state, |graph| {
+            let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id) else {
+                return Err(format!("node `{}` not found", body.node_id));
+            };
+            if let Some(title) = body.title {
+                existing.title = title;
             }
-            *existing = node;
-            return Ok(());
-        }
-        if let Some(title) = body.title {
-            existing.title = title;
-        }
-        if let Some(position) = body.position {
-            existing.position = position;
-        }
-        if let Some(config) = body.config {
-            existing.config = config;
-        }
-        Ok(())
-    })
+            if let Some(position) = body.position {
+                existing.position = position;
+            }
+            Ok(())
+        })
+    }
 }
 
 /// 对既有节点执行字段级更新；配置补丁只覆盖提供的键。
@@ -236,32 +413,46 @@ fn graph_patch_node(payload: Value, state: &AppState) -> Result<Value, String> {
     if body.title.is_none() && body.config.is_none() {
         return Err("node patch must include title or config".to_owned());
     }
-    let rebuild_engine = body.config.is_some();
-    commit_graph_mutation(state, rebuild_engine, |graph| {
-        let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id) else {
-            return Err(format!("node `{}` not found", body.node_id));
-        };
-        if let Some(title) = body.title {
-            existing.title = title;
-        }
-        if let Some(config_patch) = body.config {
-            let Some(config) = existing.config.as_object_mut() else {
-                return Err(format!(
-                    "node `{}` config must be a JSON object",
-                    body.node_id
-                ));
+    let node_id = body.node_id.clone();
+    let updates_runtime_config = body.config.is_some();
+    if updates_runtime_config {
+        commit_graph_mutation_with_loaded_engine(
+            state,
+            |graph| {
+                let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id)
+                else {
+                    return Err(format!("node `{}` not found", body.node_id));
+                };
+                if let Some(title) = body.title {
+                    existing.title = title;
+                }
+                if let Some(config_patch) = body.config {
+                    let Some(config) = existing.config.as_object_mut() else {
+                        return Err(format!(
+                            "node `{}` config must be a JSON object",
+                            body.node_id
+                        ));
+                    };
+                    config.extend(config_patch);
+                }
+                Ok(())
+            },
+            |engine, graph| update_engine_node_config(engine, graph, &node_id),
+        )
+    } else {
+        commit_graph_mutation(state, |graph| {
+            let Some(existing) = graph.nodes.iter_mut().find(|node| node.id == body.node_id) else {
+                return Err(format!("node `{}` not found", body.node_id));
             };
-            config.extend(config_patch);
-        }
-        Ok(())
-    })
+            if let Some(title) = body.title {
+                existing.title = title;
+            }
+            Ok(())
+        })
+    }
 }
 
-fn commit_graph_mutation<F>(
-    state: &AppState,
-    rebuild_engine: bool,
-    mutate: F,
-) -> Result<Value, String>
+fn commit_graph_mutation<F>(state: &AppState, mutate: F) -> Result<Value, String>
 where
     F: FnOnce(&mut WorkflowGraph) -> Result<(), String>,
 {
@@ -269,7 +460,32 @@ where
     let mut next = current;
     mutate(&mut next)?;
     let next = normalize_workflow(next, crate::next_revision())?;
-    if rebuild_engine {
+    *state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = next.clone();
+    publish_snapshot(state, &next);
+    serde_json::to_value(next).map_err(|e| e.to_string())
+}
+
+fn commit_graph_mutation_with_loaded_engine<F, G>(
+    state: &AppState,
+    mutate: F,
+    mutate_engine: G,
+) -> Result<Value, String>
+where
+    F: FnOnce(&mut WorkflowGraph) -> Result<(), String>,
+    G: FnOnce(&camera_toolbox_app::engine::GraphEngine, &WorkflowGraph) -> Result<(), String>,
+{
+    let current = authoritative_graph(state)?;
+    let mut next = current;
+    mutate(&mut next)?;
+    let next = normalize_workflow(next, crate::next_revision())?;
+    let engine = state.engine_runtime.engine();
+    if let Some(engine) = engine.as_ref() {
+        mutate_engine(engine, &next)?;
+    } else {
+        drop(engine);
         rebuild_engine_from_graph(&next, state)?;
     }
     *state
@@ -278,6 +494,21 @@ where
         .map_err(|_| "authoritative graph state is unavailable".to_owned())? = next.clone();
     publish_snapshot(state, &next);
     serde_json::to_value(next).map_err(|e| e.to_string())
+}
+
+fn update_engine_node_config(
+    engine: &camera_toolbox_app::engine::GraphEngine,
+    graph: &WorkflowGraph,
+    node_id: &str,
+) -> Result<(), String> {
+    let node = graph
+        .nodes
+        .iter()
+        .find(|candidate| candidate.id == node_id)
+        .ok_or_else(|| format!("node `{node_id}` not found"))?;
+    engine
+        .update_node(node_id, node.config.clone())
+        .map_err(|e| e.to_string())
 }
 
 fn authoritative_graph(state: &AppState) -> Result<WorkflowGraph, String> {
@@ -333,35 +564,6 @@ fn snapshot_envelope(graph: &WorkflowGraph) -> Value {
 // ---------------------------------------------------------------------------
 // runtime.*
 // ---------------------------------------------------------------------------
-
-fn runtime_run(payload: Value, state: &AppState) -> Result<Value, String> {
-    let graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
-    let graph = normalize_workflow(graph, crate::next_revision())?;
-    rebuild_engine_from_graph(&graph, state)?;
-    *state
-        .graph_session
-        .lock()
-        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = graph.clone();
-    publish_snapshot(state, &graph);
-    Ok(json!({ "running": true, "nodes": graph.nodes.len(), "graph": graph }))
-}
-
-fn runtime_start(state: &AppState) -> Result<Value, String> {
-    let engine = state.engine_runtime.engine();
-    let engine = engine
-        .as_ref()
-        .ok_or_else(|| "engine not running".to_owned())?;
-    engine.start_all().map_err(|e| e.to_string())?;
-    Ok(serde_json::json!({ "started": true }))
-}
-
-fn runtime_stop(state: &AppState) -> Result<Value, String> {
-    let mut slot = state.engine_runtime.engine();
-    if let Some(mut engine) = slot.take() {
-        engine.stop();
-    }
-    Ok(serde_json::json!({ "running": false }))
-}
 
 fn runtime_status(state: &AppState) -> Result<Value, String> {
     let engine = state.engine_runtime.engine();
@@ -603,9 +805,8 @@ mod tests {
         );
         std::fs::remove_dir_all(dir).ok();
     }
-
     #[test]
-    fn graph_add_node_updates_authoritative_session_without_runtime_run() {
+    fn graph_add_node_updates_authoritative_session_without_global_run() {
         let dir = std::env::temp_dir().join(format!(
             "ws-router-graph-add-node-{}",
             crate::next_revision()
@@ -620,7 +821,7 @@ mod tests {
             serde_json::to_value(&node).unwrap(),
             &state,
         )
-        .expect("graph.addNode succeeds without runtime.run");
+        .expect("graph.addNode succeeds without global run");
 
         assert!(
             out["nodes"]
@@ -784,38 +985,182 @@ mod tests {
     }
 
     #[test]
-    fn graph_update_position_does_not_rebuild_engine_or_refresh_statuses() {
+    fn graph_update_node_updates_runtime_config_without_rebuild() {
         let dir = std::env::temp_dir().join(format!(
-            "ws-router-graph-position-{}",
+            "ws-router-graph-update-config-{}",
             crate::next_revision()
         ));
         let state = test_state(dir.clone());
         let seed = crate::workflow::seed_workflow_graph();
-        let node_id = seed.nodes[0].id.clone();
+        let node = seed
+            .nodes
+            .iter()
+            .find(|candidate| candidate.id == "rtsp-source-1")
+            .expect("seed RTSP source exists");
+        let node_id = node.id.clone();
+
+        dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
+        let _ = runtime_status(&state).expect("drain initial statuses");
+
+        let out = dispatch(
+            "graph.updateNode",
+            serde_json::json!({
+                "nodeId": node_id.clone(),
+                "title": "Updated RTSP Source",
+                "config": { "url": "rtsp://camera.example/live" }
+            }),
+            &state,
+        )
+        .expect("config update succeeds");
+
+        let updated = out["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["id"] == node_id)
+            .expect("node remains in graph");
+        assert_eq!(updated["title"], "Updated RTSP Source");
+        assert_eq!(updated["config"]["url"], "rtsp://camera.example/live");
+        assert!(state.engine_runtime.engine().as_ref().is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_update_node_rejects_full_node_payload() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-update-reject-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let mut seed = crate::workflow::seed_workflow_graph();
+        let node = seed.nodes.remove(0);
+        let node_id = node.id.clone();
+
+        let error = dispatch(
+            "graph.updateNode",
+            serde_json::json!({ "nodeId": node_id, "node": node }),
+            &state,
+        )
+        .expect_err("full node payload is not a local update");
+        assert!(error.contains("unknown field"));
+        assert!(error.contains("node"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_remove_edge_updates_authoritative_state_without_runtime_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-remove-edge-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let edge_id = seed.edges[0].id.clone();
+
+        dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let _ = runtime_status(&state).expect("drain initial statuses");
+        let out = dispatch(
+            "graph.removeEdge",
+            serde_json::json!({ "edgeId": edge_id.clone() }),
+            &state,
+        )
+        .expect("edge removal succeeds");
+
+        assert!(
+            !out["edges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|candidate| candidate["id"] == edge_id)
+        );
+        assert_eq!(runtime_status(&state).unwrap(), serde_json::json!([]));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_update_node_positions_updates_multiple_nodes_without_runtime_reset() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-update-positions-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let first_id = seed.nodes[0].id.clone();
+        let second_id = seed.nodes[1].id.clone();
 
         dispatch("graph.current", serde_json::json!(null), &state).expect("engine loaded");
         std::thread::sleep(std::time::Duration::from_millis(50));
         let _ = runtime_status(&state).expect("drain initial statuses");
 
         let out = dispatch(
-            "graph.updateNode",
-            serde_json::json!({ "nodeId": node_id, "position": { "x": 123.0, "y": 456.0 } }),
+            "graph.updateNodePositions",
+            serde_json::json!({
+                "nodes": [
+                    { "nodeId": first_id.clone(), "position": { "x": 111.0, "y": 222.0 } },
+                    { "nodeId": second_id.clone(), "position": { "x": 333.0, "y": 444.0 } }
+                ]
+            }),
             &state,
         )
-        .expect("position update succeeds");
+        .expect("batch position update succeeds");
 
-        let node = out["nodes"]
-            .as_array()
-            .unwrap()
+        let nodes = out["nodes"].as_array().unwrap();
+        let first = nodes
             .iter()
-            .find(|candidate| candidate["id"] == node_id)
-            .expect("node still present");
+            .find(|candidate| candidate["id"] == first_id)
+            .expect("first node remains");
+        let second = nodes
+            .iter()
+            .find(|candidate| candidate["id"] == second_id)
+            .expect("second node remains");
         assert_eq!(
-            node["position"],
-            serde_json::json!({ "x": 123.0, "y": 456.0 })
+            first["position"],
+            serde_json::json!({ "x": 111.0, "y": 222.0 })
         );
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            second["position"],
+            serde_json::json!({ "x": 333.0, "y": 444.0 })
+        );
         assert_eq!(runtime_status(&state).unwrap(), serde_json::json!([]));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn graph_remove_selection_deletes_multiple_nodes_and_incident_edges() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-graph-remove-selection-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let seed = crate::workflow::seed_workflow_graph();
+        let node_ids: Vec<String> = seed
+            .nodes
+            .iter()
+            .take(2)
+            .map(|node| node.id.clone())
+            .collect();
+        assert_eq!(node_ids.len(), 2);
+        let removed: std::collections::BTreeSet<String> = node_ids.iter().cloned().collect();
+
+        let out = dispatch(
+            "graph.removeSelection",
+            serde_json::json!({ "nodeIds": node_ids, "edgeIds": [] }),
+            &state,
+        )
+        .expect("selection removal succeeds");
+
+        assert!(
+            out["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|node| { !removed.contains(node["id"].as_str().unwrap()) })
+        );
+        assert!(out["edges"].as_array().unwrap().iter().all(|edge| {
+            !removed.contains(edge["source"]["nodeId"].as_str().unwrap())
+                && !removed.contains(edge["target"]["nodeId"].as_str().unwrap())
+        }));
         std::fs::remove_dir_all(dir).ok();
     }
 

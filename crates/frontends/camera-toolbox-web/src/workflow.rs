@@ -101,7 +101,6 @@ pub enum NodeRuntimeState {
     Error,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkflowPort {
@@ -281,11 +280,11 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
 
 pub fn node_definition(kind: NodeKind) -> NodeDefinition {
     let (category, title, description, inputs, outputs, default_config) = match kind {
-        // ① LocalFileSource（吸收 LocalWorkspace + FileBrowser + ImageFileSource）
+        // 本地图片源：root 为绝对目录，selection 是相对 root 的完整文件路径。
         NodeKind::LocalFileSource => (
             NodeCategory::Workspace,
             "Local File Source",
-            "浏览本地目录并加载单张图片帧（内嵌资源根、目录浏览、文件选择与 filter）",
+            "浏览本地绝对根目录并手动加载一张 PNG/JPEG 图片",
             vec![],
             vec![
                 port(
@@ -313,63 +312,38 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Image),
                 ),
             ],
-            json!({"root": "", "directory": "", "selection": "", "filter": "*.png;*.jpg;*.jpeg", "reload": "manual"}),
+            json!({"root": "", "directory": "", "selection": ""}),
         ),
-        // ② SftpFileSource（吸收 SftpWorkspace + FileBrowser remote）
+        // SFTP 文件源直接读取一张远端图片；SSH/workspace/fileRef 端口均无运行时实现。
         NodeKind::SftpFileSource => (
             NodeCategory::Workspace,
             "SFTP File Source",
-            "通过 SSH/SFTP 暴露远程目录并加载图片（保留 workspace 可选输出供多消费者复用）",
-            vec![optional_port(
-                "ssh",
-                "SSH",
-                PortDirection::Input,
-                PortKind::ControlSsh,
-                "control.ssh.v1",
-                Some(PortRole::Control),
+            "配置 SFTP 连接与远端文件，手动加载一张 PNG/JPEG 图片",
+            vec![],
+            vec![port(
+                "image",
+                "Image",
+                PortDirection::Output,
+                PortKind::ImageFrame,
+                "image.frame.v1",
+                Some(PortRole::Image),
             )],
-            vec![
-                port(
-                    "image",
-                    "Image",
-                    PortDirection::Output,
-                    PortKind::ImageFrame,
-                    "image.frame.v1",
-                    Some(PortRole::Image),
-                ),
-                optional_port(
-                    "fileRef",
-                    "File Ref",
-                    PortDirection::Output,
-                    PortKind::FileRef,
-                    "file.ref.v1",
-                    Some(PortRole::Image),
-                ),
-                optional_port(
-                    "workspace",
-                    "Remote Workspace",
-                    PortDirection::Output,
-                    PortKind::WorkspaceRemoteSftp,
-                    "workspace.remote.sftp.v1",
-                    Some(PortRole::Workspace),
-                ),
-            ],
-            json!({"sourceId": "sftp-main", "remoteRoot": "/", "mountLabel": "Remote SFTP", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "selection": "", "filter": "*.png;*.jpg;*.jpeg"}),
+            json!({"host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "remoteRoot": "/", "selection": ""}),
         ),
         NodeKind::RtspSource => (
             NodeCategory::Source,
             "RTSP Input",
-            "摄像头或板端 RTSP URL 入口",
+            "连接 RTSP 并直接输出已解码视频帧；无需独立解码步骤",
             vec![],
             vec![port(
-                "endpoint",
-                "RTSP endpoint",
+                "frames",
+                "Decoded Video Frames",
                 PortDirection::Output,
-                PortKind::EndpointRtsp,
-                "media.rtsp.endpoint.v1",
-                Some(PortRole::Endpoint),
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
+                Some(PortRole::Stream),
             )],
-            json!({"url": DEFAULT_RTSP_URL, "transport": "tcp", "expectedWidth": 1920, "expectedHeight": 1080, "expectedFps": 60, "connectTimeoutMs": 8000, "idleTimeoutMs": 10000}),
+            json!({"url": DEFAULT_RTSP_URL, "transport": "tcp", "channel": 0, "width": 1920, "height": 1080, "connectTimeoutMs": 8000, "idleTimeoutMs": 10000}),
         ),
         NodeKind::SshSession => (
             NodeCategory::Control,
@@ -447,15 +421,15 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         ),
         NodeKind::RtspDecoder => (
             NodeCategory::Media,
-            "RTSP Decoder",
-            "将 RTSP 端点解码为视频帧流",
+            "Decoded Frame Relay",
+            "兼容旧流程的已解码帧直通节点；RTSP Input 已完成连接和解码，不执行二次解码",
             vec![port(
-                "endpoint",
-                "RTSP endpoint",
+                "frames",
+                "Decoded Video Frames",
                 PortDirection::Input,
-                PortKind::EndpointRtsp,
-                "media.rtsp.endpoint.v1",
-                Some(PortRole::Endpoint),
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
+                Some(PortRole::Stream),
             )],
             vec![port(
                 "frames",
@@ -465,12 +439,12 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "stream.video-frame.v1",
                 Some(PortRole::Stream),
             )],
-            json!({"transport": "tcp", "latency": "low", "previewWidth": 960, "previewHeight": 540}),
+            json!({}),
         ),
         NodeKind::FrameSampler => (
             NodeCategory::Media,
             "Frame Sampler",
-            "按显式 fps 对视频帧流降采样",
+            "按 `fpsLimit` 降采样视频帧；固定使用 latest-wins 丢帧策略",
             vec![port(
                 "input",
                 "Video Frames",
@@ -487,12 +461,12 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "stream.video-frame.v1",
                 Some(PortRole::Stream),
             )],
-            json!({"fpsLimit": 30, "dropPolicy": "latest"}),
+            json!({"fpsLimit": 30}),
         ),
         NodeKind::ImageLayer => (
             NodeCategory::Viewer,
             "Image Layer",
-            "把单张图片转为 Viewer 图层",
+            "声明图片图层元数据并原样转发；当前 Web Viewer 不渲染静态图层，visible/opacity 仅保存声明",
             vec![port(
                 "image",
                 "Image",
@@ -514,7 +488,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::VideoLayer => (
             NodeCategory::Viewer,
             "Video Layer",
-            "把视频帧流转为 Viewer 图层",
+            "声明视频图层元数据并原样转发；当前不执行 visible/opacity 或 alpha 合成",
             vec![port(
                 "frames",
                 "Video Frames",
@@ -535,12 +509,12 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         ),
         NodeKind::OverlayComposer => (
             NodeCategory::Viewer,
-            "Overlay Composer",
-            "组合图像/视频层和 overlay 层为 Viewer scene",
+            "Overlay Composer (pass-through only)",
+            "保留 video/image/overlay 接线声明，但不混合或光栅化；仅原样转发到 scene，只有视频帧可被当前 Viewer 显示",
             vec![
                 many_port(
                     "video",
-                    "Video Layers",
+                    "Video Layers (not composited)",
                     PortDirection::Input,
                     PortKind::LayerVideo,
                     "viewer.layer.video.v1",
@@ -548,7 +522,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
                 many_port(
                     "image",
-                    "Image Layers",
+                    "Image Layers (not rendered)",
                     PortDirection::Input,
                     PortKind::LayerImage,
                     "viewer.layer.image.v1",
@@ -556,7 +530,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
                 many_port(
                     "overlay",
-                    "Overlay Layers",
+                    "Overlay Layers (not rendered)",
                     PortDirection::Input,
                     PortKind::LayerOverlay,
                     "viewer.layer.overlay.v1",
@@ -565,22 +539,22 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             vec![port(
                 "scene",
-                "Viewer Scene",
+                "Pass-through Scene (video only displayable)",
                 PortDirection::Output,
                 PortKind::ViewerScene,
                 "viewer.scene.v1",
                 Some(PortRole::Layer),
             )],
-            json!({"blendMode": "normal"}),
+            json!({}),
         ),
         NodeKind::Viewer => (
             NodeCategory::Viewer,
             "Viewer",
-            "显示图层、scene、MJPEG fallback 与指标",
+            "显示引擎推送的 JPEG 视频帧及 frame meta；不渲染静态图片、overlay 或图层混合",
             vec![
                 optional_port(
                     "scene",
-                    "Viewer Scene",
+                    "Video Scene (relay only)",
                     PortDirection::Input,
                     PortKind::ViewerScene,
                     "viewer.scene.v1",
@@ -596,7 +570,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
                 optional_port(
                     "image",
-                    "Image Layer",
+                    "Image Layer (not rendered)",
                     PortDirection::Input,
                     PortKind::LayerImage,
                     "viewer.layer.image.v1",
@@ -604,12 +578,12 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 ),
             ],
             vec![],
-            json!({"fitMode": "contain", "overlay": "status", "viewport": {"scale": 1.0, "x": 0.0, "y": 0.0}}),
+            json!({}),
         ),
         NodeKind::ChessboardDetector => (
             NodeCategory::Calibration,
             "Chessboard Detector",
-            "检测棋盘格角点并输出 overlay",
+            "输入帧驱动的棋盘格检测，输出 detection 和 overlay",
             vec![
                 optional_port(
                     "image",
@@ -646,30 +620,20 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Overlay),
                 ),
             ],
-            json!({"boardRows": 11, "boardCols": 8, "squareSizeMm": 30.0, "enabled": true}),
+            json!({"boardRows": 11, "boardCols": 8, "squareSizeMm": 30.0}),
         ),
         NodeKind::DatasetCollector => (
             NodeCategory::Calibration,
             "Dataset Collector",
-            "人工接受/移除样本并形成标定数据集",
-            vec![
-                port(
-                    "image",
-                    "Video Frames",
-                    PortDirection::Input,
-                    PortKind::StreamVideoFrame,
-                    "stream.video-frame.v1",
-                    Some(PortRole::Stream),
-                ),
-                port(
-                    "detection",
-                    "Detection",
-                    PortDirection::Input,
-                    PortKind::CalibDetection,
-                    "calib.detection.v1",
-                    Some(PortRole::Dataset),
-                ),
-            ],
+            "累积检测结果；手动输出或清空 calib.dataset",
+            vec![port(
+                "detection",
+                "Detection",
+                PortDirection::Input,
+                PortKind::CalibDetection,
+                "calib.detection.v1",
+                Some(PortRole::Dataset),
+            )],
             vec![port(
                 "dataset",
                 "Dataset",
@@ -678,12 +642,12 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "calib.dataset.v1",
                 Some(PortRole::Dataset),
             )],
-            json!({"mode": "manual", "maxSamples": 80}),
+            json!({"maxSamples": 80}),
         ),
         NodeKind::CoverageAnalyzer => (
             NodeCategory::Calibration,
             "Coverage Analyzer",
-            "分析标定数据覆盖度并输出指导 overlay",
+            "按棋盘中心落点统计图像栅格覆盖度，输出可复核 coverage 与 overlay",
             vec![port(
                 "dataset",
                 "Dataset",
@@ -712,70 +676,32 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             json!({"gridCols": 6, "gridRows": 4}),
         ),
-        // ⑥ AutoCaptureController（吸收 CaptureScorer）
         NodeKind::AutoCaptureController => (
             NodeCategory::Calibration,
             "Auto Capture",
-            "把评分、帧流和目标位姿转换为抓帧命令（内嵌评分，score 可选输出保留原始能力）",
-            vec![
-                optional_port(
-                    "frames",
-                    "Video Frames",
-                    PortDirection::Input,
-                    PortKind::StreamVideoFrame,
-                    "stream.video-frame.v1",
-                    Some(PortRole::Stream),
-                ),
-                optional_port(
-                    "detection",
-                    "Detection",
-                    PortDirection::Input,
-                    PortKind::CalibDetection,
-                    "calib.detection.v1",
-                    Some(PortRole::Dataset),
-                ),
-                optional_port(
-                    "coverage",
-                    "Coverage",
-                    PortDirection::Input,
-                    PortKind::CalibCoverage,
-                    "calib.coverage.v1",
-                    Some(PortRole::Dataset),
-                ),
-                optional_port(
-                    "target",
-                    "Capture Target",
-                    PortDirection::Input,
-                    PortKind::CaptureTarget,
-                    "capture.target.v1",
-                    Some(PortRole::Command),
-                ),
-            ],
-            vec![
-                port(
-                    "command",
-                    "Capture Command",
-                    PortDirection::Output,
-                    PortKind::CommandCapture,
-                    "command.capture.v1",
-                    Some(PortRole::Command),
-                ),
-                optional_port(
-                    "score",
-                    "Capture Score",
-                    PortDirection::Output,
-                    PortKind::CaptureScore,
-                    "capture.score.v1",
-                    Some(PortRole::Status),
-                ),
-            ],
-            json!({"armed": false, "strategy": "datasetGain", "cooldownMs": 800}),
+            "布防后仅依据 capture.score 的 gain 阈值发送 capture command；不生成评分或采帧",
+            vec![port(
+                "score",
+                "Capture Score",
+                PortDirection::Input,
+                PortKind::CaptureScore,
+                "capture.score.v1",
+                Some(PortRole::Status),
+            )],
+            vec![port(
+                "command",
+                "Capture Command",
+                PortDirection::Output,
+                PortKind::CommandCapture,
+                "command.capture.v1",
+                Some(PortRole::Command),
+            )],
+            json!({"triggerThreshold": 0.5, "cooldownMs": 800}),
         ),
-        // ⑦ CalibrationSolver（吸收 ReprojectionInspector + CalibrationExport）
         NodeKind::CalibrationSolver => (
             NodeCategory::Calibration,
             "Calibration Solver",
-            "手动触发标定求解（内嵌重投影检查与导出，reprojection/report/payload 可选输出）",
+            "使用最近一次 calib.dataset 检测点；手动触发后输出 calib.solution",
             vec![port(
                 "dataset",
                 "Dataset",
@@ -784,43 +710,15 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "calib.dataset.v1",
                 Some(PortRole::Dataset),
             )],
-            vec![
-                port(
-                    "solution",
-                    "Solution",
-                    PortDirection::Output,
-                    PortKind::CalibSolution,
-                    "calib.solution.v1",
-                    Some(PortRole::Solution),
-                ),
-                optional_port(
-                    "reprojection",
-                    "Reprojection Overlay",
-                    PortDirection::Output,
-                    PortKind::LayerOverlay,
-                    "viewer.layer.overlay.v1",
-                    Some(PortRole::Overlay),
-                ),
-                optional_port(
-                    "report",
-                    "Report",
-                    PortDirection::Output,
-                    PortKind::CalibReport,
-                    "calib.report.v1",
-                    Some(PortRole::Solution),
-                ),
-                optional_port(
-                    "payload",
-                    "EEPROM Payload",
-                    PortDirection::Output,
-                    PortKind::EepromPayload,
-                    "eeprom.payload.v1",
-                    Some(PortRole::Command),
-                ),
-            ],
+            vec![port(
+                "solution",
+                "Solution",
+                PortDirection::Output,
+                PortKind::CalibSolution,
+                "calib.solution.v1",
+                Some(PortRole::Solution),
+            )],
             json!({
-                "model": "pinhole",
-                "trigger": "manual",
                 "boardCols": 8,
                 "boardRows": 11,
                 "squareSizeMm": 30.0,
@@ -830,15 +728,12 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "fy": 1234.56,
                 "cx": 960.0,
                 "cy": 540.0,
-                "distortionCoefficients": vec![0.0; 12],
-                "maxResidualPx": 1.0,
-                "format": "yaml",
             }),
         ),
         NodeKind::PoseGuide => (
             NodeCategory::Calibration,
             "Pose Guide",
-            "根据覆盖度生成 guided pose 目标和 overlay",
+            "根据 coverage 的未覆盖图像栅格给出下一帧目标，不等同于相机 6DoF 位姿",
             vec![port(
                 "coverage",
                 "Coverage",
@@ -850,7 +745,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             vec![
                 port(
                     "target",
-                    "Capture Target",
+                    "Image-grid Target",
                     PortDirection::Output,
                     PortKind::CaptureTarget,
                     "capture.target.v1",
@@ -998,7 +893,7 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
         WorkmodeTemplate {
             id: "calibration",
             title: "Calibration",
-            description: "RTSP → Decoder → Detector → Dataset / Coverage / AutoCapture / Reprojection / Export / Solver",
+            description: "RTSP → Decoder → Detector → Dataset → Coverage / Solver；Pose Guide 仅给出图像栅格提示",
             graph: calibration_template_graph(),
         },
         WorkmodeTemplate {
@@ -1069,7 +964,6 @@ pub fn validate_cardinality_constraints(graph: &WorkflowGraph) -> Result<(), Str
     Ok(())
 }
 
-
 /// 标准化保存前的工作流图：修正 schema/revision，并拒绝运行时字段进入持久化文件。
 pub fn normalize_workflow(
     mut graph: WorkflowGraph,
@@ -1077,6 +971,7 @@ pub fn normalize_workflow(
 ) -> Result<WorkflowGraph, String> {
     graph.schema_version = WORKFLOW_SCHEMA_VERSION.to_owned();
     graph.revision = revision;
+    normalize_source_contracts(&mut graph);
     for node in &mut graph.nodes {
         reject_runtime_config(&node.config)?;
         let definition = node_definition(node.kind);
@@ -1086,6 +981,86 @@ pub fn normalize_workflow(
     }
     validate_workflow(&graph)?;
     Ok(graph)
+}
+
+/// 将旧图收敛到 source 已直接输出解码帧的当前契约，避免保存后断开已有 RTSP 连线。
+fn normalize_source_contracts(graph: &mut WorkflowGraph) {
+    for node in &mut graph.nodes {
+        let Some(config) = node.config.as_object_mut() else {
+            continue;
+        };
+        match node.kind {
+            NodeKind::LocalFileSource => {
+                let directory = config_string(config, "directory")
+                    .unwrap_or_default()
+                    .trim_matches('/')
+                    .to_owned();
+                let selection = config
+                    .get("selection")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                if let Some(selection) = selection {
+                    let selection = selection.trim_start_matches('/');
+                    if !directory.is_empty()
+                        && !selection.is_empty()
+                        && !selection.starts_with(&format!("{directory}/"))
+                    {
+                        config.insert(
+                            "selection".to_owned(),
+                            json!(format!("{directory}/{selection}")),
+                        );
+                    }
+                }
+                config.remove("filter");
+                config.remove("reload");
+            }
+            NodeKind::SftpFileSource => {
+                config.remove("sourceId");
+                config.remove("mountLabel");
+                config.remove("filter");
+            }
+            NodeKind::RtspSource => {
+                for (legacy, current) in [("expectedWidth", "width"), ("expectedHeight", "height")]
+                {
+                    if let Some(value) = config.remove(legacy) {
+                        config.entry(current.to_owned()).or_insert(value);
+                    }
+                }
+                config.remove("expectedFps");
+                config
+                    .entry("channel".to_owned())
+                    .or_insert_with(|| json!(0));
+            }
+            NodeKind::RtspDecoder => {
+                config.clear();
+                if node.title == "RTSP Decoder" {
+                    node.title = "Decoded Frame Relay".to_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for edge in &mut graph.edges {
+        let source_is_rtsp = graph
+            .nodes
+            .iter()
+            .any(|node| node.id == edge.source.node_id && node.kind == NodeKind::RtspSource);
+        let target_is_decoder = graph
+            .nodes
+            .iter()
+            .any(|node| node.id == edge.target.node_id && node.kind == NodeKind::RtspDecoder);
+        if source_is_rtsp && edge.source.port_id == "endpoint" {
+            edge.source.port_id = "frames".to_owned();
+            edge.kind = PortKind::StreamVideoFrame;
+            edge.schema = "stream.video-frame.v1".to_owned();
+        }
+        if target_is_decoder && edge.target.port_id == "endpoint" {
+            edge.target.port_id = "frames".to_owned();
+            edge.kind = PortKind::StreamVideoFrame;
+            edge.schema = "stream.video-frame.v1".to_owned();
+        }
+    }
 }
 
 /// 校验端口方向与类型，避免 UI 产生无法执行的数据流边。
@@ -1144,6 +1119,17 @@ fn validate_rtsp_source_config(node: &WorkflowNode) -> Result<(), String> {
             ));
         }
     }
+    if let Some(transport) = config_string(config, "transport") {
+        if !matches!(transport, "tcp" | "udp") {
+            return Err(format!(
+                "node `{}` config `transport` must be tcp or udp",
+                node.id
+            ));
+        }
+    }
+    validate_integer_range(node, config, "channel", 0, u16::MAX.into())?;
+    validate_integer_range(node, config, "width", 1, 16_384)?;
+    validate_integer_range(node, config, "height", 1, 16_384)?;
     validate_timeout_ms(node, config, "connectTimeoutMs")?;
     validate_timeout_ms(node, config, "idleTimeoutMs")?;
     Ok(())
@@ -1157,17 +1143,46 @@ fn validate_timeout_ms(
     let Some(value) = config.get(key) else {
         return Ok(());
     };
-    let ms = value.as_u64().or_else(|| {
-        value
-            .as_str()
-            .and_then(|text| text.parse::<u64>().ok())
-    });
+    let ms = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()));
     let Some(ms) = ms else {
-        return Err(format!("node `{}` config `{key}` must be milliseconds", node.id));
+        return Err(format!(
+            "node `{}` config `{key}` must be milliseconds",
+            node.id
+        ));
     };
     if ms == 0 || ms > 120_000 {
         return Err(format!(
             "node `{}` config `{key}` must be in 1..=120000 ms",
+            node.id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_integer_range(
+    node: &WorkflowNode,
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    minimum: u64,
+    maximum: u64,
+) -> Result<(), String> {
+    let Some(value) = config.get(key) else {
+        return Ok(());
+    };
+    let number = value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()));
+    let Some(number) = number else {
+        return Err(format!(
+            "node `{}` config `{key}` must be an integer",
+            node.id
+        ));
+    };
+    if !(minimum..=maximum).contains(&number) {
+        return Err(format!(
+            "node `{}` config `{key}` must be in {minimum}..={maximum}",
             node.id
         ));
     }
@@ -1198,12 +1213,25 @@ fn validate_ssh_session_config(node: &WorkflowNode) -> Result<(), String> {
 
 fn validate_sftp_file_source_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
-    let source_id = required_config_string(node, config, "sourceId")?;
-    validate_file_source_id(node, "sourceId", source_id)?;
-    let remote_root = required_config_string(node, config, "remoteRoot")?;
-    validate_remote_root(node, remote_root)?;
-    if let Some(label) = config_string(config, "mountLabel") {
-        validate_printable_config_text(node, "mountLabel", label)?;
+    if let Some(host) = config_string(config, "host") {
+        validate_printable_config_text(node, "host", host)?;
+    }
+    if let Some(username) = config_string(config, "username") {
+        validate_printable_config_text(node, "username", username)?;
+    }
+    if let Some(port) = config_string(config, "port") {
+        let port = port
+            .parse::<u16>()
+            .map_err(|_| format!("node `{}` SFTP port must be in 1..=65535", node.id))?;
+        if port == 0 {
+            return Err(format!("node `{}` SFTP port must be in 1..=65535", node.id));
+        }
+    }
+    if let Some(remote_root) = config_string(config, "remoteRoot") {
+        validate_remote_root(node, remote_root)?;
+    }
+    if let Some(selection) = config_string(config, "selection") {
+        validate_source_relative_path(node, "selection", selection, true)?;
     }
     Ok(())
 }
@@ -1211,16 +1239,19 @@ fn validate_sftp_file_source_config(node: &WorkflowNode) -> Result<(), String> {
 fn validate_local_file_source_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
     if let Some(root) = config_string(config, "root") {
-        validate_source_relative_path(node, "root", root, true)?;
+        let root = root.trim();
+        if !root.is_empty() && (!std::path::Path::new(root).is_absolute() || root.contains('\0')) {
+            return Err(format!(
+                "node `{}` config `root` must be an absolute local directory",
+                node.id
+            ));
+        }
     }
     if let Some(directory) = config_string(config, "directory") {
         validate_source_relative_path(node, "directory", directory, true)?;
     }
     if let Some(selection) = config_string(config, "selection") {
         validate_source_relative_path(node, "selection", selection, true)?;
-    }
-    if let Some(filter) = config_string(config, "filter") {
-        validate_printable_config_text(node, "filter", filter)?;
     }
     Ok(())
 }
@@ -1231,22 +1262,42 @@ fn reject_runtime_config(config: &serde_json::Value) -> Result<(), String> {
         "streamSessionId",
         "decoderFrames",
         "mjpegHeaders",
-        "frameBytes",
-        "socketId",
-        "longLogs",
         "password",
-        "credential",
-        "credentialRef",
         "privateKey",
         "secret",
     ];
-    // 递归遍历所有嵌套 object 与数组元素，堵住 {"auth":{"password":...}} 这类落盘绕过；
-    // 旧实现只检查顶层 object，嵌套 secret 会原样写入 .ctworkflow.json。
+
+    fn valid_credential_ref(value: &str) -> bool {
+        let value = value.trim();
+        if value.is_empty() {
+            return true;
+        }
+        if let Some(path) = value.strip_prefix("key-file:") {
+            return path.starts_with('/') && path.len() > 1 && !value.contains(['\0', '\r', '\n']);
+        }
+        if let Some(id) = value.strip_prefix("session:") {
+            return !id.is_empty()
+                && id.len() <= 128
+                && id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'));
+        }
+        false
+    }
+    // 递归遍历所有嵌套 object 与数组元素，堵住嵌套 secret 的落盘绕过。
     fn walk(value: &serde_json::Value) -> Result<(), String> {
         match value {
             serde_json::Value::Object(map) => {
                 for (key, child) in map {
-                    if FORBIDDEN_KEYS.contains(&key.as_str()) {
+                    if key == "credentialRef" {
+                        let reference = child.as_str().ok_or_else(|| {
+                            "runtime field `credentialRef` must be a safe reference string"
+                                .to_owned()
+                        })?;
+                        if !valid_credential_ref(reference) {
+                            return Err("runtime field `credentialRef` must be empty, key-file:/absolute/path, or session:<opaque-id>; secret material is forbidden".to_owned());
+                        }
+                    } else if FORBIDDEN_KEYS.contains(&key.as_str()) {
                         return Err(format!("runtime field `{key}` must not be persisted"));
                     }
                     walk(child)?;
@@ -1273,35 +1324,11 @@ fn node_config_object(
         .ok_or_else(|| format!("node `{}` config must be a JSON object", node.id))
 }
 
-fn required_config_string<'a>(
-    node: &WorkflowNode,
-    config: &'a serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<&'a str, String> {
-    config_string(config, key)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| format!("node `{}` config `{key}` must not be empty", node.id))
-}
-
 fn config_string<'a>(
     config: &'a serde_json::Map<String, serde_json::Value>,
     key: &str,
 ) -> Option<&'a str> {
     config.get(key).and_then(serde_json::Value::as_str)
-}
-
-fn validate_file_source_id(node: &WorkflowNode, key: &str, value: &str) -> Result<(), String> {
-    if value.is_empty()
-        || value.contains('/')
-        || value.contains('\\')
-        || value.chars().any(char::is_control)
-    {
-        return Err(format!(
-            "node `{}` config `{key}` must be a non-empty source id without path separators",
-            node.id
-        ));
-    }
-    Ok(())
 }
 
 fn validate_remote_root(node: &WorkflowNode, value: &str) -> Result<(), String> {
@@ -1401,7 +1428,7 @@ fn viewer_template_graph() -> WorkflowGraph {
     let decoder = workflow_node(
         "rtsp-decoder-1",
         NodeKind::RtspDecoder,
-        "RTSP Decoder",
+        "Decoded Frame Relay",
         NodePosition { x: 380.0, y: 140.0 },
     );
     let layer = workflow_node(
@@ -1427,11 +1454,11 @@ fn viewer_template_graph() -> WorkflowGraph {
             edge(
                 "edge-rtsp-decoder",
                 "rtsp-source-1",
-                "endpoint",
+                "frames",
                 "rtsp-decoder-1",
-                "endpoint",
-                PortKind::EndpointRtsp,
-                "media.rtsp.endpoint.v1",
+                "frames",
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
             ),
             edge(
                 "edge-decoder-layer",
@@ -1513,7 +1540,7 @@ fn calibration_template_graph() -> WorkflowGraph {
         workflow_node(
             "calib-decoder",
             NodeKind::RtspDecoder,
-            "RTSP Decoder",
+            "Decoded Frame Relay",
             NodePosition { x: 320.0, y: 120.0 },
         ),
         workflow_node(
@@ -1539,15 +1566,6 @@ fn calibration_template_graph() -> WorkflowGraph {
             NodeKind::CalibrationSolver,
             "Calibration Solver",
             NodePosition { x: 1540.0, y: 80.0 },
-        ),
-        workflow_node(
-            "calib-autocapture",
-            NodeKind::AutoCaptureController,
-            "Auto Capture",
-            NodePosition {
-                x: 1240.0,
-                y: 300.0,
-            },
         ),
         workflow_node(
             "calib-pose-guide",
@@ -1582,11 +1600,11 @@ fn calibration_template_graph() -> WorkflowGraph {
             edge(
                 "calib-e-rtsp-decoder",
                 "calib-rtsp-source",
-                "endpoint",
+                "frames",
                 "calib-decoder",
-                "endpoint",
-                PortKind::EndpointRtsp,
-                "media.rtsp.endpoint.v1",
+                "frames",
+                PortKind::StreamVideoFrame,
+                "stream.video-frame.v1",
             ),
             edge(
                 "calib-e-decoder-detector",
@@ -1598,28 +1616,10 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "stream.video-frame.v1",
             ),
             edge(
-                "calib-e-decoder-dataset-image",
-                "calib-decoder",
-                "frames",
-                "calib-dataset",
-                "image",
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-            ),
-            edge(
                 "calib-e-detection-dataset",
                 "calib-detector",
                 "detection",
                 "calib-dataset",
-                "detection",
-                PortKind::CalibDetection,
-                "calib.detection.v1",
-            ),
-            edge(
-                "calib-e-detection-autocapture",
-                "calib-detector",
-                "detection",
-                "calib-autocapture",
                 "detection",
                 PortKind::CalibDetection,
                 "calib.detection.v1",
@@ -1643,15 +1643,6 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "calib.dataset.v1",
             ),
             edge(
-                "calib-e-coverage-autocapture",
-                "calib-coverage",
-                "coverage",
-                "calib-autocapture",
-                "coverage",
-                PortKind::CalibCoverage,
-                "calib.coverage.v1",
-            ),
-            edge(
                 "calib-e-coverage-pose",
                 "calib-coverage",
                 "coverage",
@@ -1659,24 +1650,6 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "coverage",
                 PortKind::CalibCoverage,
                 "calib.coverage.v1",
-            ),
-            edge(
-                "calib-e-target-autocapture",
-                "calib-pose-guide",
-                "target",
-                "calib-autocapture",
-                "target",
-                PortKind::CaptureTarget,
-                "capture.target.v1",
-            ),
-            edge(
-                "calib-e-solver-reprojection-overlay",
-                "calib-solver",
-                "reprojection",
-                "calib-overlay",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
             ),
             edge(
                 "calib-e-video-overlay",
@@ -1775,9 +1748,9 @@ fn workflow_node(id: &str, kind: NodeKind, title: &str, position: NodePosition) 
         title: title.to_owned(),
         position,
         state: match kind {
-            NodeKind::RtspSource
-            | NodeKind::SshSession
-            | NodeKind::X5Device => NodeRuntimeState::Ready,
+            NodeKind::RtspSource | NodeKind::SshSession | NodeKind::X5Device => {
+                NodeRuntimeState::Ready
+            }
             _ => NodeRuntimeState::Idle,
         },
         category: definition.category,
@@ -1895,7 +1868,7 @@ mod tests {
             graph
                 .edges
                 .iter()
-                .any(|edge| edge.kind == PortKind::EndpointRtsp)
+                .any(|edge| edge.kind == PortKind::StreamVideoFrame)
         );
         assert!(
             graph
@@ -1906,20 +1879,68 @@ mod tests {
     }
 
     #[test]
+    fn normalize_migrates_legacy_rtsp_fields_and_ports() {
+        let mut graph = viewer_template_graph();
+        let source = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == NodeKind::RtspSource)
+            .expect("RTSP source exists");
+        source.config = json!({
+            "url": "rtsp://127.0.0.1:554/test",
+            "transport": "tcp",
+            "expectedWidth": 1280,
+            "expectedHeight": 720,
+            "expectedFps": 30,
+        });
+        let decoder = graph
+            .nodes
+            .iter_mut()
+            .find(|node| node.kind == NodeKind::RtspDecoder)
+            .expect("RTSP relay exists");
+        decoder.config = json!({"transport": "tcp"});
+        let edge = graph.edges.first_mut().expect("source relay edge exists");
+        edge.source.port_id = "endpoint".to_owned();
+        edge.target.port_id = "endpoint".to_owned();
+        edge.kind = PortKind::EndpointRtsp;
+        edge.schema = "media.rtsp.endpoint.v1".to_owned();
+
+        let graph =
+            normalize_workflow(graph, "next".to_owned()).expect("legacy source graph migrates");
+        let source = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::RtspSource)
+            .expect("normalized RTSP source exists");
+        assert_eq!(source.config["width"], json!(1280));
+        assert_eq!(source.config["height"], json!(720));
+        assert_eq!(source.config["channel"], json!(0));
+        assert!(source.config.get("expectedWidth").is_none());
+        assert!(source.outputs.iter().any(|port| port.id == "frames"));
+        let edge = graph
+            .edges
+            .first()
+            .expect("normalized source relay edge exists");
+        assert_eq!(edge.source.port_id, "frames");
+        assert_eq!(edge.target.port_id, "frames");
+        assert_eq!(edge.kind, PortKind::StreamVideoFrame);
+    }
+
+    #[test]
     fn validation_rejects_self_loop() {
         let graph = seed_workflow_graph();
         let edge = WorkflowEdge {
-            id: "bad".to_owned(),
+            id: "self-loop".to_owned(),
             source: PortEndpoint {
                 node_id: "rtsp-source-1".to_owned(),
-                port_id: "endpoint".to_owned(),
+                port_id: "frames".to_owned(),
             },
             target: PortEndpoint {
                 node_id: "rtsp-source-1".to_owned(),
-                port_id: "endpoint".to_owned(),
+                port_id: "frames".to_owned(),
             },
-            kind: PortKind::EndpointRtsp,
-            schema: "media.rtsp.endpoint.v1".to_owned(),
+            kind: PortKind::StreamVideoFrame,
+            schema: "stream.video-frame.v1".to_owned(),
             schema_version: WORKFLOW_SCHEMA_VERSION.to_owned(),
         };
         assert!(validate_edge(&graph, &edge).is_err());
@@ -1929,17 +1950,17 @@ mod tests {
     fn validation_rejects_incompatible_port_kinds() {
         let mut graph = seed_workflow_graph();
         let bad = WorkflowEdge {
-            id: "bad".to_owned(),
+            id: "bad-kind".to_owned(),
             source: PortEndpoint {
                 node_id: "rtsp-source-1".to_owned(),
-                port_id: "endpoint".to_owned(),
+                port_id: "frames".to_owned(),
             },
             target: PortEndpoint {
                 node_id: "viewer-1".to_owned(),
                 port_id: "video".to_owned(),
             },
-            kind: PortKind::EndpointRtsp,
-            schema: "media.rtsp.endpoint.v1".to_owned(),
+            kind: PortKind::StreamVideoFrame,
+            schema: "stream.video-frame.v1".to_owned(),
             schema_version: WORKFLOW_SCHEMA_VERSION.to_owned(),
         };
         graph.edges.push(bad.clone());
@@ -1965,7 +1986,8 @@ mod tests {
         duplicate.id = "edge-layer-viewer-duplicate".to_owned();
         graph.edges.push(duplicate);
 
-        let err = validate_workflow(&graph).expect_err("second incoming edge to One port must fail");
+        let err =
+            validate_workflow(&graph).expect_err("second incoming edge to One port must fail");
         assert!(err.contains("cardinality=One"), "unexpected error: {err}");
         assert!(err.contains("viewer-1"), "unexpected error: {err}");
     }
@@ -2000,7 +2022,7 @@ mod tests {
     }
 
     #[test]
-    fn calibration_template_contains_full_dataset_chain() {
+    fn calibration_template_contains_dataset_to_solver_chain_without_fake_autocapture_loop() {
         let graph = calibration_template_graph();
         validate_workflow(&graph).expect("calibration template is valid");
         assert!(
@@ -2016,36 +2038,23 @@ mod tests {
                 .any(|node| node.kind == NodeKind::CalibrationSolver)
         );
         assert!(
-            graph
+            !graph
                 .nodes
                 .iter()
                 .any(|node| node.kind == NodeKind::AutoCaptureController)
         );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::OverlayComposer)
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "calib-e-decoder-dataset-image")
-        );
-        // 合并后 solver 的 reprojection 可选输出直接进 overlay，不再有独立 ReprojectionInspector。
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "calib-e-solver-reprojection-overlay")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "calib-e-overlay-viewer")
-        );
+        for edge_id in [
+            "calib-e-detection-dataset",
+            "calib-e-dataset-coverage",
+            "calib-e-dataset-solver",
+            "calib-e-coverage-pose",
+            "calib-e-overlay-viewer",
+        ] {
+            assert!(
+                graph.edges.iter().any(|edge| edge.id == edge_id),
+                "missing {edge_id}"
+            );
+        }
     }
 
     #[test]
@@ -2058,37 +2067,48 @@ mod tests {
     }
 
     #[test]
-    fn merged_nodes_have_expanded_port_surface() {
-        // X5Device：control + rtsp(多路) + snapshot(可选 image) + video(可选 video-frame)。
-        let x5 = node_definition(NodeKind::X5Device);
-        assert_eq!(x5.outputs.len(), 4);
-        assert!(x5.outputs.iter().any(|p| p.id == "rtsp" && p.cardinality == PortCardinality::Many));
-        assert!(x5.outputs.iter().any(|p| p.id == "snapshot" && p.kind == PortKind::ImageFrame && !p.required));
-        assert!(x5.outputs.iter().any(|p| p.id == "video" && p.kind == PortKind::StreamVideoFrame));
-
-        // CalibrationSolver：solution + reprojection/report/payload 三个可选输出。
+    fn calibration_nodes_only_declare_implemented_ports() {
         let solver = node_definition(NodeKind::CalibrationSolver);
-        assert_eq!(solver.outputs.len(), 4);
-        assert!(solver.outputs.iter().any(|p| p.id == "solution" && p.kind == PortKind::CalibSolution));
-        assert!(solver.outputs.iter().any(|p| p.id == "reprojection" && p.kind == PortKind::LayerOverlay && !p.required));
-        assert!(solver.outputs.iter().any(|p| p.id == "report" && p.kind == PortKind::CalibReport && !p.required));
-        assert!(solver.outputs.iter().any(|p| p.id == "payload" && p.kind == PortKind::EepromPayload && !p.required));
+        assert_eq!(solver.inputs.len(), 1);
+        assert_eq!(solver.outputs.len(), 1);
+        assert!(
+            solver
+                .outputs
+                .iter()
+                .any(|p| p.id == "solution" && p.kind == PortKind::CalibSolution)
+        );
 
-        // AutoCaptureController：frames/detection/coverage/target 输入 + command/score 输出。
+        let dataset = node_definition(NodeKind::DatasetCollector);
+        assert_eq!(dataset.inputs.len(), 1);
+        assert_eq!(dataset.outputs.len(), 1);
+        assert!(dataset.inputs.iter().any(|p| p.id == "detection"));
+        assert!(
+            dataset
+                .outputs
+                .iter()
+                .any(|p| p.id == "dataset" && p.kind == PortKind::CalibDataset)
+        );
+
         let auto = node_definition(NodeKind::AutoCaptureController);
-        assert_eq!(auto.inputs.len(), 4);
-        assert_eq!(auto.outputs.len(), 2);
-        assert!(auto.inputs.iter().any(|p| p.id == "detection"));
-        assert!(auto.inputs.iter().any(|p| p.id == "coverage"));
-        assert!(auto.outputs.iter().any(|p| p.id == "command"));
-        assert!(auto.outputs.iter().any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required));
+        assert_eq!(auto.inputs.len(), 1);
+        assert_eq!(auto.outputs.len(), 1);
+        assert!(
+            auto.inputs
+                .iter()
+                .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore)
+        );
+        assert!(
+            auto.outputs
+                .iter()
+                .any(|p| p.id == "command" && p.kind == PortKind::CommandCapture)
+        );
 
-        // LocalFileSource：image + preview/fileRef 可选输出。
-        let local = node_definition(NodeKind::LocalFileSource);
-        assert_eq!(local.outputs.len(), 3);
-        assert!(local.outputs.iter().any(|p| p.id == "image" && p.kind == PortKind::ImageFrame));
-        assert!(local.outputs.iter().any(|p| p.id == "preview" && !p.required));
-        assert!(local.outputs.iter().any(|p| p.id == "fileRef" && p.kind == PortKind::FileRef && !p.required));
+        let pose = node_definition(NodeKind::PoseGuide);
+        assert!(
+            pose.outputs
+                .iter()
+                .any(|p| p.id == "target" && p.label == "Image-grid Target")
+        );
     }
 
     #[test]
@@ -2101,8 +2121,18 @@ mod tests {
     #[test]
     fn local_file_source_emits_image_and_file_ref() {
         let source = node_definition(NodeKind::LocalFileSource);
-        assert!(source.outputs.iter().any(|p| p.kind == PortKind::ImageFrame));
-        assert!(source.outputs.iter().any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1"));
+        assert!(
+            source
+                .outputs
+                .iter()
+                .any(|p| p.kind == PortKind::ImageFrame)
+        );
+        assert!(
+            source
+                .outputs
+                .iter()
+                .any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1")
+        );
     }
 
     #[test]
@@ -2116,7 +2146,6 @@ mod tests {
         ));
         let node = graph.nodes.last_mut().expect("SFTP node exists");
         node.config["remoteRoot"] = json!("/opt/../etc");
-
         let error = validate_workflow(&graph).expect_err("unsafe remote root rejected");
         assert!(error.contains("remoteRoot"));
     }
@@ -2137,10 +2166,17 @@ mod tests {
         let error = reject_runtime_config(&nested).expect_err("nested secret must be rejected");
         assert!(error.contains("password"));
 
-        // 数组元素里携带 secret 也必须被拒。
-        let array = json!({"tokens": [{"credentialRef": "key-file:/x"}]});
-        let error = reject_runtime_config(&array).expect_err("array secret must be rejected");
+        // 数组元素中的 credentialRef 仍需校验引用语法，不能写入密码或裸字符串。
+        let array = json!({"tokens": [{"credentialRef": "plaintext-password"}]});
+        let error =
+            reject_runtime_config(&array).expect_err("unsafe credential reference rejected");
         assert!(error.contains("credentialRef"));
+
+        let empty_reference = json!({"auth": {"credentialRef": ""}});
+        assert!(reject_runtime_config(&empty_reference).is_ok());
+
+        let safe = json!({"auth": {"credentialRef": "key-file:/home/user/.ssh/id_ed25519"}});
+        assert!(reject_runtime_config(&safe).is_ok());
 
         // 合法嵌套（不含敏感键）应通过。
         let benign = json!({"auth": {"host": "camera.local", "port": 22}});

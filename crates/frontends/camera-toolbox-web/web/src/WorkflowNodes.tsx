@@ -1,21 +1,37 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState, type ReactNode } from 'react';
 import type { NodeProps } from '@xyflow/react';
-import type { FlowNodeData } from './workflow';
+import type { FlowNodeData, X5ControlResponse } from './workflow';
+import {
+  captureX5Snapshot,
+  configureX5Rtsp,
+  inspectEepromProvision,
+  previewEepromProvision,
+  previewI2cTransfer,
+  probeX5Control,
+  runEepromProvision,
+  runI2cTransfer,
+  startX5RtspChannel,
+  statusX5Control,
+  type EepromExecuteRequest,
+  type EepromInspectRequest,
+  type EepromPreviewRequest,
+  type I2cExecuteRequest,
+  type I2cPreviewRequest,
+} from './workflow';
 import { configText } from './nodeConfig';
-import { NodeHeader, PortHandles } from './nodes/shared';
+import { NodeActionButtons, NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './nodes/shared';
 import { FileBrowser } from './FileBrowser';
 
-/**
- * ① LocalFileSource（吸收 LocalWorkspace + FileBrowser + ImageFileSource）：
- * root + directory/selection（内嵌目录浏览）+ filter 展示。
- */
+const SOURCE_TRIGGER_ACTIONS = [{ action: 'trigger', label: '加载' }] as const;
+
+/** 本地图片源：根目录绝对路径，selection 是相对根目录的完整文件路径。 */
 export function LocalFileSourceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const root = configText(node, 'root', '');
   const directory = configText(node, 'directory', '');
   const selection = configText(node, 'selection', '');
-  const filter = configText(node, 'filter', '*.png;*.jpg;*.jpeg');
+  const actionPending = Boolean(nodeData.actionPending);
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const [draftRoot, setDraftRoot] = useState(root);
@@ -51,7 +67,15 @@ export function LocalFileSourceNode({ data, selected }: NodeProps) {
             onDirectory={(path) => nodeData.onNodeConfigChange?.(node.id, 'directory', path)}
             onSelection={(path) => nodeData.onNodeConfigChange?.(node.id, 'selection', path)}
           />
-          <span>Filter: {filter}</span>
+          <span className="node-hint">选择 PNG/JPEG 后点击加载；目录仅用于浏览，不参与文件路径拼接。</span>
+          <RuntimeOutputSummary output={nodeData.runtimeOutput} />
+          <NodeActionButtons
+            nodeId={node.id}
+            actions={SOURCE_TRIGGER_ACTIONS}
+            pending={actionPending}
+            onAction={nodeData.onNodeAction}
+            onRefreshOutput={nodeData.onRefreshNodeOutput}
+          />
         </div>
       </section>
       {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
@@ -60,44 +84,44 @@ export function LocalFileSourceNode({ data, selected }: NodeProps) {
 }
 
 
-/**
- * ② SftpFileSource（吸收 SftpWorkspace + FileBrowser remote）：
- * sourceId + remoteRoot 编辑，可选 workspace/fileRef/image 输出由 PortHandles 渲染。
- */
+/** SFTP 图片源：直接使用配置连接 SFTP 并触发读取；不声明未实现的 workspace/SSH 端口。 */
 export function SftpFileSourceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const remoteRoot = configText(node, 'remoteRoot', '/');
-  const sourceId = configText(node, 'sourceId', 'sftp-main');
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
-  const [draftRoot, setDraftRoot] = useState(remoteRoot);
-  useEffect(() => setDraftRoot(remoteRoot), [remoteRoot]);
-  const applyRoot = () => nodeData.onNodeConfigChange?.(node.id, 'remoteRoot', draftRoot.trim() || '/');
+  const actionPending = Boolean(nodeData.actionPending);
+  const connectionConfig = {
+    host: configText(node, 'host', ''),
+    port: configText(node, 'port', '22'),
+    username: configText(node, 'username', 'root'),
+    credentialRef: configText(node, 'credentialRef', ''),
+    expectedHostKey: configText(node, 'expectedHostKey', ''),
+    remoteRoot,
+    selection: configText(node, 'selection', ''),
+  };
   return (
     <div className="workflow-node-shell">
       <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
         <NodeHeader node={node} runtimeState={runtimeState} />
 
-        <div className="node-body">
-          <label htmlFor={`${node.id}-remote-root`}>Remote root</label>
-          <input
-            id={`${node.id}-remote-root`}
-            className="rtsp-url-input nodrag"
-            value={draftRoot}
-            placeholder="/data/captures"
-            spellCheck={false}
-            onChange={(event) => setDraftRoot(event.target.value)}
-            onBlur={applyRoot}
-            onKeyDown={(event) => {
-              if (event.key === 'Enter') {
-                applyRoot();
-                event.currentTarget.blur();
-              }
-            }}
+        <PortHandles node={node} />
+        <div className="node-body compact">
+          <ScalarConfigFields
+            nodeId={node.id}
+            config={connectionConfig}
+            onChange={nodeData.onNodeConfigChange}
           />
-          <span>Source ID: {sourceId}</span>
-          <span>Session-bound; no password or directory cache is persisted.</span>
+          <span className="node-hint">仅支持 PNG/JPEG；credentialRef 使用 key-file:/绝对路径 或 session:ID，密码不会写入工作流。</span>
+          <RuntimeOutputSummary output={nodeData.runtimeOutput} />
+          <NodeActionButtons
+            nodeId={node.id}
+            actions={SOURCE_TRIGGER_ACTIONS}
+            pending={actionPending}
+            onAction={nodeData.onNodeAction}
+            onRefreshOutput={nodeData.onRefreshNodeOutput}
+          />
         </div>
       </section>
       {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
@@ -106,60 +130,209 @@ export function SftpFileSourceNode({ data, selected }: NodeProps) {
 }
 
 
-/** SshSession：控制会话展示。SSH 参数编辑/expectedHostKey pin 属 M3（见 t8 遗留记录）。 */
+function Field({
+  id,
+  label,
+  value,
+  onChange,
+  type = 'text',
+  placeholder,
+}: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  type?: 'text' | 'number' | 'password';
+  placeholder?: string;
+}) {
+  return (
+    <label className="node-config-field">
+      <code>{label}</code>
+      <input id={id} className="nodrag nowheel" type={type} value={value} placeholder={placeholder} onChange={(event) => onChange(event.target.value)} />
+    </label>
+  );
+}
+
+function configBool(node: FlowNodeData['workflowNode'], key: string, fallback: boolean): boolean {
+  const value = node.config[key];
+  return typeof value === 'boolean' ? value : fallback;
+}
+
+function numberValue(value: string, fallback = 0): number {
+  const parsed = Number(value.trim());
+  return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function ResultBox({ value }: { value: unknown }) {
+  if (value === undefined) return null;
+  const text = typeof value === 'string' ? value : JSON.stringify(value);
+  return <pre className="node-runtime-output" title={text}>{text}</pre>;
+}
+
+function RemoteFrame({ nodeData, selected, children }: { nodeData: FlowNodeData; selected?: boolean; children: ReactNode }) {
+  const { workflowNode: node, runtimeState, runtimeDiagnostic } = nodeData;
+  return (
+    <div className="workflow-node-shell">
+      <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
+        <NodeHeader node={node} runtimeState={runtimeState} />
+        <PortHandles node={node} />
+        <div className="node-body">{children}</div>
+      </section>
+      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
+    </div>
+  );
+}
+
+/** SSH 参数可编辑，credentialRef 只接受 key-file:/ 或 session: 引用，不保存密码/私钥内容。 */
 export function SshSessionNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
+  const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
   const host = configText(node, 'host', '');
-  const profileId = configText(node, 'profileId', '');
-  const username = configText(node, 'username', 'root');
-  const expectedHostKey = configText(node, 'expectedHostKey', '');
-  const runtimeState = nodeData.runtimeState;
-  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
+  const credentialRef = configText(node, 'credentialRef', '');
   return (
-    <div className="workflow-node-shell">
-      <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-        <NodeHeader node={node} runtimeState={runtimeState} />
-
-        <PortHandles node={node} />
-        <div className="node-body compact">
-          <span>Profile: {profileId || 'manual'}</span>
-          <span>Host: {host || 'unset'}</span>
-          <span>User: {username}</span>
-          <span>Auto: {String(node.config.autoConnect === true)}</span>
-          {expectedHostKey && <span>HostKey: {expectedHostKey.slice(0, 16)}…</span>}
-        </div>
-      </section>
-      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
-    </div>
+    <RemoteFrame nodeData={nodeData} selected={selected}>
+      <Field id={`${node.id}-host`} label="Host" value={host} onChange={(value) => set('host', value)} placeholder="camera.local" />
+      <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
+      <Field id={`${node.id}-username`} label="User" value={configText(node, 'username', 'root')} onChange={(value) => set('username', value)} />
+      <Field id={`${node.id}-credential`} label="Credential ref" value={credentialRef} onChange={(value) => set('credentialRef', value)} placeholder="key-file:/absolute/path" />
+      <Field id={`${node.id}-host-key`} label="Pinned host key" value={configText(node, 'expectedHostKey', '')} onChange={(value) => set('expectedHostKey', value)} placeholder="ssh-ed25519 AAAA…" />
+      <Field id={`${node.id}-recipe`} label="Recipe ID" value={configText(node, 'recipeId', '')} onChange={(value) => set('recipeId', value)} placeholder="registered command recipe" />
+      <label className="node-hint">Only a credential reference is persisted; secret material never enters the workflow. Pin the host key before triggering.</label>
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
+      </div>
+    </RemoteFrame>
   );
 }
 
-
-/**
- * ③ X5Device（吸收 X5RtspChannel + X5Snapshot）：
- * TCP 控制 + 多路 RTSP channel + snapshot/video 可选输出。
- */
+/** X5 control is explicit and side-effecting: every Probe/Status/RTSP/Snapshot click opens a TCP request. */
 export function X5DeviceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
-  const channels = configText(node, 'channels', '[0]');
-  const runtimeState = nodeData.runtimeState;
-  const runtimeDiagnostic = nodeData.runtimeDiagnostic;
+  const host = configText(node, 'host', '10.21.12.108');
+  const tcpPort = numberValue(configText(node, 'tcpPort', '9073'), 9073);
+  const channel = numberValue(configText(node, 'channel', '0'));
+  const [pending, setPending] = useState(false);
+  const [result, setResult] = useState<X5ControlResponse | string>();
+  const call = async (operation: () => Promise<X5ControlResponse>) => {
+    setPending(true);
+    try { setResult(await operation()); } catch (error) { setResult(String(error)); } finally { setPending(false); }
+  };
+  const binding = { host, tcpPort };
   return (
-    <div className="workflow-node-shell">
-      <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
-        <NodeHeader node={node} runtimeState={runtimeState} />
-        <PortHandles node={node} />
-        <div className="node-body compact">
-          <span>Host: {configText(node, 'host', '10.21.12.108')}</span>
-          <span>TCP: {configText(node, 'tcpPort', '9073')}</span>
-          <span>FPS: {configText(node, 'fps', '60')}</span>
-          <span>Bitrate: {configText(node, 'bitrateKbps', '12000')} kbps</span>
-          <span>Channels: {channels}</span>
-        </div>
-      </section>
-      {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
-    </div>
+    <RemoteFrame nodeData={nodeData} selected={selected}>
+      <Field id={`${node.id}-host`} label="Host" value={host} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'host', value)} />
+      <Field id={`${node.id}-tcp-port`} label="TCP port" value={configText(node, 'tcpPort', '9073')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'tcpPort', value)} type="number" />
+      <Field id={`${node.id}-channel`} label="Channel" value={configText(node, 'channel', '0')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'channel', value)} type="number" />
+      <Field id={`${node.id}-fps`} label="RTSP FPS" value={configText(node, 'fps', '60')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'fps', value)} type="number" />
+      <Field id={`${node.id}-bitrate`} label="RTSP kbps" value={configText(node, 'bitrateKbps', '12000')} onChange={(value) => nodeData.onNodeConfigChange?.(node.id, 'bitrateKbps', value)} type="number" />
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => probeX5Control(binding))}>Probe</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => statusX5Control(binding))}>Status</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => configureX5Rtsp({ ...binding, fps: numberValue(configText(node, 'fps', '60'), 60), bitrateKbps: numberValue(configText(node, 'bitrateKbps', '12000'), 12000) }))}>Configure RTSP</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => startX5RtspChannel({ ...binding, channel }))}>Start RTSP</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => captureX5Snapshot({ ...binding, channel, mode: 'latest' }))}>Snapshot</button>
+      </div>
+      <span className="node-hint">Snapshot/RTSP support depends on the connected X5 firmware; failed capability requests remain visible below.</span>
+      <ResultBox value={result} />
+    </RemoteFrame>
   );
+}
+
+function sshBinding(node: FlowNodeData['workflowNode']) {
+  return {
+    host: configText(node, 'host', ''),
+    port: numberValue(configText(node, 'port', '22'), 22),
+    username: configText(node, 'username', 'root'),
+    credentialRef: configText(node, 'credentialRef', ''),
+    expectedHostKey: configText(node, 'expectedHostKey', ''),
+  };
+}
+
+function I2cForm({ data, selected, eeprom = false }: { data: NodeProps['data']; selected?: boolean; eeprom?: boolean }) {
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
+  const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
+  const rawPayload = configText(node, 'payload', '').trim();
+  const payload = rawPayload
+    ? rawPayload.split(/[\s,;]+/).filter(Boolean).map((item) => numberValue(item, -1)).filter((item) => Number.isInteger(item) && item >= 0 && item <= 255)
+    : [];
+  const base = {
+    nodeId: node.id,
+    profileId: configText(node, 'profileId', 'x5-lab'),
+    bus: configText(node, 'bus', 'i2c-1'),
+    address: numberValue(configText(node, 'address', '0x50')),
+    register: numberValue(configText(node, 'register', '0x0000')),
+    payload,
+    pageSize: numberValue(configText(node, 'pageSize', '16'), 16),
+  };
+  const [pending, setPending] = useState(false);
+  const [preview, setPreview] = useState<unknown>();
+  const [snapshot, setSnapshot] = useState<string>();
+  const run = async (operation: () => Promise<unknown>) => {
+    setPending(true);
+    try {
+      const result = await operation();
+      setPreview(result);
+      if (typeof result === 'object' && result !== null && 'snapshot' in result) {
+        const candidate = result.snapshot;
+        if (typeof candidate === 'object' && candidate !== null && 'imageSha256' in candidate && typeof candidate.imageSha256 === 'string') {
+          setSnapshot(candidate.imageSha256);
+        }
+      }
+    } catch (error) {
+      setPreview(String(error));
+    } finally {
+      setPending(false);
+    }
+  };
+  const ssh = sshBinding(node);
+  const warning = eeprom
+    ? 'EEPROM writes are irreversible. Inspect first, require verifyAfterWrite, and confirm only after checking the preview.'
+    : 'I²C writes can change hardware state. Preview validates the request but performs no I/O.';
+  const i2cPreview: I2cPreviewRequest = { ...base, operation: configText(node, 'mode', 'read') === 'write' ? 'write' : 'read' };
+  const eepromPreview: EepromPreviewRequest = { ...base, mapId: configText(node, 'mapId', 'yg-stereo-p24c64g-v1'), verifyAfterWrite: configBool(node, 'verifyAfterWrite', true) };
+  const eepromInspect: EepromInspectRequest = { ...eepromPreview, ssh };
+  const eepromExecute: EepromExecuteRequest | undefined = snapshot
+    ? { ...eepromPreview, ssh, confirmExecution: true, expectedBeforeSha256: snapshot }
+    : undefined;
+  const i2cExecute: I2cExecuteRequest = {
+    ...i2cPreview,
+    ssh,
+    confirmExecution: configText(node, 'mode', 'read') !== 'write' || configBool(node, 'confirmWrites', false),
+  };
+  return (
+    <RemoteFrame nodeData={nodeData} selected={selected}>
+      <Field id={`${node.id}-profile`} label="Profile" value={base.profileId} onChange={(value) => set('profileId', value)} />
+      <Field id={`${node.id}-host`} label="SSH host" value={ssh.host} onChange={(value) => set('host', value)} />
+      <Field id={`${node.id}-port`} label="SSH port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
+      <Field id={`${node.id}-user`} label="SSH user" value={ssh.username} onChange={(value) => set('username', value)} />
+      <Field id={`${node.id}-credential`} label="Credential ref" value={ssh.credentialRef} onChange={(value) => set('credentialRef', value)} placeholder="key-file:/absolute/path" />
+      <Field id={`${node.id}-host-key`} label="Pinned host key" value={configText(node, 'expectedHostKey', '')} onChange={(value) => set('expectedHostKey', value)} />
+      <Field id={`${node.id}-bus`} label="I²C bus" value={base.bus} onChange={(value) => set('bus', value)} />
+      <Field id={`${node.id}-address`} label="Address" value={configText(node, 'address', '0x50')} onChange={(value) => set('address', value)} />
+      <Field id={`${node.id}-register`} label="Register" value={configText(node, 'register', '0x0000')} onChange={(value) => set('register', value)} />
+      <Field id={`${node.id}-payload`} label="Payload bytes" value={configText(node, 'payload', '')} onChange={(value) => set('payload', value)} placeholder="0x01 0x02 …" />
+      <Field id={`${node.id}-page-size`} label="Page size" value={configText(node, 'pageSize', '16')} onChange={(value) => set('pageSize', value)} type="number" />
+      {eeprom ? <Field id={`${node.id}-map`} label="EEPROM map" value={configText(node, 'mapId', 'yg-stereo-p24c64g-v1')} onChange={(value) => set('mapId', value)} /> : null}
+      {eeprom ? <label className="node-config-checkbox"><code>Verify after write</code><input className="nodrag nowheel" type="checkbox" checked={configBool(node, 'verifyAfterWrite', true)} onChange={(event) => set('verifyAfterWrite', event.target.checked)} /></label> : <Field id={`${node.id}-mode`} label="Mode" value={configText(node, 'mode', 'read')} onChange={(value) => set('mode', value === 'write' ? 'write' : 'read')} />}
+      <span className="node-hint">{warning}</span>
+      <div className="node-actions">
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => run(() => eeprom ? previewEepromProvision(eepromPreview) : previewI2cTransfer(i2cPreview))}>Preview (no I/O)</button>
+        {eeprom ? <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => run(() => inspectEepromProvision(eepromInspect))}>Inspect</button> : null}
+        <button type="button" className="nodrag nowheel" disabled={pending || (eeprom && !eepromExecute)} onClick={() => run(() => eeprom ? runEepromProvision(eepromExecute!) : runI2cTransfer(i2cExecute))}>{eeprom ? 'Provision (confirm)' : 'Run'}</button>
+      </div>
+      {eeprom && !snapshot ? <span className="node-hint">Inspect must succeed in this process before Provision is enabled.</span> : null}
+      <ResultBox value={preview} />
+    </RemoteFrame>
+  );
+}
+
+export function I2cTransferNode({ data, selected }: NodeProps) {
+  return <I2cForm data={data} selected={selected} />;
+}
+
+export function EepromProvisionNode({ data, selected }: NodeProps) {
+  return <I2cForm data={data} selected={selected} eeprom />;
 }

@@ -1,6 +1,6 @@
 import type { NodeProps } from '@xyflow/react';
 import type { FlowNodeData } from '../workflow';
-import { NodeHeader, PortHandles } from './shared';
+import { NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './shared';
 
 /** 标定求解节点：显示棋盘参数 + Trigger 触发一次求解。 */
 export function CalibrationSolverNode({ data, selected }: NodeProps) {
@@ -9,6 +9,7 @@ export function CalibrationSolverNode({ data, selected }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const cfg = node.config;
+  const actionPending = Boolean(nodeData.actionPending);
   return (
     <div className="workflow-node-shell">
       <section className={`workflow-node generic-node ${selected ? 'selected' : ''}`}>
@@ -16,19 +17,20 @@ export function CalibrationSolverNode({ data, selected }: NodeProps) {
 
         <PortHandles node={node} />
         <div className="node-body compact">
-          <span className="node-param">
-            <code>board</code>&nbsp;{String(cfg.boardCols ?? 8)}×{String(cfg.boardRows ?? 11)}
-          </span>
-          <span className="node-param">
-            <code>square</code>&nbsp;{String(cfg.squareSizeMm ?? 30)}mm
-          </span>
+          <ScalarConfigFields
+            nodeId={node.id}
+            config={node.config}
+            onChange={nodeData.onNodeConfigChange}
+          />
+          <RuntimeOutputSummary output={nodeData.runtimeOutput} />
           <div className="node-actions">
             <button
               type="button"
-              disabled={runtimeState === 'disabled'}
+              className="nodrag nowheel"
+              disabled={runtimeState === 'disabled' || actionPending}
               onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}
             >
-              {runtimeState === 'running' ? '求解中…' : '求解'}
+              {actionPending ? '处理中…' : runtimeState === 'running' ? '求解中…' : '求解'}
             </button>
           </div>
         </div>

@@ -17,7 +17,9 @@ use super::{
     registry::NodeRegistry,
     runtime::{NodeReporter, NodeRuntime, OutputRegistry, SpawnContext},
     services::EngineServices,
-    spec::{NodeEvent, NodeId, NodeRuntimeState, NodeSpec, NodeStatusReport, PortCardinality, PortId},
+    spec::{
+        NodeEvent, NodeId, NodeRuntimeState, NodeSpec, NodeStatusReport, PortCardinality, PortId,
+    },
 };
 
 /// 端口端点引用。
@@ -54,7 +56,11 @@ pub enum GraphBuildError {
     #[error("node `{0}` failed to instantiate: {1}")]
     Instantiate(NodeId, #[source] NodeError),
     #[error("edge `{edge}` connects a second source into cardinality=One input `{node}:{port}`")]
-    CardinalityViolation { edge: String, node: NodeId, port: PortId },
+    CardinalityViolation {
+        edge: String,
+        node: NodeId,
+        port: PortId,
+    },
     #[error("node `{0}` already exists (incremental add_node)")]
     DuplicateNode(NodeId),
     #[error("edge `{0}` already exists (incremental add_edge)")]
@@ -62,16 +68,18 @@ pub enum GraphBuildError {
     #[error("edge `{edge}` would create a cycle")]
     WouldCreateCycle { edge: String },
     #[error("edge `{edge}` port kinds mismatch: `{from}` != `{to}`")]
-    PortKindMismatch { edge: String, from: String, to: String },
+    PortKindMismatch {
+        edge: String,
+        from: String,
+        to: String,
+    },
 }
 
 /// 节点 actor 句柄。
 struct EngineNodeHandle {
-    kind: String,
     /// 保留完整 spec：增量 add_edge/remove_edge/update_node 需要据此校验端口与 cardinality。
     spec: NodeSpec,
     mailbox: MailboxSender,
-    /// 输出注册表（与 actor 共享同一 `Arc<RwLock>` 下游表）：增量连/断边直接在此 connect/disconnect。
     outputs: OutputRegistry,
     handle: Option<JoinHandle<()>>,
 }
@@ -129,13 +137,17 @@ impl GraphEngine {
         for node in &spec.nodes {
             let (tx, rx) = create_mailbox(4);
             mailboxes.insert(node.id.clone(), (tx, rx));
-            outputs.insert(node.id.clone(), make_output_registry(node.id.clone(), &latest_outputs));
+            outputs.insert(
+                node.id.clone(),
+                make_output_registry(node.id.clone(), &latest_outputs),
+            );
         }
 
         // 3. 接线（fan-out）：源输出端口 → 目标 mailbox。
         //    先按 node_id 建规格索引，校验边的端口确实存在于声明的 inputs/outputs 上，
         //    并执行 D7 cardinality 判重：One 输入端口只允许一条入边。
-        let node_specs: HashMap<&NodeId, &NodeSpec> = spec.nodes.iter().map(|node| (&node.id, node)).collect();
+        let node_specs: HashMap<&NodeId, &NodeSpec> =
+            spec.nodes.iter().map(|node| (&node.id, node)).collect();
         let mut connected_inputs: HashMap<NodeId, HashSet<PortId>> = HashMap::new();
         for edge in &spec.edges {
             validate_edge(edge, &node_specs, &mut connected_inputs)?;
@@ -185,7 +197,6 @@ impl GraphEngine {
             nodes.insert(
                 node.id.clone(),
                 EngineNodeHandle {
-                    kind: node.kind.clone(),
                     spec: node.clone(),
                     mailbox,
                     outputs,
@@ -220,33 +231,6 @@ impl GraphEngine {
             .mailbox
             .send(NodeMessage::Action(action))
             .map_err(|_| NodeError::Execution(format!("node `{node_id}` mailbox closed")))
-    }
-
-    /// 图级 run/start：按 kind 对各节点派发启动动作（源 Connect、按钮 Trigger、auto Arm），
-    /// 其余 kind 无启动动作则跳过。尽力启动：先发完全部动作，再汇总错误，不因单节点失败阻断整图。
-    pub fn start_all(&self) -> Result<(), NodeError> {
-        let inner = self
-            .inner
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let mut errors: Vec<String> = Vec::new();
-        for (node_id, handle) in &inner.nodes {
-            let Some(action) = start_action_for_kind(&handle.kind) else {
-                continue;
-            };
-            if let Err(error) = handle.mailbox.send(NodeMessage::Action(action)) {
-                errors.push(format!("node `{node_id}`: {error:?}"));
-            }
-        }
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(NodeError::Execution(format!(
-                "start_all: {} node(s) failed: {}",
-                errors.len(),
-                errors.join("; ")
-            )))
-        }
     }
 
     /// 非阻塞取回节点状态更新（web 层轮询后推 WebSocket）。
@@ -303,7 +287,10 @@ impl GraphEngine {
 
     /// 停止图：发 Stop 给所有 actor 并等待退出。
     pub fn stop(&mut self) {
-        let inner = self.inner.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let inner = self
+            .inner
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for handle in inner.nodes.values() {
             let _ = handle.mailbox.send(NodeMessage::Stop);
         }
@@ -342,7 +329,11 @@ impl GraphEngine {
 
         let viewer_slot = (node.kind == crate::engine::node::kinds::VIEWER)
             .then(|| Arc::new(LatestDecodedFrameSlot::default()));
-        let reporter = NodeReporter::new(node.id.clone(), self.status_tx.clone(), self.event_tx.clone());
+        let reporter = NodeReporter::new(
+            node.id.clone(),
+            self.status_tx.clone(),
+            self.event_tx.clone(),
+        );
         reporter.report_state(initial_state, diagnostic);
         let handle = spawn_node_actor(
             node.clone(),
@@ -360,7 +351,6 @@ impl GraphEngine {
         inner.nodes.insert(
             node.id.clone(),
             EngineNodeHandle {
-                kind: node.kind.clone(),
                 spec: node,
                 mailbox: mailbox_tx,
                 outputs,
@@ -370,51 +360,59 @@ impl GraphEngine {
         Ok(())
     }
 
-    /// 增量：从运行中的图移除一个节点。先停 actor，再拆所有关联边、清理引用。
+    /// 增量：从运行中的图移除一个节点。先摘图内引用，再停 actor。
     pub fn remove_node(&self, node_id: &str) -> Result<(), GraphBuildError> {
-        let mut inner = self
-            .inner
-            .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(mut handle) = inner.nodes.remove(node_id) else {
-            return Err(GraphBuildError::MissingNode(
-                format!("remove node `{node_id}`"),
-                node_id.to_owned(),
-            ));
-        };
+        let mut handle = {
+            let mut inner = self
+                .inner
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(handle) = inner.nodes.remove(node_id) else {
+                return Err(GraphBuildError::MissingNode(
+                    format!("remove node `{node_id}`"),
+                    node_id.to_owned(),
+                ));
+            };
 
-        // 1. 停该 actor：发 Stop + join，随后再摘 mailbox 引用，避免悬垂。
-        let _ = handle.mailbox.send(NodeMessage::Stop);
-        if let Some(join) = handle.handle.take() {
-            let _ = join.join();
-        }
-
-        // 2. 拆所有与它相关的边：先从上游源输出端口 disconnect 掉对它的 sender，
-        //    再清 edges 注册表。
-        let related: Vec<(String, EdgeSpec)> = inner
-            .edges
-            .iter()
-            .filter(|(_, edge)| edge.source.node_id == node_id || edge.target.node_id == node_id)
-            .map(|(id, edge)| (id.clone(), edge.clone()))
-            .collect();
-        for (id, edge) in &related {
-            // 该边是「别人 → 本节点」：从上游源 disconnect 本节点的 mailbox。
-            if edge.source.node_id != node_id {
-                if let Some(source) = inner.nodes.get_mut(&edge.source.node_id) {
+            // 先断开所有相关边并从图中摘除该节点；释放图锁后再 join，避免慢停止卡住全图读写。
+            let related: Vec<(String, EdgeSpec)> = inner
+                .edges
+                .iter()
+                .filter(|(_, edge)| {
+                    edge.source.node_id == node_id || edge.target.node_id == node_id
+                })
+                .map(|(id, edge)| (id.clone(), edge.clone()))
+                .collect();
+            for (id, edge) in &related {
+                if edge.source.node_id == node_id {
+                    if let Some(target) = inner.nodes.get(&edge.target.node_id) {
+                        handle
+                            .outputs
+                            .disconnect(edge.source.port_id.clone(), &target.mailbox);
+                    }
+                } else if let Some(source) = inner.nodes.get_mut(&edge.source.node_id) {
                     source
                         .outputs
                         .disconnect(edge.source.port_id.clone(), &handle.mailbox);
                 }
+                inner.edges.remove(id);
             }
-            inner.edges.remove(id);
-        }
 
-        // 3. 清 viewer_slot 与 latest_outputs 记录。
-        inner.viewer_slots.remove(node_id);
-        self.latest_outputs
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(node_id);
+            inner.viewer_slots.remove(node_id);
+            self.latest_outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(node_id);
+            handle
+        };
+
+        let _ = handle.mailbox.send(NodeMessage::Stop);
+        if let Some(join) = handle.handle.take() {
+            let join_name = format!("node-stop-{}", node_id);
+            let _ = std::thread::Builder::new().name(join_name).spawn(move || {
+                let _ = join.join();
+            });
+        }
         Ok(())
     }
 
@@ -438,7 +436,9 @@ impl GraphEngine {
         validate_edge(&edge, &index, &mut connected)?;
         // 成环检测：沿目标 → 源方向 BFS，确认不会回到源。
         if would_create_cycle(&inner.edges, &edge) {
-            return Err(GraphBuildError::WouldCreateCycle { edge: edge.id.clone() });
+            return Err(GraphBuildError::WouldCreateCycle {
+                edge: edge.id.clone(),
+            });
         }
         let target_mailbox = inner
             .nodes
@@ -484,18 +484,18 @@ impl GraphEngine {
     }
 
     /// 增量：更新节点 config（本阶段为 config 替换），保留其余 spec 字段不动。
-    pub fn update_node(&self, node_id: &str, config: serde_json::Value) -> Result<(), GraphBuildError> {
+    pub fn update_node(
+        &self,
+        node_id: &str,
+        config: serde_json::Value,
+    ) -> Result<(), GraphBuildError> {
         let mut inner = self
             .inner
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let handle = inner
-            .nodes
-            .get_mut(node_id)
-            .ok_or_else(|| GraphBuildError::MissingNode(
-                format!("update node `{node_id}`"),
-                node_id.to_owned(),
-            ))?;
+        let handle = inner.nodes.get_mut(node_id).ok_or_else(|| {
+            GraphBuildError::MissingNode(format!("update node `{node_id}`"), node_id.to_owned())
+        })?;
         handle.spec.config = config;
         Ok(())
     }
@@ -508,19 +508,20 @@ impl Drop for GraphEngine {
 }
 
 impl Inner {
-    fn new(nodes: HashMap<NodeId, EngineNodeHandle>, edges: Vec<EdgeSpec>, viewer_slots: HashMap<NodeId, Arc<LatestDecodedFrameSlot>>) -> Self {
-        let edges = edges.into_iter().map(|edge| (edge.id.clone(), edge)).collect();
-        Self { nodes, edges, viewer_slots }
-    }
-}
-
-/// 图级启动：按 kind 映射到启动动作；无启动动作的 kind 返回 `None`（跳过）。
-fn start_action_for_kind(kind: &str) -> Option<NodeAction> {
-    match kind {
-        "rtspSource" | "localFileSource" => Some(NodeAction::Connect),
-        "calibrationSolver" => Some(NodeAction::Trigger),
-        "autoCaptureController" => Some(NodeAction::Arm),
-        _ => None,
+    fn new(
+        nodes: HashMap<NodeId, EngineNodeHandle>,
+        edges: Vec<EdgeSpec>,
+        viewer_slots: HashMap<NodeId, Arc<LatestDecodedFrameSlot>>,
+    ) -> Self {
+        let edges = edges
+            .into_iter()
+            .map(|edge| (edge.id.clone(), edge))
+            .collect();
+        Self {
+            nodes,
+            edges,
+            viewer_slots,
+        }
     }
 }
 
@@ -538,7 +539,11 @@ fn initial_state(node: &NodeSpec, connected: Option<&HashSet<PortId>>) -> NodeRu
     }
 }
 
-fn state_diagnostic(state: NodeRuntimeState, connected: &HashSet<PortId>, node: &NodeSpec) -> String {
+fn state_diagnostic(
+    state: NodeRuntimeState,
+    connected: &HashSet<PortId>,
+    node: &NodeSpec,
+) -> String {
     match state {
         NodeRuntimeState::Disabled => {
             let missing: Vec<&str> = node
@@ -628,31 +633,35 @@ fn validate_edge(
     specs: &HashMap<&NodeId, &NodeSpec>,
     connected: &mut HashMap<NodeId, HashSet<PortId>>,
 ) -> Result<(), GraphBuildError> {
-    let source_spec = specs
-        .get(&edge.source.node_id)
-        .ok_or_else(|| GraphBuildError::MissingNode(edge.id.clone(), edge.source.node_id.clone()))?;
-    let target_spec = specs
-        .get(&edge.target.node_id)
-        .ok_or_else(|| GraphBuildError::MissingNode(edge.id.clone(), edge.target.node_id.clone()))?;
+    let source_spec = specs.get(&edge.source.node_id).ok_or_else(|| {
+        GraphBuildError::MissingNode(edge.id.clone(), edge.source.node_id.clone())
+    })?;
+    let target_spec = specs.get(&edge.target.node_id).ok_or_else(|| {
+        GraphBuildError::MissingNode(edge.id.clone(), edge.target.node_id.clone())
+    })?;
 
     let source_port = source_spec
         .outputs
         .iter()
         .find(|port| port.id == edge.source.port_id)
-        .ok_or_else(|| GraphBuildError::MissingPort(
-            edge.id.clone(),
-            edge.source.port_id.clone(),
-            edge.source.node_id.clone(),
-        ))?;
+        .ok_or_else(|| {
+            GraphBuildError::MissingPort(
+                edge.id.clone(),
+                edge.source.port_id.clone(),
+                edge.source.node_id.clone(),
+            )
+        })?;
     let target_port = target_spec
         .inputs
         .iter()
         .find(|port| port.id == edge.target.port_id)
-        .ok_or_else(|| GraphBuildError::MissingPort(
-            edge.id.clone(),
-            edge.target.port_id.clone(),
-            edge.target.node_id.clone(),
-        ))?;
+        .ok_or_else(|| {
+            GraphBuildError::MissingPort(
+                edge.id.clone(),
+                edge.target.port_id.clone(),
+                edge.target.node_id.clone(),
+            )
+        })?;
 
     // schema 匹配：源输出 port.kind 必须等于目标输入 port.kind。
     if source_port.kind != target_port.kind {
@@ -665,7 +674,9 @@ fn validate_edge(
 
     // D7 cardinality：One 输入端口只允许一条入边。
     let target_connected = connected.entry(edge.target.node_id.clone()).or_default();
-    if target_port.cardinality == PortCardinality::One && target_connected.contains(&edge.target.port_id) {
+    if target_port.cardinality == PortCardinality::One
+        && target_connected.contains(&edge.target.port_id)
+    {
         return Err(GraphBuildError::CardinalityViolation {
             edge: edge.id.clone(),
             node: edge.target.node_id.clone(),
@@ -700,7 +711,11 @@ fn all_connected_inputs(edges: &HashMap<String, EdgeSpec>) -> HashMap<NodeId, Ha
 /// 从运行内注册表快照一张 `GraphSpec`，供增量校验复用（自有数据，避免借用冲突）。
 fn snapshot_spec(inner: &Inner) -> GraphSpec {
     GraphSpec {
-        nodes: inner.nodes.values().map(|handle| handle.spec.clone()).collect(),
+        nodes: inner
+            .nodes
+            .values()
+            .map(|handle| handle.spec.clone())
+            .collect(),
         edges: inner.edges.values().cloned().collect(),
     }
 }
@@ -734,9 +749,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use super::*;
-    use crate::engine::{DataPacket, NodeFactory, PortSpec};
     use crate::engine::services::StreamServiceFactory;
     use crate::engine::spec::PortCardinality;
+    use crate::engine::{DataPacket, NodeFactory, PortSpec};
     use crate::platform::StreamService;
 
     struct PassthroughFactory;
@@ -773,7 +788,11 @@ mod tests {
             Ok(())
         }
 
-        fn on_action(&mut self, _action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        fn on_action(
+            &mut self,
+            _action: NodeAction,
+            _rt: &mut NodeRuntime,
+        ) -> Result<(), NodeError> {
             Ok(())
         }
 
@@ -844,11 +863,18 @@ mod tests {
                 DataPacket::Json(value) => value["src"].as_str().unwrap_or("?").to_owned(),
                 _ => "?".to_owned(),
             };
-            self.received.lock().unwrap().push((port.to_owned(), marker));
+            self.received
+                .lock()
+                .unwrap()
+                .push((port.to_owned(), marker));
             Ok(())
         }
 
-        fn on_action(&mut self, _action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        fn on_action(
+            &mut self,
+            _action: NodeAction,
+            _rt: &mut NodeRuntime,
+        ) -> Result<(), NodeError> {
             Ok(())
         }
 
@@ -932,14 +958,20 @@ mod tests {
         let mut registry = NodeRegistry::new();
         registry.register(Box::new(PassthroughFactory));
         let spec = GraphSpec {
-            nodes: vec![node_spec("b", vec![port("in", true)], vec![port("out", false)])],
+            nodes: vec![node_spec(
+                "b",
+                vec![port("in", true)],
+                vec![port("out", false)],
+            )],
             edges: vec![],
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         let statuses = engine.drain_status();
-        assert!(statuses.iter().any(|status| {
-            status.node_id == "b" && status.state == NodeRuntimeState::Disabled
-        }));
+        assert!(
+            statuses.iter().any(|status| {
+                status.node_id == "b" && status.state == NodeRuntimeState::Disabled
+            })
+        );
         let _ = engine;
     }
 
@@ -956,9 +988,11 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         let statuses = engine.drain_status();
-        assert!(statuses.iter().any(|status| {
-            status.node_id == "b" && status.state == NodeRuntimeState::Idle
-        }));
+        assert!(
+            statuses
+                .iter()
+                .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Idle })
+        );
         let _ = engine;
     }
 
@@ -1045,71 +1079,12 @@ mod tests {
         let _ = engine;
     }
 
-    #[test]
-    fn start_action_maps_kinds_to_actions() {
-        // 源 → Connect、按钮 → Trigger、auto → Arm、其余 → 跳过。
-        assert!(matches!(
-            start_action_for_kind("rtspSource"),
-            Some(NodeAction::Connect)
-        ));
-        assert!(matches!(
-            start_action_for_kind("localFileSource"),
-            Some(NodeAction::Connect)
-        ));
-        assert!(matches!(
-            start_action_for_kind("calibrationSolver"),
-            Some(NodeAction::Trigger)
-        ));
-        assert!(matches!(
-            start_action_for_kind("autoCaptureController"),
-            Some(NodeAction::Arm)
-        ));
-        // 变换/图层/viewer/composite/skeleton 等无启动动作的 kind 跳过。
-        for skipped in [
-            "frameSampler",
-            "rtspDecoder",
-            "videoLayer",
-            "imageLayer",
-            "viewer",
-            "overlayComposer",
-            "datasetCollector",
-            "coverageAnalyzer",
-            "poseGuide",
-            "chessboardDetector",
-            "sftpFileSource",
-            "sshSession",
-            "x5Device",
-            "i2cTransfer",
-            "eepromProvision",
-            "passthrough",
-        ] {
-            assert!(matches!(start_action_for_kind(skipped), None), "{skipped} must be skipped");
-        }
-    }
-
-    #[test]
-    fn start_all_dispatches_to_live_nodes_without_error() {
-        // 用内置 registry 建一个含源/按钮/auto/变换的混合图；start_all 尽力派发应返回 Ok。
-        let mut registry = NodeRegistry::new();
-        crate::engine::register_builtin(&mut registry);
-
-        let spec = GraphSpec {
-            nodes: vec![
-                node_spec_with_kind("src", "rtspSource", vec![], vec![]),
-                node_spec_with_kind("solver", "calibrationSolver", vec![], vec![]),
-                node_spec_with_kind("auto", "autoCaptureController", vec![], vec![]),
-                node_spec_with_kind("sampler", "frameSampler", vec![], vec![]),
-            ],
-            edges: vec![],
-        };
-        let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
-        // rtspSource 的 Connect 会在 on_action 里因缺 stream_factory 报错，但那是 actor 内部事件，
-        // 不影响 start_all 的「投递成功」判定；只要 mailbox 存活即 Ok。
-        assert!(engine.start_all().is_ok());
-        let _ = engine;
-    }
-
-    fn node_spec_with_kind(id: &str, kind: &str, inputs: Vec<PortSpec>, outputs: Vec<PortSpec>) -> NodeSpec {
+    fn node_spec_with_kind(
+        id: &str,
+        kind: &str,
+        inputs: Vec<PortSpec>,
+        outputs: Vec<PortSpec>,
+    ) -> NodeSpec {
         NodeSpec {
             id: id.to_owned(),
             kind: kind.to_owned(),
@@ -1153,8 +1128,18 @@ mod tests {
         let spec = GraphSpec {
             nodes: vec![
                 node_spec_with_kind("src", "emitter", vec![], vec![port("out", false)]),
-                node_spec_with_kind("a", "passthrough", vec![port("in", false)], vec![port("out", false)]),
-                node_spec_with_kind("b", "passthrough", vec![port("in", false)], vec![port("out", false)]),
+                node_spec_with_kind(
+                    "a",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
+                node_spec_with_kind(
+                    "b",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
             ],
             edges: vec![
                 edge_with_ports("e1", "src", "out", "a", "in"),
@@ -1164,12 +1149,15 @@ mod tests {
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
 
         // 触发源：它向 "out" emit 一次，fan-out 到 a/b 两个下游 mailbox。
-        engine.send_action("src", NodeAction::Trigger).expect("trigger src");
+        engine
+            .send_action("src", NodeAction::Trigger)
+            .expect("trigger src");
 
         // actor 在线程里跑，短等待 + 轮询直到两个下游都回灌了最近输出。
-        wait_until(|| {
-            engine.latest_output("a").is_some() && engine.latest_output("b").is_some()
-        }, "fan-out targets A/B 均产出");
+        wait_until(
+            || engine.latest_output("a").is_some() && engine.latest_output("b").is_some(),
+            "fan-out targets A/B 均产出",
+        );
 
         assert!(engine.latest_output("a").is_some(), "A 应收到 fan-out 数据");
         assert!(engine.latest_output("b").is_some(), "B 应收到 fan-out 数据");
@@ -1220,11 +1208,18 @@ mod tests {
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
 
         // 两个源各触发一次，分别经不同端口 fan-in 到同一个 Recorder。
-        engine.send_action("src_a", NodeAction::Trigger).expect("trigger src_a");
-        engine.send_action("src_b", NodeAction::Trigger).expect("trigger src_b");
+        engine
+            .send_action("src_a", NodeAction::Trigger)
+            .expect("trigger src_a");
+        engine
+            .send_action("src_b", NodeAction::Trigger)
+            .expect("trigger src_b");
 
         // Recorder 收到两个不同端口的数据，端口区分正确。
-        wait_until(|| received.lock().unwrap().len() >= 2, "fan-in 两个端口均到达");
+        wait_until(
+            || received.lock().unwrap().len() >= 2,
+            "fan-in 两个端口均到达",
+        );
 
         let mut got = received.lock().unwrap().clone();
         got.sort();
@@ -1250,7 +1245,13 @@ mod tests {
     }
 
     /// 构造一条指定端口 id 的边（fan-out/fan-in 测试需要自定义端口命名）。
-    fn edge_with_ports(id: &str, source: &str, source_port: &str, target: &str, target_port: &str) -> EdgeSpec {
+    fn edge_with_ports(
+        id: &str,
+        source: &str,
+        source_port: &str,
+        target: &str,
+        target_port: &str,
+    ) -> EdgeSpec {
         EdgeSpec {
             id: id.to_owned(),
             source: PortEndpoint {
@@ -1284,17 +1285,9 @@ mod tests {
             nodes: vec![
                 node_spec_with_kind("a1", "passthrough", vec![], vec![port("out", false)]),
                 node_spec_with_kind("a2", "passthrough", vec![], vec![port("out", false)]),
-                node_spec_with_kind(
-                    "b",
-                    "passthrough",
-                    vec![port("in", true)],
-                    vec![],
-                ),
+                node_spec_with_kind("b", "passthrough", vec![port("in", true)], vec![]),
             ],
-            edges: vec![
-                edge("e1", "a1", "b"),
-                edge("e2", "a2", "b"),
-            ],
+            edges: vec![edge("e1", "a1", "b"), edge("e2", "a2", "b")],
         };
         let result = GraphEngine::build(spec, &registry, EngineServices::default());
         let err = result.as_ref().err();
@@ -1320,7 +1313,9 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
 
-        engine.add_edge(edge("e1", "a1", "b")).expect("first edge ok");
+        engine
+            .add_edge(edge("e1", "a1", "b"))
+            .expect("first edge ok");
         let second = engine.add_edge(edge("e2", "a2", "b"));
         assert!(
             matches!(second, Err(GraphBuildError::CardinalityViolation { .. })),
@@ -1348,7 +1343,9 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         engine.add_edge(edge("e1", "a1", "b")).expect("first ok");
-        engine.add_edge(edge("e2", "a2", "b")).expect("second ok on Many input");
+        engine
+            .add_edge(edge("e2", "a2", "b"))
+            .expect("second ok on Many input");
     }
 
     #[test]
@@ -1357,8 +1354,18 @@ mod tests {
         registry.register(Box::new(PassthroughFactory));
         let spec = GraphSpec {
             nodes: vec![
-                node_spec_with_kind("a", "passthrough", vec![port("in", false)], vec![port("out", false)]),
-                node_spec_with_kind("b", "passthrough", vec![port("in", false)], vec![port("out", false)]),
+                node_spec_with_kind(
+                    "a",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
+                node_spec_with_kind(
+                    "b",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
             ],
             edges: vec![edge("e1", "a", "b")],
         };
@@ -1414,28 +1421,45 @@ mod tests {
         let spec = GraphSpec {
             nodes: vec![
                 node_spec_with_kind("src", "emitter", vec![], vec![port("out", false)]),
-                node_spec_with_kind("b", "passthrough", vec![port("in", false)], vec![port("out", false)]),
+                node_spec_with_kind(
+                    "b",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
             ],
             edges: vec![],
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
 
         // 初始未连边，触发无下游（latest_output("b") 仍为 None）。
-        engine.send_action("src", NodeAction::Trigger).expect("trigger");
+        engine
+            .send_action("src", NodeAction::Trigger)
+            .expect("trigger");
         std::thread::sleep(std::time::Duration::from_millis(50));
         assert!(engine.latest_output("b").is_none(), "未连边时 b 不应有输出");
 
         // 连边后触发，数据流生效。
-        engine.add_edge(edge_with_ports("e1", "src", "out", "b", "in")).expect("add edge");
-        engine.send_action("src", NodeAction::Trigger).expect("trigger");
-        wait_until(|| engine.latest_output("b").is_some(), "data flows to b after add_edge");
+        engine
+            .add_edge(edge_with_ports("e1", "src", "out", "b", "in"))
+            .expect("add edge");
+        engine
+            .send_action("src", NodeAction::Trigger)
+            .expect("trigger");
+        wait_until(
+            || engine.latest_output("b").is_some(),
+            "data flows to b after add_edge",
+        );
         assert!(engine.latest_output("b").is_some());
 
         // 断边后触发，b 不再有更新（latest_output 保留旧值，改用新触发验证无变化不现实，这里仅验证断边本身不报错且边被移除）。
         engine.remove_edge("e1").expect("remove edge");
         // 再触发，b 的 latest_output 仍为旧值，且不新增（由于无法清除，仅验证 remove_edge 幂等 + 二次 remove 报 MissingNode）。
         let again = engine.remove_edge("e1");
-        assert!(matches!(again, Err(GraphBuildError::MissingNode(..))), "second remove must miss: {again:?}");
+        assert!(
+            matches!(again, Err(GraphBuildError::MissingNode(..))),
+            "second remove must miss: {again:?}"
+        );
     }
 
     #[test]
@@ -1444,28 +1468,52 @@ mod tests {
         registry.register(Box::new(EmitterFactory));
         registry.register(Box::new(PassthroughFactory));
         let spec = GraphSpec {
-            nodes: vec![
-                node_spec_with_kind("src", "emitter", vec![], vec![port("out", false)]),
-            ],
+            nodes: vec![node_spec_with_kind(
+                "src",
+                "emitter",
+                vec![],
+                vec![port("out", false)],
+            )],
             edges: vec![],
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
 
-        let new_node = node_spec_with_kind("b", "passthrough", vec![port("in", false)], vec![port("out", false)]);
+        let new_node = node_spec_with_kind(
+            "b",
+            "passthrough",
+            vec![port("in", false)],
+            vec![port("out", false)],
+        );
         engine.add_node(new_node, &registry).expect("add node");
         // 重复 add_node 被拒。
-        let dup = engine.add_node(node_spec_with_kind("b", "passthrough", vec![], vec![]), &registry);
-        assert!(matches!(dup, Err(GraphBuildError::DuplicateNode(_))), "dup: {dup:?}");
+        let dup = engine.add_node(
+            node_spec_with_kind("b", "passthrough", vec![], vec![]),
+            &registry,
+        );
+        assert!(
+            matches!(dup, Err(GraphBuildError::DuplicateNode(_))),
+            "dup: {dup:?}"
+        );
 
         // 连边 + 数据流。
-        engine.add_edge(edge_with_ports("e1", "src", "out", "b", "in")).expect("add edge");
-        engine.send_action("src", NodeAction::Trigger).expect("trigger");
-        wait_until(|| engine.latest_output("b").is_some(), "data flows after add_node+add_edge");
+        engine
+            .add_edge(edge_with_ports("e1", "src", "out", "b", "in"))
+            .expect("add edge");
+        engine
+            .send_action("src", NodeAction::Trigger)
+            .expect("trigger");
+        wait_until(
+            || engine.latest_output("b").is_some(),
+            "data flows after add_node+add_edge",
+        );
 
         // remove_node：级联拆边 + 清输出 + 摘除。
         engine.remove_node("b").expect("remove node");
         let missing = engine.send_action("b", NodeAction::Trigger);
-        assert!(matches!(missing, Err(NodeError::Precondition(_))), "b must be gone: {missing:?}");
+        assert!(
+            matches!(missing, Err(NodeError::Precondition(_))),
+            "b must be gone: {missing:?}"
+        );
     }
 
     #[test]
@@ -1477,8 +1525,12 @@ mod tests {
             edges: vec![],
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
-        engine.update_node("a", serde_json::json!({"url": "rtsp://x"})).expect("update");
-        engine.update_node("missing", serde_json::json!({})).expect_err("missing node must err");
+        engine
+            .update_node("a", serde_json::json!({"url": "rtsp://x"}))
+            .expect("update");
+        engine
+            .update_node("missing", serde_json::json!({}))
+            .expect_err("missing node must err");
     }
 
     /// 端到端 viewer 显示帧率基准（离线 mock 解码器，忽略不随常规测试跑）：
@@ -1487,8 +1539,8 @@ mod tests {
     #[test]
     #[ignore = "端到端 viewer 显示帧率基准，需 4s，手动 --ignored 运行"]
     fn viewer_display_fps_end_to_end_benchmark() {
-        use std::sync::atomic::Ordering;
         use crate::platform::{DecodedVideoFrame, StreamFrameIdentity};
+        use std::sync::atomic::Ordering;
 
         struct BurstMockService {
             slot: Arc<LatestDecodedFrameSlot>,
@@ -1505,7 +1557,8 @@ mod tests {
                 session_id: crate::platform::StreamSessionId,
                 _request: crate::platform::StreamOpenRequest,
                 control: crate::platform::StreamOperationControl,
-            ) -> Result<crate::platform::StreamSession, crate::platform::StreamServiceError> {
+            ) -> Result<crate::platform::StreamSession, crate::platform::StreamServiceError>
+            {
                 let slot = Arc::clone(&self.slot);
                 let fps = self.fps;
                 let burst = self.burst;
@@ -1521,7 +1574,10 @@ mod tests {
                                 height: 64,
                                 rgba: Arc::from(vec![0u8; 64 * 64 * 4]),
                                 identity: StreamFrameIdentity::unavailable(
-                                    producer_session.clone(), 0, seq, "bench",
+                                    producer_session.clone(),
+                                    0,
+                                    seq,
+                                    "bench",
                                 ),
                             });
                         }
@@ -1621,19 +1677,33 @@ mod tests {
             edges: vec![
                 EdgeSpec {
                     id: "e1".to_owned(),
-                    source: PortEndpoint { node_id: "rtsp".to_owned(), port_id: "endpoint".to_owned() },
-                    target: PortEndpoint { node_id: "layer".to_owned(), port_id: "frames".to_owned() },
+                    source: PortEndpoint {
+                        node_id: "rtsp".to_owned(),
+                        port_id: "endpoint".to_owned(),
+                    },
+                    target: PortEndpoint {
+                        node_id: "layer".to_owned(),
+                        port_id: "frames".to_owned(),
+                    },
                 },
                 EdgeSpec {
                     id: "e2".to_owned(),
-                    source: PortEndpoint { node_id: "layer".to_owned(), port_id: "layer".to_owned() },
-                    target: PortEndpoint { node_id: "viewer".to_owned(), port_id: "video".to_owned() },
+                    source: PortEndpoint {
+                        node_id: "layer".to_owned(),
+                        port_id: "layer".to_owned(),
+                    },
+                    target: PortEndpoint {
+                        node_id: "viewer".to_owned(),
+                        port_id: "video".to_owned(),
+                    },
                 },
             ],
         };
 
         let engine = GraphEngine::build(spec, &registry, services).expect("build");
-        engine.start_all().expect("start_all");
+        engine
+            .send_action("rtsp", NodeAction::Connect)
+            .expect("connect rtsp");
 
         // 预热 500ms 让链路稳定。
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -1659,7 +1729,10 @@ mod tests {
             "viewer benchmark: 60fps burst=3 解码 → 4s 内前端 250ms 轮询实际显示新帧 {displayed} 帧 = {:.1} fps；轮询命中引擎侧帧 {engine_frames} 次",
             displayed as f64 / 4.0
         );
-        assert!(displayed <= 16, "250ms 轮询 4s 最多显示 16 帧，实际 {displayed}");
+        assert!(
+            displayed <= 16,
+            "250ms 轮询 4s 最多显示 16 帧，实际 {displayed}"
+        );
     }
 
     /// 从引擎侧最新帧序列近似生产者总数（帧序号单调递增）。

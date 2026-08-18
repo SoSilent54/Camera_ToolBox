@@ -3,7 +3,10 @@
 //! `Arm` 后进入待命状态；收到评分输入且超过阈值时自动输出抓帧命令。
 //! 这是「arm/disarm + 条件自动触发」的完整样板。
 
-use std::sync::Arc;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde_json::json;
 
@@ -23,6 +26,7 @@ impl NodeFactory for AutoCaptureFactory {
         Ok(Box::new(AutoCaptureNode {
             spec,
             armed: false,
+            last_capture_at: None,
         }))
     }
 }
@@ -30,6 +34,7 @@ impl NodeFactory for AutoCaptureFactory {
 pub struct AutoCaptureNode {
     spec: NodeSpec,
     armed: bool,
+    last_capture_at: Option<Instant>,
 }
 
 impl NodeInstance for AutoCaptureNode {
@@ -51,22 +56,38 @@ impl NodeInstance for AutoCaptureNode {
         if port != "score" || !self.armed {
             return Ok(());
         }
-        let DataPacket::Json(score) = packet else {
-            return Ok(());
+        let DataPacket::Score(score) = packet else {
+            return Err(NodeError::Precondition(
+                "autoCaptureController.score requires capture.score".to_owned(),
+            ));
         };
-        let gain = score.get("gain").and_then(serde_json::Value::as_f64).unwrap_or(0.0);
+        let gain = score
+            .get("gain")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0);
         let threshold = config_f64(&self.spec, "triggerThreshold", 0.5);
-        if gain >= threshold {
-            rt.emit(
-                "command",
-                DataPacket::Json(Arc::new(json!({
-                    "action": "capture",
-                    "reason": "score-gain",
-                    "gain": gain,
-                }))),
-            )?;
-            rt.report_event(format!("auto-capture triggered (gain {gain:.3} ≥ {threshold})"));
+        if gain < threshold {
+            return Ok(());
         }
+        let cooldown = Duration::from_millis(config_u64(&self.spec, "cooldownMs", 800));
+        if self
+            .last_capture_at
+            .is_some_and(|last| last.elapsed() < cooldown)
+        {
+            return Ok(());
+        }
+        rt.emit(
+            "command",
+            DataPacket::Json(Arc::new(json!({
+                "action": "capture",
+                "reason": "score-gain",
+                "gain": gain,
+            }))),
+        )?;
+        self.last_capture_at = Some(Instant::now());
+        rt.report_event(format!(
+            "auto-capture triggered (gain {gain:.3} ≥ {threshold})"
+        ));
         Ok(())
     }
 
@@ -74,11 +95,13 @@ impl NodeInstance for AutoCaptureNode {
         match action {
             NodeAction::Arm => {
                 self.armed = true;
+                self.last_capture_at = None;
                 rt.report_state(NodeRuntimeState::Running, "armed");
                 Ok(())
             }
             NodeAction::Disarm => {
                 self.armed = false;
+                self.last_capture_at = None;
                 rt.report_state(NodeRuntimeState::Idle, "disarmed");
                 Ok(())
             }
@@ -88,6 +111,7 @@ impl NodeInstance for AutoCaptureNode {
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         self.armed = false;
+        self.last_capture_at = None;
         rt.report_state(NodeRuntimeState::Idle, "stopped");
         Ok(())
     }
@@ -100,14 +124,19 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
         .unwrap_or(fallback)
 }
 
+fn config_u64(spec: &NodeSpec, key: &str, fallback: u64) -> u64 {
+    spec.config
+        .get(key)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(fallback)
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
-    use crate::engine::{
-        NodeReporter, OutputRegistry, PortCardinality, PortSpec, SpawnContext,
-    };
+    use crate::engine::{NodeReporter, OutputRegistry, PortCardinality, PortSpec, SpawnContext};
 
     fn spec() -> NodeSpec {
         NodeSpec {
@@ -132,7 +161,9 @@ mod tests {
         }
     }
 
-    fn runtime(state_tx: mpsc::Sender<crate::engine::NodeStatusReport>) -> (NodeRuntime, OutputRegistry) {
+    fn runtime(
+        state_tx: mpsc::Sender<crate::engine::NodeStatusReport>,
+    ) -> (NodeRuntime, OutputRegistry) {
         let (event_tx, _event_rx) = mpsc::channel();
         let reporter = NodeReporter::new("auto-1".to_owned(), state_tx, event_tx);
         let outputs = OutputRegistry::default();
@@ -146,7 +177,9 @@ mod tests {
         (NodeRuntime::new(ctx), outputs)
     }
 
-    fn last_state(rx: &mpsc::Receiver<crate::engine::NodeStatusReport>) -> Option<NodeRuntimeState> {
+    fn last_state(
+        rx: &mpsc::Receiver<crate::engine::NodeStatusReport>,
+    ) -> Option<NodeRuntimeState> {
         let mut last = None;
         while let Ok(report) = rx.try_recv() {
             last = Some(report.state);
@@ -155,7 +188,7 @@ mod tests {
     }
 
     fn score(gain: f64) -> DataPacket {
-        DataPacket::Json(Arc::new(serde_json::json!({"gain": gain})))
+        DataPacket::Score(Arc::new(serde_json::json!({"gain": gain})))
     }
 
     #[test]
@@ -194,7 +227,8 @@ mod tests {
 
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
         // 未 arm，即使 gain 超标也不触发
-        node.on_input("score", score(0.9), &mut rt).expect("on_input");
+        node.on_input("score", score(0.9), &mut rt)
+            .expect("on_input");
         assert_eq!(*emitted.lock().unwrap(), 0);
     }
 
@@ -224,7 +258,8 @@ mod tests {
         node.on_action(NodeAction::Arm, &mut rt).expect("arm");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
 
-        node.on_input("score", score(0.8), &mut rt).expect("on_input");
+        node.on_input("score", score(0.8), &mut rt)
+            .expect("on_input");
         let commands = commands.lock().unwrap().clone();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0]["action"], "capture");
@@ -251,7 +286,8 @@ mod tests {
 
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
         node.on_action(NodeAction::Arm, &mut rt).expect("arm");
-        node.on_input("score", score(0.1), &mut rt).expect("on_input");
+        node.on_input("score", score(0.1), &mut rt)
+            .expect("on_input");
         assert_eq!(*emitted.lock().unwrap(), 0);
     }
 
@@ -275,7 +311,9 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel();
         let (mut rt, _outputs) = runtime(state_tx);
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
-        let err = node.on_action(NodeAction::Trigger, &mut rt).expect_err("unsupported");
+        let err = node
+            .on_action(NodeAction::Trigger, &mut rt)
+            .expect_err("unsupported");
         assert!(matches!(err, NodeError::UnsupportedAction(_)));
     }
 }

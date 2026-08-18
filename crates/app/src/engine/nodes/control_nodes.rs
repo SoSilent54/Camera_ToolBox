@@ -83,8 +83,9 @@ impl I2cTransferNode {
         let target = self.target()?;
         let action = self.i2c_action()?;
         let executor = rt.services().i2c_executor()?;
-        let control = RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
-            .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let control =
+            RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
+                .map_err(|error| NodeError::Execution(error.to_string()))?;
 
         rt.report_state(NodeRuntimeState::Running, "executing I2C transfer");
         let result: I2cHelperResult = executor
@@ -100,7 +101,9 @@ impl I2cTransferNode {
     fn target(&self) -> Result<ControlTargetSpec, NodeError> {
         let host = config_string(&self.spec, "host");
         if host.trim().is_empty() {
-            return Err(NodeError::Precondition("config `host` is required".to_owned()));
+            return Err(NodeError::Precondition(
+                "config `host` is required".to_owned(),
+            ));
         }
         let port = config_string(&self.spec, "port");
         let port = if port.trim().is_empty() {
@@ -111,7 +114,11 @@ impl I2cTransferNode {
                 .map_err(|_| NodeError::Config("config `port` must be a valid u16".to_owned()))?
         };
         let username = config_string(&self.spec, "username");
-        let username = if username.trim().is_empty() { "root".to_owned() } else { username };
+        let username = if username.trim().is_empty() {
+            "root".to_owned()
+        } else {
+            username
+        };
         let expected_host_key = non_empty(config_string(&self.spec, "expectedHostKey"));
         Ok(ControlTargetSpec {
             host,
@@ -124,7 +131,9 @@ impl I2cTransferNode {
     fn credential_ref(&self) -> Result<String, NodeError> {
         let credential_ref = config_string(&self.spec, "credentialRef");
         if credential_ref.trim().is_empty() {
-            return Err(NodeError::Precondition("config `credentialRef` is required".to_owned()));
+            return Err(NodeError::Precondition(
+                "config `credentialRef` is required".to_owned(),
+            ));
         }
         Ok(credential_ref)
     }
@@ -144,7 +153,9 @@ impl I2cTransferNode {
                     I2cMessageSpec {
                         address,
                         flags: vec![],
-                        data: I2cMessageData::Write { bytes: register.to_be_bytes().to_vec() },
+                        data: I2cMessageData::Write {
+                            bytes: register.to_be_bytes().to_vec(),
+                        },
                     },
                     I2cMessageSpec {
                         address,
@@ -156,7 +167,11 @@ impl I2cTransferNode {
             }],
             // write：按 pageSize 把 payload 分段成多个 transaction，每段 register 地址 + chunk，写后 settle。
             "write" => page_write_transactions(bus, address, register, &self.spec)?,
-            other => return Err(NodeError::Config(format!("unsupported mode `{other}` (read/write)"))),
+            other => {
+                return Err(NodeError::Config(format!(
+                    "unsupported mode `{other}` (read/write)"
+                )));
+            }
         };
 
         Ok(I2cHelperAction::Transfer { transactions })
@@ -189,7 +204,10 @@ impl NodeInstance for EepromProvisionNode {
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Ready, "trigger to inspect/provision EEPROM");
+        rt.report_state(
+            NodeRuntimeState::Ready,
+            "trigger to inspect/provision EEPROM",
+        );
         Ok(())
     }
 
@@ -221,8 +239,9 @@ impl EepromProvisionNode {
         let credential_ref = self.credential_ref()?;
         let action = self.eeprom_action()?;
         let executor = rt.services().eeprom_executor()?;
-        let control = RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
-            .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let control =
+            RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
+                .map_err(|error| NodeError::Execution(error.to_string()))?;
 
         rt.report_state(NodeRuntimeState::Running, "executing EEPROM operation");
         let result = executor
@@ -237,16 +256,24 @@ impl EepromProvisionNode {
     fn target(&self) -> Result<ControlTargetSpec, NodeError> {
         let host = config_string(&self.spec, "host");
         if host.trim().is_empty() {
-            return Err(NodeError::Precondition("config `host` is required".to_owned()));
+            return Err(NodeError::Precondition(
+                "config `host` is required".to_owned(),
+            ));
         }
         let port = config_string(&self.spec, "port");
         let port = if port.trim().is_empty() {
             22
         } else {
-            port.trim().parse::<u16>().map_err(|_| NodeError::Config("config `port` must be u16".to_owned()))?
+            port.trim()
+                .parse::<u16>()
+                .map_err(|_| NodeError::Config("config `port` must be u16".to_owned()))?
         };
         let username = config_string(&self.spec, "username");
-        let username = if username.trim().is_empty() { "root".to_owned() } else { username };
+        let username = if username.trim().is_empty() {
+            "root".to_owned()
+        } else {
+            username
+        };
         let expected_host_key = non_empty(config_string(&self.spec, "expectedHostKey"));
         Ok(ControlTargetSpec {
             host,
@@ -259,15 +286,15 @@ impl EepromProvisionNode {
     fn credential_ref(&self) -> Result<String, NodeError> {
         let credential_ref = config_string(&self.spec, "credentialRef");
         if credential_ref.trim().is_empty() {
-            return Err(NodeError::Precondition("config `credentialRef` is required".to_owned()));
+            return Err(NodeError::Precondition(
+                "config `credentialRef` is required".to_owned(),
+            ));
         }
         Ok(credential_ref)
     }
 
     /// 由 config `mode`（inspect/provision）构造 EEPROM 动作。
-    fn eeprom_action(
-        &self,
-    ) -> Result<crate::platform::EepromHelperAction, NodeError> {
+    fn eeprom_action(&self) -> Result<crate::platform::EepromHelperAction, NodeError> {
         let mode = config_string(&self.spec, "mode");
         match mode.as_str() {
             "inspect" => Ok(crate::platform::EepromHelperAction::Inspect),
@@ -279,7 +306,9 @@ impl EepromProvisionNode {
                     expected_before_sha256: config_string(&self.spec, "expectedBeforeSha256"),
                 })
             }
-            other => Err(NodeError::Config(format!("unsupported mode `{other}` (inspect/provision)"))),
+            other => Err(NodeError::Config(format!(
+                "unsupported mode `{other}` (inspect/provision)"
+            ))),
         }
     }
 
@@ -290,7 +319,10 @@ impl EepromProvisionNode {
         let segments = if payload.is_empty() {
             vec![]
         } else {
-            vec![EepromWriteSegment { offset: 0, bytes: payload }]
+            vec![EepromWriteSegment {
+                offset: 0,
+                bytes: payload,
+            }]
         };
         Ok(EepromProvisionRequest {
             map_id,
@@ -316,7 +348,11 @@ fn config_string(spec: &NodeSpec, key: &str) -> String {
 }
 
 fn non_empty(value: String) -> Option<String> {
-    if value.trim().is_empty() { None } else { Some(value) }
+    if value.trim().is_empty() {
+        None
+    } else {
+        Some(value)
+    }
 }
 
 /// 解析 `i2c-N` 或十进制数字为 u32。
@@ -330,7 +366,10 @@ fn parse_i2c_bus(bus: &str) -> Result<u32, NodeError> {
 /// 解析 `0x..` 十六进制为 u16（address / register）。
 fn parse_hex_u16(value: &str) -> Result<u16, NodeError> {
     let trimmed = value.trim();
-    let digits = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
     u16::from_str_radix(digits, 16)
         .map_err(|_| NodeError::Config(format!("config value `{value}` must be a hex u16")))
 }
@@ -341,10 +380,15 @@ fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, NodeError> {
     if trimmed.is_empty() {
         return Ok(vec![]);
     }
-    let digits = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")).unwrap_or(trimmed);
+    let digits = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+        .unwrap_or(trimmed);
     let digits = digits.replace('_', "");
     if !digits.len().is_multiple_of(2) {
-        return Err(NodeError::Config("hex payload must have even length".to_owned()));
+        return Err(NodeError::Config(
+            "hex payload must have even length".to_owned(),
+        ));
     }
     (0..digits.len())
         .step_by(2)
@@ -371,7 +415,9 @@ fn page_write_transactions(
 ) -> Result<Vec<I2cTransactionSpec>, NodeError> {
     let payload = parse_hex_bytes(&config_string(spec, "payload"))?;
     if payload.is_empty() {
-        return Err(NodeError::Config("config `payload` is required for write mode".to_owned()));
+        return Err(NodeError::Config(
+            "config `payload` is required for write mode".to_owned(),
+        ));
     }
     let page_size = config_usize(spec, "pageSize", 16).max(1);
 
@@ -537,9 +583,19 @@ impl SftpFileSourceNode {
         let host = non_empty(config_string(&self.spec, "host")).ok_or_else(|| {
             NodeError::Precondition("sftpFileSource host must be configured".to_owned())
         })?;
+        let port = config_string(&self.spec, "port")
+            .parse::<u16>()
+            .map_err(|_| {
+                NodeError::Config("sftpFileSource port must be in 1..=65535".to_owned())
+            })?;
+        if port == 0 {
+            return Err(NodeError::Config(
+                "sftpFileSource port must be in 1..=65535".to_owned(),
+            ));
+        }
         Ok(ControlTargetSpec {
             host,
-            port: config_string(&self.spec, "port").parse::<u16>().unwrap_or(22),
+            port,
             username: config_string(&self.spec, "username"),
             expected_host_key: non_empty(config_string(&self.spec, "expectedHostKey")),
         })
@@ -595,20 +651,39 @@ impl NodeInstance for SftpFileSourceNode {
 impl SftpFileSourceNode {
     fn fetch(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         let target = self.target()?;
-        let credential_ref = non_empty(config_string(&self.spec, "credentialRef")).ok_or_else(|| {
-            NodeError::Precondition("sftpFileSource credentialRef must be configured".to_owned())
-        })?;
+        let credential_ref =
+            non_empty(config_string(&self.spec, "credentialRef")).ok_or_else(|| {
+                NodeError::Precondition(
+                    "sftpFileSource credentialRef must be configured".to_owned(),
+                )
+            })?;
         let path = self.remote_path()?;
-        let format = match path.rsplit('.').next().map(str::to_ascii_lowercase).as_deref() {
+        rt.report_state(NodeRuntimeState::Running, "fetching remote image");
+        let format = match path
+            .rsplit('.')
+            .next()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
             Some("png") => RasterFormat::Png,
             Some("jpg" | "jpeg") => RasterFormat::Jpeg,
-            _ => return Err(NodeError::Precondition("unsupported remote image extension".to_owned())),
+            _ => {
+                return Err(NodeError::Precondition(
+                    "unsupported remote image extension".to_owned(),
+                ));
+            }
         };
 
         let reader = rt.services().sftp_reader()?;
         let control = control_timeout(30, 120)?;
         let bytes = reader
-            .read(&target, &credential_ref, &path, DECODED_IMAGE_BYTE_LIMIT, control)
+            .read(
+                &target,
+                &credential_ref,
+                &path,
+                DECODED_IMAGE_BYTE_LIMIT,
+                control,
+            )
             .map_err(NodeError::Execution)?;
 
         let codec = rt.services().image_codec()?;
@@ -630,8 +705,7 @@ impl SftpFileSourceNode {
                 "sftp file source",
             ),
         };
-        rt.report_state(NodeRuntimeState::Running, "decoded remote image");
-        let _ = rt.emit("image", DataPacket::ImageFrame(Arc::new(frame)));
+        rt.emit("image", DataPacket::ImageFrame(Arc::new(frame)))?;
         rt.report_state(NodeRuntimeState::Idle, "remote image ready");
         Ok(())
     }
@@ -652,7 +726,9 @@ fn compact_rgba8(frame: &Rgba8Frame, width: u32, height: u32) -> Result<Arc<[u8]
         let start = row * frame.stride;
         let end = start + row_bytes;
         let Some(row_slice) = pixels.get(start..end) else {
-            return Err(NodeError::Execution("image stride/layout inconsistent".to_owned()));
+            return Err(NodeError::Execution(
+                "image stride/layout inconsistent".to_owned(),
+            ));
         };
         compact.extend_from_slice(row_slice);
     }
@@ -717,15 +793,18 @@ impl SshSessionNode {
         let host = non_empty(config_string(&self.spec, "host")).ok_or_else(|| {
             NodeError::Precondition("sshSession host must be configured".to_owned())
         })?;
-        let credential_ref = non_empty(config_string(&self.spec, "credentialRef")).ok_or_else(|| {
-            NodeError::Precondition("sshSession credentialRef must be configured".to_owned())
-        })?;
+        let credential_ref =
+            non_empty(config_string(&self.spec, "credentialRef")).ok_or_else(|| {
+                NodeError::Precondition("sshSession credentialRef must be configured".to_owned())
+            })?;
         let recipe_id = non_empty(config_string(&self.spec, "recipeId")).ok_or_else(|| {
             NodeError::Precondition("sshSession recipeId must be configured".to_owned())
         })?;
         let target = ControlTargetSpec {
             host,
-            port: config_string(&self.spec, "port").parse::<u16>().unwrap_or(22),
+            port: config_string(&self.spec, "port")
+                .parse::<u16>()
+                .unwrap_or(22),
             username: config_string(&self.spec, "username"),
             expected_host_key: non_empty(config_string(&self.spec, "expectedHostKey")),
         };
@@ -753,7 +832,10 @@ impl SshSessionNode {
     }
 }
 
-fn control_timeout(connect_secs: u64, overall_secs: u64) -> Result<RemoteOperationControl, NodeError> {
+fn control_timeout(
+    connect_secs: u64,
+    overall_secs: u64,
+) -> Result<RemoteOperationControl, NodeError> {
     RemoteOperationControl::new(
         RemoteTimeouts {
             connect: Duration::from_secs(connect_secs),
@@ -840,9 +922,7 @@ mod tests {
 
     #[test]
     fn missing_executor_is_precondition() {
-        let mut node = I2cTransferNode {
-            spec: i2c_spec(),
-        };
+        let mut node = I2cTransferNode { spec: i2c_spec() };
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let err = node
             .on_action(NodeAction::Trigger, &mut rt)
@@ -873,9 +953,7 @@ mod tests {
 
     #[test]
     fn executor_is_invoked_and_result_emitted() {
-        let mut node = I2cTransferNode {
-            spec: i2c_spec(),
-        };
+        let mut node = I2cTransferNode { spec: i2c_spec() };
         let executor_called = Arc::new(Mutex::new(0));
         let services = EngineServices {
             i2c_executor: Some(Arc::new(RecordingI2cExecutor {

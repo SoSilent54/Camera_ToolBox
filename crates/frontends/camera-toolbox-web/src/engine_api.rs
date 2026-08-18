@@ -2,20 +2,19 @@
 
 use std::sync::{Arc, Mutex};
 
+use camera_toolbox_adapters::media::FfmpegRtspStreamService;
+use camera_toolbox_adapters::{ImageRasterCodec, LocalRawLoader};
 use camera_toolbox_app::engine::{
     DataPacket, EdgeSpec, EngineServices, GraphEngine, GraphSpec, NodeAction, NodeRegistry,
     NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
 };
 use camera_toolbox_app::platform::{RtspStreamConfig, StreamService};
-use camera_toolbox_adapters::media::FfmpegRtspStreamService;
-use camera_toolbox_adapters::{ImageRasterCodec, LocalRawLoader};
 use serde_json::json;
 
 use crate::{
     AppState,
     workflow::{
-        NodeKind, PortDirection, PortKind, WorkflowEdge, WorkflowGraph, WorkflowNode,
-        WorkflowPort,
+        NodeKind, PortDirection, PortKind, WorkflowEdge, WorkflowGraph, WorkflowNode, WorkflowPort,
     },
 };
 
@@ -91,7 +90,6 @@ pub(crate) fn build_services(state: &AppState) -> EngineServices {
     }
 }
 
-
 /// 把 `DataPacket` 折叠成可序列化的 JSON：帧类只给元数据，其余（Detection/Solution/弱类型）直接序列化。
 pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
     match packet {
@@ -129,10 +127,13 @@ pub(crate) fn parse_action_str(action: &str) -> Result<NodeAction, String> {
         "trigger" => Ok(NodeAction::Trigger),
         "arm" => Ok(NodeAction::Arm),
         "disarm" => Ok(NodeAction::Disarm),
+        "clear" => Ok(NodeAction::Custom {
+            name: "clear".to_owned(),
+            payload: serde_json::Value::Null,
+        }),
         other => Err(format!("unknown action `{other}`")),
     }
 }
-
 
 /// 把持久化工作流图投影为引擎图规格。
 pub(crate) fn to_engine_spec(graph: &WorkflowGraph) -> GraphSpec {
@@ -209,10 +210,7 @@ mod tests {
         assert_eq!(spec.nodes.len(), graph.nodes.len());
         assert_eq!(spec.edges.len(), graph.edges.len());
         // kind 序列化为 camelCase 字符串（与引擎 kinds 常量一致）。
-        assert!(spec
-            .nodes
-            .iter()
-            .any(|node| node.kind == "rtspSource"));
+        assert!(spec.nodes.iter().any(|node| node.kind == "rtspSource"));
         // 必需输入端口投影为 required。
         for (engine_node, graph_node) in spec.nodes.iter().zip(&graph.nodes) {
             for (engine_port, graph_port) in engine_node.inputs.iter().zip(&graph_node.inputs) {
@@ -222,5 +220,13 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn clear_action_maps_to_dataset_custom_action() {
+        assert!(matches!(
+            parse_action_str("clear"),
+            Ok(NodeAction::Custom { ref name, .. }) if name == "clear"
+        ));
     }
 }

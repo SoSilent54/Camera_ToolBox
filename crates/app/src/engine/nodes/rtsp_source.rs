@@ -1,7 +1,7 @@
 //! RTSP 源节点：连接 RTSP 后经 `StreamService` 解码并向输出推送视频帧。
 //!
-//! 引擎把「RTSP 连接 + 解码」合并在本节点（`StreamService` 内部已解码为 RGBA），
-//! 因此输出为 `stream.video-frame`；独立的 `rtspDecoder` 节点语义在引擎层为 no-op。
+//! `rtspSource` 已承担连接与解码，输出 `stream.video-frame`；`rtspDecoder`
+//! 只保留为兼容已有工作流的帧直通节点，不承担二次解码。
 
 use std::{
     sync::{
@@ -19,8 +19,8 @@ use crate::{
     platform::{
         LatestDecodedFrameSlot, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport,
         StreamCancellation, StreamOpenRequest, StreamOperationControl, StreamRecordingRequest,
-        StreamService, StreamServiceError, StreamServiceEvent, StreamSessionId, StreamStage,
-        StreamTerminal, StreamTimeouts,
+        StreamService, StreamServiceError, StreamServiceEvent, StreamSession, StreamSessionId,
+        StreamStage, StreamTerminal, StreamTimeouts,
     },
 };
 
@@ -32,17 +32,18 @@ impl NodeFactory for RtspSourceFactory {
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        // 输出端口 id 跟随 web 图（rtspSource 输出 "endpoint"），避免硬编码导致接线断裂。
+        // 输出端口 id 跟随 web 图（rtspSource 输出 "frames"），避免硬编码导致接线断裂。
         let output_port = spec
             .outputs
             .first()
             .map(|port| port.id.clone())
-            .unwrap_or_else(|| "endpoint".to_owned());
+            .unwrap_or_else(|| "frames".to_owned());
         Ok(Box::new(RtspSourceNode {
             spec,
             output_port,
             cancellation: None,
             pump_cancel: None,
+            session: None,
         }))
     }
 }
@@ -51,6 +52,7 @@ pub struct RtspSourceNode {
     spec: NodeSpec,
     output_port: String,
     cancellation: Option<StreamCancellation>,
+    session: Option<StreamSession>,
     pump_cancel: Option<Arc<AtomicBool>>,
 }
 
@@ -90,8 +92,11 @@ impl NodeInstance for RtspSourceNode {
 impl RtspSourceNode {
     fn connect(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         if let Some(cancellation) = self.cancellation.as_ref() {
-            if !cancellation.is_cancelled() {
+            if !cancellation.is_cancelled() && self.session.is_some() {
                 return Ok(());
+            }
+            if let Some(session) = self.session.take() {
+                let _ = session.force_cleanup();
             }
             self.cancellation.take();
             self.pump_cancel.take();
@@ -100,12 +105,17 @@ impl RtspSourceNode {
         if url.is_empty() {
             return Err(NodeError::Config("RTSP url is required".to_owned()));
         }
-        let width = config_u32(&self.spec, "width", 960);
-        let height = config_u32(&self.spec, "height", 540);
+        let width = config_u32(&self.spec, "width", 1920);
+        let height = config_u32(&self.spec, "height", 1080);
         let channel = config_u16(&self.spec, "channel", 0);
         let transport = match config_string(&self.spec, "transport", "tcp").as_str() {
+            "tcp" => RtspTransport::Tcp,
             "udp" => RtspTransport::Udp,
-            _ => RtspTransport::Tcp,
+            value => {
+                return Err(NodeError::Config(format!(
+                    "transport must be tcp or udp, got `{value}`"
+                )));
+            }
         };
 
         let factory = rt.services().stream_factory()?;
@@ -143,6 +153,7 @@ impl RtspSourceNode {
         };
 
         let latest_frame = Arc::clone(&session.latest_frame);
+        self.session = Some(session);
         self.cancellation = Some(cancellation);
         let output_port = self.output_port.clone();
         let pump_cancel_flag = Arc::clone(&pump_cancel);
@@ -157,6 +168,9 @@ impl RtspSourceNode {
     }
 
     fn disconnect(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        if let Some(session) = self.session.take() {
+            session.request_close();
+        }
         if let Some(cancellation) = self.cancellation.take() {
             cancellation.cancel();
         }
@@ -317,8 +331,8 @@ mod tests {
             title: "RTSP Source".to_owned(),
             inputs: vec![],
             outputs: vec![crate::engine::PortSpec {
-                id: "endpoint".to_owned(),
-                label: "Endpoint".to_owned(),
+                id: "frames".to_owned(),
+                label: "Decoded Video Frames".to_owned(),
                 kind: "stream.video-frame".to_owned(),
                 cardinality: crate::engine::PortCardinality::One,
                 required: false,

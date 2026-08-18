@@ -1,6 +1,6 @@
 //! 本地文件源节点：从本地目录加载单张图片帧（按钮节点范式）。
 //!
-//! `on_action(Trigger)` 时按 `root` + `directory` + `selection` 拼接本地路径，读取文件字节后
+//! `on_action(Trigger)` 时以绝对 `root` + 相对 `selection` 定位文件；`directory` 仅记录浏览位置。
 //! 按扩展名分派：
 //! - `.png` → `RasterImageCodec::decode_rgba8(Png)`
 //! - `.jpg`/`.jpeg` → `RasterImageCodec::decode_rgba8(Jpeg)`
@@ -11,7 +11,7 @@
 //!
 //! 未注入 `image_codec`、路径为空或读取失败时按前置/执行条件失败，不 panic。
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
@@ -78,8 +78,10 @@ impl NodeInstance for LocalFileSourceNode {
 impl LocalFileSourceNode {
     fn load(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         let path = self.resolve_path()?;
-        let bytes = std::fs::read(&path)
-            .map_err(|error| NodeError::Execution(format!("read {} failed: {error}", path.display())))?;
+        rt.report_state(NodeRuntimeState::Running, "loading image");
+        let bytes = std::fs::read(&path).map_err(|error| {
+            NodeError::Execution(format!("read {} failed: {error}", path.display()))
+        })?;
 
         // 按扩展名分派；非 PNG/JPEG（含 .raw）暂不 demosaic，诚实上报。
         let format = match extension(&path).as_deref() {
@@ -96,7 +98,6 @@ impl LocalFileSourceNode {
         };
 
         let image_codec: Arc<dyn RasterImageCodec> = rt.services().image_codec()?;
-        rt.report_state(NodeRuntimeState::Running, "loading image");
         let rgba = image_codec
             .decode_rgba8(format, &bytes, DECODED_IMAGE_BYTE_LIMIT)
             .map_err(|error| NodeError::Execution(error.to_string()))?;
@@ -108,8 +109,9 @@ impl LocalFileSourceNode {
             height: rgba.height,
             rgba: compact,
             identity: StreamFrameIdentity::unavailable(
-                StreamSessionId::new(format!("local-{}", self.spec.id))
-                    .map_err(|_| NodeError::Execution("invalid local stream session id".to_owned()))?,
+                StreamSessionId::new(format!("local-{}", self.spec.id)).map_err(|_| {
+                    NodeError::Execution("invalid local stream session id".to_owned())
+                })?,
                 0,
                 0,
                 "local-file-source".to_owned(),
@@ -133,26 +135,33 @@ impl LocalFileSourceNode {
         Ok(())
     }
 
-    /// 拼接本地路径：`root` + `directory` + `selection`（均为 source-relative，空段跳过）。
+    /// `root` 是绝对目录，`selection` 是 file browser 返回的 root-relative 文件路径。
+    /// `directory` 只保存浏览位置，不能再次拼接，否则会重复目录层级。
     fn resolve_path(&self) -> Result<PathBuf, NodeError> {
-        let root = config_string(&self.spec, "root");
-        let directory = config_string(&self.spec, "directory");
-        let selection = config_string(&self.spec, "selection");
-
-        let mut path = PathBuf::new();
-        for segment in [root, directory, selection] {
-            let trimmed = segment.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            path.push(trimmed);
-        }
-        if path.as_os_str().is_empty() {
+        let root = config_string(&self.spec, "root").trim();
+        let root_path = Path::new(root);
+        if root.is_empty() || !root_path.is_absolute() {
             return Err(NodeError::Config(
-                "root/directory/selection must select a non-empty local path".to_owned(),
+                "root must select an absolute local directory".to_owned(),
             ));
         }
-        Ok(path)
+        let selection = config_string(&self.spec, "selection").trim();
+        if selection.is_empty() {
+            return Err(NodeError::Config(
+                "selection must select a local file".to_owned(),
+            ));
+        }
+        if Path::new(selection).components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        }) {
+            return Err(NodeError::Config(
+                "selection must stay relative to root".to_owned(),
+            ));
+        }
+        Ok(root_path.join(selection))
     }
 }
 
@@ -171,7 +180,9 @@ fn compact_rgba(frame: &camera_toolbox_core::Rgba8Frame) -> Result<Arc<[u8]>, No
         let start = row * frame.stride;
         let end = start + row_bytes;
         let Some(row_slice) = pixels.get(start..end) else {
-            return Err(NodeError::Execution("image stride/layout inconsistent".to_owned()));
+            return Err(NodeError::Execution(
+                "image stride/layout inconsistent".to_owned(),
+            ));
         };
         compact.extend_from_slice(row_slice);
     }
@@ -221,7 +232,7 @@ mod tests {
                     required: false,
                 },
             ],
-            config: serde_json::json!({"root": "", "directory": "", "selection": "", "filter": "*.png", "reload": "manual"}),
+            config: serde_json::json!({"root": "", "directory": "", "selection": ""}),
         }
     }
 
@@ -235,27 +246,47 @@ mod tests {
     }
 
     #[test]
-    fn empty_path_is_config_error() {
+    fn empty_root_or_selection_is_config_error() {
         let node = LocalFileSourceNode { spec: spec() };
-        let err = node
-            .resolve_path()
-            .expect_err("empty root/directory/selection must be rejected");
+        let err = node.resolve_path().expect_err("empty root is rejected");
+        assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
+
+        let mut selected_without_root = spec();
+        selected_without_root.config["selection"] = serde_json::json!("board.png");
+        let err = LocalFileSourceNode {
+            spec: selected_without_root,
+        }
+        .resolve_path()
+        .expect_err("selection without root is rejected");
         assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
     }
 
     #[test]
-    fn path_joins_root_directory_selection() {
+    fn path_joins_root_and_root_relative_selection() {
         let mut s = spec();
         s.config = serde_json::json!({
             "root": "/srv/images",
             "directory": "calib",
-            "selection": "board.png",
-            "filter": "*.png",
-            "reload": "manual",
+            "selection": "calib/board.png",
         });
         let node = LocalFileSourceNode { spec: s };
         let path = node.resolve_path().expect("path resolves");
-        assert_eq!(path, std::path::PathBuf::from("/srv/images/calib/board.png"));
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/srv/images/calib/board.png")
+        );
+    }
+
+    #[test]
+    fn selection_cannot_escape_root() {
+        for selection in ["../outside.png", "/tmp/outside.png"] {
+            let mut s = spec();
+            s.config = serde_json::json!({"root": "/srv/images", "selection": selection});
+            let err = LocalFileSourceNode { spec: s }
+                .resolve_path()
+                .expect_err("unsafe selection is rejected");
+            assert!(matches!(err, NodeError::Config(_)), "got {err:?}");
+        }
     }
 
     #[test]

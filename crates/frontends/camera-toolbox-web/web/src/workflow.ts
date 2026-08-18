@@ -97,6 +97,16 @@ export interface NodePosition {
   y: number;
 }
 
+export interface WorkflowNodePositionUpdate {
+  nodeId: string;
+  position: NodePosition;
+}
+
+export interface WorkflowSelectionDeletion {
+  nodeIds: string[];
+  edgeIds: string[];
+}
+
 export interface WorkflowPort {
   id: string;
   label: string;
@@ -177,6 +187,7 @@ export interface SshExecutionBinding {
   port?: number;
   username?: string;
   credentialRef: string;
+  expectedHostKey?: string;
 }
 
 export interface I2cExecuteRequest extends I2cPreviewRequest {
@@ -314,6 +325,18 @@ export type ViewerPreview =
   | { kind: 'rtsp'; url: string }
   | { kind: 'local-image'; url: string };
 
+/** 可持久化的通用节点标量配置值。 */
+export type ScalarConfigValue = string | number | boolean;
+
+/** 后端 `runtime.node.action` 当前支持的通用节点动作。 */
+export type NodeActionName = 'connect' | 'disconnect' | 'trigger' | 'arm' | 'disarm' | 'clear';
+
+/** 节点显式声明的可用动作；未声明时 GenericWorkflowNode 不渲染动作按钮。 */
+export interface NodeActionControl {
+  action: NodeActionName;
+  label: string;
+}
+
 export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
   preview?: ViewerPreview;
@@ -321,10 +344,18 @@ export interface FlowNodeData extends Record<string, unknown> {
   runtimeState?: 'disabled' | 'idle' | 'ready' | 'running' | 'warning' | 'error';
   /** 引擎实时诊断；用于解释 error/warning 的根因。 */
   runtimeDiagnostic?: string;
+  /** 节点动作请求是否仍在等待后端确认。 */
+  actionPending?: boolean;
+  /** `runtime.node.output` 返回的最新可序列化输出；不写回工作流图。 */
+  runtimeOutput?: unknown;
+  /** 由节点类型或配置显式声明的可用动作。 */
+  availableActions?: readonly NodeActionControl[];
   onRtspUrlChange?: (nodeId: string, url: string) => void;
-  onNodeConfigChange?: (nodeId: string, key: string, value: string | boolean) => void;
-  /** 触发节点动作（connect/disconnect/trigger/arm/disarm）。 */
-  onNodeAction?: (nodeId: string, action: string) => void;
+  onNodeConfigChange?: (nodeId: string, key: string, value: ScalarConfigValue) => void;
+  /** 触发节点动作（connect/disconnect/trigger/arm/disarm/clear）。 */
+  onNodeAction?: (nodeId: string, action: NodeActionName) => void;
+  /** 拉取节点最近一次输出；无输出时保留当前摘要。 */
+  onRefreshNodeOutput?: (nodeId: string) => void;
 }
 
 export interface FlowEdgeData extends Record<string, unknown> {
@@ -375,6 +406,14 @@ export async function updateGraphNodePosition(nodeId: string, position: NodePosi
   return request('graph.updateNode', { nodeId, position });
 }
 
+export async function updateGraphNodePositions(nodes: WorkflowNodePositionUpdate[]): Promise<WorkflowGraph> {
+  return request('graph.updateNodePositions', { nodes });
+}
+
+export async function removeGraphSelection(selection: WorkflowSelectionDeletion): Promise<WorkflowGraph> {
+  return request('graph.removeSelection', selection);
+}
+
 export async function replaceGraph(graph: WorkflowGraph): Promise<WorkflowGraph> {
   return request('graph.replace', graph);
 }
@@ -409,6 +448,11 @@ export async function deleteWorkflow(id: string): Promise<void> {
 
 export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
   await request('workflow.validate', graph);
+}
+
+/** 拉取引擎记录的某节点最新输出；缺少输出时服务端返回错误。 */
+export async function loadRuntimeNodeOutput(nodeId: string): Promise<unknown> {
+  return request('runtime.node.output', { nodeId });
 }
 
 

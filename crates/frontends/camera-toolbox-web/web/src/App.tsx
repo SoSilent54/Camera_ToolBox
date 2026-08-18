@@ -17,6 +17,7 @@ import {
   type OnConnectEnd,
   type OnConnectStart,
   type OnConnectStartParams,
+  type OnMove,
   type ReactFlowInstance,
 } from '@xyflow/react';
 import {
@@ -33,18 +34,21 @@ import {
   loadSavedWorkflow,
   loadWorkflow,
   loadWorkmodeTemplates,
-  removeGraphEdge,
   removeGraphNode,
+  removeGraphSelection,
   replaceGraph,
   saveWorkflow,
   patchGraphNode,
   updateGraphNodePosition,
+  updateGraphNodePositions,
   validateConnectionKinds,
   type FlowEdgeData,
   type FlowNodeData,
+  type NodeActionControl,
   type NodeDefinition,
   type NodeKind,
   type PortKind,
+  type ScalarConfigValue,
   type WorkflowEdge,
   type WorkflowGraph,
   type WorkflowNode,
@@ -52,6 +56,8 @@ import {
   type WorkmodeTemplate,
 } from './workflow';
 import {
+  EepromProvisionNode,
+  I2cTransferNode,
   LocalFileSourceNode,
   SftpFileSourceNode,
   SshSessionNode,
@@ -60,6 +66,7 @@ import {
 import {
   AutoCaptureNode,
   CalibrationSolverNode,
+  CalibrationWorkflowNode,
   GenericWorkflowNode,
   NodeLibraryItem,
   RtspSourceNode,
@@ -93,6 +100,13 @@ type NodeCreateMenuMode =
       fromCardinality: 'one' | 'many';
     };
 
+type PaneClickState = {
+  startX: number;
+  startY: number;
+  moved: boolean;
+  active: boolean;
+};
+
 type NodeCreateCandidate = {
   definition: NodeDefinition;
   compatiblePort?: WorkflowPort;
@@ -106,12 +120,6 @@ const GENERIC_NODE_KINDS: NodeKind[] = [
   'imageLayer',
   'videoLayer',
   'overlayComposer',
-  'chessboardDetector',
-  'datasetCollector',
-  'coverageAnalyzer',
-  'poseGuide',
-  'i2cTransfer',
-  'eepromProvision',
 ];
 
 const nodeTypes = Object.fromEntries([
@@ -120,11 +128,31 @@ const nodeTypes = Object.fromEntries([
   ['sftpFileSource', SftpFileSourceNode],
   ['sshSession', SshSessionNode],
   ['x5Device', X5DeviceNode],
+  ['i2cTransfer', I2cTransferNode],
+  ['eepromProvision', EepromProvisionNode],
   ['viewer', ViewerNode],
   ['calibrationSolver', CalibrationSolverNode],
   ['autoCaptureController', AutoCaptureNode],
+  ['chessboardDetector', CalibrationWorkflowNode],
+  ['datasetCollector', CalibrationWorkflowNode],
+  ['coverageAnalyzer', CalibrationWorkflowNode],
+  ['poseGuide', CalibrationWorkflowNode],
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
 ]);
+
+const PANE_CLICK_DISTANCE_PX = 5;
+const GRID_TARGET_SCREEN_GAP_PX = 28;
+const GRID_MIN_GAP = 24;
+const GRID_MAX_GAP = 144;
+
+const MANUAL_TRIGGER_ACTIONS: readonly NodeActionControl[] = [{ action: 'trigger', label: '触发' }];
+
+/** generic 节点须显式以 `trigger: "manual"` 声明动作，避免暴露后端尚未实现的入口。 */
+function genericNodeActions(node: WorkflowNode): readonly NodeActionControl[] | undefined {
+  return GENERIC_NODE_KINDS.includes(node.kind) && node.config.trigger === 'manual'
+    ? MANUAL_TRIGGER_ACTIONS
+    : undefined;
+}
 
 export function App() {
   const [graph, setGraph] = useState<WorkflowGraph | null>(null);
@@ -135,7 +163,7 @@ export function App() {
   const [edges, setEdges, onEdgesChangeBase] = useEdgesState<FlowEdge>([]);
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待后端图快照...']);
-  const { nodeStates, nodeDiagnostics, sendAction } = useEngine();
+  const { nodeStates, nodeDiagnostics, nodeOutputs, pendingActions, sendAction, refreshNodeOutput } = useEngine();
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
@@ -148,6 +176,8 @@ export function App() {
   const connectionStartRef = useRef<OnConnectStartParams | null>(null);
   const graphRef = useRef<WorkflowGraph | null>(null);
   const draggingNodeIdRef = useRef<string | null>(null);
+  const paneClickRef = useRef<PaneClickState>({ startX: 0, startY: 0, moved: false, active: false });
+  const [backgroundGap, setBackgroundGap] = useState(() => backgroundGapForZoom(1));
 
   const pushEvent = useCallback((event: string) => {
     setEvents((current) => [event, ...current].slice(0, 10));
@@ -365,7 +395,7 @@ export function App() {
   );
 
   const handleNodeConfigChange = useCallback(
-    (nodeId: string, key: string, value: string | boolean) => {
+    (nodeId: string, key: string, value: ScalarConfigValue) => {
       commitGraph(patchGraphNode(nodeId, { config: { [key]: value } }), `节点配置已更新：${key}`);
     },
     [commitGraph],
@@ -375,12 +405,19 @@ export function App() {
     setNodes((current) => current.map((flowNode) => {
       const runtimeState = nodeStates[flowNode.id];
       const runtimeDiagnostic = nodeDiagnostics[flowNode.id];
+      const runtimeOutput = nodeOutputs[flowNode.id];
+      const actionPending = Boolean(pendingActions[flowNode.id]);
+      const availableActions = genericNodeActions(flowNode.data.workflowNode);
       if (
         flowNode.data.onRtspUrlChange === handleRtspUrlChange
         && flowNode.data.onNodeConfigChange === handleNodeConfigChange
         && flowNode.data.onNodeAction === sendAction
+        && flowNode.data.onRefreshNodeOutput === refreshNodeOutput
         && flowNode.data.runtimeState === runtimeState
         && flowNode.data.runtimeDiagnostic === runtimeDiagnostic
+        && flowNode.data.runtimeOutput === runtimeOutput
+        && flowNode.data.availableActions === availableActions
+        && flowNode.data.actionPending === actionPending
       ) {
         return flowNode;
       }
@@ -390,13 +427,17 @@ export function App() {
           ...flowNode.data,
           runtimeState,
           runtimeDiagnostic,
+          runtimeOutput,
+          availableActions,
           onRtspUrlChange: handleRtspUrlChange,
+          actionPending,
           onNodeConfigChange: handleNodeConfigChange,
           onNodeAction: sendAction,
+          onRefreshNodeOutput: refreshNodeOutput,
         },
       };
     }));
-  }, [handleNodeConfigChange, handleRtspUrlChange, nodeDiagnostics, nodeStates, nodes.length, sendAction, setNodes]);
+  }, [handleNodeConfigChange, handleRtspUrlChange, nodeDiagnostics, nodeOutputs, nodeStates, pendingActions, refreshNodeOutput, nodes.length, sendAction, setNodes]);
 
   const createFlowNodeAt = useCallback(
     (kind: NodeKind, position: { x: number; y: number }): FlowNode => {
@@ -545,16 +586,20 @@ export function App() {
   );
 
   const handleDeleteSelection = useCallback(() => {
-    if (selection.type === 'none') {
+    const selectedNodeIds = nodesRef.current
+      .filter((node) => node.selected)
+      .map((node) => node.data.workflowNode.id);
+    const selectedEdgeIds = edgesRef.current
+      .filter((edge) => edge.selected)
+      .map((edge) => edge.id);
+    if (selectedNodeIds.length === 0 && selectedEdgeIds.length === 0) {
       pushEvent('没有选中的节点或连线');
       return;
     }
-    if (selection.type === 'edge') {
-      commitGraph(removeGraphEdge(selection.edge.id), `删除连线：${selection.edge.id}`);
-      return;
-    }
-    commitGraph(removeGraphNode(selection.node.id), `删除节点：${selection.node.title}`);
-  }, [commitGraph, pushEvent, selection]);
+    setSelection({ type: 'none' });
+    setContextMenu(null);
+    commitGraph(removeGraphSelection({ nodeIds: selectedNodeIds, edgeIds: selectedEdgeIds }), `删除选中项：${selectedNodeIds.length} 个节点、${selectedEdgeIds.length} 条连线`);
+  }, [commitGraph, pushEvent]);
 
   const handleDuplicateSelection = useCallback(() => {
     if (selection.type !== 'node') {
@@ -646,17 +691,42 @@ export function App() {
     pushEvent('画布已适配视图');
   }, [pushEvent]);
 
+  const handleViewportMove = useCallback<OnMove>((event, viewport) => {
+    if (event && paneClickRef.current.active) {
+      paneClickRef.current.moved = true;
+    }
+    const nextGap = backgroundGapForZoom(viewport.zoom);
+    setBackgroundGap(nextGap);
+  }, []);
+
   const handleNodeDragStart = useCallback((_event: MouseEvent | TouchEvent, node: FlowNode) => {
     draggingNodeIdRef.current = node.id;
   }, []);
 
   const handleNodeDragStop = useCallback((_event: MouseEvent | TouchEvent, node: FlowNode) => {
     draggingNodeIdRef.current = null;
-    const workflowNode = node.data.workflowNode;
-    if (workflowNode.position.x === node.position.x && workflowNode.position.y === node.position.y) {
+    const movedNodes = nodesRef.current.filter((candidate) => {
+      if (candidate.id !== node.id && !candidate.selected) {
+        return false;
+      }
+      const workflowNode = candidate.data.workflowNode;
+      return workflowNode.position.x !== candidate.position.x || workflowNode.position.y !== candidate.position.y;
+    });
+    if (movedNodes.length === 0) {
       return;
     }
-    commitGraph(updateGraphNodePosition(workflowNode.id, { x: node.position.x, y: node.position.y }), `节点位置已更新：${workflowNode.title}`);
+    if (movedNodes.length === 1) {
+      const workflowNode = movedNodes[0].data.workflowNode;
+      commitGraph(updateGraphNodePosition(workflowNode.id, { x: movedNodes[0].position.x, y: movedNodes[0].position.y }), `节点位置已更新：${workflowNode.title}`);
+      return;
+    }
+    commitGraph(
+      updateGraphNodePositions(movedNodes.map((candidate) => ({
+        nodeId: candidate.data.workflowNode.id,
+        position: { x: candidate.position.x, y: candidate.position.y },
+      }))),
+      `已批量更新 ${movedNodes.length} 个节点位置`,
+    );
   }, [commitGraph]);
 
   const handleNodeContextMenu = useCallback((event: ReactMouseEvent, node: FlowNode) => {
@@ -695,20 +765,36 @@ export function App() {
     }
   }, [commitGraph, contextMenu, handleNodeTitleChange]);
 
-  const handleCanvasContextMenu = useCallback((event: ReactMouseEvent) => {
+  const handleCanvasContextMenu = useCallback((event: ReactMouseEvent | globalThis.MouseEvent) => {
     event.preventDefault();
   }, []);
 
+  const handlePaneClick = useCallback((event: ReactMouseEvent) => {
+    const clickState = paneClickRef.current;
+    const moved = clickState.moved;
+    clickState.active = false;
+    clickState.moved = false;
+    if (event.button !== 0 || moved) {
+      return;
+    }
+    setContextMenu(null);
+    openFreeNodeMenu(event);
+  }, [openFreeNodeMenu]);
+
   const handleCanvasMouseDown = useCallback((event: ReactMouseEvent) => {
+    const target = event.target as HTMLElement | null;
+    if (target?.closest('.react-flow__node, .react-flow__handle, input, textarea, select, .context-menu, .node-create-menu')) {
+      return;
+    }
+    if (event.button === 0 && target?.closest('.react-flow__pane')) {
+      paneClickRef.current = { startX: event.clientX, startY: event.clientY, moved: false, active: true };
+      return;
+    }
     if (event.button !== 2) {
       return;
     }
     const bounds = canvasRegionRef.current?.getBoundingClientRect();
     if (!bounds) {
-      return;
-    }
-    const target = event.target as HTMLElement | null;
-    if (target?.closest('.react-flow__node, .react-flow__handle, input, textarea, select, .context-menu, .node-create-menu')) {
       return;
     }
     const startX = event.clientX - bounds.left;
@@ -718,6 +804,12 @@ export function App() {
   }, []);
 
   const handleCanvasMouseMove = useCallback((event: ReactMouseEvent) => {
+    const clickState = paneClickRef.current;
+    if (clickState.active && !clickState.moved) {
+      const dx = event.clientX - clickState.startX;
+      const dy = event.clientY - clickState.startY;
+      clickState.moved = Math.hypot(dx, dy) > PANE_CLICK_DISTANCE_PX;
+    }
     const current = marqueeRef.current;
     if (!current.active) {
       return;
@@ -752,7 +844,6 @@ export function App() {
       return;
     }
     if (Math.abs(current.curX - current.startX) < 5 && Math.abs(current.curY - current.startY) < 5) {
-      openFreeNodeMenu(event);
       return;
     }
     const topLeft = flow.screenToFlowPosition({
@@ -918,11 +1009,15 @@ export function App() {
           onDragOver={handleDragNodeOver}
           onDrop={handleDropNode}
           onSelectionChange={onSelectionChange}
+          onPaneClick={handlePaneClick}
+          onPaneContextMenu={handleCanvasContextMenu}
+          onMove={handleViewportMove}
           onNodeDragStart={handleNodeDragStart}
           onNodeDragStop={handleNodeDragStop}
           onNodeContextMenu={handleNodeContextMenu}
           onInit={(instance) => {
             flowInstanceRef.current = instance;
+            setBackgroundGap(backgroundGapForZoom(instance.getViewport().zoom));
           }}
           fitView
           fitViewOptions={{ padding: 0.18, duration: 260 }}
@@ -931,9 +1026,10 @@ export function App() {
           zoomOnScroll
           elevateEdgesOnSelect
           deleteKeyCode={null}
+          paneClickDistance={5}
           proOptions={{ hideAttribution: true }}
         >
-          <Background variant={BackgroundVariant.Lines} color="#334155" gap={24} size={1.25} />
+          <Background variant={BackgroundVariant.Lines} color="#334155" gap={backgroundGap} size={1.25} />
           <MiniMap className="workflow-minimap" pannable zoomable nodeStrokeWidth={2} />
           <Controls className="workflow-controls" position="bottom-left" />
           <Panel position="top-left" className="canvas-panel">
@@ -1330,6 +1426,11 @@ function clampMenuPosition(x: number, y: number): { x: number; y: number } {
 
 function centerNodeAt(position: { x: number; y: number }): { x: number; y: number } {
   return { x: position.x - 90, y: position.y - 50 };
+}
+
+function backgroundGapForZoom(zoom: number): number {
+  const safeZoom = Number.isFinite(zoom) && zoom > 0 ? zoom : 1;
+  return clamp(GRID_TARGET_SCREEN_GAP_PX / safeZoom, GRID_MIN_GAP, GRID_MAX_GAP);
 }
 
 function clamp(value: number, min: number, max: number): number {
