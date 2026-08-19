@@ -398,7 +398,6 @@ export interface FlowEdgeData extends Record<string, unknown> {
   kind: PortKind;
   schema: string;
   schemaVersion: string;
-  pulses?: readonly EdgePulseView[];
 }
 
 export async function loadWorkflow(): Promise<WorkflowGraph> {

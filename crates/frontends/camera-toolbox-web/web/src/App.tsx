@@ -42,7 +42,6 @@ import {
   updateGraphNodePosition,
   updateGraphNodePositions,
   validateConnectionKinds,
-  type EdgePulseView,
   type FlowEdgeData,
   type FlowNodeData,
   type NodeActionControl,
@@ -57,6 +56,7 @@ import {
   type WorkmodeTemplate,
 } from './workflow';
 import { FlowPulseEdge } from './FlowPulseEdge';
+import { FlowPulseOverlay } from './FlowPulseOverlay';
 import {
   EepromProvisionNode,
   I2cTransferNode,
@@ -304,8 +304,8 @@ export function App() {
   );
 
   const displayedEdges = useMemo(
-    () => decorateFlowEdges(edges, nodes, runtimeNodeStates, edgePulses),
-    [edges, nodes, runtimeNodeStates, edgePulses],
+    () => decorateFlowEdges(edges, nodes, runtimeNodeStates),
+    [edges, nodes, runtimeNodeStates],
   );
 
   const onNodesChange = useCallback((changes: NodeChange<FlowNode>[]) => {
@@ -1044,6 +1044,7 @@ export function App() {
           proOptions={{ hideAttribution: true }}
         >
           <Background variant={BackgroundVariant.Lines} color="#334155" gap={backgroundGap} size={1.25} />
+          <FlowPulseOverlay pulses={edgePulses} />
           <MiniMap className="workflow-minimap" pannable zoomable nodeStrokeWidth={2} />
           <Controls className="workflow-controls" position="bottom-left" />
           <Panel position="top-left" className="canvas-panel">
@@ -1166,12 +1167,7 @@ function isNewerGraphRevision(nextRevision: string, currentRevision: string): bo
   return nextRevision > currentRevision;
 }
 
-function decorateFlowEdges(
-  edges: FlowEdge[],
-  nodes: FlowNode[],
-  runtimeNodeStates: Map<string, string>,
-  edgePulses: ReadonlyMap<string, readonly EdgePulseView[]>,
-): FlowEdge[] {
+function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStates: Map<string, string>): FlowEdge[] {
   const outgoing = new Map<string, FlowEdge[]>();
   for (const edge of edges) {
     outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge]);
@@ -1196,21 +1192,15 @@ function decorateFlowEdges(
       queue.push(edge.target);
     }
   }
-
   return edges.map((edge) => {
     const active = activeNodes.has(edge.source)
       || runtimeNodeStates.get(edge.source) === 'running'
       || runtimeNodeStates.get(edge.target) === 'running';
-    const edgeData = edge.data as FlowEdgeData;
     return {
       ...edge,
       animated: false,
       style: active ? ACTIVE_EDGE_STYLE : DORMANT_EDGE_STYLE,
       className: `workflow-edge ${active ? 'flow-active' : 'flow-inactive'}`,
-      data: {
-        ...edgeData,
-        pulses: edgePulses.get(edge.id) ?? [],
-      },
     };
   });
 }

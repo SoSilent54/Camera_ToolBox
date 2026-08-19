@@ -705,6 +705,16 @@ button:hover {
   fill: #94a3b8;
 }
 
+.edge-flow-overlay {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  overflow: visible;
+  pointer-events: none;
+}
+
 .edge-flow-pulse {
   fill: #facc15;
   stroke: #0f172a;
