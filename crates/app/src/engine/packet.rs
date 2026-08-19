@@ -429,6 +429,27 @@ impl DataPacket {
             Self::Json(_) => "status.metrics",
         }
     }
+
+    /// 返回可用于流动动画去重/标注的来源帧序号；非帧派生负载返回 None。
+    #[must_use]
+    pub fn flow_sequence(&self) -> Option<u64> {
+        match self {
+            Self::VideoFrame(frame) => Some(frame.identity.frame_sequence),
+            Self::ImageFrame(frame) => Some(frame.identity.frame_sequence),
+            Self::Detection(detection) => Some(detection.frame_identity.frame_sequence),
+            Self::Score(score) => Some(score.frame_identity.frame_sequence),
+            Self::CaptureRequest(request) => request
+                .source_identity
+                .as_ref()
+                .map(|identity| identity.frame_sequence),
+            Self::Solution(_)
+            | Self::Coverage(_)
+            | Self::Dataset(_)
+            | Self::Report(_)
+            | Self::Target(_)
+            | Self::Json(_) => None,
+        }
+    }
 }
 
 impl std::fmt::Debug for DataPacket {

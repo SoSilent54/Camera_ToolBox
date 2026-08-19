@@ -385,11 +385,20 @@ export interface FlowNodeData extends Record<string, unknown> {
   onRefreshNodeOutput?: (nodeId: string) => void;
 }
 
+export interface EdgePulseView {
+  id: string;
+  edgeId: string;
+  packetKind: string;
+  sequence?: number;
+  startedAt: number;
+}
+
 export interface FlowEdgeData extends Record<string, unknown> {
   workflowEdge?: WorkflowEdge;
   kind: PortKind;
   schema: string;
   schemaVersion: string;
+  pulses?: readonly EdgePulseView[];
 }
 
 export async function loadWorkflow(): Promise<WorkflowGraph> {

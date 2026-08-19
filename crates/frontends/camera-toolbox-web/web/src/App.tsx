@@ -42,6 +42,7 @@ import {
   updateGraphNodePosition,
   updateGraphNodePositions,
   validateConnectionKinds,
+  type EdgePulseView,
   type FlowEdgeData,
   type FlowNodeData,
   type NodeActionControl,
@@ -55,6 +56,7 @@ import {
   type WorkflowPort,
   type WorkmodeTemplate,
 } from './workflow';
+import { FlowPulseEdge } from './FlowPulseEdge';
 import {
   EepromProvisionNode,
   I2cTransferNode,
@@ -76,6 +78,7 @@ import {
 import { Console } from './Console';
 import { useEngine } from './useEngine';
 import { subscribeSnapshot, subscribeTopic } from './useEngineSocket';
+import { useEdgeFlowPulses } from './useEdgeFlowPulses';
 
 type FlowNode = Node<FlowNodeData>;
 type FlowEdge = Edge<FlowEdgeData>;
@@ -145,6 +148,10 @@ const nodeTypes = Object.fromEntries([
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
 ]);
 
+const edgeTypes = {
+  flowPulse: FlowPulseEdge,
+};
+
 const PANE_CLICK_DISTANCE_PX = 5;
 const GRID_TARGET_SCREEN_GAP_PX = 28;
 const GRID_MIN_GAP = 24;
@@ -169,6 +176,7 @@ export function App() {
   const [selection, setSelection] = useState<Selection>({ type: 'none' });
   const [events, setEvents] = useState<string[]>(['等待后端图快照...']);
   const { nodeStates, nodeDiagnostics, nodeOutputs, pendingActions, sendAction, refreshNodeOutput } = useEngine();
+  const edgePulses = useEdgeFlowPulses();
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; nodeId: string } | null>(null);
   const flowInstanceRef = useRef<ReactFlowInstance<FlowNode, FlowEdge> | null>(null);
   const [collapsedCategories, setCollapsedCategories] = useState<Set<string>>(new Set());
@@ -296,8 +304,8 @@ export function App() {
   );
 
   const displayedEdges = useMemo(
-    () => decorateFlowEdges(edges, nodes, runtimeNodeStates),
-    [edges, nodes, runtimeNodeStates],
+    () => decorateFlowEdges(edges, nodes, runtimeNodeStates, edgePulses),
+    [edges, nodes, runtimeNodeStates, edgePulses],
   );
 
   const onNodesChange = useCallback((changes: NodeChange<FlowNode>[]) => {
@@ -1006,6 +1014,7 @@ export function App() {
           nodes={nodes}
           edges={displayedEdges}
           nodeTypes={nodeTypes}
+          edgeTypes={edgeTypes}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
@@ -1095,9 +1104,9 @@ function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
     sourceHandle: edge.source.portId,
     target: edge.target.nodeId,
     targetHandle: edge.target.portId,
+    type: 'flowPulse',
     animated: false,
     style: DORMANT_EDGE_STYLE,
-    label: labelForPortKind(edge.kind),
     data: { workflowEdge: edge, kind: edge.kind, schema: edge.schema, schemaVersion: edge.schemaVersion },
     className: 'workflow-edge flow-inactive',
   }));
@@ -1136,7 +1145,7 @@ function mergeFlowEdges(current: FlowEdge[], graph: WorkflowGraph): FlowEdge[] {
       sourceHandle: nextEdge.sourceHandle,
       target: nextEdge.target,
       targetHandle: nextEdge.targetHandle,
-      label: nextEdge.label,
+      type: nextEdge.type,
       data: nextEdge.data,
       animated: nextEdge.animated,
       style: nextEdge.style,
@@ -1157,7 +1166,12 @@ function isNewerGraphRevision(nextRevision: string, currentRevision: string): bo
   return nextRevision > currentRevision;
 }
 
-function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStates: Map<string, string>): FlowEdge[] {
+function decorateFlowEdges(
+  edges: FlowEdge[],
+  nodes: FlowNode[],
+  runtimeNodeStates: Map<string, string>,
+  edgePulses: ReadonlyMap<string, readonly EdgePulseView[]>,
+): FlowEdge[] {
   const outgoing = new Map<string, FlowEdge[]>();
   for (const edge of edges) {
     outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge]);
@@ -1187,11 +1201,16 @@ function decorateFlowEdges(edges: FlowEdge[], nodes: FlowNode[], runtimeNodeStat
     const active = activeNodes.has(edge.source)
       || runtimeNodeStates.get(edge.source) === 'running'
       || runtimeNodeStates.get(edge.target) === 'running';
+    const edgeData = edge.data as FlowEdgeData;
     return {
       ...edge,
-      animated: active,
+      animated: false,
       style: active ? ACTIVE_EDGE_STYLE : DORMANT_EDGE_STYLE,
       className: `workflow-edge ${active ? 'flow-active' : 'flow-inactive'}`,
+      data: {
+        ...edgeData,
+        pulses: edgePulses.get(edge.id) ?? [],
+      },
     };
   });
 }

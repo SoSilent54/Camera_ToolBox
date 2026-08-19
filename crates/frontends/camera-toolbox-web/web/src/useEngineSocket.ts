@@ -17,7 +17,7 @@ const WS_RECONNECT_DELAY_MS = 1000;
 const WS_REQUEST_TIMEOUT_MS = 8000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 
-export type EngineTopic = 'status' | 'event' | 'frame' | 'frame_meta';
+export type EngineTopic = 'status' | 'event' | 'frame' | 'frame_meta' | 'flow';
 
 export interface WsRequestEnvelope {
   id: number;

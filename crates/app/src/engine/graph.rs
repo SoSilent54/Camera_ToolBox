@@ -12,6 +12,7 @@ use crate::platform::LatestDecodedFrameSlot;
 
 use super::{
     channel::{MailboxReceiver, MailboxSender, NodeMessage, create_mailbox},
+    flow::{EdgeFlowPulse, EdgeLink},
     node::{NodeAction, NodeError, NodeInstance},
     packet::DataPacket,
     registry::NodeRegistry,
@@ -21,6 +22,9 @@ use super::{
         NodeEvent, NodeId, NodeRuntimeState, NodeSpec, NodeStatusReport, PortCardinality, PortId,
     },
 };
+
+/// 边级流事件缓冲容量；满时只丢动画事件，不阻塞数据流。
+const FLOW_PULSE_CHANNEL_CAPACITY: usize = 4096;
 
 /// 端口端点引用。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,8 +103,10 @@ pub struct GraphEngine {
     /// 状态/事件发送端：build 时创建并长期保留，供增量 add_node 的新 reporter 克隆。
     status_tx: mpsc::Sender<NodeStatusReport>,
     event_tx: mpsc::Sender<NodeEvent>,
+    flow_tx: mpsc::SyncSender<EdgeFlowPulse>,
     status_rx: mpsc::Receiver<NodeStatusReport>,
     event_rx: mpsc::Receiver<NodeEvent>,
+    flow_rx: mpsc::Receiver<EdgeFlowPulse>,
     latest_outputs: Arc<Mutex<HashMap<NodeId, DataPacket>>>,
     inner: RwLock<Inner>,
 }
@@ -113,6 +119,7 @@ impl GraphEngine {
         services: EngineServices,
     ) -> Result<Self, GraphBuildError> {
         let (status_tx, status_rx) = mpsc::channel();
+        let (flow_tx, flow_rx) = mpsc::sync_channel(FLOW_PULSE_CHANNEL_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
         let services = Arc::new(services);
         // 节点最近输出缓存：emit 成功后由每个节点的 OutputRegistry 回灌，供中间结果查看。
@@ -139,7 +146,7 @@ impl GraphEngine {
             mailboxes.insert(node.id.clone(), (tx, rx));
             outputs.insert(
                 node.id.clone(),
-                make_output_registry(node.id.clone(), &latest_outputs),
+                make_output_registry(node.id.clone(), &latest_outputs, flow_tx.clone()),
             );
         }
 
@@ -157,11 +164,7 @@ impl GraphEngine {
             let source_outputs = outputs
                 .get_mut(&edge.source.node_id)
                 .expect("source node validated to exist");
-            source_outputs.connect(
-                edge.source.port_id.clone(),
-                edge.target.port_id.clone(),
-                target_tx.clone(),
-            );
+            source_outputs.connect(edge_link(edge), target_tx.clone());
         }
 
         // 4. spawn actor，并推导初始状态。
@@ -212,6 +215,8 @@ impl GraphEngine {
         let engine = Inner::new(nodes, spec.edges, viewer_slots);
         Ok(Self {
             services,
+            flow_tx,
+            flow_rx,
             status_tx,
             event_tx,
             status_rx,
@@ -253,6 +258,19 @@ impl GraphEngine {
         let mut out = Vec::new();
         while let Ok(event) = self.event_rx.try_recv() {
             out.push(event);
+        }
+        out
+    }
+
+    /// 非阻塞取回边级流动脉冲（web 层批量推 WebSocket）。
+    #[must_use]
+    pub fn drain_flow_pulses(&self, limit: usize) -> Vec<EdgeFlowPulse> {
+        let mut out = Vec::new();
+        while out.len() < limit {
+            let Ok(pulse) = self.flow_rx.try_recv() else {
+                break;
+            };
+            out.push(pulse);
         }
         out
     }
@@ -325,7 +343,8 @@ impl GraphEngine {
             .map_err(|error| GraphBuildError::Instantiate(node.id.clone(), error))?;
 
         let (mailbox_tx, mailbox_rx) = create_mailbox(4);
-        let outputs = make_output_registry(node.id.clone(), &self.latest_outputs);
+        let outputs =
+            make_output_registry(node.id.clone(), &self.latest_outputs, self.flow_tx.clone());
 
         let connected = connected_inputs_for(&inner.edges, &node.id);
         let initial_state = initial_state(&node, Some(&connected));
@@ -392,14 +411,14 @@ impl GraphEngine {
                     if let Some(target) = inner.nodes.get(&edge.target.node_id) {
                         handle.outputs.disconnect(
                             edge.source.port_id.clone(),
-                            &edge.target.port_id,
+                            &edge.id,
                             &target.mailbox,
                         );
                     }
                 } else if let Some(source) = inner.nodes.get_mut(&edge.source.node_id) {
                     source.outputs.disconnect(
                         edge.source.port_id.clone(),
-                        &edge.target.port_id,
+                        &edge.id,
                         &handle.mailbox,
                     );
                 }
@@ -459,11 +478,7 @@ impl GraphEngine {
             .get_mut(&edge.source.node_id)
             .expect("source validated")
             .outputs
-            .connect(
-                edge.source.port_id.clone(),
-                edge.target.port_id.clone(),
-                target_mailbox,
-            );
+            .connect(edge_link(&edge), target_mailbox);
         inner.edges.insert(edge.id.clone(), edge);
         Ok(())
     }
@@ -487,11 +502,9 @@ impl GraphEngine {
             .map(|handle| handle.mailbox.clone());
         if let Some(target_mailbox) = target_mailbox {
             if let Some(source) = inner.nodes.get_mut(&edge.source.node_id) {
-                source.outputs.disconnect(
-                    edge.source.port_id.clone(),
-                    &edge.target.port_id,
-                    &target_mailbox,
-                );
+                source
+                    .outputs
+                    .disconnect(edge.source.port_id.clone(), &edge.id, &target_mailbox);
             }
         }
         Ok(())
@@ -658,8 +671,10 @@ fn spawn_node_actor(
 fn make_output_registry(
     node_id: NodeId,
     latest_outputs: &Arc<Mutex<HashMap<NodeId, DataPacket>>>,
+    flow_tx: mpsc::SyncSender<EdgeFlowPulse>,
 ) -> OutputRegistry {
     let mut registry = OutputRegistry::default();
+    registry.set_flow_tx(flow_tx);
     let sink = Arc::clone(latest_outputs);
     registry.set_record(Arc::new(move |packet: DataPacket| {
         sink.lock()
@@ -667,6 +682,16 @@ fn make_output_registry(
             .insert(node_id.clone(), packet);
     }));
     registry
+}
+
+fn edge_link(edge: &EdgeSpec) -> EdgeLink {
+    EdgeLink {
+        edge_id: edge.id.clone(),
+        source_node_id: edge.source.node_id.clone(),
+        source_port_id: edge.source.port_id.clone(),
+        target_node_id: edge.target.node_id.clone(),
+        target_port_id: edge.target.port_id.clone(),
+    }
 }
 
 /// 单条边的拓扑校验：源/目标节点与端口存在、kind 匹配、目标输入端口 cardinality 判重。
@@ -1206,6 +1231,13 @@ mod tests {
 
         assert!(engine.latest_output("a").is_some(), "A 应收到 fan-out 数据");
         assert!(engine.latest_output("b").is_some(), "B 应收到 fan-out 数据");
+        let mut pulse_edges: Vec<String> = engine
+            .drain_flow_pulses(10)
+            .into_iter()
+            .map(|pulse| pulse.edge_id)
+            .collect();
+        pulse_edges.sort();
+        assert_eq!(pulse_edges, vec!["e1".to_owned(), "e2".to_owned()]);
     }
 
     /// 图级 多合1（fan-in）：A→t.image、B→t.video，Recorder 按端口区分收到的数据。
@@ -1276,6 +1308,13 @@ mod tests {
             ],
             "应按 image/video 端口区分两条 fan-in 数据"
         );
+        let mut pulse_edges: Vec<String> = engine
+            .drain_flow_pulses(10)
+            .into_iter()
+            .map(|pulse| pulse.edge_id)
+            .collect();
+        pulse_edges.sort();
+        assert_eq!(pulse_edges, vec!["e_img".to_owned(), "e_vid".to_owned()]);
     }
 
     /// 短等待 + 轮询：actor 在独立线程跑，同步测试用固定窗口反复检查谓词，超时报错。

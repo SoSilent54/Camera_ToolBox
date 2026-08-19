@@ -705,6 +705,24 @@ button:hover {
   fill: #94a3b8;
 }
 
+.edge-flow-pulse {
+  fill: #facc15;
+  stroke: #0f172a;
+  stroke-width: 1.5px;
+  filter: drop-shadow(0 0 6px rgba(250, 204, 21, 0.8));
+  pointer-events: none;
+}
+
+.edge-flow-pulse.frame {
+  fill: #22d3ee;
+  filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.8));
+}
+
+.edge-flow-pulse.control {
+  fill: #a78bfa;
+  filter: drop-shadow(0 0 6px rgba(167, 139, 250, 0.75));
+}
+
 .workflow-minimap {
   overflow: hidden;
   border: 1px solid #2f3744;

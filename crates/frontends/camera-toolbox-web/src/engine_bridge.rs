@@ -1,11 +1,12 @@
 //! 引擎桥接：把运行中引擎的状态/事件/帧从同步 actor 世界搬到 WebSocket 推送边界。
 //!
-//! 三个独立循环（`tokio::spawn`）均在单线程 tokio runtime 内协作，每个循环：
-//! 短暂持锁取数据（`drain_status`/`drain_events`/`viewer_frame` 均为非阻塞）、立即释放，
+//! 四个独立循环（`tokio::spawn`）均在单线程 tokio runtime 内协作，每个循环：
+//! 短暂持锁取数据（`drain_status`/`drain_events`/`drain_flow_pulses`/`viewer_frame` 均为非阻塞）、立即释放，
 //! 再 `tokio::time::sleep` 让出事件循环，避免饿死其它任务或死锁（从不跨 `.await` 持有引擎锁）。
 //!
 //! - `drain_status` → `ws_hub.broadcast_text(status push)`
 //! - `drain_events` → `ws_hub.broadcast_text(event push)`
+//! - `drain_flow_pulses` → `ws_hub.broadcast_text(flow push)`
 //! - viewer 帧：按 `frame_sequence` 去重（同帧不重复编码），`viewer_encode_width=960` 降采样
 //!   编码 JPEG → `ws_hub.publish_frame`（先 frame_meta 文本再 Binary）。
 
@@ -23,6 +24,9 @@ const STATUS_POLL_MS: u64 = 50;
 const EVENT_POLL_MS: u64 = 50;
 /// 帧循环的轮询间隔：约 60fps 的离散采样窗口；实际帧率由上游 pummp 事件驱动决定。
 const FRAME_POLL_MS: u64 = 16;
+/// 边级脉冲循环的轮询间隔和单次批量上限；只影响动画延迟/丢弃，不影响真实数据流。
+const FLOW_POLL_MS: u64 = 16;
+const FLOW_BATCH_LIMIT: usize = 256;
 
 /// viewer 帧 JPEG 编码目标宽度（等比缩放；见计划参数表 `viewer_encode_width`）。
 const VIEWER_ENCODE_WIDTH: u32 = 960;
@@ -39,6 +43,11 @@ pub fn spawn(state: AppState, hub: Arc<WsHub>) {
     let event_hub = Arc::clone(&hub);
     tokio::spawn(async move {
         drain_events_loop(event_state, event_hub).await;
+    });
+    let flow_state = state.clone();
+    let flow_hub = Arc::clone(&hub);
+    tokio::spawn(async move {
+        drain_flow_loop(flow_state, flow_hub).await;
     });
 
     tokio::spawn(async move {
@@ -84,6 +93,27 @@ async fn drain_events_loop(state: AppState, hub: Arc<WsHub>) {
             }
         }
         tokio::time::sleep(Duration::from_millis(EVENT_POLL_MS)).await;
+    }
+}
+
+/// 流事件循环：把引擎上报的边级 pulse 批量转成 `flow` push 广播。
+async fn drain_flow_loop(state: AppState, hub: Arc<WsHub>) {
+    loop {
+        {
+            let engine = state.engine_runtime.engine();
+            if let Some(engine) = engine.as_ref() {
+                let pulses = engine.drain_flow_pulses(FLOW_BATCH_LIMIT);
+                if !pulses.is_empty() {
+                    let push = json!({
+                        "kind": "push",
+                        "topic": "flow",
+                        "payload": { "pulses": pulses },
+                    });
+                    hub.broadcast_text(push.to_string());
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(FLOW_POLL_MS)).await;
     }
 }
 
