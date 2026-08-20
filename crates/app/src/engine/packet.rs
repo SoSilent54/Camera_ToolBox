@@ -4,10 +4,8 @@
 
 use std::sync::Arc;
 
-use camera_toolbox_core::{CalibrationSolution, ChessboardDetection};
-
-#[cfg(test)]
-use camera_toolbox_core::CalibrationImageSize;
+use camera_toolbox_core::{CalibrationImageSize, CalibrationSolution, ChessboardDetection};
+use serde::{Deserialize, Serialize};
 
 use crate::platform::{DecodedVideoFrame, SourcePts, StreamFrameIdentity, StreamSessionId};
 
@@ -180,6 +178,354 @@ pub struct CaptureRequest {
     pub source_identity: Option<ImageFrameIdentity>,
 }
 
+/// 标定板参数包的版本化 JSON 类型标识。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CalibrationBoardParamsKind {
+    #[serde(rename = "calib.board.params.v1")]
+    V1,
+}
+
+/// 当前受支持的标定板类型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CalibrationBoardKind {
+    #[serde(rename = "chessboard")]
+    Chessboard,
+}
+
+/// 相机模型参数包的版本化 JSON 类型标识。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CameraModelParamsKind {
+    #[serde(rename = "calib.camera.model.v1")]
+    V1,
+}
+
+/// 当前受支持的相机投影模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CameraModelKind {
+    #[serde(rename = "pinhole")]
+    Pinhole,
+}
+
+/// 畸变模型参数包的版本化 JSON 类型标识。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DistortionModelParamsKind {
+    #[serde(rename = "calib.distortion.model.v1")]
+    V1,
+}
+
+/// 当前受支持的镜头畸变模型。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DistortionModelKind {
+    #[serde(rename = "none")]
+    None,
+}
+
+/// 检测姿态包的版本化 JSON 类型标识。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectionPoseKind {
+    #[serde(rename = "calib.pose.v1")]
+    V1,
+}
+
+/// 检测姿态的坐标变换约定。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectionPoseConvention {
+    /// 将标定板坐标系中的点变换到相机坐标系。
+    #[serde(rename = "T_camera_board")]
+    TCameraBoard,
+}
+
+/// 三维向量；姿态平移使用米，Rodrigues 旋转向量使用弧度。
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationVector3 {
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
+}
+
+impl CalibrationVector3 {
+    #[must_use]
+    pub const fn new(x: f64, y: f64, z: f64) -> Self {
+        Self { x, y, z }
+    }
+
+    #[must_use]
+    pub fn is_finite(self) -> bool {
+        self.x.is_finite() && self.y.is_finite() && self.z.is_finite()
+    }
+}
+
+/// 参数包不满足下游检测、PnP 或求解前置条件时的错误。
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+pub enum CalibrationParameterError {
+    #[error("chessboard inner-corner dimensions must be within 2..=64, got {cols}x{rows}")]
+    InvalidBoardDimensions { cols: u16, rows: u16 },
+    #[error("{field} must be finite and positive, got {value}")]
+    NonFiniteOrNonPositive { field: &'static str, value: f64 },
+    #[error("{field} must be finite, got {value}")]
+    NonFinite { field: &'static str, value: f64 },
+    #[error("camera image size must be nonzero, got {width}x{height}")]
+    InvalidImageSize { width: u32, height: u32 },
+    #[error("the none distortion model requires zero coefficients, got {count}")]
+    NoneDistortionCoefficients { count: usize },
+    #[error("reprojection error must be finite and non-negative, got {value}")]
+    InvalidReprojectionError { value: f64 },
+}
+
+/// 可复用的棋盘格标定板参数；`cols`/`rows` 表示内角点数。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CalibrationBoardParams {
+    pub kind: CalibrationBoardParamsKind,
+    pub board_kind: CalibrationBoardKind,
+    pub cols: u16,
+    pub rows: u16,
+    pub square_size_mm: f64,
+}
+
+impl Default for CalibrationBoardParams {
+    fn default() -> Self {
+        Self {
+            kind: CalibrationBoardParamsKind::V1,
+            board_kind: CalibrationBoardKind::Chessboard,
+            cols: 11,
+            rows: 8,
+            square_size_mm: 40.0,
+        }
+    }
+}
+
+impl CalibrationBoardParams {
+    /// 构造当前唯一受支持的棋盘格参数包。
+    ///
+    /// # Errors
+    ///
+    /// 内角点尺寸不在 `2..=64` 或方格间距不是有限正数时返回错误。
+    pub fn new(
+        cols: u16,
+        rows: u16,
+        square_size_mm: f64,
+    ) -> Result<Self, CalibrationParameterError> {
+        let params = Self {
+            cols,
+            rows,
+            square_size_mm,
+            ..Self::default()
+        };
+        params.validate()?;
+        Ok(params)
+    }
+
+    /// 返回 Pose/Solver 生成 object points 时必须使用的米单位间距。
+    #[must_use]
+    pub fn square_size_meters(&self) -> f64 {
+        self.square_size_mm / 1_000.0
+    }
+
+    /// 验证当前棋盘格参数可用于检测和几何求解。
+    ///
+    /// # Errors
+    ///
+    /// 内角点尺寸不在 `2..=64` 或方格间距不是有限正数时返回错误。
+    pub fn validate(&self) -> Result<(), CalibrationParameterError> {
+        if !(2..=64).contains(&self.cols) || !(2..=64).contains(&self.rows) {
+            return Err(CalibrationParameterError::InvalidBoardDimensions {
+                cols: self.cols,
+                rows: self.rows,
+            });
+        }
+        validate_finite_positive("squareSizeMm", self.square_size_mm)
+    }
+}
+
+/// 可复用的针孔相机初始内参；焦距和主点的单位均为像素。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CameraModelParams {
+    pub kind: CameraModelParamsKind,
+    pub model: CameraModelKind,
+    pub fx: f64,
+    pub fy: f64,
+    pub cx: f64,
+    pub cy: f64,
+    pub image_size: Option<CalibrationImageSize>,
+}
+
+impl Default for CameraModelParams {
+    fn default() -> Self {
+        Self {
+            kind: CameraModelParamsKind::V1,
+            model: CameraModelKind::Pinhole,
+            fx: 900.0,
+            fy: 900.0,
+            cx: 960.0,
+            cy: 540.0,
+            image_size: Some(CalibrationImageSize {
+                width: 1_920,
+                height: 1_080,
+            }),
+        }
+    }
+}
+
+impl CameraModelParams {
+    /// 构造当前唯一受支持的针孔相机内参包。
+    ///
+    /// # Errors
+    ///
+    /// 焦距不是有限正数、主点不是有限数，或可选图像尺寸为零时返回错误。
+    pub fn new(
+        fx: f64,
+        fy: f64,
+        cx: f64,
+        cy: f64,
+        image_size: Option<CalibrationImageSize>,
+    ) -> Result<Self, CalibrationParameterError> {
+        let params = Self {
+            fx,
+            fy,
+            cx,
+            cy,
+            image_size,
+            ..Self::default()
+        };
+        params.validate()?;
+        Ok(params)
+    }
+
+    /// 验证针孔模型参数可安全转换为投影矩阵。
+    ///
+    /// # Errors
+    ///
+    /// 焦距不是有限正数、主点不是有限数，或可选图像尺寸为零时返回错误。
+    pub fn validate(&self) -> Result<(), CalibrationParameterError> {
+        validate_finite_positive("fx", self.fx)?;
+        validate_finite_positive("fy", self.fy)?;
+        validate_finite("cx", self.cx)?;
+        validate_finite("cy", self.cy)?;
+        if let Some(image_size) = self.image_size {
+            if image_size.width == 0 || image_size.height == 0 {
+                return Err(CalibrationParameterError::InvalidImageSize {
+                    width: image_size.width,
+                    height: image_size.height,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// 可复用的镜头畸变参数；当前只有无畸变模型。
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DistortionModelParams {
+    pub kind: DistortionModelParamsKind,
+    pub model: DistortionModelKind,
+    pub coefficients: Vec<f64>,
+}
+
+impl Default for DistortionModelParams {
+    fn default() -> Self {
+        Self {
+            kind: DistortionModelParamsKind::V1,
+            model: DistortionModelKind::None,
+            coefficients: Vec::new(),
+        }
+    }
+}
+
+impl DistortionModelParams {
+    /// 验证当前无畸变模型没有被携带 OpenCV 系数的调用方错误复用。
+    ///
+    /// # Errors
+    ///
+    /// `none` 模型携带任意系数时返回错误。
+    pub fn validate(&self) -> Result<(), CalibrationParameterError> {
+        if !self.coefficients.is_empty() {
+            return Err(CalibrationParameterError::NoneDistortionCoefficients {
+                count: self.coefficients.len(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// 单帧 PnP 输出的标定板姿态；始终保留产生检测的原始帧身份。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DetectionPose {
+    pub kind: DetectionPoseKind,
+    pub frame_identity: ImageFrameIdentity,
+    pub convention: DetectionPoseConvention,
+    pub translation_m: CalibrationVector3,
+    pub rotation_rodrigues: CalibrationVector3,
+    pub reprojection_error_px: Option<f64>,
+}
+
+impl DetectionPose {
+    /// 以固定的 `T_camera_board` 约定构造有效的 PnP 姿态。
+    ///
+    /// # Errors
+    ///
+    /// 平移/旋转存在非有限分量，或重投影误差为负数、NaN、无穷时返回错误。
+    pub fn new(
+        frame_identity: ImageFrameIdentity,
+        translation_m: CalibrationVector3,
+        rotation_rodrigues: CalibrationVector3,
+        reprojection_error_px: Option<f64>,
+    ) -> Result<Self, CalibrationParameterError> {
+        let pose = Self {
+            kind: DetectionPoseKind::V1,
+            frame_identity,
+            convention: DetectionPoseConvention::TCameraBoard,
+            translation_m,
+            rotation_rodrigues,
+            reprojection_error_px,
+        };
+        pose.validate()?;
+        Ok(pose)
+    }
+
+    /// 验证姿态数值可安全发送到运行时输出或下游几何节点。
+    ///
+    /// # Errors
+    ///
+    /// 平移/旋转存在非有限分量，或重投影误差为负数、NaN、无穷时返回错误。
+    pub fn validate(&self) -> Result<(), CalibrationParameterError> {
+        for (field, value) in [
+            ("translationM.x", self.translation_m.x),
+            ("translationM.y", self.translation_m.y),
+            ("translationM.z", self.translation_m.z),
+            ("rotationRodrigues.x", self.rotation_rodrigues.x),
+            ("rotationRodrigues.y", self.rotation_rodrigues.y),
+            ("rotationRodrigues.z", self.rotation_rodrigues.z),
+        ] {
+            validate_finite(field, value)?;
+        }
+        if let Some(error) = self.reprojection_error_px {
+            if !error.is_finite() || error < 0.0 {
+                return Err(CalibrationParameterError::InvalidReprojectionError { value: error });
+            }
+        }
+        Ok(())
+    }
+}
+
+fn validate_finite_positive(
+    field: &'static str,
+    value: f64,
+) -> Result<(), CalibrationParameterError> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(CalibrationParameterError::NonFiniteOrNonPositive { field, value });
+    }
+    Ok(())
+}
+
+fn validate_finite(field: &'static str, value: f64) -> Result<(), CalibrationParameterError> {
+    if !value.is_finite() {
+        return Err(CalibrationParameterError::NonFinite { field, value });
+    }
+    Ok(())
+}
 /// 检测结果连同产生它的原始图像身份；后续评分和采集请求必须只转发该身份，不得重建。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DetectionPacket {
@@ -417,6 +763,14 @@ pub enum DataPacket {
     ImageFrame(Arc<ImageFrame>),
     /// `calib.detection`：棋盘格检测结果及其来源帧身份。
     Detection(Arc<DetectionPacket>),
+    /// `calib.board.params`：棋盘格标定板参数。
+    CalibrationBoardParams(Arc<CalibrationBoardParams>),
+    /// `calib.camera.model`：针孔相机初始内参。
+    CameraModelParams(Arc<CameraModelParams>),
+    /// `calib.distortion.model`：镜头畸变模型参数。
+    DistortionModelParams(Arc<DistortionModelParams>),
+    /// `calib.pose`：检测帧中标定板的 `T_camera_board` 姿态。
+    DetectionPose(Arc<DetectionPose>),
     /// `calib.solution`：标定求解结果。
     Solution(Arc<CalibrationSolution>),
     /// `calib.coverage`：标定数据覆盖度（弱类型，`Arc<Value>` 承载）。
@@ -447,6 +801,10 @@ impl DataPacket {
             Self::VideoFrame(_) => "stream.video-frame",
             Self::ImageFrame(_) => "image.frame",
             Self::Detection(_) => "calib.detection",
+            Self::CalibrationBoardParams(_) => "calib.board.params",
+            Self::CameraModelParams(_) => "calib.camera.model",
+            Self::DistortionModelParams(_) => "calib.distortion.model",
+            Self::DetectionPose(_) => "calib.pose",
             Self::Solution(_) => "calib.solution",
             Self::Coverage(_) => "calib.coverage",
             Self::Dataset(_) => "calib.dataset",
@@ -467,6 +825,7 @@ impl DataPacket {
             Self::VideoFrame(frame) => Some(frame.identity.frame_sequence),
             Self::ImageFrame(frame) => Some(frame.identity.frame_sequence),
             Self::Detection(detection) => Some(detection.frame_identity.frame_sequence),
+            Self::DetectionPose(pose) => Some(pose.frame_identity.frame_sequence),
             Self::Score(score) => Some(score.frame_identity.frame_sequence),
             Self::CaptureSignal(signal) => Some(signal.frame_identity.frame_sequence),
             Self::CaptureTrigger(trigger) => Some(trigger.frame_identity.frame_sequence),
@@ -474,7 +833,10 @@ impl DataPacket {
                 .source_identity
                 .as_ref()
                 .map(|identity| identity.frame_sequence),
-            Self::Solution(_)
+            Self::CalibrationBoardParams(_)
+            | Self::CameraModelParams(_)
+            | Self::DistortionModelParams(_)
+            | Self::Solution(_)
             | Self::Coverage(_)
             | Self::Dataset(_)
             | Self::Report(_)
@@ -501,6 +863,13 @@ impl std::fmt::Debug for DataPacket {
                 .field("sequence", &frame.identity.frame_sequence)
                 .finish(),
             Self::Detection(_) => f.write_str("Detection(..)"),
+            Self::CalibrationBoardParams(_) => f.write_str("CalibrationBoardParams(..)"),
+            Self::CameraModelParams(_) => f.write_str("CameraModelParams(..)"),
+            Self::DistortionModelParams(_) => f.write_str("DistortionModelParams(..)"),
+            Self::DetectionPose(pose) => f
+                .debug_struct("DetectionPose")
+                .field("sequence", &pose.frame_identity.frame_sequence)
+                .finish(),
             Self::Solution(solution) => f
                 .debug_struct("Solution")
                 .field("views", &solution.views.len())
@@ -632,6 +1001,104 @@ mod tests {
         )
         .expect_err("odd NV12 width must be rejected");
         assert_eq!(error, ImageFrameError::InvalidNv12Dimensions);
+    }
+
+    #[test]
+    fn calibration_parameter_defaults_round_trip_as_v1_contracts() {
+        let board = CalibrationBoardParams::default();
+        let board_json = serde_json::to_value(&board).expect("board params serialize");
+        assert_eq!(
+            board_json,
+            serde_json::json!({
+                "kind": "calib.board.params.v1",
+                "boardKind": "chessboard",
+                "cols": 11,
+                "rows": 8,
+                "squareSizeMm": 40.0,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CalibrationBoardParams>(board_json)
+                .expect("board params deserialize"),
+            board
+        );
+        assert!((board.square_size_meters() - 0.04).abs() < f64::EPSILON);
+
+        let camera = CameraModelParams::default();
+        let camera_json = serde_json::to_value(&camera).expect("camera params serialize");
+        assert_eq!(
+            camera_json,
+            serde_json::json!({
+                "kind": "calib.camera.model.v1",
+                "model": "pinhole",
+                "fx": 900.0,
+                "fy": 900.0,
+                "cx": 960.0,
+                "cy": 540.0,
+                "imageSize": {"width": 1920, "height": 1080},
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<CameraModelParams>(camera_json)
+                .expect("camera params deserialize"),
+            camera
+        );
+
+        let distortion = DistortionModelParams::default();
+        let distortion_json =
+            serde_json::to_value(&distortion).expect("distortion params serialize");
+        assert_eq!(
+            distortion_json,
+            serde_json::json!({
+                "kind": "calib.distortion.model.v1",
+                "model": "none",
+                "coefficients": [],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<DistortionModelParams>(distortion_json)
+                .expect("distortion params deserialize"),
+            distortion
+        );
+    }
+
+    #[test]
+    fn calibration_parameter_validation_and_packet_kinds_are_explicit() {
+        assert!(CalibrationBoardParams::new(1, 8, 40.0).is_err());
+        assert!(CameraModelParams::new(0.0, 900.0, 960.0, 540.0, None).is_err());
+        assert!(DistortionModelParams {
+            coefficients: vec![0.0],
+            ..DistortionModelParams::default()
+        }
+        .validate()
+        .is_err());
+
+        let identity = ImageFrameIdentity::from(&stream_identity());
+        let pose = DetectionPose::new(
+            identity.clone(),
+            CalibrationVector3::new(0.0, 0.0, 1.0),
+            CalibrationVector3::new(0.0, 0.0, 0.0),
+            None,
+        )
+        .expect("finite pose");
+        assert_eq!(pose.frame_identity, identity);
+        assert_eq!(
+            DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default()))
+                .port_kind(),
+            "calib.board.params"
+        );
+        assert_eq!(
+            DataPacket::CameraModelParams(Arc::new(CameraModelParams::default())).port_kind(),
+            "calib.camera.model"
+        );
+        assert_eq!(
+            DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default()))
+                .port_kind(),
+            "calib.distortion.model"
+        );
+        let pose_packet = DataPacket::DetectionPose(Arc::new(pose));
+        assert_eq!(pose_packet.port_kind(), "calib.pose");
+        assert_eq!(pose_packet.flow_sequence(), Some(42));
     }
 
     #[test]

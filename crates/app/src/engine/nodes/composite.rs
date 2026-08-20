@@ -14,7 +14,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use camera_toolbox_core::ChessboardDetection;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::{
     engine::{
@@ -84,6 +84,9 @@ pub(crate) struct CalibrationDataset {
     pub(crate) board: Value,
     pub(crate) samples: Vec<CalibrationDatasetSample>,
     pub(crate) count: usize,
+    /// 当前仅存在于节点运行态/输出快照的选中样本；绝不写入 WorkflowGraph。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) selected_sample_id: Option<String>,
 }
 
 impl CalibrationDataset {
@@ -278,6 +281,8 @@ impl NodeFactory for DatasetCollectorFactory {
             samples: Vec::new(),
             pending_images: Vec::new(),
             pending_scores: Vec::new(),
+            cached_images: Vec::new(),
+            selected_sample_id: None,
             next_sample_id: 1,
         }))
     }
@@ -289,6 +294,9 @@ pub struct DatasetCollectorNode {
     /// image/score 可先到达；只按完整 identity 相等关联，绝不按时间戳寻找“最近帧”。
     pending_images: Vec<(ImageFrameIdentity, DatasetImageRef)>,
     pending_scores: Vec<(ImageFrameIdentity, DatasetSampleScore)>,
+    /// 有界 runtime 图像缓存；键只用完整 `ImageFrameIdentity`，供已选样本的 preview 输出复用。
+    cached_images: Vec<(ImageFrameIdentity, Arc<ImageFrame>)>,
+    selected_sample_id: Option<String>,
     next_sample_id: u64,
 }
 
@@ -312,13 +320,22 @@ impl NodeInstance for DatasetCollectorNode {
         rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
         match port {
+            "frames" => {
+                let DataPacket::VideoFrame(frame) = packet else {
+                    return Err(NodeError::Precondition(
+                        "datasetCollector.frames requires stream.video-frame".to_owned(),
+                    ));
+                };
+                self.record_image(Arc::new(ImageFrame::from(frame.as_ref())))
+            }
+
             "image" => {
                 let DataPacket::ImageFrame(image) = packet else {
                     return Err(NodeError::Precondition(
                         "datasetCollector.image requires image.frame".to_owned(),
                     ));
                 };
-                self.record_image(image.as_ref())
+                self.record_image(image)
             }
             "detection" => {
                 let DataPacket::Detection(detection) = packet else {
@@ -349,8 +366,21 @@ impl NodeInstance for DatasetCollectorNode {
                 self.samples.clear();
                 self.pending_images.clear();
                 self.pending_scores.clear();
+                self.cached_images.clear();
+                self.selected_sample_id = None;
                 self.emit_dataset(rt)?;
                 rt.report_event("dataset cleared");
+                Ok(())
+            }
+            NodeAction::Custom { name, payload } if name == "select" => {
+                let sample_id = sample_id_from_action_payload(&payload)?.to_owned();
+                let preview = self.select_sample(&sample_id)?;
+                rt.emit("preview", DataPacket::ImageFrame(preview))?;
+                // preview 必须先发，确保 dataset snapshot 仍是节点的 latest runtime output。
+                self.emit_dataset(rt)?;
+                rt.report_event(format!(
+                    "selected dataset sample {sample_id} (preview emitted)"
+                ));
                 Ok(())
             }
             NodeAction::Custom { name, payload }
@@ -394,6 +424,10 @@ impl NodeInstance for DatasetCollectorNode {
         while self.pending_scores.len() > max_samples {
             self.pending_scores.swap_remove(0);
         }
+        while self.cached_images.len() > max_samples {
+            self.cached_images.swap_remove(0);
+        }
+        self.clear_selection_if_missing();
         Ok(())
     }
 
@@ -414,18 +448,35 @@ impl DatasetCollectorNode {
         Ok(max_samples)
     }
 
-    /// 记录 image 的轻量引用；`ImageFrame::planes` 永不进入样本或 pending state。
-    fn record_image(&mut self, image: &ImageFrame) -> Result<(), NodeError> {
-        let image_ref = image_ref_from_image(image);
+    /// 同时保存轻量引用与有界原帧缓存；缓存只按完整 identity 查找，绝不做时间邻近匹配。
+    fn record_image(&mut self, image: Arc<ImageFrame>) -> Result<(), NodeError> {
+        let identity = image.identity.clone();
+        let image_ref = image_ref_from_image(image.as_ref());
+        self.store_cached_image(image)?;
         if let Some(sample) = self
             .samples
             .iter_mut()
-            .find(|sample| sample.identity == image.identity)
+            .find(|sample| sample.identity == identity)
         {
             sample.image_ref = image_ref;
             return Ok(());
         }
-        self.store_pending_image(image.identity.clone(), image_ref)
+        self.store_pending_image(identity, image_ref)
+    }
+
+    fn store_cached_image(&mut self, image: Arc<ImageFrame>) -> Result<(), NodeError> {
+        let identity = image.identity.clone();
+        if let Some((_, cached_image)) = self
+            .cached_images
+            .iter_mut()
+            .find(|(cached_identity, _)| *cached_identity == identity)
+        {
+            *cached_image = image;
+            return Ok(());
+        }
+        self.trim_cached_images()?;
+        self.cached_images.push((identity, image));
+        Ok(())
     }
 
     fn record_score(&mut self, score: &CalibrationFrameScore) -> Result<(), NodeError> {
@@ -498,6 +549,7 @@ impl DatasetCollectorNode {
                 .map(CollectedDatasetSample::wire)
                 .collect(),
             count: self.samples.len(),
+            selected_sample_id: self.selected_sample_id.clone(),
         };
         let dataset = serde_json::to_value(dataset).map_err(|error| {
             NodeError::Execution(format!("serialize calibration dataset: {error}"))
@@ -551,6 +603,13 @@ impl DatasetCollectorNode {
         Ok(())
     }
 
+    fn trim_cached_images(&mut self) -> Result<(), NodeError> {
+        if self.cached_images.len() >= self.max_samples()? {
+            self.cached_images.swap_remove(0);
+        }
+        Ok(())
+    }
+
     fn trim_pending_images(&mut self) -> Result<(), NodeError> {
         if self.pending_images.len() >= self.max_samples()? {
             self.pending_images.swap_remove(0);
@@ -579,6 +638,44 @@ impl DatasetCollectorNode {
             .map(|index| self.pending_scores.swap_remove(index).1)
     }
 
+    fn cached_image(&self, identity: &ImageFrameIdentity) -> Option<Arc<ImageFrame>> {
+        self.cached_images
+            .iter()
+            .find(|(cached_identity, _)| cached_identity == identity)
+            .map(|(_, image)| Arc::clone(image))
+    }
+
+    fn select_sample(&mut self, sample_id: &str) -> Result<Arc<ImageFrame>, NodeError> {
+        let identity = self
+            .samples
+            .iter()
+            .find(|sample| sample.id == sample_id)
+            .map(|sample| sample.identity.clone())
+            .ok_or_else(|| {
+                NodeError::Precondition(format!("dataset sample `{sample_id}` does not exist"))
+            })?;
+        let preview = self.cached_image(&identity).ok_or_else(|| {
+            NodeError::Precondition(format!(
+                "dataset sample `{sample_id}` has no exact cached image preview"
+            ))
+        })?;
+        self.selected_sample_id = Some(sample_id.to_owned());
+        Ok(preview)
+    }
+
+    fn clear_selection_if_missing(&mut self) {
+        let selected_missing = match self.selected_sample_id.as_deref() {
+            Some(selected_sample_id) => !self
+                .samples
+                .iter()
+                .any(|sample| sample.id == selected_sample_id),
+            None => false,
+        };
+        if selected_missing {
+            self.selected_sample_id = None;
+        }
+    }
+
     fn next_sample_id(&mut self) -> Result<String, NodeError> {
         let id = self.next_sample_id;
         self.next_sample_id = self.next_sample_id.checked_add(1).ok_or_else(|| {
@@ -598,6 +695,7 @@ impl DatasetCollectorNode {
         match action {
             "delete" => {
                 self.samples.remove(index);
+                self.clear_selection_if_missing();
             }
             "accept" => self.samples[index].acceptance.accepted = true,
             "reject" => self.samples[index].acceptance.accepted = false,
@@ -999,12 +1097,13 @@ fn config_usize(spec: &NodeSpec, key: &str, fallback: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
-
+    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
     use super::*;
+
+
     use crate::{
         engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext},
-        platform::StreamSessionId,
+        platform::{DecodedVideoFrame, StreamSessionId},
     };
     use camera_toolbox_core::{CalibrationImageSize, CalibrationPoint};
 
@@ -1107,8 +1206,8 @@ mod tests {
     fn collector() -> DatasetCollectorNode {
         let mut spec = node_spec(
             "datasetCollector",
-            vec!["image", "detection", "score"],
-            vec!["dataset"],
+            vec!["frames", "image", "detection", "score"],
+            vec!["dataset", "preview"],
         );
         spec.config = json!({"maxSamples": 4});
         DatasetCollectorNode {
@@ -1116,8 +1215,21 @@ mod tests {
             samples: Vec::new(),
             pending_images: Vec::new(),
             pending_scores: Vec::new(),
+            cached_images: Vec::new(),
+            selected_sample_id: None,
             next_sample_id: 1,
         }
+    }
+
+    fn video_frame(frame_identity: ImageFrameIdentity) -> DataPacket {
+        DataPacket::VideoFrame(Arc::new(DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: Arc::from([0_u8; 16]),
+            identity: frame_identity
+                .stream_identity()
+                .expect("stream-backed frame identity"),
+        }))
     }
 
     fn detection_packet(
@@ -1378,6 +1490,145 @@ mod tests {
             )
             .expect_err("missing sample id must be rejected");
         assert!(matches!(error, NodeError::Precondition(_)));
+    }
+
+    #[test]
+    fn collector_records_video_frame_for_exact_identity_preview() {
+        let frame_identity = identity(7);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut rt = runtime_with_record(Arc::clone(&recorded));
+        let mut node = collector();
+
+        node.on_input("frames", video_frame(frame_identity.clone()), &mut rt)
+            .expect("video frame input");
+        node.on_input(
+            "detection",
+            detection_packet(detection(2, 2, 1.0, 1.0), frame_identity),
+            &mut rt,
+        )
+        .expect("detection input");
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        node.on_action(
+            NodeAction::Custom {
+                name: "select".to_owned(),
+                payload: json!({"sampleId": "sample-1"}),
+            },
+            &mut rt,
+        )
+        .expect("select cached video frame");
+
+        let recorded = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(matches!(recorded.first(), Some(DataPacket::ImageFrame(_))));
+    }
+
+    #[test]
+    fn collector_select_emits_exact_cached_image_before_dataset_snapshot() {
+        let frame_identity = identity(7);
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut rt = runtime_with_record(Arc::clone(&recorded));
+        let mut node = collector();
+        let image = Arc::new(
+            ImageFrame::rgba8(2, 2, Arc::from(vec![0_u8; 16]), frame_identity.clone())
+                .expect("image"),
+        );
+        node.on_input("image", DataPacket::ImageFrame(Arc::clone(&image)), &mut rt)
+            .expect("image input");
+        node.on_input(
+            "detection",
+            detection_packet(detection(2, 2, 1.0, 1.0), frame_identity),
+            &mut rt,
+        )
+        .expect("detection input");
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        node.on_action(
+            NodeAction::Custom {
+                name: "select".to_owned(),
+                payload: json!({"sampleId": "sample-1"}),
+            },
+            &mut rt,
+        )
+        .expect("select sample");
+
+        let recorded = recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(recorded.len(), 2);
+        let DataPacket::ImageFrame(preview) = &recorded[0] else {
+            panic!("select must emit cached image preview first");
+        };
+        assert_eq!(preview.as_ref(), image.as_ref());
+        let DataPacket::Dataset(dataset) = &recorded[1] else {
+            panic!("select must leave dataset as the latest runtime output");
+        };
+        assert_eq!(dataset["selectedSampleId"], "sample-1");
+    }
+
+    #[test]
+    fn collector_select_rejects_nearby_but_nonidentical_image() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut rt = runtime_with_record(Arc::clone(&recorded));
+        let mut node = collector();
+        let image = ImageFrame::rgba8(2, 2, Arc::from(vec![0_u8; 16]), identity(8))
+            .expect("unrelated image");
+        node.on_input("image", DataPacket::ImageFrame(Arc::new(image)), &mut rt)
+            .expect("image input");
+        node.on_input(
+            "detection",
+            detection_packet(detection(2, 2, 1.0, 1.0), identity(7)),
+            &mut rt,
+        )
+        .expect("detection input");
+        recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let error = node
+            .on_action(
+                NodeAction::Custom {
+                    name: "select".to_owned(),
+                    payload: json!({"sampleId": "sample-1"}),
+                },
+                &mut rt,
+            )
+            .expect_err("select must reject a sample without an exact cached image");
+
+        assert!(matches!(
+            error,
+            NodeError::Precondition(message) if message.contains("no exact cached image preview")
+        ));
+        assert!(node.selected_sample_id.is_none());
+        assert!(recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
+    }
+
+    #[test]
+    fn collector_bounds_preview_cache_by_sample_capacity() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut rt = runtime_with_record(recorded);
+        let mut node = collector();
+        node.on_config_update(json!({"maxSamples": 1}), &mut rt)
+            .expect("reduce cache capacity");
+        for sequence in 1..=2 {
+            let image = ImageFrame::rgba8(2, 2, Arc::from(vec![0_u8; 16]), identity(sequence))
+                .expect("image");
+            node.on_input("image", DataPacket::ImageFrame(Arc::new(image)), &mut rt)
+                .expect("image input");
+        }
+        assert_eq!(node.cached_images.len(), 1);
+        assert_eq!(node.cached_images[0].0, identity(2));
     }
 
     #[test]

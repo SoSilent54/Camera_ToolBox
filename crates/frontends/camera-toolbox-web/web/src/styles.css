@@ -689,21 +689,18 @@ button:hover {
 }
 
 .workflow-edge .react-flow__edge-path {
-  stroke: #94a3b8;
-  opacity: 0.9;
+  opacity: 0.72;
   stroke-width: 2px;
-  transition: stroke 180ms ease, opacity 180ms ease, stroke-width 180ms ease;
+  transition: opacity 180ms ease, stroke-width 180ms ease;
 }
 
 .workflow-edge.flow-active .react-flow__edge-path {
-  stroke: #38bdf8;
   opacity: 1;
   stroke-width: 2.25px;
 }
 
 .workflow-edge.flow-inactive .react-flow__edge-path {
-  stroke: #94a3b8;
-  opacity: 0.9;
+  opacity: 0.72;
   stroke-width: 2px;
 }
 
@@ -738,21 +735,17 @@ button:hover {
 }
 
 .edge-flow-pulse {
-  fill: #facc15;
   stroke: #0f172a;
   stroke-width: 1.5px;
-  filter: drop-shadow(0 0 6px rgba(250, 204, 21, 0.8));
   pointer-events: none;
 }
 
-.edge-flow-pulse.frame {
-  fill: #22d3ee;
-  filter: drop-shadow(0 0 6px rgba(34, 211, 238, 0.8));
+.workflow-connection-preview-primary {
+  animation: workflow-connection-preview-dash 560ms linear infinite;
 }
 
-.edge-flow-pulse.control {
-  fill: #a78bfa;
-  filter: drop-shadow(0 0 6px rgba(167, 139, 250, 0.75));
+@keyframes workflow-connection-preview-dash {
+  to { stroke-dashoffset: -13; }
 }
 
 .workflow-minimap {
@@ -1336,9 +1329,19 @@ button:disabled {
   padding: 0.22rem 0.28rem;
 }
 
+.dataset-sample-row:focus-visible {
+  outline: 2px solid rgba(125, 211, 252, 0.85);
+  outline-offset: 1px;
+}
+
 .dataset-sample-row:hover {
   border-color: rgba(125, 211, 252, 0.36);
   background: rgba(30, 41, 59, 0.54);
+}
+
+.dataset-sample-row.selected {
+  border-color: rgba(56, 189, 248, 0.72);
+  background: rgba(14, 116, 144, 0.2);
 }
 
 .dataset-sample-main {
@@ -1437,6 +1440,7 @@ button:disabled {
 .dataset-sample-actions .dataset-sample-delete {
   color: #fecaca;
 }
+
 
 .dataset-browser-empty {
   margin: 0;

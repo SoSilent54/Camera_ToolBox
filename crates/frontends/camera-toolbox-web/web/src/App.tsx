@@ -56,6 +56,7 @@ import {
   type WorkmodeTemplate,
 } from './workflow';
 import { FlowPulseEdge } from './FlowPulseEdge';
+import { FlowConnectionPreview } from './FlowConnectionPreview';
 import { FlowPulseOverlay } from './FlowPulseOverlay';
 import {
   EepromProvisionNode,
@@ -70,6 +71,7 @@ import {
 import {
   AutoCaptureNode,
   CalibrationSolverNode,
+  CalibrationParameterNode,
   CalibrationWorkflowNode,
   DatasetCollectorNode,
   GenericWorkflowNode,
@@ -143,6 +145,8 @@ const nodeTypes = Object.fromEntries([
   ['eepromProvision', EepromProvisionNode],
   ['viewer', ViewerNode],
   ['calibrationSolver', CalibrationSolverNode],
+  ['calibrationBoardParams', CalibrationParameterNode],
+  ['cameraInitialParams', CalibrationParameterNode],
   ['autoCaptureController', AutoCaptureNode],
   ['chessboardDetector', CalibrationWorkflowNode],
   ['calibrationFrameScorer', CalibrationWorkflowNode],
@@ -152,6 +156,7 @@ const nodeTypes = Object.fromEntries([
   ['datasetCollector', DatasetCollectorNode],
   ['coverageAnalyzer', CalibrationWorkflowNode],
   ['poseGuide', CalibrationWorkflowNode],
+  ['poseEstimator', CalibrationWorkflowNode],
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
 ]);
 
@@ -1023,6 +1028,7 @@ export function App() {
           edges={displayedEdges}
           nodeTypes={nodeTypes}
           edgeTypes={edgeTypes}
+          connectionLineComponent={FlowConnectionPreview}
           onNodesChange={onNodesChange}
           onEdgesChange={onEdgesChange}
           onConnect={onConnect}
@@ -1102,9 +1108,9 @@ function toFlowNodes(graph: WorkflowGraph): FlowNode[] {
     },
   }));
 }
-// 空闲边使用显式 SVG 样式，避免仅靠低对比度 CSS 而在深色画布上消失。
-const DORMANT_EDGE_STYLE = { stroke: '#94a3b8', strokeWidth: 2, opacity: 0.9 } as const;
-const ACTIVE_EDGE_STYLE = { stroke: '#38bdf8', strokeWidth: 2.25, opacity: 1 } as const;
+// 边的负载类型决定颜色；运行时状态只改变对比度和线宽。
+const DORMANT_EDGE_STYLE = { strokeWidth: 2, opacity: 0.72 } as const;
+const ACTIVE_EDGE_STYLE = { strokeWidth: 2.25, opacity: 1 } as const;
 
 function toFlowEdges(graph: WorkflowGraph): FlowEdge[] {
   return graph.edges.map((edge) => ({

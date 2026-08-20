@@ -12,13 +12,14 @@ use camera_toolbox_core::{
 
 use crate::{
     engine::{
+        packet::{CalibrationBoardParams, CameraModelParams, DistortionModelParams},
         DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
         NodeRuntimeState, NodeSpec,
     },
     ports::CalibrationCancellation,
 };
 
-use super::composite::{CalibrationDataset, parse_calibration_dataset};
+use super::composite::{parse_calibration_dataset, CalibrationDataset};
 
 pub struct CalibrationSolverFactory;
 
@@ -31,6 +32,9 @@ impl NodeFactory for CalibrationSolverFactory {
         Ok(Box::new(CalibrationSolverNode {
             spec,
             dataset: None,
+            board: None,
+            camera_model: None,
+            distortion_model: None,
         }))
     }
 }
@@ -38,6 +42,9 @@ impl NodeFactory for CalibrationSolverFactory {
 pub struct CalibrationSolverNode {
     spec: NodeSpec,
     dataset: Option<CalibrationDataset>,
+    board: Option<Arc<CalibrationBoardParams>>,
+    camera_model: Option<Arc<CameraModelParams>>,
+    distortion_model: Option<Arc<DistortionModelParams>>,
 }
 
 impl NodeInstance for CalibrationSolverNode {
@@ -56,15 +63,39 @@ impl NodeInstance for CalibrationSolverNode {
         packet: DataPacket,
         _rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
-        if port != "dataset" {
-            return Ok(());
+        match (port, packet) {
+            ("dataset", DataPacket::Dataset(dataset)) => {
+                self.dataset = Some(parse_calibration_dataset(&dataset)?);
+            }
+            ("board", DataPacket::CalibrationBoardParams(board)) => self.board = Some(board),
+            ("cameraModel", DataPacket::CameraModelParams(camera_model)) => {
+                self.camera_model = Some(camera_model);
+            }
+            ("distortionModel", DataPacket::DistortionModelParams(distortion_model)) => {
+                self.distortion_model = Some(distortion_model);
+            }
+            ("dataset", _) => {
+                return Err(NodeError::Precondition(
+                    "calibrationSolver.dataset requires calib.dataset".to_owned(),
+                ));
+            }
+            ("board", _) => {
+                return Err(NodeError::Precondition(
+                    "calibrationSolver.board requires calib.board.params".to_owned(),
+                ));
+            }
+            ("cameraModel", _) => {
+                return Err(NodeError::Precondition(
+                    "calibrationSolver.cameraModel requires calib.camera.model".to_owned(),
+                ));
+            }
+            ("distortionModel", _) => {
+                return Err(NodeError::Precondition(
+                    "calibrationSolver.distortionModel requires calib.distortion.model".to_owned(),
+                ));
+            }
+            _ => {}
         }
-        let DataPacket::Dataset(dataset) = packet else {
-            return Err(NodeError::Precondition(
-                "calibrationSolver.dataset requires calib.dataset".to_owned(),
-            ));
-        };
-        self.dataset = Some(parse_calibration_dataset(&dataset)?);
         Ok(())
     }
 
@@ -140,35 +171,42 @@ impl CalibrationSolverNode {
     }
 
     fn build_request(&self) -> Result<CalibrationRequest, NodeError> {
-        let image_size = CalibrationImageSize::new(
+        let fallback_image_size = CalibrationImageSize::new(
             config_u32(&self.spec, "imageWidth", 1920),
             config_u32(&self.spec, "imageHeight", 1080),
         )
         .map_err(|error| NodeError::Config(error.to_string()))?;
-        let board = BoardSpec::new(
-            config_u16(&self.spec, "boardCols", 8),
-            config_u16(&self.spec, "boardRows", 11),
-            config_f64(&self.spec, "squareSizeMm", 30.0),
-        )
-        .map_err(|error| NodeError::Config(error.to_string()))?;
+        let image_size = self
+            .camera_model
+            .as_ref()
+            .and_then(|params| params.image_size)
+            .unwrap_or(fallback_image_size);
+        let board = match self.board.as_deref() {
+            Some(params) => board_spec_from_params(params)?,
+            None => BoardSpec::new(
+                config_u16(&self.spec, "boardCols", 8),
+                config_u16(&self.spec, "boardRows", 11),
+                config_f64(&self.spec, "squareSizeMm", 30.0),
+            )
+            .map_err(|error| NodeError::Config(error.to_string()))?,
+        };
 
         let image_points: Vec<Vec<CalibrationPoint>> = if let Some(dataset) = &self.dataset {
             let mut points = Vec::with_capacity(dataset.samples.len());
             for sample in dataset.accepted_enabled_samples() {
                 let detection = &sample.detection;
                 if detection.image_size != image_size {
-                    return Err(NodeError::Config(format!(
-                        "dataset sample `{}` image size {:?} does not match configured {:?}",
+                    return Err(NodeError::Precondition(format!(
+                        "dataset sample `{}` image size {:?} does not match active {:?}",
                         sample.id, detection.image_size, image_size
                     )));
                 }
                 detection.validate(board).map_err(|error| {
                     NodeError::Precondition(format!(
-                        "dataset sample `{}` is invalid: {error}",
+                        "dataset sample `{}` is invalid for active board: {error}",
                         sample.id
                     ))
                 })?;
-                // 求解器只保留 accepted/enabled detection 的角点，数学输入与旧请求保持一致。
                 points.push(detection.corners.clone());
             }
             if points.is_empty() {
@@ -185,23 +223,74 @@ impl CalibrationSolverNode {
                 .unwrap_or_default()
         };
 
-        let fx = config_f64(&self.spec, "fx", 1234.56);
-        let fy = config_f64(&self.spec, "fy", 1234.56);
-        let cx = config_f64(&self.spec, "cx", 960.0);
-        let cy = config_f64(&self.spec, "cy", 540.0);
-        let camera_matrix = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0];
-        let distortion_coefficients = vec![0.0; 12];
+        let initial_intrinsics = match (self.camera_model.as_deref(), self.distortion_model.as_deref()) {
+            (Some(camera_model), Some(distortion_model)) => {
+                initial_intrinsics_from_params(camera_model, distortion_model)?
+            }
+            (Some(camera_model), None) => {
+                initial_intrinsics_from_params(camera_model, &DistortionModelParams::default())?
+            }
+            (None, _) => InitialIntrinsics {
+                camera_matrix: [
+                    config_f64(&self.spec, "fx", 1234.56),
+                    0.0,
+                    config_f64(&self.spec, "cx", 960.0),
+                    0.0,
+                    config_f64(&self.spec, "fy", 1234.56),
+                    config_f64(&self.spec, "cy", 540.0),
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                distortion_coefficients: vec![0.0; 12],
+            },
+        };
+        initial_intrinsics
+            .validate()
+            .map_err(|error| NodeError::Precondition(format!("invalid initial intrinsics: {error}")))?;
 
         Ok(CalibrationRequest {
             image_size,
             board,
             image_points,
-            initial_intrinsics: InitialIntrinsics {
-                camera_matrix,
-                distortion_coefficients,
-            },
+            initial_intrinsics,
         })
     }
+}
+
+fn board_spec_from_params(params: &CalibrationBoardParams) -> Result<BoardSpec, NodeError> {
+    params
+        .validate()
+        .map_err(|error| NodeError::Precondition(format!("invalid board parameters: {error}")))?;
+    BoardSpec::new(params.cols, params.rows, params.square_size_mm)
+        .map_err(|error| NodeError::Precondition(error.to_string()))
+}
+
+fn initial_intrinsics_from_params(
+    camera_model: &CameraModelParams,
+    distortion_model: &DistortionModelParams,
+) -> Result<InitialIntrinsics, NodeError> {
+    camera_model
+        .validate()
+        .map_err(|error| NodeError::Precondition(format!("invalid camera parameters: {error}")))?;
+    distortion_model.validate().map_err(|error| {
+        NodeError::Precondition(format!("invalid distortion parameters: {error}"))
+    })?;
+    Ok(InitialIntrinsics {
+        camera_matrix: [
+            camera_model.fx,
+            0.0,
+            camera_model.cx,
+            0.0,
+            camera_model.fy,
+            camera_model.cy,
+            0.0,
+            0.0,
+            1.0,
+        ],
+        // 当前 only-none 公共模型在 OpenCV 调用边界以显式零向量表达。
+        distortion_coefficients: vec![0.0; 5],
+    })
 }
 
 fn config_u32(spec: &NodeSpec, key: &str, fallback: u32) -> u32 {
@@ -229,7 +318,7 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
 
     use super::*;
     use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
@@ -395,6 +484,9 @@ mod tests {
         let node = CalibrationSolverNode {
             spec: spec(),
             dataset: None,
+            board: None,
+            camera_model: None,
+            distortion_model: None,
         };
         let request = node.build_request().expect("build request");
         assert_eq!(request.image_size.width, 1920);
@@ -414,6 +506,9 @@ mod tests {
         let mut node = CalibrationSolverNode {
             spec: spec(),
             dataset: None,
+            board: None,
+            camera_model: None,
+            distortion_model: None,
         };
         node.on_config_update(
             serde_json::json!({
@@ -437,6 +532,41 @@ mod tests {
         assert_eq!(request.board.inner_rows, 6);
         assert_eq!(request.initial_intrinsics.camera_matrix[0], 500.0);
         assert_eq!(request.initial_intrinsics.camera_matrix[2], 640.0);
+    }
+
+    #[test]
+    fn parameter_packets_override_legacy_solver_config() {
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverNode {
+            spec: spec(),
+            dataset: None,
+            board: None,
+            camera_model: None,
+            distortion_model: None,
+        };
+        node.on_input(
+            "board",
+            DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default())),
+            &mut rt,
+        )
+        .expect("board input");
+        node.on_input(
+            "cameraModel",
+            DataPacket::CameraModelParams(Arc::new(CameraModelParams::default())),
+            &mut rt,
+        )
+        .expect("camera input");
+        node.on_input(
+            "distortionModel",
+            DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default())),
+            &mut rt,
+        )
+        .expect("distortion input");
+        let request = node.build_request().expect("request from parameter packets");
+        assert_eq!((request.board.inner_cols, request.board.inner_rows, request.board.square_size), (11, 8, 40.0));
+        assert_eq!(request.initial_intrinsics.camera_matrix[0], 900.0);
+        assert_eq!(request.initial_intrinsics.distortion_coefficients, vec![0.0; 5]);
     }
 
     #[test]
@@ -468,6 +598,9 @@ mod tests {
         let mut node = CalibrationSolverNode {
             spec: spec(),
             dataset: None,
+            board: None,
+            camera_model: None,
+            distortion_model: None,
         };
         node.on_input("dataset", DataPacket::Dataset(Arc::new(dataset)), &mut rt)
             .expect("accept rich dataset");
@@ -495,6 +628,9 @@ mod tests {
         let mut node = CalibrationSolverNode {
             spec: spec(),
             dataset: None,
+            board: None,
+            camera_model: None,
+            distortion_model: None,
         };
         node.on_input("dataset", DataPacket::Dataset(Arc::new(dataset)), &mut rt)
             .expect("accept rich dataset");

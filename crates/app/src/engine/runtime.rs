@@ -3,14 +3,13 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc, Arc, RwLock,
     },
     thread::JoinHandle,
 };
 
-use crate::platform::{LatestDecodedFrameSlot, host_monotonic_time_ns};
+use crate::platform::{host_monotonic_time_ns, LatestDecodedFrameSlot};
 
 use super::{
     channel::{ChannelFull, MailboxSender, NodeMessage},
@@ -266,7 +265,7 @@ impl NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{mpsc, Arc, Mutex};
 
     use super::*;
     use crate::engine::packet::DataPacket;

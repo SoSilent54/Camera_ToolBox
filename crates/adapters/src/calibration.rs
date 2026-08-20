@@ -1,6 +1,8 @@
 //! `OpenCV` 标定 adapter；所有 `OpenCV` 类型限定在本模块内。
 
-use camera_toolbox_app::{CalibrationBackend, CalibrationBackendError, CalibrationCancellation};
+use camera_toolbox_app::{
+    CalibrationBackend, CalibrationBackendError, CalibrationCancellation, SubpixelRefinementOptions,
+};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
     ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics, PANGBOT_CALIBRATION_FLAGS,
@@ -50,69 +52,33 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
         board: BoardSpec,
         cancellation: &CalibrationCancellation,
     ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError> {
-        checkpoint(cancellation)?;
-        board.validate()?;
-        CalibrationImageSize::new(expected_size.width, expected_size.height)?;
-        if !encoded_png.starts_with(PNG_SIGNATURE) {
-            return Err(CalibrationBackendError::InputNotPng);
-        }
-        ensure_decoded_budget(expected_size, decoded_byte_limit)?;
+        self.detect_png_internal(
+            encoded_png,
+            expected_size,
+            decoded_byte_limit,
+            board,
+            None,
+            cancellation,
+        )
+    }
 
-        let encoded = Vector::<u8>::from_slice(encoded_png);
-        let bgr = imgcodecs::imdecode(&encoded, imgcodecs::IMREAD_COLOR)
-            .map_err(|error| cv_error("imdecode", &error))?;
-        if bgr.empty() {
-            return Err(CalibrationBackendError::OpenCv {
-                operation: "imdecode",
-                message: "decoder returned an empty image".to_owned(),
-            });
-        }
-        let actual_size = calibration_image_size(&bgr)?;
-        if actual_size != expected_size {
-            return Err(CalibrationBackendError::ImageSizeMismatch {
-                expected: expected_size,
-                actual: actual_size,
-            });
-        }
-        checkpoint(cancellation)?;
-
-        let mut gray = Mat::default();
-        imgproc::cvt_color_def(&bgr, &mut gray, imgproc::COLOR_BGR2GRAY)
-            .map_err(|error| cv_error("cvtColor(BGR2GRAY)", &error))?;
-        let mut corners = Vector::<Point2f>::new();
-        let board_size = Size::new(i32::from(board.inner_cols), i32::from(board.inner_rows));
-        let found =
-            objdetect::find_chessboard_corners(&gray, board_size, &mut corners, DETECTOR_FLAGS)
-                .map_err(|error| cv_error("findChessboardCorners", &error))?;
-        checkpoint(cancellation)?;
-
-        if !found {
-            return Ok(ChessboardDetectionOutcome::NotFound {
-                image_size: actual_size,
-            });
-        }
-        let refinement = refine_detected_corners(&gray, &mut corners, board, cancellation)?;
-        debug_assert!(
-            refinement.final_window.is_none() || refinement.preferred_window.is_some(),
-            "a final subpixel window requires a preferred window"
-        );
-        if !refinement.accepted {
-            return Ok(ChessboardDetectionOutcome::NotFound {
-                image_size: actual_size,
-            });
-        }
-        checkpoint(cancellation)?;
-
-        let detection = ChessboardDetection {
-            image_size: actual_size,
-            corners: corners
-                .to_vec()
-                .into_iter()
-                .map(|point| CalibrationPoint::new(point.x, point.y))
-                .collect(),
-        };
-        detection.validate(board)?;
-        Ok(ChessboardDetectionOutcome::Found(detection))
+    fn detect_png_with_options(
+        &self,
+        encoded_png: &[u8],
+        expected_size: CalibrationImageSize,
+        decoded_byte_limit: usize,
+        board: BoardSpec,
+        options: SubpixelRefinementOptions,
+        cancellation: &CalibrationCancellation,
+    ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError> {
+        self.detect_png_internal(
+            encoded_png,
+            expected_size,
+            decoded_byte_limit,
+            board,
+            Some(options),
+            cancellation,
+        )
     }
 
     fn estimate_pose(
@@ -328,6 +294,87 @@ impl CalibrationBackend for OpenCvCalibrationBackend {
     }
 }
 
+impl OpenCvCalibrationBackend {
+    /// 显式配置走固定 `cornerSubPix` 参数；`None` 保留历史自适应细化与稳定性筛选。
+    fn detect_png_internal(
+        &self,
+        encoded_png: &[u8],
+        expected_size: CalibrationImageSize,
+        decoded_byte_limit: usize,
+        board: BoardSpec,
+        options: Option<SubpixelRefinementOptions>,
+        cancellation: &CalibrationCancellation,
+    ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError> {
+        checkpoint(cancellation)?;
+        board.validate()?;
+        CalibrationImageSize::new(expected_size.width, expected_size.height)?;
+        if !encoded_png.starts_with(PNG_SIGNATURE) {
+            return Err(CalibrationBackendError::InputNotPng);
+        }
+        ensure_decoded_budget(expected_size, decoded_byte_limit)?;
+
+        let encoded = Vector::<u8>::from_slice(encoded_png);
+        let bgr = imgcodecs::imdecode(&encoded, imgcodecs::IMREAD_COLOR)
+            .map_err(|error| cv_error("imdecode", &error))?;
+        if bgr.empty() {
+            return Err(CalibrationBackendError::OpenCv {
+                operation: "imdecode",
+                message: "decoder returned an empty image".to_owned(),
+            });
+        }
+        let actual_size = calibration_image_size(&bgr)?;
+        if actual_size != expected_size {
+            return Err(CalibrationBackendError::ImageSizeMismatch {
+                expected: expected_size,
+                actual: actual_size,
+            });
+        }
+        checkpoint(cancellation)?;
+
+        let mut gray = Mat::default();
+        imgproc::cvt_color_def(&bgr, &mut gray, imgproc::COLOR_BGR2GRAY)
+            .map_err(|error| cv_error("cvtColor(BGR2GRAY)", &error))?;
+        let mut corners = Vector::<Point2f>::new();
+        let board_size = Size::new(i32::from(board.inner_cols), i32::from(board.inner_rows));
+        let found = objdetect::find_chessboard_corners(&gray, board_size, &mut corners, DETECTOR_FLAGS)
+            .map_err(|error| cv_error("findChessboardCorners", &error))?;
+        checkpoint(cancellation)?;
+        if !found {
+            return Ok(ChessboardDetectionOutcome::NotFound { image_size: actual_size });
+        }
+
+        match options {
+            None => {
+                let refinement = refine_detected_corners(&gray, &mut corners, board, cancellation)?;
+                debug_assert!(
+                    refinement.final_window.is_none() || refinement.preferred_window.is_some(),
+                    "a final subpixel window requires a preferred window"
+                );
+                if !refinement.accepted {
+                    return Ok(ChessboardDetectionOutcome::NotFound { image_size: actual_size });
+                }
+            }
+            Some(options) if options.enabled => {
+                options.validate()?;
+                corner_sub_pix_with_options(&gray, &mut corners, options)?;
+                checkpoint(cancellation)?;
+            }
+            Some(options) => options.validate()?,
+        }
+        checkpoint(cancellation)?;
+        let detection = ChessboardDetection {
+            image_size: actual_size,
+            corners: corners
+                .to_vec()
+                .into_iter()
+                .map(|point| CalibrationPoint::new(point.x, point.y))
+                .collect(),
+        };
+        detection.validate(board)?;
+        Ok(ChessboardDetectionOutcome::Found(detection))
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SubpixelRefinementReport {
     accepted: bool,
@@ -435,6 +482,22 @@ fn corner_sub_pix_with_window(
         SUBPIX_EPSILON,
     )
     .map_err(|error| cv_error("TermCriteria(subpixel)", &error))?;
+    imgproc::corner_sub_pix(gray, corners, window, SUBPIX_ZERO_ZONE, criteria)
+        .map_err(|error| cv_error("cornerSubPix", &error))
+}
+
+fn corner_sub_pix_with_options(
+    gray: &Mat,
+    corners: &mut Vector<Point2f>,
+    options: SubpixelRefinementOptions,
+) -> Result<(), CalibrationBackendError> {
+    let criteria = TermCriteria::new(
+        core::TermCriteria_EPS | core::TermCriteria_COUNT,
+        options.max_iterations,
+        options.epsilon,
+    )
+    .map_err(|error| cv_error("TermCriteria(subpixel)", &error))?;
+    let window = Size::new(options.window_radius, options.window_radius);
     imgproc::corner_sub_pix(gray, corners, window, SUBPIX_ZERO_ZONE, criteria)
         .map_err(|error| cv_error("cornerSubPix", &error))
 }

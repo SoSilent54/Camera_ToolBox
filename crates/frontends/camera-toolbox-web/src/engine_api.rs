@@ -7,17 +7,19 @@ use camera_toolbox_adapters::hex_arm::HexArmWebSocketClient;
 use camera_toolbox_adapters::media::FfmpegRtspStreamService;
 use camera_toolbox_adapters::{ImageRasterCodec, LocalRawLoader};
 use camera_toolbox_app::engine::{
-    DataPacket, EdgeSpec, EngineServices, GraphEngine, GraphSpec, NodeAction, NodeRegistry,
-    NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
+    DataPacket, EdgeSpec, EngineServices, GraphEngine, GraphSpec, ImageFrameIdentity, NodeAction,
+    NodeRegistry, NodeSpec, PortCardinality, PortEndpoint, PortSpec, StreamServiceFactory,
 };
-use camera_toolbox_app::platform::{RtspStreamConfig, StreamService};
+use camera_toolbox_app::platform::{
+    RtspStreamConfig, SourcePts, SourcePtsProvenance, StreamService,
+};
 use serde_json::json;
 
 use crate::{
-    AppState,
     workflow::{
         NodeKind, PortDirection, PortKind, WorkflowEdge, WorkflowGraph, WorkflowNode, WorkflowPort,
     },
+    AppState,
 };
 
 /// 引擎运行时：节点注册表 + 当前已装载的图。
@@ -124,6 +126,20 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
             }
             value
         }
+        DataPacket::CalibrationBoardParams(params) => serde_json::to_value(params.as_ref())
+            .unwrap_or(json!({ "kind": "calib.board.params.v1" })),
+        DataPacket::CameraModelParams(params) => serde_json::to_value(params.as_ref())
+            .unwrap_or(json!({ "kind": "calib.camera.model.v1" })),
+        DataPacket::DistortionModelParams(params) => serde_json::to_value(params.as_ref())
+            .unwrap_or(json!({ "kind": "calib.distortion.model.v1" })),
+        DataPacket::DetectionPose(pose) => json!({
+            "kind": pose.kind,
+            "frameIdentity": pose_frame_identity_to_json(&pose.frame_identity),
+            "convention": pose.convention,
+            "translationM": pose.translation_m,
+            "rotationRodrigues": pose.rotation_rodrigues,
+            "reprojectionErrorPx": pose.reprojection_error_px,
+        }),
         DataPacket::Solution(solution) => {
             serde_json::to_value(solution.as_ref()).unwrap_or(json!({ "type": "solution" }))
         }
@@ -155,6 +171,40 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
     }
 }
 
+/// 沿用 Dataset 的帧身份 JSON 字段，避免为 Pose 引入第二套身份协议。
+fn pose_frame_identity_to_json(identity: &ImageFrameIdentity) -> serde_json::Value {
+    json!({
+        "frameSequence": identity.frame_sequence,
+        "sourcePts": pose_source_pts_to_json(&identity.source_pts),
+        "hostMonotonicTimeNs": identity.host_monotonic_time_ns,
+    })
+}
+
+/// 沿用 Dataset 的 Source PTS JSON 形状，供姿态运行时输出显示来源时钟。
+fn pose_source_pts_to_json(source_pts: &SourcePts) -> serde_json::Value {
+    match source_pts {
+        SourcePts::Known {
+            ticks,
+            time_base_numerator,
+            time_base_denominator,
+            provenance,
+        } => json!({
+            "kind": "known",
+            "ticks": ticks,
+            "timeBase": {
+                "numerator": time_base_numerator,
+                "denominator": time_base_denominator,
+            },
+            "provenance": match provenance {
+                SourcePtsProvenance::FfmpegDecodedFrame => "ffmpegDecodedFrame",
+                SourcePtsProvenance::FfmpegShowinfo => "ffmpegShowinfo",
+                SourcePtsProvenance::Unavailable => "unavailable",
+            },
+        }),
+        SourcePts::Unavailable { reason } => json!({"kind": "unavailable", "reason": reason}),
+    }
+}
+
 pub(crate) fn parse_action_str(
     action: &str,
     payload: serde_json::Value,
@@ -165,7 +215,8 @@ pub(crate) fn parse_action_str(
         "trigger" => Ok(NodeAction::Trigger),
         "arm" => Ok(NodeAction::Arm),
         "disarm" => Ok(NodeAction::Disarm),
-        "accept"
+        "select"
+        | "accept"
         | "reject"
         | "enable"
         | "disable"
@@ -258,6 +309,33 @@ fn enum_str<T: serde::Serialize>(value: T) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use camera_toolbox_app::{
+        engine::{
+            CalibrationBoardParams, CalibrationVector3, CameraModelParams, DetectionPose,
+            DistortionModelParams, FrameProvenance, ImageFrameIdentity,
+        },
+        platform::{SourcePts, SourcePtsProvenance, StreamSessionId},
+    };
+
+    fn pose_identity() -> ImageFrameIdentity {
+        ImageFrameIdentity {
+            provenance: FrameProvenance::Stream {
+                stream_id: StreamSessionId::new("rtsp-camera-0").expect("valid stream id"),
+                channel: 3,
+            },
+            frame_sequence: 42,
+            source_pts: SourcePts::Known {
+                ticks: 9_000,
+                time_base_numerator: 1,
+                time_base_denominator: 90_000,
+                provenance: SourcePtsProvenance::FfmpegDecodedFrame,
+            },
+            host_monotonic_time_ns: 123_456,
+            device_timestamp_ns: Some(987_654),
+        }
+    }
 
     #[test]
     fn to_engine_spec_projects_seed_graph() {
@@ -279,6 +357,72 @@ mod tests {
     }
 
     #[test]
+    fn packet_to_json_projects_calibration_parameter_and_pose_contracts() {
+        for (packet, expected) in [
+            (
+                DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default())),
+                serde_json::json!({
+                    "kind": "calib.board.params.v1",
+                    "boardKind": "chessboard",
+                    "cols": 11,
+                    "rows": 8,
+                    "squareSizeMm": 40.0,
+                }),
+            ),
+            (
+                DataPacket::CameraModelParams(Arc::new(CameraModelParams::default())),
+                serde_json::json!({
+                    "kind": "calib.camera.model.v1",
+                    "model": "pinhole",
+                    "fx": 900.0,
+                    "fy": 900.0,
+                    "cx": 960.0,
+                    "cy": 540.0,
+                    "imageSize": {"width": 1920, "height": 1080},
+                }),
+            ),
+            (
+                DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default())),
+                serde_json::json!({
+                    "kind": "calib.distortion.model.v1",
+                    "model": "none",
+                    "coefficients": [],
+                }),
+            ),
+        ] {
+            assert_eq!(packet_to_json(&packet), expected);
+        }
+
+        let pose = DetectionPose::new(
+            pose_identity(),
+            CalibrationVector3::new(0.0, 0.0, 1.0),
+            CalibrationVector3::new(0.0, 0.1, 0.0),
+            Some(0.25),
+        )
+        .expect("finite pose");
+        assert_eq!(
+            packet_to_json(&DataPacket::DetectionPose(Arc::new(pose))),
+            serde_json::json!({
+                "kind": "calib.pose.v1",
+                "frameIdentity": {
+                    "frameSequence": 42,
+                    "sourcePts": {
+                        "kind": "known",
+                        "ticks": 9_000,
+                        "timeBase": {"numerator": 1, "denominator": 90_000},
+                        "provenance": "ffmpegDecodedFrame",
+                    },
+                    "hostMonotonicTimeNs": 123_456,
+                },
+                "convention": "T_camera_board",
+                "translationM": {"x": 0.0, "y": 0.0, "z": 1.0},
+                "rotationRodrigues": {"x": 0.0, "y": 0.1, "z": 0.0},
+                "reprojectionErrorPx": 0.25,
+            })
+        );
+    }
+
+    #[test]
     fn clear_action_maps_to_dataset_custom_action_with_null_payload() {
         assert!(matches!(
             parse_action_str("clear", serde_json::Value::Null),
@@ -289,7 +433,7 @@ mod tests {
     #[test]
     fn dataset_row_actions_preserve_sample_id_payload() {
         let payload = serde_json::json!({ "sampleId": "sample-1" });
-        for action in ["accept", "reject", "enable", "disable", "delete"] {
+        for action in ["select", "accept", "reject", "enable", "disable", "delete"] {
             assert!(matches!(
                 parse_action_str(action, payload.clone()),
                 Ok(NodeAction::Custom { name, payload: actual })

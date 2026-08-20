@@ -37,7 +37,7 @@ export function DatasetCollectorNode({ data, selected }: NodeProps) {
         <NodeHeader node={node} runtimeState={nodeData.runtimeState} />
         <PortHandles node={node} />
         <div className="node-body compact">
-          <span className="node-hint">样本仅在运行时缓存；“输出数据集”发送到 dataset 端口，不写入本地文件。</span>
+          <span className="node-hint">点击样本直接输出精确匹配的缓存原图到预览端口；样本仅在运行时缓存，缺失原图时显示运行时诊断。</span>
           <ScalarConfigFields
             nodeId={node.id}
             config={node.config}
@@ -46,6 +46,7 @@ export function DatasetCollectorNode({ data, selected }: NodeProps) {
           <DatasetSampleBrowser
             dataset={dataset}
             maxSamples={maxSamples}
+            selectedSampleId={dataset?.selectedSampleId}
             pending={Boolean(nodeData.actionPending)}
             onAction={nodeData.onNodeAction ? (action, sampleId) => nodeData.onNodeAction?.(node.id, action, { sampleId }) : undefined}
           />
@@ -67,11 +68,13 @@ export function DatasetCollectorNode({ data, selected }: NodeProps) {
 function DatasetSampleBrowser({
   dataset,
   maxSamples,
+  selectedSampleId,
   pending,
   onAction,
 }: {
   dataset?: DatasetCollectorRuntimeOutput;
   maxSamples?: number;
+  selectedSampleId?: string;
   pending: boolean;
   onAction?: (action: DatasetSampleActionName, sampleId: string) => void;
 }) {
@@ -89,7 +92,13 @@ function DatasetSampleBrowser({
         samples.length > 0 ? (
           <ul className="dataset-sample-list">
             {samples.map((sample) => (
-              <DatasetSampleRow key={sample.id} sample={sample} pending={pending} onAction={onAction} />
+              <DatasetSampleRow
+                key={sample.id}
+                sample={sample}
+                selected={sample.id === selectedSampleId}
+                pending={pending}
+                onAction={onAction}
+              />
             ))}
           </ul>
         ) : <p className="dataset-browser-empty">当前数据集没有可显示样本。</p>
@@ -100,10 +109,12 @@ function DatasetSampleBrowser({
 
 function DatasetSampleRow({
   sample,
+  selected,
   pending,
   onAction,
 }: {
   sample: DatasetSampleRuntimeOutput;
+  selected: boolean;
   pending: boolean;
   onAction?: (action: DatasetSampleActionName, sampleId: string) => void;
 }) {
@@ -117,8 +128,29 @@ function DatasetSampleRow({
   const availabilityAction: DatasetSampleActionName = enabled ? 'disable' : 'enable';
   const disabled = !onAction || pending;
 
+  const selectSample = () => {
+    if (!disabled) {
+      onAction?.('select', sample.id);
+    }
+  };
+  const handleSampleKeyDown = (event: React.KeyboardEvent<HTMLLIElement>) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      selectSample();
+    }
+  };
+
   return (
-    <li className="dataset-sample-row" title={sample.id}>
+    <li
+      className={`nodrag nowheel dataset-sample-row ${selected ? 'selected' : ''}`}
+      title={sample.id}
+      role="button"
+      tabIndex={disabled ? -1 : 0}
+      aria-pressed={selected}
+      aria-disabled={disabled}
+      onClick={selectSample}
+      onKeyDown={handleSampleKeyDown}
+    >
       <div className="dataset-sample-main">
         <div className="dataset-sample-source">
           <span className="dataset-sample-icon">#</span>
@@ -135,7 +167,10 @@ function DatasetSampleRow({
           type="button"
           className="nodrag nowheel"
           disabled={disabled}
-          onClick={() => onAction?.(reviewAction, sample.id)}
+          onClick={(event) => {
+            event.stopPropagation();
+            onAction?.(reviewAction, sample.id);
+          }}
         >
           {reviewAction === 'accept' ? '采纳' : '拒绝'}
         </button>
@@ -143,7 +178,10 @@ function DatasetSampleRow({
           type="button"
           className="nodrag nowheel"
           disabled={disabled}
-          onClick={() => onAction?.(availabilityAction, sample.id)}
+          onClick={(event) => {
+            event.stopPropagation();
+            onAction?.(availabilityAction, sample.id);
+          }}
         >
           {availabilityAction === 'enable' ? '启用' : '停用'}
         </button>
@@ -151,13 +189,17 @@ function DatasetSampleRow({
           type="button"
           className="nodrag nowheel dataset-sample-delete"
           disabled={disabled}
-          onClick={() => onAction?.('delete', sample.id)}
+          onClick={(event) => {
+            event.stopPropagation();
+            onAction?.('delete', sample.id);
+          }}
         >
           删除
         </button>
       </div>
     </li>
   );
+
 }
 
 type SampleStatus = {
@@ -207,6 +249,7 @@ function parseDatasetOutput(output: unknown): DatasetCollectorRuntimeOutput | un
   return {
     kind: 'calib.dataset.v1',
     count: nonNegativeInteger(record.count) ?? samples.length,
+    selectedSampleId: stringValue(record.selectedSampleId),
     samples,
   };
 }

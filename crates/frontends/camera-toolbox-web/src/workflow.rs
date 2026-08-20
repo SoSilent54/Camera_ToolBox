@@ -85,6 +85,8 @@ pub enum NodeKind {
     OverlayComposer,
     Viewer,
     ChessboardDetector,
+    CalibrationBoardParams,
+    CameraInitialParams,
     CalibrationFrameScorer,
     ScoreThresholdGate,
     ConsecutiveHoldGate,
@@ -93,6 +95,7 @@ pub enum NodeKind {
     AutoCaptureController,
     CaptureRequestBuilder,
     CalibrationSolver,
+    PoseEstimator,
     PoseGuide,
     I2cTransfer,
     EepromProvision,
@@ -166,6 +169,14 @@ pub enum PortKind {
     ViewerScene,
     #[serde(rename = "calib.detection")]
     CalibDetection,
+    #[serde(rename = "calib.board.params")]
+    CalibBoardParams,
+    #[serde(rename = "calib.camera.model")]
+    CalibCameraModel,
+    #[serde(rename = "calib.distortion.model")]
+    CalibDistortionModel,
+    #[serde(rename = "calib.pose")]
+    CalibPose,
     #[serde(rename = "calib.coverage")]
     CalibCoverage,
     #[serde(rename = "calib.dataset")]
@@ -284,8 +295,13 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::VideoLayer),
         node_definition(NodeKind::Viewer),
         node_definition(NodeKind::ChessboardDetector),
+        node_definition(NodeKind::CalibrationBoardParams),
+        node_definition(NodeKind::CameraInitialParams),
         node_definition(NodeKind::DatasetCollector),
+        node_definition(NodeKind::CoverageAnalyzer),
         node_definition(NodeKind::CalibrationSolver),
+        node_definition(NodeKind::PoseEstimator),
+        node_definition(NodeKind::PoseGuide),
         node_definition(NodeKind::I2cTransfer),
         node_definition(NodeKind::EepromProvision),
     ];
@@ -674,47 +690,78 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             vec![],
             json!({}),
         ),
+        NodeKind::CalibrationBoardParams => (
+            NodeCategory::Calibration,
+            "Calibration Board Params",
+            "手动输出棋盘格内角点尺寸与方格物理间距参数",
+            vec![],
+            vec![port(
+                "board",
+                "Board",
+                PortDirection::Output,
+                PortKind::CalibBoardParams,
+                "calib.board.params.v1",
+                None,
+            )],
+            json!({
+                "boardKind": "chessboard",
+                "boardCols": 11,
+                "boardRows": 8,
+                "squareSizeMm": 40.0,
+            }),
+        ),
+        NodeKind::CameraInitialParams => (
+            NodeCategory::Calibration,
+            "Camera Initial Params",
+            "手动输出针孔相机初始内参与无畸变镜头模型参数",
+            vec![],
+            vec![
+                port(
+                    "cameraModel",
+                    "Camera Model",
+                    PortDirection::Output,
+                    PortKind::CalibCameraModel,
+                    "calib.camera.model.v1",
+                    None,
+                ),
+                port(
+                    "distortionModel",
+                    "Distortion Model",
+                    PortDirection::Output,
+                    PortKind::CalibDistortionModel,
+                    "calib.distortion.model.v1",
+                    None,
+                ),
+            ],
+            json!({
+                "cameraModelKind": "pinhole",
+                "fx": 900.0,
+                "fy": 900.0,
+                "cx": 960.0,
+                "cy": 540.0,
+                "imageWidth": 1920,
+                "imageHeight": 1080,
+                "distortionKind": "none",
+            }),
+        ),
         NodeKind::ChessboardDetector => (
             NodeCategory::Calibration,
             "Chessboard Detector",
-            "输入帧驱动的棋盘格检测，输出 detection 和 overlay",
+            "输入帧驱动的棋盘格检测；可接入显式棋盘参数，亚像素细化默认关闭",
             vec![
-                optional_port(
-                    "image",
-                    "Image",
-                    PortDirection::Input,
-                    PortKind::ImageFrame,
-                    "image.frame.v1",
-                    Some(PortRole::Image),
-                ),
-                optional_port(
-                    "frames",
-                    "Video Frames",
-                    PortDirection::Input,
-                    PortKind::StreamVideoFrame,
-                    "stream.video-frame.v1",
-                    Some(PortRole::Stream),
-                ),
+                optional_port("image", "Image", PortDirection::Input, PortKind::ImageFrame, "image.frame.v1", Some(PortRole::Image)),
+                optional_port("frames", "Video Frames", PortDirection::Input, PortKind::StreamVideoFrame, "stream.video-frame.v1", Some(PortRole::Stream)),
+                optional_port("board", "Board Params", PortDirection::Input, PortKind::CalibBoardParams, "calib.board.params.v1", None),
             ],
             vec![
-                port(
-                    "detection",
-                    "Detection",
-                    PortDirection::Output,
-                    PortKind::CalibDetection,
-                    "calib.detection.v1",
-                    Some(PortRole::Dataset),
-                ),
-                port(
-                    "overlay",
-                    "Overlay",
-                    PortDirection::Output,
-                    PortKind::LayerOverlay,
-                    "viewer.layer.overlay.v1",
-                    Some(PortRole::Overlay),
-                ),
+                port("detection", "Detection", PortDirection::Output, PortKind::CalibDetection, "calib.detection.v1", Some(PortRole::Dataset)),
+                port("overlay", "Overlay", PortDirection::Output, PortKind::LayerOverlay, "viewer.layer.overlay.v1", Some(PortRole::Overlay)),
             ],
-            json!({"boardRows": 11, "boardCols": 8, "squareSizeMm": 30.0}),
+            json!({
+                "boardRows": 11, "boardCols": 8, "squareSizeMm": 30.0,
+                "subpixelEnabled": false, "subpixelWindowRadius": 5,
+                "subpixelMaxIterations": 30, "subpixelEpsilon": 0.01,
+            }),
         ),
         NodeKind::CalibrationFrameScorer => (
             NodeCategory::Calibration,
@@ -784,9 +831,18 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         ),
         NodeKind::DatasetCollector => (
             NodeCategory::Calibration,
-            "Dataset Collector",
-            "按完全相同的帧身份关联 image、detection 和 score，浏览并管理可接受的标定样本；不保存图像字节",
+            "Calibration Dataset Browser",
+            "按完全相同的帧身份关联 frames/image、detection 和 score；选中样本即输出预览，支持采纳/拒绝、启用/停用和删除。dataset JSON 只保存引用与元数据、不内联图像 bytes；运行时维护有界 Arc<ImageFrame> 预览缓存。",
             vec![
+                optional_port(
+                    "frames",
+                    "Captured Video Frames",
+                    PortDirection::Input,
+                    PortKind::StreamVideoFrame,
+                    "stream.video-frame.v1",
+                    Some(PortRole::Image),
+                ),
+
                 optional_port(
                     "image",
                     "Captured Image",
@@ -812,14 +868,24 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     Some(PortRole::Status),
                 ),
             ],
-            vec![port(
-                "dataset",
-                "Dataset",
-                PortDirection::Output,
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-                Some(PortRole::Dataset),
-            )],
+            vec![
+                port(
+                    "dataset",
+                    "Dataset",
+                    PortDirection::Output,
+                    PortKind::CalibDataset,
+                    "calib.dataset.v1",
+                    Some(PortRole::Dataset),
+                ),
+                optional_port(
+                    "preview",
+                    "Selected Sample Preview",
+                    PortDirection::Output,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+            ],
             json!({"maxSamples": 80}),
         ),
         NodeKind::CoverageAnalyzer => (
@@ -901,34 +967,32 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::CalibrationSolver => (
             NodeCategory::Calibration,
             "Calibration Solver",
-            "使用最近一次 calib.dataset 检测点；手动触发后输出 calib.solution",
-            vec![port(
-                "dataset",
-                "Dataset",
-                PortDirection::Input,
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-                Some(PortRole::Dataset),
-            )],
-            vec![port(
-                "solution",
-                "Solution",
-                PortDirection::Output,
-                PortKind::CalibSolution,
-                "calib.solution.v1",
-                Some(PortRole::Solution),
-            )],
+            "使用最近一次 calib.dataset；显式 board/camera/distortion 输入优先于旧配置，手动触发后输出 calib.solution",
+            vec![
+                port("dataset", "Dataset", PortDirection::Input, PortKind::CalibDataset, "calib.dataset.v1", Some(PortRole::Dataset)),
+                optional_port("board", "Board Params", PortDirection::Input, PortKind::CalibBoardParams, "calib.board.params.v1", None),
+                optional_port("cameraModel", "Camera Model", PortDirection::Input, PortKind::CalibCameraModel, "calib.camera.model.v1", None),
+                optional_port("distortionModel", "Distortion Model", PortDirection::Input, PortKind::CalibDistortionModel, "calib.distortion.model.v1", None),
+            ],
+            vec![port("solution", "Solution", PortDirection::Output, PortKind::CalibSolution, "calib.solution.v1", Some(PortRole::Solution))],
             json!({
-                "boardCols": 8,
-                "boardRows": 11,
-                "squareSizeMm": 30.0,
-                "imageWidth": 1920,
-                "imageHeight": 1080,
-                "fx": 1234.56,
-                "fy": 1234.56,
-                "cx": 960.0,
-                "cy": 540.0,
+                "boardCols": 8, "boardRows": 11, "squareSizeMm": 30.0,
+                "imageWidth": 1920, "imageHeight": 1080,
+                "fx": 1234.56, "fy": 1234.56, "cx": 960.0, "cy": 540.0,
             }),
+        ),
+        NodeKind::PoseEstimator => (
+            NodeCategory::Calibration,
+            "Pose Estimator",
+            "对单帧棋盘检测以显式板/相机/畸变参数求解 T_camera_board；平移单位为 m",
+            vec![
+                port("detection", "Detection", PortDirection::Input, PortKind::CalibDetection, "calib.detection.v1", Some(PortRole::Dataset)),
+                port("board", "Board Params", PortDirection::Input, PortKind::CalibBoardParams, "calib.board.params.v1", None),
+                port("cameraModel", "Camera Model", PortDirection::Input, PortKind::CalibCameraModel, "calib.camera.model.v1", None),
+                port("distortionModel", "Distortion Model", PortDirection::Input, PortKind::CalibDistortionModel, "calib.distortion.model.v1", None),
+            ],
+            vec![port("pose", "T_camera_board", PortDirection::Output, PortKind::CalibPose, "calib.pose.v1", Some(PortRole::Status))],
+            json!({}),
         ),
         NodeKind::PoseGuide => (
             NodeCategory::Calibration,
@@ -1022,8 +1086,8 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
         },
         WorkmodeTemplate {
             id: "calibration",
-            title: "Detection Dataset Loop",
-            description: "RTSP frames → Chessboard Detector; Viewer renders frame-matched overlay and Dataset Collector lists detections",
+            title: "Calibration Capture",
+            description: "RTSP detection → frame score → threshold/hold/arm gates → capture request; Dataset Collector drives coverage, pose guidance, and calibration solving",
             graph: calibration_template_graph(),
         },
         WorkmodeTemplate {
@@ -2026,72 +2090,35 @@ fn x5233_raw_template_graph() -> WorkflowGraph {
 
 fn calibration_template_graph() -> WorkflowGraph {
     let nodes = vec![
-        workflow_node(
-            "calib-rtsp-source",
-            NodeKind::RtspSource,
-            "RTSP Input",
-            NodePosition { x: 60.0, y: 180.0 },
-        ),
-        workflow_node(
-            "calib-detector",
-            NodeKind::ChessboardDetector,
-            "Chessboard Detector",
-            NodePosition { x: 360.0, y: 180.0 },
-        ),
-        workflow_node(
-            "calib-viewer",
-            NodeKind::Viewer,
-            "Viewer",
-            NodePosition { x: 660.0, y: 80.0 },
-        ),
-        workflow_node(
-            "calib-dataset",
-            NodeKind::DatasetCollector,
-            "Dataset Collector",
-            NodePosition { x: 660.0, y: 380.0 },
-        ),
+        workflow_node("calib-rtsp-source", NodeKind::RtspSource, "RTSP Input", NodePosition { x: 60.0, y: 220.0 }),
+        workflow_node("calib-board", NodeKind::CalibrationBoardParams, "Calibration Board Params", NodePosition { x: 60.0, y: 520.0 }),
+        workflow_node("calib-camera", NodeKind::CameraInitialParams, "Camera Initial Params", NodePosition { x: 360.0, y: 520.0 }),
+        workflow_node("calib-detector", NodeKind::ChessboardDetector, "Chessboard Detector", NodePosition { x: 400.0, y: 200.0 }),
+        workflow_node("calib-dataset", NodeKind::DatasetCollector, "Calibration Dataset Browser", NodePosition { x: 720.0, y: 200.0 }),
+        workflow_node("calib-pose", NodeKind::PoseEstimator, "Pose Estimator", NodePosition { x: 720.0, y: 520.0 }),
+        workflow_node("calib-solver", NodeKind::CalibrationSolver, "Calibration Solver", NodePosition { x: 1040.0, y: 360.0 }),
+        workflow_node("calib-viewer", NodeKind::Viewer, "Viewer", NodePosition { x: 1040.0, y: 80.0 }),
     ];
     graph(
-        "camera-toolbox-calibration-dataset-loop-template",
-        "Detection Dataset Loop",
+        "camera-toolbox-calibration-template",
+        "Calibration Capture Workspace",
         nodes,
         vec![
-            edge(
-                "calib-rtsp-detector",
-                "calib-rtsp-source",
-                "frames",
-                "calib-detector",
-                "frames",
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-            ),
-            edge(
-                "calib-rtsp-viewer",
-                "calib-rtsp-source",
-                "frames",
-                "calib-viewer",
-                "video",
-                PortKind::StreamVideoFrame,
-                "stream.video-frame.v1",
-            ),
-            edge(
-                "calib-detection-dataset",
-                "calib-detector",
-                "detection",
-                "calib-dataset",
-                "detection",
-                PortKind::CalibDetection,
-                "calib.detection.v1",
-            ),
-            edge(
-                "calib-detector-overlay-viewer",
-                "calib-detector",
-                "overlay",
-                "calib-viewer",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
+            edge("calib-rtsp-detector", "calib-rtsp-source", "frames", "calib-detector", "frames", PortKind::StreamVideoFrame, "stream.video-frame.v1"),
+            edge("calib-rtsp-viewer", "calib-rtsp-source", "frames", "calib-viewer", "video", PortKind::StreamVideoFrame, "stream.video-frame.v1"),
+            edge("calib-board-detector", "calib-board", "board", "calib-detector", "board", PortKind::CalibBoardParams, "calib.board.params.v1"),
+            edge("calib-board-pose", "calib-board", "board", "calib-pose", "board", PortKind::CalibBoardParams, "calib.board.params.v1"),
+            edge("calib-board-solver", "calib-board", "board", "calib-solver", "board", PortKind::CalibBoardParams, "calib.board.params.v1"),
+            edge("calib-camera-pose", "calib-camera", "cameraModel", "calib-pose", "cameraModel", PortKind::CalibCameraModel, "calib.camera.model.v1"),
+            edge("calib-camera-distortion-pose", "calib-camera", "distortionModel", "calib-pose", "distortionModel", PortKind::CalibDistortionModel, "calib.distortion.model.v1"),
+            edge("calib-camera-solver", "calib-camera", "cameraModel", "calib-solver", "cameraModel", PortKind::CalibCameraModel, "calib.camera.model.v1"),
+            edge("calib-camera-distortion-solver", "calib-camera", "distortionModel", "calib-solver", "distortionModel", PortKind::CalibDistortionModel, "calib.distortion.model.v1"),
+            edge("calib-detection-dataset", "calib-detector", "detection", "calib-dataset", "detection", PortKind::CalibDetection, "calib.detection.v1"),
+            edge("calib-detection-pose", "calib-detector", "detection", "calib-pose", "detection", PortKind::CalibDetection, "calib.detection.v1"),
+            edge("calib-detector-overlay-viewer", "calib-detector", "overlay", "calib-viewer", "overlay", PortKind::LayerOverlay, "viewer.layer.overlay.v1"),
+            edge("calib-dataset-preview-viewer", "calib-dataset", "preview", "calib-viewer", "image", PortKind::ImageFrame, "image.frame.v1"),
+            edge("calib-dataset-solver", "calib-dataset", "dataset", "calib-solver", "dataset", PortKind::CalibDataset, "calib.dataset.v1"),
+            edge("calib-rtsp-dataset-frames", "calib-rtsp-source", "frames", "calib-dataset", "frames", PortKind::StreamVideoFrame, "stream.video-frame.v1"),
         ],
     )
 }
@@ -2268,22 +2295,18 @@ mod tests {
     fn seed_graph_is_x5233_preview_with_unified_image_contract() {
         let graph = seed_workflow_graph();
         validate_workflow(&graph).expect("seed graph is valid");
-        assert!(
-            graph.nodes.iter().any(|node| {
-                node.kind == NodeKind::X5233Driver && node.title == "X5_233 Driver"
-            })
-        );
-        assert!(
-            graph.edges.iter().any(|edge| {
-                edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1"
-            })
-        );
-        assert!(
-            !graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::OverlayComposer)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| { node.kind == NodeKind::X5233Driver && node.title == "X5_233 Driver" }));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1" }));
+        assert!(!graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::OverlayComposer));
     }
 
     #[test]
@@ -2445,24 +2468,18 @@ mod tests {
                 && port.kind == PortKind::StatusMetrics
                 && port.schema == "status.metrics.v1"
         }));
-        assert!(
-            graph
-                .edges
-                .iter()
-                .all(|edge| edge.id != "obsolete-x5-snapshot")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "x5-yuv-to-image-layer")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "x5-capture-request")
-        );
+        assert!(graph
+            .edges
+            .iter()
+            .all(|edge| edge.id != "obsolete-x5-snapshot"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.id == "x5-yuv-to-image-layer"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.id == "x5-capture-request"));
     }
 
     #[test]
@@ -2610,44 +2627,42 @@ mod tests {
     }
 
     #[test]
-    fn calibration_template_wires_minimal_detection_dataset_loop() {
+    fn calibration_template_wires_the_minimum_parameterized_dataset_loop() {
         let graph = calibration_template_graph();
         validate_workflow(&graph).expect("calibration template is valid");
-        let kinds: Vec<NodeKind> = graph.nodes.iter().map(|node| node.kind.clone()).collect();
-        assert_eq!(
-            kinds,
-            vec![
-                NodeKind::RtspSource,
-                NodeKind::ChessboardDetector,
-                NodeKind::Viewer,
-                NodeKind::DatasetCollector,
-            ]
-        );
-        for hidden_kind in [
+        for kind in [
+            NodeKind::RtspSource,
+            NodeKind::CalibrationBoardParams,
+            NodeKind::CameraInitialParams,
+            NodeKind::ChessboardDetector,
+            NodeKind::DatasetCollector,
+            NodeKind::CalibrationSolver,
+            NodeKind::PoseEstimator,
+            NodeKind::Viewer,
+        ] {
+            assert!(graph.nodes.iter().any(|node| node.kind == kind), "missing {kind:?}");
+        }
+        for hidden in [
             NodeKind::CalibrationFrameScorer,
             NodeKind::ScoreThresholdGate,
             NodeKind::ConsecutiveHoldGate,
             NodeKind::AutoCaptureController,
             NodeKind::CaptureRequestBuilder,
-            NodeKind::CoverageAnalyzer,
-            NodeKind::PoseGuide,
         ] {
-            assert!(
-                !graph.nodes.iter().any(|node| node.kind == hidden_kind),
-                "{hidden_kind:?} must stay out of the first Web calibration template"
-            );
+            assert!(!graph.nodes.iter().any(|node| node.kind == hidden), "unexpected {hidden:?}");
         }
-        assert_eq!(graph.edges.len(), 4);
         for edge_id in [
             "calib-rtsp-detector",
             "calib-rtsp-viewer",
+            "calib-rtsp-dataset-frames",
+            "calib-board-detector",
             "calib-detection-dataset",
             "calib-detector-overlay-viewer",
+            "calib-dataset-preview-viewer",
+            "calib-dataset-solver",
+            "calib-detection-pose",
         ] {
-            assert!(
-                graph.edges.iter().any(|edge| edge.id == edge_id),
-                "missing {edge_id}"
-            );
+            assert!(graph.edges.iter().any(|edge| edge.id == edge_id), "missing {edge_id}");
         }
     }
 
@@ -2655,17 +2670,13 @@ mod tests {
     fn node_catalog_exposes_hex_arm_only_when_feature_enabled() {
         let catalog = node_catalog();
         #[cfg(feature = "hex-arm-control")]
-        assert!(
-            catalog
-                .iter()
-                .any(|definition| definition.kind == NodeKind::HexArmDevice)
-        );
+        assert!(catalog
+            .iter()
+            .any(|definition| definition.kind == NodeKind::HexArmDevice));
         #[cfg(not(feature = "hex-arm-control"))]
-        assert!(
-            !catalog
-                .iter()
-                .any(|definition| definition.kind == NodeKind::HexArmDevice)
-        );
+        assert!(!catalog
+            .iter()
+            .any(|definition| definition.kind == NodeKind::HexArmDevice));
     }
 
     #[test]
@@ -2710,38 +2721,30 @@ mod tests {
     }
 
     #[test]
-    fn node_catalog_has_feature_dependent_nodes() {
+    fn node_catalog_hides_compatibility_only_calibration_nodes() {
         let catalog = node_catalog();
-        assert_eq!(
-            catalog.len(),
-            if cfg!(feature = "hex-arm-control") {
-                17
-            } else {
-                16
-            }
-        );
-        assert!(
-            !catalog
-                .iter()
-                .any(|definition| definition.kind == NodeKind::OverlayComposer),
-            "OverlayComposer is legacy-only; new graphs should connect overlays directly to Viewer"
-        );
-        // 每个 kind 都能通过 node_definition 展开，且无重复。
-        for hidden_kind in [
+        assert_eq!(catalog.len(), if cfg!(feature = "hex-arm-control") { 22 } else { 21 });
+        for hidden in [
+            NodeKind::OverlayComposer,
             NodeKind::CalibrationFrameScorer,
             NodeKind::ScoreThresholdGate,
             NodeKind::ConsecutiveHoldGate,
             NodeKind::AutoCaptureController,
             NodeKind::CaptureRequestBuilder,
+        ] {
+            assert!(!catalog.iter().any(|definition| definition.kind == hidden), "{hidden:?} must stay compatibility-only");
+        }
+        for calibration_kind in [
+            NodeKind::ChessboardDetector,
+            NodeKind::CalibrationBoardParams,
+            NodeKind::CameraInitialParams,
+            NodeKind::DatasetCollector,
             NodeKind::CoverageAnalyzer,
+            NodeKind::CalibrationSolver,
+            NodeKind::PoseEstimator,
             NodeKind::PoseGuide,
         ] {
-            assert!(
-                !catalog
-                    .iter()
-                    .any(|definition| definition.kind == hidden_kind),
-                "{hidden_kind:?} should remain implemented but hidden from the default Web catalog"
-            );
+            assert!(catalog.iter().any(|definition| definition.kind == calibration_kind), "{calibration_kind:?} must be available in the Web catalog");
         }
         let kinds: Vec<NodeKind> = catalog.iter().map(|def| def.kind).collect();
         assert_eq!(kinds.len(), catalog.len());
@@ -2774,42 +2777,80 @@ mod tests {
 
     #[test]
     fn calibration_nodes_declare_the_refactored_runtime_contracts() {
+        let board = node_definition(NodeKind::CalibrationBoardParams);
+        assert_eq!(board.outputs.len(), 1);
+        assert!(board.outputs.iter().any(|port| {
+            port.id == "board"
+                && port.kind == PortKind::CalibBoardParams
+                && port.schema == "calib.board.params.v1"
+        }));
+        assert_eq!(board.default_config["boardKind"], json!("chessboard"));
+        assert_eq!(board.default_config["boardCols"], json!(11));
+        assert_eq!(board.default_config["boardRows"], json!(8));
+        assert_eq!(board.default_config["squareSizeMm"], json!(40.0));
+
+        let camera = node_definition(NodeKind::CameraInitialParams);
+        assert_eq!(camera.outputs.len(), 2);
+        assert!(camera.outputs.iter().any(|port| {
+            port.id == "cameraModel"
+                && port.kind == PortKind::CalibCameraModel
+                && port.schema == "calib.camera.model.v1"
+        }));
+        assert!(camera.outputs.iter().any(|port| {
+            port.id == "distortionModel"
+                && port.kind == PortKind::CalibDistortionModel
+                && port.schema == "calib.distortion.model.v1"
+        }));
+        assert_eq!(camera.default_config["cameraModelKind"], json!("pinhole"));
+        assert_eq!(camera.default_config["fx"], json!(900.0));
+        assert_eq!(camera.default_config["fy"], json!(900.0));
+        assert_eq!(camera.default_config["cx"], json!(960.0));
+        assert_eq!(camera.default_config["cy"], json!(540.0));
+        assert_eq!(camera.default_config["imageWidth"], json!(1920));
+        assert_eq!(camera.default_config["imageHeight"], json!(1080));
+        assert_eq!(camera.default_config["distortionKind"], json!("none"));
+
         let solver = node_definition(NodeKind::CalibrationSolver);
-        assert_eq!(solver.inputs.len(), 1);
-        assert_eq!(solver.outputs.len(), 1);
-        assert!(
-            solver
-                .outputs
-                .iter()
-                .any(|p| p.id == "solution" && p.kind == PortKind::CalibSolution)
-        );
+        assert_eq!(solver.inputs.len(), 4);
+        assert!(solver.inputs.iter().any(|p| p.id == "board" && p.kind == PortKind::CalibBoardParams && !p.required));
+        assert!(solver.inputs.iter().any(|p| p.id == "cameraModel" && p.kind == PortKind::CalibCameraModel && !p.required));
+        assert!(solver.inputs.iter().any(|p| p.id == "distortionModel" && p.kind == PortKind::CalibDistortionModel && !p.required));
+        assert!(solver.outputs.iter().any(|p| p.id == "solution" && p.kind == PortKind::CalibSolution));
 
         let dataset = node_definition(NodeKind::DatasetCollector);
-        assert_eq!(dataset.inputs.len(), 3);
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "image" && p.kind == PortKind::ImageFrame && !p.required)
-        );
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "detection" && p.kind == PortKind::CalibDetection)
-        );
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required)
-        );
-        assert!(
-            dataset
-                .outputs
-                .iter()
-                .any(|p| p.id == "dataset" && p.kind == PortKind::CalibDataset)
-        );
+        assert_eq!(dataset.inputs.len(), 4);
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "frames" && p.kind == PortKind::StreamVideoFrame && !p.required));
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "image" && p.kind == PortKind::ImageFrame && !p.required));
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "detection" && p.kind == PortKind::CalibDetection));
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required));
+        assert!(dataset
+            .outputs
+            .iter()
+            .any(|p| p.id == "dataset" && p.kind == PortKind::CalibDataset));
+        assert!(dataset
+            .outputs
+            .iter()
+            .any(|p| { p.id == "preview" && p.kind == PortKind::ImageFrame && !p.required }));
+        assert_eq!(dataset.title, "Calibration Dataset Browser");
+        assert!(dataset.description.contains("选中样本即输出预览"));
+        assert!(dataset.description.contains("采纳/拒绝"));
+        assert!(dataset.description.contains("启用/停用"));
+        assert!(dataset.description.contains("不内联图像 bytes"));
+        assert!(dataset
+            .description
+            .contains("有界 Arc<ImageFrame> 预览缓存"));
 
         let scorer = node_definition(NodeKind::CalibrationFrameScorer);
         assert_eq!(scorer.inputs[0].kind, PortKind::CalibDetection);
@@ -2824,34 +2865,29 @@ mod tests {
         assert_eq!(hold.outputs[0].kind, PortKind::CaptureTrigger);
 
         let arm = node_definition(NodeKind::AutoCaptureController);
-        assert!(
-            arm.inputs
-                .iter()
-                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger)
-        );
-        assert!(
-            arm.outputs
-                .iter()
-                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger)
-        );
+        assert!(arm
+            .inputs
+            .iter()
+            .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger));
+        assert!(arm
+            .outputs
+            .iter()
+            .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger));
 
         let request = node_definition(NodeKind::CaptureRequestBuilder);
-        assert!(
-            request
-                .inputs
-                .iter()
-                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger && !p.required)
-        );
+        assert!(request
+            .inputs
+            .iter()
+            .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger && !p.required));
         assert!(request.outputs.iter().any(|p| p.id == "capture"
             && p.kind == PortKind::CommandCapture
             && p.schema == "command.capture.request.v1"));
 
         let pose = node_definition(NodeKind::PoseGuide);
-        assert!(
-            pose.outputs
-                .iter()
-                .any(|p| p.id == "target" && p.label == "Image-grid Target")
-        );
+        assert!(pose
+            .outputs
+            .iter()
+            .any(|p| p.id == "target" && p.label == "Image-grid Target"));
     }
     #[test]
     fn validation_rejects_mismatched_image_format_hints() {
@@ -2971,11 +3007,11 @@ mod tests {
                 .expect("required workmode template")
         };
         let x5233_preview = find("x5233-preview");
-        assert!(
-            x5233_preview.graph.edges.iter().any(|edge| {
-                edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1"
-            })
-        );
+        assert!(x5233_preview
+            .graph
+            .edges
+            .iter()
+            .any(|edge| { edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1" }));
         let rtsp_snapshot = find("rtsp-snapshot");
         assert!(rtsp_snapshot.graph.edges.iter().any(|edge| {
             edge.id == "rtsp-snapshot-image-viewer" && edge.kind == PortKind::ImageFrame
@@ -3002,12 +3038,11 @@ mod tests {
                     && port.format_hint.as_deref() == Some("BayerRaw")
             })
         }));
-        assert!(
-            raw.graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::Demosaic)
-        );
+        assert!(raw
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::Demosaic));
         assert!(raw.graph.edges.iter().any(|edge| {
             edge.id == "x5233-raw-driver-demosaic" && edge.kind == PortKind::ImageFrame
         }));
@@ -3016,18 +3051,14 @@ mod tests {
     #[test]
     fn local_file_source_emits_image_and_file_ref() {
         let source = node_definition(NodeKind::LocalFileSource);
-        assert!(
-            source
-                .outputs
-                .iter()
-                .any(|p| p.kind == PortKind::ImageFrame)
-        );
-        assert!(
-            source
-                .outputs
-                .iter()
-                .any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1")
-        );
+        assert!(source
+            .outputs
+            .iter()
+            .any(|p| p.kind == PortKind::ImageFrame));
+        assert!(source
+            .outputs
+            .iter()
+            .any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1"));
     }
 
     #[test]

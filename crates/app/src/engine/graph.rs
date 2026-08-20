@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, RwLock, atomic::AtomicBool, mpsc},
+    sync::{atomic::AtomicBool, mpsc, Arc, Mutex, RwLock},
     thread::JoinHandle,
 };
 
@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::platform::LatestDecodedFrameSlot;
 
 use super::{
-    channel::{MailboxReceiver, MailboxSender, NodeMessage, create_mailbox},
+    channel::{create_mailbox, MailboxReceiver, MailboxSender, NodeMessage},
     flow::{EdgeFlowPulse, EdgeLink},
     node::{NodeAction, NodeError, NodeInstance},
     packet::DataPacket,
@@ -1037,11 +1037,9 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         let statuses = engine.drain_status();
-        assert!(
-            statuses.iter().any(|status| {
-                status.node_id == "b" && status.state == NodeRuntimeState::Disabled
-            })
-        );
+        assert!(statuses
+            .iter()
+            .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Disabled }));
         let _ = engine;
     }
 
@@ -1058,11 +1056,9 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         let statuses = engine.drain_status();
-        assert!(
-            statuses
-                .iter()
-                .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Idle })
-        );
+        assert!(statuses
+            .iter()
+            .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Idle }));
         let _ = engine;
     }
 

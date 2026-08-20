@@ -22,11 +22,13 @@
 //! `EngineServices` 的 trait；外部 IO（RTSP/SSH/X5/标定）一律经服务注入，不在节点内构造具体适配器。
 
 pub mod auto_capture;
+pub mod calibration_params;
 pub mod calibration_solver;
 pub mod capture_logic;
 pub mod composite;
 pub mod control_nodes;
 pub mod detection;
+pub mod pose_estimator;
 pub mod local_source;
 pub mod rtsp_source;
 pub mod transform;
@@ -35,6 +37,10 @@ pub mod viewer;
 use crate::engine::NodeRegistry;
 
 pub use auto_capture::{AutoCaptureFactory, AutoCaptureNode};
+pub use calibration_params::{
+    CalibrationBoardParamsFactory, CalibrationBoardParamsNode, CameraInitialParamsFactory,
+    CameraInitialParamsNode,
+};
 pub use calibration_solver::{CalibrationSolverFactory, CalibrationSolverNode};
 pub use capture_logic::{
     CalibrationFrameScorerFactory, CalibrationFrameScorerNode, CaptureRequestBuilderFactory,
@@ -52,6 +58,7 @@ pub use control_nodes::{
 };
 pub use detection::{ChessboardDetectorFactory, ChessboardDetectorNode};
 pub use local_source::{LocalFileSourceFactory, LocalFileSourceNode};
+pub use pose_estimator::{PoseEstimatorFactory, PoseEstimatorNode};
 pub use rtsp_source::{RtspSourceFactory, RtspSourceNode};
 pub use transform::{
     DemosaicFactory, DemosaicNode, FrameSamplerFactory, FrameSamplerNode, ImageLayerFactory,
@@ -68,12 +75,15 @@ pub fn register_builtin(registry: &mut NodeRegistry) {
     registry.register(Box::new(DemosaicFactory));
     registry.register(Box::new(ImageLayerFactory));
     registry.register(Box::new(ViewerFactory));
+    registry.register(Box::new(CalibrationBoardParamsFactory));
+    registry.register(Box::new(CameraInitialParamsFactory));
     registry.register(Box::new(CalibrationSolverFactory));
     registry.register(Box::new(AutoCaptureFactory));
     registry.register(Box::new(OverlayComposerFactory));
     registry.register(Box::new(DatasetCollectorFactory));
     registry.register(Box::new(CoverageAnalyzerFactory));
     registry.register(Box::new(PoseGuideFactory));
+    registry.register(Box::new(PoseEstimatorFactory));
     registry.register(Box::new(ChessboardDetectorFactory));
     registry.register(Box::new(CalibrationFrameScorerFactory));
     registry.register(Box::new(ScoreThresholdGateFactory));
@@ -106,6 +116,8 @@ mod tests {
             "videoLayer",
             "imageLayer",
             "viewer",
+            "calibrationBoardParams",
+            "cameraInitialParams",
             "calibrationSolver",
             "autoCaptureController",
             "overlayComposer",
@@ -113,6 +125,7 @@ mod tests {
             "coverageAnalyzer",
             "poseGuide",
             "chessboardDetector",
+            "poseEstimator",
             "calibrationFrameScorer",
             "scoreThresholdGate",
             "consecutiveHoldGate",

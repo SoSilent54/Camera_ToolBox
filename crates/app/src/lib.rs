@@ -38,7 +38,7 @@ pub use ports::{
     ArtifactError, ArtifactStore, CalibrationBackend, CalibrationBackendError,
     CalibrationCancellation, CaptureBackend, ExposureControl, RasterCodecError, RasterFormat,
     RasterImageCodec, RawFrameLoadError, RawFrameLoader, ReadableCaptureBackend, RegisterRead,
-    RegisterWrite, SensorIdentity,
+    RegisterWrite, SensorIdentity, SubpixelRefinementOptions,
 };
 pub use workflow::{
     AnalysisReport, AppError, CaptureAndAnalyzeRequest, CommandEnvelope, LocalRawAnalyzeReport,

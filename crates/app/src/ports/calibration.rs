@@ -24,6 +24,29 @@ impl CalibrationCancellation {
     }
 }
 
+/// 用户显式配置的角点亚像素细化；关闭时保留 `findChessboardCorners` 的原始角点。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubpixelRefinementOptions {
+    pub enabled: bool,
+    pub window_radius: i32,
+    pub max_iterations: i32,
+    pub epsilon: f64,
+}
+
+impl SubpixelRefinementOptions {
+    /// 校验 OpenCV `cornerSubPix` 的窗口和终止条件。
+    pub fn validate(self) -> Result<(), CalibrationBackendError> {
+        if !(1..=64).contains(&self.window_radius)
+            || !(1..=10_000).contains(&self.max_iterations)
+            || !self.epsilon.is_finite()
+            || self.epsilon <= 0.0
+        {
+            return Err(CalibrationBackendError::InvalidSubpixelOptions);
+        }
+        Ok(())
+    }
+}
+
 /// 由 adapter 实现的棋盘检测与内参标定能力。
 pub trait CalibrationBackend: Send + Sync {
     /// 返回实际链接 `OpenCV` 的版本和构建信息，用于 parity 报告与启动诊断。
@@ -49,6 +72,26 @@ pub trait CalibrationBackend: Send + Sync {
         board: BoardSpec,
         cancellation: &CalibrationCancellation,
     ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError>;
+
+    /// 使用显式亚像素配置检测棋盘。旧 backend 可忽略配置并复用 `detect_png`，避免破坏独立测试实现。
+    fn detect_png_with_options(
+        &self,
+        encoded_png: &[u8],
+        expected_size: CalibrationImageSize,
+        decoded_byte_limit: usize,
+        board: BoardSpec,
+        options: SubpixelRefinementOptions,
+        cancellation: &CalibrationCancellation,
+    ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError> {
+        let _ = options;
+        self.detect_png(
+            encoded_png,
+            expected_size,
+            decoded_byte_limit,
+            board,
+            cancellation,
+        )
+    }
 
     /// 用当前初始内参对单张 authoritative 棋盘检测求解外参，用于自动采集约束收益评估。
     ///
@@ -83,6 +126,8 @@ pub enum CalibrationBackendError {
     InvalidData(#[from] CalibrationDataError),
     #[error("calibration detector accepts PNG encoded bytes only")]
     InputNotPng,
+    #[error("invalid subpixel refinement options")]
+    InvalidSubpixelOptions,
     #[error("decoded BGR+Gray requires {required} bytes, limit is {limit} bytes")]
     DecodedImageTooLarge { required: usize, limit: usize },
     #[error("decoded image size differs: expected {expected:?}, got {actual:?}")]

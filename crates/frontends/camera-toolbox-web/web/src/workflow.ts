@@ -17,6 +17,8 @@ export type NodeKind =
   | 'overlayComposer'
   | 'viewer'
   | 'chessboardDetector'
+  | 'calibrationBoardParams'
+  | 'cameraInitialParams'
   | 'calibrationFrameScorer'
   | 'scoreThresholdGate'
   | 'consecutiveHoldGate'
@@ -25,6 +27,7 @@ export type NodeKind =
   | 'coverageAnalyzer'
   | 'autoCaptureController'
   | 'calibrationSolver'
+  | 'poseEstimator'
   | 'poseGuide'
   | 'i2cTransfer'
   | 'eepromProvision';
@@ -51,6 +54,10 @@ export type PortKind =
   | 'layer.overlay'
   | 'viewer.scene'
   | 'calib.detection'
+  | 'calib.board.params'
+  | 'calib.camera.model'
+  | 'calib.distortion.model'
+  | 'calib.pose'
   | 'calib.coverage'
   | 'calib.dataset'
   | 'calib.solution'
@@ -341,8 +348,8 @@ export type ViewerPreview =
 /** 可持久化的通用节点标量配置值。 */
 export type ScalarConfigValue = string | number | boolean;
 
-/** Dataset Collector 样本审核动作；请求体只在运行时传输，不写入工作流图。 */
-export type DatasetSampleActionName = 'accept' | 'reject' | 'enable' | 'disable' | 'delete';
+/** Dataset Collector 的运行时样本操作；payload 仅经 WS 传输，不写入工作流图。 */
+export type DatasetSampleActionName = 'select' | 'accept' | 'reject' | 'enable' | 'disable' | 'delete';
 
 export interface DatasetSampleActionPayload {
   sampleId: string;
@@ -381,6 +388,8 @@ export interface DatasetCollectorRuntimeOutput {
   kind: 'calib.dataset.v1';
   count: number;
   samples: DatasetSampleRuntimeOutput[];
+  /** 仅运行时 snapshot 的已选样本；缺省表示尚未成功选择可预览图像。 */
+  selectedSampleId?: string;
 }
 
 /** 单个可审核标定样本；图像引用仅含元数据/引用，不含图像字节。 */

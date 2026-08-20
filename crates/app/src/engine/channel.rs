@@ -4,9 +4,8 @@
 //! 帧流在 mailbox 满时丢弃「新到」的帧（`try_send` 失败即丢新），控制命令不占帧容量，避免被高频帧流堵住。
 
 use std::sync::{
-    Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    mpsc,
+    mpsc, Arc,
 };
 
 use super::{node::NodeAction, packet::DataPacket, spec::PortId};

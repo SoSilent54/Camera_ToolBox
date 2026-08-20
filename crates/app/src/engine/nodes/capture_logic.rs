@@ -505,7 +505,7 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> Result<f64, NodeErro
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
 
     use camera_toolbox_core::{CalibrationImageSize, CalibrationPoint, ChessboardDetection};
 

@@ -9,8 +9,8 @@
 //! web 层装配注入（后续任务）；本模块只依赖 trait。
 
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::time::Duration;
 
@@ -22,13 +22,13 @@ use crate::engine::{
     NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, RawMetadata,
 };
 use crate::platform::{
-    CommandResult, ControlTargetSpec, DumpCancellation, HexArmJointPositionsRequest,
-    HexArmTargetConfig, HexArmTransport, LatestDecodedFrameSlot, RemoteOperationControl,
-    RemoteTimeouts, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport, SourcePts,
-    StreamCancellation, StreamFrameIdentity, StreamOpenRequest, StreamOperationControl,
-    StreamRecordingRequest, StreamService, StreamServiceError, StreamServiceEvent, StreamSession,
-    StreamSessionId, StreamStage, StreamTerminal, StreamTimeouts, TypedCommandRequest,
-    X5233CapturePayload, host_monotonic_time_ns,
+    host_monotonic_time_ns, CommandResult, ControlTargetSpec, DumpCancellation,
+    HexArmJointPositionsRequest, HexArmTargetConfig, HexArmTransport, LatestDecodedFrameSlot,
+    RemoteOperationControl, RemoteTimeouts, RtspCodec, RtspLatencyMode, RtspStreamConfig,
+    RtspTransport, SourcePts, StreamCancellation, StreamFrameIdentity, StreamOpenRequest,
+    StreamOperationControl, StreamRecordingRequest, StreamService, StreamServiceError,
+    StreamServiceEvent, StreamSession, StreamSessionId, StreamStage, StreamTerminal,
+    StreamTimeouts, TypedCommandRequest, X5233CapturePayload,
 };
 #[cfg(test)]
 use crate::platform::{
@@ -1775,7 +1775,7 @@ fn control_timeout(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, atomic::AtomicBool, mpsc};
+    use std::sync::{atomic::AtomicBool, mpsc, Arc};
 
     use parking_lot::Mutex;
 

@@ -67,7 +67,8 @@ function portTitle(port: WorkflowNode['inputs'][number]): string {
   return [port.label, port.kind, port.schema, port.formatHint].filter(Boolean).join(' · ');
 }
 
-export function portKindTone(kind: PortKind): string {
+/** 将端口契约归类为既有视觉色调。 */
+export function portKindTone(kind: string): string {
   if (kind.startsWith('workspace') || kind.startsWith('file')) return 'port-tone-workspace';
   if (kind.startsWith('control')) return 'port-tone-control';
   if (kind.startsWith('endpoint') || kind.startsWith('stream')) return 'port-tone-media';
@@ -76,6 +77,20 @@ export function portKindTone(kind: PortKind): string {
   if (kind.startsWith('i2c') || kind.startsWith('eeprom')) return 'port-tone-io';
   if (kind.startsWith('status')) return 'port-tone-status';
   return 'port-tone-default';
+}
+
+/** 连线和流动脉冲复用 Handle 的类型色，避免端口与边表达不同的负载语义。 */
+export function portKindColor(kind: string): string {
+  switch (portKindTone(kind)) {
+    case 'port-tone-workspace': return '#94a3b8';
+    case 'port-tone-control': return '#34d399';
+    case 'port-tone-media': return '#38bdf8';
+    case 'port-tone-image': return '#a78bfa';
+    case 'port-tone-calib': return '#fb7185';
+    case 'port-tone-io': return '#2dd4bf';
+    case 'port-tone-status': return '#f59e0b';
+    default: return '#cbd5e1';
+  }
 }
 
 /** 仅暴露可无歧义序列化回工作流的标量配置，复杂对象仍由专用节点负责。 */

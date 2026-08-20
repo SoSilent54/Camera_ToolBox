@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react';
 import { ViewportPortal } from '@xyflow/react';
 import { useFlowEdgePaths } from './FlowPulseEdge';
+import { portKindColor } from './nodes/shared';
 import { EDGE_FLOW_PULSE_DURATION_MS } from './useEdgeFlowPulses';
 import type { EdgePulseView } from './workflow';
 
@@ -25,9 +26,13 @@ function OverlayPulseMarker({ pulse }: OverlayPulseMarkerProps) {
     animationRef.current?.beginElement();
   }, []);
 
-  const className = pulse.pulse.packetKind.includes('frame') ? 'edge-flow-pulse frame' : 'edge-flow-pulse control';
+  const color = portKindColor(pulse.pulse.packetKind);
   return (
-    <circle r={4} className={className}>
+    <circle
+      r={4}
+      className="edge-flow-pulse"
+      style={{ fill: color, filter: `drop-shadow(0 0 6px ${color})` }}
+    >
       <animateMotion
         ref={animationRef}
         path={pulse.path}

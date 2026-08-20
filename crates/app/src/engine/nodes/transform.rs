@@ -7,8 +7,8 @@
 
 use std::{
     sync::{
-        Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc,
     },
     thread,
     time::Duration,
@@ -642,7 +642,7 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
 
     use super::*;
     use crate::engine::{NodeReporter, OutputRegistry, PortCardinality, PortSpec, SpawnContext};

@@ -16,10 +16,11 @@ use serde_json::json;
 
 use crate::{
     engine::{
-        DataPacket, DetectionPacket, ImageFrame, ImageFrameFormat, ImageFrameIdentity, NodeAction,
-        NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
+        packet::CalibrationBoardParams, DataPacket, DetectionPacket, ImageFrame,
+        ImageFrameFormat, ImageFrameIdentity, NodeAction, NodeError, NodeFactory, NodeInstance,
+        NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
     },
-    ports::CalibrationCancellation,
+    ports::{CalibrationCancellation, SubpixelRefinementOptions},
 };
 
 /// 单帧解码峰值字节预算：OpenCV BGR + Gray 同时存活，每像素 4 bytes（与
@@ -34,12 +35,13 @@ impl NodeFactory for ChessboardDetectorFactory {
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(ChessboardDetectorNode { spec }))
+        Ok(Box::new(ChessboardDetectorNode { spec, board: None }))
     }
 }
 
 pub struct ChessboardDetectorNode {
     spec: NodeSpec,
+    board: Option<Arc<CalibrationBoardParams>>,
 }
 
 impl NodeInstance for ChessboardDetectorNode {
@@ -60,6 +62,17 @@ impl NodeInstance for ChessboardDetectorNode {
     ) -> Result<(), NodeError> {
         // 兼容仍以 DecodedVideoFrame 表示的 RTSP stream；ImageFrame 已显式保留格式与身份。
         match (port, packet) {
+            ("board", DataPacket::CalibrationBoardParams(board)) => {
+                board.validate().map_err(|error| {
+                    NodeError::Precondition(format!("invalid detector board parameters: {error}"))
+                })?;
+                self.board = Some(board);
+                rt.report_event("updated detector board parameters");
+                Ok(())
+            }
+            ("board", _) => Err(NodeError::Precondition(
+                "chessboardDetector.board requires calib.board.params".to_owned(),
+            )),
             ("image", DataPacket::ImageFrame(frame))
             | ("frames", DataPacket::ImageFrame(frame)) => self.detect(&frame, rt),
             ("frames", DataPacket::VideoFrame(frame)) => {
@@ -71,6 +84,25 @@ impl NodeInstance for ChessboardDetectorNode {
 
     fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
         Err(NodeError::UnsupportedAction(action.name().to_owned()))
+    }
+
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let next = NodeSpec {
+            config,
+            ..self.spec.clone()
+        };
+        let candidate = Self {
+            spec: next.clone(),
+            board: self.board.clone(),
+        };
+        candidate.board()?;
+        candidate.subpixel_options()?;
+        self.spec = next;
+        Ok(())
     }
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -124,13 +156,15 @@ impl ChessboardDetectorNode {
             .map_err(|error| NodeError::Execution(error.to_string()))?;
 
         let board = self.board()?;
+        let subpixel_options = self.subpixel_options()?;
         rt.report_state(NodeRuntimeState::Running, "detecting chessboard");
         let outcome = backend
-            .detect_png(
+            .detect_png_with_options(
                 &png,
                 expected_size,
                 decoded_byte_limit,
                 board,
+                subpixel_options,
                 &CalibrationCancellation::default(),
             )
             .map_err(|error| NodeError::Execution(error.to_string()))?;
@@ -199,12 +233,33 @@ impl ChessboardDetectorNode {
     }
 
     fn board(&self) -> Result<BoardSpec, NodeError> {
+        if let Some(board) = self.board.as_deref() {
+            board.validate().map_err(|error| {
+                NodeError::Precondition(format!("invalid detector board parameters: {error}"))
+            })?;
+            return BoardSpec::new(board.cols, board.rows, board.square_size_mm)
+                .map_err(|error| NodeError::Precondition(error.to_string()));
+        }
         BoardSpec::new(
             config_u16(&self.spec, "boardCols", 8),
             config_u16(&self.spec, "boardRows", 11),
             config_f64(&self.spec, "squareSizeMm", 30.0),
         )
         .map_err(|error| NodeError::Config(error.to_string()))
+    }
+
+    fn subpixel_options(&self) -> Result<SubpixelRefinementOptions, NodeError> {
+        // 未携带新配置的已保存图维持历史自适应细化；新建 Web 节点会明确写入 false。
+        let options = SubpixelRefinementOptions {
+            enabled: config_bool(&self.spec, "subpixelEnabled", true),
+            window_radius: config_i32(&self.spec, "subpixelWindowRadius", 5),
+            max_iterations: config_i32(&self.spec, "subpixelMaxIterations", 30),
+            epsilon: config_f64(&self.spec, "subpixelEpsilon", 0.01),
+        };
+        options
+            .validate()
+            .map_err(|error| NodeError::Config(error.to_string()))?;
+        Ok(options)
     }
 }
 
@@ -228,13 +283,11 @@ fn chessboard_outline(detection: &ChessboardDetection, board: BoardSpec) -> serd
         rows.saturating_sub(1) * cols + cols - 1,
         rows.saturating_sub(1) * cols,
     ];
-    json!(
-        indexes
-            .into_iter()
-            .filter_map(|index| detection.corners.get(index))
-            .map(|corner| json!({"x": corner.x, "y": corner.y}))
-            .collect::<Vec<_>>()
-    )
+    json!(indexes
+        .into_iter()
+        .filter_map(|index| detection.corners.get(index))
+        .map(|corner| json!({"x": corner.x, "y": corner.y}))
+        .collect::<Vec<_>>())
 }
 
 /// 单帧解码峰值字节预算：`width * height * DECODED_BYTES_PER_PIXEL`（BGR + Gray 同存）。
@@ -349,6 +402,21 @@ fn compact_rows(
     Ok(compact.into())
 }
 
+fn config_bool(spec: &NodeSpec, key: &str, fallback: bool) -> bool {
+    spec.config
+        .get(key)
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(fallback)
+}
+
+fn config_i32(spec: &NodeSpec, key: &str, fallback: i32) -> i32 {
+    spec.config
+        .get(key)
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .unwrap_or(fallback)
+}
+
 fn has_output_port(spec: &NodeSpec, id: &str) -> bool {
     spec.outputs.iter().any(|port: &PortSpec| port.id == id)
 }
@@ -370,7 +438,7 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
 
     use super::*;
     use crate::engine::{
@@ -483,7 +551,7 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             viewer_slot: None,
         });
-        let node = ChessboardDetectorNode { spec: spec() };
+        let node = ChessboardDetectorNode { spec: spec(), board: None };
         let frame = frame(640, 480);
         let board = BoardSpec::new(2, 2, 30.0).expect("board");
         let detection = ChessboardDetection {
@@ -519,7 +587,7 @@ mod tests {
     #[test]
     fn missing_image_codec_is_precondition() {
         let input = spec();
-        let mut node = ChessboardDetectorNode { spec: input };
+        let mut node = ChessboardDetectorNode { spec: input, board: None };
         // 未注入任何服务；非空帧会先取 image_codec → Precondition。
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let err = node
@@ -531,19 +599,18 @@ mod tests {
     #[test]
     fn empty_frame_is_skipped_without_services() {
         let input = spec();
-        let mut node = ChessboardDetectorNode { spec: input };
+        let mut node = ChessboardDetectorNode { spec: input, board: None };
         // 空帧在取任何 service 之前即被跳过，因此无需注入服务也应成功返回。
         let (mut rt, _outputs) = runtime(EngineServices::default());
-        assert!(
-            node.on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
-                .is_ok()
-        );
+        assert!(node
+            .on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
+            .is_ok());
     }
 
     #[test]
     fn rtsp_frames_image_frame_triggers_detection_path() {
         let input = spec();
-        let mut node = ChessboardDetectorNode { spec: input };
+        let mut node = ChessboardDetectorNode { spec: input, board: None };
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let err = node
             .on_input("frames", DataPacket::ImageFrame(frame(2, 2)), &mut rt)
@@ -551,5 +618,42 @@ mod tests {
                 "RTSP frames as ImageFrame must reach detection and fail on missing services",
             );
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
+    }
+    #[test]
+    fn explicit_subpixel_config_is_validated_and_legacy_config_keeps_refinement() {
+        let mut node = ChessboardDetectorNode { spec: spec(), board: None };
+        assert!(node.subpixel_options().expect("legacy options").enabled);
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        node.on_config_update(
+            serde_json::json!({
+                "subpixelEnabled": false,
+                "subpixelWindowRadius": 5,
+                "subpixelMaxIterations": 30,
+                "subpixelEpsilon": 0.01,
+            }),
+            &mut rt,
+        )
+        .expect("valid explicit refinement config");
+        assert!(!node.subpixel_options().expect("configured options").enabled);
+        let error = node.on_config_update(
+            serde_json::json!({"subpixelWindowRadius": 0}),
+            &mut rt,
+        );
+        assert!(matches!(error, Err(NodeError::Config(_))));
+    }
+
+    #[test]
+    fn board_packet_overrides_legacy_detector_config() {
+        let mut node = ChessboardDetectorNode { spec: spec(), board: None };
+        let (mut rt, _outputs) = runtime(EngineServices::default());
+        let board = CalibrationBoardParams::new(11, 8, 40.0).expect("board params");
+        node.on_input(
+            "board",
+            DataPacket::CalibrationBoardParams(Arc::new(board)),
+            &mut rt,
+        )
+        .expect("board input");
+        let active = node.board().expect("active board");
+        assert_eq!((active.inner_cols, active.inner_rows, active.square_size), (11, 8, 40.0));
     }
 }

@@ -81,7 +81,7 @@ impl NodeInstance for AutoCaptureNode {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
+    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
 
     use super::*;
     use crate::{
