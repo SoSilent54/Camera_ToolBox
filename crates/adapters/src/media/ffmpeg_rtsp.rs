@@ -1,6 +1,7 @@
 //! RTSP → RGBA 的进程内 FFmpeg 解码器；直接保留解码帧 PTS 与时间基。
 
 use std::{
+    collections::VecDeque,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -301,6 +302,9 @@ fn decode_rtsp(
     let mut decoded = ffmpeg::util::frame::video::Video::empty();
     let mut rgba = ffmpeg::util::frame::video::Video::empty();
     let mut frame_sequence = 0_u64;
+    // 当前 X5 H.264 编码器没有 B 帧：每个送入 decoder 的 access unit 至多产生一个
+    // 对应解码帧，因此按提交顺序保存包侧 SEI 时间戳即可，不得从 PTS 推断。
+    let mut pending_device_timestamps = VecDeque::new();
 
     loop {
         if state.shutdown_requested.load(Ordering::Acquire) {
@@ -320,6 +324,8 @@ fn decode_rtsp(
         if packet.stream() != stream_index {
             continue;
         }
+        let device_timestamp_ns = packet.data().and_then(parse_h264_annex_b_timestamp_ns);
+        pending_device_timestamps.push_back(device_timestamp_ns);
         let codec_start = Instant::now();
         decoder
             .send_packet(&packet)
@@ -358,21 +364,141 @@ fn decode_rtsp(
                         .to_owned(),
                 },
             };
+            let device_timestamp_ns = pending_device_timestamps.pop_front().unwrap_or(None);
             let published_host_time_ns = host_monotonic_time_ns();
             latest.publish(DecodedVideoFrame {
                 width: output_width,
                 height: output_height,
                 rgba: bytes.into(),
-                identity: StreamFrameIdentity::known_at(
+                identity: StreamFrameIdentity::known_at_with_device_timestamp(
                     session_id.clone(),
                     channel,
                     frame_sequence,
                     source_pts,
                     published_host_time_ns,
+                    device_timestamp_ns,
                 ),
             });
             stats.decoded_frames.fetch_add(1, Ordering::Release);
             frame_sequence = frame_sequence.saturating_add(1);
+        }
+    }
+}
+
+const X5_TIMESTAMP_SEI_UUID: [u8; 16] = [
+    0x58, 0x35, 0x54, 0x53, 0x50, 0x4e, 0x53, 0x00, 0x8a, 0x75, 0x42, 0x1e, 0x91, 0x0f, 0x20, 0x26,
+];
+
+/// 从 Annex-B H.264 access unit 读取 X5 注入的 user_data_unregistered SEI。
+///
+/// 发送端约定 payload type 为 5、payload 为 16-byte UUID 加大端 `timestamp_ns`。
+/// 解析仅检查编码流明确携带的值，绝不以 PTS 或本机时钟填补缺失时间戳。
+fn parse_h264_annex_b_timestamp_ns(access_unit: &[u8]) -> Option<u64> {
+    let mut search_from = 0;
+    while let Some((start_code_offset, nal_offset)) =
+        h264_annex_b_start_code(access_unit, search_from)
+    {
+        let next_start_code = h264_annex_b_start_code(access_unit, nal_offset)
+            .map_or(access_unit.len(), |(offset, _)| offset);
+        let nal = &access_unit[nal_offset..next_start_code];
+        if nal.first().is_some_and(|header| header & 0x1f == 6)
+            && let Some(timestamp_ns) = parse_h264_timestamp_sei_rbsp(&nal[1..])
+        {
+            return Some(timestamp_ns);
+        }
+        search_from = next_start_code;
+        if next_start_code == access_unit.len() || next_start_code <= start_code_offset {
+            break;
+        }
+    }
+    None
+}
+
+/// 返回起始码位置及其后第一个 NAL byte 的位置，兼容三、四字节 Annex-B 起始码。
+fn h264_annex_b_start_code(data: &[u8], from: usize) -> Option<(usize, usize)> {
+    let mut offset = from;
+    while offset + 3 <= data.len() {
+        if data[offset] == 0 && data[offset + 1] == 0 {
+            if data[offset + 2] == 1 {
+                return Some((offset, offset + 3));
+            }
+            if offset + 4 <= data.len() && data[offset + 2] == 0 && data[offset + 3] == 1 {
+                return Some((offset, offset + 4));
+            }
+        }
+        offset += 1;
+    }
+    None
+}
+
+/// H.264 RBSP byte reader：跳过 emulation-prevention three-byte，避免复制 NAL payload。
+struct H264RbspReader<'a> {
+    data: &'a [u8],
+    offset: usize,
+    preceding_zeroes: u8,
+}
+
+impl<'a> H264RbspReader<'a> {
+    const fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            offset: 0,
+            preceding_zeroes: 0,
+        }
+    }
+
+    fn next(&mut self) -> Option<u8> {
+        while let Some(&byte) = self.data.get(self.offset) {
+            self.offset += 1;
+            if self.preceding_zeroes >= 2
+                && byte == 3
+                && self.data.get(self.offset).is_some_and(|next| *next <= 3)
+            {
+                self.preceding_zeroes = 0;
+                continue;
+            }
+            self.preceding_zeroes = if byte == 0 {
+                self.preceding_zeroes.saturating_add(1)
+            } else {
+                0
+            };
+            return Some(byte);
+        }
+        None
+    }
+}
+
+fn parse_h264_timestamp_sei_rbsp(rbsp: &[u8]) -> Option<u64> {
+    let mut reader = H264RbspReader::new(rbsp);
+    while let Some(payload_type) = read_h264_sei_value(&mut reader) {
+        let payload_size = read_h264_sei_value(&mut reader)?;
+        if payload_type == 5 && payload_size == X5_TIMESTAMP_SEI_UUID.len() + 8 {
+            let mut payload = [0_u8; 24];
+            for byte in &mut payload {
+                *byte = reader.next()?;
+            }
+            if payload[..X5_TIMESTAMP_SEI_UUID.len()] != X5_TIMESTAMP_SEI_UUID {
+                continue;
+            }
+            let timestamp_bytes: [u8; 8] =
+                payload[X5_TIMESTAMP_SEI_UUID.len()..].try_into().ok()?;
+            return Some(u64::from_be_bytes(timestamp_bytes));
+        }
+        for _ in 0..payload_size {
+            reader.next()?;
+        }
+    }
+    None
+}
+
+/// `payloadType` 和 `payloadSize` 使用连续 `0xff` 加尾字节的可变长编码。
+fn read_h264_sei_value(reader: &mut H264RbspReader<'_>) -> Option<usize> {
+    let mut value = 0_usize;
+    loop {
+        let byte = reader.next()?;
+        value = value.checked_add(usize::from(byte))?;
+        if byte != u8::MAX {
+            return Some(value);
         }
     }
 }
@@ -651,5 +777,47 @@ mod tests {
             timestamps.push(frame.timestamp());
         }
         assert_eq!(timestamps, vec![Some(0), Some(18_000), Some(36_000)]);
+    }
+    #[test]
+    fn h264_annex_b_timestamp_sei_reads_x5_user_data() {
+        let timestamp_ns = 0x0102_0304_0506_0708_u64;
+        let mut access_unit = vec![0, 0, 0, 1, 0x06, 5, 24];
+        access_unit.extend_from_slice(&X5_TIMESTAMP_SEI_UUID);
+        access_unit.extend_from_slice(&timestamp_ns.to_be_bytes());
+        access_unit.push(0x80);
+        access_unit.extend_from_slice(&[0, 0, 1, 0x65, 0x88]);
+
+        assert_eq!(
+            parse_h264_annex_b_timestamp_ns(&access_unit),
+            Some(timestamp_ns)
+        );
+    }
+
+    #[test]
+    fn h264_annex_b_timestamp_sei_unescapes_timestamp_payload() {
+        let timestamp_ns = 0x0000_0102_0304_0506_u64;
+        let mut access_unit = vec![0, 0, 1, 0x06, 5, 24];
+        access_unit.extend_from_slice(&X5_TIMESTAMP_SEI_UUID);
+        access_unit.extend_from_slice(&[0, 0, 3, 1, 2, 3, 4, 5, 6]);
+        access_unit.push(0x80);
+        access_unit.extend_from_slice(&[0, 0, 1, 0x65]);
+
+        assert_eq!(
+            parse_h264_annex_b_timestamp_ns(&access_unit),
+            Some(timestamp_ns)
+        );
+    }
+
+    #[test]
+    fn h264_annex_b_timestamp_sei_rejects_truncated_or_foreign_payload() {
+        let mut truncated = vec![0, 0, 1, 0x06, 5, 24];
+        truncated.extend_from_slice(&X5_TIMESTAMP_SEI_UUID);
+        truncated.extend_from_slice(&[0; 7]);
+        assert_eq!(parse_h264_annex_b_timestamp_ns(&truncated), None);
+
+        let mut foreign = vec![0, 0, 1, 0x06, 5, 24];
+        foreign.extend_from_slice(&[0; 16]);
+        foreign.extend_from_slice(&1_u64.to_be_bytes());
+        assert_eq!(parse_h264_annex_b_timestamp_ns(&foreign), None);
     }
 }

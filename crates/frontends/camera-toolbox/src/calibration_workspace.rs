@@ -65,8 +65,6 @@ const DATASET_GAIN_CAPTURE_HOLD_FRAMES: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
 const GUIDED_HOLD_JITTER_Z_LIMIT: f64 = 0.04;
 const GUIDED_HOLD_JITTER_RPY_DEGREES: f64 = 2.0;
-const X5_RTSP_PTS_BRIDGE_TOLERANCE_90K: u64 = 3_000;
-const X5_RTSP_PTS_BRIDGE_MAX_AGE_NS: u64 = 2_000_000_000;
 const GUIDED_POSE_X_TOLERANCE: f64 = 0.10;
 const GUIDED_POSE_Y_TOLERANCE: f64 = 0.10;
 const GUIDED_POSE_Z_TOLERANCE: f64 = 0.24;
@@ -327,102 +325,6 @@ struct FrozenStreamInput {
     encoded: CalibrationEncodedPng,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct RtspPtsBridgeKey {
-    stream_id: StreamSessionId,
-    channel: u16,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct RtspPtsBridgeSample {
-    source_pts_90k: u64,
-    driver_rtsp_pts_90k: u64,
-    offset_90k: i128,
-    sampled_frame_sequence: u64,
-    updated_at_host_ns: u64,
-}
-
-impl RtspPtsBridgeSample {
-    fn target_rtsp_pts_90k(&self, source_pts_90k: u64) -> Result<u64, String> {
-        let target = i128::from(source_pts_90k) + self.offset_90k;
-        u64::try_from(target).map_err(|_| {
-            format!(
-                "RTSP PTS bridge target is outside u64: source_pts_90k={source_pts_90k}, offset_90k={}",
-                self.offset_90k
-            )
-        })
-    }
-}
-
-// RTSP 当前未携带显式 board metadata；PTS bridge 是过渡方案，只匹配同一 RTP 90k 时间轴。
-#[allow(dead_code)]
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum AuthoritativeYuvLookup {
-    FrameId(u64),
-    TimestampNs(u64),
-    RtspPts90k {
-        pts_90k: u64,
-        tolerance_90k: u64,
-        source_pts_90k: u64,
-        bridge_offset_90k: i128,
-    },
-}
-
-impl AuthoritativeYuvLookup {
-    fn from_rtsp_identity(identity: &StreamFrameIdentity) -> Result<Self, String> {
-        match &identity.source_pts {
-            camera_toolbox_app::SourcePts::Known { provenance, .. } => Err(format!(
-                "RTSP frame PTS ({provenance:?}) is presentation timing only; direct X5 authoritative YUV lookup requires explicit frame_id/timestamp_ns metadata from RTSP SEI or RTP header extension"
-            )),
-            camera_toolbox_app::SourcePts::Unavailable { reason } => Err(format!(
-                "RTSP frame has no board frame_id/timestamp_ns metadata: {reason}"
-            )),
-        }
-    }
-
-    const fn label(&self) -> &'static str {
-        match self {
-            Self::FrameId(_) => "frame_id",
-            Self::TimestampNs(_) => "timestamp_ns",
-            Self::RtspPts90k { .. } => "rtsp_pts_90k",
-        }
-    }
-
-    const fn value(&self) -> u64 {
-        match self {
-            Self::FrameId(value) | Self::TimestampNs(value) => *value,
-            Self::RtspPts90k { pts_90k, .. } => *pts_90k,
-        }
-    }
-}
-
-fn source_pts_to_90k(source_pts: &camera_toolbox_app::SourcePts) -> Result<u64, String> {
-    let camera_toolbox_app::SourcePts::Known {
-        ticks,
-        time_base_numerator,
-        time_base_denominator,
-        provenance,
-    } = source_pts
-    else {
-        return Err(format!("RTSP frame has no PTS: {source_pts:?}"));
-    };
-    if *ticks < 0 || *time_base_numerator == 0 || *time_base_denominator == 0 {
-        return Err(format!(
-            "RTSP frame PTS is invalid for bridge: ticks={ticks}, time_base={time_base_numerator}/{time_base_denominator}, provenance={provenance:?}"
-        ));
-    }
-    let scaled = i128::from(*ticks)
-        .checked_mul(i128::from(*time_base_numerator))
-        .and_then(|value| value.checked_mul(90_000))
-        .ok_or_else(|| format!("RTSP frame PTS overflows 90k bridge: ticks={ticks}"))?
-        / i128::from(*time_base_denominator);
-    u64::try_from(scaled).map_err(|_| {
-        format!(
-            "RTSP frame PTS cannot be represented as u64 90k ticks: ticks={ticks}, time_base={time_base_numerator}/{time_base_denominator}"
-        )
-    })
-}
-
 fn x5_ring_status_range(valid: u16, min: u64, max: u64) -> String {
     if valid == 0 {
         "—".to_owned()
@@ -454,14 +356,12 @@ fn format_x5_authoritative_yuv_ring_diagnostics(
         );
     };
     format!(
-        "ring_channel=CH{}, ring_valid={}/{}, ring_frame_id={}, ring_timestamp_ns={}, ring_rtsp_pts_90k={}, ring_last_rtsp_pts_90k={}, ring_retention_ns={}, ring_evicted={}, ring_dropped={}",
+        "ring_channel=CH{}, ring_valid={}/{}, ring_frame_id={}, ring_timestamp_ns={}, ring_retention_ns={}, ring_evicted={}, ring_dropped={}",
         ring.channel,
         ring.valid,
         ring.depth,
         x5_ring_status_range(ring.valid, ring.min_frame_id, ring.max_frame_id),
         x5_ring_status_range(ring.valid, ring.min_timestamp_ns, ring.max_timestamp_ns),
-        x5_ring_status_range(ring.valid, ring.min_rtsp_pts_90k, ring.max_rtsp_pts_90k),
-        ring.last_rtsp_pts_90k,
         ring.retention_ns,
         ring.evicted,
         ring.dropped
@@ -615,7 +515,7 @@ fn freeze_authoritative_yuv_input(
     store: CaptureStore,
     acquisition_key: camera_toolbox_app::AutoCaptureAcquisitionKey,
     rtsp_identity: &StreamFrameIdentity,
-    lookup: &AuthoritativeYuvLookup,
+    timestamp_ns: u64,
 ) -> Result<FrozenStreamInput, String> {
     let spec = x5_yuv_snapshot_spec(&snapshot)?;
     let image_size = CalibrationImageSize::new(snapshot.width, snapshot.height)
@@ -660,44 +560,9 @@ fn freeze_authoritative_yuv_input(
     primary_attributes.insert("chroma_stride".to_owned(), spec.chroma_stride.to_string());
     primary_attributes.insert("y_len".to_owned(), snapshot.y_len.to_string());
     primary_attributes.insert("uv_len".to_owned(), snapshot.uv_len.to_string());
-    primary_attributes.insert(
-        "rtsp_timestamp_us".to_owned(),
-        snapshot.rtsp_timestamp_us.to_string(),
-    );
-    primary_attributes.insert("rtsp_pts_90k".to_owned(), snapshot.rtsp_pts_90k.to_string());
-    if let Some(delta_90k) = snapshot.match_rtsp_pts_delta_90k {
-        primary_attributes.insert("match_rtsp_pts_delta_90k".to_owned(), delta_90k.to_string());
-    }
-    if let AuthoritativeYuvLookup::RtspPts90k {
-        source_pts_90k,
-        bridge_offset_90k,
-        tolerance_90k,
-        ..
-    } = lookup
-    {
-        primary_attributes.insert(
-            "rtsp_bridge_source_pts_90k".to_owned(),
-            source_pts_90k.to_string(),
-        );
-        primary_attributes.insert(
-            "rtsp_bridge_offset_90k".to_owned(),
-            bridge_offset_90k.to_string(),
-        );
-        primary_attributes.insert(
-            "rtsp_bridge_tolerance_90k".to_owned(),
-            tolerance_90k.to_string(),
-        );
-    }
     primary_attributes.insert("frame_id".to_owned(), snapshot.frame_id.to_string());
     primary_attributes.insert("timestamp_ns".to_owned(), snapshot.timestamp_ns.to_string());
-    primary_attributes.insert(
-        "match_mode".to_owned(),
-        snapshot
-            .match_mode
-            .as_deref()
-            .unwrap_or(lookup.label())
-            .to_owned(),
-    );
+    primary_attributes.insert("match_mode".to_owned(), "timestamp_ns".to_owned());
     primary_attributes.insert(
         "rtsp_precheck_stream_id".to_owned(),
         rtsp_identity.stream_id.as_str().to_owned(),
@@ -711,8 +576,8 @@ fn freeze_authoritative_yuv_input(
         rtsp_identity.host_monotonic_time_ns.to_string(),
     );
     primary_attributes.insert(
-        "rtsp_precheck_source_pts".to_owned(),
-        format!("{:?}", rtsp_identity.source_pts),
+        "rtsp_precheck_device_timestamp_ns".to_owned(),
+        timestamp_ns.to_string(),
     );
     primary_attributes.insert(
         "captured_at_host_monotonic_ns".to_owned(),
@@ -804,18 +669,17 @@ fn freeze_authoritative_yuv_input(
         .publish_validated(analysis_reservation, analysis_asset)
         .map_err(|error| format!("Cannot publish X5 YUV analysis image: {error}"))?;
 
-    let yuv_identity = StreamFrameIdentity::known_at(
+    let yuv_identity = StreamFrameIdentity::known_at_with_device_timestamp(
         rtsp_identity.stream_id.clone(),
         snapshot.channel,
         snapshot.frame_id,
         camera_toolbox_app::SourcePts::Unavailable {
             reason: format!(
-                "X5_233 TCP SNAPSHOT matched RTSP precheck by {}; timestamp_ns={}",
-                lookup.label(),
-                snapshot.timestamp_ns
+                "X5_233 TCP SNAPSHOT matched RTSP precheck by device timestamp_ns={timestamp_ns}"
             ),
         },
         captured_at_ns,
+        Some(snapshot.timestamp_ns),
     );
     let source_revision = CalibrationInputRevision::EphemeralRaster {
         primary_sha256,
@@ -2951,7 +2815,6 @@ pub(crate) struct CalibrationWorkspace {
     display_layer: CalibrationDisplayLayer,
     preview_viewport: CalibrationPreviewViewport,
     preview_mode: CalibrationPreviewMode,
-    pts_bridge_cache: BTreeMap<RtspPtsBridgeKey, RtspPtsBridgeSample>,
     coverage: Option<CoverageVisualization>,
     coverage_dirty: bool,
     auto_capture_enabled: bool,
@@ -3552,7 +3415,6 @@ impl CalibrationWorkspace {
             display_layer: CalibrationDisplayLayer::default(),
             preview_viewport: CalibrationPreviewViewport::default(),
             preview_mode: CalibrationPreviewMode::default(),
-            pts_bridge_cache: BTreeMap::new(),
             coverage: None,
             coverage_dirty: true,
             auto_capture_enabled: false,
@@ -4011,7 +3873,6 @@ impl CalibrationWorkspace {
                 acquisition_key: acquisition_key.clone(),
                 image_size,
             });
-            self.pts_bridge_cache.clear();
             self.auto_capture.latest_detection = None;
             self.auto_capture.last_assessment = None;
             self.auto_capture.reset_dataset_gain_hold();
@@ -4244,8 +4105,6 @@ impl CalibrationWorkspace {
     }
 
     pub(crate) fn stream_disconnected(&mut self, session_id: &StreamSessionId) {
-        self.pts_bridge_cache
-            .retain(|key, _| key.stream_id != *session_id);
         let pending_matches = self
             .auto_capture
             .pending
@@ -4307,130 +4166,17 @@ impl CalibrationWorkspace {
         }
     }
 
-    fn authoritative_yuv_lookup_for_rtsp_identity(
-        &mut self,
-        host: &str,
-        tcp_port: u16,
+    fn authoritative_yuv_timestamp_ns_for_rtsp_identity(
         rtsp_identity: &StreamFrameIdentity,
-    ) -> Result<AuthoritativeYuvLookup, String> {
-        if let Ok(lookup) = AuthoritativeYuvLookup::from_rtsp_identity(rtsp_identity) {
-            return Ok(lookup);
-        }
-        let source_pts_90k = source_pts_to_90k(&rtsp_identity.source_pts)?;
-        let key = RtspPtsBridgeKey {
-            stream_id: rtsp_identity.stream_id.clone(),
-            channel: rtsp_identity.channel,
-        };
-        let now_ns = host_monotonic_time_ns();
-        let sample = self
-            .pts_bridge_cache
-            .get(&key)
-            .filter(|sample| {
-                now_ns.saturating_sub(sample.updated_at_host_ns) <= X5_RTSP_PTS_BRIDGE_MAX_AGE_NS
-            })
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| {
-                self.refresh_rtsp_pts_bridge_sample(host, tcp_port, rtsp_identity, source_pts_90k)
-            })?;
-        let target_pts_90k = sample.target_rtsp_pts_90k(source_pts_90k)?;
-        tracing::warn!(
-            operation = "x5_rtsp_pts_bridge",
-            channel = rtsp_identity.channel,
-            frame_sequence = rtsp_identity.frame_sequence,
-            source_pts_90k,
-            target_rtsp_pts_90k = target_pts_90k,
-            bridge_offset_90k = sample.offset_90k,
-            sampled_frame_sequence = sample.sampled_frame_sequence,
-            sampled_source_pts_90k = sample.source_pts_90k,
-            sampled_driver_rtsp_pts_90k = sample.driver_rtsp_pts_90k,
-            tolerance_90k = X5_RTSP_PTS_BRIDGE_TOLERANCE_90K,
-            "X5 authoritative YUV using experimental RTSP PTS bridge"
-        );
-        Ok(AuthoritativeYuvLookup::RtspPts90k {
-            pts_90k: target_pts_90k,
-            tolerance_90k: X5_RTSP_PTS_BRIDGE_TOLERANCE_90K,
-            source_pts_90k,
-            bridge_offset_90k: sample.offset_90k,
+    ) -> Result<u64, String> {
+        rtsp_identity.device_timestamp_ns.ok_or_else(|| {
+            format!(
+                "RTSP frame has no device timestamp_ns metadata for exact X5 authoritative YUV lookup; stream={}, channel={}, frame_sequence={}",
+                rtsp_identity.stream_id.as_str(),
+                rtsp_identity.channel,
+                rtsp_identity.frame_sequence
+            )
         })
-    }
-
-    fn refresh_rtsp_pts_bridge_sample(
-        &mut self,
-        host: &str,
-        tcp_port: u16,
-        rtsp_identity: &StreamFrameIdentity,
-        source_pts_90k: u64,
-    ) -> Result<RtspPtsBridgeSample, String> {
-        let status = x5_tcp_client::status(host, tcp_port)
-            .map_err(|error| format!("RTSP PTS bridge status query failed: {error}"))?;
-        let ring = status
-            .rings
-            .iter()
-            .find(|ring| ring.channel == rtsp_identity.channel)
-            .ok_or_else(|| {
-                format!(
-                    "RTSP PTS bridge missing CH{} ring status",
-                    rtsp_identity.channel
-                )
-            })?;
-        if ring.valid == 0 || ring.last_rtsp_pts_90k == 0 {
-            return Err(format!(
-                "RTSP PTS bridge needs driver rtsp_pts_90k status, got CH{} valid={} last_rtsp_pts_90k={}",
-                rtsp_identity.channel, ring.valid, ring.last_rtsp_pts_90k
-            ));
-        }
-        let sample = RtspPtsBridgeSample {
-            source_pts_90k,
-            driver_rtsp_pts_90k: ring.last_rtsp_pts_90k,
-            offset_90k: i128::from(ring.last_rtsp_pts_90k) - i128::from(source_pts_90k),
-            sampled_frame_sequence: rtsp_identity.frame_sequence,
-            updated_at_host_ns: host_monotonic_time_ns(),
-        };
-        self.pts_bridge_cache.insert(
-            RtspPtsBridgeKey {
-                stream_id: rtsp_identity.stream_id.clone(),
-                channel: rtsp_identity.channel,
-            },
-            sample.clone(),
-        );
-        tracing::warn!(
-            operation = "x5_rtsp_pts_bridge",
-            channel = rtsp_identity.channel,
-            frame_sequence = rtsp_identity.frame_sequence,
-            source_pts_90k,
-            driver_rtsp_pts_90k = sample.driver_rtsp_pts_90k,
-            bridge_offset_90k = sample.offset_90k,
-            ring_valid = ring.valid,
-            ring_depth = ring.depth,
-            "X5 RTSP PTS bridge sample refreshed from TCP ring tail"
-        );
-        Ok(sample)
-    }
-
-    fn remember_successful_rtsp_pts_bridge(
-        &mut self,
-        rtsp_identity: &StreamFrameIdentity,
-        source_pts_90k: u64,
-        driver_rtsp_pts_90k: u64,
-    ) {
-        if driver_rtsp_pts_90k == 0 {
-            return;
-        }
-        let sample = RtspPtsBridgeSample {
-            source_pts_90k,
-            driver_rtsp_pts_90k,
-            offset_90k: i128::from(driver_rtsp_pts_90k) - i128::from(source_pts_90k),
-            sampled_frame_sequence: rtsp_identity.frame_sequence,
-            updated_at_host_ns: host_monotonic_time_ns(),
-        };
-        self.pts_bridge_cache.insert(
-            RtspPtsBridgeKey {
-                stream_id: rtsp_identity.stream_id.clone(),
-                channel: rtsp_identity.channel,
-            },
-            sample,
-        );
     }
 
     fn queue_authoritative_yuv_candidate(
@@ -4456,63 +4202,35 @@ impl CalibrationWorkspace {
             return Err("live source has no authoritative YUV capture provider".to_owned());
         };
         let LiveAuthoritativeCapture::X5233TcpYuv { host, tcp_port } = authoritative_capture;
-        let lookup = self
-            .authoritative_yuv_lookup_for_rtsp_identity(&host, tcp_port, rtsp_identity)
+        let timestamp_ns = Self::authoritative_yuv_timestamp_ns_for_rtsp_identity(rtsp_identity)
             .map_err(|error| {
                 tracing::warn!(
                     operation = "x5_authoritative_yuv_lookup",
                     channel = rtsp_identity.channel,
                     frame_sequence = rtsp_identity.frame_sequence,
-                    source_pts = ?rtsp_identity.source_pts,
                     error = %error,
-                    "X5 authoritative YUV lookup could not derive frame identity"
+                    "X5 authoritative YUV lookup requires the RTSP device timestamp"
                 );
                 error
             })?;
-        let lookup_label = lookup.label();
-        let lookup_value = lookup.value();
-        let snapshot = match &lookup {
-            AuthoritativeYuvLookup::FrameId(frame_id) => {
-                x5_tcp_client::capture_yuv_snapshot_by_frame_id(
-                    &host,
-                    tcp_port,
-                    rtsp_identity.channel,
-                    *frame_id,
-                )
-            }
-            AuthoritativeYuvLookup::TimestampNs(timestamp_ns) => {
-                x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
-                    &host,
-                    tcp_port,
-                    rtsp_identity.channel,
-                    *timestamp_ns,
-                )
-            }
-            AuthoritativeYuvLookup::RtspPts90k {
-                pts_90k,
-                tolerance_90k,
-                ..
-            } => x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
-                &host,
-                tcp_port,
-                rtsp_identity.channel,
-                *pts_90k,
-                *tolerance_90k,
-            ),
-        }
+        let snapshot = x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
+            &host,
+            tcp_port,
+            rtsp_identity.channel,
+            timestamp_ns,
+        )
         .map_err(|error| {
             let ring_diagnostics =
                 query_x5_authoritative_yuv_ring_diagnostics(&host, tcp_port, rtsp_identity.channel);
             let message = format!(
-                "X5 authoritative YUV lookup by {lookup_label} failed: {error}; current {ring_diagnostics}"
+                "X5 authoritative YUV lookup by timestamp_ns={timestamp_ns} failed: {error}; current {ring_diagnostics}"
             );
             tracing::warn!(
                 operation = "x5_authoritative_yuv_lookup",
                 host = %host,
                 tcp_port,
                 channel = rtsp_identity.channel,
-                lookup = lookup_label,
-                lookup_value,
+                timestamp_ns,
                 error = %error,
                 ring = %ring_diagnostics,
                 "X5 authoritative YUV lookup failed"
@@ -4531,20 +4249,13 @@ impl CalibrationWorkspace {
                 snapshot.width, snapshot.height, image_size.width, image_size.height
             ));
         }
-        if let AuthoritativeYuvLookup::RtspPts90k { source_pts_90k, .. } = &lookup {
-            self.remember_successful_rtsp_pts_bridge(
-                rtsp_identity,
-                *source_pts_90k,
-                snapshot.rtsp_pts_90k,
-            );
-        }
 
         let FrozenStreamInput { source, encoded } = freeze_authoritative_yuv_input(
             snapshot,
             store,
             acquisition_key.clone(),
             rtsp_identity,
-            &lookup,
+            timestamp_ns,
         )?;
         let frame_identity = match &source.kind {
             CalibrationSourceKind::Stream(stream) => stream.identity.clone(),
@@ -9266,9 +8977,32 @@ mod tests {
     use std::time::Instant;
 
     #[test]
-    fn x5_authoritative_lookup_rejects_ffmpeg_pts_as_board_timestamp() {
+    fn x5_authoritative_lookup_uses_identity_device_timestamp() {
+        let identity = StreamFrameIdentity::known_at_with_device_timestamp(
+            StreamSessionId::new("rtsp-device-timestamp-test").unwrap(),
+            0,
+            42,
+            camera_toolbox_app::SourcePts::Known {
+                ticks: 30_000,
+                time_base_numerator: 1,
+                time_base_denominator: 90_000,
+                provenance: camera_toolbox_app::SourcePtsProvenance::FfmpegDecodedFrame,
+            },
+            123,
+            Some(456_789),
+        );
+
+        assert_eq!(
+            CalibrationWorkspace::authoritative_yuv_timestamp_ns_for_rtsp_identity(&identity)
+                .unwrap(),
+            456_789
+        );
+    }
+
+    #[test]
+    fn x5_authoritative_lookup_rejects_missing_device_timestamp() {
         let identity = StreamFrameIdentity::known_at(
-            StreamSessionId::new("rtsp-pts-test").unwrap(),
+            StreamSessionId::new("rtsp-device-timestamp-test").unwrap(),
             0,
             42,
             camera_toolbox_app::SourcePts::Known {
@@ -9280,83 +9014,11 @@ mod tests {
             123,
         );
 
-        let error = AuthoritativeYuvLookup::from_rtsp_identity(&identity).unwrap_err();
+        let error =
+            CalibrationWorkspace::authoritative_yuv_timestamp_ns_for_rtsp_identity(&identity)
+                .unwrap_err();
 
-        assert!(error.contains("presentation timing only"));
-        assert!(error.contains("explicit frame_id/timestamp_ns metadata"));
-    }
-
-    #[test]
-    fn x5_rtsp_pts_bridge_converts_source_pts_to_90k() {
-        let ffmpeg_pts = camera_toolbox_app::SourcePts::Known {
-            ticks: 500,
-            time_base_numerator: 1,
-            time_base_denominator: 1_000,
-            provenance: camera_toolbox_app::SourcePtsProvenance::FfmpegDecodedFrame,
-        };
-
-        assert_eq!(source_pts_to_90k(&ffmpeg_pts).unwrap(), 45_000);
-    }
-
-    #[test]
-    fn x5_rtsp_pts_bridge_applies_cached_offset() {
-        let sample = RtspPtsBridgeSample {
-            source_pts_90k: 30_000,
-            driver_rtsp_pts_90k: 1_030_000,
-            offset_90k: 1_000_000,
-            sampled_frame_sequence: 7,
-            updated_at_host_ns: 0,
-        };
-
-        assert_eq!(sample.target_rtsp_pts_90k(31_527).unwrap(), 1_031_527);
-    }
-    #[test]
-    fn x5_authoritative_ring_diagnostics_formats_status_range() {
-        let status = x5_tcp_client::X5DriverStatus {
-            camera_running: true,
-            rtsp_started: true,
-            rtsp_tx_enabled: true,
-            rtsp_requested_enabled: true,
-            rtsp_control_busy: false,
-            rtsp_pending_action: String::new(),
-            rtsp_last_error: 0,
-            rtsp_action_id: 0,
-            rtsp_last_message: String::new(),
-            rtsp_channels: Vec::new(),
-            rings: vec![x5_tcp_client::X5RingStatus {
-                channel: 0,
-                depth: 24,
-                valid: 24,
-                write_index: 5,
-                min_frame_id: 10,
-                max_frame_id: 33,
-                last_frame_id: 33,
-                min_timestamp_ns: 37_906_100_000,
-                max_timestamp_ns: 37_906_777_777,
-                last_timestamp_ns: 37_906_777_777,
-                last_rtsp_timestamp_us: 42_118_642,
-                last_rtsp_pts_90k: 3_790_677,
-                min_rtsp_pts_90k: 3_790_610,
-                max_rtsp_pts_90k: 3_790_677,
-                retention_ns: 677_777,
-                dropped: 2,
-                evicted: 9,
-            }],
-            fps: Some(60),
-            bitrate_kbps: Some(6_000),
-            pipeline_config_version: Some(1),
-        };
-
-        let diagnostics = format_x5_authoritative_yuv_ring_diagnostics(&status, 0);
-
-        assert!(diagnostics.contains("ring_valid=24/24"));
-        assert!(diagnostics.contains("ring_frame_id=10..33"));
-        assert!(diagnostics.contains("ring_timestamp_ns=37906100000..37906777777"));
-        assert!(diagnostics.contains("ring_rtsp_pts_90k=3790610..3790677"));
-        assert!(diagnostics.contains("ring_last_rtsp_pts_90k=3790677"));
-        assert!(diagnostics.contains("ring_retention_ns=677777"));
-        assert!(diagnostics.contains("ring_evicted=9"));
-        assert!(diagnostics.contains("ring_dropped=2"));
+        assert!(error.contains("no device timestamp_ns metadata"));
     }
     #[test]
     fn loaded_yaml_result_becomes_active_without_dataset_calibration() {

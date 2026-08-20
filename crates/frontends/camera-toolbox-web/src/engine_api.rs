@@ -134,8 +134,17 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
         | DataPacket::Json(value) => (**value).clone(),
         DataPacket::Score(score) => json!({
             "type": "capture.score",
-            "gain": score.gain,
+            "score": score.score,
             "frameSequence": score.frame_identity.frame_sequence,
+        }),
+        DataPacket::CaptureSignal(signal) => json!({
+            "type": "capture.signal",
+            "accepted": signal.accepted,
+            "frameSequence": signal.frame_identity.frame_sequence,
+        }),
+        DataPacket::CaptureTrigger(trigger) => json!({
+            "type": "capture.trigger",
+            "frameSequence": trigger.frame_identity.frame_sequence,
         }),
         DataPacket::CaptureRequest(request) => json!({
             "type": "command.capture.request.v1",
@@ -146,25 +155,37 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
     }
 }
 
-pub(crate) fn parse_action_str(action: &str) -> Result<NodeAction, String> {
+pub(crate) fn parse_action_str(
+    action: &str,
+    payload: serde_json::Value,
+) -> Result<NodeAction, String> {
     match action {
         "connect" => Ok(NodeAction::Connect),
         "disconnect" => Ok(NodeAction::Disconnect),
         "trigger" => Ok(NodeAction::Trigger),
         "arm" => Ok(NodeAction::Arm),
         "disarm" => Ok(NodeAction::Disarm),
-        "clear"
+        "accept"
+        | "reject"
+        | "enable"
+        | "disable"
+        | "delete"
+        | "clear"
         | "probe"
         | "status"
         | "capture_yuv"
         | "capture_raw"
+        | "open_rtsp_ch0"
+        | "open_rtsp_ch3"
+        | "open_rtsp_all"
+        | "close_rtsp"
         | "initialize_api_control"
         | "calibrate"
         | "clear_parking_stop"
         | "zero_current"
         | "send_joint_positions" => Ok(NodeAction::Custom {
             name: action.to_owned(),
-            payload: serde_json::Value::Null,
+            payload,
         }),
         other => Err(format!("unknown action `{other}`")),
     }
@@ -258,18 +279,34 @@ mod tests {
     }
 
     #[test]
-    fn clear_action_maps_to_dataset_custom_action() {
+    fn clear_action_maps_to_dataset_custom_action_with_null_payload() {
         assert!(matches!(
-            parse_action_str("clear"),
-            Ok(NodeAction::Custom { ref name, .. }) if name == "clear"
+            parse_action_str("clear", serde_json::Value::Null),
+            Ok(NodeAction::Custom { ref name, payload: serde_json::Value::Null }) if name == "clear"
         ));
     }
 
     #[test]
-    fn hex_arm_actions_map_to_explicit_custom_actions() {
+    fn dataset_row_actions_preserve_sample_id_payload() {
+        let payload = serde_json::json!({ "sampleId": "sample-1" });
+        for action in ["accept", "reject", "enable", "disable", "delete"] {
+            assert!(matches!(
+                parse_action_str(action, payload.clone()),
+                Ok(NodeAction::Custom { name, payload: actual })
+                    if name == action && actual == payload
+            ));
+        }
+    }
+
+    #[test]
+    fn custom_control_actions_map_to_explicit_custom_actions() {
         for action in [
             "probe",
             "status",
+            "open_rtsp_ch0",
+            "open_rtsp_ch3",
+            "open_rtsp_all",
+            "close_rtsp",
             "initialize_api_control",
             "calibrate",
             "clear_parking_stop",
@@ -277,7 +314,7 @@ mod tests {
             "send_joint_positions",
         ] {
             assert!(matches!(
-                parse_action_str(action),
+                parse_action_str(action, serde_json::Value::Null),
                 Ok(NodeAction::Custom { name, .. }) if name == action
             ));
         }

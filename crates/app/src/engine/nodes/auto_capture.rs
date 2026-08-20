@@ -1,14 +1,7 @@
-//! 自动采集控制器节点：条件自动触发的节点（范式样板）。
+//! 自动采集控制器节点：显式布防的触发透传门。
 //!
-//! `Arm` 后进入待命状态；收到评分输入且超过阈值时自动输出抓帧命令。
-//! 这是「arm/disarm + 条件自动触发」的完整样板。
-
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
-
-use serde_json::json;
+//! 阈值和连续保持分别由专用节点完成；本节点只保留 UI 所需的 Arm/Disarm
+//! 语义，布防时原样转发同一份 [`crate::engine::CaptureTrigger`]，不重建帧身份。
 
 use crate::engine::{
     DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState,
@@ -22,19 +15,13 @@ impl NodeFactory for AutoCaptureFactory {
         "autoCaptureController"
     }
 
-    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(AutoCaptureNode {
-            spec,
-            armed: false,
-            last_capture_at: None,
-        }))
+    fn instantiate(&self, _spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+        Ok(Box::new(AutoCaptureNode { armed: false }))
     }
 }
 
 pub struct AutoCaptureNode {
-    spec: NodeSpec,
     armed: bool,
-    last_capture_at: Option<Instant>,
 }
 
 impl NodeInstance for AutoCaptureNode {
@@ -43,7 +30,7 @@ impl NodeInstance for AutoCaptureNode {
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Ready, "arm to enable auto-capture");
+        rt.report_state(NodeRuntimeState::Ready, "arm to forward capture triggers");
         Ok(())
     }
 
@@ -53,38 +40,19 @@ impl NodeInstance for AutoCaptureNode {
         packet: DataPacket,
         rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
-        if port != "score" || !self.armed {
+        if port != "trigger" || !self.armed {
             return Ok(());
         }
-        let DataPacket::Score(score) = packet else {
+        let DataPacket::CaptureTrigger(trigger) = &packet else {
             return Err(NodeError::Precondition(
-                "autoCaptureController.score requires capture.score".to_owned(),
+                "autoCaptureController.trigger requires capture.trigger".to_owned(),
             ));
         };
-        let gain = score.gain;
-        let threshold = config_f64(&self.spec, "triggerThreshold", 0.5);
-        if gain < threshold {
-            return Ok(());
-        }
-        let cooldown = Duration::from_millis(config_u64(&self.spec, "cooldownMs", 800));
-        if self
-            .last_capture_at
-            .is_some_and(|last| last.elapsed() < cooldown)
-        {
-            return Ok(());
-        }
-        rt.emit(
-            "command",
-            DataPacket::Json(Arc::new(json!({
-                "action": "capture",
-                "reason": "score-gain",
-                "gain": gain,
-            }))),
-        )?;
-        self.last_capture_at = Some(Instant::now());
         rt.report_event(format!(
-            "auto-capture triggered (gain {gain:.3} ≥ {threshold})"
+            "armed capture trigger forwarded for frame {}",
+            trigger.frame_identity.frame_sequence
         ));
+        rt.emit("trigger", packet)?;
         Ok(())
     }
 
@@ -92,13 +60,11 @@ impl NodeInstance for AutoCaptureNode {
         match action {
             NodeAction::Arm => {
                 self.armed = true;
-                self.last_capture_at = None;
                 rt.report_state(NodeRuntimeState::Running, "armed");
                 Ok(())
             }
             NodeAction::Disarm => {
                 self.armed = false;
-                self.last_capture_at = None;
                 rt.report_state(NodeRuntimeState::Idle, "disarmed");
                 Ok(())
             }
@@ -108,24 +74,9 @@ impl NodeInstance for AutoCaptureNode {
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         self.armed = false;
-        self.last_capture_at = None;
         rt.report_state(NodeRuntimeState::Idle, "stopped");
         Ok(())
     }
-}
-
-fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
-    spec.config
-        .get(key)
-        .and_then(serde_json::Value::as_f64)
-        .unwrap_or(fallback)
-}
-
-fn config_u64(spec: &NodeSpec, key: &str, fallback: u64) -> u64 {
-    spec.config
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(fallback)
 }
 
 #[cfg(test)]
@@ -135,48 +86,74 @@ mod tests {
     use super::*;
     use crate::{
         engine::{
-            GainScore, ImageFrameIdentity, NodeReporter, OutputRegistry, PortCardinality, PortSpec,
-            SpawnContext,
+            CaptureTrigger, ImageFrameIdentity, NodeReporter, OutputRegistry, PortCardinality,
+            PortSpec, SpawnContext,
         },
-        platform::{StreamFrameIdentity, StreamSessionId},
+        platform::{SourcePts, SourcePtsProvenance, StreamFrameIdentity, StreamSessionId},
     };
+
     fn spec() -> NodeSpec {
         NodeSpec {
             id: "auto-1".to_owned(),
             kind: "autoCaptureController".to_owned(),
-            title: "Auto Capture".to_owned(),
+            title: "Arm Gate".to_owned(),
             inputs: vec![PortSpec {
-                id: "score".to_owned(),
-                label: "Score".to_owned(),
-                kind: "capture.score".to_owned(),
+                id: "trigger".to_owned(),
+                label: "Trigger".to_owned(),
+                kind: "capture.trigger".to_owned(),
                 cardinality: PortCardinality::One,
                 required: false,
             }],
             outputs: vec![PortSpec {
-                id: "command".to_owned(),
-                label: "Command".to_owned(),
-                kind: "capture.command".to_owned(),
+                id: "trigger".to_owned(),
+                label: "Trigger".to_owned(),
+                kind: "capture.trigger".to_owned(),
                 cardinality: PortCardinality::One,
                 required: false,
             }],
-            config: serde_json::json!({"triggerThreshold": 0.5}),
+            config: serde_json::json!({}),
         }
     }
 
+    fn identity(sequence: u64) -> ImageFrameIdentity {
+        ImageFrameIdentity::from(&StreamFrameIdentity::known_at(
+            StreamSessionId::new("auto-capture-test").expect("valid stream id"),
+            0,
+            sequence,
+            SourcePts::Known {
+                ticks: sequence as i64 * 3_000,
+                time_base_numerator: 1,
+                time_base_denominator: 90_000,
+                provenance: SourcePtsProvenance::FfmpegDecodedFrame,
+            },
+            sequence * 1_000,
+        ))
+    }
+
+    fn trigger(sequence: u64) -> DataPacket {
+        DataPacket::CaptureTrigger(Arc::new(CaptureTrigger {
+            frame_identity: identity(sequence),
+        }))
+    }
+
     fn runtime(
-        state_tx: mpsc::Sender<crate::engine::NodeStatusReport>,
-    ) -> (NodeRuntime, OutputRegistry) {
+        record: Arc<Mutex<Vec<DataPacket>>>,
+    ) -> (NodeRuntime, mpsc::Receiver<crate::engine::NodeStatusReport>) {
+        let (state_tx, state_rx) = mpsc::channel();
         let (event_tx, _event_rx) = mpsc::channel();
         let reporter = NodeReporter::new("auto-1".to_owned(), state_tx, event_tx);
-        let outputs = OutputRegistry::default();
+        let mut outputs = OutputRegistry::default();
+        outputs.set_record(Arc::new(move |packet| {
+            record.lock().expect("record lock").push(packet)
+        }));
         let ctx = SpawnContext {
-            outputs: outputs.clone(),
+            outputs,
             reporter,
             services: Arc::new(crate::engine::EngineServices::default()),
             cancel: Arc::new(AtomicBool::new(false)),
             viewer_slot: None,
         };
-        (NodeRuntime::new(ctx), outputs)
+        (NodeRuntime::new(ctx), state_rx)
     }
 
     fn last_state(
@@ -189,19 +166,6 @@ mod tests {
         last
     }
 
-    fn score(gain: f64) -> DataPacket {
-        let stream_identity = StreamFrameIdentity::unavailable(
-            StreamSessionId::new("auto-capture-test").expect("valid session id"),
-            0,
-            0,
-            "test identity".to_owned(),
-        );
-        DataPacket::Score(Arc::new(GainScore {
-            gain,
-            frame_identity: ImageFrameIdentity::from(&stream_identity),
-        }))
-    }
-
     #[test]
     fn factory_instantiates_with_expected_kind() {
         assert_eq!(AutoCaptureFactory.kind(), "autoCaptureController");
@@ -211,101 +175,66 @@ mod tests {
 
     #[test]
     fn on_start_reports_ready() {
-        let (state_tx, state_rx) = mpsc::channel();
-        let (mut rt, _outputs) = runtime(state_tx);
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, state_rx) = runtime(record);
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
         node.on_start(&mut rt).expect("on_start");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Ready));
     }
 
     #[test]
-    fn score_ignored_until_armed() {
-        let (state_tx, _state_rx) = mpsc::channel();
-        let mut outputs = OutputRegistry::default();
-        let emitted: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-        let sink = Arc::clone(&emitted);
-        outputs.set_record(Arc::new(move |_| *sink.lock().unwrap() += 1));
-        let (event_tx, _event_rx) = mpsc::channel();
-        let reporter = NodeReporter::new("auto-1".to_owned(), state_tx, event_tx);
-        let ctx = SpawnContext {
-            outputs: outputs.clone(),
-            reporter,
-            services: Arc::new(crate::engine::EngineServices::default()),
-            cancel: Arc::new(AtomicBool::new(false)),
-            viewer_slot: None,
-        };
-        let mut rt = NodeRuntime::new(ctx);
-
+    fn trigger_is_ignored_until_armed() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, _state_rx) = runtime(Arc::clone(&record));
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
-        // 未 arm，即使 gain 超标也不触发
-        node.on_input("score", score(0.9), &mut rt)
-            .expect("on_input");
-        assert_eq!(*emitted.lock().unwrap(), 0);
+
+        node.on_input("trigger", trigger(9), &mut rt)
+            .expect("unarmed trigger is ignored");
+        assert!(record.lock().expect("record lock").is_empty());
     }
 
     #[test]
-    fn arm_then_score_above_threshold_emits_command() {
-        let (state_tx, state_rx) = mpsc::channel();
-        let mut outputs = OutputRegistry::default();
-        let commands: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&commands);
-        outputs.set_record(Arc::new(move |packet| {
-            if let DataPacket::Json(value) = packet {
-                sink.lock().unwrap().push((*value).clone());
-            }
-        }));
-        let (event_tx, _event_rx) = mpsc::channel();
-        let reporter = NodeReporter::new("auto-1".to_owned(), state_tx, event_tx);
-        let ctx = SpawnContext {
-            outputs: outputs.clone(),
-            reporter,
-            services: Arc::new(crate::engine::EngineServices::default()),
-            cancel: Arc::new(AtomicBool::new(false)),
-            viewer_slot: None,
-        };
-        let mut rt = NodeRuntime::new(ctx);
-
+    fn armed_trigger_is_forwarded_without_identity_change() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, state_rx) = runtime(Arc::clone(&record));
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
         node.on_action(NodeAction::Arm, &mut rt).expect("arm");
         assert_eq!(last_state(&state_rx), Some(NodeRuntimeState::Running));
 
-        node.on_input("score", score(0.8), &mut rt)
-            .expect("on_input");
-        let commands = commands.lock().unwrap().clone();
-        assert_eq!(commands.len(), 1);
-        assert_eq!(commands[0]["action"], "capture");
-        assert_eq!(commands[0]["gain"], 0.8);
+        node.on_input("trigger", trigger(9), &mut rt)
+            .expect("forward trigger");
+        let output = record
+            .lock()
+            .expect("record lock")
+            .pop()
+            .expect("forwarded trigger");
+        let DataPacket::CaptureTrigger(trigger) = output else {
+            panic!("expected capture trigger");
+        };
+        assert_eq!(trigger.frame_identity, identity(9));
     }
 
     #[test]
-    fn score_below_threshold_does_not_emit() {
-        let (state_tx, _state_rx) = mpsc::channel();
-        let mut outputs = OutputRegistry::default();
-        let emitted: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-        let sink = Arc::clone(&emitted);
-        outputs.set_record(Arc::new(move |_| *sink.lock().unwrap() += 1));
-        let (event_tx, _event_rx) = mpsc::channel();
-        let reporter = NodeReporter::new("auto-1".to_owned(), state_tx, event_tx);
-        let ctx = SpawnContext {
-            outputs: outputs.clone(),
-            reporter,
-            services: Arc::new(crate::engine::EngineServices::default()),
-            cancel: Arc::new(AtomicBool::new(false)),
-            viewer_slot: None,
-        };
-        let mut rt = NodeRuntime::new(ctx);
-
+    fn armed_gate_rejects_non_trigger_packet() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, _state_rx) = runtime(record);
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
         node.on_action(NodeAction::Arm, &mut rt).expect("arm");
-        node.on_input("score", score(0.1), &mut rt)
-            .expect("on_input");
-        assert_eq!(*emitted.lock().unwrap(), 0);
+
+        assert!(matches!(
+            node.on_input(
+                "trigger",
+                DataPacket::Json(Arc::new(serde_json::json!({}))),
+                &mut rt,
+            ),
+            Err(NodeError::Precondition(_))
+        ));
     }
 
     #[test]
     fn disarm_and_stop_report_idle() {
-        let (state_tx, state_rx) = mpsc::channel();
-        let (mut rt, _outputs) = runtime(state_tx);
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, state_rx) = runtime(record);
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
 
         node.on_action(NodeAction::Arm, &mut rt).expect("arm");
@@ -319,8 +248,8 @@ mod tests {
 
     #[test]
     fn unsupported_action_is_error() {
-        let (state_tx, _state_rx) = mpsc::channel();
-        let (mut rt, _outputs) = runtime(state_tx);
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let (mut rt, _state_rx) = runtime(record);
         let mut node = AutoCaptureFactory.instantiate(spec()).expect("instantiate");
         let err = node
             .on_action(NodeAction::Trigger, &mut rt)

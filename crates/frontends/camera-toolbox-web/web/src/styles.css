@@ -1263,6 +1263,166 @@ button:disabled {
   color: #fecaca;
 }
 
+/* Dataset Collector 采用文件浏览器式样本行；专用宽度为来源、状态、评分和审核动作留出空间。 */
+.workflow-node-shell.dataset-collector-node-shell,
+.workflow-node.dataset-collector-node {
+  inline-size: 304px;
+  max-inline-size: 304px;
+}
+
+.dataset-browser {
+  display: grid;
+  gap: 0.28rem;
+  min-width: 0;
+  border-top: 1px solid rgba(148, 163, 184, 0.1);
+  padding-top: 0.35rem;
+}
+
+.dataset-browser-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.35rem;
+  color: #cbd5e1;
+  font-size: 0.68rem;
+}
+
+.dataset-browser-header span {
+  color: #94a3b8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.62rem;
+}
+
+.dataset-sample-list {
+  display: grid;
+  max-block-size: 184px;
+  gap: 0.14rem;
+  margin: 0;
+  overflow: auto;
+  padding: 0;
+  list-style: none;
+}
+
+.dataset-sample-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 0.36rem;
+  min-width: 0;
+  border: 1px solid rgba(51, 65, 85, 0.72);
+  background: rgba(15, 23, 42, 0.46);
+  padding: 0.22rem 0.28rem;
+}
+
+.dataset-sample-row:hover {
+  border-color: rgba(125, 211, 252, 0.36);
+  background: rgba(30, 41, 59, 0.54);
+}
+
+.dataset-sample-main {
+  display: grid;
+  min-width: 0;
+  gap: 0.12rem;
+}
+
+.dataset-sample-source,
+.dataset-sample-meta,
+.dataset-sample-actions {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.dataset-sample-source {
+  gap: 0.24rem;
+}
+
+.dataset-sample-icon {
+  flex: 0 0 auto;
+  color: #64748b;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.64rem;
+}
+
+.dataset-sample-name {
+  min-width: 0;
+  overflow: hidden;
+  color: #dbeafe;
+  font-size: 0.66rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dataset-sample-meta {
+  flex-wrap: wrap;
+  gap: 0.18rem 0.3rem;
+  color: #94a3b8;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.58rem;
+}
+
+.dataset-sample-status {
+  border: 1px solid transparent;
+  border-radius: 999px;
+  padding: 0.02rem 0.24rem;
+}
+
+.dataset-sample-status.accepted {
+  border-color: rgba(74, 222, 128, 0.42);
+  color: #86efac;
+}
+
+.dataset-sample-status.rejected {
+  border-color: rgba(248, 113, 113, 0.42);
+  color: #fca5a5;
+}
+
+.dataset-sample-status.disabled {
+  border-color: rgba(148, 163, 184, 0.4);
+  color: #cbd5e1;
+}
+
+.dataset-sample-status.pending {
+  border-color: rgba(251, 191, 36, 0.42);
+  color: #fde68a;
+}
+
+.dataset-sample-score {
+  color: #fda4af;
+}
+
+.dataset-sample-detail {
+  overflow: hidden;
+  color: #64748b;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dataset-sample-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 0.14rem;
+  max-inline-size: 5.55rem;
+}
+
+.dataset-sample-actions button {
+  min-width: 0;
+  padding: 0.1rem 0.2rem;
+  font-size: 0.58rem;
+  line-height: 1.15;
+}
+
+.dataset-sample-actions .dataset-sample-delete {
+  color: #fecaca;
+}
+
+.dataset-browser-empty {
+  margin: 0;
+  color: #64748b;
+  font-size: 0.63rem;
+  line-height: 1.35;
+}
+
 /* 节点内触发按钮：按钮过多时换行，不能把节点横向撑开。 */
 .node-actions {
   display: flex;

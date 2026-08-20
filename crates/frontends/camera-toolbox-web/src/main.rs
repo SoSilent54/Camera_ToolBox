@@ -379,11 +379,6 @@ impl X5ControlClient for ControlRuntime {
                     timestamp_ns,
                 )
             }
-            (CaptureTarget::Yuv { channel }, CaptureMode::RtspPts90k { pts, tolerance }) => {
-                x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
-                    host, port, channel, pts, tolerance,
-                )
-            }
             (CaptureTarget::Raw { camera }, CaptureMode::Latest) => {
                 let snapshot = x5_tcp_client::capture_raw_snapshot(host, port, camera, 3_000)?;
                 return Ok(X5233CapturePayload::BayerRaw {
@@ -413,8 +408,6 @@ impl X5ControlClient for ControlRuntime {
             uv_len: snapshot.uv_len,
             frame_id: snapshot.frame_id,
             timestamp_ns: snapshot.timestamp_ns,
-            rtsp_pts_90k: snapshot.rtsp_pts_90k,
-            match_rtsp_pts_delta_90k: snapshot.match_rtsp_pts_delta_90k,
             payload: Arc::from(snapshot.payload),
         })
     }
@@ -768,9 +761,6 @@ fn x5_rtsp_channel_response(channel: &x5_tcp_client::X5RtspChannelStatus) -> Val
         "actionId": channel.action_id,
         "lastMessage": channel.last_message,
         "port": channel.port,
-        "rtspPtsValid": channel.rtsp_pts_valid,
-        "rtspPtsOrigin90k": channel.rtsp_pts_origin_90k,
-        "rtspPtsLast90k": channel.rtsp_pts_last_90k,
         "path": channel.path,
     })
 }
@@ -787,10 +777,6 @@ fn x5_ring_response(ring: &x5_tcp_client::X5RingStatus) -> Value {
         "minTimestampNs": ring.min_timestamp_ns,
         "maxTimestampNs": ring.max_timestamp_ns,
         "lastTimestampNs": ring.last_timestamp_ns,
-        "lastRtspTimestampUs": ring.last_rtsp_timestamp_us,
-        "lastRtspPts90k": ring.last_rtsp_pts_90k,
-        "minRtspPts90k": ring.min_rtsp_pts_90k,
-        "maxRtspPts90k": ring.max_rtsp_pts_90k,
         "retentionNs": ring.retention_ns,
         "dropped": ring.dropped,
         "evicted": ring.evicted,
@@ -861,10 +847,6 @@ fn x5_snapshot_response(snapshot: &x5_tcp_client::X5YuvSnapshot) -> Value {
         "payloadBytes": snapshot.payload.len(),
         "frameId": snapshot.frame_id,
         "timestampNs": snapshot.timestamp_ns,
-        "rtspTimestampUs": snapshot.rtsp_timestamp_us,
-        "rtspPts90k": snapshot.rtsp_pts_90k,
-        "matchRtspPtsDelta90k": snapshot.match_rtsp_pts_delta_90k,
-        "matchMode": snapshot.match_mode,
     })
 }
 
@@ -901,27 +883,11 @@ fn ssh_target_from_binding(
             "ssh.username must be a non-empty printable username",
         ));
     }
-    // 必须 pin 服务端 host key，拒绝「接受任意密钥」路径，消除 MITM 风险。
-    let expected_host_key = binding
-        .expected_host_key
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            PreviewApiError::bad_request(
-                "ssh.expectedHostKey must be pinned to the server's OpenSSH public key",
-            )
-        })?;
-    if expected_host_key.chars().any(char::is_control) {
-        return Err(PreviewApiError::bad_request(
-            "ssh.expectedHostKey must not contain control characters",
-        ));
-    }
     Ok(SshConnectionTarget {
         host: binding.host.trim().to_owned(),
         port: binding.port,
         username: binding.username.trim().to_owned(),
-        expected_host_key: Some(expected_host_key.to_owned()),
+        expected_host_key: None,
         command_subsystem: None,
         remote_event_subsystem: None,
     })
@@ -935,11 +901,9 @@ fn validate_credential_ref(reference: &str) -> std::result::Result<String, Previ
             "ssh.credentialRef must be a non-empty credential reference",
         ));
     }
-    // 新建的 SSH / I²C / EEPROM 节点仅由 password 注册端点产生 session 引用；保留
-    // key-file 解析以兼容现有 SFTP 工作流，避免把该兼容路径重新暴露到这些节点的 UI。
-    if !reference.starts_with("session:") && !reference.starts_with("key-file:/") {
+    if !reference.starts_with("session:") || reference.len() == "session:".len() {
         return Err(PreviewApiError::bad_request(
-            "ssh.credentialRef must use session:<node-id> or key-file:/absolute/path",
+            "ssh.credentialRef must use session:<node-id>",
         ));
     }
     Ok(reference.to_owned())
@@ -1104,10 +1068,6 @@ struct SshExecutionBinding {
     #[serde(default = "default_ssh_username")]
     username: String,
     credential_ref: String,
-    /// 显式 pin 的服务端 host key（OpenSSH public key 字符串）。缺失时拒绝执行，
-    /// 避免无条件接受任意服务器密钥（MITM 防护）。
-    #[serde(default)]
-    expected_host_key: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1194,7 +1154,6 @@ enum X5SnapshotMode {
     Latest,
     FrameId,
     TimestampNs,
-    RtspPts90k,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1208,10 +1167,6 @@ struct X5SnapshotRequest {
     frame_id: Option<u64>,
     #[serde(default)]
     timestamp_ns: Option<u64>,
-    #[serde(default)]
-    rtsp_pts_90k: Option<u64>,
-    #[serde(default)]
-    rtsp_pts_tolerance_90k: Option<u64>,
 }
 #[cfg(feature = "calibration-opencv")]
 #[derive(Debug, Deserialize)]
@@ -1698,18 +1653,6 @@ pub(crate) fn control_dispatch(
                         port,
                         req.channel,
                         timestamp_ns,
-                    )
-                }
-                X5SnapshotMode::RtspPts90k => {
-                    let rtsp_pts_90k = req
-                        .rtsp_pts_90k
-                        .ok_or_else(|| "X5 rtsp_pts_90k snapshot requires rtspPts90k".to_owned())?;
-                    x5_tcp_client::capture_yuv_snapshot_by_rtsp_pts_90k(
-                        &host,
-                        port,
-                        req.channel,
-                        rtsp_pts_90k,
-                        req.rtsp_pts_tolerance_90k.unwrap_or(0),
                     )
                 }
             }
@@ -2207,10 +2150,7 @@ mod tests {
             host: "camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            credential_ref: "key-file:/tmp/test-key".to_owned(),
-            // 与 MemorySshTransport::new("host-key") 的 actual_host_key 对齐，
-            // 验证 host key 已从请求绑定透传而非无条件接受。
-            expected_host_key: Some("host-key".to_owned()),
+            credential_ref: "session:test-key".to_owned(),
         }
     }
 
@@ -2220,8 +2160,7 @@ mod tests {
             "host": "camera.local",
             "port": 22,
             "username": "root",
-            "credentialRef": "key-file:/tmp/test-key",
-            "expectedHostKey": "host-key",
+            "credentialRef": "session:test-key",
         })
     }
 
@@ -2249,7 +2188,7 @@ mod tests {
 
     #[cfg(feature = "platform-ssh")]
     fn eeprom_state(memory: &Arc<MemorySshTransport>) -> AppState {
-        memory.allow_credential("key-file:/tmp/test-key");
+        memory.allow_credential("session:test-key");
         let resolver: Arc<dyn CredentialResolver> = memory.clone();
         let transport: Arc<dyn SshTransportFactory> = memory.clone();
         AppState {
@@ -2296,28 +2235,24 @@ mod tests {
     }
 
     #[test]
-    fn x5_snapshot_response_exposes_metadata_without_payload() {
+    fn x5_snapshot_response_exposes_exact_frame_identity_only() {
         let snapshot = x5_tcp_client::X5YuvSnapshot {
             channel: 3,
             width: 1920,
             height: 1080,
-            y_len: 1,
-            uv_len: 1,
-            frame_id: 42,
+            y_len: 2,
+            uv_len: 0,
+            frame_id: 77,
             timestamp_ns: 7_654_321,
-            rtsp_timestamp_us: 123_456,
-            rtsp_pts_90k: 456_789,
-            match_rtsp_pts_delta_90k: Some(0),
-            match_mode: Some("rtsp_pts_90k".to_owned()),
             payload: vec![0x11, 0x22],
         };
 
         let value = x5_snapshot_response(&snapshot);
 
         assert_eq!(value["channel"], 3);
-        assert_eq!(value["pixelFormat"], "nv12");
+        assert_eq!(value["frameId"], 77);
+        assert_eq!(value["timestampNs"], 7_654_321);
         assert_eq!(value["payloadBytes"], 2);
-        assert_eq!(value["matchMode"], "rtsp_pts_90k");
         assert!(value.get("payload").is_none());
     }
 
@@ -2546,46 +2481,27 @@ mod tests {
 
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn ssh_target_requires_pinned_host_key() {
-        // 缺失 expectedHostKey 必须拒绝，不再无条件接受任意服务器密钥。
-        let missing = SshExecutionBinding {
+    fn ssh_target_uses_password_session_without_host_key_pin() {
+        let binding = SshExecutionBinding {
             host: "camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            credential_ref: "key-file:/tmp/k".to_owned(),
-            expected_host_key: None,
+            credential_ref: "session:test".to_owned(),
         };
-        let error =
-            ssh_target_from_binding(&missing).expect_err("missing host key must be rejected");
-        assert!(error.error.contains("expectedHostKey"));
-
-        // 提供空字符串同样拒绝（trim 后为空）。
-        let empty = SshExecutionBinding {
-            expected_host_key: Some("  ".to_owned()),
-            ..missing
-        };
-        let error = ssh_target_from_binding(&empty).expect_err("blank host key must be rejected");
-        assert!(error.error.contains("expectedHostKey"));
-
-        // 合法的 pin 透传到 target。
-        let pinned = SshExecutionBinding {
-            expected_host_key: Some("ssh-ed25519 AAAA".to_owned()),
-            ..empty
-        };
-        let target = ssh_target_from_binding(&pinned).expect("pinned host key accepted");
-        assert_eq!(
-            target.expected_host_key.as_deref(),
-            Some("ssh-ed25519 AAAA")
-        );
+        let target = ssh_target_from_binding(&binding).expect("password SSH target accepted");
+        assert_eq!(target.host, "camera.local");
+        assert_eq!(target.port, 22);
+        assert_eq!(target.username, "root");
+        assert!(target.expected_host_key.is_none());
     }
 
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn credential_ref_accepts_session_or_legacy_sftp_key_reference() {
+    fn credential_ref_accepts_only_password_session_reference() {
         assert!(validate_credential_ref("session:test").is_ok());
         assert!(validate_credential_ref("password:secret").is_err());
-        assert!(validate_credential_ref("key-file:/tmp/id_ed25519").is_ok());
-        assert!(validate_credential_ref("key-file:/tmp/id\ninjected").is_err());
+        assert!(validate_credential_ref("key-file:/tmp/id_ed25519").is_err());
+        assert!(validate_credential_ref("session:").is_err());
     }
 
     #[cfg(feature = "platform-ssh")]

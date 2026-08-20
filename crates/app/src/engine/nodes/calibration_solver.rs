@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
-    ChessboardDetection, InitialIntrinsics,
+    InitialIntrinsics,
 };
 
 use crate::{
@@ -17,6 +17,8 @@ use crate::{
     },
     ports::CalibrationCancellation,
 };
+
+use super::composite::{CalibrationDataset, parse_calibration_dataset};
 
 pub struct CalibrationSolverFactory;
 
@@ -35,7 +37,7 @@ impl NodeFactory for CalibrationSolverFactory {
 
 pub struct CalibrationSolverNode {
     spec: NodeSpec,
-    dataset: Option<Vec<ChessboardDetection>>,
+    dataset: Option<CalibrationDataset>,
 }
 
 impl NodeInstance for CalibrationSolverNode {
@@ -62,16 +64,7 @@ impl NodeInstance for CalibrationSolverNode {
                 "calibrationSolver.dataset requires calib.dataset".to_owned(),
             ));
         };
-        if dataset.get("kind").and_then(serde_json::Value::as_str) != Some("calib.dataset.v1") {
-            return Err(NodeError::Precondition(
-                "dataset payload kind must be calib.dataset.v1".to_owned(),
-            ));
-        }
-        let samples = serde_json::from_value(dataset.get("samples").cloned().unwrap_or_default())
-            .map_err(|error| {
-            NodeError::Precondition(format!("invalid dataset samples: {error}"))
-        })?;
-        self.dataset = Some(samples);
+        self.dataset = Some(parse_calibration_dataset(&dataset)?);
         Ok(())
     }
 
@@ -82,6 +75,20 @@ impl NodeInstance for CalibrationSolverNode {
         }
     }
 
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let next = NodeSpec {
+            config,
+            ..self.spec.clone()
+        };
+        Self::validate_config(&next)?;
+        self.spec = next;
+        Ok(())
+    }
+
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         rt.report_state(NodeRuntimeState::Idle, "stopped");
         Ok(())
@@ -89,6 +96,37 @@ impl NodeInstance for CalibrationSolverNode {
 }
 
 impl CalibrationSolverNode {
+    fn validate_config(spec: &NodeSpec) -> Result<(), NodeError> {
+        CalibrationImageSize::new(
+            config_u32(spec, "imageWidth", 1920),
+            config_u32(spec, "imageHeight", 1080),
+        )
+        .map_err(|error| NodeError::Config(error.to_string()))?;
+        BoardSpec::new(
+            config_u16(spec, "boardCols", 8),
+            config_u16(spec, "boardRows", 11),
+            config_f64(spec, "squareSizeMm", 30.0),
+        )
+        .map_err(|error| NodeError::Config(error.to_string()))?;
+        InitialIntrinsics {
+            camera_matrix: [
+                config_f64(spec, "fx", 1234.56),
+                0.0,
+                config_f64(spec, "cx", 960.0),
+                0.0,
+                config_f64(spec, "fy", 1234.56),
+                config_f64(spec, "cy", 540.0),
+                0.0,
+                0.0,
+                1.0,
+            ],
+            distortion_coefficients: vec![0.0; 12],
+        }
+        .validate()
+        .map_err(|error| NodeError::Config(error.to_string()))?;
+        Ok(())
+    }
+
     fn solve(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         let backend = rt.services().calibration_backend()?;
         let request = self.build_request()?;
@@ -114,24 +152,29 @@ impl CalibrationSolverNode {
         )
         .map_err(|error| NodeError::Config(error.to_string()))?;
 
-        let image_points: Vec<Vec<CalibrationPoint>> = if let Some(samples) = &self.dataset {
-            if samples.is_empty() {
-                return Err(NodeError::Precondition(
-                    "calibration dataset is empty".to_owned(),
-                ));
-            }
-            let mut points = Vec::with_capacity(samples.len());
-            for (index, detection) in samples.iter().enumerate() {
+        let image_points: Vec<Vec<CalibrationPoint>> = if let Some(dataset) = &self.dataset {
+            let mut points = Vec::with_capacity(dataset.samples.len());
+            for sample in dataset.accepted_enabled_samples() {
+                let detection = &sample.detection;
                 if detection.image_size != image_size {
                     return Err(NodeError::Config(format!(
-                        "dataset sample {index} image size {:?} does not match configured {:?}",
-                        detection.image_size, image_size
+                        "dataset sample `{}` image size {:?} does not match configured {:?}",
+                        sample.id, detection.image_size, image_size
                     )));
                 }
                 detection.validate(board).map_err(|error| {
-                    NodeError::Precondition(format!("dataset sample {index} is invalid: {error}"))
+                    NodeError::Precondition(format!(
+                        "dataset sample `{}` is invalid: {error}",
+                        sample.id
+                    ))
                 })?;
+                // 求解器只保留 accepted/enabled detection 的角点，数学输入与旧请求保持一致。
                 points.push(detection.corners.clone());
+            }
+            if points.is_empty() {
+                return Err(NodeError::Precondition(
+                    "calibration dataset has no accepted/enabled samples".to_owned(),
+                ));
             }
             points
         } else {
@@ -191,7 +234,7 @@ mod tests {
     use super::*;
     use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
     use crate::ports::{CalibrationBackend, CalibrationBackendError};
-    use camera_toolbox_core::ChessboardDetectionOutcome;
+    use camera_toolbox_core::{ChessboardDetection, ChessboardDetectionOutcome};
 
     fn spec() -> NodeSpec {
         NodeSpec {
@@ -301,6 +344,32 @@ mod tests {
         last
     }
 
+    fn rich_dataset_sample(
+        id: &str,
+        detection: ChessboardDetection,
+        accepted: bool,
+        enabled: bool,
+    ) -> serde_json::Value {
+        let width = detection.image_size.width;
+        let height = detection.image_size.height;
+        serde_json::json!({
+            "id": id,
+            "imageRef": {
+                "ref": format!("runtime://frame/{id}"),
+                "width": width,
+                "height": height,
+                "format": "GRAY8",
+            },
+            "detection": detection,
+            "score": {"score": 0.5, "frameSequence": 1},
+            "acceptance": {"accepted": accepted, "enabled": enabled},
+            "provenance": {
+                "source": {"kind": "test"},
+                "frameIdentity": {"frameSequence": 1},
+            },
+        })
+    }
+
     #[test]
     fn factory_instantiates_with_expected_kind() {
         assert_eq!(CalibrationSolverFactory.kind(), "calibrationSolver");
@@ -339,31 +408,100 @@ mod tests {
     }
 
     #[test]
-    fn dataset_input_becomes_calibration_image_points() {
-        let detection = ChessboardDetection {
-            image_size: CalibrationImageSize::new(1920, 1080).expect("image size"),
-            corners: vec![CalibrationPoint::new(12.0, 24.0); 88],
-        };
+    fn config_update_changes_solver_request_contract() {
         let (state_tx, _state_rx) = mpsc::channel();
         let mut rt = runtime(EngineServices::default(), state_tx);
         let mut node = CalibrationSolverNode {
             spec: spec(),
             dataset: None,
         };
-        node.on_input(
-            "dataset",
-            DataPacket::Dataset(Arc::new(serde_json::json!({
-                "kind": "calib.dataset.v1",
-                "samples": [detection],
-            }))),
+        node.on_config_update(
+            serde_json::json!({
+                "imageWidth": 1280,
+                "imageHeight": 720,
+                "boardCols": 7,
+                "boardRows": 6,
+                "squareSizeMm": 24.0,
+                "fx": 500.0,
+                "fy": 510.0,
+                "cx": 640.0,
+                "cy": 360.0,
+            }),
             &mut rt,
         )
-        .expect("accept dataset");
+        .expect("update solver config");
+        let request = node.build_request().expect("build updated request");
+        assert_eq!(request.image_size.width, 1280);
+        assert_eq!(request.image_size.height, 720);
+        assert_eq!(request.board.inner_cols, 7);
+        assert_eq!(request.board.inner_rows, 6);
+        assert_eq!(request.initial_intrinsics.camera_matrix[0], 500.0);
+        assert_eq!(request.initial_intrinsics.camera_matrix[2], 640.0);
+    }
+
+    #[test]
+    fn rich_dataset_only_accepted_enabled_samples_become_calibration_image_points() {
+        let active = ChessboardDetection {
+            image_size: CalibrationImageSize::new(1920, 1080).expect("image size"),
+            corners: vec![CalibrationPoint::new(12.0, 24.0); 88],
+        };
+        let rejected = ChessboardDetection {
+            image_size: CalibrationImageSize::new(1920, 1080).expect("image size"),
+            corners: vec![CalibrationPoint::new(48.0, 96.0); 88],
+        };
+        let disabled = ChessboardDetection {
+            image_size: CalibrationImageSize::new(1920, 1080).expect("image size"),
+            corners: vec![CalibrationPoint::new(120.0, 240.0); 88],
+        };
+        let dataset = serde_json::json!({
+            "kind": "calib.dataset.v1",
+            "board": null,
+            "samples": [
+                rich_dataset_sample("active", active, true, true),
+                rich_dataset_sample("rejected", rejected, false, true),
+                rich_dataset_sample("disabled", disabled, true, false),
+            ],
+            "count": 3,
+        });
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverNode {
+            spec: spec(),
+            dataset: None,
+        };
+        node.on_input("dataset", DataPacket::Dataset(Arc::new(dataset)), &mut rt)
+            .expect("accept rich dataset");
         let request = node.build_request().expect("build request");
         assert_eq!(
             request.image_points,
             vec![vec![CalibrationPoint::new(12.0, 24.0); 88]]
         );
+    }
+
+    #[test]
+    fn dataset_without_accepted_enabled_samples_is_rejected() {
+        let detection = ChessboardDetection {
+            image_size: CalibrationImageSize::new(1920, 1080).expect("image size"),
+            corners: vec![CalibrationPoint::new(12.0, 24.0); 88],
+        };
+        let dataset = serde_json::json!({
+            "kind": "calib.dataset.v1",
+            "board": null,
+            "samples": [rich_dataset_sample("rejected", detection, false, true)],
+            "count": 1,
+        });
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(EngineServices::default(), state_tx);
+        let mut node = CalibrationSolverNode {
+            spec: spec(),
+            dataset: None,
+        };
+        node.on_input("dataset", DataPacket::Dataset(Arc::new(dataset)), &mut rt)
+            .expect("accept rich dataset");
+        let error = node
+            .build_request()
+            .expect_err("no accepted/enabled samples");
+        assert!(matches!(error, NodeError::Precondition(_)));
     }
 
     #[test]

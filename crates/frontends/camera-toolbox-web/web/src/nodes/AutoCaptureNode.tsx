@@ -1,8 +1,8 @@
 import type { NodeProps } from '@xyflow/react';
 import type { FlowNodeData } from '../workflow';
-import { NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './shared';
+import { NodeHeader, PortHandles, RuntimeOutputSummary } from './shared';
 
-/** 自动采集节点：Arm/Disarm 切换条件自动触发。 */
+/** Arm Gate：布防后透传 capture trigger；未布防时不产生任何设备采集请求。 */
 export function AutoCaptureNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
@@ -17,11 +17,7 @@ export function AutoCaptureNode({ data, selected }: NodeProps) {
 
         <PortHandles node={node} />
         <div className="node-body compact">
-          <ScalarConfigFields
-            nodeId={node.id}
-            config={node.config}
-            onChange={nodeData.onNodeConfigChange}
-          />
+          <span className="node-hint">布防后才透传 capture trigger；未布防时上游 trigger 会被丢弃。</span>
           <RuntimeOutputSummary output={nodeData.runtimeOutput} />
           <div className="node-actions">
             <button

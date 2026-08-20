@@ -1,7 +1,7 @@
 //! 帧变换节点：由数据输入触发的转换节点（范式样板）。
 //!
 //! 引擎语义下 `rtspSource` 已把「连接 + 解码」合并，因此 `rtspDecoder` 是 pass-through；
-//! `demosaic` 是显式 RAW Bayer → RGBA 转换；`frameSampler` 按时间降采样；`videoLayer`/`imageLayer` 是可见性标记的 pass-through。
+//! `demosaic` 是显式 RAW Bayer → RGBA/Gray 转换；`frameSampler` 按时间降采样；`videoLayer`/`imageLayer` 是可见性标记的 pass-through。
 //!
 //! 这是「转换节点」的完整样板：`on_input` 收到上游帧 → 变换 → `emit` 到输出端口。
 
@@ -134,9 +134,81 @@ impl NodeInstance for DemosaicNode {
             )));
         }
 
-        let rgba = demosaic_bayer_bilinear(&frame)?;
-        let image = ImageFrame::rgba8(frame.width, frame.height, rgba, frame.identity.clone())
-            .map_err(|error| NodeError::Execution(format!("invalid demosaic output: {error}")))?;
+        let raw = self.raw_metadata(frame.raw.as_ref())?;
+        let output_format = self.output_format()?;
+        let mut frame = frame.as_ref().clone();
+        frame.raw = Some(raw);
+
+        let image = match output_format {
+            DemosaicOutputFormat::Rgba8 => {
+                let rgba = demosaic_bayer_bilinear(&frame)?;
+                ImageFrame::rgba8(frame.width, frame.height, rgba, frame.identity.clone()).map_err(
+                    |error| NodeError::Execution(format!("invalid demosaic output: {error}")),
+                )?
+            }
+            DemosaicOutputFormat::Gray8 => {
+                let plane = frame.planes.first().ok_or_else(|| {
+                    NodeError::Precondition("BayerRaw image is missing pixel plane".to_owned())
+                })?;
+                let width = usize::try_from(frame.width).map_err(|_| {
+                    NodeError::Execution("BayerRaw width overflows host".to_owned())
+                })?;
+                let height = usize::try_from(frame.height).map_err(|_| {
+                    NodeError::Execution("BayerRaw height overflows host".to_owned())
+                })?;
+                let raw = frame.raw.as_ref().ok_or_else(|| {
+                    NodeError::Precondition("BayerRaw image is missing RAW metadata".to_owned())
+                })?;
+                let luma = compact_raw_luma(plane, width, height, raw)?;
+                ImageFrame::new(
+                    frame.width,
+                    frame.height,
+                    ImageFrameFormat::Gray8,
+                    vec![ImagePlane::new(Arc::from(luma), frame.width)],
+                    frame.identity.clone(),
+                    None,
+                    None,
+                )
+                .map_err(|error| {
+                    NodeError::Execution(format!("invalid demosaic output: {error}"))
+                })?
+            }
+            DemosaicOutputFormat::Gray16Le => {
+                let plane = frame.planes.first().ok_or_else(|| {
+                    NodeError::Precondition("BayerRaw image is missing pixel plane".to_owned())
+                })?;
+                let width = usize::try_from(frame.width).map_err(|_| {
+                    NodeError::Execution("BayerRaw width overflows host".to_owned())
+                })?;
+                let height = usize::try_from(frame.height).map_err(|_| {
+                    NodeError::Execution("BayerRaw height overflows host".to_owned())
+                })?;
+                let raw = frame.raw.as_ref().ok_or_else(|| {
+                    NodeError::Precondition("BayerRaw image is missing RAW metadata".to_owned())
+                })?;
+                let luma = compact_raw_luma(plane, width, height, raw)?;
+                let mut bytes = Vec::with_capacity(luma.len() * 2);
+                for value in luma {
+                    let sample = u16::from(value) * 257;
+                    bytes.extend_from_slice(&sample.to_le_bytes());
+                }
+                let stride_bytes = frame.width.checked_mul(2).ok_or_else(|| {
+                    NodeError::Execution("BayerRaw output stride overflows host".to_owned())
+                })?;
+                ImageFrame::new(
+                    frame.width,
+                    frame.height,
+                    ImageFrameFormat::Gray16Le,
+                    vec![ImagePlane::new(Arc::from(bytes), stride_bytes)],
+                    frame.identity.clone(),
+                    None,
+                    None,
+                )
+                .map_err(|error| {
+                    NodeError::Execution(format!("invalid demosaic output: {error}"))
+                })?
+            }
+        };
         rt.emit("image", DataPacket::ImageFrame(Arc::new(image)))?;
         rt.report_state(NodeRuntimeState::Running, "demosaic frame emitted");
         Ok(())
@@ -152,11 +224,88 @@ impl NodeInstance for DemosaicNode {
     }
 }
 
+impl DemosaicNode {
+    fn raw_metadata(
+        &self,
+        _frame_raw: Option<&crate::engine::RawMetadata>,
+    ) -> Result<crate::engine::RawMetadata, NodeError> {
+        let bayer = config_string(&self.spec, "bayer")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| NodeError::Config("demosaic requires explicit bayer".to_owned()))?;
+        let bayer_pattern = match bayer.as_str() {
+            "rggb" => BayerPattern::Rggb,
+            "bggr" => BayerPattern::Bggr,
+            "grbg" => BayerPattern::Grbg,
+            "gbrg" => BayerPattern::Gbrg,
+            value => {
+                return Err(NodeError::Config(format!(
+                    "unsupported demosaic Bayer pattern `{value}`"
+                )));
+            }
+        };
+        let bits_per_sample = config_u64(&self.spec, "bitsPerSample")
+            .and_then(|value| u8::try_from(value).ok())
+            .filter(|value| (1..=16).contains(value))
+            .ok_or_else(|| {
+                NodeError::Config(
+                    "demosaic bitsPerSample must be a non-negative integer in 1..=16".to_owned(),
+                )
+            })?;
+        let black_level = u16::try_from(config_u64(&self.spec, "blackLevel").ok_or_else(|| {
+            NodeError::Config("demosaic requires explicit blackLevel".to_owned())
+        })?)
+        .map_err(|_| NodeError::Config("demosaic blackLevel must fit in u16".to_owned()))?;
+        Ok(crate::engine::RawMetadata {
+            bayer_pattern,
+            bits_per_sample,
+            black_level: Some(black_level),
+            white_level: None,
+        })
+    }
+
+    fn output_format(&self) -> Result<DemosaicOutputFormat, NodeError> {
+        match config_string(&self.spec, "outputFormat")
+            .as_deref()
+            .unwrap_or("rgba")
+        {
+            "rgba" => Ok(DemosaicOutputFormat::Rgba8),
+            "gray8" => Ok(DemosaicOutputFormat::Gray8),
+            "gray16le" => Ok(DemosaicOutputFormat::Gray16Le),
+            value => Err(NodeError::Config(format!(
+                "unsupported demosaic outputFormat `{value}`"
+            ))),
+        }
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BayerChannel {
     Red,
     Green,
     Blue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DemosaicOutputFormat {
+    Rgba8,
+    Gray8,
+    Gray16Le,
+}
+
+fn config_string(spec: &NodeSpec, key: &str) -> Option<String> {
+    let value = spec.config.get(key)?;
+    value
+        .as_str()
+        .map(|text| text.trim().to_owned())
+        .or_else(|| value.as_u64().map(|number| number.to_string()))
+}
+
+fn config_u64(spec: &NodeSpec, key: &str) -> Option<u64> {
+    let value = spec.config.get(key)?;
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    value.as_str()?.trim().parse::<u64>().ok()
 }
 
 fn demosaic_bayer_bilinear(frame: &ImageFrame) -> Result<Arc<[u8]>, NodeError> {
@@ -520,6 +669,12 @@ mod tests {
         }
     }
 
+    fn demosaic_spec(config: serde_json::Value) -> NodeSpec {
+        let mut spec = pt_spec("demosaic", "image");
+        spec.config = config;
+        spec
+    }
+
     /// 构造一个带 `record` 回调的 runtime：emit 无下游时也会把 packet 送进 record sink。
     fn runtime(
         outputs: OutputRegistry,
@@ -545,6 +700,38 @@ mod tests {
             rgba: Arc::from(vec![0u8; 16]),
             identity: StreamFrameIdentity::unavailable(session, 0, seq, "test"),
         }))
+    }
+
+    fn bayer_raw_frame(
+        source: &DecodedVideoFrame,
+        width: u32,
+        height: u32,
+        samples: &[u16],
+        bayer_pattern: BayerPattern,
+        bits_per_sample: u8,
+        black_level: Option<u16>,
+    ) -> Arc<ImageFrame> {
+        let mut bytes = Vec::with_capacity(samples.len() * 2);
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+        Arc::new(
+            ImageFrame::new(
+                width,
+                height,
+                ImageFrameFormat::BayerRaw,
+                vec![ImagePlane::new(Arc::from(bytes), width * 2)],
+                crate::engine::ImageFrameIdentity::from(&source.identity),
+                None,
+                Some(crate::engine::RawMetadata {
+                    bayer_pattern,
+                    bits_per_sample,
+                    black_level,
+                    white_level: None,
+                }),
+            )
+            .expect("valid BayerRaw fixture"),
+        )
     }
 
     fn last_state(
@@ -687,28 +874,23 @@ mod tests {
         let DataPacket::VideoFrame(source) = video_frame(11) else {
             panic!("test fixture must be a video frame");
         };
-        let raw = Arc::new(
-            ImageFrame::new(
-                2,
-                2,
-                ImageFrameFormat::BayerRaw,
-                vec![ImagePlane::new(
-                    Arc::from(vec![0xff, 0x0f, 0x00, 0x00, 0x00, 0x00, 0xff, 0x0f]),
-                    4,
-                )],
-                crate::engine::ImageFrameIdentity::from(&source.identity),
-                None,
-                Some(crate::engine::RawMetadata {
-                    bayer_pattern: BayerPattern::Rggb,
-                    bits_per_sample: 12,
-                    black_level: None,
-                    white_level: None,
-                }),
-            )
-            .expect("valid BayerRaw fixture"),
+        let raw = bayer_raw_frame(
+            &source,
+            2,
+            2,
+            &[4095, 0, 0, 4095],
+            BayerPattern::Rggb,
+            12,
+            None,
         );
         let mut node = DemosaicNode {
-            spec: pt_spec("demosaic", "image"),
+            spec: demosaic_spec(serde_json::json!({
+                "algorithm": "bilinear",
+                "outputFormat": "rgba",
+                "bayer": "rggb",
+                "bitsPerSample": 12,
+                "blackLevel": 0,
+            })),
         };
 
         node.on_input("raw", DataPacket::ImageFrame(raw), &mut rt)
@@ -724,6 +906,141 @@ mod tests {
         let rgba = image.rgba8_plane().expect("RGBA plane");
         assert_eq!(rgba.bytes.len(), 16);
         assert!(rgba.bytes.iter().any(|byte| *byte > 0));
+    }
+
+    #[test]
+    fn demosaic_gray8_applies_black_level_and_config_bits() {
+        let mut outputs = OutputRegistry::default();
+        let relayed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&relayed);
+        outputs.set_record(Arc::new(move |packet| sink.lock().push(packet)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(outputs, state_tx);
+        let DataPacket::VideoFrame(source) = video_frame(13) else {
+            panic!("test fixture must be a video frame");
+        };
+        let raw = bayer_raw_frame(&source, 2, 1, &[0, 4095], BayerPattern::Rggb, 12, None);
+        let mut node = DemosaicNode {
+            spec: demosaic_spec(serde_json::json!({
+                "algorithm": "bilinear",
+                "outputFormat": "gray8",
+                "bayer": "rggb",
+                "bitsPerSample": 12,
+                "blackLevel": 2048,
+            })),
+        };
+
+        node.on_input("raw", DataPacket::ImageFrame(raw), &mut rt)
+            .expect("gray8 demosaic succeeds");
+
+        let relayed = relayed.lock();
+        assert_eq!(relayed.len(), 1);
+        let DataPacket::ImageFrame(image) = &relayed[0] else {
+            panic!("demosaic must emit image.frame");
+        };
+        assert_eq!(image.format, ImageFrameFormat::Gray8);
+        assert_eq!(image.planes[0].bytes.as_ref(), &[0, 255]);
+    }
+
+    #[test]
+    fn demosaic_gray16le_uses_configured_output_format() {
+        let mut outputs = OutputRegistry::default();
+        let relayed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&relayed);
+        outputs.set_record(Arc::new(move |packet| sink.lock().push(packet)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(outputs, state_tx);
+        let DataPacket::VideoFrame(source) = video_frame(14) else {
+            panic!("test fixture must be a video frame");
+        };
+        let raw = bayer_raw_frame(&source, 2, 1, &[0, 4095], BayerPattern::Rggb, 12, None);
+        let mut node = DemosaicNode {
+            spec: demosaic_spec(serde_json::json!({
+                "algorithm": "bilinear",
+                "outputFormat": "gray16le",
+                "bayer": "rggb",
+                "bitsPerSample": 12,
+                "blackLevel": 0,
+            })),
+        };
+
+        node.on_input("raw", DataPacket::ImageFrame(raw), &mut rt)
+            .expect("gray16le demosaic succeeds");
+
+        let relayed = relayed.lock();
+        assert_eq!(relayed.len(), 1);
+        let DataPacket::ImageFrame(image) = &relayed[0] else {
+            panic!("demosaic must emit image.frame");
+        };
+        assert_eq!(image.format, ImageFrameFormat::Gray16Le);
+        assert_eq!(image.planes[0].stride_bytes, 4);
+        assert_eq!(image.planes[0].bytes.as_ref(), &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn demosaic_bayer_override_changes_channel_interpretation() {
+        let mut outputs = OutputRegistry::default();
+        let relayed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&relayed);
+        outputs.set_record(Arc::new(move |packet| sink.lock().push(packet)));
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(outputs, state_tx);
+        let DataPacket::VideoFrame(source) = video_frame(15) else {
+            panic!("test fixture must be a video frame");
+        };
+        let raw = bayer_raw_frame(
+            &source,
+            2,
+            2,
+            &[4095, 0, 0, 0],
+            BayerPattern::Rggb,
+            12,
+            None,
+        );
+        let mut node = DemosaicNode {
+            spec: demosaic_spec(serde_json::json!({
+                "algorithm": "bilinear",
+                "outputFormat": "rgba",
+                "bayer": "bggr",
+                "bitsPerSample": 12,
+                "blackLevel": 0,
+            })),
+        };
+
+        node.on_input("raw", DataPacket::ImageFrame(raw), &mut rt)
+            .expect("Bayer override succeeds");
+
+        let relayed = relayed.lock();
+        assert_eq!(relayed.len(), 1);
+        let DataPacket::ImageFrame(image) = &relayed[0] else {
+            panic!("demosaic must emit image.frame");
+        };
+        let rgba = image.rgba8_plane().expect("RGBA plane");
+        assert_eq!(&rgba.bytes[0..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn demosaic_rejects_missing_explicit_raw_config_even_when_frame_has_metadata() {
+        let outputs = OutputRegistry::default();
+        let (state_tx, _state_rx) = mpsc::channel();
+        let mut rt = runtime(outputs, state_tx);
+        let DataPacket::VideoFrame(source) = video_frame(16) else {
+            panic!("test fixture must be a video frame");
+        };
+        let raw = bayer_raw_frame(&source, 2, 1, &[0, 4095], BayerPattern::Rggb, 12, None);
+        let mut node = DemosaicNode {
+            spec: demosaic_spec(serde_json::json!({
+                "algorithm": "bilinear",
+                "outputFormat": "rgba",
+                "bitsPerSample": 12,
+                "blackLevel": 0,
+            })),
+        };
+
+        let error = node
+            .on_input("raw", DataPacket::ImageFrame(raw), &mut rt)
+            .expect_err("Demosaic must not fall back to frame RAW metadata");
+        assert!(error.to_string().contains("explicit bayer"));
     }
 
     #[test]

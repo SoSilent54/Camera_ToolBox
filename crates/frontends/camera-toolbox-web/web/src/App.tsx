@@ -64,17 +64,20 @@ import {
   SftpFileSourceNode,
   SshSessionNode,
   X5233DriverNode,
+  DemosaicNode,
   HexArmDeviceNode,
 } from './WorkflowNodes';
 import {
   AutoCaptureNode,
   CalibrationSolverNode,
   CalibrationWorkflowNode,
+  DatasetCollectorNode,
   GenericWorkflowNode,
   NodeLibraryItem,
   RtspSourceNode,
   ViewerNode,
 } from './nodes';
+
 import { Console } from './Console';
 import { useEngine } from './useEngine';
 import { subscribeSnapshot, subscribeTopic } from './useEngineSocket';
@@ -101,6 +104,7 @@ type NodeCreateMenuMode =
       fromDirection: 'input' | 'output';
       fromPortKind: PortKind;
       fromSchema: string;
+      fromFormatHint?: string;
       fromCardinality: 'one' | 'many';
     };
 
@@ -120,12 +124,12 @@ const DEFAULT_RTSP_URL = 'rtsp://10.21.12.108:554/PRR';
 const DND_NODE_KIND = 'application/x-camera-toolbox-node-kind';
 const GENERIC_NODE_KINDS: NodeKind[] = [
   'rtspDecoder',
-  'demosaic',
   'frameSampler',
   'imageLayer',
   'videoLayer',
   'overlayComposer',
 ];
+
 
 const nodeTypes = Object.fromEntries([
   ['rtspSource', RtspSourceNode],
@@ -133,6 +137,7 @@ const nodeTypes = Object.fromEntries([
   ['sftpFileSource', SftpFileSourceNode],
   ['sshSession', SshSessionNode],
   ['x5233Driver', X5233DriverNode],
+  ['demosaic', DemosaicNode],
   ['hexArmDevice', HexArmDeviceNode],
   ['i2cTransfer', I2cTransferNode],
   ['eepromProvision', EepromProvisionNode],
@@ -140,9 +145,11 @@ const nodeTypes = Object.fromEntries([
   ['calibrationSolver', CalibrationSolverNode],
   ['autoCaptureController', AutoCaptureNode],
   ['chessboardDetector', CalibrationWorkflowNode],
-  ['gainScorer', CalibrationWorkflowNode],
-  ['captureGate', CalibrationWorkflowNode],
-  ['datasetCollector', CalibrationWorkflowNode],
+  ['calibrationFrameScorer', CalibrationWorkflowNode],
+  ['scoreThresholdGate', CalibrationWorkflowNode],
+  ['consecutiveHoldGate', CalibrationWorkflowNode],
+  ['captureRequestBuilder', CalibrationWorkflowNode],
+  ['datasetCollector', DatasetCollectorNode],
   ['coverageAnalyzer', CalibrationWorkflowNode],
   ['poseGuide', CalibrationWorkflowNode],
   ...GENERIC_NODE_KINDS.map((kind) => [kind, GenericWorkflowNode]),
@@ -563,6 +570,7 @@ export function App() {
       fromDirection,
       fromPortKind: fromPort.kind,
       fromSchema: fromPort.schema,
+      fromFormatHint: fromPort.formatHint,
       fromCardinality: fromPort.cardinality,
     });
   }, [nodeById]);
@@ -1428,6 +1436,7 @@ function compatiblePortsForCreateMenu(definition: NodeDefinition, mode: Extract<
     direction: mode.fromDirection,
     kind: mode.fromPortKind,
     schema: mode.fromSchema,
+    formatHint: mode.fromFormatHint,
     required: false,
     cardinality: mode.fromCardinality,
   };

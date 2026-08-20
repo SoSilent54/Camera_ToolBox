@@ -96,8 +96,6 @@ pub enum FrameProvenance {
         camera: Option<u16>,
         /// 驱动采集时间戳；不是本机单调时钟。
         timestamp_ns: u64,
-        /// 仅在设备的 RTSP ring 提供 bridge 时存在，不能用作强同帧身份。
-        rtsp_pts_90k: Option<u64>,
     },
     File {
         source: String,
@@ -114,6 +112,7 @@ pub struct ImageFrameIdentity {
     pub frame_sequence: u64,
     pub source_pts: SourcePts,
     pub host_monotonic_time_ns: u64,
+    pub device_timestamp_ns: Option<u64>,
 }
 
 impl From<&StreamFrameIdentity> for ImageFrameIdentity {
@@ -126,6 +125,7 @@ impl From<&StreamFrameIdentity> for ImageFrameIdentity {
             frame_sequence: identity.frame_sequence,
             source_pts: identity.source_pts.clone(),
             host_monotonic_time_ns: identity.host_monotonic_time_ns,
+            device_timestamp_ns: identity.device_timestamp_ns,
         }
     }
 }
@@ -143,6 +143,16 @@ impl ImageFrameIdentity {
             frame_sequence: self.frame_sequence,
             source_pts: self.source_pts.clone(),
             host_monotonic_time_ns: self.host_monotonic_time_ns,
+            device_timestamp_ns: self.device_timestamp_ns,
+        })
+    }
+
+    /// 返回可用于 X5 TCP exact snapshot 的设备时间戳；禁止退回本机单调时钟。
+    #[must_use]
+    pub fn device_timestamp_ns(&self) -> Option<u64> {
+        self.device_timestamp_ns.or_else(|| match &self.provenance {
+            FrameProvenance::Device { timestamp_ns, .. } => Some(*timestamp_ns),
+            _ => None,
         })
     }
 }
@@ -154,13 +164,12 @@ pub enum CaptureTarget {
     Raw { camera: u16 },
 }
 
-/// X5_233 ring 的匹配条件。RTSP PTS 仅是跨链路 best-effort bridge，不是强帧身份。
+/// X5_233 ring 的强匹配条件；`timestamp_ns` 必须来自设备侧 metadata。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMode {
     Latest,
     FrameId(u64),
     TimestampNs(u64),
-    RtspPts90k { pts: u64, tolerance: u64 },
 }
 
 /// `command.capture.request.v1` 的进程内载荷；可选来源身份随检测/评分链路原样携带。
@@ -178,10 +187,25 @@ pub struct DetectionPacket {
     pub frame_identity: ImageFrameIdentity,
 }
 
-/// 归一化采集收益与其来源帧身份。`gain` 由 `GainScorer` 保证为有限且落在 `[0, 1]`。
+/// 归一化标定帧质量评分；`score` 由 `CalibrationFrameScorer` 保证为有限且落在 `[0, 1]`。
+///
+/// 来源帧身份必须沿检测、阈值、连续保持和采集请求链路原样传递，不能由下游重建。
 #[derive(Clone, Debug, PartialEq)]
-pub struct GainScore {
-    pub gain: f64,
+pub struct CalibrationFrameScore {
+    pub score: f64,
+    pub frame_identity: ImageFrameIdentity,
+}
+
+/// 阈值门的逐帧判定；拒绝也要向下游传递，才能让连续保持门正确重置。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureSignal {
+    pub accepted: bool,
+    pub frame_identity: ImageFrameIdentity,
+}
+
+/// 连续保持条件满足后产生的无歧义抓帧触发。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureTrigger {
     pub frame_identity: ImageFrameIdentity,
 }
 
@@ -401,8 +425,12 @@ pub enum DataPacket {
     Dataset(Arc<serde_json::Value>),
     /// `calib.report`：标定报告（弱类型）。
     Report(Arc<serde_json::Value>),
-    /// `capture.score`：带来源帧身份的归一化采集评分。
-    Score(Arc<GainScore>),
+    /// `capture.score`：带来源帧身份的归一化标定帧质量评分。
+    Score(Arc<CalibrationFrameScore>),
+    /// `capture.signal`：阈值门对每个评分帧的接受/拒绝判定。
+    CaptureSignal(Arc<CaptureSignal>),
+    /// `capture.trigger`：连续保持门完成后的抓帧触发。
+    CaptureTrigger(Arc<CaptureTrigger>),
     /// `capture.target`：采集目标位姿（弱类型）。
     Target(Arc<serde_json::Value>),
     /// `command.capture.request.v1`：以明确目标和匹配条件驱动设备抓帧。
@@ -424,6 +452,8 @@ impl DataPacket {
             Self::Dataset(_) => "calib.dataset",
             Self::Report(_) => "calib.report",
             Self::Score(_) => "capture.score",
+            Self::CaptureSignal(_) => "capture.signal",
+            Self::CaptureTrigger(_) => "capture.trigger",
             Self::Target(_) => "capture.target",
             Self::CaptureRequest(_) => "command.capture.request.v1",
             Self::Json(_) => "status.metrics",
@@ -438,6 +468,8 @@ impl DataPacket {
             Self::ImageFrame(frame) => Some(frame.identity.frame_sequence),
             Self::Detection(detection) => Some(detection.frame_identity.frame_sequence),
             Self::Score(score) => Some(score.frame_identity.frame_sequence),
+            Self::CaptureSignal(signal) => Some(signal.frame_identity.frame_sequence),
+            Self::CaptureTrigger(trigger) => Some(trigger.frame_identity.frame_sequence),
             Self::CaptureRequest(request) => request
                 .source_identity
                 .as_ref()
@@ -478,6 +510,8 @@ impl std::fmt::Debug for DataPacket {
             Self::Dataset(_) => f.write_str("Dataset(..)"),
             Self::Report(_) => f.write_str("Report(..)"),
             Self::Score(_) => f.write_str("Score(..)"),
+            Self::CaptureSignal(_) => f.write_str("CaptureSignal(..)"),
+            Self::CaptureTrigger(_) => f.write_str("CaptureTrigger(..)"),
             Self::Target(_) => f.write_str("Target(..)"),
             Self::CaptureRequest(_) => f.write_str("CaptureRequest(..)"),
             Self::Json(_) => f.write_str("Json(..)"),
@@ -491,7 +525,7 @@ mod tests {
     use crate::platform::{SourcePtsProvenance, StreamSessionId};
 
     fn stream_identity() -> StreamFrameIdentity {
-        StreamFrameIdentity::known_at(
+        StreamFrameIdentity::known_at_with_device_timestamp(
             StreamSessionId::new("rtsp-camera-0").expect("valid stream id"),
             3,
             42,
@@ -502,6 +536,7 @@ mod tests {
                 provenance: SourcePtsProvenance::FfmpegDecodedFrame,
             },
             123_456,
+            Some(987_654),
         )
     }
 
@@ -520,6 +555,7 @@ mod tests {
         assert_eq!(image.identity.frame_sequence, 42);
         assert_eq!(image.identity.source_pts, decoded.identity.source_pts);
         assert_eq!(image.identity.host_monotonic_time_ns, 123_456);
+        assert_eq!(image.identity.device_timestamp_ns(), Some(987_654));
         assert_eq!(
             image.identity.provenance,
             FrameProvenance::Stream {
@@ -530,7 +566,7 @@ mod tests {
     }
 
     #[test]
-    fn typed_detection_and_gain_retain_the_same_frame_identity() {
+    fn typed_capture_chain_retains_the_same_frame_identity() {
         let identity = ImageFrameIdentity::from(&stream_identity());
         let detection = DetectionPacket {
             detection: Arc::new(ChessboardDetection {
@@ -539,12 +575,27 @@ mod tests {
             }),
             frame_identity: identity.clone(),
         };
-        let score = GainScore {
-            gain: 0.5,
+        let score = CalibrationFrameScore {
+            score: 0.5,
             frame_identity: detection.frame_identity.clone(),
+        };
+        let signal = CaptureSignal {
+            accepted: true,
+            frame_identity: score.frame_identity.clone(),
+        };
+        let trigger = CaptureTrigger {
+            frame_identity: signal.frame_identity.clone(),
+        };
+        let request = CaptureRequest {
+            target: CaptureTarget::Yuv { channel: 3 },
+            mode: CaptureMode::FrameId(trigger.frame_identity.frame_sequence),
+            source_identity: Some(trigger.frame_identity.clone()),
         };
 
         assert_eq!(score.frame_identity, identity);
+        assert_eq!(signal.frame_identity, identity);
+        assert_eq!(trigger.frame_identity, identity);
+        assert_eq!(request.source_identity.as_ref(), Some(&identity));
         assert_eq!(
             DataPacket::Detection(Arc::new(detection)).port_kind(),
             "calib.detection"
@@ -552,6 +603,18 @@ mod tests {
         assert_eq!(
             DataPacket::Score(Arc::new(score)).port_kind(),
             "capture.score"
+        );
+        assert_eq!(
+            DataPacket::CaptureSignal(Arc::new(signal)).port_kind(),
+            "capture.signal"
+        );
+        assert_eq!(
+            DataPacket::CaptureTrigger(Arc::new(trigger)).port_kind(),
+            "capture.trigger"
+        );
+        assert_eq!(
+            DataPacket::CaptureRequest(Arc::new(request)).flow_sequence(),
+            Some(42)
         );
     }
 
@@ -576,15 +639,25 @@ mod tests {
         let coverage = DataPacket::Coverage(Arc::new(serde_json::json!({})));
         let dataset = DataPacket::Dataset(Arc::new(serde_json::json!({})));
         let report = DataPacket::Report(Arc::new(serde_json::json!({})));
-        let score = DataPacket::Score(Arc::new(GainScore {
-            gain: 0.5,
-            frame_identity: ImageFrameIdentity::from(&stream_identity()),
+        let identity = ImageFrameIdentity::from(&stream_identity());
+        let score = DataPacket::Score(Arc::new(CalibrationFrameScore {
+            score: 0.5,
+            frame_identity: identity.clone(),
+        }));
+        let signal = DataPacket::CaptureSignal(Arc::new(CaptureSignal {
+            accepted: true,
+            frame_identity: identity.clone(),
+        }));
+        let trigger = DataPacket::CaptureTrigger(Arc::new(CaptureTrigger {
+            frame_identity: identity,
         }));
         let target = DataPacket::Target(Arc::new(serde_json::json!({})));
         assert_eq!(coverage.port_kind(), "calib.coverage");
         assert_eq!(dataset.port_kind(), "calib.dataset");
         assert_eq!(report.port_kind(), "calib.report");
         assert_eq!(score.port_kind(), "capture.score");
+        assert_eq!(signal.port_kind(), "capture.signal");
+        assert_eq!(trigger.port_kind(), "capture.trigger");
         assert_eq!(target.port_kind(), "capture.target");
     }
 

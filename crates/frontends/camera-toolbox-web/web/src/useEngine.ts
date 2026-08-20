@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { loadRuntimeNodeOutput, type NodeActionName } from './workflow';
-import { subscribeTopic, wsRequest } from './useEngineSocket';
+import { loadRuntimeNodeOutput, nodeAction, type DatasetSampleActionPayload, type NodeActionName } from './workflow';
+import { subscribeTopic } from './useEngineSocket';
 
 export type EngineState = 'disabled' | 'idle' | 'ready' | 'running' | 'warning' | 'error';
 
@@ -28,6 +28,20 @@ export function useEngine() {
       .then((output) => setNodeOutputs((current) => ({ ...current, [nodeId]: output })))
       .catch(() => undefined);
   }, []);
+
+  const clearPendingAction = useCallback((nodeId: string, action?: NodeActionName) => {
+    if (!(nodeId in pendingActionsRef.current)) {
+      return;
+    }
+    if (action && pendingActionsRef.current[nodeId] !== action) {
+      return;
+    }
+    const nextPending = { ...pendingActionsRef.current };
+    delete nextPending[nodeId];
+    pendingActionsRef.current = nextPending;
+    setPendingActions(nextPending);
+    refreshNodeOutput(nodeId);
+  }, [refreshNodeOutput]);
   // 订阅 status 推送，按 nodeId 覆盖 state/diagnostic，合并进本地状态。
   useEffect(() => {
     return subscribeTopic('status', (payload) => {
@@ -36,13 +50,7 @@ export function useEngine() {
         return;
       }
       setNodeStates((current) => ({ ...current, [status.nodeId]: status.state }));
-      if (status.nodeId in pendingActionsRef.current) {
-        const nextPending = { ...pendingActionsRef.current };
-        delete nextPending[status.nodeId];
-        pendingActionsRef.current = nextPending;
-        setPendingActions(nextPending);
-        refreshNodeOutput(status.nodeId);
-      }
+      clearPendingAction(status.nodeId);
       setNodeDiagnostics((current) => {
         if (typeof status.diagnostic === 'string' && status.diagnostic.trim()) {
           return { ...current, [status.nodeId]: status.diagnostic };
@@ -52,19 +60,20 @@ export function useEngine() {
         return next;
       });
     });
-  }, [refreshNodeOutput]);
+  }, [clearPendingAction]);
 
 
-  /** 派发节点动作（connect/disconnect/trigger/arm/disarm）；同一节点同一时刻只允许一个动作在途。 */
-  const sendAction = useCallback((nodeId: string, action: NodeActionName) => {
+  /** 派发节点动作；样本审核可带非持久化的 `{ sampleId }` payload，同一节点同一时刻只允许一个动作在途。 */
+  const sendAction = useCallback((nodeId: string, action: NodeActionName, payload?: DatasetSampleActionPayload) => {
     if (pendingActionsRef.current[nodeId]) {
       return;
     }
     pendingActionsRef.current = { ...pendingActionsRef.current, [nodeId]: action };
     setPendingActions(pendingActionsRef.current);
-    void wsRequest('runtime.node.action', { nodeId, action })
+    void nodeAction(nodeId, action, payload)
       .then(() => {
-        refreshNodeOutput(nodeId);
+        // WS ack 只代表动作已入队，节点 actor 可能还没 emit runtime output；延迟刷新避免抢读旧 dataset。
+        window.setTimeout(() => refreshNodeOutput(nodeId), 100);
         window.setTimeout(() => {
           if (pendingActionsRef.current[nodeId] !== action) {
             return;
@@ -86,7 +95,7 @@ export function useEngine() {
         pendingActionsRef.current = nextPending;
         setPendingActions(nextPending);
       });
-  }, [refreshNodeOutput]);
+  }, [clearPendingAction]);
 
   return { nodeStates, nodeDiagnostics, nodeOutputs, pendingActions, sendAction, refreshNodeOutput };
 }

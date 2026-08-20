@@ -36,7 +36,11 @@ use crate::engine::NodeRegistry;
 
 pub use auto_capture::{AutoCaptureFactory, AutoCaptureNode};
 pub use calibration_solver::{CalibrationSolverFactory, CalibrationSolverNode};
-pub use capture_logic::{CaptureGateFactory, CaptureGateNode, GainScorerFactory, GainScorerNode};
+pub use capture_logic::{
+    CalibrationFrameScorerFactory, CalibrationFrameScorerNode, CaptureRequestBuilderFactory,
+    CaptureRequestBuilderNode, ConsecutiveHoldGateFactory, ConsecutiveHoldGateNode,
+    ScoreThresholdGateFactory, ScoreThresholdGateNode,
+};
 pub use composite::{
     CoverageAnalyzerFactory, CoverageAnalyzerNode, DatasetCollectorFactory, DatasetCollectorNode,
     OverlayComposerFactory, OverlayComposerNode, PoseGuideFactory, PoseGuideNode,
@@ -71,8 +75,10 @@ pub fn register_builtin(registry: &mut NodeRegistry) {
     registry.register(Box::new(CoverageAnalyzerFactory));
     registry.register(Box::new(PoseGuideFactory));
     registry.register(Box::new(ChessboardDetectorFactory));
-    registry.register(Box::new(GainScorerFactory));
-    registry.register(Box::new(CaptureGateFactory));
+    registry.register(Box::new(CalibrationFrameScorerFactory));
+    registry.register(Box::new(ScoreThresholdGateFactory));
+    registry.register(Box::new(ConsecutiveHoldGateFactory));
+    registry.register(Box::new(CaptureRequestBuilderFactory));
     registry.register(Box::new(LocalFileSourceFactory));
     registry.register(Box::new(SftpFileSourceFactory));
     registry.register(Box::new(SshSessionFactory));
@@ -107,8 +113,10 @@ mod tests {
             "coverageAnalyzer",
             "poseGuide",
             "chessboardDetector",
-            "gainScorer",
-            "captureGate",
+            "calibrationFrameScorer",
+            "scoreThresholdGate",
+            "consecutiveHoldGate",
+            "captureRequestBuilder",
             "localFileSource",
             "sftpFileSource",
             "sshSession",

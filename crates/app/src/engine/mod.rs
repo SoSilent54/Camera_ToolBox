@@ -20,9 +20,9 @@ pub use graph::{EdgeSpec, GraphBuildError, GraphEngine, GraphSpec, PortEndpoint}
 pub use node::{NodeAction, NodeError, NodeFactory, NodeInstance, kinds};
 pub use nodes::register_builtin;
 pub use packet::{
-    BayerPattern, CaptureMode, CaptureRequest, CaptureTarget, ColorMetadata, ColorSpace,
-    DataPacket, DetectionPacket, FrameProvenance, GainScore, ImageFrame, ImageFrameError,
-    ImageFrameFormat, ImageFrameIdentity, ImagePlane, RawMetadata,
+    BayerPattern, CalibrationFrameScore, CaptureMode, CaptureRequest, CaptureSignal, CaptureTarget,
+    CaptureTrigger, ColorMetadata, ColorSpace, DataPacket, DetectionPacket, FrameProvenance,
+    ImageFrame, ImageFrameError, ImageFrameFormat, ImageFrameIdentity, ImagePlane, RawMetadata,
 };
 pub use registry::NodeRegistry;
 pub use runtime::{NodeReporter, NodeRuntime, OutputRegistry, SpawnContext};

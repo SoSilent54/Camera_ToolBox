@@ -1,50 +1,51 @@
-//! 最小确定性采集逻辑节点：`Detection -> GainScore -> CaptureRequest`。
+//! 自动标定采集逻辑节点：检测评分、阈值判断、连续保持和请求构造。
 //!
-//! 节点只在收到数据包时同步计算，不引入计时、后台循环或隐藏状态机。帧身份从检测
-//! 结果复制到评分，再作为 `CaptureRequest::source_identity` 原样传递给采集适配器。
+//! 每个节点只承担一个确定性职责；帧身份从检测结果一直传到最终的
+//! [`CaptureRequest::source_identity`]，不创建时间对齐或重建来源身份。
 
 use std::sync::Arc;
 
-use crate::{
-    engine::{
-        CaptureMode, CaptureRequest, CaptureTarget, DataPacket, FrameProvenance, GainScore,
-        NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec,
-    },
-    platform::SourcePts,
+use crate::engine::{
+    CalibrationFrameScore, CaptureMode, CaptureRequest, CaptureSignal, CaptureTarget,
+    CaptureTrigger, DataPacket, FrameProvenance, ImageFrameIdentity, NodeAction, NodeError,
+    NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec,
 };
 
-/// 将棋盘角点完整度映射为归一化 gain。
-pub struct GainScorerFactory;
+/// 将棋盘角点完整度映射为归一化标定帧评分。
+pub struct CalibrationFrameScorerFactory;
 
-impl NodeFactory for GainScorerFactory {
+impl NodeFactory for CalibrationFrameScorerFactory {
     fn kind(&self) -> &'static str {
-        "gainScorer"
+        "calibrationFrameScorer"
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(GainScorerNode { spec }))
+        Ok(Box::new(CalibrationFrameScorerNode { spec }))
     }
 }
 
-pub struct GainScorerNode {
+pub struct CalibrationFrameScorerNode {
     spec: NodeSpec,
 }
 
-impl GainScorerNode {
+impl CalibrationFrameScorerNode {
+    /// 返回棋盘规格要求的内角点数，避免零除或无意义的评分。
     fn expected_corners(&self) -> Result<usize, NodeError> {
         let expected = config_u64(&self.spec, "expectedCorners", 88)?;
         usize::try_from(expected)
             .ok()
             .filter(|value| *value > 0)
             .ok_or_else(|| {
-                NodeError::Config("gainScorer.expectedCorners must be a positive usize".to_owned())
+                NodeError::Config(
+                    "calibrationFrameScorer.expectedCorners must be a positive usize".to_owned(),
+                )
             })
     }
 }
 
-impl NodeInstance for GainScorerNode {
+impl NodeInstance for CalibrationFrameScorerNode {
     fn kind(&self) -> &'static str {
-        "gainScorer"
+        "calibrationFrameScorer"
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -63,24 +64,39 @@ impl NodeInstance for GainScorerNode {
         }
         let DataPacket::Detection(detection) = packet else {
             return Err(NodeError::Precondition(
-                "gainScorer.detection requires calib.detection".to_owned(),
+                "calibrationFrameScorer.detection requires calib.detection".to_owned(),
             ));
         };
         let expected = self.expected_corners()?;
-        let gain = (detection.detection.corners.len() as f64 / expected as f64).min(1.0);
+        let score = (detection.detection.corners.len() as f64 / expected as f64).min(1.0);
         rt.emit(
             "score",
-            DataPacket::Score(Arc::new(GainScore {
-                gain,
+            DataPacket::Score(Arc::new(CalibrationFrameScore {
+                score,
                 frame_identity: detection.frame_identity.clone(),
             })),
         )?;
-        rt.report_event(format!("scored detection gain {gain:.3}"));
+        rt.report_event(format!("calibration frame scored {score:.3}"));
         Ok(())
     }
 
     fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
         Err(NodeError::UnsupportedAction(action.name().to_owned()))
+    }
+
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let next = NodeSpec {
+            config,
+            ..self.spec.clone()
+        };
+        let probe = Self { spec: next.clone() };
+        probe.expected_corners()?;
+        self.spec = next;
+        Ok(())
     }
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -89,116 +105,42 @@ impl NodeInstance for GainScorerNode {
     }
 }
 
-/// 对达到阈值的不同帧做固定帧数的稳定保持，并创建精确的抓帧请求。
-pub struct CaptureGateFactory;
+/// 将评分转换为带明确接受状态的通用阈值信号。
+pub struct ScoreThresholdGateFactory;
 
-impl NodeFactory for CaptureGateFactory {
+impl NodeFactory for ScoreThresholdGateFactory {
     fn kind(&self) -> &'static str {
-        "captureGate"
+        "scoreThresholdGate"
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(CaptureGateNode {
-            spec,
-            stable_frames: 0,
-            last_identity: None,
-        }))
+        Ok(Box::new(ScoreThresholdGateNode { spec }))
     }
 }
 
-pub struct CaptureGateNode {
+pub struct ScoreThresholdGateNode {
     spec: NodeSpec,
-    stable_frames: u8,
-    last_identity: Option<crate::engine::ImageFrameIdentity>,
 }
 
-impl CaptureGateNode {
-    fn config(&self) -> Result<CaptureGateConfig, NodeError> {
-        let minimum_gain = config_f64(&self.spec, "minimumGain", 0.4)?;
-        if !minimum_gain.is_finite() || !(0.0..=1.0).contains(&minimum_gain) {
+impl ScoreThresholdGateNode {
+    fn threshold(&self) -> Result<f64, NodeError> {
+        let threshold = config_f64(&self.spec, "threshold", 0.4)?;
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
             return Err(NodeError::Config(
-                "captureGate.minimumGain must be finite and within [0, 1]".to_owned(),
+                "scoreThresholdGate.threshold must be finite and within [0, 1]".to_owned(),
             ));
         }
-        let hold_frames = config_u64(&self.spec, "holdFrames", 3)?;
-        let hold_frames = u8::try_from(hold_frames).map_err(|_| {
-            NodeError::Config("captureGate.holdFrames must be within 1..=30".to_owned())
-        })?;
-        if !(1..=30).contains(&hold_frames) {
-            return Err(NodeError::Config(
-                "captureGate.holdFrames must be within 1..=30".to_owned(),
-            ));
-        }
-        let channel = config_u16(&self.spec, "channel", 0)?;
-        let camera = config_u16(&self.spec, "camera", 0)?;
-        let target = match config_string(&self.spec, "target", "yuv").as_str() {
-            "yuv" => CaptureTarget::Yuv { channel },
-            "raw" => CaptureTarget::Raw { camera },
-            value => {
-                return Err(NodeError::Config(format!(
-                    "captureGate.target `{value}` is unsupported; expected yuv or raw"
-                )));
-            }
-        };
-        Ok(CaptureGateConfig {
-            minimum_gain,
-            hold_frames,
-            target,
-            mode: config_string(&self.spec, "mode", "latest"),
-            rtsp_pts_tolerance_90k: config_u64(&self.spec, "rtspPtsTolerance90k", 0)?,
-        })
-    }
-
-    fn capture_mode(
-        mode: &str,
-        identity: &crate::engine::ImageFrameIdentity,
-        tolerance: u64,
-    ) -> Result<CaptureMode, NodeError> {
-        match mode {
-            "latest" => Ok(CaptureMode::Latest),
-            "frame_id" => Ok(CaptureMode::FrameId(identity.frame_sequence)),
-            "timestamp_ns" => Ok(CaptureMode::TimestampNs(identity.host_monotonic_time_ns)),
-            "rtsp_pts_90k" => match &identity.source_pts {
-                SourcePts::Known {
-                    ticks,
-                    time_base_numerator: 1,
-                    time_base_denominator: 90_000,
-                    ..
-                } if *ticks >= 0 => Ok(CaptureMode::RtspPts90k {
-                    pts: *ticks as u64,
-                    tolerance,
-                }),
-                _ => Err(NodeError::Precondition(
-                    "captureGate rtsp_pts_90k mode requires a non-negative 1/90000 source PTS"
-                        .to_owned(),
-                )),
-            },
-            value => Err(NodeError::Config(format!(
-                "captureGate.mode `{value}` is unsupported; expected latest, frame_id, timestamp_ns, or rtsp_pts_90k"
-            ))),
-        }
-    }
-
-    fn validate_source(identity: &crate::engine::ImageFrameIdentity) -> Result<(), NodeError> {
-        match &identity.provenance {
-            FrameProvenance::Stream { .. } | FrameProvenance::Device { .. } => Ok(()),
-            FrameProvenance::File { .. } => Err(NodeError::Precondition(
-                "captureGate cannot request a new capture from a file-backed frame".to_owned(),
-            )),
-            FrameProvenance::Unknown { .. } => Err(NodeError::Precondition(
-                "captureGate requires a source frame identity".to_owned(),
-            )),
-        }
+        Ok(threshold)
     }
 }
 
-impl NodeInstance for CaptureGateNode {
+impl NodeInstance for ScoreThresholdGateNode {
     fn kind(&self) -> &'static str {
-        "captureGate"
+        "scoreThresholdGate"
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Ready, "waiting for stable gain scores");
+        rt.report_state(NodeRuntimeState::Ready, "waiting for frame scores");
         Ok(())
     }
 
@@ -213,53 +155,29 @@ impl NodeInstance for CaptureGateNode {
         }
         let DataPacket::Score(score) = packet else {
             return Err(NodeError::Precondition(
-                "captureGate.score requires capture.score".to_owned(),
+                "scoreThresholdGate.score requires capture.score".to_owned(),
             ));
         };
-        let config = self.config()?;
-        if !score.gain.is_finite() || !(0.0..=1.0).contains(&score.gain) {
+        if !score.score.is_finite() || !(0.0..=1.0).contains(&score.score) {
             return Err(NodeError::Precondition(
-                "captureGate received an invalid gain outside [0, 1]".to_owned(),
+                "scoreThresholdGate received a score outside [0, 1]".to_owned(),
             ));
         }
-        Self::validate_source(&score.frame_identity)?;
-        if self.last_identity.as_ref() == Some(&score.frame_identity) {
-            rt.report_event("ignored duplicate score for the same source frame");
-            return Ok(());
-        }
-        self.last_identity = Some(score.frame_identity.clone());
-        if score.gain < config.minimum_gain {
-            self.stable_frames = 0;
-            rt.report_event(format!(
-                "gain {:.3} below minimum {:.3}; stable hold reset",
-                score.gain, config.minimum_gain
-            ));
-            return Ok(());
-        }
-        self.stable_frames = self.stable_frames.saturating_add(1);
-        if self.stable_frames < config.hold_frames {
-            rt.report_event(format!(
-                "stable hold {}/{}",
-                self.stable_frames, config.hold_frames
-            ));
-            return Ok(());
-        }
-
-        let mode = Self::capture_mode(
-            &config.mode,
-            &score.frame_identity,
-            config.rtsp_pts_tolerance_90k,
-        )?;
+        let threshold = self.threshold()?;
+        let accepted = score.score >= threshold;
         rt.emit(
-            "capture",
-            DataPacket::CaptureRequest(Arc::new(CaptureRequest {
-                target: config.target,
-                mode,
-                source_identity: Some(score.frame_identity.clone()),
+            "signal",
+            DataPacket::CaptureSignal(Arc::new(CaptureSignal {
+                accepted,
+                frame_identity: score.frame_identity.clone(),
             })),
         )?;
-        self.stable_frames = 0;
-        rt.report_event("capture request emitted after stable hold");
+        rt.report_event(format!(
+            "frame score {:.3} {} threshold {:.3}",
+            score.score,
+            if accepted { "meets" } else { "below" },
+            threshold
+        ));
         Ok(())
     }
 
@@ -267,20 +185,291 @@ impl NodeInstance for CaptureGateNode {
         Err(NodeError::UnsupportedAction(action.name().to_owned()))
     }
 
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let next = NodeSpec {
+            config,
+            ..self.spec.clone()
+        };
+        let probe = Self { spec: next.clone() };
+        probe.threshold()?;
+        self.spec = next;
+        Ok(())
+    }
+
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        self.stable_frames = 0;
+        rt.report_state(NodeRuntimeState::Idle, "stopped");
+        Ok(())
+    }
+}
+
+/// 对不同来源帧的已接受信号做连续保持，达到数量后产生一次抓帧触发。
+pub struct ConsecutiveHoldGateFactory;
+
+impl NodeFactory for ConsecutiveHoldGateFactory {
+    fn kind(&self) -> &'static str {
+        "consecutiveHoldGate"
+    }
+
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+        Ok(Box::new(ConsecutiveHoldGateNode {
+            spec,
+            consecutive_count: 0,
+            last_identity: None,
+        }))
+    }
+}
+
+pub struct ConsecutiveHoldGateNode {
+    spec: NodeSpec,
+    consecutive_count: u8,
+    last_identity: Option<ImageFrameIdentity>,
+}
+
+impl ConsecutiveHoldGateNode {
+    fn hold_count(&self) -> Result<u8, NodeError> {
+        let hold_count = config_u64(&self.spec, "holdCount", 3)?;
+        let hold_count = u8::try_from(hold_count).map_err(|_| {
+            NodeError::Config("consecutiveHoldGate.holdCount must be within 1..=30".to_owned())
+        })?;
+        if !(1..=30).contains(&hold_count) {
+            return Err(NodeError::Config(
+                "consecutiveHoldGate.holdCount must be within 1..=30".to_owned(),
+            ));
+        }
+        Ok(hold_count)
+    }
+}
+
+impl NodeInstance for ConsecutiveHoldGateNode {
+    fn kind(&self) -> &'static str {
+        "consecutiveHoldGate"
+    }
+
+    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        rt.report_state(
+            NodeRuntimeState::Ready,
+            "waiting for accepted frame signals",
+        );
+        Ok(())
+    }
+
+    fn on_input(
+        &mut self,
+        port: &str,
+        packet: DataPacket,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        if port != "signal" {
+            return Ok(());
+        }
+        let DataPacket::CaptureSignal(signal) = packet else {
+            return Err(NodeError::Precondition(
+                "consecutiveHoldGate.signal requires capture.signal".to_owned(),
+            ));
+        };
+        if self.last_identity.as_ref() == Some(&signal.frame_identity) {
+            rt.report_event("ignored duplicate signal for the same source frame");
+            return Ok(());
+        }
+        self.last_identity = Some(signal.frame_identity.clone());
+        if !signal.accepted {
+            self.consecutive_count = 0;
+            rt.report_event("rejected signal reset consecutive hold");
+            return Ok(());
+        }
+
+        let hold_count = self.hold_count()?;
+        self.consecutive_count = self.consecutive_count.saturating_add(1);
+        if self.consecutive_count < hold_count {
+            rt.report_event(format!(
+                "consecutive hold {}/{}",
+                self.consecutive_count, hold_count
+            ));
+            return Ok(());
+        }
+
+        rt.emit(
+            "trigger",
+            DataPacket::CaptureTrigger(Arc::new(CaptureTrigger {
+                frame_identity: signal.frame_identity.clone(),
+            })),
+        )?;
+        self.consecutive_count = 0;
+        rt.report_event("capture trigger emitted after consecutive hold");
+        Ok(())
+    }
+
+    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        Err(NodeError::UnsupportedAction(action.name().to_owned()))
+    }
+
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let next = NodeSpec {
+            config,
+            ..self.spec.clone()
+        };
+        let probe = Self {
+            spec: next.clone(),
+            consecutive_count: 0,
+            last_identity: None,
+        };
+        probe.hold_count()?;
+        self.spec = next;
+        self.consecutive_count = 0;
+        self.last_identity = None;
+        Ok(())
+    }
+
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        self.consecutive_count = 0;
         self.last_identity = None;
         rt.report_state(NodeRuntimeState::Idle, "stopped");
         Ok(())
     }
 }
 
-struct CaptureGateConfig {
-    minimum_gain: f64,
-    hold_frames: u8,
-    target: CaptureTarget,
-    mode: String,
-    rtsp_pts_tolerance_90k: u64,
+/// 基于触发帧身份和设备配置构造精确的 `CaptureRequest`。
+pub struct CaptureRequestBuilderFactory;
+
+impl NodeFactory for CaptureRequestBuilderFactory {
+    fn kind(&self) -> &'static str {
+        "captureRequestBuilder"
+    }
+
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
+        Ok(Box::new(CaptureRequestBuilderNode { spec }))
+    }
+}
+
+pub struct CaptureRequestBuilderNode {
+    spec: NodeSpec,
+}
+
+impl CaptureRequestBuilderNode {
+    fn capture_target(&self) -> Result<CaptureTarget, NodeError> {
+        match config_string(&self.spec, "target", "yuv").as_str() {
+            "yuv" => {
+                config_u16(&self.spec, "channel", 0).map(|channel| CaptureTarget::Yuv { channel })
+            }
+            "raw" => {
+                config_u16(&self.spec, "camera", 0).map(|camera| CaptureTarget::Raw { camera })
+            }
+            value => Err(NodeError::Config(format!(
+                "captureRequestBuilder.target `{value}` is unsupported; expected yuv or raw"
+            ))),
+        }
+    }
+
+    fn capture_mode(&self, identity: &ImageFrameIdentity) -> Result<CaptureMode, NodeError> {
+        let mode = config_string(&self.spec, "mode", "latest");
+        match mode.as_str() {
+            "latest" => Ok(CaptureMode::Latest),
+            "frame_id" => Ok(CaptureMode::FrameId(identity.frame_sequence)),
+            "timestamp_ns" => identity.device_timestamp_ns().map_or_else(
+                || {
+                    Err(NodeError::Precondition(
+                        "captureRequestBuilder timestamp_ns mode requires device timestamp_ns metadata"
+                            .to_owned(),
+                    ))
+                },
+                |timestamp_ns| Ok(CaptureMode::TimestampNs(timestamp_ns)),
+            ),
+            value => Err(NodeError::Config(format!(
+                "captureRequestBuilder.mode `{value}` is unsupported; expected latest, frame_id, or timestamp_ns"
+            ))),
+        }
+    }
+
+    fn validate_config(&self) -> Result<(), NodeError> {
+        self.capture_target()?;
+        match config_string(&self.spec, "mode", "latest").as_str() {
+            "latest" | "frame_id" | "timestamp_ns" => Ok(()),
+            value => Err(NodeError::Config(format!(
+                "captureRequestBuilder.mode `{value}` is unsupported; expected latest, frame_id, or timestamp_ns"
+            ))),
+        }
+    }
+
+    fn validate_source(identity: &ImageFrameIdentity) -> Result<(), NodeError> {
+        match &identity.provenance {
+            FrameProvenance::Stream { .. } | FrameProvenance::Device { .. } => Ok(()),
+            FrameProvenance::File { .. } => Err(NodeError::Precondition(
+                "captureRequestBuilder cannot request a new capture from a file-backed frame"
+                    .to_owned(),
+            )),
+            FrameProvenance::Unknown { .. } => Err(NodeError::Precondition(
+                "captureRequestBuilder requires a source frame identity".to_owned(),
+            )),
+        }
+    }
+}
+
+impl NodeInstance for CaptureRequestBuilderNode {
+    fn kind(&self) -> &'static str {
+        "captureRequestBuilder"
+    }
+
+    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        rt.report_state(NodeRuntimeState::Ready, "waiting for capture triggers");
+        Ok(())
+    }
+
+    fn on_input(
+        &mut self,
+        port: &str,
+        packet: DataPacket,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        if port != "trigger" {
+            return Ok(());
+        }
+        let DataPacket::CaptureTrigger(trigger) = packet else {
+            return Err(NodeError::Precondition(
+                "captureRequestBuilder.trigger requires capture.trigger".to_owned(),
+            ));
+        };
+        Self::validate_source(&trigger.frame_identity)?;
+        let request = CaptureRequest {
+            target: self.capture_target()?,
+            mode: self.capture_mode(&trigger.frame_identity)?,
+            source_identity: Some(trigger.frame_identity.clone()),
+        };
+        rt.emit("capture", DataPacket::CaptureRequest(Arc::new(request)))?;
+        rt.report_event("capture request constructed from trigger identity");
+        Ok(())
+    }
+
+    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        Err(NodeError::UnsupportedAction(action.name().to_owned()))
+    }
+
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        _rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let next = NodeSpec {
+            config,
+            ..self.spec.clone()
+        };
+        let probe = Self { spec: next.clone() };
+        probe.validate_config()?;
+        self.spec = next;
+        Ok(())
+    }
+
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        rt.report_state(NodeRuntimeState::Idle, "stopped");
+        Ok(())
+    }
 }
 
 fn config_string(spec: &NodeSpec, key: &str, fallback: &str) -> String {
@@ -323,14 +512,13 @@ mod tests {
     use super::*;
     use crate::{
         engine::{
-            DetectionPacket, ImageFrameIdentity, NodeReporter, OutputRegistry, PortCardinality,
-            PortSpec, SpawnContext,
+            DetectionPacket, NodeReporter, OutputRegistry, PortCardinality, PortSpec, SpawnContext,
         },
-        platform::{SourcePtsProvenance, StreamFrameIdentity, StreamSessionId},
+        platform::{SourcePts, SourcePtsProvenance, StreamFrameIdentity, StreamSessionId},
     };
 
     fn stream_identity(sequence: u64) -> ImageFrameIdentity {
-        ImageFrameIdentity::from(&StreamFrameIdentity::known_at(
+        ImageFrameIdentity::from(&StreamFrameIdentity::known_at_with_device_timestamp(
             StreamSessionId::new("logic-test").expect("valid stream id"),
             0,
             sequence,
@@ -340,7 +528,8 @@ mod tests {
                 time_base_denominator: 90_000,
                 provenance: SourcePtsProvenance::FfmpegDecodedFrame,
             },
-            sequence * 1_000,
+            sequence * 10,
+            Some(sequence * 1_000),
         ))
     }
 
@@ -356,9 +545,22 @@ mod tests {
         }))
     }
 
-    fn score(sequence: u64, gain: f64) -> DataPacket {
-        DataPacket::Score(Arc::new(GainScore {
-            gain,
+    fn score(sequence: u64, value: f64) -> DataPacket {
+        DataPacket::Score(Arc::new(CalibrationFrameScore {
+            score: value,
+            frame_identity: stream_identity(sequence),
+        }))
+    }
+
+    fn signal(sequence: u64, accepted: bool) -> DataPacket {
+        DataPacket::CaptureSignal(Arc::new(CaptureSignal {
+            accepted,
+            frame_identity: stream_identity(sequence),
+        }))
+    }
+
+    fn trigger(sequence: u64) -> DataPacket {
+        DataPacket::CaptureTrigger(Arc::new(CaptureTrigger {
             frame_identity: stream_identity(sequence),
         }))
     }
@@ -380,45 +582,27 @@ mod tests {
         })
     }
 
-    fn gain_spec() -> NodeSpec {
+    fn node_spec(
+        kind: &str,
+        input: (&str, &str),
+        output: (&str, &str),
+        config: serde_json::Value,
+    ) -> NodeSpec {
         NodeSpec {
-            id: "gain".to_owned(),
-            kind: "gainScorer".to_owned(),
-            title: "Gain".to_owned(),
+            id: kind.to_owned(),
+            kind: kind.to_owned(),
+            title: kind.to_owned(),
             inputs: vec![PortSpec {
-                id: "detection".to_owned(),
-                label: "Detection".to_owned(),
-                kind: "calib.detection".to_owned(),
+                id: input.0.to_owned(),
+                label: input.0.to_owned(),
+                kind: input.1.to_owned(),
                 cardinality: PortCardinality::One,
                 required: true,
             }],
             outputs: vec![PortSpec {
-                id: "score".to_owned(),
-                label: "Score".to_owned(),
-                kind: "capture.score".to_owned(),
-                cardinality: PortCardinality::One,
-                required: true,
-            }],
-            config: serde_json::json!({"expectedCorners": 4}),
-        }
-    }
-
-    fn gate_spec(config: serde_json::Value) -> NodeSpec {
-        NodeSpec {
-            id: "gate".to_owned(),
-            kind: "captureGate".to_owned(),
-            title: "Gate".to_owned(),
-            inputs: vec![PortSpec {
-                id: "score".to_owned(),
-                label: "Score".to_owned(),
-                kind: "capture.score".to_owned(),
-                cardinality: PortCardinality::One,
-                required: true,
-            }],
-            outputs: vec![PortSpec {
-                id: "capture".to_owned(),
-                label: "Capture".to_owned(),
-                kind: "command.capture".to_owned(),
+                id: output.0.to_owned(),
+                label: output.0.to_owned(),
+                kind: output.1.to_owned(),
                 cardinality: PortCardinality::One,
                 required: true,
             }],
@@ -426,12 +610,48 @@ mod tests {
         }
     }
 
+    fn scorer_spec() -> NodeSpec {
+        node_spec(
+            "calibrationFrameScorer",
+            ("detection", "calib.detection"),
+            ("score", "capture.score"),
+            serde_json::json!({"expectedCorners": 4}),
+        )
+    }
+
+    fn threshold_spec(config: serde_json::Value) -> NodeSpec {
+        node_spec(
+            "scoreThresholdGate",
+            ("score", "capture.score"),
+            ("signal", "capture.signal"),
+            config,
+        )
+    }
+
+    fn hold_spec(config: serde_json::Value) -> NodeSpec {
+        node_spec(
+            "consecutiveHoldGate",
+            ("signal", "capture.signal"),
+            ("trigger", "capture.trigger"),
+            config,
+        )
+    }
+
+    fn builder_spec(config: serde_json::Value) -> NodeSpec {
+        node_spec(
+            "captureRequestBuilder",
+            ("trigger", "capture.trigger"),
+            ("capture", "command.capture.request.v1"),
+            config,
+        )
+    }
+
     #[test]
-    fn gain_scorer_preserves_detection_frame_identity() {
+    fn calibration_frame_scorer_preserves_detection_frame_identity() {
         let record = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = runtime(Arc::clone(&record));
-        let mut node = GainScorerFactory
-            .instantiate(gain_spec())
+        let mut node = CalibrationFrameScorerFactory
+            .instantiate(scorer_spec())
             .expect("instantiate");
 
         node.on_input("detection", detection(7, 3), &mut runtime)
@@ -445,97 +665,250 @@ mod tests {
         let DataPacket::Score(score) = output else {
             panic!("expected score output");
         };
-        assert_eq!(score.gain, 0.75);
+        assert_eq!(score.score, 0.75);
         assert_eq!(score.frame_identity, stream_identity(7));
     }
 
     #[test]
-    fn capture_gate_emits_typed_request_after_stable_hold() {
+    fn score_threshold_gate_emits_accepted_and_rejected_signals() {
         let record = Arc::new(Mutex::new(Vec::new()));
         let mut runtime = runtime(Arc::clone(&record));
-        let mut node = CaptureGateFactory
-            .instantiate(gate_spec(serde_json::json!({
-                "minimumGain": 0.4,
-                "holdFrames": 3,
-                "mode": "latest",
+        let mut node = ScoreThresholdGateFactory
+            .instantiate(threshold_spec(serde_json::json!({"threshold": 0.5})))
+            .expect("instantiate");
+
+        node.on_input("score", score(1, 0.5), &mut runtime)
+            .expect("accepted score");
+        node.on_input("score", score(2, 0.49), &mut runtime)
+            .expect("rejected score");
+
+        let outputs = record.lock().expect("record lock");
+        assert_eq!(outputs.len(), 2);
+        let DataPacket::CaptureSignal(first) = &outputs[0] else {
+            panic!("expected accepted signal");
+        };
+        let DataPacket::CaptureSignal(second) = &outputs[1] else {
+            panic!("expected rejected signal");
+        };
+        assert_eq!(
+            (first.accepted, &first.frame_identity),
+            (true, &stream_identity(1))
+        );
+        assert_eq!(
+            (second.accepted, &second.frame_identity),
+            (false, &stream_identity(2))
+        );
+    }
+
+    #[test]
+    fn consecutive_hold_gate_requires_distinct_accepted_signals() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = runtime(Arc::clone(&record));
+        let mut node = ConsecutiveHoldGateFactory
+            .instantiate(hold_spec(serde_json::json!({"holdCount": 2})))
+            .expect("instantiate");
+
+        node.on_input("signal", signal(1, true), &mut runtime)
+            .expect("first accepted signal");
+        node.on_input("signal", signal(1, true), &mut runtime)
+            .expect("duplicate signal");
+        node.on_input("signal", signal(2, true), &mut runtime)
+            .expect("second accepted signal");
+        node.on_input("signal", signal(3, true), &mut runtime)
+            .expect("next accepted signal");
+        node.on_input("signal", signal(4, false), &mut runtime)
+            .expect("rejected signal");
+        node.on_input("signal", signal(5, true), &mut runtime)
+            .expect("accepted signal after reset");
+
+        let outputs = record.lock().expect("record lock");
+        assert_eq!(outputs.len(), 1);
+        let DataPacket::CaptureTrigger(trigger) = &outputs[0] else {
+            panic!("expected capture trigger");
+        };
+        assert_eq!(trigger.frame_identity, stream_identity(2));
+    }
+
+    #[test]
+    fn capture_request_builder_preserves_identity_and_validates_config() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = runtime(Arc::clone(&record));
+        let mut node = CaptureRequestBuilderFactory
+            .instantiate(builder_spec(serde_json::json!({
+                "target": "yuv",
                 "channel": 3,
-                "camera": 1,
-                "target": "yuv"
+                "mode": "timestamp_ns"
             })))
             .expect("instantiate");
 
-        for sequence in 1..=3 {
-            node.on_input("score", score(sequence, 0.7), &mut runtime)
-                .expect("stable score");
-        }
-
+        node.on_input("trigger", trigger(2), &mut runtime)
+            .expect("build request");
         let outputs = record.lock().expect("record lock");
         assert_eq!(outputs.len(), 1);
         let DataPacket::CaptureRequest(request) = &outputs[0] else {
             panic!("expected capture request");
         };
         assert_eq!(request.target, CaptureTarget::Yuv { channel: 3 });
-        assert_eq!(request.mode, CaptureMode::Latest);
-        assert_eq!(request.source_identity.as_ref(), Some(&stream_identity(3)));
-    }
+        assert_eq!(request.mode, CaptureMode::TimestampNs(2_000));
+        assert_eq!(request.source_identity.as_ref(), Some(&stream_identity(2)));
+        drop(outputs);
 
-    #[test]
-    fn capture_gate_resets_unstable_hold_without_triggering() {
-        let record = Arc::new(Mutex::new(Vec::new()));
-        let mut runtime = runtime(Arc::clone(&record));
-        let mut node = CaptureGateFactory
-            .instantiate(gate_spec(
-                serde_json::json!({"minimumGain": 0.4, "holdFrames": 3}),
-            ))
-            .expect("instantiate");
-
-        for (sequence, gain) in [(1, 0.8), (2, 0.1), (3, 0.8), (4, 0.8)] {
-            node.on_input("score", score(sequence, gain), &mut runtime)
-                .expect("score is valid");
-        }
-        assert!(record.lock().expect("record lock").is_empty());
-    }
-
-    #[test]
-    fn capture_gate_rejects_invalid_threshold_unknown_identity_and_target() {
-        let record = Arc::new(Mutex::new(Vec::new()));
-        let mut runtime = runtime(Arc::clone(&record));
-        let mut invalid_threshold = CaptureGateFactory
-            .instantiate(gate_spec(serde_json::json!({"minimumGain": 1.1})))
+        let mut invalid_target = CaptureRequestBuilderFactory
+            .instantiate(builder_spec(serde_json::json!({"target": "rgb"})))
             .expect("instantiate");
         assert!(matches!(
-            invalid_threshold.on_input("score", score(1, 0.8), &mut runtime),
+            invalid_target.on_input("trigger", trigger(1), &mut runtime),
             Err(NodeError::Config(_))
         ));
 
-        let mut invalid_target = CaptureGateFactory
-            .instantiate(gate_spec(serde_json::json!({"target": "rgb"})))
+        let mut invalid_mode = CaptureRequestBuilderFactory
+            .instantiate(builder_spec(serde_json::json!({"mode": "unknown"})))
             .expect("instantiate");
         assert!(matches!(
-            invalid_target.on_input("score", score(1, 0.8), &mut runtime),
+            invalid_mode.on_input("trigger", trigger(1), &mut runtime),
             Err(NodeError::Config(_))
         ));
 
-        let mut missing_identity = CaptureGateFactory
-            .instantiate(gate_spec(serde_json::json!({"holdFrames": 1})))
-            .expect("instantiate");
-        let unknown = DataPacket::Score(Arc::new(GainScore {
-            gain: 0.8,
-            frame_identity: crate::engine::ImageFrameIdentity {
-                provenance: FrameProvenance::Unknown {
-                    reason: "test".to_owned(),
-                },
-                frame_sequence: 0,
-                source_pts: SourcePts::Unavailable {
-                    reason: "test".to_owned(),
-                },
-                host_monotonic_time_ns: 0,
+        let unknown_identity = ImageFrameIdentity {
+            provenance: FrameProvenance::Unknown {
+                reason: "test".to_owned(),
             },
+            frame_sequence: 0,
+            source_pts: SourcePts::Unavailable {
+                reason: "test".to_owned(),
+            },
+            host_monotonic_time_ns: 0,
+            device_timestamp_ns: None,
+        };
+        let unknown_trigger = DataPacket::CaptureTrigger(Arc::new(CaptureTrigger {
+            frame_identity: unknown_identity,
         }));
         assert!(matches!(
-            missing_identity.on_input("score", unknown, &mut runtime),
+            node.on_input("trigger", unknown_trigger, &mut runtime),
             Err(NodeError::Precondition(_))
         ));
-        assert!(record.lock().expect("record lock").is_empty());
+    }
+
+    #[test]
+    fn capture_request_builder_rejects_timestamp_mode_without_device_metadata() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = runtime(record);
+        let mut node = CaptureRequestBuilderFactory
+            .instantiate(builder_spec(serde_json::json!({"mode": "timestamp_ns"})))
+            .expect("instantiate");
+        let identity = ImageFrameIdentity::from(&StreamFrameIdentity::known_at(
+            StreamSessionId::new("logic-test-without-device-timestamp").expect("valid stream id"),
+            0,
+            1,
+            SourcePts::Unavailable {
+                reason: "test".to_owned(),
+            },
+            123,
+        ));
+        let trigger = DataPacket::CaptureTrigger(Arc::new(CaptureTrigger {
+            frame_identity: identity,
+        }));
+
+        assert!(matches!(
+            node.on_input("trigger", trigger, &mut runtime),
+            Err(NodeError::Precondition(_))
+        ));
+    }
+    #[test]
+    fn capture_request_builder_validates_only_the_selected_target_config() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = runtime(Arc::clone(&record));
+        let mut node = CaptureRequestBuilderFactory
+            .instantiate(builder_spec(serde_json::json!({
+                "target": "raw",
+                "camera": 1,
+                "channel": 65_536
+            })))
+            .expect("instantiate");
+
+        node.on_input("trigger", trigger(1), &mut runtime)
+            .expect("build raw request");
+        let output = record
+            .lock()
+            .expect("record lock")
+            .pop()
+            .expect("raw capture request");
+        let DataPacket::CaptureRequest(request) = output else {
+            panic!("expected capture request");
+        };
+        assert_eq!(request.target, CaptureTarget::Raw { camera: 1 });
+        assert_eq!(request.mode, CaptureMode::Latest);
+    }
+
+    #[test]
+    fn config_update_changes_spec_backed_runtime_behavior() {
+        let record = Arc::new(Mutex::new(Vec::new()));
+        let mut runtime = runtime(Arc::clone(&record));
+
+        let mut scorer = CalibrationFrameScorerFactory
+            .instantiate(scorer_spec())
+            .expect("instantiate scorer");
+        scorer
+            .on_config_update(serde_json::json!({"expectedCorners": 2}), &mut runtime)
+            .expect("update scorer config");
+        scorer
+            .on_input("detection", detection(10, 2), &mut runtime)
+            .expect("score after config update");
+        let DataPacket::Score(updated_score) = record.lock().expect("record lock").pop().unwrap()
+        else {
+            panic!("expected score");
+        };
+        assert_eq!(updated_score.score, 1.0);
+
+        let mut threshold = ScoreThresholdGateFactory
+            .instantiate(threshold_spec(serde_json::json!({"threshold": 0.9})))
+            .expect("instantiate threshold");
+        threshold
+            .on_config_update(serde_json::json!({"threshold": 0.4}), &mut runtime)
+            .expect("update threshold config");
+        threshold
+            .on_input("score", score(11, 0.5), &mut runtime)
+            .expect("threshold after config update");
+        let DataPacket::CaptureSignal(updated_signal) =
+            record.lock().expect("record lock").pop().unwrap()
+        else {
+            panic!("expected signal");
+        };
+        assert!(updated_signal.accepted);
+
+        let mut hold = ConsecutiveHoldGateFactory
+            .instantiate(hold_spec(serde_json::json!({"holdCount": 3})))
+            .expect("instantiate hold");
+        hold.on_input("signal", signal(12, true), &mut runtime)
+            .expect("first signal");
+        hold.on_config_update(serde_json::json!({"holdCount": 1}), &mut runtime)
+            .expect("update hold config");
+        hold.on_input("signal", signal(13, true), &mut runtime)
+            .expect("signal after hold update");
+        assert!(matches!(
+            record.lock().expect("record lock").pop().unwrap(),
+            DataPacket::CaptureTrigger(_)
+        ));
+
+        let mut builder = CaptureRequestBuilderFactory
+            .instantiate(builder_spec(
+                serde_json::json!({"target": "yuv", "channel": 0}),
+            ))
+            .expect("instantiate builder");
+        builder
+            .on_config_update(
+                serde_json::json!({"target": "raw", "camera": 2}),
+                &mut runtime,
+            )
+            .expect("update builder config");
+        builder
+            .on_input("trigger", trigger(14), &mut runtime)
+            .expect("builder after config update");
+        let DataPacket::CaptureRequest(request) =
+            record.lock().expect("record lock").pop().unwrap()
+        else {
+            panic!("expected request");
+        };
+        assert_eq!(request.target, CaptureTarget::Raw { camera: 2 });
     }
 }

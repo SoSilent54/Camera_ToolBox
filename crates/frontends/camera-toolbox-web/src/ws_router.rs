@@ -603,15 +603,18 @@ fn runtime_status(state: &AppState) -> Result<Value, String> {
     Ok(serde_json::to_value(statuses).map_err(|e| e.to_string())?)
 }
 
+#[derive(serde::Deserialize)]
+struct RuntimeNodeActionBody {
+    #[serde(rename = "nodeId")]
+    node_id: String,
+    action: String,
+    #[serde(default)]
+    payload: Value,
+}
+
 fn runtime_node_action(payload: Value, state: &AppState) -> Result<Value, String> {
-    #[derive(serde::Deserialize)]
-    struct Body {
-        #[serde(rename = "nodeId")]
-        node_id: String,
-        action: String,
-    }
-    let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
-    let action = engine_api::parse_action_str(&body.action)?;
+    let body: RuntimeNodeActionBody = serde_json::from_value(payload).map_err(deser_err)?;
+    let action = engine_api::parse_action_str(&body.action, body.payload)?;
     ensure_engine_loaded(state)?;
     let engine = state.engine_runtime.engine();
     let engine = engine
@@ -1210,6 +1213,19 @@ mod tests {
                 crate::workflow::seed_workflow_graph(),
             )),
         }
+    }
+
+    #[test]
+    fn runtime_node_action_request_defaults_missing_payload_to_null() {
+        let body: RuntimeNodeActionBody = serde_json::from_value(serde_json::json!({
+            "nodeId": "dataset-1",
+            "action": "clear"
+        }))
+        .expect("legacy action request remains valid");
+
+        assert_eq!(body.node_id, "dataset-1");
+        assert_eq!(body.action, "clear");
+        assert_eq!(body.payload, Value::Null);
     }
 
     #[test]

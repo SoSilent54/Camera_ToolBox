@@ -85,11 +85,13 @@ pub enum NodeKind {
     OverlayComposer,
     Viewer,
     ChessboardDetector,
-    GainScorer,
-    CaptureGate,
+    CalibrationFrameScorer,
+    ScoreThresholdGate,
+    ConsecutiveHoldGate,
     DatasetCollector,
     CoverageAnalyzer,
     AutoCaptureController,
+    CaptureRequestBuilder,
     CalibrationSolver,
     PoseGuide,
     I2cTransfer,
@@ -174,6 +176,10 @@ pub enum PortKind {
     CalibReport,
     #[serde(rename = "capture.score")]
     CaptureScore,
+    #[serde(rename = "capture.signal")]
+    CaptureSignal,
+    #[serde(rename = "capture.trigger")]
+    CaptureTrigger,
     #[serde(rename = "capture.target")]
     CaptureTarget,
     #[serde(rename = "command.capture")]
@@ -278,11 +284,13 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::VideoLayer),
         node_definition(NodeKind::Viewer),
         node_definition(NodeKind::ChessboardDetector),
-        node_definition(NodeKind::GainScorer),
-        node_definition(NodeKind::CaptureGate),
+        node_definition(NodeKind::CalibrationFrameScorer),
+        node_definition(NodeKind::ScoreThresholdGate),
+        node_definition(NodeKind::ConsecutiveHoldGate),
         node_definition(NodeKind::DatasetCollector),
         node_definition(NodeKind::CoverageAnalyzer),
         node_definition(NodeKind::AutoCaptureController),
+        node_definition(NodeKind::CaptureRequestBuilder),
         node_definition(NodeKind::CalibrationSolver),
         node_definition(NodeKind::PoseGuide),
         node_definition(NodeKind::I2cTransfer),
@@ -351,7 +359,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "image.frame.v1",
                 Some(PortRole::Image),
             )],
-            json!({"host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "remoteRoot": "/", "selection": ""}),
+            json!({"host": "", "port": "22", "username": "root", "credentialRef": "", "remoteRoot": "/", "selection": ""}),
         ),
         NodeKind::RtspSource => (
             NodeCategory::Source,
@@ -391,13 +399,13 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "i2c.result.v1",
                 Some(PortRole::Status),
             )],
-            json!({"profileId": "", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "recipeId": "", "autoConnect": false}),
+            json!({"profileId": "", "host": "", "port": "22", "username": "root", "credentialRef": "", "recipeId": "", "autoConnect": false}),
         ),
         // X5_233 Driver 的图端口是运行时实现的正式契约；手动快照和 capture 输入必须收敛到同一路径。
         NodeKind::X5233Driver => (
             NodeCategory::Control,
             "X5_233 Driver",
-            "X5_233 TCP driver: multi-channel video, NV12/RAW capture, and status output",
+            "X5_233 TCP driver: video/capture outputs plus Probe/Status JSON on status.metrics",
             vec![optional_port(
                 "capture",
                 "Capture Request",
@@ -435,7 +443,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 image_port("rawCam1", "RAW CAM1", PortDirection::Output, "BayerRaw"),
                 port(
                     "status",
-                    "Status",
+                    "Status metrics",
                     PortDirection::Output,
                     PortKind::StatusMetrics,
                     "status.metrics.v1",
@@ -452,11 +460,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "snapshotMode": "latest",
                 "snapshotFrameId": "",
                 "snapshotTimestampNs": "",
-                "snapshotRtspPts90k": "",
-                "snapshotRtspPtsTolerance90k": 0,
-                "rawCamera": 0,
-                "rawBayerPattern": "rggb",
-                "rawBitsPerSample": 12
+                "rawCamera": 0
             }),
         ),
         // Hex Arm 只声明实际存在的独立控制面；它不在图内伪造帧或状态数据包。
@@ -501,7 +505,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::Demosaic => (
             NodeCategory::Media,
             "Demosaic",
-            "显式 BayerRaw → Rgba8 转换；RAW 进入 Viewer/Detector 前必须经过该节点",
+            "显式 BayerRaw → 输出格式转换；Bayer / bit depth / black level 必须在本节点选择",
             vec![format_hint_port(
                 port(
                     "raw",
@@ -522,9 +526,9 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     "image.frame.v1",
                     Some(PortRole::Image),
                 ),
-                "Rgba8",
+                "Rgba8 | Gray8 | Gray16Le",
             )],
-            json!({"algorithm": "bilinear", "outputFormat": "rgba"}),
+            json!({"algorithm": "bilinear", "outputFormat": "rgba", "bayer": "rggb", "bitsPerSample": 12, "blackLevel": 0}),
         ),
         NodeKind::FrameSampler => (
             NodeCategory::Media,
@@ -719,10 +723,10 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             ],
             json!({"boardRows": 11, "boardCols": 8, "squareSizeMm": 30.0}),
         ),
-        NodeKind::GainScorer => (
+        NodeKind::CalibrationFrameScorer => (
             NodeCategory::Calibration,
-            "Gain Scorer",
-            "将棋盘角点完整度归一化为带原始帧身份的 capture score",
+            "Calibration Frame Scorer",
+            "将棋盘角点完整度归一化为保留原始帧身份的标定样本分数",
             vec![port(
                 "detection",
                 "Detection",
@@ -733,7 +737,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             )],
             vec![port(
                 "score",
-                "Capture Score",
+                "Calibration Frame Score",
                 PortDirection::Output,
                 PortKind::CaptureScore,
                 "capture.score.v1",
@@ -741,40 +745,80 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             )],
             json!({"expectedCorners": 88}),
         ),
-        NodeKind::CaptureGate => (
+        NodeKind::ScoreThresholdGate => (
             NodeCategory::Calibration,
-            "Capture Gate",
-            "达到最小 gain 并连续稳定 holdFrames 帧后，构造带来源身份的 Capture Request",
+            "Score Threshold Gate",
+            "只将达到阈值的标定样本分数转换为通用 capture signal",
             vec![port(
                 "score",
-                "Capture Score",
+                "Calibration Frame Score",
                 PortDirection::Input,
                 PortKind::CaptureScore,
                 "capture.score.v1",
                 Some(PortRole::Status),
             )],
             vec![port(
-                "capture",
-                "Capture Request",
+                "signal",
+                "Capture Signal",
                 PortDirection::Output,
-                PortKind::CommandCapture,
-                "command.capture.request.v1",
+                PortKind::CaptureSignal,
+                "capture.signal.v1",
+                Some(PortRole::Status),
+            )],
+            json!({"threshold": 0.4}),
+        ),
+        NodeKind::ConsecutiveHoldGate => (
+            NodeCategory::Calibration,
+            "Consecutive Hold Gate",
+            "仅在连续不同帧均通过时将通用 capture signal 转换为 capture trigger",
+            vec![port(
+                "signal",
+                "Capture Signal",
+                PortDirection::Input,
+                PortKind::CaptureSignal,
+                "capture.signal.v1",
+                Some(PortRole::Status),
+            )],
+            vec![port(
+                "trigger",
+                "Capture Trigger",
+                PortDirection::Output,
+                PortKind::CaptureTrigger,
+                "capture.trigger.v1",
                 Some(PortRole::Command),
             )],
-            json!({"minimumGain": 0.4, "holdFrames": 3, "mode": "latest", "channel": 0, "camera": 0, "target": "yuv", "rtspPtsTolerance90k": 0}),
+            json!({"holdCount": 3}),
         ),
         NodeKind::DatasetCollector => (
             NodeCategory::Calibration,
             "Dataset Collector",
-            "累积检测结果；手动输出或清空 calib.dataset",
-            vec![port(
-                "detection",
-                "Detection",
-                PortDirection::Input,
-                PortKind::CalibDetection,
-                "calib.detection.v1",
-                Some(PortRole::Dataset),
-            )],
+            "按完全相同的帧身份关联 image、detection 和 score，浏览并管理可接受的标定样本；不保存图像字节",
+            vec![
+                optional_port(
+                    "image",
+                    "Captured Image",
+                    PortDirection::Input,
+                    PortKind::ImageFrame,
+                    "image.frame.v1",
+                    Some(PortRole::Image),
+                ),
+                port(
+                    "detection",
+                    "Detection",
+                    PortDirection::Input,
+                    PortKind::CalibDetection,
+                    "calib.detection.v1",
+                    Some(PortRole::Dataset),
+                ),
+                optional_port(
+                    "score",
+                    "Calibration Frame Score",
+                    PortDirection::Input,
+                    PortKind::CaptureScore,
+                    "capture.score.v1",
+                    Some(PortRole::Status),
+                ),
+            ],
             vec![port(
                 "dataset",
                 "Dataset",
@@ -819,25 +863,47 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         ),
         NodeKind::AutoCaptureController => (
             NodeCategory::Calibration,
-            "Auto Capture",
-            "布防后仅依据 capture.score 的 gain 阈值发送 capture command；不生成评分或采帧",
+            "Arm Gate",
+            "布防时透传 capture trigger；解除布防时抑制触发，不评分、不去重、不构造采集请求",
             vec![port(
-                "score",
-                "Capture Score",
+                "trigger",
+                "Capture Trigger",
                 PortDirection::Input,
-                PortKind::CaptureScore,
-                "capture.score.v1",
-                Some(PortRole::Status),
-            )],
-            vec![port(
-                "command",
-                "Capture Command",
-                PortDirection::Output,
-                PortKind::CommandCapture,
-                "command.capture.v1",
+                PortKind::CaptureTrigger,
+                "capture.trigger.v1",
                 Some(PortRole::Command),
             )],
-            json!({"triggerThreshold": 0.5, "cooldownMs": 800}),
+            vec![port(
+                "trigger",
+                "Capture Trigger",
+                PortDirection::Output,
+                PortKind::CaptureTrigger,
+                "capture.trigger.v1",
+                Some(PortRole::Command),
+            )],
+            json!({}),
+        ),
+        NodeKind::CaptureRequestBuilder => (
+            NodeCategory::Calibration,
+            "Capture Request Builder",
+            "将保留帧身份的 trigger 与显式配置的设备目标构造成采集请求",
+            vec![optional_port(
+                "trigger",
+                "Capture Trigger",
+                PortDirection::Input,
+                PortKind::CaptureTrigger,
+                "capture.trigger.v1",
+                Some(PortRole::Command),
+            )],
+            vec![port(
+                "capture",
+                "Capture Request",
+                PortDirection::Output,
+                PortKind::CommandCapture,
+                "command.capture.request.v1",
+                Some(PortRole::Command),
+            )],
+            json!({"mode": "latest", "channel": 0, "camera": 0, "target": "yuv"}),
         ),
         NodeKind::CalibrationSolver => (
             NodeCategory::Calibration,
@@ -917,7 +983,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "i2c.result.v1",
                 Some(PortRole::Status),
             )],
-            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
+            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "bus": "i2c-1", "address": "0x50", "register": "0x0000", "payload": "", "pageSize": 16, "mode": "read", "confirmWrites": true}),
         ),
         // EEPROM map/payload/bus 都由节点内联配置，避免展示无运行时实现的输入/输出端口。
         NodeKind::EepromProvision => (
@@ -933,7 +999,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "i2c.result.v1",
                 Some(PortRole::Status),
             )],
-            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "expectedHostKey": "", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "verifyAfterWrite": true}),
+            json!({"profileId": "x5-lab", "host": "", "port": "22", "username": "root", "credentialRef": "", "bus": "i2c-1", "address": "0x50", "register": "0x0010", "payload": "", "pageSize": 32, "mapId": "yg-stereo-p24c64g-v1", "verifyAfterWrite": true}),
         ),
     };
     NodeDefinition {
@@ -964,7 +1030,7 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
         WorkmodeTemplate {
             id: "calibration",
             title: "Calibration Capture",
-            description: "RTSP Detection → Gain Scorer → Capture Gate → X5_233 capture request",
+            description: "RTSP detection → frame score → threshold/hold/arm gates → capture request; Dataset Collector drives coverage, pose guidance, and calibration solving",
             graph: calibration_template_graph(),
         },
         WorkmodeTemplate {
@@ -1133,6 +1199,10 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
                 config.remove("sourceId");
                 config.remove("mountLabel");
                 config.remove("filter");
+                config.remove("expectedHostKey");
+            }
+            NodeKind::SshSession | NodeKind::I2cTransfer | NodeKind::EepromProvision => {
+                config.remove("expectedHostKey");
             }
             NodeKind::RtspSource => {
                 for (legacy, current) in [("expectedWidth", "width"), ("expectedHeight", "height")]
@@ -1150,6 +1220,7 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
                 normalize_x5233_driver_config(config);
                 node.title = "X5_233 Driver".to_owned();
             }
+            NodeKind::Demosaic => normalize_demosaic_config(config),
             NodeKind::HexArmDevice => normalize_hex_arm_device_config(config),
             NodeKind::RtspDecoder => {
                 config.clear();
@@ -1238,20 +1309,30 @@ fn normalize_x5233_driver_config(config: &mut serde_json::Map<String, serde_json
     config
         .entry("snapshotMode".to_owned())
         .or_insert_with(|| json!("latest"));
-    config
-        .entry("snapshotRtspPtsTolerance90k".to_owned())
-        .or_insert_with(|| json!(0));
+    config.remove("snapshotRtspPts90k");
+    config.remove("snapshotRtspPtsTolerance90k");
     config
         .entry("rawCamera".to_owned())
         .or_insert_with(|| json!(0));
-    config
-        .entry("rawBayerPattern".to_owned())
-        .or_insert_with(|| json!("rggb"));
-    config
-        .entry("rawBitsPerSample".to_owned())
-        .or_insert_with(|| json!(12));
 }
 
+fn normalize_demosaic_config(config: &mut serde_json::Map<String, serde_json::Value>) {
+    config
+        .entry("algorithm".to_owned())
+        .or_insert_with(|| json!("bilinear"));
+    config
+        .entry("outputFormat".to_owned())
+        .or_insert_with(|| json!("rgba"));
+    config
+        .entry("bayer".to_owned())
+        .or_insert_with(|| json!("rggb"));
+    config
+        .entry("bitsPerSample".to_owned())
+        .or_insert_with(|| json!(12));
+    config
+        .entry("blackLevel".to_owned())
+        .or_insert_with(|| json!(0));
+}
 /// 未配置的旧 Hex Arm 节点保持不可运动；不为 KCP 等未实现传输路径提供隐式回退。
 fn normalize_hex_arm_device_config(config: &mut serde_json::Map<String, serde_json::Value>) {
     config
@@ -1315,7 +1396,37 @@ pub fn validate_edge(graph: &WorkflowGraph, edge: &WorkflowEdge) -> Result<(), S
             edge.schema_version
         ));
     }
+    if !format_hints_compatible(source.format_hint.as_deref(), target.format_hint.as_deref()) {
+        return Err(format!(
+            "image format hint mismatch: source {:?}, target {:?}",
+            source.format_hint, target.format_hint
+        ));
+    }
     Ok(())
+}
+
+fn format_hints_compatible(source: Option<&str>, target: Option<&str>) -> bool {
+    let Some(source) = source else {
+        return true;
+    };
+    let Some(target) = target else {
+        return true;
+    };
+    let source_formats = split_format_hints(source);
+    let target_formats = split_format_hints(target);
+    source_formats.iter().any(|source_format| {
+        target_formats
+            .iter()
+            .any(|target_format| source_format == target_format)
+    })
+}
+
+fn split_format_hints(value: &str) -> Vec<&str> {
+    value
+        .split('|')
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .collect()
 }
 
 fn validate_node_config(node: &WorkflowNode) -> Result<(), String> {
@@ -1470,7 +1581,7 @@ fn validate_integer_range(
     Ok(())
 }
 
-/// SSH Session、I²C 与 EEPROM 只接受密码注册端点生成的进程内 session 引用。
+/// SSH Session、SFTP、I²C 与 EEPROM 只接受密码注册端点生成的进程内 session 引用。
 fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
     if let Some(host) = config_string(config, "host") {
@@ -1490,7 +1601,16 @@ fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
             return Err(format!("node `{}` SSH port must be in 1..=65535", node.id));
         }
     }
-    if let Some(reference) = config_string(config, "credentialRef") {
+    validate_session_credential_ref(node, config, "credentialRef")?;
+    Ok(())
+}
+
+fn validate_session_credential_ref(
+    node: &WorkflowNode,
+    config: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<(), String> {
+    if let Some(reference) = config_string(config, key) {
         let reference = reference.trim();
         if !reference.is_empty()
             && (!reference.starts_with("session:")
@@ -1500,7 +1620,7 @@ fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')))
         {
             return Err(format!(
-                "node `{}` credentialRef must be empty or a password session:<node-id> reference",
+                "node `{}` {key} must be empty or a password session:<node-id> reference",
                 node.id
             ));
         }
@@ -1524,6 +1644,7 @@ fn validate_sftp_file_source_config(node: &WorkflowNode) -> Result<(), String> {
             return Err(format!("node `{}` SFTP port must be in 1..=65535", node.id));
         }
     }
+    validate_session_credential_ref(node, config, "credentialRef")?;
     if let Some(remote_root) = config_string(config, "remoteRoot") {
         validate_remote_root(node, remote_root)?;
     }
@@ -1569,9 +1690,6 @@ fn reject_runtime_config(config: &serde_json::Value) -> Result<(), String> {
         if value.is_empty() {
             return true;
         }
-        if let Some(path) = value.strip_prefix("key-file:") {
-            return path.starts_with('/') && path.len() > 1 && !value.contains(['\0', '\r', '\n']);
-        }
         if let Some(id) = value.strip_prefix("session:") {
             return !id.is_empty()
                 && id.len() <= 128
@@ -1592,7 +1710,7 @@ fn reject_runtime_config(config: &serde_json::Value) -> Result<(), String> {
                                 .to_owned()
                         })?;
                         if !valid_credential_ref(reference) {
-                            return Err("runtime field `credentialRef` must be empty, key-file:/absolute/path, or session:<opaque-id>; secret material is forbidden".to_owned());
+                            return Err("runtime field `credentialRef` must be empty or session:<opaque-id>; secret material and key-file references are forbidden".to_owned());
                         }
                     } else if FORBIDDEN_KEYS.contains(&key.as_str()) {
                         return Err(format!("runtime field `{key}` must not be persisted"));
@@ -1869,22 +1987,22 @@ fn x5233_raw_template_graph() -> WorkflowGraph {
             y: 120.0,
         },
     );
-    let mut gate = workflow_node(
-        "x5233-raw-gate",
-        NodeKind::CaptureGate,
-        "Capture Gate",
+    let mut request_builder = workflow_node(
+        "x5233-raw-capture-request",
+        NodeKind::CaptureRequestBuilder,
+        "Capture Request Builder",
         NodePosition { x: 80.0, y: 140.0 },
     );
-    gate.config["target"] = json!("raw");
-    gate.config["camera"] = json!(0);
+    request_builder.config["target"] = json!("raw");
+    request_builder.config["camera"] = json!(0);
     graph(
         "camera-toolbox-x5233-raw-diagnostic-template",
         "X5_233 RAW Diagnostic Workspace",
-        vec![gate, driver, demosaic, viewer],
+        vec![request_builder, driver, demosaic, viewer],
         vec![
             edge(
-                "x5233-raw-gate-driver",
-                "x5233-raw-gate",
+                "x5233-raw-request-driver",
+                "x5233-raw-capture-request",
                 "capture",
                 "x5233-driver-raw",
                 "capture",
@@ -1928,31 +2046,91 @@ fn calibration_template_graph() -> WorkflowGraph {
             NodePosition { x: 360.0, y: 140.0 },
         ),
         workflow_node(
-            "calib-gain",
-            NodeKind::GainScorer,
-            "Gain Scorer",
+            "calib-frame-scorer",
+            NodeKind::CalibrationFrameScorer,
+            "Calibration Frame Scorer",
             NodePosition { x: 660.0, y: 140.0 },
         ),
         workflow_node(
-            "calib-gate",
-            NodeKind::CaptureGate,
-            "Capture Gate",
+            "calib-score-threshold",
+            NodeKind::ScoreThresholdGate,
+            "Score Threshold Gate",
             NodePosition { x: 960.0, y: 140.0 },
         ),
         workflow_node(
-            "calib-x5233-driver",
-            NodeKind::X5233Driver,
-            "X5_233 Driver",
+            "calib-consecutive-hold",
+            NodeKind::ConsecutiveHoldGate,
+            "Consecutive Hold Gate",
             NodePosition {
                 x: 1260.0,
                 y: 140.0,
             },
         ),
         workflow_node(
+            "calib-arm-gate",
+            NodeKind::AutoCaptureController,
+            "Arm Gate",
+            NodePosition {
+                x: 1560.0,
+                y: 140.0,
+            },
+        ),
+        workflow_node(
+            "calib-capture-request",
+            NodeKind::CaptureRequestBuilder,
+            "Capture Request Builder",
+            NodePosition {
+                x: 1860.0,
+                y: 140.0,
+            },
+        ),
+        workflow_node(
+            "calib-x5233-driver",
+            NodeKind::X5233Driver,
+            "X5_233 Driver",
+            NodePosition {
+                x: 2160.0,
+                y: 140.0,
+            },
+        ),
+        workflow_node(
+            "calib-dataset",
+            NodeKind::DatasetCollector,
+            "Dataset Collector",
+            NodePosition { x: 960.0, y: 430.0 },
+        ),
+        workflow_node(
+            "calib-coverage",
+            NodeKind::CoverageAnalyzer,
+            "Coverage Analyzer",
+            NodePosition {
+                x: 1260.0,
+                y: 430.0,
+            },
+        ),
+        workflow_node(
+            "calib-pose-guide",
+            NodeKind::PoseGuide,
+            "Pose Guide",
+            NodePosition {
+                x: 1560.0,
+                y: 430.0,
+            },
+        ),
+        workflow_node(
+            "calib-solver",
+            NodeKind::CalibrationSolver,
+            "Calibration Solver",
+            NodePosition {
+                x: 1260.0,
+                y: 700.0,
+            },
+        ),
+        workflow_node(
             "calib-viewer",
             NodeKind::Viewer,
             "Viewer",
-            NodePosition { x: 660.0, y: 380.0 },
+            NodePosition { x: 660.0, y: 680.0 },
         ),
     ];
     graph(
@@ -1979,10 +2157,19 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "stream.video-frame.v1",
             ),
             edge(
-                "calib-detection-gain",
+                "calib-detection-scorer",
                 "calib-detector",
                 "detection",
-                "calib-gain",
+                "calib-frame-scorer",
+                "detection",
+                PortKind::CalibDetection,
+                "calib.detection.v1",
+            ),
+            edge(
+                "calib-detection-dataset",
+                "calib-detector",
+                "detection",
+                "calib-dataset",
                 "detection",
                 PortKind::CalibDetection,
                 "calib.detection.v1",
@@ -1997,17 +2184,53 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "viewer.layer.overlay.v1",
             ),
             edge(
-                "calib-gain-gate",
-                "calib-gain",
+                "calib-score-threshold",
+                "calib-frame-scorer",
                 "score",
-                "calib-gate",
+                "calib-score-threshold",
                 "score",
                 PortKind::CaptureScore,
                 "capture.score.v1",
             ),
             edge(
-                "calib-gate-x5233-capture",
-                "calib-gate",
+                "calib-score-dataset",
+                "calib-frame-scorer",
+                "score",
+                "calib-dataset",
+                "score",
+                PortKind::CaptureScore,
+                "capture.score.v1",
+            ),
+            edge(
+                "calib-threshold-hold",
+                "calib-score-threshold",
+                "signal",
+                "calib-consecutive-hold",
+                "signal",
+                PortKind::CaptureSignal,
+                "capture.signal.v1",
+            ),
+            edge(
+                "calib-hold-arm",
+                "calib-consecutive-hold",
+                "trigger",
+                "calib-arm-gate",
+                "trigger",
+                PortKind::CaptureTrigger,
+                "capture.trigger.v1",
+            ),
+            edge(
+                "calib-arm-request",
+                "calib-arm-gate",
+                "trigger",
+                "calib-capture-request",
+                "trigger",
+                PortKind::CaptureTrigger,
+                "capture.trigger.v1",
+            ),
+            edge(
+                "calib-request-x5233-capture",
+                "calib-capture-request",
                 "capture",
                 "calib-x5233-driver",
                 "capture",
@@ -2015,13 +2238,49 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "command.capture.request.v1",
             ),
             edge(
-                "calib-rtsp-snapshot-viewer",
-                "calib-rtsp-source",
-                "snapshot",
+                "calib-dataset-coverage",
+                "calib-dataset",
+                "dataset",
+                "calib-coverage",
+                "dataset",
+                PortKind::CalibDataset,
+                "calib.dataset.v1",
+            ),
+            edge(
+                "calib-dataset-solver",
+                "calib-dataset",
+                "dataset",
+                "calib-solver",
+                "dataset",
+                PortKind::CalibDataset,
+                "calib.dataset.v1",
+            ),
+            edge(
+                "calib-coverage-pose",
+                "calib-coverage",
+                "coverage",
+                "calib-pose-guide",
+                "coverage",
+                PortKind::CalibCoverage,
+                "calib.coverage.v1",
+            ),
+            edge(
+                "calib-coverage-overlay-viewer",
+                "calib-coverage",
+                "overlay",
                 "calib-viewer",
-                "image",
-                PortKind::ImageFrame,
-                "image.frame.v1",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
+            ),
+            edge(
+                "calib-pose-overlay-viewer",
+                "calib-pose-guide",
+                "overlay",
+                "calib-viewer",
+                "overlay",
+                PortKind::LayerOverlay,
+                "viewer.layer.overlay.v1",
             ),
         ],
     )
@@ -2301,9 +2560,9 @@ mod tests {
             NodePosition { x: 120.0, y: 0.0 },
         ));
         graph.nodes.push(workflow_node(
-            "x5-capture-gate",
-            NodeKind::CaptureGate,
-            "Capture Gate",
+            "x5-capture-request",
+            NodeKind::CaptureRequestBuilder,
+            "Capture Request Builder",
             NodePosition { x: 240.0, y: 0.0 },
         ));
         graph.edges.push(WorkflowEdge {
@@ -2336,7 +2595,7 @@ mod tests {
         });
         graph.edges.push(edge(
             "x5-capture-request",
-            "x5-capture-gate",
+            "x5-capture-request",
             "capture",
             "x5-1",
             "capture",
@@ -2405,7 +2664,6 @@ mod tests {
             json!("x5233Driver")
         );
     }
-
     #[test]
     fn rtsp_input_declares_optional_capture_and_rgba_snapshot() {
         let rtsp = node_definition(NodeKind::RtspSource);
@@ -2542,27 +2800,25 @@ mod tests {
     }
 
     #[test]
-    fn calibration_template_uses_identity_preserving_capture_chain() {
+    fn calibration_template_wires_the_identity_preserving_dataset_flow() {
         let graph = calibration_template_graph();
         validate_workflow(&graph).expect("calibration template is valid");
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::X5233Driver)
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::GainScorer)
-        );
-        assert!(
-            graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::CaptureGate)
-        );
+        for kind in [
+            NodeKind::CalibrationFrameScorer,
+            NodeKind::ScoreThresholdGate,
+            NodeKind::ConsecutiveHoldGate,
+            NodeKind::AutoCaptureController,
+            NodeKind::CaptureRequestBuilder,
+            NodeKind::DatasetCollector,
+            NodeKind::CoverageAnalyzer,
+            NodeKind::PoseGuide,
+            NodeKind::CalibrationSolver,
+        ] {
+            assert!(
+                graph.nodes.iter().any(|node| node.kind == kind),
+                "missing {kind:?}"
+            );
+        }
         assert!(
             !graph
                 .nodes
@@ -2570,12 +2826,17 @@ mod tests {
                 .any(|node| node.kind == NodeKind::OverlayComposer)
         );
         for edge_id in [
-            "calib-rtsp-detector",
-            "calib-detection-gain",
-            "calib-gain-gate",
-            "calib-gate-x5233-capture",
-            "calib-rtsp-viewer",
-            "calib-rtsp-snapshot-viewer",
+            "calib-detection-scorer",
+            "calib-score-threshold",
+            "calib-threshold-hold",
+            "calib-hold-arm",
+            "calib-arm-request",
+            "calib-request-x5233-capture",
+            "calib-detection-dataset",
+            "calib-score-dataset",
+            "calib-dataset-coverage",
+            "calib-dataset-solver",
+            "calib-coverage-pose",
         ] {
             assert!(
                 graph.edges.iter().any(|edge| edge.id == edge_id),
@@ -2648,9 +2909,9 @@ mod tests {
         assert_eq!(
             catalog.len(),
             if cfg!(feature = "hex-arm-control") {
-                22
+                24
             } else {
-                21
+                23
             }
         );
         assert!(
@@ -2690,7 +2951,7 @@ mod tests {
     }
 
     #[test]
-    fn calibration_nodes_only_declare_implemented_ports() {
+    fn calibration_nodes_declare_the_refactored_runtime_contracts() {
         let solver = node_definition(NodeKind::CalibrationSolver);
         assert_eq!(solver.inputs.len(), 1);
         assert_eq!(solver.outputs.len(), 1);
@@ -2702,9 +2963,25 @@ mod tests {
         );
 
         let dataset = node_definition(NodeKind::DatasetCollector);
-        assert_eq!(dataset.inputs.len(), 1);
-        assert_eq!(dataset.outputs.len(), 1);
-        assert!(dataset.inputs.iter().any(|p| p.id == "detection"));
+        assert_eq!(dataset.inputs.len(), 3);
+        assert!(
+            dataset
+                .inputs
+                .iter()
+                .any(|p| p.id == "image" && p.kind == PortKind::ImageFrame && !p.required)
+        );
+        assert!(
+            dataset
+                .inputs
+                .iter()
+                .any(|p| p.id == "detection" && p.kind == PortKind::CalibDetection)
+        );
+        assert!(
+            dataset
+                .inputs
+                .iter()
+                .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required)
+        );
         assert!(
             dataset
                 .outputs
@@ -2712,50 +2989,83 @@ mod tests {
                 .any(|p| p.id == "dataset" && p.kind == PortKind::CalibDataset)
         );
 
-        let auto = node_definition(NodeKind::AutoCaptureController);
-        assert_eq!(auto.inputs.len(), 1);
-        assert_eq!(auto.outputs.len(), 1);
+        let scorer = node_definition(NodeKind::CalibrationFrameScorer);
+        assert_eq!(scorer.inputs[0].kind, PortKind::CalibDetection);
+        assert_eq!(scorer.outputs[0].kind, PortKind::CaptureScore);
+
+        let threshold = node_definition(NodeKind::ScoreThresholdGate);
+        assert_eq!(threshold.inputs[0].kind, PortKind::CaptureScore);
+        assert_eq!(threshold.outputs[0].kind, PortKind::CaptureSignal);
+
+        let hold = node_definition(NodeKind::ConsecutiveHoldGate);
+        assert_eq!(hold.inputs[0].kind, PortKind::CaptureSignal);
+        assert_eq!(hold.outputs[0].kind, PortKind::CaptureTrigger);
+
+        let arm = node_definition(NodeKind::AutoCaptureController);
         assert!(
-            auto.inputs
+            arm.inputs
                 .iter()
-                .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore)
+                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger)
         );
         assert!(
-            auto.outputs
+            arm.outputs
                 .iter()
-                .any(|p| p.id == "command" && p.kind == PortKind::CommandCapture)
+                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger)
         );
 
-        let gain = node_definition(NodeKind::GainScorer);
-        assert_eq!(gain.inputs[0].kind, PortKind::CalibDetection);
-        assert_eq!(gain.outputs[0].kind, PortKind::CaptureScore);
+        let request = node_definition(NodeKind::CaptureRequestBuilder);
+        assert!(
+            request
+                .inputs
+                .iter()
+                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger && !p.required)
+        );
+        assert!(request.outputs.iter().any(|p| p.id == "capture"
+            && p.kind == PortKind::CommandCapture
+            && p.schema == "command.capture.request.v1"));
 
-        let gate = node_definition(NodeKind::CaptureGate);
-        assert_eq!(gate.inputs[0].kind, PortKind::CaptureScore);
-        assert!(gate.outputs.iter().any(|port| {
-            port.id == "capture"
-                && port.kind == PortKind::CommandCapture
-                && port.schema == "command.capture.request.v1"
-        }));
-
-        let demosaic = node_definition(NodeKind::Demosaic);
-        assert!(demosaic.inputs.iter().any(|port| {
-            port.id == "raw"
-                && port.kind == PortKind::ImageFrame
-                && port.schema == "image.frame.v1"
-                && port.format_hint.as_deref() == Some("BayerRaw")
-        }));
-        assert!(demosaic.outputs.iter().any(|port| {
-            port.id == "image"
-                && port.kind == PortKind::ImageFrame
-                && port.schema == "image.frame.v1"
-                && port.format_hint.as_deref() == Some("Rgba8")
-        }));
         let pose = node_definition(NodeKind::PoseGuide);
         assert!(
             pose.outputs
                 .iter()
                 .any(|p| p.id == "target" && p.label == "Image-grid Target")
+        );
+    }
+    #[test]
+    fn validation_rejects_mismatched_image_format_hints() {
+        let source = workflow_node(
+            "demosaic-source",
+            NodeKind::Demosaic,
+            "Demosaic Source",
+            NodePosition { x: 0.0, y: 0.0 },
+        );
+        let target = workflow_node(
+            "demosaic-target",
+            NodeKind::Demosaic,
+            "Demosaic Target",
+            NodePosition { x: 320.0, y: 0.0 },
+        );
+        let graph = graph(
+            "format-hint-graph",
+            "Format Hint Graph",
+            vec![source, target],
+            vec![],
+        );
+        let edge = edge(
+            "demosaic-source-to-target",
+            "demosaic-source",
+            "image",
+            "demosaic-target",
+            "raw",
+            PortKind::ImageFrame,
+            "image.frame.v1",
+        );
+
+        let error =
+            validate_edge(&graph, &edge).expect_err("BayerRaw input must not accept image output");
+        assert!(
+            error.contains("image format hint mismatch"),
+            "unexpected error: {error}"
         );
     }
 
@@ -2796,6 +3106,7 @@ mod tests {
     fn password_only_control_nodes_reject_key_file_references() {
         for kind in [
             NodeKind::SshSession,
+            NodeKind::SftpFileSource,
             NodeKind::I2cTransfer,
             NodeKind::EepromProvision,
         ] {
@@ -2937,7 +3248,11 @@ mod tests {
         let empty_reference = json!({"auth": {"credentialRef": ""}});
         assert!(reject_runtime_config(&empty_reference).is_ok());
 
-        let safe = json!({"auth": {"credentialRef": "key-file:/home/user/.ssh/id_ed25519"}});
+        let key_file = json!({"auth": {"credentialRef": "key-file:/home/user/.ssh/id_ed25519"}});
+        let error = reject_runtime_config(&key_file).expect_err("key-file reference rejected");
+        assert!(error.contains("key-file"));
+
+        let safe = json!({"auth": {"credentialRef": "session:password_only"}});
         assert!(reject_runtime_config(&safe).is_ok());
 
         // 合法嵌套（不含敏感键）应通过。

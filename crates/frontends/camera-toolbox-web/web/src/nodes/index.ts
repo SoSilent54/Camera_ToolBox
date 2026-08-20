@@ -1,6 +1,7 @@
 export { AutoCaptureNode } from './AutoCaptureNode';
 export { CalibrationSolverNode } from './CalibrationSolverNode';
 export { CalibrationWorkflowNode } from './CalibrationWorkflowNode';
+export { DatasetCollectorNode } from './DatasetCollectorNode';
 export { GenericWorkflowNode } from './GenericWorkflowNode';
 export { RtspSourceNode } from './RtspSourceNode';
 export { ViewerNode } from './ViewerNode';

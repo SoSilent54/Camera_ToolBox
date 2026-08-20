@@ -624,6 +624,8 @@ pub enum SourcePtsProvenance {
 }
 
 /// 直播帧跨 Viewer 与后续数据集时不可变的来源和时钟语义。
+///
+/// `device_timestamp_ns` 只在 RTSP metadata 明确携带时存在；绝不从 PTS 或本机时钟推断。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StreamFrameIdentity {
     pub stream_id: crate::platform::StreamSessionId,
@@ -631,6 +633,7 @@ pub struct StreamFrameIdentity {
     pub frame_sequence: u64,
     pub source_pts: SourcePts,
     pub host_monotonic_time_ns: u64,
+    pub device_timestamp_ns: Option<u64>,
 }
 
 /// 返回进程内共享 epoch 的单调时钟。跨线程时差必须只使用此函数的两个采样值。
@@ -658,8 +661,10 @@ impl StreamFrameIdentity {
                 reason: reason.into(),
             },
             host_monotonic_time_ns: host_monotonic_time_ns(),
+            device_timestamp_ns: None,
         }
     }
+
     #[must_use]
     pub fn known(
         stream_id: crate::platform::StreamSessionId,
@@ -685,12 +690,33 @@ impl StreamFrameIdentity {
         source_pts: SourcePts,
         host_monotonic_time_ns: u64,
     ) -> Self {
+        Self::known_at_with_device_timestamp(
+            stream_id,
+            channel,
+            frame_sequence,
+            source_pts,
+            host_monotonic_time_ns,
+            None,
+        )
+    }
+
+    /// 构造携带设备侧时间戳的流帧身份；该时间戳可用于 X5 TCP exact snapshot。
+    #[must_use]
+    pub fn known_at_with_device_timestamp(
+        stream_id: crate::platform::StreamSessionId,
+        channel: u16,
+        frame_sequence: u64,
+        source_pts: SourcePts,
+        host_monotonic_time_ns: u64,
+        device_timestamp_ns: Option<u64>,
+    ) -> Self {
         Self {
             stream_id,
             channel,
             frame_sequence,
             source_pts,
             host_monotonic_time_ns,
+            device_timestamp_ns,
         }
     }
 }

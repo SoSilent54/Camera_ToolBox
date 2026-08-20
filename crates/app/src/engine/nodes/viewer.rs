@@ -197,6 +197,7 @@ fn display_identity(image: &ImageFrame) -> StreamFrameIdentity {
                 reason: "display-only identity for non-stream ImageFrame".to_owned(),
             },
             host_monotonic_time_ns: image.identity.host_monotonic_time_ns,
+            device_timestamp_ns: image.identity.device_timestamp_ns(),
         }
     })
 }
@@ -687,13 +688,13 @@ mod tests {
                         channel: 3,
                         camera: Some(0),
                         timestamp_ns: 987_654,
-                        rtsp_pts_90k: Some(90_000),
                     },
                     frame_sequence: 42,
                     source_pts: SourcePts::Unavailable {
                         reason: "device snapshot has no RTSP PTS".to_owned(),
                     },
                     host_monotonic_time_ns: 123,
+                    device_timestamp_ns: Some(987_654),
                 },
                 None,
                 None,

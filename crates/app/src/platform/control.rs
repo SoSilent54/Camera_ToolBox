@@ -134,8 +134,6 @@ pub enum X5233CapturePayload {
         uv_len: usize,
         frame_id: u64,
         timestamp_ns: u64,
-        rtsp_pts_90k: u64,
-        match_rtsp_pts_delta_90k: Option<u64>,
         payload: Arc<[u8]>,
     },
     BayerRaw {

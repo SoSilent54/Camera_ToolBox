@@ -582,10 +582,6 @@ fn x5_233_yuv_snapshot_publishes_image_document() {
                 uv_len: 2,
                 frame_id: 7,
                 timestamp_ns: 123,
-                rtsp_timestamp_us: 0,
-                rtsp_pts_90k: 0,
-                match_rtsp_pts_delta_90k: None,
-                match_mode: Some("latest".to_owned()),
                 payload: vec![16, 32, 48, 64, 128, 128],
             },
         )

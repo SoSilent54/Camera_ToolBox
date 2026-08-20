@@ -8,7 +8,10 @@
 //! 真实 SSH helper 执行体（`SshI2cHelperService`/`SshEepromProvisionService` 适配为 executor）由
 //! web 层装配注入（后续任务）；本模块只依赖 trait。
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Duration;
 
 use camera_toolbox_core::Rgba8Frame;
@@ -20,9 +23,12 @@ use crate::engine::{
 };
 use crate::platform::{
     CommandResult, ControlTargetSpec, DumpCancellation, HexArmJointPositionsRequest,
-    HexArmTargetConfig, HexArmTransport, RemoteOperationControl, RemoteTimeouts, SourcePts,
-    StreamFrameIdentity, StreamSessionId, TypedCommandRequest, X5233CapturePayload,
-    host_monotonic_time_ns,
+    HexArmTargetConfig, HexArmTransport, LatestDecodedFrameSlot, RemoteOperationControl,
+    RemoteTimeouts, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport, SourcePts,
+    StreamCancellation, StreamFrameIdentity, StreamOpenRequest, StreamOperationControl,
+    StreamRecordingRequest, StreamService, StreamServiceError, StreamServiceEvent, StreamSession,
+    StreamSessionId, StreamStage, StreamTerminal, StreamTimeouts, TypedCommandRequest,
+    X5233CapturePayload, host_monotonic_time_ns,
 };
 #[cfg(test)]
 use crate::platform::{
@@ -125,23 +131,16 @@ impl I2cTransferNode {
         } else {
             username
         };
-        let expected_host_key = non_empty(config_string(&self.spec, "expectedHostKey"));
         Ok(ControlTargetSpec {
             host,
             port,
             username,
-            expected_host_key,
+            expected_host_key: None,
         })
     }
 
     fn credential_ref(&self) -> Result<String, NodeError> {
-        let credential_ref = config_string(&self.spec, "credentialRef");
-        if credential_ref.trim().is_empty() {
-            return Err(NodeError::Precondition(
-                "config `credentialRef` is required".to_owned(),
-            ));
-        }
-        Ok(credential_ref)
+        password_session_credential_ref(&self.spec, "config `credentialRef`")
     }
 
     /// 由 config 构造 I²C 动作：mode=read → 写 register 后读 pageSize 字节；mode=write → 整段写 payload。
@@ -279,23 +278,16 @@ impl EepromProvisionNode {
         } else {
             username
         };
-        let expected_host_key = non_empty(config_string(&self.spec, "expectedHostKey"));
         Ok(ControlTargetSpec {
             host,
             port,
             username,
-            expected_host_key,
+            expected_host_key: None,
         })
     }
 
     fn credential_ref(&self) -> Result<String, NodeError> {
-        let credential_ref = config_string(&self.spec, "credentialRef");
-        if credential_ref.trim().is_empty() {
-            return Err(NodeError::Precondition(
-                "config `credentialRef` is required".to_owned(),
-            ));
-        }
-        Ok(credential_ref)
+        password_session_credential_ref(&self.spec, "config `credentialRef`")
     }
 
     /// 由 config `mode`（inspect/provision）构造 EEPROM 动作。
@@ -358,6 +350,29 @@ fn non_empty(value: String) -> Option<String> {
     } else {
         Some(value)
     }
+}
+
+fn password_session_credential_ref(spec: &NodeSpec, label: &str) -> Result<String, NodeError> {
+    let credential_ref = config_string(spec, "credentialRef");
+    let credential_ref = credential_ref.trim();
+    if credential_ref.is_empty() {
+        return Err(NodeError::Precondition(format!("{label} is required")));
+    }
+    let Some(session_id) = credential_ref.strip_prefix("session:") else {
+        return Err(NodeError::Precondition(format!(
+            "{label} must be a password session:<node-id> reference"
+        )));
+    };
+    if session_id.is_empty()
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(NodeError::Precondition(format!(
+            "{label} must be a password session:<node-id> reference"
+        )));
+    }
+    Ok(credential_ref.to_owned())
 }
 
 #[cfg(test)]
@@ -469,7 +484,7 @@ fn emit_json_result<T: serde::Serialize>(
 // X5_233 Driver 节点
 // ---------------------------------------------------------------------------
 
-/// X5_233 专用驱动适配器；只发布真实帧与状态，不把 RTSP endpoint 当作图数据输出。
+/// X5_233 专用驱动适配器；TCP 用于状态/抓帧，RTSP video 输出由本节点显式连接并解码。
 pub struct X5233DriverFactory;
 
 impl NodeFactory for X5233DriverFactory {
@@ -478,15 +493,31 @@ impl NodeFactory for X5233DriverFactory {
     }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(X5233DriverNode { spec }))
+        Ok(Box::new(X5233DriverNode::new(spec)))
     }
 }
 
 pub struct X5233DriverNode {
     spec: NodeSpec,
+    video_ch0: Option<X5233VideoStream>,
+    video_ch3: Option<X5233VideoStream>,
+}
+
+struct X5233VideoStream {
+    cancellation: StreamCancellation,
+    session: StreamSession,
+    pump_cancel: Arc<AtomicBool>,
 }
 
 impl X5233DriverNode {
+    fn new(spec: NodeSpec) -> Self {
+        Self {
+            spec,
+            video_ch0: None,
+            video_ch3: None,
+        }
+    }
+
     fn host(&self) -> Result<String, NodeError> {
         non_empty(config_string(&self.spec, "host")).ok_or_else(|| {
             NodeError::Precondition("x5233Driver host must be configured".to_owned())
@@ -526,11 +557,6 @@ impl X5233DriverNode {
             "timestamp_ns" => self
                 .required_config_u64("snapshotTimestampNs", "snapshotTimestampNs")
                 .map(CaptureMode::TimestampNs),
-            "rtsp_pts_90k" => {
-                let pts = self.required_config_u64("snapshotRtspPts90k", "snapshotRtspPts90k")?;
-                let tolerance = self.config_u64("snapshotRtspPtsTolerance90k").unwrap_or(0);
-                Ok(CaptureMode::RtspPts90k { pts, tolerance })
-            }
             value => Err(NodeError::Config(format!(
                 "x5233Driver snapshotMode `{value}` is unsupported"
             ))),
@@ -559,38 +585,201 @@ impl X5233DriverNode {
         })
     }
 
-    fn raw_metadata(&self) -> Result<RawMetadata, NodeError> {
-        let bayer_pattern = match config_string(&self.spec, "rawBayerPattern").as_str() {
-            "rggb" => BayerPattern::Rggb,
-            "bggr" => BayerPattern::Bggr,
-            "grbg" => BayerPattern::Grbg,
-            "gbrg" => BayerPattern::Gbrg,
-            "" => {
-                return Err(NodeError::Precondition(
-                    "x5233Driver RAW capture requires config rawBayerPattern".to_owned(),
-                ));
-            }
-            value => {
-                return Err(NodeError::Config(format!(
-                    "x5233Driver rawBayerPattern `{value}` is unsupported"
+    fn raw_metadata(&self) -> RawMetadata {
+        RawMetadata {
+            bayer_pattern: BayerPattern::Rggb,
+            bits_per_sample: 12,
+            black_level: None,
+            white_level: None,
+        }
+    }
+
+    fn config_u32(&self, key: &str, fallback: u32) -> u32 {
+        self.config_u64(key)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(fallback)
+    }
+
+    fn rtsp_channel(&self) -> u16 {
+        self.config_u16("rtspChannel", 0)
+    }
+
+    fn rtsp_output_port(channel: u16) -> Result<&'static str, NodeError> {
+        match channel {
+            0 => Ok("videoCh0"),
+            3 => Ok("videoCh3"),
+            _ => Err(NodeError::Precondition(format!(
+                "X5_233 video only exposes RTSP channels 0 and 3, got {channel}"
+            ))),
+        }
+    }
+
+    fn rtsp_url(&self, channel: u16) -> Result<String, NodeError> {
+        let explicit_url = config_string(&self.spec, "rtspUrl");
+        if !explicit_url.trim().is_empty() {
+            return Ok(explicit_url);
+        }
+        let port = match channel {
+            0 => 554,
+            3 => 557,
+            _ => {
+                return Err(NodeError::Precondition(format!(
+                    "X5_233 video only exposes RTSP channels 0 and 3, got {channel}"
                 )));
             }
         };
-        let bits_per_sample = self
-            .config_u64("rawBitsPerSample")
-            .and_then(|value| u8::try_from(value).ok())
-            .filter(|value| (1..=16).contains(value))
-            .ok_or_else(|| {
-                NodeError::Precondition(
-                    "x5233Driver RAW capture requires rawBitsPerSample in 1..=16".to_owned(),
-                )
-            })?;
-        Ok(RawMetadata {
-            bayer_pattern,
-            bits_per_sample,
-            black_level: None,
-            white_level: None,
-        })
+        Ok(format!("rtsp://{}:{port}/PRR", self.host()?))
+    }
+
+    fn connect_video(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        self.connect_video_channel(self.rtsp_channel(), rt)
+    }
+
+    fn connect_all_video(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        self.connect_video_channel(0, rt)?;
+        self.connect_video_channel(3, rt)
+    }
+
+    fn connect_video_channel(
+        &mut self,
+        channel: u16,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let output_port = Self::rtsp_output_port(channel)?.to_owned();
+        if let Some(stream) = self.video_stream_ref(channel)? {
+            if !stream.cancellation.is_cancelled() {
+                rt.report_state(
+                    NodeRuntimeState::Running,
+                    format!("x5_233 video CH{channel} streaming"),
+                );
+                return Ok(());
+            }
+        }
+        self.disconnect_video_channel(channel, rt)?;
+
+        let factory = rt.services().stream_factory()?;
+        let config = RtspStreamConfig {
+            url: self.rtsp_url(channel)?,
+            channel,
+            width: self.config_u32("rtspWidth", 1920),
+            height: self.config_u32("rtspHeight", 1080),
+            codec: RtspCodec::H264,
+            transport: RtspTransport::Tcp,
+            latency_mode: RtspLatencyMode::Low,
+        };
+        let service: Arc<dyn StreamService> = factory.create(config);
+        let session_id = StreamSessionId::new(format!("x5-{}-ch{channel}", self.spec.id))
+            .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let request = StreamOpenRequest {
+            channel,
+            media: "rtsp".to_owned(),
+            cseq: 1,
+            prefer_hardware_acceleration: false,
+            recording: StreamRecordingRequest::default(),
+        };
+        let cancellation = StreamCancellation::default();
+        let pump_cancel = Arc::new(AtomicBool::new(false));
+        let reporter =
+            x5233_stream_reporter(rt, channel, cancellation.clone(), Arc::clone(&pump_cancel));
+        let control = StreamOperationControl::new(
+            x5233_stream_timeouts_from_config(&self.spec)?,
+            cancellation.clone(),
+            reporter,
+        )
+        .map_err(|error| NodeError::Execution(error.to_string()))?;
+        let session = match service.open(session_id, request, control) {
+            Ok(session) => session,
+            Err(error) => {
+                rt.report_state(
+                    NodeRuntimeState::Error,
+                    x5233_stream_failure_diagnostic(channel, &error),
+                );
+                return Err(NodeError::Execution(error.to_string()));
+            }
+        };
+
+        let latest_frame = Arc::clone(&session.latest_frame);
+        rt.spawn(format!("x5-video-pump-{}-ch{channel}", self.spec.id), {
+            let pump_cancel = Arc::clone(&pump_cancel);
+            move |ctx| pump_x5233_video_frames(latest_frame, ctx, pump_cancel, output_port)
+        });
+        *self.video_stream_slot(channel)? = Some(X5233VideoStream {
+            cancellation,
+            session,
+            pump_cancel,
+        });
+        rt.report_state(
+            NodeRuntimeState::Running,
+            format!("x5_233 video CH{channel} streaming"),
+        );
+        Ok(())
+    }
+
+    fn disconnect_video_channel(
+        &mut self,
+        channel: u16,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        let Some(stream) = self.video_stream_slot(channel)?.take() else {
+            return Ok(());
+        };
+        close_x5233_video_stream(stream);
+        if self.has_active_video_stream() {
+            rt.report_state(
+                NodeRuntimeState::Running,
+                format!("x5_233 video CH{channel} disconnected; other channel still streaming"),
+            );
+        } else {
+            rt.report_state(
+                NodeRuntimeState::Idle,
+                format!("x5_233 video CH{channel} disconnected"),
+            );
+        }
+        Ok(())
+    }
+
+    fn disconnect_video(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        if let Some(stream) = self.video_ch0.take() {
+            close_x5233_video_stream(stream);
+        }
+        if let Some(stream) = self.video_ch3.take() {
+            close_x5233_video_stream(stream);
+        }
+        rt.report_state(NodeRuntimeState::Idle, "x5_233 video disconnected");
+        Ok(())
+    }
+
+    fn video_stream_ref(&self, channel: u16) -> Result<&Option<X5233VideoStream>, NodeError> {
+        match channel {
+            0 => Ok(&self.video_ch0),
+            3 => Ok(&self.video_ch3),
+            _ => Err(NodeError::Precondition(format!(
+                "X5_233 video only exposes RTSP channels 0 and 3, got {channel}"
+            ))),
+        }
+    }
+
+    fn video_stream_slot(
+        &mut self,
+        channel: u16,
+    ) -> Result<&mut Option<X5233VideoStream>, NodeError> {
+        match channel {
+            0 => Ok(&mut self.video_ch0),
+            3 => Ok(&mut self.video_ch3),
+            _ => Err(NodeError::Precondition(format!(
+                "X5_233 video only exposes RTSP channels 0 and 3, got {channel}"
+            ))),
+        }
+    }
+
+    fn has_active_video_stream(&self) -> bool {
+        self.video_ch0
+            .as_ref()
+            .is_some_and(|stream| !stream.cancellation.is_cancelled())
+            || self
+                .video_ch3
+                .as_ref()
+                .is_some_and(|stream| !stream.cancellation.is_cancelled())
     }
 
     fn capture(&self, request: &CaptureRequest, rt: &mut NodeRuntime) -> Result<(), NodeError> {
@@ -617,8 +806,6 @@ impl X5233DriverNode {
                 uv_len,
                 frame_id,
                 timestamp_ns,
-                rtsp_pts_90k,
-                match_rtsp_pts_delta_90k,
                 payload,
             } => {
                 if request.target != (CaptureTarget::Yuv { channel }) {
@@ -647,8 +834,7 @@ impl X5233DriverNode {
                         payload.len()
                     )));
                 }
-                let identity =
-                    x5233_identity(channel, None, frame_id, timestamp_ns, Some(rtsp_pts_90k));
+                let identity = x5233_identity(channel, None, frame_id, timestamp_ns);
                 let frame = ImageFrame::new(
                     width,
                     height,
@@ -664,13 +850,6 @@ impl X5233DriverNode {
                 .map_err(|error| {
                     NodeError::Execution(format!("invalid X5_233 NV12 frame: {error}"))
                 })?;
-                if matches!(request.mode, CaptureMode::RtspPts90k { .. })
-                    && match_rtsp_pts_delta_90k.is_none()
-                {
-                    return Err(NodeError::Execution(
-                        "X5_233 PTS bridge response omitted match delta".to_owned(),
-                    ));
-                }
                 (output, frame)
             }
             X5233CapturePayload::BayerRaw {
@@ -697,8 +876,9 @@ impl X5233DriverNode {
                         )));
                     }
                 };
-                let raw = self.raw_metadata()?;
-                let identity = x5233_identity(camera, Some(camera), frame_id, timestamp_ns, None);
+                let raw = self.raw_metadata();
+
+                let identity = x5233_identity(camera, Some(camera), frame_id, timestamp_ns);
                 let frame = ImageFrame::new(
                     width,
                     height,
@@ -716,8 +896,14 @@ impl X5233DriverNode {
         };
         rt.emit(output, DataPacket::ImageFrame(Arc::new(frame)))?;
         rt.report_event(format!("x5_233 capture published on {output}"));
+        rt.report_state(NodeRuntimeState::Idle, "x5_233 capture ready");
         Ok(())
     }
+}
+fn close_x5233_video_stream(stream: X5233VideoStream) {
+    stream.session.request_close();
+    stream.cancellation.cancel();
+    stream.pump_cancel.store(true, Ordering::Release);
 }
 
 impl NodeInstance for X5233DriverNode {
@@ -752,7 +938,29 @@ impl NodeInstance for X5233DriverNode {
 
     fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         match action {
+            NodeAction::Connect => self.connect_video(rt),
+            NodeAction::Disconnect => self.disconnect_video(rt),
+            NodeAction::Custom { name, .. } if name == "open_rtsp_ch0" => {
+                self.connect_video_channel(0, rt)
+            }
+            NodeAction::Custom { name, .. } if name == "open_rtsp_ch3" => {
+                self.connect_video_channel(3, rt)
+            }
+            NodeAction::Custom { name, .. } if name == "open_rtsp_all" => {
+                self.connect_all_video(rt)
+            }
+            NodeAction::Custom { name, .. } if name == "close_rtsp" => self.disconnect_video(rt),
             NodeAction::Trigger => {
+                let status = rt
+                    .services()
+                    .x5_client()?
+                    .status(&self.host()?, self.port())
+                    .map_err(NodeError::Execution)?;
+                rt.emit("status", DataPacket::Json(Arc::new(status)))?;
+                rt.report_state(NodeRuntimeState::Idle, "x5_233 status ready");
+                Ok(())
+            }
+            NodeAction::Custom { name, .. } if name == "status" => {
                 let status = rt
                     .services()
                     .x5_client()?
@@ -770,6 +978,7 @@ impl NodeInstance for X5233DriverNode {
                     .map_err(NodeError::Execution)?;
                 rt.emit("status", DataPacket::Json(Arc::new(summary)))?;
                 rt.report_event("x5_233 probe ready".to_owned());
+                rt.report_state(NodeRuntimeState::Idle, "x5_233 probe ready");
                 Ok(())
             }
             NodeAction::Custom { name, .. } if name == "snapshot" || name == "capture_yuv" => {
@@ -784,8 +993,131 @@ impl NodeInstance for X5233DriverNode {
     }
 
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Idle, "stopped");
-        Ok(())
+        self.disconnect_video(rt)
+    }
+}
+
+fn x5233_stream_reporter(
+    rt: &NodeRuntime,
+    channel: u16,
+    cancellation: StreamCancellation,
+    pump_cancel: Arc<AtomicBool>,
+) -> Arc<dyn Fn(StreamServiceEvent) + Send + Sync> {
+    let reporter = rt.context().reporter.clone();
+    Arc::new(move |event| {
+        match &event {
+            StreamServiceEvent::Terminal(StreamTerminal::Failed(error)) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(
+                    NodeRuntimeState::Error,
+                    x5233_stream_failure_diagnostic(channel, error),
+                );
+            }
+            StreamServiceEvent::Terminal(StreamTerminal::Forced {
+                remote_state_unknown,
+            }) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(
+                    NodeRuntimeState::Error,
+                    format!(
+                        "x5_233 video CH{channel} forced closed; remote_state_unknown={remote_state_unknown}"
+                    ),
+                );
+            }
+            StreamServiceEvent::Terminal(StreamTerminal::BoundaryClosed) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(
+                    NodeRuntimeState::Idle,
+                    format!("x5_233 video CH{channel} boundary closed"),
+                );
+            }
+            StreamServiceEvent::Terminal(StreamTerminal::Cancelled) => {
+                cancellation.cancel();
+                pump_cancel.store(true, Ordering::Release);
+                reporter.report_state(
+                    NodeRuntimeState::Idle,
+                    format!("x5_233 video CH{channel} cancelled"),
+                );
+            }
+            StreamServiceEvent::Stage(StreamStage::Playing) => {
+                reporter.report_state(
+                    NodeRuntimeState::Running,
+                    format!("x5_233 video CH{channel} streaming"),
+                );
+            }
+            _ => {}
+        }
+        reporter.report_event(format!("x5_233 video CH{channel} stream: {event:?}"));
+    })
+}
+
+fn pump_x5233_video_frames(
+    latest: Arc<LatestDecodedFrameSlot>,
+    ctx: crate::engine::SpawnContext,
+    cancel: Arc<AtomicBool>,
+    output_port: String,
+) {
+    while !cancel.load(Ordering::Acquire) {
+        let Some(frame) = latest.wait_latest_timeout(X5233_PUMP_CANCEL_POLL) else {
+            continue;
+        };
+        let _ = ctx
+            .outputs
+            .emit(&output_port, DataPacket::VideoFrame(frame));
+    }
+}
+
+const X5233_PUMP_CANCEL_POLL: Duration = Duration::from_millis(100);
+const X5233_DEFAULT_CONNECT_TIMEOUT_MS: u64 = 8_000;
+const X5233_DEFAULT_IDLE_TIMEOUT_MS: u64 = 10_000;
+const X5233_MAX_TIMEOUT_MS: u64 = 120_000;
+
+fn x5233_stream_timeouts_from_config(spec: &NodeSpec) -> Result<StreamTimeouts, NodeError> {
+    let connect = x5233_config_duration_ms(
+        spec,
+        "rtspConnectTimeoutMs",
+        X5233_DEFAULT_CONNECT_TIMEOUT_MS,
+    )?;
+    let idle = x5233_config_duration_ms(spec, "rtspIdleTimeoutMs", X5233_DEFAULT_IDLE_TIMEOUT_MS)?;
+    StreamTimeouts { connect, idle }
+        .validate()
+        .map_err(|error| NodeError::Config(error.to_string()))
+}
+
+fn x5233_config_duration_ms(
+    spec: &NodeSpec,
+    key: &str,
+    fallback_ms: u64,
+) -> Result<Duration, NodeError> {
+    let value_ms = spec
+        .config
+        .get(key)
+        .and_then(|value| {
+            value
+                .as_u64()
+                .or_else(|| value.as_str().and_then(|text| text.parse::<u64>().ok()))
+        })
+        .unwrap_or(fallback_ms);
+    if value_ms == 0 || value_ms > X5233_MAX_TIMEOUT_MS {
+        return Err(NodeError::Config(format!(
+            "x5233Driver {key} must be in 1..={X5233_MAX_TIMEOUT_MS} ms"
+        )));
+    }
+    Ok(Duration::from_millis(value_ms))
+}
+
+fn x5233_stream_failure_diagnostic(channel: u16, error: &StreamServiceError) -> String {
+    match error {
+        StreamServiceError::ConnectTimeout { timeout_ms } => format!(
+            "x5_233 video CH{channel} failed before first decoded frame: connect timeout after {timeout_ms} ms; check RTSP channel/server/network or increase rtspConnectTimeoutMs"
+        ),
+        StreamServiceError::IdleTimeout { timeout_ms, .. } => format!(
+            "x5_233 video CH{channel} failed after frames stopped: idle timeout after {timeout_ms} ms; check encoder/network stability"
+        ),
+        _ => format!("x5_233 video CH{channel} stream failed: {error}"),
     }
 }
 
@@ -806,7 +1138,6 @@ fn x5233_identity(
     camera: Option<u16>,
     frame_id: u64,
     timestamp_ns: u64,
-    rtsp_pts_90k: Option<u64>,
 ) -> ImageFrameIdentity {
     ImageFrameIdentity {
         provenance: FrameProvenance::Device {
@@ -814,13 +1145,13 @@ fn x5233_identity(
             channel,
             camera,
             timestamp_ns,
-            rtsp_pts_90k,
         },
         frame_sequence: frame_id,
         source_pts: SourcePts::Unavailable {
             reason: "X5_233 device timestamp is not a decoded RTSP frame identity".to_owned(),
         },
         host_monotonic_time_ns: host_monotonic_time_ns(),
+        device_timestamp_ns: Some(timestamp_ns),
     }
 }
 
@@ -1201,7 +1532,7 @@ impl SftpFileSourceNode {
             host,
             port,
             username: config_string(&self.spec, "username"),
-            expected_host_key: non_empty(config_string(&self.spec, "expectedHostKey")),
+            expected_host_key: None,
         })
     }
 
@@ -1256,11 +1587,7 @@ impl SftpFileSourceNode {
     fn fetch(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         let target = self.target()?;
         let credential_ref =
-            non_empty(config_string(&self.spec, "credentialRef")).ok_or_else(|| {
-                NodeError::Precondition(
-                    "sftpFileSource credentialRef must be configured".to_owned(),
-                )
-            })?;
+            password_session_credential_ref(&self.spec, "sftpFileSource credentialRef")?;
         let path = self.remote_path()?;
         rt.report_state(NodeRuntimeState::Running, "fetching remote image");
         let format = match path
@@ -1395,9 +1722,7 @@ impl SshSessionNode {
             NodeError::Precondition("sshSession host must be configured".to_owned())
         })?;
         let credential_ref =
-            non_empty(config_string(&self.spec, "credentialRef")).ok_or_else(|| {
-                NodeError::Precondition("sshSession credentialRef must be configured".to_owned())
-            })?;
+            password_session_credential_ref(&self.spec, "sshSession credentialRef")?;
         let recipe_id = non_empty(config_string(&self.spec, "recipeId")).ok_or_else(|| {
             NodeError::Precondition("sshSession recipeId must be configured".to_owned())
         })?;
@@ -1407,7 +1732,7 @@ impl SshSessionNode {
                 .parse::<u16>()
                 .unwrap_or(22),
             username: config_string(&self.spec, "username"),
-            expected_host_key: non_empty(config_string(&self.spec, "expectedHostKey")),
+            expected_host_key: None,
         };
         let request = TypedCommandRequest::new(recipe_id)
             .map_err(|e| NodeError::Precondition(e.to_string()))?;
@@ -1456,7 +1781,11 @@ mod tests {
 
     use super::*;
     use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
-    use crate::platform::{EepromExecutor, HexArmControlClient, I2cExecutor, X5ControlClient};
+    use crate::platform::{
+        DecodedVideoFrame, EepromExecutor, HexArmControlClient, I2cExecutor,
+        LatestDecodedFrameSlot, SourcePtsProvenance, StreamServiceError, StreamSession,
+        X5ControlClient,
+    };
 
     fn i2c_spec() -> NodeSpec {
         NodeSpec {
@@ -1499,9 +1828,71 @@ mod tests {
                 "host": "camera.local",
                 "tcpPort": 9073,
                 "snapshotChannel": 3,
-                "rawBayerPattern": "rggb",
-                "rawBitsPerSample": 12,
             }),
+        }
+    }
+
+    struct RecordingX5StreamService {
+        opened: Arc<Mutex<Vec<String>>>,
+        frame: Arc<LatestDecodedFrameSlot>,
+    }
+
+    impl StreamService for RecordingX5StreamService {
+        fn service_id(&self) -> &str {
+            "mock-x5-video"
+        }
+
+        fn open(
+            &self,
+            session_id: StreamSessionId,
+            _request: StreamOpenRequest,
+            control: StreamOperationControl,
+        ) -> Result<StreamSession, StreamServiceError> {
+            self.opened.lock().push(session_id.as_str().to_owned());
+            Ok(StreamSession::new(
+                session_id,
+                Arc::clone(&self.frame),
+                control,
+            ))
+        }
+    }
+
+    struct RecordingX5StreamFactory {
+        configs: Arc<Mutex<Vec<RtspStreamConfig>>>,
+        opened: Arc<Mutex<Vec<String>>>,
+        frames: Arc<Mutex<Vec<(u16, Arc<LatestDecodedFrameSlot>)>>>,
+    }
+
+    impl crate::engine::StreamServiceFactory for RecordingX5StreamFactory {
+        fn create(&self, config: RtspStreamConfig) -> Arc<dyn StreamService> {
+            let channel = config.channel;
+            let frame = Arc::new(LatestDecodedFrameSlot::default());
+            self.configs.lock().push(config);
+            self.frames.lock().push((channel, Arc::clone(&frame)));
+            Arc::new(RecordingX5StreamService {
+                opened: Arc::clone(&self.opened),
+                frame,
+            })
+        }
+    }
+
+    fn decoded_video_frame(sequence: u64, channel: u16) -> DecodedVideoFrame {
+        DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: Arc::from([7_u8; 16]),
+            identity: StreamFrameIdentity::known_at(
+                StreamSessionId::new("x5-video-test").expect("valid session id"),
+                channel,
+                sequence,
+                SourcePts::Known {
+                    ticks: 9_000,
+                    time_base_numerator: 1,
+                    time_base_denominator: 90_000,
+                    provenance: SourcePtsProvenance::FfmpegDecodedFrame,
+                },
+                123_456,
+            ),
         }
     }
 
@@ -1682,6 +2073,74 @@ mod tests {
             .expect_err("missing i2c_executor must be a precondition");
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
     }
+    #[test]
+    fn rtsp_open_all_keeps_ch0_and_ch3_streams_active() {
+        let configs = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(Mutex::new(Vec::new()));
+        let frames = Arc::new(Mutex::new(Vec::new()));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            stream_factory: Some(Arc::new(RecordingX5StreamFactory {
+                configs: Arc::clone(&configs),
+                opened: Arc::clone(&opened),
+                frames: Arc::clone(&frames),
+            })),
+            ..EngineServices::default()
+        };
+        let mut rt = runtime_with_record(services, Arc::clone(&emitted));
+        let spec = x5_spec();
+        let mut node = X5233DriverNode::new(spec);
+
+        node.on_action(
+            NodeAction::Custom {
+                name: "open_rtsp_all".to_owned(),
+                payload: serde_json::Value::Null,
+            },
+            &mut rt,
+        )
+        .expect("open both X5 RTSP video channels");
+        let slots = frames.lock().clone();
+        assert_eq!(slots.len(), 2);
+        for (channel, slot) in slots {
+            slot.publish(decoded_video_frame(90 + u64::from(channel), channel));
+        }
+        for _ in 0..50 {
+            if emitted.lock().len() >= 2 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        node.on_action(
+            NodeAction::Custom {
+                name: "close_rtsp".to_owned(),
+                payload: serde_json::Value::Null,
+            },
+            &mut rt,
+        )
+        .expect("close X5 RTSP video");
+        rt.stop_background();
+
+        let configs = configs.lock();
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].url, "rtsp://camera.local:554/PRR");
+        assert_eq!(configs[0].channel, 0);
+        assert_eq!(configs[1].url, "rtsp://camera.local:557/PRR");
+        assert_eq!(configs[1].channel, 3);
+        assert_eq!(opened.lock().as_slice(), ["x5-x5-1-ch0", "x5-x5-1-ch3"]);
+        let packets = emitted.lock();
+        assert_eq!(packets.len(), 2);
+        let mut channels = packets
+            .iter()
+            .map(|packet| {
+                let DataPacket::VideoFrame(frame) = packet else {
+                    panic!("X5 video output must emit stream.video-frame, got {packet:?}");
+                };
+                frame.identity.channel
+            })
+            .collect::<Vec<_>>();
+        channels.sort_unstable();
+        assert_eq!(channels, [0, 3]);
+    }
 
     #[test]
     fn missing_host_is_precondition_before_executor() {
@@ -1740,14 +2199,12 @@ mod tests {
             uv_len: 2,
             frame_id: 42,
             timestamp_ns: 123_456,
-            rtsp_pts_90k: 9_000,
-            match_rtsp_pts_delta_90k: Some(0),
             payload: Arc::from([1_u8, 2, 3, 4, 5, 6]),
         }
     }
 
     #[test]
-    fn capture_request_emits_nv12_with_driver_identity_and_pts_bridge_provenance() {
+    fn capture_request_emits_nv12_with_exact_device_timestamp_identity() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let emitted = Arc::new(Mutex::new(Vec::new()));
         let services = EngineServices {
@@ -1758,13 +2215,10 @@ mod tests {
             ..EngineServices::default()
         };
         let mut rt = runtime_with_record(services, Arc::clone(&emitted));
-        let mut node = X5233DriverNode { spec: x5_spec() };
+        let mut node = X5233DriverNode::new(x5_spec());
         let request = CaptureRequest {
             target: CaptureTarget::Yuv { channel: 3 },
-            mode: CaptureMode::RtspPts90k {
-                pts: 9_000,
-                tolerance: 0,
-            },
+            mode: CaptureMode::TimestampNs(123_456),
             source_identity: None,
         };
 
@@ -1789,9 +2243,9 @@ mod tests {
                 channel: 3,
                 camera: None,
                 timestamp_ns: 123_456,
-                rtsp_pts_90k: Some(9_000),
             } if driver == "x5_233"
         ));
+        assert_eq!(frame.identity.device_timestamp_ns(), Some(123_456));
         assert!(matches!(
             frame.identity.source_pts,
             SourcePts::Unavailable { .. }
@@ -1809,7 +2263,7 @@ mod tests {
             ..EngineServices::default()
         };
         let (mut rt, _outputs) = runtime(services);
-        let mut node = X5233DriverNode { spec: x5_spec() };
+        let mut node = X5233DriverNode::new(x5_spec());
         node.on_action(
             NodeAction::Custom {
                 name: "capture_yuv".to_owned(),
@@ -1848,22 +2302,18 @@ mod tests {
             ..EngineServices::default()
         };
         let (mut rt, _outputs) = runtime(services);
-        let mut node = X5233DriverNode {
-            spec: NodeSpec {
-                id: "x5-1".to_owned(),
-                kind: "x5233Driver".to_owned(),
-                title: "X5_233 Driver".to_owned(),
-                inputs: vec![],
-                outputs: vec![],
-                config: serde_json::json!({
-                    "host": "10.21.12.108",
-                    "tcpPort": 9073,
-                    "rawCamera": 1,
-                    "rawBayerPattern": "bggr",
-                    "rawBitsPerSample": 12,
-                }),
-            },
-        };
+        let mut node = X5233DriverNode::new(NodeSpec {
+            id: "x5-1".to_owned(),
+            kind: "x5233Driver".to_owned(),
+            title: "X5_233 Driver".to_owned(),
+            inputs: vec![],
+            outputs: vec![],
+            config: serde_json::json!({
+                "host": "10.21.12.108",
+                "tcpPort": 9073,
+                "rawCamera": 1,
+            }),
+        });
         node.on_action(
             NodeAction::Custom {
                 name: "capture_raw".to_owned(),
@@ -1883,7 +2333,7 @@ mod tests {
     }
 
     #[test]
-    fn raw_capture_emits_bayer_frame_with_explicit_metadata() {
+    fn raw_capture_emits_bayer_frame_with_default_metadata() {
         let requests = Arc::new(Mutex::new(Vec::new()));
         let emitted = Arc::new(Mutex::new(Vec::new()));
         let services = EngineServices {
@@ -1903,7 +2353,7 @@ mod tests {
             ..EngineServices::default()
         };
         let mut rt = runtime_with_record(services, Arc::clone(&emitted));
-        let mut node = X5233DriverNode { spec: x5_spec() };
+        let mut node = X5233DriverNode::new(x5_spec());
         node.on_input(
             "capture",
             DataPacket::CaptureRequest(Arc::new(CaptureRequest {
@@ -1940,7 +2390,7 @@ mod tests {
 
     #[test]
     fn raw_exact_capture_is_explicit_precondition_without_device_support() {
-        let mut node = X5233DriverNode { spec: x5_spec() };
+        let mut node = X5233DriverNode::new(x5_spec());
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let error = node
             .on_input(
@@ -1958,7 +2408,7 @@ mod tests {
 
     #[test]
     fn capture_without_x5_client_is_precondition() {
-        let mut node = X5233DriverNode { spec: x5_spec() };
+        let mut node = X5233DriverNode::new(x5_spec());
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let error = node
             .on_input(

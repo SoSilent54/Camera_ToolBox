@@ -18,9 +18,9 @@ use crate::{
     },
     platform::{
         LatestDecodedFrameSlot, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport,
-        SourcePts, StreamCancellation, StreamOpenRequest, StreamOperationControl,
-        StreamRecordingRequest, StreamService, StreamServiceError, StreamServiceEvent,
-        StreamSession, StreamSessionId, StreamStage, StreamTerminal, StreamTimeouts,
+        StreamCancellation, StreamOpenRequest, StreamOperationControl, StreamRecordingRequest,
+        StreamService, StreamServiceError, StreamServiceEvent, StreamSession, StreamSessionId,
+        StreamStage, StreamTerminal, StreamTimeouts,
     },
 };
 
@@ -249,26 +249,20 @@ impl RtspSourceNode {
             CaptureMode::FrameId(expected) => (frame.identity.frame_sequence == expected)
                 .then_some(frame)
                 .ok_or_else(|| capture_miss("frame_id", expected)),
-            CaptureMode::TimestampNs(expected) => (frame.identity.host_monotonic_time_ns
-                == expected)
-                .then_some(frame)
-                .ok_or_else(|| capture_miss("timestamp_ns", expected)),
-            CaptureMode::RtspPts90k { pts, tolerance } => {
-                let matches = matches!(
-                    &frame.identity.source_pts,
-                    SourcePts::Known {
-                        ticks,
-                        time_base_numerator: 1,
-                        time_base_denominator: 90_000,
-                        ..
-                    } if u64::try_from(*ticks)
-                        .ok()
-                        .is_some_and(|actual| actual.abs_diff(pts) <= tolerance)
-                );
-                matches
-                    .then_some(frame)
-                    .ok_or_else(|| capture_miss("rtsp_pts_90k", pts))
-            }
+            CaptureMode::TimestampNs(expected) => frame
+                .identity
+                .device_timestamp_ns()
+                .ok_or_else(|| {
+                    NodeError::Precondition(
+                        "RTSP capture timestamp_ns matching requires device timestamp_ns metadata"
+                            .to_owned(),
+                    )
+                })
+                .and_then(|actual| {
+                    (actual == expected)
+                        .then_some(frame)
+                        .ok_or_else(|| capture_miss("timestamp_ns", expected))
+                }),
         }
     }
 }
@@ -502,8 +496,8 @@ mod tests {
         (NodeRuntime::new(ctx), packets)
     }
 
-    fn decoded_frame(sequence: u64, timestamp_ns: u64, pts: i64) -> Arc<ImageFrame> {
-        let identity = StreamFrameIdentity::known_at(
+    fn decoded_frame(sequence: u64, device_timestamp_ns: Option<u64>, pts: i64) -> Arc<ImageFrame> {
+        let identity = StreamFrameIdentity::known_at_with_device_timestamp(
             StreamSessionId::new("rtsp-test").expect("valid session id"),
             2,
             sequence,
@@ -513,7 +507,8 @@ mod tests {
                 time_base_denominator: 90_000,
                 provenance: SourcePtsProvenance::FfmpegDecodedFrame,
             },
-            timestamp_ns,
+            123,
+            device_timestamp_ns,
         );
         Arc::new(ImageFrame::from(&DecodedVideoFrame {
             width: 2,
@@ -620,7 +615,7 @@ mod tests {
             );
         });
 
-        let frame = decoded_frame(7, 8_000, 9_000);
+        let frame = decoded_frame(7, Some(8_000), 9_000);
         let decoded = frame.decoded_rgba_frame().expect("stream RGBA frame");
         source.publish(decoded);
         for _ in 0..50 {
@@ -658,7 +653,7 @@ mod tests {
 
     #[test]
     fn capture_latest_emits_cached_rgba_with_identity() {
-        let frame = decoded_frame(7, 8_000, 9_000);
+        let frame = decoded_frame(7, Some(8_000), 9_000);
         let identity = frame.identity.clone();
         let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
         let (state_tx, _state_rx) = mpsc::channel();
@@ -685,18 +680,11 @@ mod tests {
 
     #[test]
     fn capture_exact_modes_emit_only_matching_cached_metadata() {
-        let frame = decoded_frame(7, 8_000, 9_000);
+        let frame = decoded_frame(7, Some(8_000), 9_000);
         let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
         let (state_tx, _state_rx) = mpsc::channel();
         let (mut rt, packets) = runtime_with_packets(EngineServices::default(), state_tx);
-        for mode in [
-            CaptureMode::FrameId(7),
-            CaptureMode::TimestampNs(8_000),
-            CaptureMode::RtspPts90k {
-                pts: 9_001,
-                tolerance: 1,
-            },
-        ] {
+        for mode in [CaptureMode::FrameId(7), CaptureMode::TimestampNs(8_000)] {
             node.on_input("capture", capture_request(mode, None), &mut rt)
                 .expect("cached metadata matches capture request");
         }
@@ -705,7 +693,7 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .len(),
-            3
+            2
         );
     }
 
@@ -723,21 +711,24 @@ mod tests {
             .expect_err("missing decoded frame");
         assert!(matches!(error, NodeError::Precondition(_)));
 
-        let frame = decoded_frame(7, 8_000, 9_000);
-        for mode in [
-            CaptureMode::FrameId(8),
-            CaptureMode::TimestampNs(8_001),
-            CaptureMode::RtspPts90k {
-                pts: 9_001,
-                tolerance: 0,
-            },
-        ] {
+        let frame = decoded_frame(7, Some(8_000), 9_000);
+        for mode in [CaptureMode::FrameId(8), CaptureMode::TimestampNs(8_001)] {
             let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
             let error = node
                 .on_input("capture", capture_request(mode, None), &mut rt)
                 .expect_err("exact cache miss");
             assert!(matches!(error, NodeError::Precondition(_)), "got {error:?}");
         }
+
+        let mut node = node_with_cached_frame(Some(decoded_frame(7, None, 9_000)));
+        let error = node
+            .on_input(
+                "capture",
+                capture_request(CaptureMode::TimestampNs(8_000), None),
+                &mut rt,
+            )
+            .expect_err("device timestamp metadata is required");
+        assert!(matches!(error, NodeError::Precondition(_)));
         let mut node = node_with_cached_frame(Some(Arc::clone(&frame)));
         let raw_request = DataPacket::CaptureRequest(Arc::new(CaptureRequest {
             target: CaptureTarget::Raw { camera: 0 },

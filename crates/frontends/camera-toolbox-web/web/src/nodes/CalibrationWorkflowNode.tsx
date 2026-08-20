@@ -1,11 +1,6 @@
 import type { NodeProps } from '@xyflow/react';
-import type { FlowNodeData, NodeActionControl } from '../workflow';
-import { NodeActionButtons, NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './shared';
-
-const DATASET_ACTIONS: readonly NodeActionControl[] = [
-  { action: 'trigger', label: '输出数据集' },
-  { action: 'clear', label: '清空样本' },
-];
+import type { FlowNodeData } from '../workflow';
+import { NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './shared';
 
 /** 标定辅助节点：只暴露实际实现的配置、动作和运行时输出，避免把输入驱动节点伪装成完整自动闭环。 */
 export function CalibrationWorkflowNode({ data, selected }: NodeProps) {
@@ -13,7 +8,6 @@ export function CalibrationWorkflowNode({ data, selected }: NodeProps) {
   const node = nodeData.workflowNode;
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
-  const actions = node.kind === 'datasetCollector' ? DATASET_ACTIONS : undefined;
 
   return (
     <div className="workflow-node-shell">
@@ -28,13 +22,6 @@ export function CalibrationWorkflowNode({ data, selected }: NodeProps) {
             onChange={nodeData.onNodeConfigChange}
           />
           <RuntimeOutputSummary output={nodeData.runtimeOutput} />
-          <NodeActionButtons
-            nodeId={node.id}
-            actions={actions}
-            pending={nodeData.actionPending}
-            onAction={nodeData.onNodeAction}
-            onRefreshOutput={nodeData.onRefreshNodeOutput}
-          />
         </div>
       </section>
       {runtimeDiagnostic ? <div className="node-diagnostic-below" title={runtimeDiagnostic}>{runtimeDiagnostic}</div> : null}
@@ -46,12 +33,14 @@ function nodeHint(kind: string): string {
   switch (kind) {
     case 'chessboardDetector':
       return '随输入帧检测棋盘格';
-    case 'gainScorer':
-      return '按角点完整度计算 gain，并保留帧身份';
-    case 'captureGate':
-      return '满足阈值并稳定保持后发出抓帧请求';
-    case 'datasetCollector':
-      return '累积 detection，手动输出或清空';
+    case 'calibrationFrameScorer':
+      return '依据棋盘角点完整度生成 score，并保留帧身份';
+    case 'scoreThresholdGate':
+      return '按 score 阈值把评分转换为 capture signal';
+    case 'consecutiveHoldGate':
+      return '连续稳定的 signal 转换为 capture trigger，并去重帧身份';
+    case 'captureRequestBuilder':
+      return '将 trigger 和显式配置的 YUV/RAW 目标组装成设备 capture request';
     case 'coverageAnalyzer':
       return '按棋盘中心栅格统计覆盖度';
     case 'poseGuide':

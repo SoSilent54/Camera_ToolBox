@@ -17,8 +17,10 @@ export type NodeKind =
   | 'overlayComposer'
   | 'viewer'
   | 'chessboardDetector'
-  | 'gainScorer'
-  | 'captureGate'
+  | 'calibrationFrameScorer'
+  | 'scoreThresholdGate'
+  | 'consecutiveHoldGate'
+  | 'captureRequestBuilder'
   | 'datasetCollector'
   | 'coverageAnalyzer'
   | 'autoCaptureController'
@@ -54,6 +56,8 @@ export type PortKind =
   | 'calib.solution'
   | 'calib.report'
   | 'capture.score'
+  | 'capture.signal'
+  | 'capture.trigger'
   | 'capture.target'
   | 'command.capture'
   | 'i2c.bus'
@@ -194,7 +198,6 @@ export interface SshExecutionBinding {
   port?: number;
   username?: string;
   credentialRef: string;
-  expectedHostKey?: string;
 }
 
 /** 密码只通过本机 WebSocket 写入服务端进程内凭据库；图中只保存返回的 session 引用。 */
@@ -275,15 +278,13 @@ export interface X5ChannelRequest extends X5BindingRequest {
   channel: number;
 }
 
-export type X5SnapshotMode = 'latest' | 'frame_id' | 'timestamp_ns' | 'rtsp_pts_90k';
+export type X5SnapshotMode = 'latest' | 'frame_id' | 'timestamp_ns';
 
 export interface X5SnapshotRequest extends X5BindingRequest {
   channel: number;
   mode: X5SnapshotMode;
   frameId?: number;
   timestampNs?: number;
-  rtspPts90k?: number;
-  rtspPtsTolerance90k?: number;
 }
 
 export type X5ControlResponse = Record<string, unknown>;
@@ -340,6 +341,13 @@ export type ViewerPreview =
 /** 可持久化的通用节点标量配置值。 */
 export type ScalarConfigValue = string | number | boolean;
 
+/** Dataset Collector 样本审核动作；请求体只在运行时传输，不写入工作流图。 */
+export type DatasetSampleActionName = 'accept' | 'reject' | 'enable' | 'disable' | 'delete';
+
+export interface DatasetSampleActionPayload {
+  sampleId: string;
+}
+
 /** 后端 `runtime.node.action` 当前支持的节点动作。 */
 export type NodeActionName =
   | 'connect'
@@ -348,10 +356,15 @@ export type NodeActionName =
   | 'arm'
   | 'disarm'
   | 'clear'
+  | DatasetSampleActionName
   | 'probe'
   | 'status'
   | 'capture_yuv'
   | 'capture_raw'
+  | 'open_rtsp_ch0'
+  | 'open_rtsp_ch3'
+  | 'open_rtsp_all'
+  | 'close_rtsp'
   | 'initialize_api_control'
   | 'calibrate'
   | 'clear_parking_stop'
@@ -363,6 +376,55 @@ export interface NodeActionControl {
   action: NodeActionName;
   label: string;
 }
+/** Dataset Collector 的最近一次运行时输出；它由引擎维护，绝不回写 WorkflowGraph。 */
+export interface DatasetCollectorRuntimeOutput {
+  kind: 'calib.dataset.v1';
+  count: number;
+  samples: DatasetSampleRuntimeOutput[];
+}
+
+/** 单个可审核标定样本；图像引用仅含元数据/引用，不含图像字节。 */
+export interface DatasetSampleRuntimeOutput {
+  id: string;
+  imageRef?: DatasetImageReference;
+  detection?: unknown;
+  score?: DatasetFrameScore | null;
+  acceptance?: DatasetSampleAcceptance;
+  provenance?: DatasetSampleProvenance;
+}
+
+/** 采集图像的轻量引用；format 为 null 表示采集端没有声明像素格式。 */
+export interface DatasetImageReference {
+  ref: string;
+  width: number;
+  height: number;
+  format: string | null;
+}
+
+export interface DatasetFrameScore {
+  score: number;
+  frameSequence: number;
+}
+
+export interface DatasetSampleAcceptance {
+  accepted?: boolean;
+  enabled?: boolean;
+}
+
+export interface DatasetSampleProvenance {
+  source?: DatasetSampleSource;
+  frameIdentity?: DatasetFrameIdentity;
+}
+
+export type DatasetSampleSource = Record<string, unknown>;
+
+export interface DatasetFrameIdentity {
+  frameSequence?: number;
+  sourcePts?: DatasetSourcePts;
+  hostMonotonicTimeNs?: number;
+}
+
+export type DatasetSourcePts = Record<string, unknown>;
 
 export interface FlowNodeData extends Record<string, unknown> {
   workflowNode: WorkflowNode;
@@ -379,8 +441,8 @@ export interface FlowNodeData extends Record<string, unknown> {
   availableActions?: readonly NodeActionControl[];
   onRtspUrlChange?: (nodeId: string, url: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: ScalarConfigValue) => void;
-  /** 触发节点动作；Hex Arm 的关节弧度保留在已校验的节点 config，动作本身不携带任意 payload。 */
-  onNodeAction?: (nodeId: string, action: NodeActionName) => void;
+  /** 触发节点动作；样本审核 payload 仅经运行时 WS 透传，绝不持久化到图配置。 */
+  onNodeAction?: (nodeId: string, action: NodeActionName, payload?: DatasetSampleActionPayload) => void;
   /** 拉取节点最近一次输出；无输出时保留当前摘要。 */
   onRefreshNodeOutput?: (nodeId: string) => void;
 }
@@ -543,9 +605,9 @@ export async function captureX5Snapshot(requestBody: X5SnapshotRequest): Promise
 
 
 
-/** 向引擎节点投递动作（connect/disconnect/trigger/arm/disarm）。 */
-export async function nodeAction(nodeId: string, action: string): Promise<{ ok: boolean }> {
-  return request('runtime.node.action', { nodeId, action });
+/** 向引擎节点投递动作；可选 payload 仅用于 Dataset Collector 的样本审核。 */
+export async function nodeAction(nodeId: string, action: string, payload?: DatasetSampleActionPayload): Promise<{ ok: boolean }> {
+  return request('runtime.node.action', payload ? { nodeId, action, payload } : { nodeId, action });
 }
 
 /** 目录条目。 */
@@ -596,7 +658,26 @@ export function validateConnectionKinds(source: WorkflowPort, target: WorkflowPo
   if (source.schema !== target.schema) {
     return `${source.schema} 不能连接到 ${target.schema}`;
   }
+  if (!formatHintsCompatible(source.formatHint, target.formatHint)) {
+    return `像素格式 ${source.formatHint ?? '未声明'} 不能连接到 ${target.formatHint ?? '未声明'}`;
+  }
   return null;
+}
+
+function formatHintsCompatible(source?: string, target?: string): boolean {
+  if (!source || !target) {
+    return true;
+  }
+  const sourceFormats = splitFormatHints(source);
+  const targetFormats = splitFormatHints(target);
+  return sourceFormats.some((format) => targetFormats.includes(format));
+}
+
+function splitFormatHints(value: string): string[] {
+  return value
+    .split('|')
+    .map((item) => item.trim())
+    .filter((item) => item.length > 0);
 }
 
 async function request<T>(path: string, payload?: unknown): Promise<T> {

@@ -75,9 +75,6 @@ pub struct X5RtspChannelStatus {
     pub action_id: u64,
     pub last_message: String,
     pub port: Option<u16>,
-    pub rtsp_pts_valid: bool,
-    pub rtsp_pts_origin_90k: u64,
-    pub rtsp_pts_last_90k: u64,
     pub path: String,
 }
 
@@ -93,10 +90,6 @@ pub struct X5RingStatus {
     pub min_timestamp_ns: u64,
     pub max_timestamp_ns: u64,
     pub last_timestamp_ns: u64,
-    pub last_rtsp_timestamp_us: u64,
-    pub last_rtsp_pts_90k: u64,
-    pub min_rtsp_pts_90k: u64,
-    pub max_rtsp_pts_90k: u64,
     pub retention_ns: u64,
     pub dropped: u64,
     pub evicted: u64,
@@ -111,10 +104,6 @@ pub struct X5YuvSnapshot {
     pub uv_len: usize,
     pub frame_id: u64,
     pub timestamp_ns: u64,
-    pub rtsp_timestamp_us: u64,
-    pub rtsp_pts_90k: u64,
-    pub match_rtsp_pts_delta_90k: Option<u64>,
-    pub match_mode: Option<String>,
     pub payload: Vec<u8>,
 }
 
@@ -417,53 +406,6 @@ pub fn capture_yuv_snapshot_by_timestamp_ns(
     Ok(snapshot)
 }
 
-/// 按 RTSP 90k PTS bridge 抓取同源原始 NV12；仅用于显式 PTS 桥接实验。
-pub fn capture_yuv_snapshot_by_rtsp_pts_90k(
-    host: &str,
-    port: u16,
-    channel: u16,
-    rtsp_pts_90k: u64,
-    tolerance_90k: u64,
-) -> Result<X5YuvSnapshot, String> {
-    let response = request_frame(
-        host,
-        port,
-        11,
-        &json!({
-            "cmd": "SNAPSHOT",
-            "channel": channel,
-            "mode": "rtsp_pts_90k",
-            "rtsp_pts_90k": rtsp_pts_90k,
-            "rtsp_pts_tolerance_90k": tolerance_90k,
-        }),
-    )?;
-    ensure_ok(&response.meta).map_err(|error| {
-        tracing::warn!(
-            operation = "x5_yuv_snapshot",
-            host = %host,
-            port,
-            channel,
-            mode = "rtsp_pts_90k",
-            request_rtsp_pts_90k = rtsp_pts_90k,
-            request_rtsp_pts_tolerance_90k = tolerance_90k,
-            error = %error,
-            "X5 YUV snapshot failed"
-        );
-        error
-    })?;
-    let snapshot = parse_yuv_snapshot(response)?;
-    let delta = snapshot.match_rtsp_pts_delta_90k.ok_or_else(|| {
-        "X5 SNAPSHOT rtsp_pts_90k response missing match_rtsp_pts_delta_90k".to_owned()
-    })?;
-    if delta > tolerance_90k {
-        return Err(format!(
-            "X5 SNAPSHOT rtsp_pts_90k mismatch: requested {rtsp_pts_90k}, got {} (delta {delta}, tolerance {tolerance_90k})",
-            snapshot.rtsp_pts_90k
-        ));
-    }
-    Ok(snapshot)
-}
-
 /// 返回仍需要发送 START_RTSP 的通道；已 requested/running 的通道只等待稳定，不重复触发重启。
 pub fn rtsp_channels_requiring_start(
     status: &X5DriverStatus,
@@ -719,9 +661,6 @@ fn parse_rtsp_channel_status(value: &Value) -> Option<X5RtspChannelStatus> {
         last_message: value_string(value, "last_message")
             .unwrap_or("unknown")
             .to_owned(),
-        rtsp_pts_valid: value_bool(value, "rtsp_pts_valid").unwrap_or(false),
-        rtsp_pts_origin_90k: value_u64(value, "rtsp_pts_origin_90k").unwrap_or(0),
-        rtsp_pts_last_90k: value_u64(value, "rtsp_pts_last_90k").unwrap_or(0),
         port: value_u64(value, "port").and_then(|value| u16::try_from(value).ok()),
         path: value_string(value, "path").unwrap_or("/PRR").to_owned(),
     })
@@ -755,10 +694,6 @@ fn parse_ring_status(value: &Value) -> Option<X5RingStatus> {
         valid,
         write_index,
         min_frame_id,
-        last_rtsp_timestamp_us: value_u64(value, "last_rtsp_timestamp_us").unwrap_or(0),
-        last_rtsp_pts_90k: value_u64(value, "last_rtsp_pts_90k").unwrap_or(0),
-        min_rtsp_pts_90k: value_u64(value, "min_rtsp_pts_90k").unwrap_or(0),
-        max_rtsp_pts_90k: value_u64(value, "max_rtsp_pts_90k").unwrap_or(0),
         max_frame_id,
         last_frame_id,
         min_timestamp_ns,
@@ -793,14 +728,10 @@ fn parse_yuv_snapshot(response: X5ResponseFrame) -> Result<X5YuvSnapshot, String
         channel: required_u16(&response.meta, "channel", "X5 SNAPSHOT response")?,
         width: required_u32(&response.meta, "width", "X5 SNAPSHOT response")?,
         height: required_u32(&response.meta, "height", "X5 SNAPSHOT response")?,
-        rtsp_timestamp_us: value_u64(&response.meta, "rtsp_timestamp_us").unwrap_or(0),
-        rtsp_pts_90k: value_u64(&response.meta, "rtsp_pts_90k").unwrap_or(0),
-        match_rtsp_pts_delta_90k: value_u64(&response.meta, "match_rtsp_pts_delta_90k"),
         y_len,
         uv_len,
         frame_id: required_u64(&response.meta, "frame_id", "X5 SNAPSHOT response")?,
         timestamp_ns: required_u64(&response.meta, "timestamp_ns", "X5 SNAPSHOT response")?,
-        match_mode: value_string(&response.meta, "match_mode").map(str::to_owned),
         payload: response.payload,
     })
 }
@@ -1166,9 +1097,6 @@ mod tests {
                         "action_id": 4,
                         "last_message": "start_queued action_id=4",
                         "port": 557,
-                        "rtsp_pts_valid": true,
-                        "rtsp_pts_origin_90k": 123_000,
-                        "rtsp_pts_last_90k": 456_000,
                         "path": "/PRR"
                     }
                 ],
@@ -1188,10 +1116,6 @@ mod tests {
                     "max_frame_id": 0,
                     "min_timestamp_ns": 0,
                     "max_timestamp_ns": 0,
-                    "last_rtsp_timestamp_us": 5_066_666,
-                    "last_rtsp_pts_90k": 456_000,
-                    "min_rtsp_pts_90k": 123_000,
-                    "max_rtsp_pts_90k": 456_000,
                     "retention_ns": 0,
                     "dropped": 0,
                     "evicted": 0
@@ -1216,16 +1140,9 @@ mod tests {
         assert!(status.rtsp_channels[0].requested_enabled);
         assert!(status.rtsp_channels[0].busy);
         assert_eq!(status.rtsp_channels[0].port, Some(557));
-        assert!(status.rtsp_channels[0].rtsp_pts_valid);
-        assert_eq!(status.rtsp_channels[0].rtsp_pts_origin_90k, 123_000);
-        assert_eq!(status.rtsp_channels[0].rtsp_pts_last_90k, 456_000);
         assert_eq!(status.rings.len(), 1);
         assert_eq!(status.rings[0].channel, 3);
         assert_eq!(status.rings[0].valid, 0);
-        assert_eq!(status.rings[0].last_rtsp_timestamp_us, 5_066_666);
-        assert_eq!(status.rings[0].last_rtsp_pts_90k, 456_000);
-        assert_eq!(status.rings[0].min_rtsp_pts_90k, 123_000);
-        assert_eq!(status.rings[0].max_rtsp_pts_90k, 456_000);
         assert_eq!(
             rtsp_readiness_pending(&status, &[3]).unwrap(),
             vec![
@@ -1292,10 +1209,6 @@ mod tests {
                 "payload_len": 6,
                 "frame_id": 11,
                 "timestamp_ns": 22,
-                "rtsp_timestamp_us": 1_234_567,
-                "rtsp_pts_90k": 111_111,
-                "match_rtsp_pts_delta_90k": 12,
-                "match_mode": "timestamp_ns"
             }),
             payload: vec![16, 16, 16, 16, 128, 128],
         };
@@ -1307,10 +1220,6 @@ mod tests {
         assert_eq!(snapshot.height, 2);
         assert_eq!(snapshot.y_len, 4);
         assert_eq!(snapshot.uv_len, 2);
-        assert_eq!(snapshot.match_mode.as_deref(), Some("timestamp_ns"));
-        assert_eq!(snapshot.rtsp_timestamp_us, 1_234_567);
-        assert_eq!(snapshot.rtsp_pts_90k, 111_111);
-        assert_eq!(snapshot.match_rtsp_pts_delta_90k, Some(12));
         assert_eq!(snapshot.payload.len(), 6);
     }
 

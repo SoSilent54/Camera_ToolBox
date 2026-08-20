@@ -20,7 +20,7 @@ import {
   type I2cPreviewRequest,
 } from './workflow';
 import { configText } from './nodeConfig';
-import { NodeActionButtons, NodeHeader, PortHandles, RuntimeOutputSummary, ScalarConfigFields } from './nodes/shared';
+import { NodeActionButtons, NodeHeader, PortHandles, RuntimeOutputSummary } from './nodes/shared';
 import { FileBrowser } from './FileBrowser';
 
 const SOURCE_TRIGGER_ACTIONS = [{ action: 'trigger', label: '加载' }] as const;
@@ -85,7 +85,7 @@ export function LocalFileSourceNode({ data, selected }: NodeProps) {
 }
 
 
-/** SFTP 图片源：直接使用配置连接 SFTP 并触发读取；不声明未实现的 workspace/SSH 端口。 */
+/** SFTP 图片源：密码注册后直接连接 SFTP 并触发读取；不声明未实现的 workspace/SSH 端口。 */
 export function SftpFileSourceNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
@@ -93,15 +93,7 @@ export function SftpFileSourceNode({ data, selected }: NodeProps) {
   const runtimeState = nodeData.runtimeState;
   const runtimeDiagnostic = nodeData.runtimeDiagnostic;
   const actionPending = Boolean(nodeData.actionPending);
-  const connectionConfig = {
-    host: configText(node, 'host', ''),
-    port: configText(node, 'port', '22'),
-    username: configText(node, 'username', 'root'),
-    credentialRef: configText(node, 'credentialRef', ''),
-    expectedHostKey: configText(node, 'expectedHostKey', ''),
-    remoteRoot,
-    selection: configText(node, 'selection', ''),
-  };
+  const set = (key: string, value: string) => nodeData.onNodeConfigChange?.(node.id, key, value);
   return (
     <div className="workflow-node-shell">
       <section className={`workflow-node remote-node ${selected ? 'selected' : ''}`}>
@@ -109,12 +101,13 @@ export function SftpFileSourceNode({ data, selected }: NodeProps) {
 
         <PortHandles node={node} />
         <div className="node-body compact">
-          <ScalarConfigFields
-            nodeId={node.id}
-            config={connectionConfig}
-            onChange={nodeData.onNodeConfigChange}
-          />
-          <span className="node-hint">仅支持 PNG/JPEG；credentialRef 使用 key-file:/绝对路径 或 session:ID，密码不会写入工作流。</span>
+          <Field id={`${node.id}-host`} label="Host" value={configText(node, 'host', '')} onChange={(value) => set('host', value)} placeholder="camera.local" />
+          <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
+          <Field id={`${node.id}-username`} label="User" value={configText(node, 'username', 'root')} onChange={(value) => set('username', value)} />
+          <PasswordCredentialField nodeId={node.id} credentialRef={configText(node, 'credentialRef', '')} onCredentialRef={(value) => set('credentialRef', value)} />
+          <Field id={`${node.id}-remote-root`} label="Remote root" value={remoteRoot} onChange={(value) => set('remoteRoot', value)} />
+          <Field id={`${node.id}-selection`} label="Selection" value={configText(node, 'selection', '')} onChange={(value) => set('selection', value)} />
+          <span className="node-hint">仅支持 PNG/JPEG；认证只使用当前服务端进程内密码 session，密码和私钥路径都不会写入工作流。</span>
           <RuntimeOutputSummary output={nodeData.runtimeOutput} />
           <NodeActionButtons
             nodeId={node.id}
@@ -218,9 +211,7 @@ export function SshSessionNode({ data, selected }: NodeProps) {
       <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
       <Field id={`${node.id}-username`} label="User" value={configText(node, 'username', 'root')} onChange={(value) => set('username', value)} />
       <PasswordCredentialField nodeId={node.id} credentialRef={configText(node, 'credentialRef', '')} onCredentialRef={(value) => set('credentialRef', value)} />
-      <Field id={`${node.id}-host-key`} label="Pinned host key" value={configText(node, 'expectedHostKey', '')} onChange={(value) => set('expectedHostKey', value)} placeholder="ssh-ed25519 AAAA…" />
-      <Field id={`${node.id}-recipe`} label="Recipe ID" value={configText(node, 'recipeId', '')} onChange={(value) => set('recipeId', value)} placeholder="registered command recipe" />
-      <label className="node-hint">Password authentication only. The password is never saved in the workflow; pin the host key before triggering.</label>
+      <label className="node-hint">Password authentication only. The password is registered in the current server process and is never saved in the workflow.</label>
       <div className="node-actions">
         <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
       </div>
@@ -238,8 +229,6 @@ export function X5233DriverNode({ data, selected }: NodeProps) {
   const snapshotChannel = x5Channel(node, 'snapshotChannel');
   const snapshotMode = x5SnapshotMode(configText(node, 'snapshotMode', 'latest'));
   const rawCamera = numberValue(configText(node, 'rawCamera', '0'), 0);
-  const rawBayerPattern = configText(node, 'rawBayerPattern', 'rggb');
-  const rawBitsPerSample = configText(node, 'rawBitsPerSample', '12');
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<X5ControlResponse | string>();
   const set = (key: string, value: string) => nodeData.onNodeConfigChange?.(node.id, key, value);
@@ -249,8 +238,9 @@ export function X5233DriverNode({ data, selected }: NodeProps) {
   };
   const binding = { host, tcpPort };
   const actionPending = Boolean(nodeData.actionPending);
-  const captureDisabled = !nodeData.onNodeAction || actionPending;
-  const capture = (action: 'capture_yuv' | 'capture_raw') => nodeData.onNodeAction?.(node.id, action);
+  const workflowActionDisabled = !nodeData.onNodeAction || actionPending;
+  const captureDisabled = workflowActionDisabled;
+  const workflowAction = (action: 'open_rtsp_ch0' | 'open_rtsp_ch3' | 'open_rtsp_all' | 'close_rtsp' | 'probe' | 'status' | 'capture_yuv' | 'capture_raw') => nodeData.onNodeAction?.(node.id, action);
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
       <strong>Connection</strong>
@@ -262,11 +252,15 @@ export function X5233DriverNode({ data, selected }: NodeProps) {
       <Field id={`${node.id}-fps`} label="Encoder FPS" value={configText(node, 'fps', '60')} onChange={(value) => set('fps', value)} type="number" />
       <Field id={`${node.id}-bitrate`} label="Encoder kbps" value={configText(node, 'bitrateKbps', '12000')} onChange={(value) => set('bitrateKbps', value)} type="number" />
       <div className="node-actions">
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => probeX5Control(binding))}>Probe</button>
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => statusX5Control(binding))}>Status</button>
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => configureX5Rtsp({ ...binding, fps: numberValue(configText(node, 'fps', '60'), 60), bitrateKbps: numberValue(configText(node, 'bitrateKbps', '12000'), 12000) }))}>Configure RTSP</button>
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => startX5RtspChannel({ ...binding, channel: rtspChannel }))}>Start RTSP</button>
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => stopX5RtspChannel({ ...binding, channel: rtspChannel }))}>Stop RTSP</button>
+        <button type="button" className="nodrag nowheel" disabled={workflowActionDisabled} onClick={() => workflowAction('probe')}>{actionPending ? '查询中…' : 'Probe'}</button>
+        <button type="button" className="nodrag nowheel" disabled={workflowActionDisabled} onClick={() => workflowAction('status')}>{actionPending ? '查询中…' : 'Status'}</button>
+        <button type="button" className="nodrag nowheel" disabled={workflowActionDisabled} onClick={() => workflowAction('open_rtsp_ch0')}>{actionPending ? '连接中…' : 'RTSP Open CH0'}</button>
+        <button type="button" className="nodrag nowheel" disabled={workflowActionDisabled} onClick={() => workflowAction('open_rtsp_ch3')}>{actionPending ? '连接中…' : 'RTSP Open CH3'}</button>
+        <button type="button" className="nodrag nowheel" disabled={workflowActionDisabled} onClick={() => workflowAction('open_rtsp_all')}>{actionPending ? '连接中…' : 'RTSP Open CH0+CH3'}</button>
+        <button type="button" className="nodrag nowheel" disabled={workflowActionDisabled} onClick={() => workflowAction('close_rtsp')}>{actionPending ? '断开中…' : 'RTSP Close All'}</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => configureX5Rtsp({ ...binding, fps: numberValue(configText(node, 'fps', '60'), 60), bitrateKbps: numberValue(configText(node, 'bitrateKbps', '12000'), 12000) }))}>Configure RTSP encoder</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => startX5RtspChannel({ ...binding, channel: rtspChannel }))}>Start RTSP encoder</button>
+        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => call(() => stopX5RtspChannel({ ...binding, channel: rtspChannel }))}>Stop RTSP encoder</button>
       </div>
 
       <strong>Manual Capture</strong>
@@ -280,29 +274,72 @@ export function X5233DriverNode({ data, selected }: NodeProps) {
       />
       {snapshotMode === 'frame_id' ? <Field id={`${node.id}-snapshot-frame-id`} label="Frame ID" value={configText(node, 'snapshotFrameId', '')} onChange={(value) => set('snapshotFrameId', value)} type="number" /> : null}
       {snapshotMode === 'timestamp_ns' ? <Field id={`${node.id}-snapshot-timestamp`} label="Timestamp ns" value={configText(node, 'snapshotTimestampNs', '')} onChange={(value) => set('snapshotTimestampNs', value)} type="number" /> : null}
-      {snapshotMode === 'rtsp_pts_90k' ? <>
-        <Field id={`${node.id}-snapshot-rtsp-pts`} label="RTSP PTS (90 kHz)" value={configText(node, 'snapshotRtspPts90k', '')} onChange={(value) => set('snapshotRtspPts90k', value)} type="number" />
-        <Field id={`${node.id}-snapshot-rtsp-tolerance`} label="PTS tolerance (90 kHz)" value={configText(node, 'snapshotRtspPtsTolerance90k', '0')} onChange={(value) => set('snapshotRtspPtsTolerance90k', value)} type="number" />
-      </> : null}
       <Field id={`${node.id}-raw-camera`} label="RAW camera" value={configText(node, 'rawCamera', String(rawCamera))} onChange={(value) => set('rawCamera', value)} type="number" />
-      <SelectField
-        id={`${node.id}-raw-bayer`}
-        label="RAW Bayer"
-        value={rawBayerPattern}
-        options={X5_RAW_BAYER_PATTERNS}
-        onChange={(value) => set('rawBayerPattern', value)}
-      />
-      <Field id={`${node.id}-raw-bits`} label="RAW bits" value={rawBitsPerSample} onChange={(value) => set('rawBitsPerSample', value)} type="number" />
       <div className="node-actions">
-        <button type="button" className="nodrag nowheel" disabled={captureDisabled} onClick={() => capture('capture_yuv')}>{actionPending ? '采集中…' : 'Capture YUV'}</button>
-        <button type="button" className="nodrag nowheel" disabled={captureDisabled} onClick={() => capture('capture_raw')}>{actionPending ? '采集中…' : 'Capture RAW'}</button>
+        <button type="button" className="nodrag nowheel" disabled={captureDisabled} onClick={() => workflowAction('capture_yuv')}>{actionPending ? '采集中…' : 'Capture YUV'}</button>
+        <button type="button" className="nodrag nowheel" disabled={captureDisabled} onClick={() => workflowAction('capture_raw')}>{actionPending ? '采集中…' : 'Capture RAW'}</button>
       </div>
-      <span className="node-hint">手动采集属于 X5_233 Driver：YUV 走 snapshotChannel/mode，RAW 只支持 latest 且需要 RAW Bayer/bit depth；结果从 yuvCh0/yuvCh3 或 rawCam0/rawCam1 输出到图。</span>
+      <span className="node-hint">直接连线只建立图边，不会自动拉流；RTSP Open CH0/CH3/CH0+CH3 才会在本工作流中拉取对应端口并向 videoCh0/videoCh3 输出帧。Start/Stop RTSP encoder 只控制板端编码器。手动采集：YUV 走 snapshotChannel/mode，RAW 只支持 latest；RAW 解释参数统一在 Demosaic 节点选择。</span>
       <RuntimeOutputSummary output={nodeData.runtimeOutput} />
       <ResultBox value={result} />
     </RemoteFrame>
   );
 }
+
+/** Demosaic 节点：显式配置 RAW 解释参数与输出像素格式。 */
+export function DemosaicNode({ data, selected }: NodeProps) {
+  const nodeData = data as FlowNodeData;
+  const node = nodeData.workflowNode;
+  const algorithm = configText(node, 'algorithm', 'bilinear');
+  const outputFormatDraft = configText(node, 'outputFormat', 'rgba');
+  const outputFormat = DEMOSAIC_OUTPUT_FORMATS.some((option) => option.value === outputFormatDraft) ? outputFormatDraft : 'rgba';
+  const bayer = configText(node, 'bayer', 'rggb');
+  const bitsPerSample = configText(node, 'bitsPerSample', '12');
+  const blackLevel = configText(node, 'blackLevel', '0');
+  const set = (key: string, value: string) => nodeData.onNodeConfigChange?.(node.id, key, value);
+  return (
+    <RemoteFrame nodeData={nodeData} selected={selected}>
+      <strong>Decode</strong>
+      <SelectField
+        id={`${node.id}-algorithm`}
+        label="Algorithm"
+        value={algorithm}
+        options={DEMOSAIC_ALGORITHMS}
+        onChange={(value) => set('algorithm', value)}
+      />
+      <SelectField
+        id={`${node.id}-output-format`}
+        label="Output format"
+        value={outputFormat}
+        options={DEMOSAIC_OUTPUT_FORMATS}
+        onChange={(value) => set('outputFormat', value)}
+      />
+      <SelectField
+        id={`${node.id}-bayer`}
+        label="RAW Bayer"
+        value={bayer}
+        options={X5_RAW_BAYER_PATTERNS}
+        onChange={(value) => set('bayer', value)}
+      />
+      <Field id={`${node.id}-bits`} label="RAW bits" value={bitsPerSample} onChange={(value) => set('bitsPerSample', value)} type="number" />
+      <Field id={`${node.id}-black-level`} label="Black level" value={blackLevel} onChange={(value) => set('blackLevel', value)} type="number" />
+      <span className="node-hint">Demosaic 仅做显式 RAW 解释；Bayer / bit depth / black level 用于 RAW 归一化，Output format 决定实际输出像素格式。</span>
+      <RuntimeOutputSummary output={nodeData.runtimeOutput} />
+    </RemoteFrame>
+  );
+}
+
+type DemosaicOutputFormat = 'rgba' | 'gray8' | 'gray16le';
+
+const DEMOSAIC_ALGORITHMS: readonly { value: string; label: string }[] = [
+  { value: 'bilinear', label: 'Bilinear' },
+];
+
+const DEMOSAIC_OUTPUT_FORMATS: readonly { value: DemosaicOutputFormat; label: string }[] = [
+  { value: 'rgba', label: 'RGBA8' },
+  { value: 'gray8', label: 'GRAY8' },
+  { value: 'gray16le', label: 'GRAY16LE' },
+];
 
 /** Hex Arm 仅通过工作流节点动作控制；所有关节值以逗号分隔的弧度保存，运动按钮必须经过双重门禁。 */
 export function HexArmDeviceNode({ data, selected }: NodeProps) {
@@ -379,7 +416,6 @@ const X5_SNAPSHOT_MODES: readonly { value: X5SnapshotMode; label: string }[] = [
   { value: 'latest', label: 'Latest frame' },
   { value: 'frame_id', label: 'Exact frame ID' },
   { value: 'timestamp_ns', label: 'Exact capture timestamp' },
-  { value: 'rtsp_pts_90k', label: 'RTSP PTS bridge' },
 ];
 
 const X5_RAW_BAYER_PATTERNS: readonly { value: string; label: string }[] = [
@@ -443,7 +479,6 @@ function sshBinding(node: FlowNodeData['workflowNode']) {
     port: numberValue(configText(node, 'port', '22'), 22),
     username: configText(node, 'username', 'root'),
     credentialRef: configText(node, 'credentialRef', ''),
-    expectedHostKey: configText(node, 'expectedHostKey', ''),
   };
 }
 
@@ -506,7 +541,6 @@ function I2cForm({ data, selected, eeprom = false }: { data: NodeProps['data']; 
       <Field id={`${node.id}-port`} label="SSH port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
       <Field id={`${node.id}-user`} label="SSH user" value={ssh.username} onChange={(value) => set('username', value)} />
       <PasswordCredentialField nodeId={node.id} credentialRef={ssh.credentialRef} onCredentialRef={(value) => set('credentialRef', value)} />
-      <Field id={`${node.id}-host-key`} label="Pinned host key" value={configText(node, 'expectedHostKey', '')} onChange={(value) => set('expectedHostKey', value)} />
       <SelectField id={`${node.id}-bus`} label="I²C bus" value={base.bus} options={I2C_BUS_OPTIONS} onChange={(value) => set('bus', value)} />
       <Field id={`${node.id}-address`} label="Address" value={configText(node, 'address', '0x50')} onChange={(value) => set('address', value)} />
       <Field id={`${node.id}-register`} label="Register" value={configText(node, 'register', '0x0000')} onChange={(value) => set('register', value)} />
@@ -514,7 +548,7 @@ function I2cForm({ data, selected, eeprom = false }: { data: NodeProps['data']; 
       <Field id={`${node.id}-page-size`} label="Page size" value={configText(node, 'pageSize', '16')} onChange={(value) => set('pageSize', value)} type="number" />
       {eeprom ? <SelectField id={`${node.id}-map`} label="EEPROM map" value={configText(node, 'mapId', 'yg-stereo-p24c64g-v1')} options={[{ value: 'yg-stereo-p24c64g-v1', label: 'YG Stereo P24C64G v1' }]} onChange={(value) => set('mapId', value)} /> : null}
       {eeprom ? <label className="node-config-checkbox"><code>Verify after write</code><input className="nodrag nowheel" type="checkbox" checked={configBool(node, 'verifyAfterWrite', true)} onChange={(event) => set('verifyAfterWrite', event.target.checked)} /></label> : <SelectField id={`${node.id}-mode`} label="Mode" value={configText(node, 'mode', 'read')} options={[{ value: 'read', label: 'Read' }, { value: 'write', label: 'Write' }]} onChange={(value) => set('mode', value)} />}
-      <span className="node-hint">This node uses its inline SSH configuration; its hardware request is not driven by graph input ports.</span>
+      <span className="node-hint">This node uses inline SSH host/user plus a process-local password session; private keys and host-key pins are not part of this workflow.</span>
       <span className="node-hint">{warning}</span>
       <div className="node-actions">
         <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => run(() => eeprom ? previewEepromProvision(eepromPreview) : previewI2cTransfer(i2cPreview))}>Preview (no I/O)</button>
