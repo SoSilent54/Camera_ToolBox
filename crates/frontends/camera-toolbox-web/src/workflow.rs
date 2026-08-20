@@ -284,15 +284,8 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::VideoLayer),
         node_definition(NodeKind::Viewer),
         node_definition(NodeKind::ChessboardDetector),
-        node_definition(NodeKind::CalibrationFrameScorer),
-        node_definition(NodeKind::ScoreThresholdGate),
-        node_definition(NodeKind::ConsecutiveHoldGate),
         node_definition(NodeKind::DatasetCollector),
-        node_definition(NodeKind::CoverageAnalyzer),
-        node_definition(NodeKind::AutoCaptureController),
-        node_definition(NodeKind::CaptureRequestBuilder),
         node_definition(NodeKind::CalibrationSolver),
-        node_definition(NodeKind::PoseGuide),
         node_definition(NodeKind::I2cTransfer),
         node_definition(NodeKind::EepromProvision),
     ];
@@ -1029,8 +1022,8 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
         },
         WorkmodeTemplate {
             id: "calibration",
-            title: "Calibration Capture",
-            description: "RTSP detection → frame score → threshold/hold/arm gates → capture request; Dataset Collector drives coverage, pose guidance, and calibration solving",
+            title: "Detection Dataset Loop",
+            description: "RTSP frames → Chessboard Detector; Viewer renders frame-matched overlay and Dataset Collector lists detections",
             graph: calibration_template_graph(),
         },
         WorkmodeTemplate {
@@ -2037,105 +2030,30 @@ fn calibration_template_graph() -> WorkflowGraph {
             "calib-rtsp-source",
             NodeKind::RtspSource,
             "RTSP Input",
-            NodePosition { x: 60.0, y: 140.0 },
+            NodePosition { x: 60.0, y: 180.0 },
         ),
         workflow_node(
             "calib-detector",
             NodeKind::ChessboardDetector,
             "Chessboard Detector",
-            NodePosition { x: 360.0, y: 140.0 },
-        ),
-        workflow_node(
-            "calib-frame-scorer",
-            NodeKind::CalibrationFrameScorer,
-            "Calibration Frame Scorer",
-            NodePosition { x: 660.0, y: 140.0 },
-        ),
-        workflow_node(
-            "calib-score-threshold",
-            NodeKind::ScoreThresholdGate,
-            "Score Threshold Gate",
-            NodePosition { x: 960.0, y: 140.0 },
-        ),
-        workflow_node(
-            "calib-consecutive-hold",
-            NodeKind::ConsecutiveHoldGate,
-            "Consecutive Hold Gate",
-            NodePosition {
-                x: 1260.0,
-                y: 140.0,
-            },
-        ),
-        workflow_node(
-            "calib-arm-gate",
-            NodeKind::AutoCaptureController,
-            "Arm Gate",
-            NodePosition {
-                x: 1560.0,
-                y: 140.0,
-            },
-        ),
-        workflow_node(
-            "calib-capture-request",
-            NodeKind::CaptureRequestBuilder,
-            "Capture Request Builder",
-            NodePosition {
-                x: 1860.0,
-                y: 140.0,
-            },
-        ),
-        workflow_node(
-            "calib-x5233-driver",
-            NodeKind::X5233Driver,
-            "X5_233 Driver",
-            NodePosition {
-                x: 2160.0,
-                y: 140.0,
-            },
-        ),
-        workflow_node(
-            "calib-dataset",
-            NodeKind::DatasetCollector,
-            "Dataset Collector",
-            NodePosition { x: 960.0, y: 430.0 },
-        ),
-        workflow_node(
-            "calib-coverage",
-            NodeKind::CoverageAnalyzer,
-            "Coverage Analyzer",
-            NodePosition {
-                x: 1260.0,
-                y: 430.0,
-            },
-        ),
-        workflow_node(
-            "calib-pose-guide",
-            NodeKind::PoseGuide,
-            "Pose Guide",
-            NodePosition {
-                x: 1560.0,
-                y: 430.0,
-            },
-        ),
-        workflow_node(
-            "calib-solver",
-            NodeKind::CalibrationSolver,
-            "Calibration Solver",
-            NodePosition {
-                x: 1260.0,
-                y: 700.0,
-            },
+            NodePosition { x: 360.0, y: 180.0 },
         ),
         workflow_node(
             "calib-viewer",
             NodeKind::Viewer,
             "Viewer",
-            NodePosition { x: 660.0, y: 680.0 },
+            NodePosition { x: 660.0, y: 80.0 },
+        ),
+        workflow_node(
+            "calib-dataset",
+            NodeKind::DatasetCollector,
+            "Dataset Collector",
+            NodePosition { x: 660.0, y: 380.0 },
         ),
     ];
     graph(
-        "camera-toolbox-calibration-template",
-        "Calibration Capture Workspace",
+        "camera-toolbox-calibration-dataset-loop-template",
+        "Detection Dataset Loop",
         nodes,
         vec![
             edge(
@@ -2157,15 +2075,6 @@ fn calibration_template_graph() -> WorkflowGraph {
                 "stream.video-frame.v1",
             ),
             edge(
-                "calib-detection-scorer",
-                "calib-detector",
-                "detection",
-                "calib-frame-scorer",
-                "detection",
-                PortKind::CalibDetection,
-                "calib.detection.v1",
-            ),
-            edge(
                 "calib-detection-dataset",
                 "calib-detector",
                 "detection",
@@ -2177,105 +2086,6 @@ fn calibration_template_graph() -> WorkflowGraph {
             edge(
                 "calib-detector-overlay-viewer",
                 "calib-detector",
-                "overlay",
-                "calib-viewer",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
-            edge(
-                "calib-score-threshold",
-                "calib-frame-scorer",
-                "score",
-                "calib-score-threshold",
-                "score",
-                PortKind::CaptureScore,
-                "capture.score.v1",
-            ),
-            edge(
-                "calib-score-dataset",
-                "calib-frame-scorer",
-                "score",
-                "calib-dataset",
-                "score",
-                PortKind::CaptureScore,
-                "capture.score.v1",
-            ),
-            edge(
-                "calib-threshold-hold",
-                "calib-score-threshold",
-                "signal",
-                "calib-consecutive-hold",
-                "signal",
-                PortKind::CaptureSignal,
-                "capture.signal.v1",
-            ),
-            edge(
-                "calib-hold-arm",
-                "calib-consecutive-hold",
-                "trigger",
-                "calib-arm-gate",
-                "trigger",
-                PortKind::CaptureTrigger,
-                "capture.trigger.v1",
-            ),
-            edge(
-                "calib-arm-request",
-                "calib-arm-gate",
-                "trigger",
-                "calib-capture-request",
-                "trigger",
-                PortKind::CaptureTrigger,
-                "capture.trigger.v1",
-            ),
-            edge(
-                "calib-request-x5233-capture",
-                "calib-capture-request",
-                "capture",
-                "calib-x5233-driver",
-                "capture",
-                PortKind::CommandCapture,
-                "command.capture.request.v1",
-            ),
-            edge(
-                "calib-dataset-coverage",
-                "calib-dataset",
-                "dataset",
-                "calib-coverage",
-                "dataset",
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-            ),
-            edge(
-                "calib-dataset-solver",
-                "calib-dataset",
-                "dataset",
-                "calib-solver",
-                "dataset",
-                PortKind::CalibDataset,
-                "calib.dataset.v1",
-            ),
-            edge(
-                "calib-coverage-pose",
-                "calib-coverage",
-                "coverage",
-                "calib-pose-guide",
-                "coverage",
-                PortKind::CalibCoverage,
-                "calib.coverage.v1",
-            ),
-            edge(
-                "calib-coverage-overlay-viewer",
-                "calib-coverage",
-                "overlay",
-                "calib-viewer",
-                "overlay",
-                PortKind::LayerOverlay,
-                "viewer.layer.overlay.v1",
-            ),
-            edge(
-                "calib-pose-overlay-viewer",
-                "calib-pose-guide",
                 "overlay",
                 "calib-viewer",
                 "overlay",
@@ -2800,43 +2610,39 @@ mod tests {
     }
 
     #[test]
-    fn calibration_template_wires_the_identity_preserving_dataset_flow() {
+    fn calibration_template_wires_minimal_detection_dataset_loop() {
         let graph = calibration_template_graph();
         validate_workflow(&graph).expect("calibration template is valid");
-        for kind in [
+        let kinds: Vec<NodeKind> = graph.nodes.iter().map(|node| node.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                NodeKind::RtspSource,
+                NodeKind::ChessboardDetector,
+                NodeKind::Viewer,
+                NodeKind::DatasetCollector,
+            ]
+        );
+        for hidden_kind in [
             NodeKind::CalibrationFrameScorer,
             NodeKind::ScoreThresholdGate,
             NodeKind::ConsecutiveHoldGate,
             NodeKind::AutoCaptureController,
             NodeKind::CaptureRequestBuilder,
-            NodeKind::DatasetCollector,
             NodeKind::CoverageAnalyzer,
             NodeKind::PoseGuide,
-            NodeKind::CalibrationSolver,
         ] {
             assert!(
-                graph.nodes.iter().any(|node| node.kind == kind),
-                "missing {kind:?}"
+                !graph.nodes.iter().any(|node| node.kind == hidden_kind),
+                "{hidden_kind:?} must stay out of the first Web calibration template"
             );
         }
-        assert!(
-            !graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::OverlayComposer)
-        );
+        assert_eq!(graph.edges.len(), 4);
         for edge_id in [
-            "calib-detection-scorer",
-            "calib-score-threshold",
-            "calib-threshold-hold",
-            "calib-hold-arm",
-            "calib-arm-request",
-            "calib-request-x5233-capture",
+            "calib-rtsp-detector",
+            "calib-rtsp-viewer",
             "calib-detection-dataset",
-            "calib-score-dataset",
-            "calib-dataset-coverage",
-            "calib-dataset-solver",
-            "calib-coverage-pose",
+            "calib-detector-overlay-viewer",
         ] {
             assert!(
                 graph.edges.iter().any(|edge| edge.id == edge_id),
@@ -2909,9 +2715,9 @@ mod tests {
         assert_eq!(
             catalog.len(),
             if cfg!(feature = "hex-arm-control") {
-                24
+                17
             } else {
-                23
+                16
             }
         );
         assert!(
@@ -2921,6 +2727,22 @@ mod tests {
             "OverlayComposer is legacy-only; new graphs should connect overlays directly to Viewer"
         );
         // 每个 kind 都能通过 node_definition 展开，且无重复。
+        for hidden_kind in [
+            NodeKind::CalibrationFrameScorer,
+            NodeKind::ScoreThresholdGate,
+            NodeKind::ConsecutiveHoldGate,
+            NodeKind::AutoCaptureController,
+            NodeKind::CaptureRequestBuilder,
+            NodeKind::CoverageAnalyzer,
+            NodeKind::PoseGuide,
+        ] {
+            assert!(
+                !catalog
+                    .iter()
+                    .any(|definition| definition.kind == hidden_kind),
+                "{hidden_kind:?} should remain implemented but hidden from the default Web catalog"
+            );
+        }
         let kinds: Vec<NodeKind> = catalog.iter().map(|def| def.kind).collect();
         assert_eq!(kinds.len(), catalog.len());
     }

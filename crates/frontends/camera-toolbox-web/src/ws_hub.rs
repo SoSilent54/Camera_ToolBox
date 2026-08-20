@@ -81,6 +81,7 @@ impl WsHub {
         width: u32,
         height: u32,
         jpeg_bytes: &[u8],
+        frame_identity: &serde_json::Value,
     ) {
         let meta = serde_json::json!({
             "kind": "push",
@@ -90,6 +91,7 @@ impl WsHub {
                 "seq": seq,
                 "width": width,
                 "height": height,
+                "frameIdentity": frame_identity,
             },
         })
         .to_string();
@@ -97,6 +99,34 @@ impl WsHub {
         self.broadcast(Message::Text(meta.into()));
         let frame = Message::Binary(jpeg_bytes.to_vec().into());
         self.broadcast(frame);
+    }
+
+    /// 向前端推送节点最近运行时输出；Dataset Collector 用它即时刷新样本列表。
+    pub fn publish_runtime_output(&self, node_id: &str, output: &serde_json::Value) {
+        let payload = serde_json::json!({
+            "kind": "push",
+            "topic": "runtime_output",
+            "payload": {
+                "nodeId": node_id,
+                "output": output,
+            },
+        })
+        .to_string();
+        self.broadcast(Message::Text(payload.into()));
+    }
+
+    /// 向前端推送最新可视 overlay；前端按 TTL 显示，不在 Viewer 内做帧同步。
+    pub fn publish_overlay(&self, node_id: &str, overlay: &serde_json::Value) {
+        let payload = serde_json::json!({
+            "kind": "push",
+            "topic": "overlay",
+            "payload": {
+                "nodeId": node_id,
+                "overlay": overlay,
+            },
+        })
+        .to_string();
+        self.broadcast(Message::Text(payload.into()));
     }
 
     /// 内部广播：遍历连接表，逐个尝试发送；`send` 返回 `Err` 即视为死连接并摘除。
@@ -185,7 +215,14 @@ mod tests {
         hub.register(tx);
 
         let jpeg = vec![0xff, 0xd8, 0xff, 0xd9];
-        hub.publish_frame("node-1", 42, 960, 540, &jpeg);
+        hub.publish_frame(
+            "node-1",
+            42,
+            960,
+            540,
+            &jpeg,
+            &serde_json::json!({"frameSequence": 42}),
+        );
 
         let meta = rx.recv().await.expect("frame_meta text");
         match meta {
@@ -197,6 +234,7 @@ mod tests {
                 assert_eq!(v["payload"]["seq"], 42);
                 assert_eq!(v["payload"]["width"], 960);
                 assert_eq!(v["payload"]["height"], 540);
+                assert_eq!(v["payload"]["frameIdentity"]["frameSequence"], 42);
             }
             other => panic!("expected text frame_meta, got {other:?}"),
         }
@@ -216,7 +254,14 @@ mod tests {
         hub.register(tx1);
         hub.register(tx2);
 
-        hub.publish_frame("node-1", 1, 960, 540, &[1, 2, 3]);
+        hub.publish_frame(
+            "node-1",
+            1,
+            960,
+            540,
+            &[1, 2, 3],
+            &serde_json::json!({"frameSequence": 1}),
+        );
 
         for rx in [&mut rx1, &mut rx2] {
             let _meta = rx.recv().await.expect("meta");

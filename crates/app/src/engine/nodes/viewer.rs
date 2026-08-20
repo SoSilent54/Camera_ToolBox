@@ -73,6 +73,7 @@ impl NodeInstance for ViewerNode {
                 .get("kind")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("overlay");
+            rt.emit("overlay", DataPacket::Json(Arc::clone(overlay)))?;
             rt.report_event(format!("viewer overlay updated: {kind}"));
             return Ok(());
         }
@@ -750,11 +751,22 @@ mod tests {
     }
 
     #[test]
-    fn overlay_input_is_absorbed_by_viewer_without_publishing_frame() {
+    fn overlay_input_is_reemitted_without_publishing_frame() {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let mut outputs = OutputRegistry::default();
+        let record = Arc::clone(&emitted);
+        outputs.set_record(Arc::new(move |packet| record.lock().push(packet)));
         let (state_tx, state_rx) = mpsc::channel();
         let (event_tx, event_rx) = mpsc::channel();
-        let mut rt = runtime_with_slot_and_events(Arc::clone(&slot), state_tx, event_tx);
+        let ctx = SpawnContext {
+            outputs,
+            reporter: NodeReporter::new("viewer-1".to_owned(), state_tx, event_tx),
+            services: Arc::new(crate::engine::EngineServices::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: Some(Arc::clone(&slot)),
+        };
+        let mut rt = NodeRuntime::new(ctx);
         let mut node = ViewerFactory
             .instantiate(crate::engine::NodeSpec {
                 id: "viewer-1".to_owned(),
@@ -765,19 +777,21 @@ mod tests {
                 config: serde_json::json!({}),
             })
             .expect("instantiate");
+        let overlay = Arc::new(
+            serde_json::json!({"kind": "calib.chessboard.overlay.v1", "frameSequence": 3}),
+        );
 
-        node.on_input(
-            "overlay",
-            DataPacket::Json(Arc::new(serde_json::json!({"kind": "overlay"}))),
-            &mut rt,
-        )
-        .expect("overlay input");
+        node.on_input("overlay", DataPacket::Json(Arc::clone(&overlay)), &mut rt)
+            .expect("overlay input");
 
         assert!(
             slot.latest().is_none(),
             "overlay must not replace current frame"
         );
         assert_eq!(last_state(&state_rx), None);
+        let captured = emitted.lock();
+        assert_eq!(captured.len(), 1);
+        assert!(matches!(&captured[0], DataPacket::Json(value) if Arc::ptr_eq(value, &overlay)));
         let event = event_rx.try_recv().expect("overlay event");
         assert!(event.message.contains("viewer overlay updated"));
     }

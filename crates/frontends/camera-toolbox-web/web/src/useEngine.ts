@@ -11,6 +11,12 @@ interface StatusPush {
   diagnostic?: string;
 }
 
+/** 节点运行时输出推送；DatasetCollector emit 后由后端直接同步最新 JSON。 */
+interface RuntimeOutputPush {
+  nodeId: string;
+  output: unknown;
+}
+
 /**
  * 数据流引擎前端桥接：订阅节点状态、派发节点动作。
  * 图结构由后端 authoritative snapshot 驱动，不暴露全局 run/start 状态。
@@ -62,6 +68,16 @@ export function useEngine() {
     });
   }, [clearPendingAction]);
 
+  useEffect(() => {
+    return subscribeTopic('runtime_output', (payload) => {
+      const update = payload as RuntimeOutputPush;
+      if (!update || typeof update.nodeId !== 'string') {
+        return;
+      }
+      setNodeOutputs((current) => ({ ...current, [update.nodeId]: update.output }));
+    });
+  }, []);
+
 
   /** 派发节点动作；样本审核可带非持久化的 `{ sampleId }` payload，同一节点同一时刻只允许一个动作在途。 */
   const sendAction = useCallback((nodeId: string, action: NodeActionName, payload?: DatasetSampleActionPayload) => {
@@ -95,7 +111,7 @@ export function useEngine() {
         pendingActionsRef.current = nextPending;
         setPendingActions(nextPending);
       });
-  }, [clearPendingAction]);
+  }, [refreshNodeOutput]);
 
   return { nodeStates, nodeDiagnostics, nodeOutputs, pendingActions, sendAction, refreshNodeOutput };
 }

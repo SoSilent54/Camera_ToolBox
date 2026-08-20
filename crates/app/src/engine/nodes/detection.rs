@@ -3,20 +3,21 @@
 //! `on_input` 收到 `VideoFrame`/`ImageFrame` 后，先把 RGBA 帧经 `RasterImageCodec::encode_png`
 //! 编码为 PNG bytes，再交给 `CalibrationBackend::detect_png` 检测棋盘角点：
 //! - `Found` → 输出 `calib.detection`（强类型 `Detection`）+ `overlay`（JSON）。
-//! - `NotFound` → 上报事件并输出 `overlay`（`found:false`），不输出 detection。
+//! - `NotFound` → 只上报事件/状态，不输出 detection 或 overlay。
 //!
 //! 未注入 `image_codec` 或 `calibration` 时按前置条件失败（`NodeError::Precondition`），不 panic。
 
 use std::sync::Arc;
 
 use camera_toolbox_core::{
-    BoardSpec, CalibrationImageSize, ChessboardDetectionOutcome, Rgba8Frame,
+    BoardSpec, CalibrationImageSize, ChessboardDetection, ChessboardDetectionOutcome, Rgba8Frame,
 };
+use serde_json::json;
 
 use crate::{
     engine::{
-        DataPacket, DetectionPacket, ImageFrame, ImageFrameFormat, NodeAction, NodeError,
-        NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
+        DataPacket, DetectionPacket, ImageFrame, ImageFrameFormat, ImageFrameIdentity, NodeAction,
+        NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
     },
     ports::CalibrationCancellation,
 };
@@ -83,7 +84,7 @@ impl ChessboardDetectorNode {
         // 空帧先按无结果处理，避免 malformed carrier 在格式分派前触发 panic 或服务依赖。
         if frame.width == 0 || frame.height == 0 {
             rt.report_event("skipped empty or malformed frame");
-            return self.emit_overlay(rt, false);
+            return Ok(());
         }
         // 只有 RGB/Gray 格式可以安全交给检测器；NV12 与 Bayer 必须在图上显式转换。
         let rgba_pixels = match frame.format {
@@ -105,7 +106,7 @@ impl ChessboardDetectorNode {
         };
         if rgba_pixels.is_empty() {
             rt.report_event("skipped empty or malformed frame");
-            return self.emit_overlay(rt, false);
+            return Ok(());
         }
 
         let image_codec = rt.services().image_codec()?;
@@ -136,36 +137,63 @@ impl ChessboardDetectorNode {
 
         match outcome {
             ChessboardDetectionOutcome::Found(detection) => {
+                let detection = Arc::new(detection);
                 rt.emit(
                     "detection",
                     DataPacket::Detection(Arc::new(DetectionPacket {
-                        detection: Arc::new(detection),
+                        detection: Arc::clone(&detection),
                         frame_identity: frame.identity.clone(),
                     })),
                 )?;
-                self.emit_overlay(rt, true)?;
+                self.emit_found_overlay(rt, frame, detection.as_ref(), board)?;
                 rt.report_state(NodeRuntimeState::Idle, "detected");
                 Ok(())
             }
             ChessboardDetectionOutcome::NotFound { image_size } => {
                 rt.report_event(format!("chessboard not found in {image_size:?} frame"));
-                self.emit_overlay(rt, false)?;
                 rt.report_state(NodeRuntimeState::Idle, "not found");
                 Ok(())
             }
         }
     }
 
-    /// 输出 `found` 状态 overlay；未声明 `overlay` 输出端口时跳过（emit 对未连接端口本就 no-op）。
-    fn emit_overlay(&self, rt: &NodeRuntime, found: bool) -> Result<(), NodeError> {
+    /// 输出与原始图像像素坐标绑定的棋盘 overlay；只有检测到棋盘时才产生可视层。
+    fn emit_found_overlay(
+        &self,
+        rt: &NodeRuntime,
+        frame: &ImageFrame,
+        detection: &ChessboardDetection,
+        board: BoardSpec,
+    ) -> Result<(), NodeError> {
+        self.emit_overlay_payload(
+            rt,
+            json!({
+                "kind": "calib.chessboard.overlay.v1",
+                "schema": "viewer.layer.overlay.v1",
+                "found": true,
+                "status": "found",
+                "coordinateSpace": "image_pixel",
+                "frameSequence": frame.identity.frame_sequence,
+                "frameIdentity": frame_identity_overlay(&frame.identity),
+                "imageSize": {"width": detection.image_size.width, "height": detection.image_size.height},
+                "board": {
+                    "cols": board.inner_cols,
+                    "rows": board.inner_rows,
+                    "squareSizeMm": board.square_size,
+                },
+                "corners": detection.corners.iter().map(|corner| json!({"x": corner.x, "y": corner.y})).collect::<Vec<_>>(),
+                "outline": chessboard_outline(detection, board),
+            }),
+        )
+    }
+
+    fn emit_overlay_payload(
+        &self,
+        rt: &NodeRuntime,
+        overlay: serde_json::Value,
+    ) -> Result<(), NodeError> {
         if has_output_port(&self.spec, "overlay") {
-            rt.emit(
-                "overlay",
-                DataPacket::Json(Arc::new(serde_json::json!({
-                    "kind": "overlay",
-                    "found": found,
-                }))),
-            )?;
+            rt.emit("overlay", DataPacket::Json(Arc::new(overlay)))?;
         }
         Ok(())
     }
@@ -178,6 +206,35 @@ impl ChessboardDetectorNode {
         )
         .map_err(|error| NodeError::Config(error.to_string()))
     }
+}
+
+fn frame_identity_overlay(identity: &ImageFrameIdentity) -> serde_json::Value {
+    json!({
+        "frameSequence": identity.frame_sequence,
+        "hostMonotonicTimeNs": identity.host_monotonic_time_ns,
+        "deviceTimestampNs": identity.device_timestamp_ns,
+    })
+}
+
+fn chessboard_outline(detection: &ChessboardDetection, board: BoardSpec) -> serde_json::Value {
+    let cols = usize::from(board.inner_cols);
+    let rows = usize::from(board.inner_rows);
+    if cols == 0 || rows == 0 || detection.corners.len() < cols.saturating_mul(rows) {
+        return serde_json::Value::Null;
+    }
+    let indexes = [
+        0,
+        cols - 1,
+        rows.saturating_sub(1) * cols + cols - 1,
+        rows.saturating_sub(1) * cols,
+    ];
+    json!(
+        indexes
+            .into_iter()
+            .filter_map(|index| detection.corners.get(index))
+            .map(|corner| json!({"x": corner.x, "y": corner.y}))
+            .collect::<Vec<_>>()
+    )
 }
 
 /// 单帧解码峰值字节预算：`width * height * DECODED_BYTES_PER_PIXEL`（BGR + Gray 同存）。
@@ -317,9 +374,11 @@ mod tests {
 
     use super::*;
     use crate::engine::{
-        EngineServices, ImageFrameIdentity, NodeReporter, OutputRegistry, SpawnContext,
+        EngineServices, FrameProvenance, ImageFrameIdentity, ImagePlane, NodeReporter,
+        OutputRegistry, SpawnContext,
     };
-    use crate::platform::{StreamFrameIdentity, StreamSessionId};
+    use crate::platform::StreamSessionId;
+    use camera_toolbox_core::CalibrationPoint;
 
     fn spec() -> NodeSpec {
         NodeSpec {
@@ -354,32 +413,44 @@ mod tests {
     }
 
     fn frame(width: u32, height: u32) -> Arc<ImageFrame> {
-        let identity = StreamFrameIdentity::unavailable(
-            StreamSessionId::new("test").expect("valid session id"),
-            0,
-            0,
-            "unavailable".to_owned(),
-        );
+        let identity = ImageFrameIdentity {
+            provenance: FrameProvenance::Stream {
+                stream_id: StreamSessionId::new("detector-test").expect("session id"),
+                channel: 0,
+            },
+            frame_sequence: 0,
+            source_pts: crate::platform::SourcePts::Unavailable {
+                reason: "test".to_owned(),
+            },
+            host_monotonic_time_ns: 123,
+            device_timestamp_ns: None,
+        };
         if width == 0 || height == 0 {
             return Arc::new(ImageFrame {
                 width,
                 height,
                 format: ImageFrameFormat::Rgba8,
                 planes: Vec::new(),
-                identity: ImageFrameIdentity::from(&identity),
+                identity,
                 color: None,
                 raw: None,
             });
         }
-        let len = (width as usize) * (height as usize) * 4;
+        let byte_len = width.saturating_mul(height).saturating_mul(4) as usize;
         Arc::new(
-            ImageFrame::rgba8(
+            ImageFrame::new(
                 width,
                 height,
-                vec![0u8; len].into(),
-                ImageFrameIdentity::from(&identity),
+                ImageFrameFormat::Rgba8,
+                vec![ImagePlane::new(
+                    Arc::from(vec![0u8; byte_len]),
+                    width.saturating_mul(4),
+                )],
+                identity,
+                None,
+                None,
             )
-            .expect("test frame layout is valid"),
+            .expect("valid frame"),
         )
     }
 
@@ -390,6 +461,59 @@ mod tests {
             .instantiate(spec())
             .expect("instantiate");
         assert_eq!(instance.kind(), "chessboardDetector");
+    }
+
+    #[test]
+    fn overlay_output_records_chessboard_drawing_payload() {
+        let record: Arc<Mutex<Vec<DataPacket>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&record);
+        let mut outputs = OutputRegistry::default();
+        outputs.set_record(Arc::new(move |packet| {
+            sink.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(packet);
+        }));
+        let (status_tx, _status_rx) = mpsc::channel();
+        let (event_tx, _event_rx) = mpsc::channel();
+        let reporter = NodeReporter::new("detector-1".to_owned(), status_tx, event_tx);
+        let rt = NodeRuntime::new(SpawnContext {
+            outputs,
+            reporter,
+            services: Arc::new(EngineServices::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        });
+        let node = ChessboardDetectorNode { spec: spec() };
+        let frame = frame(640, 480);
+        let board = BoardSpec::new(2, 2, 30.0).expect("board");
+        let detection = ChessboardDetection {
+            image_size: CalibrationImageSize::new(640, 480).expect("image size"),
+            corners: vec![
+                CalibrationPoint::new(10.0, 20.0),
+                CalibrationPoint::new(30.0, 20.0),
+                CalibrationPoint::new(30.0, 40.0),
+                CalibrationPoint::new(10.0, 40.0),
+            ],
+        };
+
+        node.emit_found_overlay(&rt, frame.as_ref(), &detection, board)
+            .expect("overlay emits");
+
+        let guard = record
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(guard.len(), 1);
+        let DataPacket::Json(value) = &guard[0] else {
+            panic!("overlay must be JSON");
+        };
+        assert_eq!(value["kind"], "calib.chessboard.overlay.v1");
+        assert_eq!(value["schema"], "viewer.layer.overlay.v1");
+        assert_eq!(value["found"], true);
+        assert_eq!(value["status"], "found");
+        assert_eq!(value["frameSequence"], 0);
+        assert_eq!(value["imageSize"], json!({"width": 640, "height": 480}));
+        assert_eq!(value["corners"].as_array().expect("corners").len(), 4);
+        assert_eq!(value["outline"].as_array().expect("outline").len(), 4);
     }
 
     #[test]
@@ -427,40 +551,5 @@ mod tests {
                 "RTSP frames as ImageFrame must reach detection and fail on missing services",
             );
         assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
-    }
-
-    #[test]
-    fn overlay_output_records_found_state() {
-        let record: Arc<Mutex<Vec<DataPacket>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&record);
-        let mut outputs = OutputRegistry::default();
-        outputs.set_record(Arc::new(move |packet| {
-            sink.lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push(packet);
-        }));
-        let (status_tx, _status_rx) = mpsc::channel();
-        let (event_tx, _event_rx) = mpsc::channel();
-        let reporter = NodeReporter::new("detector-1".to_owned(), status_tx, event_tx);
-        let rt = NodeRuntime::new(SpawnContext {
-            outputs,
-            reporter,
-            services: Arc::new(EngineServices::default()),
-            cancel: Arc::new(AtomicBool::new(false)),
-            viewer_slot: None,
-        });
-        let node = ChessboardDetectorNode { spec: spec() };
-
-        node.emit_overlay(&rt, true).expect("overlay emits");
-
-        let guard = record
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert_eq!(guard.len(), 1);
-        let DataPacket::Json(value) = &guard[0] else {
-            panic!("overlay must be JSON");
-        };
-        assert_eq!(value["kind"], "overlay");
-        assert_eq!(value["found"], true);
     }
 }

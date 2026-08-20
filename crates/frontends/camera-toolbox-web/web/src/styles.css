@@ -462,6 +462,28 @@ button:hover {
   pointer-events: none;
 }
 
+.viewer-chessboard-overlay {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.viewer-chessboard-outline {
+  fill: rgba(34, 211, 238, 0.10);
+  stroke: #22d3ee;
+  stroke-width: 3;
+  vector-effect: non-scaling-stroke;
+}
+
+.viewer-chessboard-corner {
+  fill: #f97316;
+  stroke: #fff7ed;
+  stroke-width: 1.5;
+  vector-effect: non-scaling-stroke;
+}
+
 .viewer-preview .preview-grid {
   position: absolute;
   inset: 0;

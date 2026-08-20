@@ -1,12 +1,13 @@
 //! 引擎桥接：把运行中引擎的状态/事件/帧从同步 actor 世界搬到 WebSocket 推送边界。
 //!
-//! 四个独立循环（`tokio::spawn`）均在单线程 tokio runtime 内协作，每个循环：
-//! 短暂持锁取数据（`drain_status`/`drain_events`/`drain_flow_pulses`/`viewer_frame` 均为非阻塞）、立即释放，
+//! 五个独立循环（`tokio::spawn`）均在单线程 tokio runtime 内协作，每个循环：
+//! 短暂持锁取数据（`drain_status`/`drain_events`/`drain_flow_pulses`/`latest_output`/`viewer_frame` 均为非阻塞）、立即释放，
 //! 再 `tokio::time::sleep` 让出事件循环，避免饿死其它任务或死锁（从不跨 `.await` 持有引擎锁）。
 //!
 //! - `drain_status` → `ws_hub.broadcast_text(status push)`
 //! - `drain_events` → `ws_hub.broadcast_text(event push)`
 //! - `drain_flow_pulses` → `ws_hub.broadcast_text(flow push)`
+//! - viewer overlay：按 overlay `frameSequence` 去重，推送 `overlay` topic。
 //! - viewer 帧：按 `frame_sequence` 去重（同帧不重复编码），`viewer_encode_width=960` 降采样
 //!   编码 JPEG → `ws_hub.publish_frame`（先 frame_meta 文本再 Binary）。
 
@@ -14,10 +15,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
-
 use crate::AppState;
 use crate::ws_hub::WsHub;
+use camera_toolbox_app::engine::{DataPacket, GraphEngine};
+use camera_toolbox_app::platform::StreamFrameIdentity;
+use serde_json::{Value, json};
 
 /// 状态/事件循环的轮询间隔（非阻塞 `try_recv`，间隔仅决定延迟上限）。
 const STATUS_POLL_MS: u64 = 50;
@@ -48,6 +50,12 @@ pub fn spawn(state: AppState, hub: Arc<WsHub>) {
     let flow_hub = Arc::clone(&hub);
     tokio::spawn(async move {
         drain_flow_loop(flow_state, flow_hub).await;
+    });
+
+    let overlay_state = state.clone();
+    let overlay_hub = Arc::clone(&hub);
+    tokio::spawn(async move {
+        drain_overlay_loop(overlay_state, overlay_hub).await;
     });
 
     tokio::spawn(async move {
@@ -83,12 +91,16 @@ async fn drain_events_loop(state: AppState, hub: Arc<WsHub>) {
             let engine = state.engine_runtime.engine();
             if let Some(engine) = engine.as_ref() {
                 for event in engine.drain_events() {
+                    let node_id = event.node_id.clone();
                     let push = json!({
                         "kind": "push",
                         "topic": "event",
                         "payload": event,
                     });
                     hub.broadcast_text(push.to_string());
+                    if let Some(DataPacket::Dataset(dataset)) = engine.latest_output(&node_id) {
+                        hub.publish_runtime_output(&node_id, dataset.as_ref());
+                    }
                 }
             }
         }
@@ -115,6 +127,62 @@ async fn drain_flow_loop(state: AppState, hub: Arc<WsHub>) {
         }
         tokio::time::sleep(Duration::from_millis(FLOW_POLL_MS)).await;
     }
+}
+
+async fn drain_overlay_loop(state: AppState, hub: Arc<WsHub>) {
+    let mut last_seen: HashMap<String, u64> = HashMap::new();
+    loop {
+        {
+            let engine = state.engine_runtime.engine();
+            if let Some(engine) = engine.as_ref() {
+                let viewer_ids = engine.viewer_node_ids();
+                for node_id in &viewer_ids {
+                    let Some(overlay) = viewer_overlay_output(engine, node_id) else {
+                        continue;
+                    };
+                    let Some(sequence) = overlay_frame_sequence(&overlay) else {
+                        continue;
+                    };
+                    if last_seen.get(node_id) == Some(&sequence) {
+                        continue;
+                    }
+                    last_seen.insert(node_id.clone(), sequence);
+                    hub.publish_overlay(node_id, &overlay);
+                }
+                prune_last_seen(&mut last_seen, &viewer_ids);
+            } else {
+                last_seen.clear();
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(FRAME_POLL_MS)).await;
+    }
+}
+
+fn viewer_overlay_output(engine: &GraphEngine, node_id: &str) -> Option<Value> {
+    match engine.latest_output(node_id)? {
+        DataPacket::Json(value) => Some(value.as_ref().clone()),
+        _ => None,
+    }
+}
+
+fn overlay_frame_sequence(overlay: &Value) -> Option<u64> {
+    overlay
+        .get("frameSequence")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            overlay
+                .get("frameIdentity")
+                .and_then(|identity| identity.get("frameSequence"))
+                .and_then(Value::as_u64)
+        })
+}
+
+fn frame_identity_payload(identity: &StreamFrameIdentity) -> Value {
+    json!({
+        "frameSequence": identity.frame_sequence,
+        "hostMonotonicTimeNs": identity.host_monotonic_time_ns,
+        "deviceTimestampNs": identity.device_timestamp_ns,
+    })
 }
 
 /// 帧循环：对每个 viewer 节点做 latest-wins 帧推送。
@@ -146,6 +214,7 @@ async fn frame_loop(state: AppState, hub: Arc<WsHub>) {
                                 encoded.width,
                                 encoded.height,
                                 &encoded.jpeg,
+                                &frame_identity_payload(&frame.identity),
                             );
                         }
                         Err(error) => {

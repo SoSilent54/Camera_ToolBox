@@ -309,7 +309,7 @@ impl NodeInstance for DatasetCollectorNode {
         &mut self,
         port: &str,
         packet: DataPacket,
-        _rt: &mut NodeRuntime,
+        rt: &mut NodeRuntime,
     ) -> Result<(), NodeError> {
         match port {
             "image" => {
@@ -326,7 +326,8 @@ impl NodeInstance for DatasetCollectorNode {
                         "datasetCollector.detection requires calib.detection".to_owned(),
                     ));
                 };
-                self.record_detection(detection)
+                self.record_detection(detection)?;
+                self.emit_dataset(rt)
             }
             "score" => {
                 let DataPacket::Score(score) = packet else {
@@ -1268,6 +1269,30 @@ mod tests {
         );
         assert_eq!(sample["provenance"]["frameIdentity"]["frameSequence"], 7);
         assert!(parse_calibration_dataset(&dataset).is_ok());
+    }
+
+    #[test]
+    fn collector_auto_emits_dataset_when_detection_arrives() {
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let mut rt = runtime_with_record(Arc::clone(&recorded));
+        let mut node = collector();
+
+        node.on_input(
+            "detection",
+            detection_packet(detection(2, 2, 1.0, 1.0), identity(7)),
+            &mut rt,
+        )
+        .expect("detection input emits dataset");
+
+        let dataset = last_dataset(&recorded);
+        assert_eq!(dataset["kind"], CALIBRATION_DATASET_KIND);
+        assert_eq!(dataset["count"], 1);
+        assert_eq!(dataset["samples"][0]["id"], "sample-1");
+        assert_eq!(dataset["samples"][0]["score"], Value::Null);
+        assert_eq!(
+            dataset["samples"][0]["provenance"]["frameIdentity"]["frameSequence"],
+            7
+        );
     }
 
     #[test]

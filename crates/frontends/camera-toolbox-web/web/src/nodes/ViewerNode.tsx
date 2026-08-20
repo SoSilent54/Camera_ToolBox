@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { NodeResizer, type NodeProps } from '@xyflow/react';
 import type { FlowNodeData } from '../workflow';
-import { subscribeFrame } from '../useEngineSocket';
+import { subscribeFrame, subscribeTopic } from '../useEngineSocket';
 import { NodeHeader, PortHandles, RuntimeOutputSummary } from './shared';
 
 /** Viewer 节点：订阅 WS 二进制帧推送，并明确展示当前帧与断流状态。 */
@@ -61,7 +61,27 @@ function EngineFrame({
   const lastUiUpdateAt = useRef(0);
   const frameRef = useRef<FrameSnapshot>({ lastFrameAt: null, stalled: false });
   const [frame, setFrame] = useState<FrameSnapshot>({ lastFrameAt: null, stalled: false });
+  const [overlay, setOverlay] = useState<ChessboardOverlay | null>(null);
 
+  useEffect(() => {
+    let overlayTimer: number | undefined;
+    setOverlay(null);
+    const clearOverlay = () => {
+      window.clearTimeout(overlayTimer);
+      overlayTimer = window.setTimeout(() => setOverlay(null), 1_000);
+    };
+    const unsubscribe = subscribeTopic('overlay', (payload) => {
+      const nextOverlay = parseOverlayPush(payload, nodeId);
+      if (nextOverlay) {
+        setOverlay(nextOverlay);
+        clearOverlay();
+      }
+    });
+    return () => {
+      unsubscribe();
+      window.clearTimeout(overlayTimer);
+    };
+  }, [nodeId]);
   useEffect(() => {
     let disposed = false;
     let currentUrl: string | null = null;
@@ -121,6 +141,7 @@ function EngineFrame({
         setFrame(nextFrame);
       }
       scheduleStallCheck(receivedAt);
+      // Overlay 是独立的最新可视层，不再按帧身份做同步队列或过期判断。
     });
 
     return () => {
@@ -137,6 +158,7 @@ function EngineFrame({
     <div className="viewer-panel">
       <div className="viewer-preview">
         <img ref={imgRef} alt="viewer frame" />
+        <ChessboardOverlayLayer overlay={overlay} />
         {!frame.lastFrameAt ? <span className="viewer-placeholder">等待引擎 JPEG 帧</span> : null}
       </div>
       <div className={`viewer-status ${frame.stalled ? 'viewer-status-stalled' : ''}`}>
@@ -173,4 +195,91 @@ function formatFrameMeta({ seq, width, height, fps }: FrameSnapshot): string {
   const sequence = seq === undefined ? '序号未声明' : `seq ${seq}`;
   const rate = fps && Number.isFinite(fps) ? `${fps.toFixed(1)} FPS（到达率）` : '正在估算 FPS';
   return `${resolution} · ${sequence} · ${rate}`;
+}
+
+type OverlayPoint = { x: number; y: number };
+
+type ChessboardOverlay = {
+  imageSize: { width: number; height: number };
+  corners: OverlayPoint[];
+  outline: OverlayPoint[];
+};
+
+function ChessboardOverlayLayer({ overlay }: { overlay: ChessboardOverlay | null }) {
+  if (!overlay || overlay.imageSize.width <= 0 || overlay.imageSize.height <= 0) {
+    return null;
+  }
+  const outlinePoints = overlay.outline.map((point) => `${point.x},${point.y}`).join(' ');
+  return (
+    <svg
+      className="viewer-chessboard-overlay"
+      viewBox={`0 0 ${overlay.imageSize.width} ${overlay.imageSize.height}`}
+      preserveAspectRatio="xMidYMid meet"
+      aria-hidden="true"
+    >
+      {outlinePoints ? <polygon className="viewer-chessboard-outline" points={outlinePoints} /> : null}
+      {overlay.corners.map((corner, index) => (
+        <circle
+          key={`${index}-${corner.x}-${corner.y}`}
+          className="viewer-chessboard-corner"
+          cx={corner.x}
+          cy={corner.y}
+          r="3.5"
+        />
+      ))}
+    </svg>
+  );
+}
+
+function parseOverlayPush(payload: unknown, nodeId: string): ChessboardOverlay | null {
+  if (typeof payload !== 'object' || payload === null) {
+    return null;
+  }
+  const envelope = payload as { nodeId?: unknown; overlay?: unknown };
+  if (envelope.nodeId !== nodeId || typeof envelope.overlay !== 'object' || envelope.overlay === null) {
+    return null;
+  }
+  const overlay = envelope.overlay as {
+    kind?: unknown;
+    frameSequence?: unknown;
+    frameIdentity?: unknown;
+    imageSize?: unknown;
+    corners?: unknown;
+    outline?: unknown;
+  };
+  if (overlay.kind !== 'calib.chessboard.overlay.v1') {
+    return null;
+  }
+  const imageSize = typeof overlay.imageSize === 'object' && overlay.imageSize !== null
+    ? overlay.imageSize as { width?: unknown; height?: unknown }
+    : null;
+  const width = numericField(imageSize?.width);
+  const height = numericField(imageSize?.height);
+  if (width === undefined || height === undefined) {
+    return null;
+  }
+  return {
+    imageSize: { width, height },
+    corners: parseOverlayPoints(overlay.corners),
+    outline: parseOverlayPoints(overlay.outline),
+  };
+}
+
+function parseOverlayPoints(value: unknown): OverlayPoint[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value.flatMap((item) => {
+    if (typeof item !== 'object' || item === null) {
+      return [];
+    }
+    const point = item as { x?: unknown; y?: unknown };
+    const x = numericField(point.x);
+    const y = numericField(point.y);
+    return x === undefined || y === undefined ? [] : [{ x, y }];
+  });
+}
+
+function numericField(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }

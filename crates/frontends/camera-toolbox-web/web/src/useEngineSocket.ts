@@ -5,7 +5,7 @@
  * 信封：
  *   请求   { id, kind:"request",  path, payload }
  *   响应   { id, kind:"response", ok, payload? | error? }
- *   推送   { kind:"push", topic:"status"|"event"|"frame"|"frame_meta", payload }
+ *   推送   { kind:"push", topic:"status"|"event"|"frame_meta"|"flow"|"overlay", payload }
  *   快照   { kind:"snapshot", payload:{ graph, statuses } }
  *
  * 连接单例，支持断线自动重连 + 心跳；wsRequest 按 id 配对响应（8s 超时）。
@@ -17,7 +17,7 @@ const WS_RECONNECT_DELAY_MS = 1000;
 const WS_REQUEST_TIMEOUT_MS = 8000;
 const HEARTBEAT_INTERVAL_MS = 15000;
 
-export type EngineTopic = 'status' | 'event' | 'frame' | 'frame_meta' | 'flow';
+export type EngineTopic = 'status' | 'event' | 'frame' | 'frame_meta' | 'flow' | 'overlay' | 'runtime_output';
 
 export interface WsRequestEnvelope {
   id: number;
@@ -70,6 +70,7 @@ export interface ViewerFrameMeta {
   seq?: number;
   width?: number;
   height?: number;
+  frameIdentity?: unknown;
 }
 
 /** 待发送队列条目：连接就绪后统一 flush；超时由 pending 的 timer 兜底。 */
