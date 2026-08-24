@@ -16,9 +16,9 @@ use serde_json::json;
 
 use crate::{
     engine::{
-        packet::CalibrationBoardParams, DataPacket, DetectionPacket, ImageFrame,
-        ImageFrameFormat, ImageFrameIdentity, NodeAction, NodeError, NodeFactory, NodeInstance,
-        NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
+        DataPacket, DetectionPacket, ImageFrame, ImageFrameFormat, ImageFrameIdentity, NodeAction,
+        NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, PortSpec,
+        packet::CalibrationBoardParams,
     },
     ports::{CalibrationCancellation, SubpixelRefinementOptions},
 };
@@ -283,11 +283,13 @@ fn chessboard_outline(detection: &ChessboardDetection, board: BoardSpec) -> serd
         rows.saturating_sub(1) * cols + cols - 1,
         rows.saturating_sub(1) * cols,
     ];
-    json!(indexes
-        .into_iter()
-        .filter_map(|index| detection.corners.get(index))
-        .map(|corner| json!({"x": corner.x, "y": corner.y}))
-        .collect::<Vec<_>>())
+    json!(
+        indexes
+            .into_iter()
+            .filter_map(|index| detection.corners.get(index))
+            .map(|corner| json!({"x": corner.x, "y": corner.y}))
+            .collect::<Vec<_>>()
+    )
 }
 
 /// 单帧解码峰值字节预算：`width * height * DECODED_BYTES_PER_PIXEL`（BGR + Gray 同存）。
@@ -438,7 +440,7 @@ fn config_f64(spec: &NodeSpec, key: &str, fallback: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
     use crate::engine::{
@@ -551,7 +553,10 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             viewer_slot: None,
         });
-        let node = ChessboardDetectorNode { spec: spec(), board: None };
+        let node = ChessboardDetectorNode {
+            spec: spec(),
+            board: None,
+        };
         let frame = frame(640, 480);
         let board = BoardSpec::new(2, 2, 30.0).expect("board");
         let detection = ChessboardDetection {
@@ -587,7 +592,10 @@ mod tests {
     #[test]
     fn missing_image_codec_is_precondition() {
         let input = spec();
-        let mut node = ChessboardDetectorNode { spec: input, board: None };
+        let mut node = ChessboardDetectorNode {
+            spec: input,
+            board: None,
+        };
         // 未注入任何服务；非空帧会先取 image_codec → Precondition。
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let err = node
@@ -599,18 +607,25 @@ mod tests {
     #[test]
     fn empty_frame_is_skipped_without_services() {
         let input = spec();
-        let mut node = ChessboardDetectorNode { spec: input, board: None };
+        let mut node = ChessboardDetectorNode {
+            spec: input,
+            board: None,
+        };
         // 空帧在取任何 service 之前即被跳过，因此无需注入服务也应成功返回。
         let (mut rt, _outputs) = runtime(EngineServices::default());
-        assert!(node
-            .on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
-            .is_ok());
+        assert!(
+            node.on_input("image", DataPacket::ImageFrame(frame(0, 0)), &mut rt)
+                .is_ok()
+        );
     }
 
     #[test]
     fn rtsp_frames_image_frame_triggers_detection_path() {
         let input = spec();
-        let mut node = ChessboardDetectorNode { spec: input, board: None };
+        let mut node = ChessboardDetectorNode {
+            spec: input,
+            board: None,
+        };
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let err = node
             .on_input("frames", DataPacket::ImageFrame(frame(2, 2)), &mut rt)
@@ -621,7 +636,10 @@ mod tests {
     }
     #[test]
     fn explicit_subpixel_config_is_validated_and_legacy_config_keeps_refinement() {
-        let mut node = ChessboardDetectorNode { spec: spec(), board: None };
+        let mut node = ChessboardDetectorNode {
+            spec: spec(),
+            board: None,
+        };
         assert!(node.subpixel_options().expect("legacy options").enabled);
         let (mut rt, _outputs) = runtime(EngineServices::default());
         node.on_config_update(
@@ -635,16 +653,16 @@ mod tests {
         )
         .expect("valid explicit refinement config");
         assert!(!node.subpixel_options().expect("configured options").enabled);
-        let error = node.on_config_update(
-            serde_json::json!({"subpixelWindowRadius": 0}),
-            &mut rt,
-        );
+        let error = node.on_config_update(serde_json::json!({"subpixelWindowRadius": 0}), &mut rt);
         assert!(matches!(error, Err(NodeError::Config(_))));
     }
 
     #[test]
     fn board_packet_overrides_legacy_detector_config() {
-        let mut node = ChessboardDetectorNode { spec: spec(), board: None };
+        let mut node = ChessboardDetectorNode {
+            spec: spec(),
+            board: None,
+        };
         let (mut rt, _outputs) = runtime(EngineServices::default());
         let board = CalibrationBoardParams::new(11, 8, 40.0).expect("board params");
         node.on_input(
@@ -654,6 +672,9 @@ mod tests {
         )
         .expect("board input");
         let active = node.board().expect("active board");
-        assert_eq!((active.inner_cols, active.inner_rows, active.square_size), (11, 8, 40.0));
+        assert_eq!(
+            (active.inner_cols, active.inner_rows, active.square_size),
+            (11, 8, 40.0)
+        );
     }
 }

@@ -38,6 +38,9 @@ pub fn dispatch(path: &str, payload: Value, state: &AppState) -> Result<Value, S
         "graph.updateNode" => graph_update_node(payload, state),
         "graph.updateNodePositions" => graph_update_node_positions(payload, state),
         "graph.patchNode" => graph_patch_node(payload, state),
+        "graph.updateExtractorAndTaskBuilderInterface" => {
+            graph_update_extractor_and_task_builder_interface(payload, state)
+        }
         // —— 运行时动作 ——
         "runtime.status" => runtime_status(state),
         "runtime.node.action" => runtime_node_action(payload, state),
@@ -65,6 +68,24 @@ pub fn dispatch(path: &str, payload: Value, state: &AppState) -> Result<Value, S
         other => Err(format!("unknown ws path `{other}`")),
     }
 }
+fn reject_legacy_workflow_schema(value: &Value) -> Result<(), String> {
+    let schema = value
+        .get("schemaVersion")
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("graph")
+                .and_then(|graph| graph.get("schemaVersion"))
+                .and_then(Value::as_str)
+        });
+    if let Some("workflow.v1") = schema {
+        return Err(
+            "unsupported workflow schema `workflow.v1`; migration is disabled, import workflow.v2"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // graph.* 权威图命令
@@ -82,6 +103,7 @@ fn graph_current(state: &AppState) -> Result<Value, String> {
 }
 
 fn graph_replace(payload: Value, state: &AppState) -> Result<Value, String> {
+    reject_legacy_workflow_schema(&payload)?;
     let graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
     let graph = normalize_workflow(graph, crate::next_revision())?;
     rebuild_engine_from_graph(&graph, state)?;
@@ -397,6 +419,16 @@ fn graph_update_node(payload: Value, state: &AppState) -> Result<Value, String> 
                 else {
                     return Err(format!("node `{}` not found", body.node_id));
                 };
+                if matches!(
+                    existing.kind,
+                    crate::workflow::NodeKind::StructuredFieldExtractor
+                        | crate::workflow::NodeKind::I2cTaskBuilder
+                ) {
+                    return Err(
+                        "dynamic node interfaces must use graph.updateExtractorAndTaskBuilderInterface"
+                            .to_owned(),
+                    );
+                }
                 if let Some(title) = body.title {
                     existing.title = title;
                 }
@@ -452,6 +484,16 @@ fn graph_patch_node(payload: Value, state: &AppState) -> Result<Value, String> {
                 else {
                     return Err(format!("node `{}` not found", body.node_id));
                 };
+                if matches!(
+                    existing.kind,
+                    crate::workflow::NodeKind::StructuredFieldExtractor
+                        | crate::workflow::NodeKind::I2cTaskBuilder
+                ) {
+                    return Err(
+                        "dynamic node interfaces must use graph.updateExtractorAndTaskBuilderInterface"
+                            .to_owned(),
+                    );
+                }
                 if let Some(title) = body.title {
                     existing.title = title;
                 }
@@ -479,6 +521,96 @@ fn graph_patch_node(payload: Value, state: &AppState) -> Result<Value, String> {
             Ok(())
         })
     }
+}
+
+/// 原子更新 extractor 输出与 task builder 配置：先投影候选端口并校验全图边，成功后整体替换运行时图。
+fn graph_update_extractor_and_task_builder_interface(
+    payload: Value,
+    state: &AppState,
+) -> Result<Value, String> {
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase", deny_unknown_fields)]
+    struct Body {
+        extractor_node_id: String,
+        extractor_outputs: Vec<Value>,
+        task_builder_node_id: String,
+        task_builder_config: serde_json::Map<String, Value>,
+    }
+    let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
+    let current = authoritative_graph(state)?;
+    let mut candidate = current.clone();
+    let extractor = candidate
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == body.extractor_node_id)
+        .ok_or_else(|| format!("node `{}` not found", body.extractor_node_id))?;
+    if extractor.kind != crate::workflow::NodeKind::StructuredFieldExtractor {
+        return Err(format!(
+            "node `{}` is not a structuredFieldExtractor",
+            extractor.id
+        ));
+    }
+    extractor.config = json!({ "outputs": body.extractor_outputs });
+    let builder = candidate
+        .nodes
+        .iter_mut()
+        .find(|node| node.id == body.task_builder_node_id)
+        .ok_or_else(|| format!("node `{}` not found", body.task_builder_node_id))?;
+    if builder.kind != crate::workflow::NodeKind::I2cTaskBuilder {
+        return Err(format!("node `{}` is not an i2cTaskBuilder", builder.id));
+    }
+    builder.config = Value::Object(body.task_builder_config);
+
+    let candidate = normalize_workflow(candidate, crate::next_revision())?;
+    let diff = interface_port_diff(&current, &candidate);
+    rebuild_engine_from_graph(&candidate, state)?;
+    *state
+        .graph_session
+        .lock()
+        .map_err(|_| "authoritative graph state is unavailable".to_owned())? = candidate.clone();
+    publish_snapshot(state, &candidate);
+    Ok(json!({
+        "graph": candidate,
+        "candidatePortDiff": diff,
+        "diagnostics": ["candidate interfaces and all retained edges validated", "runtime graph replaced atomically after candidate build"],
+    }))
+}
+
+fn interface_port_diff(current: &WorkflowGraph, candidate: &WorkflowGraph) -> Vec<Value> {
+    current
+        .nodes
+        .iter()
+        .filter_map(|old| {
+            let next = candidate.nodes.iter().find(|node| node.id == old.id)?;
+            let diff = |old: &[crate::workflow::WorkflowPort],
+                        next: &[crate::workflow::WorkflowPort]| {
+                let old_ids: BTreeSet<&str> = old.iter().map(|port| port.id.as_str()).collect();
+                let next_ids: BTreeSet<&str> = next.iter().map(|port| port.id.as_str()).collect();
+                (
+                    next_ids
+                        .difference(&old_ids)
+                        .map(|id| (*id).to_owned())
+                        .collect::<Vec<_>>(),
+                    old_ids
+                        .difference(&next_ids)
+                        .map(|id| (*id).to_owned())
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let (added_inputs, removed_inputs) = diff(&old.inputs, &next.inputs);
+            let (added_outputs, removed_outputs) = diff(&old.outputs, &next.outputs);
+            (!added_inputs.is_empty()
+                || !removed_inputs.is_empty()
+                || !added_outputs.is_empty()
+                || !removed_outputs.is_empty())
+            .then(|| {
+                json!({
+                    "nodeId": old.id, "addedInputs": added_inputs, "removedInputs": removed_inputs,
+                    "addedOutputs": added_outputs, "removedOutputs": removed_outputs,
+                })
+            })
+        })
+        .collect()
 }
 
 fn commit_graph_mutation<F>(state: &AppState, mutate: F) -> Result<Value, String>
@@ -666,6 +798,7 @@ fn workflow_get(payload: Value, state: &AppState) -> Result<Value, String> {
 }
 
 fn workflow_create(payload: Value, state: &AppState) -> Result<Value, String> {
+    reject_legacy_workflow_schema(&payload)?;
     let mut graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
     if graph.id.trim().is_empty() {
         graph.id = format!("workflow-{}", crate::next_revision());
@@ -677,6 +810,7 @@ fn workflow_create(payload: Value, state: &AppState) -> Result<Value, String> {
 }
 
 fn workflow_import(payload: Value, state: &AppState) -> Result<Value, String> {
+    reject_legacy_workflow_schema(&payload)?;
     let mut graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
     if graph.id.trim().is_empty() {
         graph.id = format!("workflow-{}", crate::next_revision());
@@ -687,12 +821,12 @@ fn workflow_import(payload: Value, state: &AppState) -> Result<Value, String> {
 }
 
 fn workflow_save(payload: Value, state: &AppState) -> Result<Value, String> {
+    reject_legacy_workflow_schema(&payload)?;
     #[derive(serde::Deserialize)]
     struct Body {
         graph: WorkflowGraph,
         revision: String,
     }
-
     let body: Body = serde_json::from_value(payload).map_err(deser_err)?;
     if let Some(existing) = state
         .workflow_store
@@ -730,11 +864,10 @@ fn workflow_delete(payload: Value, state: &AppState) -> Result<Value, String> {
 }
 
 fn workflow_validate(payload: Value) -> Result<Value, String> {
+    reject_legacy_workflow_schema(&payload)?;
     let graph: WorkflowGraph = serde_json::from_value(payload).map_err(deser_err)?;
-    match validate_workflow(&graph) {
-        Ok(()) => Ok(serde_json::json!({ "ok": true })),
-        Err(error) => Err(error),
-    }
+    validate_workflow(&graph)?;
+    Ok(serde_json::json!({ "ok": true }))
 }
 
 /// 返回内置 seed 工作流图（对应旧 GET /api/workflow）。
@@ -1195,6 +1328,197 @@ mod tests {
         }));
         std::fs::remove_dir_all(dir).ok();
     }
+    #[test]
+    fn workflow_v1_is_rejected_by_import_save_and_validate() {
+        let dir = std::env::temp_dir().join(format!("ws-router-v1-{}", crate::next_revision()));
+        let state = test_state(dir.clone());
+        let mut legacy = serde_json::to_value(crate::workflow::seed_workflow_graph()).unwrap();
+        legacy["schemaVersion"] = serde_json::json!("workflow.v1");
+        for path in ["workflow.import", "workflow.validate"] {
+            let error =
+                dispatch(path, legacy.clone(), &state).expect_err("workflow.v1 must be rejected");
+            assert!(error.contains("workflow.v1"));
+        }
+        let error = dispatch(
+            "workflow.save",
+            serde_json::json!({ "graph": legacy, "revision": "seed" }),
+            &state,
+        )
+        .expect_err("workflow.v1 save must be rejected");
+        assert!(error.contains("workflow.v1"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+    #[test]
+    fn workflow_get_rejects_persisted_workflow_v1() {
+        let dir = std::env::temp_dir().join(format!("ws-router-get-v1-{}", crate::next_revision()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("legacy.ctworkflow.json"),
+            br#"{"schemaVersion":"workflow.v1"}"#,
+        )
+        .unwrap();
+        let state = test_state(dir.clone());
+        let error = dispatch(
+            "workflow.get",
+            serde_json::json!({ "id": "legacy" }),
+            &state,
+        )
+        .expect_err("workflow.get must reject v1");
+        assert!(error.contains("workflow.v1"));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn interface_update_returns_diff_and_replaces_runtime_after_validation() {
+        let dir =
+            std::env::temp_dir().join(format!("ws-router-interface-{}", crate::next_revision()));
+        let state = test_state(dir.clone());
+        let template = crate::workflow::workmode_templates()
+            .into_iter()
+            .find(|template| template.id == "i2c-plan-workflow")
+            .unwrap()
+            .graph;
+        *state.graph_session.lock().unwrap() = template.clone();
+        let extractor = template
+            .nodes
+            .iter()
+            .find(|node| node.id == "field-extractor")
+            .unwrap();
+        let builder = template
+            .nodes
+            .iter()
+            .find(|node| node.id == "task-builder")
+            .unwrap();
+        let mut outputs = extractor.config["outputs"].as_array().unwrap().clone();
+        outputs.push(serde_json::json!({ "id": "calibration.quality.rms_error", "pointer": "/fields/7", "type": "f64" }));
+        let output = dispatch(
+            "graph.updateExtractorAndTaskBuilderInterface",
+            serde_json::json!({
+                "extractorNodeId": extractor.id,
+                "extractorOutputs": outputs,
+                "taskBuilderNodeId": builder.id,
+                "taskBuilderConfig": builder.config,
+            }),
+            &state,
+        )
+        .expect("validated interface update succeeds");
+        assert_eq!(output["diagnostics"].as_array().unwrap().len(), 2);
+        assert!(
+            output["candidatePortDiff"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|diff| diff["nodeId"] == "field-extractor"
+                    && diff["addedOutputs"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|id| id == "calibration.quality.rms_error"))
+        );
+        assert!(state.engine_runtime.engine().as_ref().is_some());
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn interface_update_rejects_edges_removed_by_candidate_ports() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-interface-invalid-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let template = crate::workflow::workmode_templates()
+            .into_iter()
+            .find(|template| template.id == "i2c-plan-workflow")
+            .unwrap()
+            .graph;
+        *state.graph_session.lock().unwrap() = template.clone();
+        rebuild_engine_from_graph(&template, &state).expect("template engine builds");
+        let graph_before = state.graph_session.lock().unwrap().clone();
+        let engine_before = {
+            let engine = state.engine_runtime.engine();
+            engine
+                .as_ref()
+                .map(|engine| engine as *const _)
+                .expect("template engine is loaded")
+        };
+        let extractor = template
+            .nodes
+            .iter()
+            .find(|node| node.id == "field-extractor")
+            .unwrap();
+        let builder = template
+            .nodes
+            .iter()
+            .find(|node| node.id == "task-builder")
+            .unwrap();
+        let mut outputs = extractor.config["outputs"].as_array().unwrap().clone();
+        outputs.retain(|output| output["id"] != "camera.model.id");
+        let error = dispatch(
+            "graph.updateExtractorAndTaskBuilderInterface",
+            serde_json::json!({
+                "extractorNodeId": extractor.id,
+                "extractorOutputs": outputs,
+                "taskBuilderNodeId": builder.id,
+                "taskBuilderConfig": builder.config,
+            }),
+            &state,
+        )
+        .expect_err("candidate port removal must reject retained edge");
+        assert!(error.contains("camera.model.id"));
+        assert_eq!(*state.graph_session.lock().unwrap(), graph_before);
+        let engine_after = {
+            let engine = state.engine_runtime.engine();
+            engine
+                .as_ref()
+                .map(|engine| engine as *const _)
+                .expect("failed candidate retains loaded engine")
+        };
+        assert_eq!(engine_before, engine_after);
+        std::fs::remove_dir_all(dir).ok();
+    }
+    #[test]
+    fn generic_config_updates_reject_dynamic_node_interfaces() {
+        let dir = std::env::temp_dir().join(format!(
+            "ws-router-interface-generic-patch-{}",
+            crate::next_revision()
+        ));
+        let state = test_state(dir.clone());
+        let template = crate::workflow::workmode_templates()
+            .into_iter()
+            .find(|template| template.id == "i2c-plan-workflow")
+            .unwrap()
+            .graph;
+        *state.graph_session.lock().unwrap() = template.clone();
+        let builder = template
+            .nodes
+            .iter()
+            .find(|node| node.id == "task-builder")
+            .unwrap();
+
+        let patch_error = dispatch(
+            "graph.patchNode",
+            serde_json::json!({
+                "nodeId": "field-extractor",
+                "config": { "outputs": [] },
+            }),
+            &state,
+        )
+        .expect_err("generic extractor patch must be rejected");
+        assert!(patch_error.contains("graph.updateExtractorAndTaskBuilderInterface"));
+
+        let update_error = dispatch(
+            "graph.updateNode",
+            serde_json::json!({
+                "nodeId": builder.id,
+                "config": builder.config.clone(),
+            }),
+            &state,
+        )
+        .expect_err("generic task builder update must be rejected");
+        assert!(update_error.contains("graph.updateExtractorAndTaskBuilderInterface"));
+        assert_eq!(*state.graph_session.lock().unwrap(), template);
+        std::fs::remove_dir_all(dir).ok();
+    }
 
     fn test_state(dir: std::path::PathBuf) -> AppState {
         AppState {
@@ -1204,9 +1528,6 @@ mod tests {
             calibration_backend: std::sync::Arc::new(
                 camera_toolbox_adapters::OpenCvCalibrationBackend,
             ),
-            eeprom_inspects: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
             engine_runtime: std::sync::Arc::new(crate::engine_api::EngineRuntime::new()),
             ws_hub: std::sync::Arc::new(crate::ws_hub::WsHub::new()),
             graph_session: std::sync::Arc::new(std::sync::Mutex::new(

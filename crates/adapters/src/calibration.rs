@@ -336,11 +336,14 @@ impl OpenCvCalibrationBackend {
             .map_err(|error| cv_error("cvtColor(BGR2GRAY)", &error))?;
         let mut corners = Vector::<Point2f>::new();
         let board_size = Size::new(i32::from(board.inner_cols), i32::from(board.inner_rows));
-        let found = objdetect::find_chessboard_corners(&gray, board_size, &mut corners, DETECTOR_FLAGS)
-            .map_err(|error| cv_error("findChessboardCorners", &error))?;
+        let found =
+            objdetect::find_chessboard_corners(&gray, board_size, &mut corners, DETECTOR_FLAGS)
+                .map_err(|error| cv_error("findChessboardCorners", &error))?;
         checkpoint(cancellation)?;
         if !found {
-            return Ok(ChessboardDetectionOutcome::NotFound { image_size: actual_size });
+            return Ok(ChessboardDetectionOutcome::NotFound {
+                image_size: actual_size,
+            });
         }
 
         match options {
@@ -351,7 +354,9 @@ impl OpenCvCalibrationBackend {
                     "a final subpixel window requires a preferred window"
                 );
                 if !refinement.accepted {
-                    return Ok(ChessboardDetectionOutcome::NotFound { image_size: actual_size });
+                    return Ok(ChessboardDetectionOutcome::NotFound {
+                        image_size: actual_size,
+                    });
                 }
             }
             Some(options) if options.enabled => {

@@ -26,7 +26,7 @@ pub use capability::{
 pub use control::{
     ControlTargetSpec, EepromExecutor, HexArmControlClient, HexArmJointPositionsRequest,
     HexArmTargetConfig, HexArmTransport, I2cExecutor, SftpFileReader, SshCommandExecutor,
-    X5ControlClient, X5233CapturePayload,
+    SshConnection, SshConnectionService, X5ControlClient, X5233CapturePayload,
 };
 pub use controller::{DumpSubmitError, PlatformController, RemoteSubmitError, StreamSubmitError};
 pub use eeprom::{
@@ -43,12 +43,14 @@ pub use events::{
 pub use i2c::{
     I2C_HELPER_MAX_MESSAGE_BYTES, I2C_HELPER_MAX_MESSAGES_PER_TRANSACTION,
     I2C_HELPER_MAX_REQUEST_BYTES, I2C_HELPER_MAX_TOTAL_READ_BYTES,
-    I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST, I2C_HELPER_SCHEMA_VERSION, I2cBusInfo,
-    I2cHelperAction, I2cHelperFailure, I2cHelperOperation, I2cHelperOutput, I2cHelperRequest,
-    I2cHelperRequestValidationError, I2cHelperResult, I2cHelperService, I2cHelperServiceError,
-    I2cMessageData, I2cMessageDirection, I2cMessageFlag, I2cMessageResult, I2cMessageSpec,
-    I2cTransactionResult, I2cTransactionSpec, validate_i2c_helper_action,
-    validate_i2c_transfer_transactions,
+    I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST, I2C_HELPER_SCHEMA_VERSION, I2cAuthorizedWritePlan,
+    I2cBusInfo, I2cCandidateWritePlan, I2cExecutionReport, I2cHelperAction, I2cHelperFailure,
+    I2cHelperOperation, I2cHelperOutput, I2cHelperRequest, I2cHelperRequestValidationError,
+    I2cHelperResult, I2cHelperService, I2cHelperServiceError, I2cInspectPlan, I2cInspectSnapshot,
+    I2cMapValidationContract, I2cMessageData, I2cMessageDirection, I2cMessageFlag,
+    I2cMessageResult, I2cMessageSpec, I2cPageExecutionReport, I2cPageWrite, I2cReadRange,
+    I2cTaskExecutor, I2cTaskTarget, I2cTransactionResult, I2cTransactionSpec,
+    validate_i2c_helper_action, validate_i2c_transfer_transactions,
 };
 pub use ports::{
     DecodedVideoFrame, DumpCancellation, DumpEnvelope, DumpOperationControl, DumpOperationResult,

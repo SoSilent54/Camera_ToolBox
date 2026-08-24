@@ -1,12 +1,13 @@
 import { wsRequest } from './useEngineSocket';
 
-export const WORKFLOW_SCHEMA_VERSION = 'workflow.v1';
+export const WORKFLOW_SCHEMA_VERSION = 'workflow.v2';
 
 export type NodeKind =
   | 'localFileSource'
   | 'sftpFileSource'
   | 'rtspSource'
   | 'sshSession'
+  | 'sshConnection'
   | 'x5233Driver'
   | 'hexArmDevice'
   | 'rtspDecoder'
@@ -29,15 +30,16 @@ export type NodeKind =
   | 'calibrationSolver'
   | 'poseEstimator'
   | 'poseGuide'
-  | 'i2cTransfer'
-  | 'eepromProvision';
+  | 'structuredFieldExtractor'
+  | 'serialField'
+  | 'i2cTaskBuilder'
+  | 'i2cInspector'
+  | 'i2cWriteApproval'
+  | 'i2cExecutor';
 
 export type NodeCategory = 'workspace' | 'source' | 'media' | 'viewer' | 'calibration' | 'control' | 'diagnostics';
 export type NodeRuntimeState = 'idle' | 'ready' | 'running' | 'warning' | 'error';
 export type PortDirection = 'input' | 'output';
-export type PortCardinality = 'one' | 'many';
-export type PortRole = 'workspace' | 'endpoint' | 'stream' | 'image' | 'layer' | 'overlay' | 'control' | 'status' | 'dataset' | 'solution' | 'command';
-
 export type PortKind =
   | 'workspace.local'
   | 'workspace.remote.sftp'
@@ -60,20 +62,24 @@ export type PortKind =
   | 'calib.pose'
   | 'calib.coverage'
   | 'calib.dataset'
-  | 'calib.solution'
   | 'calib.report'
   | 'capture.score'
   | 'capture.signal'
   | 'capture.trigger'
   | 'capture.target'
   | 'command.capture'
-  | 'i2c.bus'
-  | 'i2c.transfer'
-  | 'i2c.result'
-  | 'eeprom.map'
-  | 'eeprom.payload'
+  | 'data.structured.packet.v1'
+  | 'ssh.connection.v1'
+  | 'i2c.inspect-plan.v1'
+  | 'i2c.candidate-write-plan.v1'
+  | 'i2c.inspect-snapshot.v1'
+  | 'i2c.authorized-write-plan.v1'
+  | 'i2c.execution-report.v1'
+  | `data.field.${'bool' | 'u8' | 'i8' | 'u16' | 'i16' | 'u32' | 'i32' | 'u64' | 'i64' | 'f32' | 'f64' | 'str' | 'bytes'}.v1`
   | 'status.metrics';
 
+export type PortRole = 'workspace' | 'endpoint' | 'stream' | 'image' | 'layer' | 'overlay' | 'control' | 'status' | 'dataset' | 'solution' | 'command';
+export type PortCardinality = 'one' | 'many';
 export interface WorkflowGraph {
   schemaVersion: string;
   id: string;
@@ -124,6 +130,7 @@ export interface WorkflowSelectionDeletion {
 }
 
 export interface WorkflowPort {
+
   id: string;
   label: string;
   direction: PortDirection;
@@ -175,56 +182,16 @@ export interface WorkflowSummary {
   edgeCount: number;
 }
 
-export type I2cPreviewOperation = 'read' | 'write';
-
-export interface I2cPreviewRequest {
-  nodeId: string;
-  profileId: string;
-  bus: string;
-  address: number;
-  register: number;
-  payload: number[];
-  pageSize: number;
-  operation: I2cPreviewOperation;
-}
-
-export interface EepromPreviewRequest {
-  nodeId: string;
-  profileId: string;
-  bus: string;
-  address: number;
-  register: number;
-  payload: number[];
-  pageSize: number;
-  mapId: string;
-  verifyAfterWrite: boolean;
-}
-
-export interface SshExecutionBinding {
-  host: string;
-  port?: number;
-  username?: string;
-  credentialRef: string;
-}
-
 /** 密码只通过本机 WebSocket 写入服务端进程内凭据库；图中只保存返回的 session 引用。 */
 export interface SshPasswordRegistration {
   credentialRef: string;
 }
 
-export interface I2cExecuteRequest extends I2cPreviewRequest {
-  confirmExecution: boolean;
-  ssh: SshExecutionBinding;
-}
-
-export interface EepromInspectRequest extends EepromPreviewRequest {
-  ssh: SshExecutionBinding;
-}
-
-export interface EepromExecuteRequest extends EepromPreviewRequest {
-  confirmExecution: boolean;
-  expectedBeforeSha256?: string;
-  ssh: SshExecutionBinding;
+/** 原子动态端口更新的后端响应；成功时 graph 已完成候选校验和运行时图替换。 */
+export interface ExtractorTaskBuilderInterfaceUpdate {
+  graph: WorkflowGraph;
+  candidatePortDiff: unknown[];
+  diagnostics: string[];
 }
 export interface CalibrationImageSize {
   width: number;
@@ -247,29 +214,6 @@ export interface InitialIntrinsics {
   distortionCoefficients: number[];
 }
 
-export interface CalibrationRequest {
-  imageSize: CalibrationImageSize;
-  board: BoardSpec;
-  imagePoints: CalibrationPoint[][];
-  initialIntrinsics: InitialIntrinsics;
-}
-
-export interface ViewCalibrationResult {
-  rotationVector: number[];
-  translationVector: number[];
-  projectedPoints: CalibrationPoint[];
-  reprojectionRmse: number;
-  maxReprojectionError: number;
-}
-
-export interface CalibrationSolution {
-  imageSize: CalibrationImageSize;
-  cameraMatrix: number[];
-  distortionCoefficients: number[];
-  rmsError: number;
-  calibrationFlags: number;
-  views: ViewCalibrationResult[];
-}
 
 export interface X5BindingRequest {
   host: string;
@@ -296,50 +240,6 @@ export interface X5SnapshotRequest extends X5BindingRequest {
 
 export type X5ControlResponse = Record<string, unknown>;
 
-export interface EepromInspectResponse {
-  preview: ControlRequestPreview;
-  snapshot: {
-    key: string;
-    imageSha256: string;
-    target: {
-      nodeId: string;
-      host: string;
-      port: number;
-      username: string;
-      mapId: string;
-      bus: string;
-      address: number;
-    };
-  };
-  result: unknown;
-}
-
-export interface ControlRequestPreview {
-  target: {
-    nodeId: string;
-    profileId: string;
-    bus: string;
-    address: number;
-    register: number;
-    payload: number[];
-  };
-  operation: 'read' | 'write' | 'provision';
-  pageSplitEstimate: {
-    pageSize: number;
-    writeCount: number;
-    segments: Array<{ register: number; payloadLength: number }>;
-  };
-  requiresConfirmation: boolean;
-  execution: 'preview-only';
-  mapId: string | null;
-  verifyAfterWrite: boolean | null;
-}
-
-export interface ControlExecutionResult {
-  preview: ControlRequestPreview;
-  execution: 'completed' | 'blocked';
-  result: unknown;
-}
 
 export type ViewerPreview =
   | { kind: 'rtsp'; url: string }
@@ -446,14 +346,22 @@ export interface FlowNodeData extends Record<string, unknown> {
   actionPending?: boolean;
   /** `runtime.node.output` 返回的最新可序列化输出；不写回工作流图。 */
   runtimeOutput?: unknown;
+  /** 已接入输入端口的最新运行时输出；只用于显示和安全闸，不持久化。 */
+  inputRuntimeOutputs?: Readonly<Record<string, unknown>>;
   /** 由节点类型或配置显式声明的可用动作。 */
   availableActions?: readonly NodeActionControl[];
   onRtspUrlChange?: (nodeId: string, url: string) => void;
-  onNodeConfigChange?: (nodeId: string, key: string, value: ScalarConfigValue) => void;
+  onNodeConfigChange?: (nodeId: string, key: string, value: unknown) => void;
+  /** 原子提交一组相互依赖的持久化配置，供 SSH 等整体验证节点使用。 */
+  onNodeConfigPatch?: (nodeId: string, config: Record<string, unknown>) => void;
   /** 触发节点动作；样本审核 payload 仅经运行时 WS 透传，绝不持久化到图配置。 */
   onNodeAction?: (nodeId: string, action: NodeActionName, payload?: DatasetSampleActionPayload) => void;
   /** 拉取节点最近一次输出；无输出时保留当前摘要。 */
   onRefreshNodeOutput?: (nodeId: string) => void;
+  /** 仅由 extractor/task builder 专用 UI 使用，后端原子重建两者的动态端口。 */
+  onPlanInterfaceChange?: (nodeId: string, config: Record<string, unknown>) => void;
+  /** 当前入边已占用的 typed-field 槽位；用于在 Builder 中呈现可连线状态。 */
+  connectedInputPortIds?: readonly string[];
 }
 
 export interface EdgePulseView {
@@ -560,32 +468,26 @@ export async function validateWorkflow(graph: WorkflowGraph): Promise<void> {
 export async function loadRuntimeNodeOutput(nodeId: string): Promise<unknown> {
   return request('runtime.node.output', { nodeId });
 }
-
-/** 注册或替换一个仅存在于当前服务端进程的 SSH 密码。 */
 export async function registerSshPassword(nodeId: string, password: string): Promise<SshPasswordRegistration> {
   return request('control.ssh.password', { nodeId, password });
 }
 
-
-/** 执行一次显式 I²C 请求；写操作必须由调用者传入确认与 SSH 运行时绑定。 */
-export async function runI2cTransfer(requestBody: I2cExecuteRequest): Promise<ControlExecutionResult> {
-  return request('control.i2c.run', requestBody);
+/** 同时提交 extractor 输出和 builder 配置，避免任一动态端口更新留下无效中间图。 */
+export async function updateExtractorAndTaskBuilderInterface(
+  extractorNodeId: string,
+  extractorOutputs: unknown[],
+  taskBuilderNodeId: string,
+  taskBuilderConfig: Record<string, unknown>,
+): Promise<ExtractorTaskBuilderInterfaceUpdate> {
+  return request('graph.updateExtractorAndTaskBuilderInterface', {
+    extractorNodeId,
+    extractorOutputs,
+    taskBuilderNodeId,
+    taskBuilderConfig,
+  });
 }
 
-/** EEPROM Inspect 会建立显式 SSH helper 会话，并把最新读回 hash 作为进程内写入门禁。 */
-export async function inspectEepromProvision(requestBody: EepromInspectRequest): Promise<EepromInspectResponse> {
-  return request('control.eeprom.inspect', requestBody);
-}
 
-/** EEPROM 写入必须复用同一进程内 Inspect 快照，并由 helper 执行字节级回读校验。 */
-export async function runEepromProvision(requestBody: EepromExecuteRequest): Promise<ControlExecutionResult> {
-  return request('control.eeprom.run', requestBody);
-}
-
-/** 手动触发一次标定求解；请求体只包含原始 CalibrationRequest，不持久化到 WorkflowGraph。 */
-export async function runCalibrationSolver(requestBody: CalibrationRequest): Promise<CalibrationSolution> {
-  return request('control.calibration.solver.run', requestBody);
-}
 
 /** X5 TCP 控制面只在显式按钮触发时连接设备；host/port 来自节点轻量配置。 */
 export async function probeX5Control(requestBody: X5BindingRequest): Promise<X5ControlResponse> {
@@ -638,15 +540,6 @@ export async function listLocalFiles(root: string, path: string): Promise<FileLi
   return request('file.local.list', { root, path });
 }
 
-/** 请求服务器校验 I²C 配置并返回预览；该端点不执行任何 I/O。 */
-export async function previewI2cTransfer(requestBody: I2cPreviewRequest): Promise<ControlRequestPreview> {
-  return request('control.i2c.preview', requestBody);
-}
-
-/** 请求服务器校验 EEPROM 配置并返回预览；该端点不执行任何 I/O。 */
-export async function previewEepromProvision(requestBody: EepromPreviewRequest): Promise<ControlRequestPreview> {
-  return request('control.eeprom.preview', requestBody);
-}
 
 export function labelForPortKind(kind: PortKind): string {
   return kind;

@@ -3,13 +3,14 @@
 use std::{
     collections::HashMap,
     sync::{
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
-        mpsc, Arc, RwLock,
+        mpsc,
     },
     thread::JoinHandle,
 };
 
-use crate::platform::{host_monotonic_time_ns, LatestDecodedFrameSlot};
+use crate::platform::{LatestDecodedFrameSlot, host_monotonic_time_ns};
 
 use super::{
     channel::{ChannelFull, MailboxSender, NodeMessage},
@@ -117,33 +118,39 @@ impl OutputRegistry {
         let _ = flow_tx.try_send(pulse);
     }
 
-    /// 向输出端口发布数据；无下游时视为 no-op 成功（未连接输出是合法状态，不算错误），
-    /// 仅当下游存在但全部通道满时返回 `ChannelFull`。
+    /// 向输出端口发布数据。视频帧允许在容量满时丢弃新帧；配置、计划和 typed-field
+    /// 是离散且会改变语义的消息，必须可靠投递，不能因帧 mailbox 容量而丢失。
     pub fn emit(&self, port: &str, packet: DataPacket) -> Result<(), ChannelFull> {
-        let guard = self
+        // 克隆当前下游快照后立即释放 ports 锁；即使未来可靠 lane 改为会等待的实现，
+        // 增量图编辑也不会被发送路径阻塞。
+        let senders = self
             .ports
             .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let Some(senders) = guard.get(port) else {
-            drop(guard);
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(port)
+            .cloned();
+        let Some(senders) = senders else {
             (self.record)(packet);
             return Ok(());
         };
         let mut delivered = false;
-        for downstream in senders {
-            if downstream
-                .sender
-                .try_send(NodeMessage::Input {
+        for downstream in &senders {
+            let result = if packet.is_realtime_stream() {
+                downstream.sender.try_send(NodeMessage::Input {
                     port: downstream.link.target_port_id.clone(),
                     packet: packet.clone(),
                 })
-                .is_ok()
-            {
+            } else {
+                downstream.sender.send(NodeMessage::ReliableInput {
+                    port: downstream.link.target_port_id.clone(),
+                    packet: packet.clone(),
+                })
+            };
+            if result.is_ok() {
                 delivered = true;
                 self.report_flow(&downstream.link, &packet);
             }
         }
-        drop(guard);
         if delivered {
             (self.record)(packet);
             Ok(())
@@ -265,10 +272,11 @@ impl NodeRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, mpsc};
 
     use super::*;
-    use crate::engine::packet::DataPacket;
+    use crate::engine::packet::{DataPacket, FrameProvenance, ImageFrame, ImageFrameIdentity};
+    use crate::platform::SourcePts;
 
     #[test]
     fn emit_without_downstream_is_noop_ok() {
@@ -296,7 +304,7 @@ mod tests {
         assert!(outputs.emit("out", packet).is_ok());
         assert!(matches!(
             rx.try_recv(),
-            Ok(NodeMessage::Input { port, .. }) if port == "in"
+            Ok(NodeMessage::ReliableInput { port, .. }) if port == "in"
         ));
     }
 
@@ -396,9 +404,15 @@ mod tests {
         assert!(outputs.emit("out", packet).is_ok());
 
         // 三个下游都必须收到目标输入端口 "in" 的数据。
-        assert!(matches!(rx1.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
-        assert!(matches!(rx2.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
-        assert!(matches!(rx3.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
+        assert!(
+            matches!(rx1.try_recv(), Ok(NodeMessage::ReliableInput { port, .. }) if port == "in")
+        );
+        assert!(
+            matches!(rx2.try_recv(), Ok(NodeMessage::ReliableInput { port, .. }) if port == "in")
+        );
+        assert!(
+            matches!(rx3.try_recv(), Ok(NodeMessage::ReliableInput { port, .. }) if port == "in")
+        );
     }
 
     #[test]
@@ -439,7 +453,10 @@ mod tests {
             )
             .expect("emit");
         // 仍连接的下游收到，被摘除的下游收不到。
-        assert!(matches!(rx1.try_recv(), Ok(NodeMessage::Input { .. })));
+        assert!(matches!(
+            rx1.try_recv(),
+            Ok(NodeMessage::ReliableInput { .. })
+        ));
         assert!(matches!(
             rx2.try_recv(),
             Err(std::sync::mpsc::TryRecvError::Empty)
@@ -476,7 +493,9 @@ mod tests {
             )
             .expect("emit succeeds");
 
-        assert!(matches!(rx.try_recv(), Ok(NodeMessage::Input { port, .. }) if port == "in"));
+        assert!(
+            matches!(rx.try_recv(), Ok(NodeMessage::ReliableInput { port, .. }) if port == "in")
+        );
         let pulse = flow_rx
             .try_recv()
             .expect("successful delivery reports pulse");
@@ -489,8 +508,50 @@ mod tests {
         assert_eq!(pulse.sequence, None);
     }
 
+    fn image_packet(sequence: u64) -> DataPacket {
+        DataPacket::ImageFrame(Arc::new(
+            ImageFrame::rgba8(
+                1,
+                1,
+                Arc::from([0, 0, 0, 0]),
+                ImageFrameIdentity {
+                    provenance: FrameProvenance::Unknown {
+                        reason: "test".to_owned(),
+                    },
+                    frame_sequence: sequence,
+                    source_pts: SourcePts::Unavailable {
+                        reason: "test".to_owned(),
+                    },
+                    host_monotonic_time_ns: sequence,
+                    device_timestamp_ns: None,
+                },
+            )
+            .expect("valid 1x1 RGBA image"),
+        ))
+    }
+
     #[test]
-    fn emit_does_not_report_flow_when_downstream_mailbox_is_full() {
+    fn image_frame_stream_drops_when_mailbox_is_full() {
+        let outputs = OutputRegistry::default();
+        let (tx, rx) = crate::engine::channel::create_mailbox(1);
+        outputs.connect(
+            crate::engine::flow::EdgeLink {
+                edge_id: "edge-image".to_owned(),
+                source_node_id: "src".to_owned(),
+                source_port_id: "out".to_owned(),
+                target_node_id: "dst".to_owned(),
+                target_port_id: "in".to_owned(),
+            },
+            tx,
+        );
+
+        assert!(outputs.emit("out", image_packet(1)).is_ok());
+        assert_eq!(outputs.emit("out", image_packet(2)), Err(ChannelFull));
+        assert!(matches!(rx.try_recv(), Ok(NodeMessage::Input { .. })));
+    }
+
+    #[test]
+    fn static_packets_bypass_frame_mailbox_capacity() {
         let mut outputs = OutputRegistry::default();
         let (flow_tx, flow_rx) = mpsc::sync_channel(8);
         outputs.set_flow_tx(flow_tx);
@@ -502,7 +563,7 @@ mod tests {
         .expect("pre-fill mailbox");
         outputs.connect(
             crate::engine::flow::EdgeLink {
-                edge_id: "edge-full".to_owned(),
+                edge_id: "edge-static".to_owned(),
                 source_node_id: "src".to_owned(),
                 source_port_id: "out".to_owned(),
                 target_node_id: "dst".to_owned(),
@@ -511,13 +572,18 @@ mod tests {
             tx,
         );
 
-        assert!(matches!(
-            outputs.emit(
+        outputs
+            .emit(
                 "out",
                 DataPacket::Json(Arc::new(serde_json::json!({"k": 1}))),
-            ),
-            Err(ChannelFull)
-        ));
-        assert!(matches!(flow_rx.try_recv(), Err(mpsc::TryRecvError::Empty)));
+            )
+            .expect("static packet must not be dropped by frame capacity");
+        assert_eq!(
+            flow_rx
+                .try_recv()
+                .expect("static delivery reports flow")
+                .edge_id,
+            "edge-static"
+        );
     }
 }

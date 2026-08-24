@@ -28,9 +28,11 @@ pub mod capture_logic;
 pub mod composite;
 pub mod control_nodes;
 pub mod detection;
-pub mod pose_estimator;
+pub mod i2c_plan_nodes;
 pub mod local_source;
+pub mod pose_estimator;
 pub mod rtsp_source;
+pub mod structured_field_extractor;
 pub mod transform;
 pub mod viewer;
 
@@ -52,14 +54,21 @@ pub use composite::{
     OverlayComposerFactory, OverlayComposerNode, PoseGuideFactory, PoseGuideNode,
 };
 pub use control_nodes::{
-    EepromProvisionFactory, EepromProvisionNode, HexArmDeviceFactory, HexArmDeviceNode,
-    I2cTransferFactory, I2cTransferNode, SftpFileSourceFactory, SftpFileSourceNode,
+    HexArmDeviceFactory, HexArmDeviceNode, SftpFileSourceFactory, SftpFileSourceNode,
     SshSessionFactory, SshSessionNode, X5233DriverFactory, X5233DriverNode,
 };
 pub use detection::{ChessboardDetectorFactory, ChessboardDetectorNode};
+pub use i2c_plan_nodes::{
+    I2cInspectorFactory, I2cInspectorNode, I2cTaskBuilderFactory, I2cTaskBuilderNode,
+    I2cTaskExecutorFactory, I2cTaskExecutorNode, I2cWriteApprovalFactory, I2cWriteApprovalNode,
+    SshConnectionFactory, SshConnectionNode,
+};
 pub use local_source::{LocalFileSourceFactory, LocalFileSourceNode};
 pub use pose_estimator::{PoseEstimatorFactory, PoseEstimatorNode};
 pub use rtsp_source::{RtspSourceFactory, RtspSourceNode};
+pub use structured_field_extractor::{
+    StructuredFieldExtractorFactory, StructuredFieldExtractorNode,
+};
 pub use transform::{
     DemosaicFactory, DemosaicNode, FrameSamplerFactory, FrameSamplerNode, ImageLayerFactory,
     PassThroughNode, RtspDecoderFactory, VideoLayerFactory,
@@ -94,8 +103,12 @@ pub fn register_builtin(registry: &mut NodeRegistry) {
     registry.register(Box::new(SshSessionFactory));
     registry.register(Box::new(X5233DriverFactory));
     registry.register(Box::new(HexArmDeviceFactory));
-    registry.register(Box::new(I2cTransferFactory));
-    registry.register(Box::new(EepromProvisionFactory));
+    registry.register(Box::new(SshConnectionFactory));
+    registry.register(Box::new(StructuredFieldExtractorFactory));
+    registry.register(Box::new(I2cTaskBuilderFactory));
+    registry.register(Box::new(I2cInspectorFactory));
+    registry.register(Box::new(I2cWriteApprovalFactory));
+    registry.register(Box::new(I2cTaskExecutorFactory));
 }
 
 #[cfg(test)]
@@ -134,9 +147,12 @@ mod tests {
             "sftpFileSource",
             "sshSession",
             "x5233Driver",
-            "hexArmDevice",
-            "i2cTransfer",
-            "eepromProvision",
+            "sshConnection",
+            "structuredFieldExtractor",
+            "i2cTaskBuilder",
+            "i2cWriteApproval",
+            "i2cExecutor",
+            "i2cInspector",
         ] {
             assert!(kinds.contains(&expected), "missing node kind {expected}");
         }

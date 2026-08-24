@@ -2,7 +2,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::AtomicBool, mpsc, Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, RwLock, atomic::AtomicBool, mpsc},
     thread::JoinHandle,
 };
 
@@ -11,7 +11,7 @@ use thiserror::Error;
 use crate::platform::LatestDecodedFrameSlot;
 
 use super::{
-    channel::{create_mailbox, MailboxReceiver, MailboxSender, NodeMessage},
+    channel::{MailboxReceiver, MailboxSender, NodeMessage, create_mailbox},
     flow::{EdgeFlowPulse, EdgeLink},
     node::{NodeAction, NodeError, NodeInstance},
     packet::DataPacket,
@@ -156,8 +156,20 @@ impl GraphEngine {
         let node_specs: HashMap<&NodeId, &NodeSpec> =
             spec.nodes.iter().map(|node| (&node.id, node)).collect();
         let mut connected_inputs: HashMap<NodeId, HashSet<PortId>> = HashMap::new();
+        let mut validated_edges = HashMap::new();
         for edge in &spec.edges {
+            if validated_edges.contains_key(&edge.id) {
+                return Err(GraphBuildError::DuplicateEdge(edge.id.clone()));
+            }
             validate_edge(edge, &node_specs, &mut connected_inputs)?;
+            if would_create_cycle(&validated_edges, edge) {
+                return Err(GraphBuildError::WouldCreateCycle {
+                    edge: edge.id.clone(),
+                });
+            }
+            validated_edges.insert(edge.id.clone(), edge.clone());
+        }
+        for edge in &spec.edges {
             let (target_tx, _) = mailboxes
                 .get(&edge.target.node_id)
                 .expect("target node validated to exist");
@@ -641,7 +653,8 @@ fn spawn_node_actor(
 
             loop {
                 match mailbox.recv() {
-                    Ok(NodeMessage::Input { port, packet }) => {
+                    Ok(NodeMessage::Input { port, packet })
+                    | Ok(NodeMessage::ReliableInput { port, packet }) => {
                         if let Err(error) = instance.on_input(&port, packet, &mut rt) {
                             reporter.report_event(format!("input on `{port}` failed: {error}"));
                         }
@@ -1037,9 +1050,11 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         let statuses = engine.drain_status();
-        assert!(statuses
-            .iter()
-            .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Disabled }));
+        assert!(
+            statuses.iter().any(|status| {
+                status.node_id == "b" && status.state == NodeRuntimeState::Disabled
+            })
+        );
         let _ = engine;
     }
 
@@ -1056,9 +1071,11 @@ mod tests {
         };
         let engine = GraphEngine::build(spec, &registry, EngineServices::default()).unwrap();
         let statuses = engine.drain_status();
-        assert!(statuses
-            .iter()
-            .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Idle }));
+        assert!(
+            statuses
+                .iter()
+                .any(|status| { status.node_id == "b" && status.state == NodeRuntimeState::Idle })
+        );
         let _ = engine;
     }
 
@@ -1361,6 +1378,7 @@ mod tests {
         // One 输入端口收到第二条入边 → build 拒绝（D7）。
         let mut registry = NodeRegistry::new();
         registry.register(Box::new(PassthroughFactory));
+
         let spec = GraphSpec {
             nodes: vec![
                 node_spec_with_kind("a1", "passthrough", vec![], vec![port("out", false)]),
@@ -1376,6 +1394,35 @@ mod tests {
                 if *node == "b" && *port == "in" && (*edge == "e1" || *edge == "e2")),
             "unexpected result: {err:?}"
         );
+    }
+    #[test]
+    fn build_rejects_cycle_in_initial_port_graph() {
+        let mut registry = NodeRegistry::new();
+        registry.register(Box::new(PassthroughFactory));
+        let spec = GraphSpec {
+            nodes: vec![
+                node_spec_with_kind(
+                    "a",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
+                node_spec_with_kind(
+                    "b",
+                    "passthrough",
+                    vec![port("in", false)],
+                    vec![port("out", false)],
+                ),
+            ],
+            edges: vec![
+                edge_with_ports("a-to-b", "a", "out", "b", "in"),
+                edge_with_ports("b-to-a", "b", "out", "a", "in"),
+            ],
+        };
+        assert!(matches!(
+            GraphEngine::build(spec, &registry, EngineServices::default()),
+            Err(GraphBuildError::WouldCreateCycle { edge }) if edge == "b-to-a"
+        ));
     }
 
     #[test]

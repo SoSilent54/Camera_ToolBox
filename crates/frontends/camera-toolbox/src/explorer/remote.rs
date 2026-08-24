@@ -11,7 +11,7 @@ use std::{
 };
 
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    SshConnectionTarget, SshCredential, SshTransportFactory,
+    ServerHostKey, SshConnectionTarget, SshCredential, SshTransportFactory,
 };
 use camera_toolbox_app::{
     DumpCancellation, RemoteAuthentication, RemoteConnectionConfig, RemoteConnectionId,
@@ -32,12 +32,20 @@ pub(crate) struct RemoteConnectionCommit {
 #[derive(Default)]
 struct RemoteConnectionDraft {
     endpoint: String,
+    expected_host_key: String,
     password: SecretBox<String>,
 }
 
 impl RemoteConnectionDraft {
     fn connect_request(&self) -> Result<RemoteConnectRequest, String> {
         let endpoint = parse_endpoint(&self.endpoint)?;
+        if self.expected_host_key.trim().is_empty() {
+            return Err("Expected SSH host key must not be empty".to_owned());
+        }
+        let expected_host_key = ServerHostKey::from_openssh(self.expected_host_key.trim())
+            .map_err(|error| format!("Expected SSH host key is invalid: {error}"))?
+            .openssh()
+            .to_owned();
         if self.password.expose_secret().is_empty() {
             return Err("Password must not be empty".to_owned());
         }
@@ -49,6 +57,7 @@ impl RemoteConnectionDraft {
             host: endpoint.host,
             port: endpoint.port,
             username: endpoint.username,
+            expected_host_key,
             password: SecretString::from(self.password.expose_secret().clone()),
         })
     }
@@ -70,6 +79,7 @@ struct RemoteConnectRequest {
     host: String,
     port: u16,
     username: String,
+    expected_host_key: String,
     password: SecretString,
 }
 
@@ -122,6 +132,13 @@ impl RemoteConnector {
                 .hint_text("user@192.168.1.100:22")
                 .desired_width(ui.available_width()),
         );
+        ui.label("Expected SSH host key");
+        ui.add_enabled(
+            enabled && !connecting,
+            egui::TextEdit::singleline(&mut self.draft.expected_host_key)
+                .hint_text("ssh-ed25519 AAAA...")
+                .desired_width(ui.available_width()),
+        );
         ui.label("Password");
         ui.add_enabled(
             enabled && !connecting,
@@ -145,7 +162,7 @@ impl RemoteConnector {
                 self.error = None;
             }
         });
-        ui.small("SFTP password connection skips SSH host-key persistence and verification.");
+        ui.small("The OpenSSH server public key is required and verified for every SFTP connection.");
         if let Some(status) = &self.status {
             ui.horizontal(|ui| {
                 if connecting {
@@ -287,7 +304,7 @@ fn run_remote_connect(
         host: request.host.clone(),
         port: request.port,
         username: request.username.clone(),
-        expected_host_key: None,
+        expected_host_key: Some(request.expected_host_key.clone()),
         command_subsystem: None,
         remote_event_subsystem: None,
     };
@@ -310,7 +327,7 @@ fn run_remote_connect(
         host: request.host,
         port: request.port,
         username: request.username,
-        expected_host_key: None,
+        expected_host_key: Some(request.expected_host_key),
         authentication: RemoteAuthentication::Password {
             slot_id: request.slot_id,
         },
@@ -447,13 +464,14 @@ mod tests {
     }
 
     #[test]
-    fn connector_uses_password_without_host_key_pin() {
+    fn connector_uses_password_with_host_key_pin() {
         let memory = Arc::new(MemorySshTransport::new(KEY_A));
         memory.insert_directory(SFTP_NAMESPACE_ROOT);
         let transport: Arc<dyn SshTransportFactory> = memory;
         let context = egui::Context::default();
         let mut connector = RemoteConnector::new(transport);
         connector.draft.endpoint = "root@camera.test:22".to_owned();
+        connector.draft.expected_host_key = KEY_A.to_owned();
         connector
             .draft
             .password
@@ -470,7 +488,7 @@ mod tests {
             thread::sleep(Duration::from_millis(5));
         };
 
-        assert_eq!(commit.config.expected_host_key, None);
+        assert_eq!(commit.config.expected_host_key.as_deref(), Some(KEY_A));
         assert!(matches!(
             commit.config.authentication,
             RemoteAuthentication::Password { .. }
@@ -479,7 +497,7 @@ mod tests {
     }
 
     #[test]
-    fn changed_host_key_is_ignored_for_password_sftp() {
+    fn changed_host_key_is_rejected_for_password_sftp() {
         let memory = Arc::new(MemorySshTransport::new(KEY_B));
         memory.insert_directory(SFTP_NAMESPACE_ROOT);
         let request = RemoteConnectRequest {
@@ -488,17 +506,15 @@ mod tests {
             host: "camera.test".to_owned(),
             port: 22,
             username: "root".to_owned(),
+            expected_host_key: KEY_A.to_owned(),
             password: SecretString::from("memory-test-secret".to_owned()),
         };
 
-        let commit =
-            run_remote_connect(request, memory.as_ref(), DumpCancellation::default()).unwrap();
+        let error = match run_remote_connect(request, memory.as_ref(), DumpCancellation::default()) {
+            Ok(_) => panic!("a changed server host key must be rejected"),
+            Err(error) => error,
+        };
 
-        assert_eq!(commit.config.expected_host_key, None);
-        assert!(matches!(
-            commit.config.authentication,
-            RemoteAuthentication::Password { .. }
-        ));
-        assert!(!commit.session_password.expose_secret().is_empty());
+        assert!(error.contains("host key"), "unexpected error: {error}");
     }
 }

@@ -3,21 +3,11 @@ import type { NodeProps } from '@xyflow/react';
 import type { FlowNodeData, NodeActionName, X5ControlResponse, X5SnapshotMode } from './workflow';
 import {
   configureX5Rtsp,
-  inspectEepromProvision,
-  previewEepromProvision,
-  previewI2cTransfer,
   probeX5Control,
   registerSshPassword,
-  runEepromProvision,
-  runI2cTransfer,
   startX5RtspChannel,
   statusX5Control,
   stopX5RtspChannel,
-  type EepromExecuteRequest,
-  type EepromInspectRequest,
-  type EepromPreviewRequest,
-  type I2cExecuteRequest,
-  type I2cPreviewRequest,
 } from './workflow';
 import { configText } from './nodeConfig';
 import { NodeActionButtons, NodeHeader, PortHandles, RuntimeOutputSummary } from './nodes/shared';
@@ -200,20 +190,22 @@ function RemoteFrame({ nodeData, selected, children }: { nodeData: FlowNodeData;
   );
 }
 
-/** SSH 节点只接受密码；密码写入服务端进程内凭据库，图仅保存 session 引用。 */
+/** SSH 节点只接受密码；密码写入服务端进程内凭据库，图仅保存 session 引用和固定的主机公钥。 */
 export function SshSessionNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
+  const expectedHostKey = configText(node, 'expectedHostKey', '');
   const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
       <Field id={`${node.id}-host`} label="Host" value={configText(node, 'host', '')} onChange={(value) => set('host', value)} placeholder="camera.local" />
       <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
       <Field id={`${node.id}-username`} label="User" value={configText(node, 'username', 'root')} onChange={(value) => set('username', value)} />
+      <Field id={`${node.id}-expected-host-key`} label="Expected host key" value={expectedHostKey} onChange={(value) => set('expectedHostKey', value)} placeholder="ssh-ed25519 AAAA..." />
       <PasswordCredentialField nodeId={node.id} credentialRef={configText(node, 'credentialRef', '')} onCredentialRef={(value) => set('credentialRef', value)} />
-      <label className="node-hint">Password authentication only. The password is registered in the current server process and is never saved in the workflow.</label>
+      <label className="node-hint">Password authentication only. The password is registered in the current server process and is never saved in the workflow. A pinned OpenSSH host key is required.</label>
       <div className="node-actions">
-        <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
+        <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction || expectedHostKey.trim().length === 0} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
       </div>
     </RemoteFrame>
   );
@@ -470,101 +462,4 @@ function PasswordCredentialField({ nodeId, credentialRef, onCredentialRef }: { n
       {message ? <span className="node-hint">{message}</span> : null}
     </>
   );
-}
-
-const I2C_BUS_OPTIONS = Array.from({ length: 8 }, (_, index) => ({ value: `i2c-${index}`, label: `I²C ${index}` }));
-function sshBinding(node: FlowNodeData['workflowNode']) {
-  return {
-    host: configText(node, 'host', ''),
-    port: numberValue(configText(node, 'port', '22'), 22),
-    username: configText(node, 'username', 'root'),
-    credentialRef: configText(node, 'credentialRef', ''),
-  };
-}
-
-function I2cForm({ data, selected, eeprom = false }: { data: NodeProps['data']; selected?: boolean; eeprom?: boolean }) {
-  const nodeData = data as FlowNodeData;
-  const node = nodeData.workflowNode;
-  const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
-  const rawPayload = configText(node, 'payload', '').trim();
-  const payload = rawPayload
-    ? rawPayload.split(/[\s,;]+/).filter(Boolean).map((item) => numberValue(item, -1)).filter((item) => Number.isInteger(item) && item >= 0 && item <= 255)
-    : [];
-  const base = {
-    nodeId: node.id,
-    profileId: configText(node, 'profileId', 'x5-lab'),
-    bus: configText(node, 'bus', 'i2c-1'),
-    address: numberValue(configText(node, 'address', '0x50')),
-    register: numberValue(configText(node, 'register', '0x0000')),
-    payload,
-    pageSize: numberValue(configText(node, 'pageSize', '16'), 16),
-  };
-  const [pending, setPending] = useState(false);
-  const [preview, setPreview] = useState<unknown>();
-  const [snapshot, setSnapshot] = useState<string>();
-  const run = async (operation: () => Promise<unknown>) => {
-    setPending(true);
-    try {
-      const result = await operation();
-      setPreview(result);
-      if (typeof result === 'object' && result !== null && 'snapshot' in result) {
-        const candidate = result.snapshot;
-        if (typeof candidate === 'object' && candidate !== null && 'imageSha256' in candidate && typeof candidate.imageSha256 === 'string') {
-          setSnapshot(candidate.imageSha256);
-        }
-      }
-    } catch (error) {
-      setPreview(String(error));
-    } finally {
-      setPending(false);
-    }
-  };
-  const ssh = sshBinding(node);
-  const warning = eeprom
-    ? 'EEPROM writes are irreversible. Inspect first, require verifyAfterWrite, and confirm only after checking the preview.'
-    : 'I²C writes can change hardware state. Preview validates the request but performs no I/O.';
-  const i2cPreview: I2cPreviewRequest = { ...base, operation: configText(node, 'mode', 'read') === 'write' ? 'write' : 'read' };
-  const eepromPreview: EepromPreviewRequest = { ...base, mapId: configText(node, 'mapId', 'yg-stereo-p24c64g-v1'), verifyAfterWrite: configBool(node, 'verifyAfterWrite', true) };
-  const eepromInspect: EepromInspectRequest = { ...eepromPreview, ssh };
-  const eepromExecute: EepromExecuteRequest | undefined = snapshot
-    ? { ...eepromPreview, ssh, confirmExecution: true, expectedBeforeSha256: snapshot }
-    : undefined;
-  const i2cExecute: I2cExecuteRequest = {
-    ...i2cPreview,
-    ssh,
-    confirmExecution: configText(node, 'mode', 'read') !== 'write' || configBool(node, 'confirmWrites', false),
-  };
-  return (
-    <RemoteFrame nodeData={nodeData} selected={selected}>
-      <Field id={`${node.id}-profile`} label="Profile" value={base.profileId} onChange={(value) => set('profileId', value)} />
-      <Field id={`${node.id}-host`} label="SSH host" value={ssh.host} onChange={(value) => set('host', value)} />
-      <Field id={`${node.id}-port`} label="SSH port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
-      <Field id={`${node.id}-user`} label="SSH user" value={ssh.username} onChange={(value) => set('username', value)} />
-      <PasswordCredentialField nodeId={node.id} credentialRef={ssh.credentialRef} onCredentialRef={(value) => set('credentialRef', value)} />
-      <SelectField id={`${node.id}-bus`} label="I²C bus" value={base.bus} options={I2C_BUS_OPTIONS} onChange={(value) => set('bus', value)} />
-      <Field id={`${node.id}-address`} label="Address" value={configText(node, 'address', '0x50')} onChange={(value) => set('address', value)} />
-      <Field id={`${node.id}-register`} label="Register" value={configText(node, 'register', '0x0000')} onChange={(value) => set('register', value)} />
-      <Field id={`${node.id}-payload`} label="Payload bytes" value={configText(node, 'payload', '')} onChange={(value) => set('payload', value)} placeholder="0x01 0x02 …" />
-      <Field id={`${node.id}-page-size`} label="Page size" value={configText(node, 'pageSize', '16')} onChange={(value) => set('pageSize', value)} type="number" />
-      {eeprom ? <SelectField id={`${node.id}-map`} label="EEPROM map" value={configText(node, 'mapId', 'yg-stereo-p24c64g-v1')} options={[{ value: 'yg-stereo-p24c64g-v1', label: 'YG Stereo P24C64G v1' }]} onChange={(value) => set('mapId', value)} /> : null}
-      {eeprom ? <label className="node-config-checkbox"><code>Verify after write</code><input className="nodrag nowheel" type="checkbox" checked={configBool(node, 'verifyAfterWrite', true)} onChange={(event) => set('verifyAfterWrite', event.target.checked)} /></label> : <SelectField id={`${node.id}-mode`} label="Mode" value={configText(node, 'mode', 'read')} options={[{ value: 'read', label: 'Read' }, { value: 'write', label: 'Write' }]} onChange={(value) => set('mode', value)} />}
-      <span className="node-hint">This node uses inline SSH host/user plus a process-local password session; private keys and host-key pins are not part of this workflow.</span>
-      <span className="node-hint">{warning}</span>
-      <div className="node-actions">
-        <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => run(() => eeprom ? previewEepromProvision(eepromPreview) : previewI2cTransfer(i2cPreview))}>Preview (no I/O)</button>
-        {eeprom ? <button type="button" className="nodrag nowheel" disabled={pending} onClick={() => run(() => inspectEepromProvision(eepromInspect))}>Inspect</button> : null}
-        <button type="button" className="nodrag nowheel" disabled={pending || (eeprom && !eepromExecute)} onClick={() => run(() => eeprom ? runEepromProvision(eepromExecute!) : runI2cTransfer(i2cExecute))}>{eeprom ? 'Provision (confirm)' : 'Run'}</button>
-      </div>
-      {eeprom && !snapshot ? <span className="node-hint">Inspect must succeed in this process before Provision is enabled.</span> : null}
-      <ResultBox value={preview} />
-    </RemoteFrame>
-  );
-}
-
-export function I2cTransferNode({ data, selected }: NodeProps) {
-  return <I2cForm data={data} selected={selected} />;
-}
-
-export function EepromProvisionNode({ data, selected }: NodeProps) {
-  return <I2cForm data={data} selected={selected} eeprom />;
 }

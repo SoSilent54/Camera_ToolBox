@@ -7,3 +7,4 @@ export { GenericWorkflowNode } from './GenericWorkflowNode';
 export { RtspSourceNode } from './RtspSourceNode';
 export { ViewerNode } from './ViewerNode';
 export { DEFAULT_RTSP_URL, NodeHeader, NodeLibraryItem, PortHandles, portKindTone } from './shared';
+export { I2cExecutorNode, I2cInspectorNode, I2cTaskBuilderNode, I2cWriteApprovalNode, SshConnectionNode, StructuredFieldExtractorNode } from './PlanWorkflowNodes';

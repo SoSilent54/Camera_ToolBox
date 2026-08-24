@@ -9,12 +9,14 @@ pub mod calibration_eeprom;
 pub mod calibration_yaml;
 pub mod color;
 pub mod eeprom_map_config;
+pub mod i2c_map;
 pub mod image;
 pub mod image_analysis;
 pub mod raw;
 pub mod raw_packing;
 pub mod raw_probe;
 pub mod sensor;
+pub mod structured_packet;
 pub mod yuv;
 
 pub use analysis::{
@@ -56,6 +58,13 @@ pub use eeprom_map_config::{
     compile_builtin_eeprom_map_config, compile_eeprom_map_config_text,
     dump_builtin_eeprom_map_config, list_builtin_eeprom_map_configs,
 };
+pub use i2c_map::{
+    ChecksumAlgorithm, ChecksumContract, I2C_MAP_SCHEMA, I2cMapAccepts, I2cMapDefinition,
+    I2cMapDefinitionError, I2cMapFixedBytes, I2cMapImage, I2cMapPage, I2cMapStorageField,
+    I2cMapTarget, I2cReadRange, LogicalInputSlot, NumericConversion, PageWritePolicy,
+    ReadBeforePolicy, ReadbackPolicy, ReadbackVerification, RoundingMode, StorageTarget,
+    builtin_i2c_map, builtin_i2c_maps, parse_i2c_map_yaml, yg_stereo_i2c_map,
+};
 pub use image::{
     ImageFrameError, ImagePlane, NativeImage, NativePixelSample, Rgba8Frame, Yuv420SpFrame,
     Yuv420SpSpec, YuvMatrix, YuvRange,
@@ -68,6 +77,9 @@ pub use raw::{BayerPattern, RawEncoding, RawFrame, RawFrameError, RawSpec};
 pub use raw_packing::{PackedRawSpec, RawPackingError, decode_le_continuous_raw};
 pub use raw_probe::{
     RawContainer, RawEndian, RawProbeCandidate, RawProbeInput, RawProbeReport, probe_raw_candidates,
+};
+pub use structured_packet::{
+    Datum, PacketProvenance, PrimitiveType, StructuredPacket, StructuredPacketError, TypedValue,
 };
 pub use yuv::{
     ImageConversionError, rgb_to_yuv, rgba8_to_yuv420sp_with_cancel, yuv_to_rgb,

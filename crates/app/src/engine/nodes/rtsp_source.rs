@@ -5,8 +5,8 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::Duration,
 };
@@ -412,7 +412,7 @@ fn config_u16(spec: &NodeSpec, key: &str, fallback: u16) -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
     use crate::engine::{

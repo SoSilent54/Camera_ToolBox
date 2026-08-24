@@ -20,19 +20,18 @@ use camera_toolbox_app::{
     AutoCaptureAcceptanceCriteria, AutoCaptureAcquisitionKey, AutoCaptureBaseline,
     CalibrationBackend, CalibrationCancellation, CalibrationEncodedPng, CalibrationInputKey,
     CalibrationInputRevision, CalibrationItemId, CalibrationItemStatus, CalibrationJobToken,
-    CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EepromInspectResult,
-    EepromWriteResult, EntryName, ExportDestination, ExportReceipt, ExportService, FileSourceId,
-    FileSystem, FileSystemError, FsCancellation, FsControl, InitialIntrinsicsBinding, OperationId,
-    PnPObservation, RasterImageCodec, SnapshotHash, StreamCaptureId, StreamFrameIdentity,
-    StreamSessionId, host_monotonic_time_ns,
+    CalibrationSession, CalibrationSnapshot, CaptureStore, DecodedVideoFrame, EntryName,
+    ExportDestination, ExportReceipt, ExportService, FileSourceId, FileSystem, FileSystemError,
+    FsCancellation, FsControl, InitialIntrinsicsBinding, OperationId, PnPObservation,
+    RasterImageCodec, SnapshotHash, StreamCaptureId, StreamFrameIdentity, StreamSessionId,
+    host_monotonic_time_ns,
 };
 use camera_toolbox_core::{
     AssetId, BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution,
     CaptureMetadata, ChessboardDetection, ChromaOrder, EphemeralAsset, InitialIntrinsics,
     IntegrityState, MediaFormat, OwnedMediaPayload, Rgba8Frame, ViewCalibrationResult,
-    YgStereoModuleCode, YgStereoSerialIdInput, Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange,
-    parse_opencv_pinhole_radtan_yaml, write_opencv_pinhole_radtan_yaml,
-    yuv420sp_to_rgba8_with_cancel,
+    Yuv420SpFrame, Yuv420SpSpec, YuvMatrix, YuvRange, parse_opencv_pinhole_radtan_yaml,
+    write_opencv_pinhole_radtan_yaml, yuv420sp_to_rgba8_with_cancel,
 };
 use eframe::egui;
 use egui_extras::{Column, TableBuilder};
@@ -42,7 +41,6 @@ use crate::calibration_acceptance::{
     DatasetAcceptanceConfigAction, DatasetAcceptanceDraft, DatasetAcceptancePanelState,
     DatasetAcceptanceProgress, render_dataset_acceptance,
 };
-use crate::calibration_eeprom::{CalibrationEepromState, CalibrationProvisionIntent};
 use crate::calibration_pipeline::{
     CalibrationDetectionPipeline, DatasetPoseEstimationSeed, DetectionProduct, DetectionStageEvent,
     DetectionStageResult, EncodedDetectionRequest, LoadedDetectionJob, MAX_ENCODED_PNG_BYTES,
@@ -99,7 +97,8 @@ const POSE_AXIS_ORIGIN_RADIUS: f32 = 4.0;
 const POSE_AXIS_X_COLOR: egui::Color32 = egui::Color32::from_rgb(255, 80, 80);
 const POSE_AXIS_Y_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 220, 120);
 const POSE_AXIS_Z_COLOR: egui::Color32 = egui::Color32::from_rgb(80, 150, 255);
-const STALE_CALIBRATION_RESULT_REASON: &str = "Dataset selection changed after this result; re-run Calibrate before export or EEPROM provisioning.";
+const STALE_CALIBRATION_RESULT_REASON: &str =
+    "Dataset selection changed after this result; re-run Calibrate before export.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CalibrationJobKind {
@@ -166,7 +165,7 @@ impl CalibrationExport {
     }
 }
 
-/// 外部 YAML 标定结果只携带 EEPROM 写入所需的 K/D12/尺寸，不绑定当前 Dataset。
+/// 外部 YAML 标定结果不绑定当前 Dataset。
 struct LoadedCalibrationResult {
     source: String,
     solution: CalibrationSolution,
@@ -2708,80 +2707,6 @@ fn run_dataset_pnp_refresh(
     DatasetPnpRefreshBatchResult { board, results }
 }
 
-#[derive(Clone, Debug)]
-struct CalibrationSnidDraft {
-    module: YgStereoModuleCode,
-    year: String,
-    month: String,
-    day: String,
-    optical_axis_class: u8,
-    sequence: String,
-}
-
-impl Default for CalibrationSnidDraft {
-    fn default() -> Self {
-        Self {
-            module: YgStereoModuleCode::Model233,
-            year: String::new(),
-            month: String::new(),
-            day: String::new(),
-            optical_axis_class: 0,
-            sequence: "1".to_owned(),
-        }
-    }
-}
-
-impl CalibrationSnidDraft {
-    /// 将 GUI 文本字段转换为 EEPROM SNID；错误直接作为写入禁用原因展示。
-    fn serial_number(&self) -> Result<String, String> {
-        let input = YgStereoSerialIdInput::new(
-            self.module,
-            parse_two_digit_year(&self.year)?,
-            parse_decimal_field("Month", &self.month)?,
-            parse_decimal_field("Day", &self.day)?,
-            self.optical_axis_class,
-            parse_decimal_field("Sequence", &self.sequence)?,
-        );
-        input.serial_number().map_err(|error| error.to_string())
-    }
-}
-
-fn parse_two_digit_year(text: &str) -> Result<u16, String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err("Year is required for SNID generation.".to_owned());
-    }
-    if trimmed.len() != 2 || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return Err("Year must be exactly two decimal digits, e.g. 26.".to_owned());
-    }
-    trimmed
-        .parse::<u16>()
-        .map_err(|_| "Year must be exactly two decimal digits, e.g. 26.".to_owned())
-}
-
-fn parse_decimal_field<T>(label: &str, text: &str) -> Result<T, String>
-where
-    T: std::str::FromStr,
-{
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{label} is required for SNID generation."));
-    }
-    trimmed
-        .parse::<T>()
-        .map_err(|_| format!("{label} must be a decimal number."))
-}
-
-fn optical_axis_class_label(value: u8) -> &'static str {
-    match value {
-        0 => "0 - unclassified",
-        1 => "1 - L0",
-        2 => "2 - L1",
-        3 => "3 - R0",
-        4 => "4 - R1",
-        _ => "invalid",
-    }
-}
 
 pub(crate) struct CalibrationWorkspace {
     session: CalibrationSession,
@@ -2797,10 +2722,8 @@ pub(crate) struct CalibrationWorkspace {
     auto_capture: AutoCaptureSession,
     next_detection_batch_id: u64,
     status: String,
-    snid_draft: CalibrationSnidDraft,
     pending_export: Option<CalibrationExport>,
     loaded_result: Option<LoadedCalibrationResult>,
-    eeprom: CalibrationEepromState,
     board_cols: u16,
     board_rows: u16,
     square_size: f64,
@@ -2832,10 +2755,6 @@ pub(crate) struct CalibrationWorkspace {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CalibrationWorkspaceKey(String);
 
-pub(crate) struct CalibrationProvisionRequest {
-    pub(crate) workspace_key: CalibrationWorkspaceKey,
-    pub(crate) intent: CalibrationProvisionIntent,
-}
 
 impl CalibrationWorkspaceKey {
     pub(crate) fn manual() -> Self {
@@ -2938,15 +2857,6 @@ impl CalibrationWorkspaceManager {
             .expect("active calibration workspace exists")
     }
 
-    #[cfg(all(test, feature = "platform-ssh"))]
-    pub(crate) fn active_eeprom_for_test(&self) -> &CalibrationEepromState {
-        &self
-            .entries
-            .get(&self.active)
-            .expect("active calibration workspace exists")
-            .workspace
-            .eeprom
-    }
     fn manual_workspace_mut(&mut self) -> &mut CalibrationWorkspace {
         &mut self
             .entries
@@ -3099,152 +3009,6 @@ impl CalibrationWorkspaceManager {
         None
     }
 
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn take_provision_intent(&mut self) -> Option<CalibrationProvisionRequest> {
-        let active_key = self.active.clone();
-        if let Some(intent) = self
-            .entries
-            .get_mut(&active_key)
-            .and_then(|entry| entry.workspace.take_provision_intent())
-        {
-            return Some(CalibrationProvisionRequest {
-                workspace_key: active_key,
-                intent,
-            });
-        }
-        for (key, entry) in &mut self.entries {
-            if *key == active_key {
-                continue;
-            }
-            if let Some(intent) = entry.workspace.take_provision_intent() {
-                return Some(CalibrationProvisionRequest {
-                    workspace_key: key.clone(),
-                    intent,
-                });
-            }
-        }
-        None
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    fn workspace_mut_for_report(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-    ) -> &mut CalibrationWorkspace {
-        let key = if self.entries.contains_key(workspace_key) {
-            workspace_key.clone()
-        } else {
-            self.active.clone()
-        };
-        &mut self
-            .entries
-            .get_mut(&key)
-            .expect("calibration workspace exists")
-            .workspace
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_configured(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        label: &str,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_target_configured(label);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_configuration_failed(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        message: impl Into<String>,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_target_configuration_failed(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_invalidated(&mut self, message: impl Into<String>) {
-        let message = message.into();
-        for entry in self.entries.values_mut() {
-            entry.workspace.report_target_invalidated(message.clone());
-        }
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_bus_discovery_failed(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        message: impl Into<String>,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_bus_discovery_failed(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_bus_discovery(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        buses: Vec<camera_toolbox_app::I2cBusInfo>,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_bus_discovery(buses);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_provision_error(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        message: impl Into<String>,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_provision_error(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_eeprom_provision_unknown(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        message: impl Into<String>,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_eeprom_provision_unknown(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_eeprom_inspect(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        target_label: String,
-        result: EepromInspectResult,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_eeprom_inspect(target_label, result);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_eeprom_provision(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        target_label: String,
-        result: &EepromWriteResult,
-        audit_file: String,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_eeprom_provision(target_label, result, audit_file);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_eeprom_provision_audit_error(
-        &mut self,
-        workspace_key: &CalibrationWorkspaceKey,
-        target_label: String,
-        result: &EepromWriteResult,
-        error: &str,
-    ) {
-        self.workspace_mut_for_report(workspace_key)
-            .report_eeprom_provision_audit_error(target_label, result, error);
-    }
 
     pub(crate) fn report_export_started(&mut self, label: &str, target_label: &str) {
         self.active_workspace_mut()
@@ -3287,8 +3051,6 @@ impl CalibrationWorkspaceManager {
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
-        sftp_source: Result<&str, &str>,
-        provision_target: Result<&str, &str>,
         has_live_inspection: bool,
         render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
@@ -3331,8 +3093,6 @@ impl CalibrationWorkspaceManager {
             ui,
             export_enabled,
             export_reason,
-            sftp_source,
-            provision_target,
             has_live_inspection,
             render_live_inspection,
         )
@@ -3344,8 +3104,6 @@ impl CalibrationWorkspaceManager {
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
-        sftp_source: Result<&str, &str>,
-        provision_target: Result<&str, &str>,
         has_live_inspection: bool,
         render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
@@ -3359,8 +3117,6 @@ impl CalibrationWorkspaceManager {
             ui,
             export_enabled,
             export_reason,
-            sftp_source,
-            provision_target,
             has_live_inspection,
             render_live_inspection,
         )
@@ -3397,10 +3153,8 @@ impl CalibrationWorkspace {
             calibration_cancellation: None,
             next_detection_batch_id: 1,
             status: "Add original PNG calibration images from Workspace Explorer.".to_owned(),
-            snid_draft: CalibrationSnidDraft::default(),
             pending_export: None,
             loaded_result: None,
-            eeprom: CalibrationEepromState::default(),
             board_cols: board.inner_cols,
             board_rows: board.inner_rows,
             square_size: board.square_size,
@@ -3462,7 +3216,7 @@ impl CalibrationWorkspace {
                     solution,
                 });
                 self.status = format!(
-                    "Loaded Calibration Result YAML from {source} ({width}×{height}); EEPROM writes can use it without Calibrate."
+                    "Loaded Calibration Result YAML from {source} ({width}×{height})."
                 );
             }
             Err(error) => {
@@ -4951,70 +4705,6 @@ impl CalibrationWorkspace {
         self.pending_export.take()
     }
 
-    pub(crate) fn take_provision_intent(&mut self) -> Option<CalibrationProvisionIntent> {
-        self.eeprom.take_intent()
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_configured(&mut self, label: &str) {
-        self.eeprom.report_target_configured(label);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_configuration_failed(&mut self, message: impl Into<String>) {
-        self.eeprom.report_target_configuration_failed(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_target_invalidated(&mut self, message: impl Into<String>) {
-        self.eeprom.report_target_invalidated(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_bus_discovery_failed(&mut self, message: impl Into<String>) {
-        self.eeprom.report_bus_discovery_failed(message);
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    pub(crate) fn report_bus_discovery(&mut self, buses: Vec<camera_toolbox_app::I2cBusInfo>) {
-        self.eeprom.report_bus_discovery(buses);
-    }
-
-    pub(crate) fn report_provision_error(&mut self, message: impl Into<String>) {
-        self.eeprom.report_error(message);
-    }
-
-    pub(crate) fn report_eeprom_provision_unknown(&mut self, message: impl Into<String>) {
-        self.eeprom.report_provision_unknown(message);
-    }
-
-    pub(crate) fn report_eeprom_inspect(
-        &mut self,
-        target_label: String,
-        result: EepromInspectResult,
-    ) {
-        self.eeprom.report_inspect(target_label, result);
-    }
-
-    pub(crate) fn report_eeprom_provision(
-        &mut self,
-        target_label: String,
-        result: &EepromWriteResult,
-        audit_file: String,
-    ) {
-        self.eeprom
-            .report_provision(target_label, result, audit_file);
-    }
-
-    pub(crate) fn report_eeprom_provision_audit_error(
-        &mut self,
-        target_label: String,
-        result: &EepromWriteResult,
-        error: &str,
-    ) {
-        self.eeprom
-            .report_provision_audit_error(target_label, result, error);
-    }
 
     pub(crate) fn report_export_started(&mut self, label: &str, target_label: &str) {
         self.status = format!("Exporting {label} to {target_label}.");
@@ -5250,8 +4940,6 @@ impl CalibrationWorkspace {
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
-        sftp_source: Result<&str, &str>,
-        provision_target: Result<&str, &str>,
         has_live_inspection: bool,
         mut render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
@@ -5352,14 +5040,7 @@ impl CalibrationWorkspace {
         egui::ScrollArea::vertical()
             .id_salt("calibration_metrics")
             .show(ui, |ui| {
-                self.render_calibration_result_panel(
-                    context,
-                    ui,
-                    export_enabled,
-                    export_reason,
-                    sftp_source,
-                    provision_target,
-                );
+                self.render_calibration_result_panel(ui, export_enabled, export_reason);
             });
         (rect, capture_request)
     }
@@ -5369,8 +5050,6 @@ impl CalibrationWorkspace {
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
-        sftp_source: Result<&str, &str>,
-        provision_target: Result<&str, &str>,
         has_live_inspection: bool,
         mut render_live_inspection: impl FnMut(&mut egui::Ui) -> Option<Arc<DecodedVideoFrame>>,
     ) -> (egui::Rect, Option<Arc<DecodedVideoFrame>>) {
@@ -5429,17 +5108,8 @@ impl CalibrationWorkspace {
                 ui.add_space(8.0);
                 ui.group(|ui| {
                     ui.set_width(ui.available_width());
-                    ui.heading("第五步：写入并保存历史");
-                    ui.label("固定映射：CH0 写入 i2c-4，CH3 写入 i2c-6。写入完成后沿用现有 EEPROM history 审计记录。")
-                    ;
-                    self.render_calibration_result_panel(
-                        context,
-                        ui,
-                        export_enabled,
-                        export_reason,
-                        sftp_source,
-                        provision_target,
-                    );
+                    ui.heading("第五步：保存标定结果");
+                    self.render_calibration_result_panel(ui, export_enabled, export_reason);
                 });
             });
         (rect, None)
@@ -5489,111 +5159,12 @@ impl CalibrationWorkspace {
         });
     }
 
-    fn render_eeprom_snid_editor(
-        &mut self,
-        ui: &mut egui::Ui,
-        snid_preview: Result<&str, &String>,
-    ) {
-        ui.label("YgStereo SNID");
-        ui.horizontal_wrapped(|ui| {
-            ui.weak("Fixed: resolution=2/FHD, vendor=T/SmartSens, algorithm=0, reserved=0");
-        });
-        egui::Grid::new("calibration_eeprom_snid_grid")
-            .num_columns(2)
-            .spacing(egui::vec2(12.0, 6.0))
-            .show(ui, |ui| {
-                ui.label("Module");
-                egui::ComboBox::from_id_salt("calibration_eeprom_snid_module")
-                    .selected_text(self.snid_draft.module.label())
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut self.snid_draft.module,
-                            YgStereoModuleCode::Model233,
-                            "233",
-                        );
-                        ui.selectable_value(
-                            &mut self.snid_draft.module,
-                            YgStereoModuleCode::Model235,
-                            "235",
-                        );
-                    });
-                ui.end_row();
-
-                ui.label("Ship date");
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Year");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.snid_draft.year)
-                            .desired_width(56.0)
-                            .hint_text("26"),
-                    );
-                    ui.label("Month");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.snid_draft.month)
-                            .desired_width(36.0)
-                            .hint_text("1-12"),
-                    );
-                    ui.label("Day");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.snid_draft.day)
-                            .desired_width(36.0)
-                            .hint_text("1-31"),
-                    );
-                });
-                ui.end_row();
-
-                ui.label("Optical axis class");
-                egui::ComboBox::from_id_salt("calibration_eeprom_snid_axis_class")
-                    .selected_text(optical_axis_class_label(self.snid_draft.optical_axis_class))
-                    .show_ui(ui, |ui| {
-                        for (value, label) in [
-                            (0, "0 - unclassified"),
-                            (1, "1 - L0"),
-                            (2, "2 - L1"),
-                            (3, "3 - R0"),
-                            (4, "4 - R1"),
-                        ] {
-                            ui.selectable_value(
-                                &mut self.snid_draft.optical_axis_class,
-                                value,
-                                label,
-                            );
-                        }
-                    });
-                ui.end_row();
-
-                ui.label("Sequence");
-                ui.horizontal_wrapped(|ui| {
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.snid_draft.sequence)
-                            .desired_width(72.0)
-                            .hint_text("1-3844"),
-                    );
-                    ui.weak("decimal input; encoded as base-62 high/low bytes");
-                });
-                ui.end_row();
-            });
-        match snid_preview {
-            Ok(value) => {
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Converted SNID");
-                    ui.monospace(value);
-                });
-            }
-            Err(error) => {
-                ui.colored_label(egui::Color32::YELLOW, format!("SNID incomplete: {error}"));
-            }
-        }
-    }
 
     fn render_calibration_result_panel(
         &mut self,
-        context: &egui::Context,
         ui: &mut egui::Ui,
         export_enabled: bool,
         export_reason: Option<&str>,
-        sftp_source: Result<&str, &str>,
-        provision_target: Result<&str, &str>,
     ) {
         let idle = self.active_job.is_none();
         let current_result_installed = self.session.installed().is_some();
@@ -5623,8 +5194,6 @@ impl CalibrationWorkspace {
             .loaded_result
             .as_ref()
             .map(|loaded| format!("Loaded YAML: {}", loaded.source));
-        let snid_result = self.snid_draft.serial_number();
-        let serial_number = snid_result.as_deref().unwrap_or("");
 
         let mut load_clicked = false;
         let mut json_export_clicked = false;
@@ -5675,41 +5244,6 @@ impl CalibrationWorkspace {
             self.pending_export = Some(CalibrationExport::Yaml(solution));
         }
 
-        let eeprom_solution = self.active_calibration_solution().cloned();
-        let eeprom_stale_result =
-            latest_result_installed && !latest_result_current && eeprom_solution.is_none();
-        let snid_error = snid_result.as_ref().err().map(String::as_str);
-        let eeprom_disabled_reason = if eeprom_stale_result {
-            Some(STALE_CALIBRATION_RESULT_REASON)
-        } else {
-            snid_error
-        };
-
-        egui::CollapsingHeader::new("EEPROM Provisioning")
-            .id_salt("eeprom_provisioning_foldout")
-            .default_open(true)
-            .show(ui, |ui| {
-                self.render_eeprom_snid_editor(ui, snid_result.as_ref().map(String::as_str));
-                ui.separator();
-                if let Some(reason) = eeprom_disabled_reason {
-                    ui.colored_label(egui::Color32::YELLOW, reason);
-                }
-                self.eeprom.render_body(
-                    context,
-                    ui,
-                    eeprom_solution.as_ref(),
-                    serial_number,
-                    sftp_source,
-                    provision_target,
-                    export_reason,
-                );
-            });
-        self.eeprom.render_confirmation(
-            context,
-            provision_target,
-            eeprom_solution.as_ref(),
-            serial_number,
-        );
     }
 
     fn render_pangbot_simplified_controls(&mut self, ui: &mut egui::Ui) {
@@ -9139,86 +8673,6 @@ mod tests {
         assert!(text.contains("-2.8624°"), "{text}");
     }
 
-    #[test]
-    fn loaded_yaml_result_builds_eeprom_update_request() {
-        let context = egui::Context::default();
-        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        let yaml = "%YAML:1.0\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
-
-        workspace.load_calibration_result_from_yaml_str(yaml, "fixture.yaml");
-
-        let image = camera_toolbox_core::FullEepromImage::from_solution(
-            workspace.active_calibration_solution().unwrap(),
-            "2T02D2567K0042",
-        )
-        .expect("loaded YAML result must encode to EEPROM image");
-        let request = image.update_calibration_request();
-        assert_eq!(
-            request.mode,
-            camera_toolbox_core::EepromProvisioningMode::UpdateCalibration
-        );
-        assert_eq!(request.serial_number, "2T02D2567K0042");
-        assert_eq!(request.segments.len(), 1);
-    }
-
-    #[test]
-    fn loaded_yaml_result_overrides_installed_solution_for_eeprom_image() {
-        let context = egui::Context::default();
-        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        for index in 0..3 {
-            install_detection_outcome(
-                &mut workspace,
-                &format!("installed-{index}.png"),
-                found_detection(640, 480),
-            );
-        }
-        let snapshot = workspace
-            .session
-            .calibration_snapshot(workspace.initial_intrinsics().unwrap())
-            .unwrap();
-        let views = snapshot
-            .request
-            .image_points
-            .iter()
-            .map(|points| camera_toolbox_core::ViewCalibrationResult {
-                rotation_vector: [0.0; 3],
-                translation_vector: [0.0, 0.0, 1.0],
-                projected_points: points.clone(),
-                reprojection_rmse: 0.1,
-                max_reprojection_error: 0.2,
-            })
-            .collect();
-        let installed_solution = CalibrationSolution {
-            image_size: snapshot.request.image_size,
-            camera_matrix: [620.0, 0.0, 318.0, 0.0, 621.0, 241.0, 0.0, 0.0, 1.0],
-            distortion_coefficients: vec![0.0; 12],
-            rms_error: 0.15,
-            calibration_flags: camera_toolbox_core::PANGBOT_CALIBRATION_FLAGS,
-            views,
-        };
-        workspace
-            .session
-            .install_solution(snapshot, installed_solution)
-            .unwrap();
-        assert_eq!(
-            workspace
-                .active_calibration_solution()
-                .unwrap()
-                .camera_matrix[0],
-            620.0
-        );
-
-        let yaml = "%YAML:1.0\nfx: 878.7023\nfy: 878.5325\ncx: 955.6284\ncy: 533.1718\nk1: 0.0345\nk2: -0.0458\np1: -0.00008590\np2: 0.00015387\nk3: 0.0119\nk4: -0.0123\nk5: 0.0234\nk6: -0.0345\ns1: 0.00001111\ns2: -0.00002222\ns3: 0.00003333\ns4: -0.00004444\nwidth: 1920\nheight: 1080\n";
-        workspace.load_calibration_result_from_yaml_str(yaml, "fixture.yaml");
-
-        let image = camera_toolbox_core::FullEepromImage::from_solution(
-            workspace.active_calibration_solution().unwrap(),
-            "2T02D2567K0042",
-        )
-        .expect("loaded YAML result must encode to EEPROM image");
-        let eeprom_fx = f32::from_le_bytes(image.as_bytes()[0x18..0x1c].try_into().unwrap());
-        assert!((eeprom_fx - 878.7023_f32).abs() < 0.0001, "fx={eeprom_fx}");
-    }
 
     fn guided_test_detection(center_uv: [f64; 2], scale: f64) -> ChessboardDetection {
         let image_size = CalibrationImageSize::new(1000, 800).unwrap();
@@ -11126,70 +10580,6 @@ mod tests {
         assert!(contrast_ratio(RMSE_TEXT_ON_TRACK, egui::Color32::DARK_GRAY) >= 4.5);
     }
 
-    #[test]
-    fn eeprom_snid_editor_renders_converted_preview() {
-        let context = egui::Context::default();
-        context.enable_accesskit();
-        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        workspace.snid_draft = CalibrationSnidDraft {
-            module: YgStereoModuleCode::Model235,
-            year: "26".to_owned(),
-            month: "1".to_owned(),
-            day: "9".to_owned(),
-            optical_axis_class: 0,
-            sequence: "1".to_owned(),
-        };
-        let snid = workspace.snid_draft.serial_number().unwrap();
-
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(900.0, 480.0),
-            )),
-            ..Default::default()
-        };
-        let output = context.run_ui(input, |ui| {
-            workspace.render_eeprom_snid_editor(ui, Ok(&snid));
-        });
-        let text = output
-            .platform_output
-            .accesskit_update
-            .unwrap()
-            .nodes
-            .into_iter()
-            .filter_map(|(_, node)| node.label().or_else(|| node.value()).map(str::to_owned))
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        for expected in [
-            "YgStereo SNID",
-            "Fixed: resolution=2/FHD, vendor=T/SmartSens, algorithm=0, reserved=0",
-            "Converted SNID",
-            "2T235261900000",
-        ] {
-            assert!(text.contains(expected), "missing {expected:?} in {text}");
-        }
-    }
-
-    #[test]
-    fn eeprom_snid_year_requires_two_decimal_digits() {
-        assert_eq!(parse_two_digit_year("26").unwrap(), 26);
-        assert!(
-            parse_two_digit_year("6")
-                .unwrap_err()
-                .contains("two decimal digits")
-        );
-        assert!(
-            parse_two_digit_year("2026")
-                .unwrap_err()
-                .contains("two decimal digits")
-        );
-        assert!(
-            parse_two_digit_year("2A")
-                .unwrap_err()
-                .contains("two decimal digits")
-        );
-    }
 
     #[test]
     fn installed_solution_renders_intrinsics_distortion_and_inline_rmse() {
@@ -11247,16 +10637,7 @@ mod tests {
             ..Default::default()
         };
         let output = context.run_ui(input, |ui| {
-            workspace.render(
-                &context,
-                ui,
-                true,
-                None,
-                Err("SFTP not connected"),
-                Err("EEPROM not configured"),
-                false,
-                |_| None,
-            );
+            workspace.render(&context, ui, true, None, false, |_| None);
         });
         let text = output
             .platform_output
@@ -11276,14 +10657,13 @@ mod tests {
             "fx",
             "620.00000000",
             "Distortion coefficients (OpenCV order)",
-            "YgStereo SNID",
-            "SNID incomplete",
-            "EEPROM Provisioning",
             "k1[0] = 0.1000000000",
             "Square size (mm)",
         ] {
             assert!(text.contains(expected), "missing {expected:?} in {text}");
         }
+        assert!(!text.contains("EEPROM Provisioning"));
+        assert!(!text.contains("I²C Tools"));
         assert!(!text.contains("Reprojection RMSE"));
         assert!(!text.contains("Wheel: zoom"));
         assert!(!text.contains("Remove selected"));
@@ -11303,16 +10683,7 @@ mod tests {
             ..Default::default()
         };
         let stale_output = context.run_ui(stale_input, |ui| {
-            workspace.render(
-                &context,
-                ui,
-                true,
-                None,
-                Err("SFTP not connected"),
-                Err("EEPROM not configured"),
-                false,
-                |_| None,
-            );
+            workspace.render(&context, ui, true, None, false, |_| None);
         });
         let stale_text = stale_output
             .platform_output
@@ -11491,20 +10862,6 @@ mod tests {
         })
     }
 
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_inspect_result(serial: &str, hash_byte: char) -> EepromInspectResult {
-        EepromInspectResult {
-            state: camera_toolbox_app::EepromDeviceState {
-                image_sha256: hash_byte.to_string().repeat(64),
-                flag_valid: true,
-                serial: camera_toolbox_app::EepromSerialState::Valid {
-                    value: serial.to_owned(),
-                },
-            },
-            backup: vec![0; camera_toolbox_core::YG_STEREO_P24C64G_IMAGE_BYTES],
-        }
-    }
-
     #[test]
     fn manager_observe_unknown_live_source_does_not_create_workspace() {
         let context = egui::Context::default();
@@ -11519,91 +10876,6 @@ mod tests {
 
         assert_eq!(manager.workspace_count_for_test(), 1);
         assert_eq!(manager.active_label_for_test(), "Manual / Files");
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    #[test]
-    fn manager_preserves_eeprom_intent_origin_for_inactive_session() {
-        let context = egui::Context::default();
-        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
-        let manual_key = CalibrationWorkspaceKey::manual();
-        let source = test_live_source();
-
-        manager.ensure_live_source_for_test(&source);
-        manager
-            .entries
-            .get_mut(&manual_key)
-            .unwrap()
-            .workspace
-            .eeprom
-            .set_pending_for_test(CalibrationProvisionIntent::Inspect {
-                expected_target_label: "root@camera:22 / i2c-4 @aaaa".to_owned(),
-            });
-
-        let request = manager.take_provision_intent().unwrap();
-
-        assert_eq!(request.workspace_key, manual_key);
-        assert!(matches!(
-            request.intent,
-            CalibrationProvisionIntent::Inspect {
-                ref expected_target_label
-            } if expected_target_label.contains("i2c-4")
-        ));
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    #[test]
-    fn manager_routes_eeprom_results_to_origin_session() {
-        let context = egui::Context::default();
-        let mut manager = CalibrationWorkspaceManager::new(&context).unwrap();
-        let manual_key = CalibrationWorkspaceKey::manual();
-        let source = test_live_source();
-        let live_key = CalibrationWorkspaceKey::for_live_source(&source);
-
-        manager.ensure_live_source_for_test(&source);
-        manager.report_eeprom_inspect(
-            &manual_key,
-            "root@camera:22 / i2c-4 @aaaa".to_owned(),
-            eeprom_inspect_result("sn4", '4'),
-        );
-
-        assert_eq!(
-            manager
-                .entries
-                .get(&manual_key)
-                .unwrap()
-                .workspace
-                .eeprom
-                .inspected_target_for_test(),
-            Some("root@camera:22 / i2c-4 @aaaa")
-        );
-        assert!(
-            manager
-                .entries
-                .get(&live_key)
-                .unwrap()
-                .workspace
-                .eeprom
-                .inspected_target_for_test()
-                .is_none()
-        );
-
-        manager.report_eeprom_inspect(
-            &live_key,
-            "root@camera:22 / i2c-6 @bbbb".to_owned(),
-            eeprom_inspect_result("sn6", '6'),
-        );
-
-        assert_eq!(
-            manager
-                .entries
-                .get(&live_key)
-                .unwrap()
-                .workspace
-                .eeprom
-                .inspected_target_for_test(),
-            Some("root@camera:22 / i2c-6 @bbbb")
-        );
     }
 
     #[test]
@@ -11895,76 +11167,6 @@ mod tests {
     }
 
     #[test]
-    fn shutter_capture_round_trip_detects_stream_frame_into_dataset() {
-        let context = egui::Context::default();
-        let store = auto_capture_store();
-        let mut workspace = CalibrationWorkspace::new(&context).unwrap();
-        let displayed = chessboard_live_frame(7);
-        assert!(
-            workspace.session.initial_intrinsics_binding().is_none(),
-            "manual shutter Dataset PnP must not require a live source-bound binding"
-        );
-
-        workspace.capture_displayed_stream_frame(
-            Arc::clone(&displayed),
-            test_live_source(),
-            store.clone(),
-        );
-
-        assert_eq!(workspace.session.items().len(), 1);
-        let item_id = workspace.session.items()[0].id;
-        assert_eq!(
-            workspace.session.items()[0].input,
-            CalibrationInputKey::StreamCapture(StreamCaptureId::from(&displayed.identity))
-        );
-        let CalibrationSourceKind::Stream(stream) = &workspace.sources[&item_id].kind else {
-            panic!("shutter capture must retain a stream source");
-        };
-        assert_eq!(stream.identity, displayed.identity);
-        let asset_id = stream
-            .asset
-            .as_ref()
-            .expect("stream source must retain its captured asset")
-            .id
-            .clone();
-        assert!(store.get(&asset_id).unwrap().is_some());
-
-        let deadline = Instant::now() + std::time::Duration::from_secs(10);
-        while !matches!(
-            workspace.session.items()[0].status,
-            CalibrationItemStatus::Found(_)
-        ) && Instant::now() < deadline
-        {
-            workspace.tick(&context);
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        let item = &workspace.session.items()[0];
-        let CalibrationItemStatus::Found(detection) = &item.status else {
-            panic!(
-                "shutter capture detection did not finish as Found: {:?}",
-                item.status
-            );
-        };
-        assert_eq!(detection.corners.len(), 88);
-        let pnp_binding = workspace
-            .dataset_pnp_binding(detection.image_size)
-            .expect("current GUI K must create a source-independent Dataset PnP binding")
-            .digest;
-        assert!(
-            item.pnp_observation
-                .as_ref()
-                .is_some_and(|observation| observation.binding_digest == pnp_binding)
-        );
-        let CalibrationSourceKind::Stream(stream) = &workspace.sources[&item_id].kind else {
-            panic!("detected stream item must retain its stream source");
-        };
-        assert_eq!(stream.identity, displayed.identity);
-        assert_eq!(stream.asset.as_ref().unwrap().id, asset_id);
-        assert!(store.get(&asset_id).unwrap().is_some());
-    }
-
-    #[test]
     fn viewer_overlay_keeps_same_acquisition_group_across_stream_reconnect() {
         let context = egui::Context::default();
         let store = auto_capture_store();
@@ -11974,7 +11176,7 @@ mod tests {
         workspace.capture_displayed_stream_frame(
             Arc::clone(&captured),
             test_live_source(),
-            store.clone(),
+            store,
         );
 
         let deadline = Instant::now() + std::time::Duration::from_secs(10);

@@ -16,10 +16,11 @@ use camera_toolbox_app::platform::{
 use serde_json::json;
 
 use crate::{
+    AppState,
+    serial_field::SerialFieldFactory,
     workflow::{
         NodeKind, PortDirection, PortKind, WorkflowEdge, WorkflowGraph, WorkflowNode, WorkflowPort,
     },
-    AppState,
 };
 
 /// 引擎运行时：节点注册表 + 当前已装载的图。
@@ -32,6 +33,7 @@ impl EngineRuntime {
     pub fn new() -> Self {
         let mut registry = NodeRegistry::new();
         camera_toolbox_app::engine::register_builtin(&mut registry);
+        registry.register(Box::new(SerialFieldFactory));
         Self {
             registry,
             engine: Mutex::new(None),
@@ -70,24 +72,24 @@ pub(crate) fn build_services(state: &AppState) -> EngineServices {
         // 供 LocalFileSource 与 ChessboardDetector 等节点使用。
         raw_loader: Some(Arc::new(LocalRawLoader)),
         image_codec: Some(Arc::new(ImageRasterCodec)),
-        // I²C / EEPROM 执行器：ControlRuntime 已实现 I2cExecutor/EepromExecutor，
-        // 内部复用 SshI2cHelperService/SshEepromProvisionService + helper payload。
+        // 计划执行与 SSH 会话均由 Web ControlRuntime 注入；旧的自由 I²C/EEPROM
+        // executor 不再属于引擎服务接口。
         #[cfg(feature = "platform-ssh")]
-        i2c_executor: Some(state.control_runtime.clone()),
+        i2c_task_executor: Some(state.control_runtime.clone()),
+        #[cfg(not(feature = "platform-ssh"))]
+        i2c_task_executor: None,
         #[cfg(feature = "platform-ssh")]
-        eeprom_executor: Some(state.control_runtime.clone()),
+        ssh_connection_service: Some(state.control_runtime.clone()),
         #[cfg(not(feature = "platform-ssh"))]
-        i2c_executor: None,
-        #[cfg(not(feature = "platform-ssh"))]
-        eeprom_executor: None,
+        ssh_connection_service: None,
         // X5 控制客户端：纯 TCP（无 SSH），始终可用；ControlRuntime 无条件 impl X5ControlClient。
         x5_client: Some(state.control_runtime.clone()),
-        // Hex Arm 协议客户端只有显式启用 feature 后才注入；默认构建不保留网络控制能力。
+        // Hex Arm 协议客户端只有显式启用 feature 后才注入。
         #[cfg(feature = "hex-arm-control")]
         hex_arm_client: Some(Arc::new(HexArmWebSocketClient::default())),
         #[cfg(not(feature = "hex-arm-control"))]
         hex_arm_client: None,
-        // SFTP / SSH 命令执行器：ControlRuntime 已实现 SftpFileReader/SshCommandExecutor。
+        // SFTP / SSH 命令执行器继续复用 ControlRuntime 的 allowlisted 服务。
         #[cfg(feature = "platform-ssh")]
         sftp_reader: Some(state.control_runtime.clone()),
         #[cfg(feature = "platform-ssh")]
@@ -99,7 +101,7 @@ pub(crate) fn build_services(state: &AppState) -> EngineServices {
     }
 }
 
-/// 把 `DataPacket` 折叠成可序列化的 JSON：帧类只给元数据，其余（Detection/Solution/弱类型）直接序列化。
+/// 把 `DataPacket` 折叠成可序列化的 JSON；计划节点输出保留结构化审计信息。
 pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
     match packet {
         DataPacket::VideoFrame(frame) => json!({
@@ -140,8 +142,94 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
             "rotationRodrigues": pose.rotation_rodrigues,
             "reprojectionErrorPx": pose.reprojection_error_px,
         }),
-        DataPacket::Solution(solution) => {
-            serde_json::to_value(solution.as_ref()).unwrap_or(json!({ "type": "solution" }))
+        DataPacket::StructuredPacket(packet) => {
+            serde_json::to_value(packet.as_ref()).unwrap_or(json!({ "type": "structured.packet" }))
+        }
+        DataPacket::SshConnection(connection) => json!({
+            "type": "ssh.connection.v1",
+            "id": connection.id(),
+            "target": {
+                "host": connection.target().host,
+                "port": connection.target().port,
+                "username": connection.target().username,
+            },
+        }),
+        DataPacket::TypedField {
+            datum, generation, ..
+        } => {
+            let mut value =
+                serde_json::to_value(datum.as_ref()).unwrap_or(json!({ "type": "data.field" }));
+            if let serde_json::Value::Object(object) = &mut value {
+                object.insert("generation".to_owned(), json!(generation));
+            }
+            value
+        }
+        DataPacket::I2cInspectPlan(plan) => json!({
+            "type": "i2c.inspect-plan.v1",
+            "mapId": plan.map_id,
+            "mapDigest": plan.map_digest,
+            "target": format!("{:?}", plan.target),
+            "readRangeCount": plan.read_ranges.len(),
+        }),
+        DataPacket::I2cCandidateWritePlan(plan) => {
+            let pages = plan
+                .pages
+                .iter()
+                .map(|page| json!({
+                    "offset": page.offset,
+                    "byteLength": page.bytes.len(),
+                    "bytesHex": page.bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                }))
+                .collect::<Vec<_>>();
+            json!({
+                "type": "i2c.candidate-write-plan.v1",
+                "mapId": plan.map_id,
+                "mapDigest": plan.map_digest,
+                "planDigest": plan.plan_digest,
+                "target": format!("{:?}", plan.target),
+                "pages": pages,
+                "pageCount": plan.pages.len(),
+                "totalBytes": plan.pages.iter().map(|page| page.bytes.len()).sum::<usize>(),
+                "verifyAfterWrite": plan.verify_after_write,
+            })
+        }
+        DataPacket::I2cInspectSnapshot(snapshot) => json!({
+            "type": "i2c.inspect-snapshot.v1",
+            "connectionId": snapshot.connection_id,
+            "mapId": snapshot.map_id,
+            "mapDigest": snapshot.map_digest,
+            "target": format!("{:?}", snapshot.target),
+            "beforeImageSha256": snapshot.before_image_sha256,
+            "deviceState": "map-required fixed bytes, checksums, and serial state validated",
+        }),
+        DataPacket::I2cAuthorizedWritePlan(plan) => json!({
+            "type": "i2c.authorized-write-plan.v1",
+            "connectionId": plan.connection_id,
+            "expectedBeforeSha256": plan.expected_before_sha256,
+            "mapId": plan.candidate.map_id,
+            "mapDigest": plan.candidate.map_digest,
+            "planDigest": plan.candidate.plan_digest,
+            "pageCount": plan.candidate.pages.len(),
+        }),
+        DataPacket::I2cExecutionReport(report) => {
+            let pages = report
+                .pages
+                .iter()
+                .map(|page| json!({
+                    "offset": page.offset,
+                    "expectedHex": page.expected.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+                    "readbackHex": page.readback.as_ref().map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>()),
+                    "error": page.error,
+                }))
+                .collect::<Vec<_>>();
+            json!({
+                "type": "i2c.execution-report.v1",
+                "beforeImageSha256": report.before_image_sha256,
+                "pages": pages,
+                "pageCount": report.pages.len(),
+                "finalVerified": report.final_verified,
+                "error": report.error,
+            })
         }
         DataPacket::Coverage(value)
         | DataPacket::Dataset(value)

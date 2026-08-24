@@ -5,8 +5,6 @@ mod auto_open;
 #[cfg(feature = "calibration-opencv")]
 mod calibration_acceptance;
 #[cfg(feature = "calibration-opencv")]
-mod calibration_eeprom;
-#[cfg(feature = "calibration-opencv")]
 mod calibration_pipeline;
 #[cfg(feature = "calibration-opencv")]
 mod calibration_workspace;
@@ -16,8 +14,6 @@ mod color_worker;
 mod explorer;
 mod export_dialog;
 mod histogram_link;
-#[cfg(feature = "platform-ssh")]
-mod i2c_tools;
 mod image_save;
 mod notification;
 mod platform_ui;

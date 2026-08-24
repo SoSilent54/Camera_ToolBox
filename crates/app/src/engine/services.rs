@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use super::node::NodeError;
 use crate::platform::{
-    EepromExecutor, HexArmControlClient, I2cExecutor, RtspStreamConfig, SftpFileReader,
-    SshCommandExecutor, StreamService, X5ControlClient,
+    HexArmControlClient, I2cTaskExecutor, RtspStreamConfig, SftpFileReader, SshCommandExecutor,
+    SshConnectionService, StreamService, X5ControlClient,
 };
 use crate::ports::{CalibrationBackend, RasterImageCodec, RawFrameLoader};
 
@@ -25,8 +25,10 @@ pub struct EngineServices {
     pub calibration: Option<Arc<dyn CalibrationBackend>>,
     pub raw_loader: Option<Arc<dyn RawFrameLoader>>,
     pub image_codec: Option<Arc<dyn RasterImageCodec>>,
-    pub i2c_executor: Option<Arc<dyn I2cExecutor>>,
-    pub eeprom_executor: Option<Arc<dyn EepromExecutor>>,
+    /// I²C 计划执行器；只接受 inspect 和逐页写入操作。
+    pub i2c_task_executor: Option<Arc<dyn I2cTaskExecutor>>,
+    /// SSH 会话建立器；credential material 不进入任何数据包。
+    pub ssh_connection_service: Option<Arc<dyn SshConnectionService>>,
     pub x5_client: Option<Arc<dyn X5ControlClient>>,
     pub hex_arm_client: Option<Arc<dyn HexArmControlClient>>,
     pub sftp_reader: Option<Arc<dyn SftpFileReader>>,
@@ -62,18 +64,18 @@ impl EngineServices {
         })
     }
 
-    /// 获取 I²C 执行器（I2cTransfer 节点执行读写时使用）。
-    pub fn i2c_executor(&self) -> Result<Arc<dyn I2cExecutor>, NodeError> {
-        self.i2c_executor
-            .clone()
-            .ok_or_else(|| NodeError::Precondition("i2c executor is not configured".to_owned()))
+    /// 获取计划专用 I²C 执行器。
+    pub fn i2c_task_executor(&self) -> Result<Arc<dyn I2cTaskExecutor>, NodeError> {
+        self.i2c_task_executor.clone().ok_or_else(|| {
+            NodeError::Precondition("I2C task executor is not configured".to_owned())
+        })
     }
 
-    /// 获取 EEPROM 执行器（EepromProvision 节点 inspect/provision 时使用）。
-    pub fn eeprom_executor(&self) -> Result<Arc<dyn EepromExecutor>, NodeError> {
-        self.eeprom_executor
-            .clone()
-            .ok_or_else(|| NodeError::Precondition("eeprom executor is not configured".to_owned()))
+    /// 获取 SSH 运行时会话建立器。
+    pub fn ssh_connection_service(&self) -> Result<Arc<dyn SshConnectionService>, NodeError> {
+        self.ssh_connection_service.clone().ok_or_else(|| {
+            NodeError::Precondition("SSH connection service is not configured".to_owned())
+        })
     }
 
     /// 获取 X5_233 Driver 控制客户端（状态查询和 `command.capture.request.v1` 时使用）。

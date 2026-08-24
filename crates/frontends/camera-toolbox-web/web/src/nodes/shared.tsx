@@ -74,7 +74,6 @@ export function portKindTone(kind: string): string {
   if (kind.startsWith('endpoint') || kind.startsWith('stream')) return 'port-tone-media';
   if (kind.startsWith('image') || kind.startsWith('layer') || kind.startsWith('viewer')) return 'port-tone-image';
   if (kind.startsWith('calib') || kind.startsWith('capture') || kind.startsWith('command')) return 'port-tone-calib';
-  if (kind.startsWith('i2c') || kind.startsWith('eeprom')) return 'port-tone-io';
   if (kind.startsWith('status')) return 'port-tone-status';
   return 'port-tone-default';
 }

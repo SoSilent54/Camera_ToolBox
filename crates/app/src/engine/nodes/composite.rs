@@ -14,7 +14,7 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use camera_toolbox_core::ChessboardDetection;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::{
     engine::{
@@ -1097,9 +1097,8 @@ fn config_usize(spec: &NodeSpec, key: &str, fallback: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
     use super::*;
-
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use crate::{
         engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext},
@@ -1608,10 +1607,12 @@ mod tests {
             NodeError::Precondition(message) if message.contains("no exact cached image preview")
         ));
         assert!(node.selected_sample_id.is_none());
-        assert!(recorded
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_empty());
+        assert!(
+            recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty()
+        );
     }
 
     #[test]

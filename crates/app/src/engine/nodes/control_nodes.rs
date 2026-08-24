@@ -1,16 +1,11 @@
-//! I²C Transfer / EEPROM Provision 节点真实实现（依赖 app 层的 `I2cExecutor`/`EepromExecutor` trait）。
+//! 设备控制节点实现。
 //!
-//! 这两个节点的真实 I/O 由 web control preview/inspect/confirm 端点驱动；GraphEngine
-//! `runtime.node.action` 不允许直接触发 I²C/EEPROM，避免绕过 UI 的写入确认与 EEPROM
-//! inspect hash 门禁。内部 `execute` 保留给测试和后续单一路径收敛使用。
-//! - 未注入 executor 或必需连接字段缺失 → `NodeError::Precondition`，不 panic。
-//!
-//! 真实 SSH helper 执行体（`SshI2cHelperService`/`SshEepromProvisionService` 适配为 executor）由
-//! web 层装配注入（后续任务）；本模块只依赖 trait。
+//! I²C/EEPROM 的旧自由配置控制路径已移除；新的 map/inspect/approval/executor
+//! 链位于 `i2c_plan_nodes`，本模块只保留其他设备控制节点。
 
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::Duration;
 
@@ -22,318 +17,15 @@ use crate::engine::{
     NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec, RawMetadata,
 };
 use crate::platform::{
-    host_monotonic_time_ns, CommandResult, ControlTargetSpec, DumpCancellation,
-    HexArmJointPositionsRequest, HexArmTargetConfig, HexArmTransport, LatestDecodedFrameSlot,
-    RemoteOperationControl, RemoteTimeouts, RtspCodec, RtspLatencyMode, RtspStreamConfig,
-    RtspTransport, SourcePts, StreamCancellation, StreamFrameIdentity, StreamOpenRequest,
-    StreamOperationControl, StreamRecordingRequest, StreamService, StreamServiceError,
-    StreamServiceEvent, StreamSession, StreamSessionId, StreamStage, StreamTerminal,
-    StreamTimeouts, TypedCommandRequest, X5233CapturePayload,
-};
-#[cfg(test)]
-use crate::platform::{
-    I2cHelperAction, I2cHelperResult, I2cMessageData, I2cMessageSpec, I2cTransactionSpec,
+    CommandResult, ControlTargetSpec, DumpCancellation, HexArmJointPositionsRequest,
+    HexArmTargetConfig, HexArmTransport, LatestDecodedFrameSlot, RemoteOperationControl,
+    RemoteTimeouts, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport, SourcePts,
+    StreamCancellation, StreamFrameIdentity, StreamOpenRequest, StreamOperationControl,
+    StreamRecordingRequest, StreamService, StreamServiceError, StreamServiceEvent, StreamSession,
+    StreamSessionId, StreamStage, StreamTerminal, StreamTimeouts, TypedCommandRequest,
+    X5233CapturePayload, host_monotonic_time_ns,
 };
 use crate::ports::RasterFormat;
-
-// ---------------------------------------------------------------------------
-// I²C Transfer 节点
-// ---------------------------------------------------------------------------
-
-pub struct I2cTransferFactory;
-
-impl NodeFactory for I2cTransferFactory {
-    fn kind(&self) -> &'static str {
-        "i2cTransfer"
-    }
-
-    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(I2cTransferNode { spec }))
-    }
-}
-
-pub struct I2cTransferNode {
-    #[cfg_attr(not(test), allow(dead_code))]
-    spec: NodeSpec,
-}
-
-impl NodeInstance for I2cTransferNode {
-    fn kind(&self) -> &'static str {
-        "i2cTransfer"
-    }
-
-    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(
-            NodeRuntimeState::Ready,
-            "use preview/run controls to execute I2C",
-        );
-        Ok(())
-    }
-
-    fn on_input(
-        &mut self,
-        _port: &str,
-        _packet: DataPacket,
-        _rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        Ok(())
-    }
-
-    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        Err(NodeError::UnsupportedAction(action.name().to_owned()))
-    }
-
-    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Idle, "stopped");
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl I2cTransferNode {
-    fn execute(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        let target = self.target()?;
-        let action = self.i2c_action()?;
-        let executor = rt.services().i2c_executor()?;
-        let control =
-            RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
-                .map_err(|error| NodeError::Execution(error.to_string()))?;
-
-        rt.report_state(NodeRuntimeState::Running, "executing I2C transfer");
-        let result: I2cHelperResult = executor
-            .execute(&target, &self.credential_ref()?, action, control)
-            .map_err(NodeError::Execution)?;
-
-        emit_json_result(rt, "result", &result)?;
-        rt.report_state(NodeRuntimeState::Idle, "transfer done");
-        Ok(())
-    }
-
-    /// 由 config 构造连接目标；host/credentialRef 为空 → Precondition。
-    fn target(&self) -> Result<ControlTargetSpec, NodeError> {
-        let host = config_string(&self.spec, "host");
-        if host.trim().is_empty() {
-            return Err(NodeError::Precondition(
-                "config `host` is required".to_owned(),
-            ));
-        }
-        let port = config_string(&self.spec, "port");
-        let port = if port.trim().is_empty() {
-            22
-        } else {
-            port.trim()
-                .parse::<u16>()
-                .map_err(|_| NodeError::Config("config `port` must be a valid u16".to_owned()))?
-        };
-        let username = config_string(&self.spec, "username");
-        let username = if username.trim().is_empty() {
-            "root".to_owned()
-        } else {
-            username
-        };
-        Ok(ControlTargetSpec {
-            host,
-            port,
-            username,
-            expected_host_key: None,
-        })
-    }
-
-    fn credential_ref(&self) -> Result<String, NodeError> {
-        password_session_credential_ref(&self.spec, "config `credentialRef`")
-    }
-
-    /// 由 config 构造 I²C 动作：mode=read → 写 register 后读 pageSize 字节；mode=write → 整段写 payload。
-    fn i2c_action(&self) -> Result<I2cHelperAction, NodeError> {
-        let bus = parse_i2c_bus(&config_string(&self.spec, "bus"))?;
-        let address = parse_hex_u16(&config_string(&self.spec, "address"))?;
-        let register = parse_hex_u16(&config_string(&self.spec, "register"))?;
-        let mode = config_string(&self.spec, "mode");
-
-        let transactions = match mode.as_str() {
-            // read：单个 transaction，先写 2 字节 register 地址（大端），再读 1 字节。
-            "read" => vec![I2cTransactionSpec {
-                bus,
-                messages: vec![
-                    I2cMessageSpec {
-                        address,
-                        flags: vec![],
-                        data: I2cMessageData::Write {
-                            bytes: register.to_be_bytes().to_vec(),
-                        },
-                    },
-                    I2cMessageSpec {
-                        address,
-                        flags: vec![],
-                        data: I2cMessageData::Read { byte_len: 1 },
-                    },
-                ],
-                settle_ms: None,
-            }],
-            // write：按 pageSize 把 payload 分段成多个 transaction，每段 register 地址 + chunk，写后 settle。
-            "write" => page_write_transactions(bus, address, register, &self.spec)?,
-            other => {
-                return Err(NodeError::Config(format!(
-                    "unsupported mode `{other}` (read/write)"
-                )));
-            }
-        };
-
-        Ok(I2cHelperAction::Transfer { transactions })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// EEPROM Provision 节点
-// ---------------------------------------------------------------------------
-
-pub struct EepromProvisionFactory;
-
-impl NodeFactory for EepromProvisionFactory {
-    fn kind(&self) -> &'static str {
-        "eepromProvision"
-    }
-
-    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(EepromProvisionNode { spec }))
-    }
-}
-
-pub struct EepromProvisionNode {
-    #[cfg_attr(not(test), allow(dead_code))]
-    spec: NodeSpec,
-}
-
-impl NodeInstance for EepromProvisionNode {
-    fn kind(&self) -> &'static str {
-        "eepromProvision"
-    }
-
-    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(
-            NodeRuntimeState::Ready,
-            "use inspect/provision controls to execute EEPROM",
-        );
-        Ok(())
-    }
-
-    fn on_input(
-        &mut self,
-        _port: &str,
-        _packet: DataPacket,
-        _rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        Ok(())
-    }
-
-    fn on_action(&mut self, action: NodeAction, _rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        Err(NodeError::UnsupportedAction(action.name().to_owned()))
-    }
-
-    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Idle, "stopped");
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-impl EepromProvisionNode {
-    fn execute(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        let target = self.target()?;
-        let credential_ref = self.credential_ref()?;
-        let action = self.eeprom_action()?;
-        let executor = rt.services().eeprom_executor()?;
-        let control =
-            RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
-                .map_err(|error| NodeError::Execution(error.to_string()))?;
-
-        rt.report_state(NodeRuntimeState::Running, "executing EEPROM operation");
-        let result = executor
-            .execute(&target, &credential_ref, action, control)
-            .map_err(NodeError::Execution)?;
-
-        emit_json_result(rt, "result", &result)?;
-        rt.report_state(NodeRuntimeState::Idle, "operation done");
-        Ok(())
-    }
-
-    fn target(&self) -> Result<ControlTargetSpec, NodeError> {
-        let host = config_string(&self.spec, "host");
-        if host.trim().is_empty() {
-            return Err(NodeError::Precondition(
-                "config `host` is required".to_owned(),
-            ));
-        }
-        let port = config_string(&self.spec, "port");
-        let port = if port.trim().is_empty() {
-            22
-        } else {
-            port.trim()
-                .parse::<u16>()
-                .map_err(|_| NodeError::Config("config `port` must be u16".to_owned()))?
-        };
-        let username = config_string(&self.spec, "username");
-        let username = if username.trim().is_empty() {
-            "root".to_owned()
-        } else {
-            username
-        };
-        Ok(ControlTargetSpec {
-            host,
-            port,
-            username,
-            expected_host_key: None,
-        })
-    }
-
-    fn credential_ref(&self) -> Result<String, NodeError> {
-        password_session_credential_ref(&self.spec, "config `credentialRef`")
-    }
-
-    /// 由 config `mode`（inspect/provision）构造 EEPROM 动作。
-    fn eeprom_action(&self) -> Result<crate::platform::EepromHelperAction, NodeError> {
-        let mode = config_string(&self.spec, "mode");
-        match mode.as_str() {
-            "inspect" => Ok(crate::platform::EepromHelperAction::Inspect),
-            "provision" => {
-                let request = self.provision_request()?;
-                // 当前 config 未携带 expected_before_sha256，占位空串；真实执行体应在调用前校验。
-                Ok(crate::platform::EepromHelperAction::Provision {
-                    request,
-                    expected_before_sha256: config_string(&self.spec, "expectedBeforeSha256"),
-                })
-            }
-            other => Err(NodeError::Config(format!(
-                "unsupported mode `{other}` (inspect/provision)"
-            ))),
-        }
-    }
-
-    fn provision_request(&self) -> Result<camera_toolbox_core::EepromProvisionRequest, NodeError> {
-        use camera_toolbox_core::{EepromProvisionRequest, EepromWriteSegment};
-        let map_id = config_string(&self.spec, "mapId");
-        let payload = parse_hex_bytes(&config_string(&self.spec, "payload"))?;
-        let segments = if payload.is_empty() {
-            vec![]
-        } else {
-            vec![EepromWriteSegment {
-                offset: 0,
-                bytes: payload,
-            }]
-        };
-        Ok(EepromProvisionRequest {
-            map_id,
-            mode: camera_toolbox_core::EepromProvisioningMode::UpdateCalibration,
-            serial_number: config_string(&self.spec, "serialNumber"),
-            overwrite_existing_serial: false,
-            segments,
-        })
-    }
-}
-
-// ---------------------------------------------------------------------------
-// 工具
-// ---------------------------------------------------------------------------
 
 /// 清理 config 读取用的字符串辅助。
 fn config_string(spec: &NodeSpec, key: &str) -> String {
@@ -373,111 +65,6 @@ fn password_session_credential_ref(spec: &NodeSpec, label: &str) -> Result<Strin
         )));
     }
     Ok(credential_ref.to_owned())
-}
-
-#[cfg(test)]
-/// 解析 `i2c-N` 或十进制数字为 u32。
-fn parse_i2c_bus(bus: &str) -> Result<u32, NodeError> {
-    let digits = bus.trim().strip_prefix("i2c-").unwrap_or(bus.trim());
-    digits
-        .parse::<u32>()
-        .map_err(|_| NodeError::Config("config `bus` must be `i2c-N` or decimal N".to_owned()))
-}
-
-#[cfg(test)]
-/// 解析 `0x..` 十六进制为 u16（address / register）。
-fn parse_hex_u16(value: &str) -> Result<u16, NodeError> {
-    let trimmed = value.trim();
-    let digits = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    u16::from_str_radix(digits, 16)
-        .map_err(|_| NodeError::Config(format!("config value `{value}` must be a hex u16")))
-}
-
-#[cfg(test)]
-/// 解析十六进制字符串（可含 `0x` 前缀）为字节。
-fn parse_hex_bytes(value: &str) -> Result<Vec<u8>, NodeError> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return Ok(vec![]);
-    }
-    let digits = trimmed
-        .strip_prefix("0x")
-        .or_else(|| trimmed.strip_prefix("0X"))
-        .unwrap_or(trimmed);
-    let digits = digits.replace('_', "");
-    if !digits.len().is_multiple_of(2) {
-        return Err(NodeError::Config(
-            "hex payload must have even length".to_owned(),
-        ));
-    }
-    (0..digits.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&digits[i..i + 2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .map_err(|_| NodeError::Config("config `payload` must be valid hex".to_owned()))
-}
-
-#[cfg(test)]
-fn config_usize(spec: &NodeSpec, key: &str, fallback: usize) -> usize {
-    spec.config
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-        .unwrap_or(fallback)
-}
-
-#[cfg(test)]
-/// 按 pageSize 把 payload 分段成多个写 transaction（每段 register 地址 + chunk，写后 settle 5ms）。
-/// 与 main.rs 的 `page_write_transactions` 语义一致，保证 EEPROM page-write 周期正确分页。
-fn page_write_transactions(
-    bus: u32,
-    address: u16,
-    register: u16,
-    spec: &NodeSpec,
-) -> Result<Vec<I2cTransactionSpec>, NodeError> {
-    let payload = parse_hex_bytes(&config_string(spec, "payload"))?;
-    if payload.is_empty() {
-        return Err(NodeError::Config(
-            "config `payload` is required for write mode".to_owned(),
-        ));
-    }
-    let page_size = config_usize(spec, "pageSize", 16).max(1);
-
-    let mut transactions = Vec::new();
-    for chunk in payload.chunks(page_size) {
-        // 每段从当前 register + 已写偏移开始；register 偏移累加 page_size。
-        let segment_register = register
-            .checked_add(u16::try_from(transactions.len() * page_size).unwrap_or(u16::MAX))
-            .ok_or_else(|| NodeError::Config("register offset overflow".to_owned()))?;
-        let mut bytes = segment_register.to_be_bytes().to_vec();
-        bytes.extend_from_slice(chunk);
-        transactions.push(I2cTransactionSpec {
-            bus,
-            messages: vec![I2cMessageSpec {
-                address,
-                flags: vec![],
-                data: I2cMessageData::Write { bytes },
-            }],
-            settle_ms: Some(5),
-        });
-    }
-    Ok(transactions)
-}
-
-#[cfg(test)]
-/// 把可序列化结果 emit 到 `result` 端口（若声明）；序列化为 Json 负载。
-fn emit_json_result<T: serde::Serialize>(
-    rt: &NodeRuntime,
-    port: &str,
-    result: &T,
-) -> Result<(), NodeError> {
-    let value = serde_json::to_value(result)
-        .map_err(|error| NodeError::Execution(format!("serialize result failed: {error}")))?;
-    rt.emit(port, DataPacket::Json(Arc::new(value)))?;
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,13 +1313,19 @@ impl SshSessionNode {
         let recipe_id = non_empty(config_string(&self.spec, "recipeId")).ok_or_else(|| {
             NodeError::Precondition("sshSession recipeId must be configured".to_owned())
         })?;
+        let expected_host_key = non_empty(config_string(&self.spec, "expectedHostKey"))
+            .ok_or_else(|| {
+                NodeError::Precondition(
+                    "sshSession expectedHostKey must be a non-empty OpenSSH public key".to_owned(),
+                )
+            })?;
         let target = ControlTargetSpec {
             host,
             port: config_string(&self.spec, "port")
                 .parse::<u16>()
                 .unwrap_or(22),
             username: config_string(&self.spec, "username"),
-            expected_host_key: None,
+            expected_host_key: Some(expected_host_key),
         };
         let request = TypedCommandRequest::new(recipe_id)
             .map_err(|e| NodeError::Precondition(e.to_string()))?;
@@ -1775,47 +1368,16 @@ fn control_timeout(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc};
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
     use parking_lot::Mutex;
 
     use super::*;
     use crate::engine::{EngineServices, NodeReporter, OutputRegistry, SpawnContext};
     use crate::platform::{
-        DecodedVideoFrame, EepromExecutor, HexArmControlClient, I2cExecutor,
-        LatestDecodedFrameSlot, SourcePtsProvenance, StreamServiceError, StreamSession,
-        X5ControlClient,
+        DecodedVideoFrame, HexArmControlClient, LatestDecodedFrameSlot, SourcePtsProvenance,
+        StreamServiceError, StreamSession, X5ControlClient,
     };
-
-    fn i2c_spec() -> NodeSpec {
-        NodeSpec {
-            id: "i2c-1".to_owned(),
-            kind: "i2cTransfer".to_owned(),
-            title: "I2C Transfer".to_owned(),
-            inputs: vec![],
-            outputs: vec![crate::engine::PortSpec {
-                id: "result".to_owned(),
-                label: "Result".to_owned(),
-                kind: "i2c.result.v1".to_owned(),
-                cardinality: crate::engine::PortCardinality::One,
-                required: false,
-            }],
-            config: serde_json::json!({
-                "host": "camera.local",
-                "port": "22",
-                "username": "root",
-                "credentialRef": "session:test",
-                "expectedHostKey": "",
-                "bus": "i2c-8",
-                "address": "0x50",
-                "register": "0x0000",
-                "payload": "",
-                "pageSize": 16,
-                "mode": "read",
-                "confirmWrites": true,
-            }),
-        }
-    }
 
     fn x5_spec() -> NodeSpec {
         NodeSpec {
@@ -1828,6 +1390,48 @@ mod tests {
                 "host": "camera.local",
                 "tcpPort": 9073,
                 "snapshotChannel": 3,
+            }),
+        }
+    }
+
+    struct RecordingSshCommandExecutor {
+        targets: Arc<Mutex<Vec<ControlTargetSpec>>>,
+    }
+
+    impl crate::platform::SshCommandExecutor for RecordingSshCommandExecutor {
+        fn execute(
+            &self,
+            target: &ControlTargetSpec,
+            _credential_ref: &str,
+            _request: TypedCommandRequest,
+            _control: RemoteOperationControl,
+        ) -> Result<CommandResult, String> {
+            self.targets.lock().push(target.clone());
+            Ok(CommandResult {
+                terminal: crate::platform::CommandTerminal::Succeeded,
+                stdout: vec![],
+                stderr: vec![],
+                stdout_truncated: false,
+                stderr_truncated: false,
+                artifact_path: None,
+            })
+        }
+    }
+
+    fn ssh_session_spec(expected_host_key: Option<&str>) -> NodeSpec {
+        NodeSpec {
+            id: "ssh-session-1".to_owned(),
+            kind: "sshSession".to_owned(),
+            title: "Pinned SSH Session".to_owned(),
+            inputs: vec![],
+            outputs: vec![],
+            config: serde_json::json!({
+                "host": "camera.local",
+                "port": "22",
+                "username": "root",
+                "credentialRef": "session:ssh-session-1",
+                "recipeId": "capture",
+                "expectedHostKey": expected_host_key,
             }),
         }
     }
@@ -2007,25 +1611,6 @@ mod tests {
         })
     }
 
-    struct RecordingI2cExecutor {
-        called: Arc<Mutex<usize>>,
-    }
-
-    impl I2cExecutor for RecordingI2cExecutor {
-        fn execute(
-            &self,
-            _target: &ControlTargetSpec,
-            _credential_ref: &str,
-            _action: I2cHelperAction,
-            _control: RemoteOperationControl,
-        ) -> Result<I2cHelperResult, String> {
-            *self.called.lock() += 1;
-            Ok(I2cHelperResult::Transfer {
-                transactions: vec![],
-            })
-        }
-    }
-
     struct RecordingX5Client {
         requests: Arc<Mutex<Vec<CaptureRequest>>>,
         payload: X5233CapturePayload,
@@ -2051,28 +1636,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn raw_i2c_runtime_trigger_is_disabled() {
-        let mut node = I2cTransferNode { spec: i2c_spec() };
-        let (mut rt, _outputs) = runtime(EngineServices::default());
-        let err = node
-            .on_action(NodeAction::Trigger, &mut rt)
-            .expect_err("raw runtime trigger must not bypass control confirmation");
-        assert!(
-            matches!(err, NodeError::UnsupportedAction(_)),
-            "got {err:?}"
-        );
-    }
-
-    #[test]
-    fn missing_executor_is_precondition_for_internal_execute() {
-        let node = I2cTransferNode { spec: i2c_spec() };
-        let (mut rt, _outputs) = runtime(EngineServices::default());
-        let err = node
-            .execute(&mut rt)
-            .expect_err("missing i2c_executor must be a precondition");
-        assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
-    }
     #[test]
     fn rtsp_open_all_keeps_ch0_and_ch3_streams_active() {
         let configs = Arc::new(Mutex::new(Vec::new()));
@@ -2140,54 +1703,6 @@ mod tests {
             .collect::<Vec<_>>();
         channels.sort_unstable();
         assert_eq!(channels, [0, 3]);
-    }
-
-    #[test]
-    fn missing_host_is_precondition_before_executor() {
-        let mut spec = i2c_spec();
-        spec.config["host"] = serde_json::json!("");
-        let node = I2cTransferNode { spec };
-        let executor_called = Arc::new(Mutex::new(0));
-        let services = EngineServices {
-            i2c_executor: Some(Arc::new(RecordingI2cExecutor {
-                called: Arc::clone(&executor_called),
-            })),
-            ..EngineServices::default()
-        };
-        let (mut rt, _outputs) = runtime(services);
-        let err = node
-            .execute(&mut rt)
-            .expect_err("missing host must be precondition");
-        assert!(matches!(err, NodeError::Precondition(_)), "got {err:?}");
-        assert_eq!(*executor_called.lock(), 0);
-    }
-
-    #[test]
-    fn executor_is_invoked_and_result_emitted() {
-        let node = I2cTransferNode { spec: i2c_spec() };
-        let executor_called = Arc::new(Mutex::new(0));
-        let services = EngineServices {
-            i2c_executor: Some(Arc::new(RecordingI2cExecutor {
-                called: Arc::clone(&executor_called),
-            })),
-            ..EngineServices::default()
-        };
-        let (mut rt, _outputs) = runtime(services);
-        assert!(node.execute(&mut rt).is_ok());
-        assert_eq!(*executor_called.lock(), 1);
-    }
-
-    #[test]
-    fn raw_eeprom_runtime_trigger_is_disabled() {
-        let mut node = EepromProvisionNode { spec: i2c_spec() };
-        let (mut rt, _outputs) = runtime(EngineServices::default());
-        let err = node
-            .on_action(NodeAction::Trigger, &mut rt)
-            .expect_err("raw runtime trigger must not bypass inspect/provision gate");
-        assert!(
-            matches!(err, NodeError::UnsupportedAction(_)),
-            "got {err:?}"
-        );
     }
 
     fn yuv_payload(channel: u16) -> X5233CapturePayload {
@@ -2478,6 +1993,60 @@ mod tests {
     }
 
     #[test]
+    fn ssh_session_rejects_missing_or_empty_host_key_before_command_execution() {
+        for expected_host_key in [None, Some("")] {
+            let targets = Arc::new(Mutex::new(Vec::new()));
+            let services = EngineServices {
+                ssh_command_executor: Some(Arc::new(RecordingSshCommandExecutor {
+                    targets: Arc::clone(&targets),
+                })),
+                ..EngineServices::default()
+            };
+            let (mut rt, _outputs) = runtime(services);
+            let mut node = SshSessionNode {
+                spec: ssh_session_spec(expected_host_key),
+            };
+
+            let error = node
+                .on_action(NodeAction::Trigger, &mut rt)
+                .expect_err("un-pinned SSH command must be rejected");
+
+            assert!(matches!(error, NodeError::Precondition(_)), "got {error:?}");
+            assert!(targets.lock().is_empty());
+        }
+    }
+
+    #[test]
+    fn ssh_session_passes_pinned_host_key_to_command_executor() {
+        let expected_host_key =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            ssh_command_executor: Some(Arc::new(RecordingSshCommandExecutor {
+                targets: Arc::clone(&targets),
+            })),
+            ..EngineServices::default()
+        };
+        let (mut rt, _outputs) = runtime(services);
+        let mut node = SshSessionNode {
+            spec: ssh_session_spec(Some(expected_host_key)),
+        };
+
+        node.on_action(NodeAction::Trigger, &mut rt)
+            .expect("pinned SSH command executes");
+
+        assert_eq!(
+            targets.lock().as_slice(),
+            [ControlTargetSpec {
+                host: "camera.local".to_owned(),
+                port: 22,
+                username: "root".to_owned(),
+                expected_host_key: Some(expected_host_key.to_owned()),
+            }]
+        );
+    }
+
+    #[test]
     fn hex_arm_config_update_disconnects_only_for_target_changes() {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let positions = Arc::new(Mutex::new(None));
@@ -2510,21 +2079,5 @@ mod tests {
             calls.lock().as_slice(),
             ["send_joint_positions", "disconnect"]
         );
-    }
-
-    #[test]
-    fn hex_and_bus_parsing() {
-        assert_eq!(parse_hex_u16("0x50").unwrap(), 0x50);
-        assert_eq!(parse_hex_u16("0X50").unwrap(), 0x50);
-        assert_eq!(parse_i2c_bus("i2c-8").unwrap(), 8);
-        assert_eq!(parse_i2c_bus("8").unwrap(), 8);
-        assert_eq!(parse_hex_bytes("0x00ab").unwrap(), vec![0x00, 0xab]);
-        assert_eq!(parse_hex_bytes("").unwrap(), Vec::<u8>::new());
-        assert!(parse_hex_bytes("0x0").is_err());
-    }
-
-    #[allow(dead_code)]
-    fn _eeprom_executor_is_importable() -> Option<Arc<dyn EepromExecutor>> {
-        None
     }
 }

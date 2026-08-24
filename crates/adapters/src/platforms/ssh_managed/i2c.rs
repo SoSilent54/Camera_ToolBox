@@ -31,19 +31,17 @@ pub struct SshI2cHelperService {
 }
 
 impl SshI2cHelperService {
-    /// 构造通用 I²C helper service；会话复用密码 SSH，当前不保存也不校验 host key。
+    /// 构造通用 I²C helper service；target 的 host key 由 transport 在建连时校验。
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         service_id: String,
-        mut target: SshConnectionTarget,
+        target: SshConnectionTarget,
         credential_ref: String,
         output_limit_bytes: u64,
         helper_payload: Arc<[u8]>,
         resolver: Arc<dyn CredentialResolver>,
         transport: Arc<dyn SshTransportFactory>,
     ) -> Result<Self, I2cHelperServiceError> {
-        // 与现有 EEPROM helper 路径保持一致：物理写入场景必须由可信网络/IP 上下文约束风险。
-        target.expected_host_key = None;
         if !(1_024..=1_048_576).contains(&output_limit_bytes) {
             return Err(I2cHelperServiceError::Protocol(
                 "I2C helper output limit must be within 1024..=1048576".to_owned(),
@@ -829,23 +827,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_host_key_does_not_prevent_i2c_helper_invocation() {
+    fn rejects_rotated_host_key_before_i2c_helper_invocation() {
         let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
-        memory.set_command_output(output(transfer_result()));
         let service = service_with_target(&memory, target(Some(STALE_HOST_KEY)));
 
-        let result = service
+        let error = service
             .execute(
                 I2cHelperOperation {
                     action: transfer_action(),
                 },
                 control(),
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert!(matches!(result, I2cHelperResult::Transfer { .. }));
-        assert_eq!(memory.captured_argv().len(), 2);
-        assert_eq!(memory.captured_stdin().len(), 1);
+        assert!(matches!(
+            error,
+            I2cHelperServiceError::Transport(message)
+                if message == "I2C SSH connection failed: SSH host key mismatch"
+        ));
+        assert!(memory.captured_argv().is_empty());
+        assert!(memory.captured_stdin().is_empty());
     }
 
     #[test]

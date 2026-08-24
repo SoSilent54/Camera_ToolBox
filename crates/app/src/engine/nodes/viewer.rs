@@ -4,8 +4,8 @@
 
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread,
     time::Duration,
@@ -17,7 +17,7 @@ use crate::{
         NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState, NodeSpec,
     },
     platform::{
-        host_monotonic_time_ns, DecodedVideoFrame, SourcePts, StreamFrameIdentity, StreamSessionId,
+        DecodedVideoFrame, SourcePts, StreamFrameIdentity, StreamSessionId, host_monotonic_time_ns,
     },
 };
 
@@ -378,7 +378,7 @@ fn liveness_loop(
 #[cfg(test)]
 mod tests {
     use parking_lot::Mutex;
-    use std::sync::{atomic::AtomicBool, mpsc, Arc};
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
     use super::*;
     use crate::engine::{
@@ -637,11 +637,13 @@ mod tests {
         node.on_input("image", DataPacket::ImageFrame(raw), &mut rt)
             .expect("viewer reports unsupported RAW without faulting graph");
         assert!(slot.latest().is_none());
-        assert!(event_rx
-            .try_recv()
-            .expect("BayerRaw diagnostic")
-            .message
-            .contains("explicit Demosaic"));
+        assert!(
+            event_rx
+                .try_recv()
+                .expect("BayerRaw diagnostic")
+                .message
+                .contains("explicit Demosaic")
+        );
     }
 
     #[test]

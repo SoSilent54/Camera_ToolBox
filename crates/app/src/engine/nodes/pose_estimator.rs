@@ -8,12 +8,12 @@ use camera_toolbox_core::{BoardSpec, InitialIntrinsics};
 
 use crate::{
     engine::{
+        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
+        NodeRuntimeState, NodeSpec,
         packet::{
             CalibrationBoardParams, CalibrationVector3, CameraModelParams, DetectionPacket,
             DetectionPose, DistortionModelParams,
         },
-        DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime,
-        NodeRuntimeState, NodeSpec,
     },
     ports::CalibrationCancellation,
 };
@@ -51,7 +51,10 @@ impl NodeInstance for PoseEstimatorNode {
     }
 
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(NodeRuntimeState::Ready, "waiting for detection and camera parameters");
+        rt.report_state(
+            NodeRuntimeState::Ready,
+            "waiting for detection and camera parameters",
+        );
         Ok(())
     }
 
@@ -120,12 +123,12 @@ impl PoseEstimatorNode {
             return Ok(());
         };
 
-        board
-            .validate()
-            .map_err(|error| NodeError::Precondition(format!("invalid board parameters: {error}")))?;
-        camera_model
-            .validate()
-            .map_err(|error| NodeError::Precondition(format!("invalid camera parameters: {error}")))?;
+        board.validate().map_err(|error| {
+            NodeError::Precondition(format!("invalid board parameters: {error}"))
+        })?;
+        camera_model.validate().map_err(|error| {
+            NodeError::Precondition(format!("invalid camera parameters: {error}"))
+        })?;
         distortion_model.validate().map_err(|error| {
             NodeError::Precondition(format!("invalid distortion parameters: {error}"))
         })?;
@@ -139,12 +142,8 @@ impl PoseEstimatorNode {
         }
 
         // PnP object points 与输出平移统一用米，避免把 UI 的 mm 板规格泄漏进位姿语义。
-        let board_spec = BoardSpec::new(
-            board.cols,
-            board.rows,
-            board.square_size_meters(),
-        )
-        .map_err(|error| NodeError::Precondition(error.to_string()))?;
+        let board_spec = BoardSpec::new(board.cols, board.rows, board.square_size_meters())
+            .map_err(|error| NodeError::Precondition(error.to_string()))?;
         detection
             .detection
             .validate(board_spec)
@@ -202,7 +201,7 @@ impl PoseEstimatorNode {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use camera_toolbox_core::{
         CalibrationImageSize, CalibrationPoint, CalibrationSolution, ChessboardDetection,
@@ -211,7 +210,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        engine::{EngineServices, FrameProvenance, ImageFrameIdentity, NodeReporter, OutputRegistry, SpawnContext},
+        engine::{
+            EngineServices, FrameProvenance, ImageFrameIdentity, NodeReporter, OutputRegistry,
+            SpawnContext,
+        },
         platform::SourcePts,
         ports::{CalibrationBackend, CalibrationBackendError},
     };
@@ -229,7 +231,9 @@ mod tests {
         let (state_tx, _state_rx) = mpsc::channel();
         let (event_tx, _event_rx) = mpsc::channel();
         let mut outputs = OutputRegistry::default();
-        outputs.set_record(Arc::new(move |packet| recorded.lock().expect("record lock").push(packet)));
+        outputs.set_record(Arc::new(move |packet| {
+            recorded.lock().expect("record lock").push(packet)
+        }));
         NodeRuntime::new(SpawnContext {
             outputs,
             reporter: NodeReporter::new("pose-test".to_owned(), state_tx, event_tx),
@@ -246,9 +250,13 @@ mod tests {
                 corners: vec![CalibrationPoint::new(10.0, 20.0); 88],
             }),
             frame_identity: ImageFrameIdentity {
-                provenance: FrameProvenance::Unknown { reason: "test".to_owned() },
+                provenance: FrameProvenance::Unknown {
+                    reason: "test".to_owned(),
+                },
                 frame_sequence: 7,
-                source_pts: SourcePts::Unavailable { reason: "test".to_owned() },
+                source_pts: SourcePts::Unavailable {
+                    reason: "test".to_owned(),
+                },
                 host_monotonic_time_ns: 1,
                 device_timestamp_ns: None,
             },
@@ -261,18 +269,34 @@ mod tests {
         let mut rt = runtime(Arc::clone(&recorded));
         let mut estimator = node();
         estimator
-            .on_input("detection", DataPacket::Detection(detection_packet()), &mut rt)
+            .on_input(
+                "detection",
+                DataPacket::Detection(detection_packet()),
+                &mut rt,
+            )
             .expect("pending detection is accepted");
         estimator
-            .on_input("board", DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default())), &mut rt)
+            .on_input(
+                "board",
+                DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default())),
+                &mut rt,
+            )
             .expect("pending board is accepted");
         estimator
-            .on_input("cameraModel", DataPacket::CameraModelParams(Arc::new(CameraModelParams::default())), &mut rt)
+            .on_input(
+                "cameraModel",
+                DataPacket::CameraModelParams(Arc::new(CameraModelParams::default())),
+                &mut rt,
+            )
             .expect("pending camera model is accepted");
         assert!(recorded.lock().expect("record lock").is_empty());
 
         let error = estimator
-            .on_input("distortionModel", DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default())), &mut rt)
+            .on_input(
+                "distortionModel",
+                DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default())),
+                &mut rt,
+            )
             .expect_err("missing backend must not yield a fake pose");
         assert!(matches!(error, NodeError::Precondition(_)));
         assert!(recorded.lock().expect("record lock").is_empty());
@@ -328,36 +352,67 @@ mod tests {
     fn complete_inputs_emit_meter_t_camera_board_pose() {
         let recorded = Arc::new(Mutex::new(Vec::new()));
         let board_seen = Arc::new(Mutex::new(None));
-        let backend = Arc::new(PoseBackend { board: Arc::clone(&board_seen) });
+        let backend = Arc::new(PoseBackend {
+            board: Arc::clone(&board_seen),
+        });
         let (state_tx, _state_rx) = mpsc::channel();
         let (event_tx, _event_rx) = mpsc::channel();
         let mut outputs = OutputRegistry::default();
         let sink = Arc::clone(&recorded);
-        outputs.set_record(Arc::new(move |packet| sink.lock().expect("record lock").push(packet)));
+        outputs.set_record(Arc::new(move |packet| {
+            sink.lock().expect("record lock").push(packet)
+        }));
         let mut rt = NodeRuntime::new(SpawnContext {
             outputs,
             reporter: NodeReporter::new("pose-test".to_owned(), state_tx, event_tx),
-            services: Arc::new(EngineServices { calibration: Some(backend), ..EngineServices::default() }),
+            services: Arc::new(EngineServices {
+                calibration: Some(backend),
+                ..EngineServices::default()
+            }),
             cancel: Arc::new(AtomicBool::new(false)),
             viewer_slot: None,
         });
         let mut estimator = node();
         for (port, packet) in [
-            ("board", DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default()))),
-            ("cameraModel", DataPacket::CameraModelParams(Arc::new(CameraModelParams::default()))),
-            ("distortionModel", DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default()))),
+            (
+                "board",
+                DataPacket::CalibrationBoardParams(Arc::new(CalibrationBoardParams::default())),
+            ),
+            (
+                "cameraModel",
+                DataPacket::CameraModelParams(Arc::new(CameraModelParams::default())),
+            ),
+            (
+                "distortionModel",
+                DataPacket::DistortionModelParams(Arc::new(DistortionModelParams::default())),
+            ),
             ("detection", DataPacket::Detection(detection_packet())),
         ] {
-            estimator.on_input(port, packet, &mut rt).expect("valid input");
+            estimator
+                .on_input(port, packet, &mut rt)
+                .expect("valid input");
         }
         let recorded = recorded.lock().expect("record lock");
         let [DataPacket::DetectionPose(pose)] = recorded.as_slice() else {
             panic!("complete inputs must emit one pose");
         };
-        assert_eq!(pose.convention, crate::engine::DetectionPoseConvention::TCameraBoard);
+        assert_eq!(
+            pose.convention,
+            crate::engine::DetectionPoseConvention::TCameraBoard
+        );
         assert_eq!(pose.translation_m, CalibrationVector3::new(1.0, 2.0, 3.0));
-        assert_eq!(pose.rotation_rodrigues, CalibrationVector3::new(0.1, 0.2, 0.3));
+        assert_eq!(
+            pose.rotation_rodrigues,
+            CalibrationVector3::new(0.1, 0.2, 0.3)
+        );
         assert_eq!(pose.reprojection_error_px, Some(0.5));
-        assert_eq!(board_seen.lock().expect("board lock").expect("board").square_size, 0.04);
+        assert_eq!(
+            board_seen
+                .lock()
+                .expect("board lock")
+                .expect("board")
+                .square_size,
+            0.04
+        );
     }
 }

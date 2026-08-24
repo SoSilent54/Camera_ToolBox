@@ -4,10 +4,17 @@
 
 use std::sync::Arc;
 
-use camera_toolbox_core::{CalibrationImageSize, CalibrationSolution, ChessboardDetection};
+use camera_toolbox_core::{
+    CalibrationImageSize, ChessboardDetection, Datum, PacketProvenance, PrimitiveType,
+    StructuredPacket,
+};
 use serde::{Deserialize, Serialize};
 
-use crate::platform::{DecodedVideoFrame, SourcePts, StreamFrameIdentity, StreamSessionId};
+use crate::platform::{
+    DecodedVideoFrame, I2cAuthorizedWritePlan, I2cCandidateWritePlan, I2cExecutionReport,
+    I2cInspectPlan, I2cInspectSnapshot, SourcePts, SshConnection, StreamFrameIdentity,
+    StreamSessionId,
+};
 
 /// 图像平面：数据与每行物理步长分开保存，不能假设所有像素格式都紧密排列。
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -752,6 +759,33 @@ fn validate_layout(
     Ok(())
 }
 
+/// 从结构化包保留到 typed-field 的不可变来源元数据。
+///
+/// 每个字段独立携带其 schema、完整 provenance 和相机模型标识；下游不得把不同字段
+/// 的来源摘要当作一致性前提，但可以逐字段执行 map 的来源合同。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TypedFieldSource {
+    pub schema: String,
+    pub provenance: PacketProvenance,
+    /// 无相机模型的通用 structured packet 保持为 None；要求模型的消费者必须拒绝它。
+    pub model_id: Option<String>,
+}
+
+impl TypedFieldSource {
+    #[must_use]
+    pub fn new(
+        schema: impl Into<String>,
+        provenance: PacketProvenance,
+        model_id: Option<String>,
+    ) -> Self {
+        Self {
+            schema: schema.into(),
+            provenance,
+            model_id,
+        }
+    }
+}
+
 /// 节点间流动的统一数据包。
 ///
 /// 变体与端口 `kind` 对应；骨架阶段先落地帧与解，其余负载类型随对应节点补齐。
@@ -771,8 +805,27 @@ pub enum DataPacket {
     DistortionModelParams(Arc<DistortionModelParams>),
     /// `calib.pose`：检测帧中标定板的 `T_camera_board` 姿态。
     DetectionPose(Arc<DetectionPose>),
-    /// `calib.solution`：标定求解结果。
-    Solution(Arc<CalibrationSolution>),
+    /// `data.structured.packet.v1`：可交换、可审计的结构化数据包。
+    StructuredPacket(Arc<StructuredPacket>),
+    /// `data.field.<primitive>.v1`：从一个结构化包提取的严格类型字段。
+    /// generation 在 extractor 的一次输入内相同，供多端口 fan-in 原子组装。
+    TypedField {
+        datum: Arc<Datum>,
+        generation: u64,
+        source: Arc<TypedFieldSource>,
+    },
+    /// `ssh.connection.v1`：进程内 SSH 会话句柄；不含 credential material，不能持久化。
+    SshConnection(Arc<SshConnection>),
+    /// `i2c.inspect-plan.v1`：只读 inspect 计划。
+    I2cInspectPlan(Arc<I2cInspectPlan>),
+    /// `i2c.candidate-write-plan.v1`：未授权的候选写计划。
+    I2cCandidateWritePlan(Arc<I2cCandidateWritePlan>),
+    /// `i2c.inspect-snapshot.v1`：由 inspect 产生的 before image 绑定快照。
+    I2cInspectSnapshot(Arc<I2cInspectSnapshot>),
+    /// `i2c.authorized-write-plan.v1`：审批后且绑定 connection/snapshot 的写计划。
+    I2cAuthorizedWritePlan(Arc<I2cAuthorizedWritePlan>),
+    /// `i2c.execution-report.v1`：逐页 readback 的最终执行报告。
+    I2cExecutionReport(Arc<I2cExecutionReport>),
     /// `calib.coverage`：标定数据覆盖度（弱类型，`Arc<Value>` 承载）。
     Coverage(Arc<serde_json::Value>),
     /// `calib.dataset`：标定数据集（弱类型）。
@@ -805,7 +858,28 @@ impl DataPacket {
             Self::CameraModelParams(_) => "calib.camera.model",
             Self::DistortionModelParams(_) => "calib.distortion.model",
             Self::DetectionPose(_) => "calib.pose",
-            Self::Solution(_) => "calib.solution",
+            Self::StructuredPacket(_) => "data.structured.packet.v1",
+            Self::TypedField { datum: field, .. } => match field.primitive_type() {
+                PrimitiveType::Bool => "data.field.bool.v1",
+                PrimitiveType::U8 => "data.field.u8.v1",
+                PrimitiveType::I8 => "data.field.i8.v1",
+                PrimitiveType::U16 => "data.field.u16.v1",
+                PrimitiveType::I16 => "data.field.i16.v1",
+                PrimitiveType::U32 => "data.field.u32.v1",
+                PrimitiveType::I32 => "data.field.i32.v1",
+                PrimitiveType::U64 => "data.field.u64.v1",
+                PrimitiveType::I64 => "data.field.i64.v1",
+                PrimitiveType::F32 => "data.field.f32.v1",
+                PrimitiveType::F64 => "data.field.f64.v1",
+                PrimitiveType::Str => "data.field.str.v1",
+                PrimitiveType::Bytes => "data.field.bytes.v1",
+            },
+            Self::SshConnection(_) => "ssh.connection.v1",
+            Self::I2cInspectPlan(_) => "i2c.inspect-plan.v1",
+            Self::I2cCandidateWritePlan(_) => "i2c.candidate-write-plan.v1",
+            Self::I2cInspectSnapshot(_) => "i2c.inspect-snapshot.v1",
+            Self::I2cAuthorizedWritePlan(_) => "i2c.authorized-write-plan.v1",
+            Self::I2cExecutionReport(_) => "i2c.execution-report.v1",
             Self::Coverage(_) => "calib.coverage",
             Self::Dataset(_) => "calib.dataset",
             Self::Report(_) => "calib.report",
@@ -816,6 +890,21 @@ impl DataPacket {
             Self::CaptureRequest(_) => "command.capture.request.v1",
             Self::Json(_) => "status.metrics",
         }
+    }
+
+    /// 高频帧派生流走 mailbox 的受限 lane；计划、配置和 typed-field 必须可靠投递。
+    #[must_use]
+    pub const fn is_realtime_stream(&self) -> bool {
+        matches!(
+            self,
+            Self::VideoFrame(_)
+                | Self::ImageFrame(_)
+                | Self::Detection(_)
+                | Self::DetectionPose(_)
+                | Self::Score(_)
+                | Self::CaptureSignal(_)
+                | Self::CaptureTrigger(_)
+        )
     }
 
     /// 返回可用于流动动画去重/标注的来源帧序号；非帧派生负载返回 None。
@@ -836,7 +925,14 @@ impl DataPacket {
             Self::CalibrationBoardParams(_)
             | Self::CameraModelParams(_)
             | Self::DistortionModelParams(_)
-            | Self::Solution(_)
+            | Self::StructuredPacket(_)
+            | Self::TypedField { .. }
+            | Self::SshConnection(_)
+            | Self::I2cInspectPlan(_)
+            | Self::I2cCandidateWritePlan(_)
+            | Self::I2cInspectSnapshot(_)
+            | Self::I2cAuthorizedWritePlan(_)
+            | Self::I2cExecutionReport(_)
             | Self::Coverage(_)
             | Self::Dataset(_)
             | Self::Report(_)
@@ -870,10 +966,46 @@ impl std::fmt::Debug for DataPacket {
                 .debug_struct("DetectionPose")
                 .field("sequence", &pose.frame_identity.frame_sequence)
                 .finish(),
-            Self::Solution(solution) => f
-                .debug_struct("Solution")
-                .field("views", &solution.views.len())
-                .field("rms", &solution.rms_error)
+            Self::StructuredPacket(packet) => f
+                .debug_struct("StructuredPacket")
+                .field("schema", &packet.schema)
+                .field("fields", &packet.fields.len())
+                .finish(),
+            Self::TypedField {
+                datum: field,
+                generation,
+                source,
+            } => f
+                .debug_struct("TypedField")
+                .field("name", &field.name)
+                .field("type", &field.primitive_type())
+                .field("generation", generation)
+                .field("schema", &source.schema)
+                .field("model_id", &source.model_id)
+                .finish(),
+            Self::SshConnection(connection) => f
+                .debug_struct("SshConnection")
+                .field("id", &connection.id())
+                .finish(),
+            Self::I2cInspectPlan(plan) => f
+                .debug_struct("I2cInspectPlan")
+                .field("map_id", &plan.map_id)
+                .finish(),
+            Self::I2cCandidateWritePlan(plan) => f
+                .debug_struct("I2cCandidateWritePlan")
+                .field("plan_digest", &plan.plan_digest)
+                .finish(),
+            Self::I2cInspectSnapshot(snapshot) => f
+                .debug_struct("I2cInspectSnapshot")
+                .field("before_image_sha256", &snapshot.before_image_sha256)
+                .finish(),
+            Self::I2cAuthorizedWritePlan(plan) => f
+                .debug_struct("I2cAuthorizedWritePlan")
+                .field("plan_digest", &plan.candidate.plan_digest)
+                .finish(),
+            Self::I2cExecutionReport(report) => f
+                .debug_struct("I2cExecutionReport")
+                .field("final_verified", &report.final_verified)
                 .finish(),
             Self::Coverage(_) => f.write_str("Coverage(..)"),
             Self::Dataset(_) => f.write_str("Dataset(..)"),
@@ -892,6 +1024,7 @@ impl std::fmt::Debug for DataPacket {
 mod tests {
     use super::*;
     use crate::platform::{SourcePtsProvenance, StreamSessionId};
+    use camera_toolbox_core::TypedValue;
 
     fn stream_identity() -> StreamFrameIdentity {
         StreamFrameIdentity::known_at_with_device_timestamp(
@@ -1066,12 +1199,14 @@ mod tests {
     fn calibration_parameter_validation_and_packet_kinds_are_explicit() {
         assert!(CalibrationBoardParams::new(1, 8, 40.0).is_err());
         assert!(CameraModelParams::new(0.0, 900.0, 960.0, 540.0, None).is_err());
-        assert!(DistortionModelParams {
-            coefficients: vec![0.0],
-            ..DistortionModelParams::default()
-        }
-        .validate()
-        .is_err());
+        assert!(
+            DistortionModelParams {
+                coefficients: vec![0.0],
+                ..DistortionModelParams::default()
+            }
+            .validate()
+            .is_err()
+        );
 
         let identity = ImageFrameIdentity::from(&stream_identity());
         let pose = DetectionPose::new(
@@ -1119,6 +1254,10 @@ mod tests {
             frame_identity: identity,
         }));
         let target = DataPacket::Target(Arc::new(serde_json::json!({})));
+        let structured = DataPacket::StructuredPacket(Arc::new(
+            StructuredPacket::new("example.packet.v1", Default::default(), vec![])
+                .expect("valid structured packet"),
+        ));
         assert_eq!(coverage.port_kind(), "calib.coverage");
         assert_eq!(dataset.port_kind(), "calib.dataset");
         assert_eq!(report.port_kind(), "calib.report");
@@ -1126,6 +1265,39 @@ mod tests {
         assert_eq!(signal.port_kind(), "capture.signal");
         assert_eq!(trigger.port_kind(), "capture.trigger");
         assert_eq!(target.port_kind(), "capture.target");
+        assert_eq!(structured.port_kind(), "data.structured.packet.v1");
+        assert_eq!(structured.flow_sequence(), None);
+    }
+
+    #[test]
+    fn typed_field_packets_use_exact_primitive_port_kinds() {
+        for (value, expected_kind) in [
+            (TypedValue::Bool(true), "data.field.bool.v1"),
+            (TypedValue::U8(1), "data.field.u8.v1"),
+            (TypedValue::I8(-1), "data.field.i8.v1"),
+            (TypedValue::U16(1), "data.field.u16.v1"),
+            (TypedValue::I16(-1), "data.field.i16.v1"),
+            (TypedValue::U32(1), "data.field.u32.v1"),
+            (TypedValue::I32(-1), "data.field.i32.v1"),
+            (TypedValue::U64(1), "data.field.u64.v1"),
+            (TypedValue::I64(-1), "data.field.i64.v1"),
+            (TypedValue::F32(1.0), "data.field.f32.v1"),
+            (TypedValue::F64(1.0), "data.field.f64.v1"),
+            (TypedValue::Str("value".to_owned()), "data.field.str.v1"),
+            (TypedValue::Bytes(vec![0x12]), "data.field.bytes.v1"),
+        ] {
+            let field = DataPacket::TypedField {
+                datum: Arc::new(Datum::new("example.field", value)),
+                generation: 1,
+                source: Arc::new(TypedFieldSource::new(
+                    "example.packet.v1",
+                    PacketProvenance::default(),
+                    Some("example.model.v1".to_owned()),
+                )),
+            };
+            assert_eq!(field.port_kind(), expected_kind);
+            assert_eq!(field.flow_sequence(), None);
+        }
     }
 
     #[test]

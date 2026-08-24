@@ -8,12 +8,12 @@ use camera_toolbox_core::CalibrationImageSize;
 use serde::Deserialize;
 
 use crate::engine::{
+    DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState,
+    NodeSpec,
     packet::{
         CalibrationBoardKind, CalibrationBoardParams, CameraModelKind, CameraModelParams,
         DistortionModelKind, DistortionModelParams,
     },
-    DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState,
-    NodeSpec,
 };
 
 const CALIBRATION_BOARD_PARAMS_KIND: &str = "calibrationBoardParams";
@@ -324,7 +324,7 @@ const fn default_distortion_kind() -> DistortionModelKind {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool, mpsc};
 
     use super::*;
     use crate::engine::{
@@ -419,8 +419,10 @@ mod tests {
             .expect("trigger emits camera parameters");
 
         let recorded = recorded.lock().expect("record lock");
-        let [DataPacket::CameraModelParams(camera), DataPacket::DistortionModelParams(distortion)] =
-            recorded.as_slice()
+        let [
+            DataPacket::CameraModelParams(camera),
+            DataPacket::DistortionModelParams(distortion),
+        ] = recorded.as_slice()
         else {
             panic!("expected camera and distortion parameter packets");
         };

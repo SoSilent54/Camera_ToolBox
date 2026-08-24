@@ -1,6 +1,7 @@
 mod engine_api;
 mod engine_bridge;
 mod files_api;
+mod serial_field;
 mod workflow;
 mod ws_hub;
 mod ws_router;
@@ -11,7 +12,7 @@ use std::{
     net::IpAddr,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
@@ -26,32 +27,30 @@ use axum::{
 #[cfg(feature = "calibration-opencv")]
 use camera_toolbox_adapters::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, SshCommandService,
-    SshConnectionTarget, SshEepromProvisionService, SshI2cHelperService, SshTransportFactory,
+    CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, ServerHostKey,
+    SshCommandService, SshConnectionTarget, SshI2cHelperService, SshTransportFactory,
     production_recipe_registry_from_env,
 };
 use camera_toolbox_adapters::x5_tcp_client;
 use camera_toolbox_app::engine::{CaptureMode, CaptureTarget};
 use camera_toolbox_app::{
     CalibrationBackend, CalibrationCancellation, CommandResult, CommandService, ControlTargetSpec,
-    DecodedVideoFrame, DumpCancellation, EepromDeviceState, EepromExecutor, EepromHelperAction,
-    EepromHelperResult, EepromProvisionOperation, EepromProvisionService,
-    EepromProvisionServiceError, EepromSerialState, I2cExecutor, I2cHelperAction,
-    I2cHelperOperation, I2cHelperResult, I2cHelperService, I2cMessageData, I2cMessageSpec,
-    I2cTransactionSpec, RemoteFileStat, RemoteOperationControl, RemoteTimeouts, SftpFileReader,
-    SshCommandExecutor, TypedCommandRequest, X5ControlClient, X5233CapturePayload,
-    validate_i2c_transfer_transactions,
+    DecodedVideoFrame, I2cAuthorizedWritePlan, I2cHelperAction, I2cHelperOperation,
+    I2cHelperResult, I2cHelperService, I2cInspectPlan, I2cMessageData, I2cMessageSpec,
+    I2cPageWrite, I2cTaskExecutor, I2cTransactionSpec, RemoteFileStat, RemoteOperationControl,
+    SftpFileReader, SshCommandExecutor, SshConnection, SshConnectionService, TypedCommandRequest,
+    X5ControlClient, X5233CapturePayload,
 };
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
-    EepromProvisionRequest, EepromProvisioningMode, EepromWriteSegment, InitialIntrinsics,
-    ViewCalibrationResult, YG_STEREO_P24C64G_INTRINSICS_BYTES, YG_STEREO_P24C64G_V1_MAP_ID,
+    InitialIntrinsics, ViewCalibrationResult,
 };
 use clap::Parser;
 use image::{ColorType, codecs::jpeg::JpegEncoder};
 use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
 use workflow::{WorkflowGraph, validate_workflow};
@@ -84,36 +83,17 @@ struct AppState {
     control_runtime: Arc<ControlRuntime>,
     #[cfg(feature = "calibration-opencv")]
     calibration_backend: Arc<dyn CalibrationBackend>,
-    eeprom_inspects: Arc<Mutex<HashMap<String, EepromInspectSnapshot>>>,
     engine_runtime: Arc<engine_api::EngineRuntime>,
     ws_hub: Arc<ws_hub::WsHub>,
     /// 后端权威工作流图；前端只渲染该状态的 snapshot，不维护独立 draft graph。
     graph_session: Arc<Mutex<WorkflowGraph>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EepromInspectSnapshot {
-    target: EepromSnapshotTarget,
-    image_sha256: String,
-    device: EepromDeviceState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct EepromSnapshotTarget {
-    node_id: String,
-    host: String,
-    port: u16,
-    username: String,
-    credential_ref: String,
-    map_id: String,
-    bus: String,
-    address: u8,
-}
-
 struct ControlRuntime {
+    /// 运行时 SSH 句柄到 credential ref 的进程内绑定；永不序列化或返回前端。
+    sessions: Arc<Mutex<HashMap<String, String>>>,
     #[cfg(feature = "platform-ssh")]
     credential_resolver: Arc<dyn CredentialResolver>,
-    /// 密码注册接口仅写入此进程内 resolver；工作流只会持久化其 session 引用。
     #[cfg(feature = "platform-ssh")]
     password_credential_resolver: Arc<ProductionCredentialResolver>,
     #[cfg(feature = "platform-ssh")]
@@ -127,6 +107,7 @@ impl ControlRuntime {
         #[cfg(feature = "platform-ssh")]
         let password_credential_resolver = Arc::new(ProductionCredentialResolver::new());
         Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(feature = "platform-ssh")]
             credential_resolver: password_credential_resolver.clone(),
             #[cfg(feature = "platform-ssh")]
@@ -145,6 +126,7 @@ impl ControlRuntime {
         helper_payload: Arc<[u8]>,
     ) -> Self {
         Self {
+            sessions: Arc::new(Mutex::new(HashMap::new())),
             credential_resolver,
             password_credential_resolver: Arc::new(ProductionCredentialResolver::new()),
             ssh_transport,
@@ -179,90 +161,6 @@ impl ControlRuntime {
             .map_err(PreviewApiError::bad_request)
     }
 }
-impl ControlRuntime {
-    fn execute_i2c(
-        &self,
-        preview: &ControlPreview,
-        ssh: &SshExecutionBinding,
-    ) -> std::result::Result<I2cHelperResult, PreviewApiError> {
-        #[cfg(feature = "platform-ssh")]
-        {
-            let action = i2c_action_from_preview(preview)?;
-            let control = RemoteOperationControl::new(
-                RemoteTimeouts {
-                    connect: Duration::from_secs(10),
-                    idle: i2c_idle_timeout(&action),
-                    overall: i2c_overall_timeout(&action),
-                },
-                DumpCancellation::default(),
-            )
-            .map_err(|error| PreviewApiError::bad_request(error.to_string()))?;
-            let service = SshI2cHelperService::new(
-                format!("workflow-web-i2c-{}", preview.target.node_id),
-                ssh_target_from_binding(ssh)?,
-                validate_credential_ref(&ssh.credential_ref)?,
-                1_048_576,
-                self.helper_payload()?,
-                Arc::clone(&self.credential_resolver),
-                Arc::clone(&self.ssh_transport),
-            )
-            .map_err(|error| PreviewApiError::bad_request(format_i2c_service_error(&error)))?;
-            return service
-                .execute(I2cHelperOperation { action }, control)
-                .map_err(|error| PreviewApiError::bad_request(format_i2c_service_error(&error)));
-        }
-        #[cfg(not(feature = "platform-ssh"))]
-        {
-            let _ = (preview, ssh);
-            Err(PreviewApiError::bad_request(
-                "workflow-web was built without platform-ssh support",
-            ))
-        }
-    }
-
-    fn execute_eeprom(
-        &self,
-        preview: &ControlPreview,
-        ssh: &SshExecutionBinding,
-        action: EepromHelperAction,
-    ) -> std::result::Result<EepromHelperResult, PreviewApiError> {
-        #[cfg(feature = "platform-ssh")]
-        {
-            let control = RemoteOperationControl::new(
-                RemoteTimeouts {
-                    connect: Duration::from_secs(10),
-                    idle: eeprom_idle_timeout(&action),
-                    overall: eeprom_overall_timeout(&action),
-                },
-                DumpCancellation::default(),
-            )
-            .map_err(|error| PreviewApiError::bad_request(error.to_string()))?;
-            let service = SshEepromProvisionService::new(
-                format!("workflow-web-eeprom-{}", preview.target.node_id),
-                ssh_target_from_binding(ssh)?,
-                validate_credential_ref(&ssh.credential_ref)?,
-                1_048_576,
-                parse_eeprom_i2c_bus(&preview.target.bus)?,
-                self.helper_payload()?,
-                Arc::clone(&self.credential_resolver),
-                Arc::clone(&self.ssh_transport),
-            )
-            .map_err(|error| PreviewApiError::bad_request(format_eeprom_service_error(&error)))?;
-            return service
-                .execute(EepromProvisionOperation { action }, control)
-                .map_err(|error| {
-                    PreviewApiError::bad_request(format_eeprom_service_error(&error))
-                });
-        }
-        #[cfg(not(feature = "platform-ssh"))]
-        {
-            let _ = (preview, ssh);
-            Err(PreviewApiError::bad_request(
-                "workflow-web was built without platform-ssh support",
-            ))
-        }
-    }
-}
 
 #[cfg(feature = "platform-ssh")]
 impl ControlRuntime {
@@ -286,78 +184,266 @@ fn ssh_target_from_spec(spec: &ControlTargetSpec) -> SshConnectionTarget {
     }
 }
 
-/// 把 I²C executor 抽象接到真实的 SSH helper：每次操作按当前 spec 构造 service 并执行。
+/// 规范化并固定工作流 SSH 目标的服务端主机密钥，避免 transport 接收未固定的目标。
 #[cfg(feature = "platform-ssh")]
-impl I2cExecutor for ControlRuntime {
-    fn execute(
+fn canonical_pinned_ssh_target(
+    target: &ControlTargetSpec,
+) -> std::result::Result<ControlTargetSpec, String> {
+    let expected_host_key = target
+        .expected_host_key
+        .as_deref()
+        .filter(|key| !key.trim().is_empty())
+        .ok_or_else(|| "SSH connection requires a non-empty expected host key".to_owned())?;
+    let expected_host_key = ServerHostKey::from_openssh(expected_host_key)
+        .map_err(|error| format!("SSH connection expected host key is invalid: {error}"))?
+        .openssh()
+        .to_owned();
+    Ok(ControlTargetSpec {
+        expected_host_key: Some(expected_host_key),
+        ..target.clone()
+    })
+}
+
+/// 建立计划节点使用的短生命周期 SSH 连接，并把 credential ref 留在进程内绑定表。
+#[cfg(feature = "platform-ssh")]
+impl SshConnectionService for ControlRuntime {
+    fn connect(
         &self,
         target: &ControlTargetSpec,
         credential_ref: &str,
-        action: I2cHelperAction,
         control: RemoteOperationControl,
-    ) -> std::result::Result<I2cHelperResult, String> {
+    ) -> std::result::Result<SshConnection, String> {
+        let target = canonical_pinned_ssh_target(target)?;
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
-        let service = SshI2cHelperService::new(
-            format!("workflow-web-i2c-{}", target.host),
-            ssh_target_from_spec(target),
+        let credential = self.credential_resolver.resolve(&credential_ref)?;
+        let transport_target = ssh_target_from_spec(&target);
+        let _session = self
+            .ssh_transport
+            .connect(&transport_target, credential, &control)
+            .map_err(|error| error.to_string())?;
+        let id = format!("workflow-ssh-{}-{}", target.host, monotonic_nonce());
+        self.sessions
+            .lock()
+            .map_err(|_| "SSH session store is poisoned".to_owned())?
+            .insert(id.clone(), credential_ref);
+        Ok(SshConnection::new(id, target))
+    }
+    fn revoke(
+        &self,
+        connection: &SshConnection,
+        _control: RemoteOperationControl,
+    ) -> std::result::Result<(), String> {
+        // connection handle 与密码 session 生命周期独立：撤销只使旧 handle 失效，
+        // 保留 credentialRef 供同一已保存 SSH 配置重新连接。
+        self.sessions
+            .lock()
+            .map_err(|_| "SSH session store is poisoned".to_owned())?
+            .remove(connection.id());
+        Ok(())
+    }
+}
+#[cfg(feature = "platform-ssh")]
+impl ControlRuntime {
+    fn i2c_service_for(
+        &self,
+        connection: &SshConnection,
+    ) -> std::result::Result<SshI2cHelperService, String> {
+        let credential_ref = self
+            .sessions
+            .lock()
+            .map_err(|_| "SSH session store is poisoned".to_owned())?
+            .get(connection.id())
+            .cloned()
+            .ok_or_else(|| "SSH connection is not active".to_owned())?;
+        SshI2cHelperService::new(
+            format!("workflow-web-plan-{}", connection.id()),
+            ssh_target_from_spec(connection.target()),
             credential_ref,
             1_048_576,
             self.helper_payload().map_err(|e| e.error)?,
             Arc::clone(&self.credential_resolver),
             Arc::clone(&self.ssh_transport),
         )
-        .map_err(|error| format_i2c_service_error(&error))?;
-        service
-            .execute(I2cHelperOperation { action }, control)
-            .map_err(|error| format_i2c_service_error(&error))
+        .map_err(|error| format_i2c_service_error(&error))
     }
 }
 
-/// 把 EEPROM executor 抽象接到真实的 SSH helper。
 #[cfg(feature = "platform-ssh")]
-impl EepromExecutor for ControlRuntime {
-    fn execute(
+impl I2cTaskExecutor for ControlRuntime {
+    fn inspect(
         &self,
-        target: &ControlTargetSpec,
-        credential_ref: &str,
-        action: EepromHelperAction,
+        connection: &SshConnection,
+        plan: &I2cInspectPlan,
         control: RemoteOperationControl,
-    ) -> std::result::Result<EepromHelperResult, String> {
-        let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
-        let service = SshEepromProvisionService::new(
-            format!("workflow-web-eeprom-{}", target.host),
-            ssh_target_from_spec(target),
-            credential_ref,
-            1_048_576,
-            // `i2c_bus` 不在 `EepromExecutor` trait 契约内（`ControlTargetSpec` 只承载
-            // host/port/username/expected_host_key），此处固定为 0；真实 bus pinning 需
-            // 后续把 bus 下钻进 spec 或 trait 后补上。map_id 已由 service 内部固定。
-            0,
-            self.helper_payload().map_err(|e| e.error)?,
-            Arc::clone(&self.credential_resolver),
-            Arc::clone(&self.ssh_transport),
-        )
-        .map_err(|error| format_eeprom_service_error(&error))?;
-        service
-            .execute(EepromProvisionOperation { action }, control)
-            .map_err(|error| format_eeprom_service_error(&error))
+    ) -> std::result::Result<Vec<u8>, String> {
+        let transactions = plan
+            .read_ranges
+            .iter()
+            .map(|range| I2cTransactionSpec {
+                bus: plan.target.bus,
+                messages: vec![
+                    I2cMessageSpec {
+                        address: plan.target.address,
+                        flags: Vec::new(),
+                        data: I2cMessageData::Write {
+                            bytes: register_bytes(plan.target.address_width_bytes, range.offset),
+                        },
+                    },
+                    I2cMessageSpec {
+                        address: plan.target.address,
+                        flags: Vec::new(),
+                        data: I2cMessageData::Read {
+                            byte_len: range.byte_len,
+                        },
+                    },
+                ],
+                settle_ms: None,
+            })
+            .collect();
+        let result = self
+            .i2c_service_for(connection)?
+            .execute(
+                I2cHelperOperation {
+                    action: I2cHelperAction::Transfer { transactions },
+                },
+                control,
+            )
+            .map_err(|error| format_i2c_service_error(&error))?;
+        Ok(read_result_bytes(result))
     }
+
+    fn verify_authorized(
+        &self,
+        connection: &SshConnection,
+        authorized: &I2cAuthorizedWritePlan,
+        control: RemoteOperationControl,
+    ) -> std::result::Result<(), String> {
+        if authorized.connection_id != connection.id() {
+            return Err("authorized write plan is bound to another SSH connection".to_owned());
+        }
+        let before = self.inspect(connection, &authorized.inspect_plan, control)?;
+        if before_image_digest(&before) != authorized.expected_before_sha256 {
+            return Err("EEPROM before-image changed since approval".to_owned());
+        }
+        Ok(())
+    }
+
+    fn write_page(
+        &self,
+        connection: &SshConnection,
+        authorized: &I2cAuthorizedWritePlan,
+        page_index: usize,
+        page: &I2cPageWrite,
+        control: RemoteOperationControl,
+    ) -> std::result::Result<Vec<u8>, String> {
+        if authorized.connection_id != connection.id() {
+            return Err("authorized write plan is bound to another SSH connection".to_owned());
+        }
+        if authorized.page_at(page_index) != Some(page) {
+            return Err(format!(
+                "authorized page {page_index} is not the exact compiled page"
+            ));
+        }
+        let transaction = I2cTransactionSpec {
+            bus: authorized.candidate.target.bus,
+            messages: vec![I2cMessageSpec {
+                address: authorized.candidate.target.address,
+                flags: Vec::new(),
+                data: I2cMessageData::Write {
+                    bytes: [
+                        register_bytes(
+                            authorized.candidate.target.address_width_bytes,
+                            page.offset,
+                        ),
+                        page.bytes.clone(),
+                    ]
+                    .concat(),
+                },
+            }],
+            settle_ms: Some(page.settle_ms),
+        };
+        let readback = I2cTransactionSpec {
+            bus: authorized.candidate.target.bus,
+            messages: vec![
+                I2cMessageSpec {
+                    address: authorized.candidate.target.address,
+                    flags: Vec::new(),
+                    data: I2cMessageData::Write {
+                        bytes: register_bytes(
+                            authorized.candidate.target.address_width_bytes,
+                            page.offset,
+                        ),
+                    },
+                },
+                I2cMessageSpec {
+                    address: authorized.candidate.target.address,
+                    flags: Vec::new(),
+                    data: I2cMessageData::Read {
+                        byte_len: u16::try_from(page.bytes.len())
+                            .map_err(|_| "page exceeds u16 length".to_owned())?,
+                    },
+                },
+            ],
+            settle_ms: None,
+        };
+        let result = self
+            .i2c_service_for(connection)?
+            .execute(
+                I2cHelperOperation {
+                    action: I2cHelperAction::Transfer {
+                        transactions: vec![transaction, readback],
+                    },
+                },
+                control,
+            )
+            .map_err(|error| format_i2c_service_error(&error))?;
+        Ok(read_result_bytes(result))
+    }
+}
+
+fn register_bytes(width: u8, offset: u16) -> Vec<u8> {
+    match width {
+        1 => vec![(offset & 0xff) as u8],
+        _ => offset.to_be_bytes().to_vec(),
+    }
+}
+
+/// 与 app 层 inspect/approval/execution 报告一致的唯一 before-image 表示。
+fn before_image_digest(bytes: &[u8]) -> String {
+    format!("sha256:{:x}", Sha256::digest(bytes))
+}
+
+fn read_result_bytes(result: I2cHelperResult) -> Vec<u8> {
+    let I2cHelperResult::Transfer { transactions } = result else {
+        return Vec::new();
+    };
+    transactions
+        .into_iter()
+        .flat_map(|transaction| transaction.messages)
+        .filter(|message| {
+            matches!(
+                message.direction,
+                camera_toolbox_app::I2cMessageDirection::Read
+            )
+        })
+        .flat_map(|message| message.bytes)
+        .collect()
+}
+
+fn monotonic_nonce() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos())
 }
 
 /// 把 X5 控制客户端抽象接到真实的 X5_233 TCP 模块（纯 TCP）。
 impl X5ControlClient for ControlRuntime {
     fn probe(&self, host: &str, port: u16) -> std::result::Result<serde_json::Value, String> {
-        x5_tcp_client::probe(host, port)
-            .map(|summary| x5_probe_response(&summary))
-            .map_err(|error| error)
+        x5_tcp_client::probe(host, port).map(|summary| x5_probe_response(&summary))
     }
-
     fn status(&self, host: &str, port: u16) -> std::result::Result<serde_json::Value, String> {
-        x5_tcp_client::status(host, port)
-            .map(|status| x5_status_response(&status))
-            .map_err(|error| error)
+        x5_tcp_client::status(host, port).map(|status| x5_status_response(&status))
     }
-
     fn capture(
         &self,
         host: &str,
@@ -413,7 +499,6 @@ impl X5ControlClient for ControlRuntime {
     }
 }
 
-/// 把 SFTP 文件读取抽象接到真实 SSH transport：每次操作按 spec 建立 session 后 stat/read。
 #[cfg(feature = "platform-ssh")]
 impl SftpFileReader for ControlRuntime {
     fn stat(
@@ -424,10 +509,7 @@ impl SftpFileReader for ControlRuntime {
         control: RemoteOperationControl,
     ) -> Result<RemoteFileStat, String> {
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
-        let credential = self
-            .credential_resolver
-            .resolve(&credential_ref)
-            .map_err(|e| e)?;
+        let credential = self.credential_resolver.resolve(&credential_ref)?;
         let mut session = self
             .ssh_transport
             .connect(&ssh_target_from_spec(target), credential, &control)
@@ -436,7 +518,6 @@ impl SftpFileReader for ControlRuntime {
             .stat(remote_path, &control)
             .map_err(|e| e.to_string())
     }
-
     fn read(
         &self,
         target: &ControlTargetSpec,
@@ -446,29 +527,18 @@ impl SftpFileReader for ControlRuntime {
         control: RemoteOperationControl,
     ) -> Result<Vec<u8>, String> {
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
-        let credential = self
-            .credential_resolver
-            .resolve(&credential_ref)
-            .map_err(|e| e)?;
+        let credential = self.credential_resolver.resolve(&credential_ref)?;
         let mut session = self
             .ssh_transport
             .connect(&ssh_target_from_spec(target), credential, &control)
             .map_err(|e| e.to_string())?;
         let mut bytes = Vec::new();
-        let mut total = 0_usize;
-        session
-            .read_file(remote_path, &control, &mut |chunk| {
-                total = total.saturating_add(chunk.len());
-                if total > limit {
-                    return Err(camera_toolbox_adapters::platforms::ssh_managed::SshTransportError::ReadLimitExceeded {
-                        requested: total as u64,
-                        limit: limit as u64,
-                    });
-                }
-                bytes.extend_from_slice(chunk);
-                Ok(())
-            })
-            .map_err(|e| e.to_string())?;
+        session.read_file(remote_path, &control, &mut |chunk| {
+            if bytes.len().saturating_add(chunk.len()) > limit {
+                return Err(camera_toolbox_adapters::platforms::ssh_managed::SshTransportError::ReadLimitExceeded { requested: bytes.len().saturating_add(chunk.len()) as u64, limit: limit as u64 });
+            }
+            bytes.extend_from_slice(chunk); Ok(())
+        }).map_err(|e| e.to_string())?;
         Ok(bytes)
     }
 }
@@ -483,6 +553,7 @@ impl SshCommandExecutor for ControlRuntime {
         request: TypedCommandRequest,
         control: RemoteOperationControl,
     ) -> Result<CommandResult, String> {
+        let target = canonical_pinned_ssh_target(target)?;
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
         // recipe 注册表从环境变量加载；无部署 recipe 时退化为空注册表（execute 会报 RecipeNotAllowed）。
         let recipes =
@@ -492,7 +563,7 @@ impl SshCommandExecutor for ControlRuntime {
         let allowed_recipe_id = request.recipe_id.clone();
         let service = SshCommandService::new(
             format!("workflow-web-ssh-{}", target.host),
-            ssh_target_from_spec(target),
+            ssh_target_from_spec(&target),
             credential_ref,
             allowed_recipe_id,
             Arc::clone(&self.credential_resolver),
@@ -504,233 +575,6 @@ impl SshCommandExecutor for ControlRuntime {
     }
 }
 
-fn i2c_action_from_preview(
-    preview: &ControlPreview,
-) -> std::result::Result<I2cHelperAction, PreviewApiError> {
-    let bus = parse_i2c_bus(&preview.target.bus)?;
-    match preview.operation {
-        "read" => Ok(I2cHelperAction::Transfer {
-            transactions: vec![I2cTransactionSpec {
-                bus,
-                messages: vec![
-                    I2cMessageSpec {
-                        address: u16::from(preview.target.address),
-                        flags: Vec::new(),
-                        data: I2cMessageData::Write {
-                            bytes: preview.target.register.to_be_bytes().to_vec(),
-                        },
-                    },
-                    I2cMessageSpec {
-                        address: u16::from(preview.target.address),
-                        flags: Vec::new(),
-                        data: I2cMessageData::Read { byte_len: 1 },
-                    },
-                ],
-                settle_ms: None,
-            }],
-        }),
-        "write" => Ok(I2cHelperAction::Transfer {
-            transactions: page_write_transactions(&preview.target, &preview.page_split_estimate)?,
-        }),
-        other => Err(PreviewApiError::bad_request(format!(
-            "unsupported I²C execution operation `{other}`",
-        ))),
-    }
-}
-
-fn page_write_transactions(
-    target: &ControlTarget,
-    estimate: &PageSplitEstimate,
-) -> std::result::Result<Vec<I2cTransactionSpec>, PreviewApiError> {
-    let bus = parse_i2c_bus(&target.bus)?;
-    let mut consumed = 0_usize;
-    let mut transactions = Vec::with_capacity(estimate.segments.len());
-    for segment in &estimate.segments {
-        let next = consumed
-            .checked_add(segment.payload_length)
-            .ok_or_else(|| PreviewApiError::bad_request("payload segment length overflows"))?;
-        let payload = target.payload.get(consumed..next).ok_or_else(|| {
-            PreviewApiError::bad_request("payload segment estimate does not match payload length")
-        })?;
-        let mut bytes = Vec::with_capacity(2 + payload.len());
-        bytes.extend_from_slice(&segment.register.to_be_bytes());
-        bytes.extend_from_slice(payload);
-        transactions.push(I2cTransactionSpec {
-            bus,
-            messages: vec![I2cMessageSpec {
-                address: u16::from(target.address),
-                flags: Vec::new(),
-                data: I2cMessageData::Write { bytes },
-            }],
-            settle_ms: Some(5),
-        });
-        consumed = next;
-    }
-    if consumed != target.payload.len() {
-        return Err(PreviewApiError::bad_request(
-            "payload segment estimate does not consume the full payload",
-        ));
-    }
-    validate_i2c_transfer_transactions(&transactions).map_err(|error| {
-        PreviewApiError::bad_request(format!(
-            "I²C transfer request is invalid: {}",
-            error.message
-        ))
-    })?;
-    Ok(transactions)
-}
-
-fn parse_i2c_bus(bus: &str) -> std::result::Result<u32, PreviewApiError> {
-    let bus = bus.trim();
-    let digits = bus.strip_prefix("i2c-").unwrap_or(bus);
-    digits
-        .parse::<u32>()
-        .map_err(|_| PreviewApiError::bad_request("bus must be `i2c-N` or decimal N"))
-}
-
-fn parse_eeprom_i2c_bus(bus: &str) -> std::result::Result<u16, PreviewApiError> {
-    let bus = parse_i2c_bus(bus)?;
-    u16::try_from(bus).map_err(|_| PreviewApiError::bad_request("EEPROM I²C bus must fit u16"))
-}
-
-fn eeprom_idle_timeout(action: &EepromHelperAction) -> Duration {
-    match action {
-        EepromHelperAction::Inspect => Duration::from_secs(30),
-        EepromHelperAction::Provision { .. } => Duration::from_secs(60),
-    }
-}
-
-fn eeprom_overall_timeout(action: &EepromHelperAction) -> Duration {
-    match action {
-        EepromHelperAction::Inspect => Duration::from_secs(90),
-        EepromHelperAction::Provision { .. } => Duration::from_secs(180),
-    }
-}
-
-fn format_eeprom_service_error(error: &EepromProvisionServiceError) -> String {
-    match error {
-        EepromProvisionServiceError::Helper(failure) => format!(
-            "EEPROM helper failure: code={}, message={}, before={:?}, rollback={:?}, rollback_error={:?}",
-            failure.code, failure.message, failure.before, failure.rollback, failure.rollback_error
-        ),
-        _ => error.to_string(),
-    }
-}
-
-fn normalize_eeprom_map_id(map_id: &str) -> std::result::Result<String, PreviewApiError> {
-    let map_id = map_id.trim();
-    match map_id {
-        YG_STEREO_P24C64G_V1_MAP_ID | "x5_233_default" => {
-            Ok(YG_STEREO_P24C64G_V1_MAP_ID.to_owned())
-        }
-        "" => Err(PreviewApiError::bad_request(
-            "EEPROM mapId must not be empty",
-        )),
-        other => Err(PreviewApiError::bad_request(format!(
-            "unsupported EEPROM mapId `{other}`; expected `{YG_STEREO_P24C64G_V1_MAP_ID}`"
-        ))),
-    }
-}
-
-fn eeprom_snapshot_target(
-    preview: &ControlPreview,
-    ssh: &SshExecutionBinding,
-) -> std::result::Result<EepromSnapshotTarget, PreviewApiError> {
-    let target = ssh_target_from_binding(ssh)?;
-    Ok(EepromSnapshotTarget {
-        node_id: preview.target.node_id.clone(),
-        host: target.host,
-        port: target.port,
-        username: target.username,
-        credential_ref: validate_credential_ref(&ssh.credential_ref)?,
-        map_id: preview.map_id.clone().ok_or_else(|| {
-            PreviewApiError::bad_request("EEPROM preview is missing the normalized mapId")
-        })?,
-        bus: preview.target.bus.trim().to_owned(),
-        address: preview.target.address,
-    })
-}
-
-fn eeprom_provision_request_from_preview(
-    preview: &ControlPreview,
-    snapshot: &EepromInspectSnapshot,
-) -> std::result::Result<EepromProvisionRequest, PreviewApiError> {
-    let map_id = preview
-        .map_id
-        .as_deref()
-        .ok_or_else(|| PreviewApiError::bad_request("EEPROM provision preview is missing mapId"))?;
-    if map_id != YG_STEREO_P24C64G_V1_MAP_ID {
-        return Err(PreviewApiError::bad_request(format!(
-            "unsupported EEPROM provision map `{map_id}`"
-        )));
-    }
-    if preview.target.address != 0x50 {
-        return Err(PreviewApiError::bad_request(
-            "Yg Stereo P24C64G EEPROM address must be 0x50",
-        ));
-    }
-    if preview.target.register != 0x0010 {
-        return Err(PreviewApiError::bad_request(
-            "workflow-web EEPROM provision currently supports UpdateCalibration at register 0x0010 only",
-        ));
-    }
-    if preview.target.payload.len() != YG_STEREO_P24C64G_INTRINSICS_BYTES {
-        return Err(PreviewApiError::bad_request(format!(
-            "UpdateCalibration payload must be exactly {YG_STEREO_P24C64G_INTRINSICS_BYTES} bytes"
-        )));
-    }
-    if preview.verify_after_write != Some(true) {
-        return Err(PreviewApiError::bad_request(
-            "EEPROM provision requires verifyAfterWrite=true; the helper always performs bytewise readback verification",
-        ));
-    }
-    let serial_number = match &snapshot.device.serial {
-        EepromSerialState::Valid { value } => value.clone(),
-        EepromSerialState::Empty => {
-            return Err(PreviewApiError::bad_request(
-                "UpdateCalibration requires an inspected EEPROM with an existing valid serial; empty devices require FullProvision from the calibration export path",
-            ));
-        }
-        EepromSerialState::Invalid { .. } => {
-            return Err(PreviewApiError::bad_request(
-                "UpdateCalibration requires an inspected EEPROM with an existing valid serial; repair invalid serial state before writing calibration bytes",
-            ));
-        }
-    };
-    let request = EepromProvisionRequest {
-        map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
-        mode: EepromProvisioningMode::UpdateCalibration,
-        serial_number,
-        overwrite_existing_serial: false,
-        segments: vec![EepromWriteSegment {
-            offset: 0x0010,
-            bytes: preview.target.payload.clone(),
-        }],
-    };
-    request.validate().map_err(|error| {
-        PreviewApiError::bad_request(format!("EEPROM provision request is invalid: {error}"))
-    })?;
-    Ok(request)
-}
-
-fn eeprom_snapshot_response(
-    key: &str,
-    snapshot: &EepromInspectSnapshot,
-) -> EepromInspectSnapshotResponse {
-    EepromInspectSnapshotResponse {
-        key: key.to_owned(),
-        image_sha256: snapshot.image_sha256.clone(),
-        target: EepromSnapshotTargetResponse {
-            node_id: snapshot.target.node_id.clone(),
-            host: snapshot.target.host.clone(),
-            port: snapshot.target.port,
-            username: snapshot.target.username.clone(),
-            map_id: snapshot.target.map_id.clone(),
-            bus: snapshot.target.bus.clone(),
-            address: snapshot.target.address,
-        },
-    }
-}
 fn x5_binding_from_request(
     binding: &X5BindingRequest,
 ) -> std::result::Result<(String, u16), PreviewApiError> {
@@ -850,49 +694,6 @@ fn x5_snapshot_response(snapshot: &x5_tcp_client::X5YuvSnapshot) -> Value {
     })
 }
 
-fn i2c_idle_timeout(action: &I2cHelperAction) -> Duration {
-    match action {
-        I2cHelperAction::ListBuses => Duration::from_secs(15),
-        I2cHelperAction::Transfer { .. } => Duration::from_secs(30),
-    }
-}
-
-fn i2c_overall_timeout(action: &I2cHelperAction) -> Duration {
-    match action {
-        I2cHelperAction::ListBuses => Duration::from_secs(45),
-        I2cHelperAction::Transfer { .. } => Duration::from_secs(120),
-    }
-}
-
-#[cfg(feature = "platform-ssh")]
-fn ssh_target_from_binding(
-    binding: &SshExecutionBinding,
-) -> std::result::Result<SshConnectionTarget, PreviewApiError> {
-    if binding.host.trim().is_empty() || binding.host.chars().any(char::is_control) {
-        return Err(PreviewApiError::bad_request(
-            "ssh.host must be a non-empty printable host",
-        ));
-    }
-    if binding.port == 0 {
-        return Err(PreviewApiError::bad_request(
-            "ssh.port must be in 1..=65535",
-        ));
-    }
-    if binding.username.trim().is_empty() || binding.username.chars().any(char::is_control) {
-        return Err(PreviewApiError::bad_request(
-            "ssh.username must be a non-empty printable username",
-        ));
-    }
-    Ok(SshConnectionTarget {
-        host: binding.host.trim().to_owned(),
-        port: binding.port,
-        username: binding.username.trim().to_owned(),
-        expected_host_key: None,
-        command_subsystem: None,
-        remote_event_subsystem: None,
-    })
-}
-
 #[cfg(feature = "platform-ssh")]
 fn validate_credential_ref(reference: &str) -> std::result::Result<String, PreviewApiError> {
     let reference = reference.trim();
@@ -988,13 +789,6 @@ fn format_i2c_service_error(error: &camera_toolbox_app::I2cHelperServiceError) -
     }
 }
 
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-}
-
 struct WorkflowStore {
     dir: PathBuf,
 }
@@ -1015,61 +809,6 @@ struct WorkflowSummary {
     edge_count: usize,
 }
 
-/// I²C 预览请求仅描述一次可能的传输；它从不打开设备或建立远程会话。
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct I2cPreviewRequest {
-    node_id: String,
-    profile_id: String,
-    bus: String,
-    address: u8,
-    register: u16,
-    payload: Vec<u8>,
-    page_size: usize,
-    operation: I2cPreviewOperation,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-enum I2cPreviewOperation {
-    Read,
-    Write,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EepromPreviewRequest {
-    node_id: String,
-    profile_id: String,
-    bus: String,
-    address: u8,
-    register: u16,
-    payload: Vec<u8>,
-    page_size: usize,
-    map_id: String,
-    verify_after_write: bool,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct I2cExecuteRequest {
-    #[serde(flatten)]
-    preview: I2cPreviewRequest,
-    confirm_execution: bool,
-    ssh: SshExecutionBinding,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct SshExecutionBinding {
-    host: String,
-    #[serde(default = "default_ssh_port")]
-    port: u16,
-    #[serde(default = "default_ssh_username")]
-    username: String,
-    credential_ref: String,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct SshPasswordRegistrationRequest {
@@ -1081,32 +820,6 @@ struct SshPasswordRegistrationRequest {
 #[serde(rename_all = "camelCase")]
 struct SshPasswordRegistrationResponse {
     credential_ref: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EepromInspectRequest {
-    #[serde(flatten)]
-    preview: EepromPreviewRequest,
-    ssh: SshExecutionBinding,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct EepromExecuteRequest {
-    #[serde(flatten)]
-    preview: EepromPreviewRequest,
-    confirm_execution: bool,
-    expected_before_sha256: Option<String>,
-    ssh: SshExecutionBinding,
-}
-
-fn default_ssh_port() -> u16 {
-    22
-}
-
-fn default_ssh_username() -> String {
-    "root".to_owned()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1250,87 +963,6 @@ fn default_x5_tcp_port() -> u16 {
 }
 
 #[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ControlExecutionResult {
-    preview: ControlPreview,
-    execution: &'static str,
-    result: ControlExecutionPayload,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum ControlExecutionPayload {
-    I2c(I2cHelperResult),
-    Eeprom(EepromHelperResult),
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EepromInspectResponse {
-    preview: ControlPreview,
-    snapshot: EepromInspectSnapshotResponse,
-    result: EepromHelperResult,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EepromInspectSnapshotResponse {
-    key: String,
-    image_sha256: String,
-    target: EepromSnapshotTargetResponse,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EepromSnapshotTargetResponse {
-    node_id: String,
-    host: String,
-    port: u16,
-    username: String,
-    map_id: String,
-    bus: String,
-    address: u8,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ControlPreview {
-    target: ControlTarget,
-    operation: &'static str,
-    page_split_estimate: PageSplitEstimate,
-    requires_confirmation: bool,
-    execution: &'static str,
-    map_id: Option<String>,
-    verify_after_write: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ControlTarget {
-    node_id: String,
-    profile_id: String,
-    bus: String,
-    address: u8,
-    register: u16,
-    payload: Vec<u8>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PageSplitEstimate {
-    page_size: usize,
-    write_count: usize,
-    segments: Vec<PageSplitSegment>,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PageSplitSegment {
-    register: u16,
-    payload_length: usize,
-}
-
-#[derive(Debug, Serialize)]
 struct PreviewApiError {
     error: String,
 }
@@ -1385,7 +1017,6 @@ fn app_router(static_dir: PathBuf, workflow_dir: PathBuf) -> Router {
         control_runtime: Arc::new(ControlRuntime::production()),
         #[cfg(feature = "calibration-opencv")]
         calibration_backend: Arc::new(OpenCvCalibrationBackend),
-        eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
         engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
         ws_hub: Arc::new(ws_hub::WsHub::new()),
         graph_session: Arc::new(Mutex::new(workflow::seed_workflow_graph())),
@@ -1445,130 +1076,6 @@ pub(crate) fn control_dispatch(
                 let _ = request;
                 return Err("workflow-web was built without platform-ssh support".to_owned());
             }
-        }
-        "control.i2c.preview" => {
-            let req: I2cPreviewRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
-            let preview = build_i2c_preview(req).map_err(|e| e.error)?;
-            serde_json::to_value(preview).map_err(ws_ser_err)
-        }
-        "control.i2c.run" => {
-            let req: I2cExecuteRequest = serde_json::from_value(payload).map_err(ws_deser_err)?;
-            let preview = build_i2c_preview(req.preview).map_err(|e| e.error)?;
-            if preview.requires_confirmation && !req.confirm_execution {
-                return Err("I²C write execution requires confirmExecution=true".to_owned());
-            }
-            let result = state
-                .control_runtime
-                .execute_i2c(&preview, &req.ssh)
-                .map_err(|e| e.error)?;
-            serde_json::to_value(ControlExecutionResult {
-                preview,
-                execution: "completed",
-                result: ControlExecutionPayload::I2c(result),
-            })
-            .map_err(ws_ser_err)
-        }
-        "control.eeprom.preview" => {
-            let req: EepromPreviewRequest =
-                serde_json::from_value(payload).map_err(ws_deser_err)?;
-            let preview = build_eeprom_preview(req).map_err(|e| e.error)?;
-            serde_json::to_value(preview).map_err(ws_ser_err)
-        }
-        "control.eeprom.inspect" => {
-            let req: EepromInspectRequest =
-                serde_json::from_value(payload).map_err(ws_deser_err)?;
-            let preview = build_eeprom_preview(req.preview).map_err(|e| e.error)?;
-            let target = eeprom_snapshot_target(&preview, &req.ssh).map_err(|e| e.error)?;
-            let result = state
-                .control_runtime
-                .execute_eeprom(&preview, &req.ssh, EepromHelperAction::Inspect)
-                .map_err(|e| e.error)?;
-            let EepromHelperResult::Inspect(inspect) = &result else {
-                return Err("EEPROM inspect returned a non-inspect helper result".to_owned());
-            };
-            let key = target.node_id.clone();
-            let snapshot = EepromInspectSnapshot {
-                target: target.clone(),
-                image_sha256: inspect.state.image_sha256.clone(),
-                device: inspect.state.clone(),
-            };
-            let response = EepromInspectResponse {
-                preview,
-                snapshot: eeprom_snapshot_response(&key, &snapshot),
-                result,
-            };
-            state
-                .eeprom_inspects
-                .lock()
-                .map_err(|_| "EEPROM inspect snapshot state is unavailable".to_owned())?
-                .insert(key, snapshot);
-            serde_json::to_value(response).map_err(ws_ser_err)
-        }
-        "control.eeprom.run" => {
-            let req: EepromExecuteRequest =
-                serde_json::from_value(payload).map_err(ws_deser_err)?;
-            let preview = build_eeprom_preview(req.preview).map_err(|e| e.error)?;
-            if !req.confirm_execution {
-                return Err("EEPROM provision requires confirmExecution=true".to_owned());
-            }
-            let Some(expected_before_sha256) = req.expected_before_sha256.as_deref() else {
-                return Err(
-                    "EEPROM provision requires expectedBeforeSha256 from the latest inspect"
-                        .to_owned(),
-                );
-            };
-            if !is_sha256(expected_before_sha256) {
-                return Err(
-                    "expectedBeforeSha256 must contain 64 lowercase hex characters".to_owned(),
-                );
-            }
-            let target = eeprom_snapshot_target(&preview, &req.ssh).map_err(|e| e.error)?;
-            let snapshot = state
-                .eeprom_inspects
-                .lock()
-                .map_err(|_| "EEPROM inspect snapshot state is unavailable".to_owned())?
-                .get(&preview.target.node_id)
-                .cloned()
-                .ok_or_else(|| {
-                    "EEPROM provision requires a process-local inspect snapshot for this node"
-                        .to_owned()
-                })?;
-            if snapshot.target != target {
-                return Err(
-                    "EEPROM target changed after inspect; inspect the selected SSH/bus/map/address again"
-                        .to_owned(),
-                );
-            }
-            if snapshot.image_sha256 != expected_before_sha256 {
-                return Err(
-                    "expectedBeforeSha256 does not match the latest process-local inspect snapshot"
-                        .to_owned(),
-                );
-            }
-            let provision_request =
-                eeprom_provision_request_from_preview(&preview, &snapshot).map_err(|e| e.error)?;
-            let result = state
-                .control_runtime
-                .execute_eeprom(
-                    &preview,
-                    &req.ssh,
-                    EepromHelperAction::Provision {
-                        request: provision_request,
-                        expected_before_sha256: expected_before_sha256.to_owned(),
-                    },
-                )
-                .map_err(|e| e.error)?;
-            state
-                .eeprom_inspects
-                .lock()
-                .map_err(|_| "EEPROM inspect snapshot state is unavailable".to_owned())?
-                .remove(&preview.target.node_id);
-            serde_json::to_value(ControlExecutionResult {
-                preview,
-                execution: "completed",
-                result: ControlExecutionPayload::Eeprom(result),
-            })
-            .map_err(ws_ser_err)
         }
         #[cfg(feature = "calibration-opencv")]
         "control.calibration.solver.run" => {
@@ -1784,134 +1291,6 @@ fn into_calibration_request(
     Ok(calibration_request)
 }
 
-fn build_i2c_preview(
-    request: I2cPreviewRequest,
-) -> std::result::Result<ControlPreview, PreviewApiError> {
-    let target = ControlTarget {
-        node_id: request.node_id,
-        profile_id: request.profile_id,
-        bus: request.bus,
-        address: request.address,
-        register: request.register,
-        payload: request.payload,
-    };
-    validate_preview_target(&target)?;
-    let is_write = matches!(request.operation, I2cPreviewOperation::Write);
-    if is_write && target.payload.is_empty() {
-        return Err(PreviewApiError::bad_request(
-            "I²C write preview requires at least one payload byte",
-        ));
-    }
-    if !is_write && !target.payload.is_empty() {
-        return Err(PreviewApiError::bad_request(
-            "I²C read preview must not include a write payload",
-        ));
-    }
-    let page_split_estimate =
-        page_split_estimate(target.register, target.payload.len(), request.page_size)?;
-    Ok(ControlPreview {
-        target,
-        operation: if is_write { "write" } else { "read" },
-        page_split_estimate,
-        requires_confirmation: is_write,
-        execution: "preview-only",
-        map_id: None,
-        verify_after_write: None,
-    })
-}
-
-fn build_eeprom_preview(
-    request: EepromPreviewRequest,
-) -> std::result::Result<ControlPreview, PreviewApiError> {
-    let map_id = normalize_eeprom_map_id(&request.map_id)?;
-    let target = ControlTarget {
-        node_id: request.node_id,
-        profile_id: request.profile_id,
-        bus: request.bus,
-        address: request.address,
-        register: request.register,
-        payload: request.payload,
-    };
-    validate_preview_target(&target)?;
-    if target.payload.is_empty() {
-        return Err(PreviewApiError::bad_request(
-            "EEPROM provision preview requires at least one payload byte",
-        ));
-    }
-    let page_split_estimate =
-        page_split_estimate(target.register, target.payload.len(), request.page_size)?;
-    Ok(ControlPreview {
-        target,
-        operation: "provision",
-        page_split_estimate,
-        requires_confirmation: true,
-        execution: "preview-only",
-        map_id: Some(map_id),
-        verify_after_write: Some(request.verify_after_write),
-    })
-}
-
-fn validate_preview_target(target: &ControlTarget) -> std::result::Result<(), PreviewApiError> {
-    if target.node_id.trim().is_empty() {
-        return Err(PreviewApiError::bad_request("nodeId must not be empty"));
-    }
-    if target.profile_id.trim().is_empty() {
-        return Err(PreviewApiError::bad_request("profileId must not be empty"));
-    }
-    if target.bus.trim().is_empty() || target.bus.chars().any(char::is_control) {
-        return Err(PreviewApiError::bad_request(
-            "bus must be a non-empty printable identifier",
-        ));
-    }
-    if !(0x03..=0x77).contains(&target.address) {
-        return Err(PreviewApiError::bad_request(
-            "address must be a 7-bit I²C address in 0x03..=0x77",
-        ));
-    }
-    if target.payload.len() > 4096 {
-        return Err(PreviewApiError::bad_request(
-            "payload exceeds the 4096-byte preview limit",
-        ));
-    }
-    Ok(())
-}
-
-fn page_split_estimate(
-    register: u16,
-    payload_length: usize,
-    page_size: usize,
-) -> std::result::Result<PageSplitEstimate, PreviewApiError> {
-    if !(1..=256).contains(&page_size) {
-        return Err(PreviewApiError::bad_request(
-            "pageSize must be in 1..=256 bytes",
-        ));
-    }
-    let mut segments = Vec::new();
-    let mut next_register = usize::from(register);
-    let end_register = next_register
-        .checked_add(payload_length)
-        .ok_or_else(|| PreviewApiError::bad_request("payload register range overflows"))?;
-    if end_register > usize::from(u16::MAX) + 1 {
-        return Err(PreviewApiError::bad_request(
-            "payload exceeds the 16-bit register range",
-        ));
-    }
-    while next_register < end_register {
-        let page_remaining = page_size - (next_register % page_size);
-        let payload_length = page_remaining.min(end_register - next_register);
-        segments.push(PageSplitSegment {
-            register: next_register as u16,
-            payload_length,
-        });
-        next_register += payload_length;
-    }
-    Ok(PageSplitEstimate {
-        page_size,
-        write_count: segments.len(),
-        segments,
-    })
-}
-
 /// 编码一次 RGB 图像为 JPEG（engine_bridge viewer 帧推送复用）。
 fn encode_rgb_jpeg(rgb: &[u8], width: u32, height: u32, quality: u8) -> Result<Vec<u8>, String> {
     let mut jpeg = Vec::new();
@@ -2040,6 +1419,12 @@ impl WorkflowStore {
     }
 
     fn save(&self, graph: &WorkflowGraph) -> std::result::Result<(), (StatusCode, String)> {
+        validate_workflow(graph).map_err(|error| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("invalid workflow for save: {error}"),
+            )
+        })?;
         let path = self.path_for_id(&graph.id)?;
         fs::create_dir_all(&self.dir).map_err(internal_error)?;
         let tmp = path.with_extension("json.tmp");
@@ -2062,7 +1447,22 @@ impl WorkflowStore {
 
 fn read_workflow_file(path: &Path) -> std::result::Result<WorkflowGraph, (StatusCode, String)> {
     let raw = fs::read(path).map_err(internal_error)?;
-    let graph: WorkflowGraph = serde_json::from_slice(&raw).map_err(|error| {
+    let envelope: Value = serde_json::from_slice(&raw).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            format!("failed to parse workflow `{}`: {error}", path.display()),
+        )
+    })?;
+    if envelope.get("schemaVersion").and_then(Value::as_str) == Some("workflow.v1") {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "invalid workflow `{}`: unsupported workflow schema `workflow.v1`",
+                path.display()
+            ),
+        ));
+    }
+    let graph: WorkflowGraph = serde_json::from_value(envelope).map_err(|error| {
         (
             StatusCode::BAD_REQUEST,
             format!("failed to parse workflow `{}`: {error}", path.display()),
@@ -2120,93 +1520,33 @@ mod tests {
     use super::*;
 
     #[cfg(feature = "platform-ssh")]
-    use camera_toolbox_adapters::platforms::ssh_managed::{
-        MemorySshTransport, TransportCommandOutput,
-    };
-    #[cfg(feature = "platform-ssh")]
-    use camera_toolbox_app::{
-        EepromHelperOutput, EepromHelperRequest, EepromInspectResult, EepromRollbackState,
-        EepromWriteResult,
-    };
-
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_preview_payload() -> EepromPreviewRequest {
-        EepromPreviewRequest {
-            node_id: "eeprom-node".to_owned(),
-            profile_id: "x5-lab".to_owned(),
-            bus: "i2c-7".to_owned(),
-            address: 0x50,
-            register: 0x0010,
-            payload: vec![0x42; YG_STEREO_P24C64G_INTRINSICS_BYTES],
-            page_size: 32,
-            map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
-            verify_after_write: true,
-        }
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_ssh_binding() -> SshExecutionBinding {
-        SshExecutionBinding {
+    #[test]
+    fn canonical_pinned_ssh_target_rejects_missing_or_empty_key_and_strips_comments() {
+        let target = ControlTargetSpec {
             host: "camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            credential_ref: "session:test-key".to_owned(),
-        }
-    }
+            expected_host_key: None,
+        };
+        assert!(canonical_pinned_ssh_target(&target).is_err());
 
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_ssh_payload() -> serde_json::Value {
-        serde_json::json!({
-            "host": "camera.local",
-            "port": 22,
-            "username": "root",
-            "credentialRef": "session:test-key",
-        })
-    }
+        let target = ControlTargetSpec {
+            expected_host_key: Some(" ".to_owned()),
+            ..target
+        };
+        assert!(canonical_pinned_ssh_target(&target).is_err());
 
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_device_state(hash: char) -> EepromDeviceState {
-        EepromDeviceState {
-            image_sha256: hash.to_string().repeat(64),
-            flag_valid: true,
-            serial: EepromSerialState::Valid {
-                value: "2T02D2567K0042".to_owned(),
-            },
-        }
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_output(result: EepromHelperResult) -> TransportCommandOutput {
-        TransportCommandOutput {
-            stdout: serde_json::to_vec(&EepromHelperOutput::Success { result }).unwrap(),
-            stderr: Vec::new(),
-            exit_status: Some(0),
-            stdout_truncated: false,
-            stderr_truncated: false,
-        }
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    fn eeprom_state(memory: &Arc<MemorySshTransport>) -> AppState {
-        memory.allow_credential("session:test-key");
-        let resolver: Arc<dyn CredentialResolver> = memory.clone();
-        let transport: Arc<dyn SshTransportFactory> = memory.clone();
-        AppState {
-            workflow_store: Arc::new(WorkflowStore {
-                dir: std::env::temp_dir(),
-            }),
-            control_runtime: Arc::new(ControlRuntime::with_ssh_for_test(
-                resolver,
-                transport,
-                Arc::<[u8]>::from(b"test-helper".as_slice()),
-            )),
-            #[cfg(feature = "calibration-opencv")]
-            calibration_backend: Arc::new(OpenCvCalibrationBackend),
-            eeprom_inspects: Arc::new(Mutex::new(HashMap::new())),
-            engine_runtime: Arc::new(engine_api::EngineRuntime::new()),
-            ws_hub: Arc::new(ws_hub::WsHub::new()),
-            graph_session: Arc::new(Mutex::new(workflow::seed_workflow_graph())),
-        }
+        let target = ControlTargetSpec {
+            expected_host_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ trusted-camera".to_owned()),
+            ..target
+        };
+        let canonical = canonical_pinned_ssh_target(&target).expect("valid OpenSSH host key");
+        assert_eq!(
+            canonical.expected_host_key.as_deref(),
+            Some(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
+            )
+        );
     }
 
     #[test]
@@ -2263,45 +1603,41 @@ mod tests {
         let mut graph = crate::workflow::seed_workflow_graph();
         graph.id = "roundtrip".to_owned();
         graph.revision = "rev-test".to_owned();
+        let definition = crate::workflow::node_definition(crate::workflow::NodeKind::SshConnection);
+        graph.nodes.push(crate::workflow::WorkflowNode {
+            id: "ssh-pinned".to_owned(),
+            kind: crate::workflow::NodeKind::SshConnection,
+            title: "Pinned SSH".to_owned(),
+            position: crate::workflow::NodePosition { x: 0.0, y: 0.0 },
+            state: crate::workflow::NodeRuntimeState::Ready,
+            category: definition.category,
+            inputs: definition.inputs,
+            outputs: definition.outputs,
+            config: json!({
+                "host": "camera.local",
+                "port": "22",
+                "username": "root",
+                "expectedHostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ",
+                "credentialRef": "session:ssh-pinned"
+            }),
+        });
         store.save(&graph).expect("workflow saved");
 
         let loaded = store.load("roundtrip").expect("workflow loaded");
         assert_eq!(loaded.id, "roundtrip");
         assert_eq!(loaded.revision, "rev-test");
         assert_eq!(loaded.nodes.len(), graph.nodes.len());
+        assert_eq!(
+            loaded
+                .nodes
+                .iter()
+                .find(|node| node.id == "ssh-pinned")
+                .and_then(|node| node.config.get("expectedHostKey")),
+            Some(&json!(
+                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
+            ))
+        );
         fs::remove_dir_all(dir).ok();
-    }
-    #[test]
-    fn i2c_write_execution_splits_payload_on_page_boundaries() {
-        let preview = build_i2c_preview(I2cPreviewRequest {
-            node_id: "i2c-node".to_owned(),
-            profile_id: "x5-lab".to_owned(),
-            bus: "i2c-6".to_owned(),
-            address: 0x50,
-            register: 0x000e,
-            payload: vec![0xaa, 0xbb, 0xcc, 0xdd],
-            page_size: 4,
-            operation: I2cPreviewOperation::Write,
-        })
-        .expect("valid preview");
-
-        let I2cHelperAction::Transfer { transactions } =
-            i2c_action_from_preview(&preview).expect("valid action")
-        else {
-            panic!("expected transfer action");
-        };
-
-        assert_eq!(transactions.len(), 2);
-        assert_eq!(transactions[0].bus, 6);
-        assert_eq!(transactions[0].settle_ms, Some(5));
-        let I2cMessageData::Write { bytes } = &transactions[0].messages[0].data else {
-            panic!("expected first page write");
-        };
-        assert_eq!(bytes, &[0x00, 0x0e, 0xaa, 0xbb]);
-        let I2cMessageData::Write { bytes } = &transactions[1].messages[0].data else {
-            panic!("expected second page write");
-        };
-        assert_eq!(bytes, &[0x00, 0x10, 0xcc, 0xdd]);
     }
 
     #[cfg(feature = "calibration-opencv")]
@@ -2335,128 +1671,6 @@ mod tests {
     }
 
     #[test]
-    fn eeprom_run_path_requires_prior_inspect_hash() {
-        assert!(!is_sha256("A".repeat(64).as_str()));
-        assert!(is_sha256("a".repeat(64).as_str()));
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    #[test]
-    fn eeprom_update_request_reuses_inspected_serial_and_payload_gate() {
-        let preview = build_eeprom_preview(eeprom_preview_payload()).expect("valid preview");
-        let snapshot = EepromInspectSnapshot {
-            target: eeprom_snapshot_target(&preview, &eeprom_ssh_binding()).unwrap(),
-            image_sha256: "a".repeat(64),
-            device: eeprom_device_state('a'),
-        };
-
-        let request = eeprom_provision_request_from_preview(&preview, &snapshot).unwrap();
-
-        assert_eq!(request.map_id, YG_STEREO_P24C64G_V1_MAP_ID);
-        assert_eq!(request.mode, EepromProvisioningMode::UpdateCalibration);
-        assert_eq!(request.serial_number, "2T02D2567K0042");
-        assert_eq!(request.segments.len(), 1);
-        assert_eq!(request.segments[0].offset, 0x0010);
-        assert_eq!(
-            request.segments[0].bytes,
-            vec![0x42; YG_STEREO_P24C64G_INTRINSICS_BYTES]
-        );
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    #[test]
-    fn eeprom_update_request_rejects_empty_inspected_serial() {
-        let preview = build_eeprom_preview(eeprom_preview_payload()).expect("valid preview");
-        let mut snapshot = EepromInspectSnapshot {
-            target: eeprom_snapshot_target(&preview, &eeprom_ssh_binding()).unwrap(),
-            image_sha256: "a".repeat(64),
-            device: eeprom_device_state('a'),
-        };
-        snapshot.device.serial = EepromSerialState::Empty;
-
-        let error = eeprom_provision_request_from_preview(&preview, &snapshot).unwrap_err();
-
-        assert!(error.error.contains("existing valid serial"));
-    }
-
-    #[cfg(feature = "platform-ssh")]
-    #[test]
-    fn eeprom_inspect_then_provision_uses_same_snapshot_target() {
-        let memory = Arc::new(MemorySshTransport::new("host-key"));
-        let state = eeprom_state(&memory);
-        memory.set_command_output(eeprom_output(EepromHelperResult::Inspect(
-            EepromInspectResult {
-                state: eeprom_device_state('a'),
-                backup: vec![0; camera_toolbox_core::YG_STEREO_P24C64G_IMAGE_BYTES],
-            },
-        )));
-
-        let inspect = control_dispatch(
-            "control.eeprom.inspect",
-            serde_json::json!({
-                "nodeId": "eeprom-node",
-                "profileId": "x5-lab",
-                "bus": "i2c-7",
-                "address": 0x50,
-                "register": 0x0010,
-                "payload": vec![0x42; YG_STEREO_P24C64G_INTRINSICS_BYTES],
-                "pageSize": 32,
-                "mapId": YG_STEREO_P24C64G_V1_MAP_ID,
-                "verifyAfterWrite": true,
-                "ssh": eeprom_ssh_payload(),
-            }),
-            &state,
-        )
-        .expect("inspect succeeds");
-        assert_eq!(inspect["snapshot"]["imageSha256"], "a".repeat(64));
-
-        memory.set_command_output(eeprom_output(EepromHelperResult::Provision(
-            EepromWriteResult {
-                before: eeprom_device_state('a'),
-                after: eeprom_device_state('b'),
-                backup: vec![0; camera_toolbox_core::YG_STEREO_P24C64G_IMAGE_BYTES],
-                page_plan: Vec::new(),
-                bytewise_verified: true,
-                rollback: EepromRollbackState::NotRequired,
-            },
-        )));
-        let result = control_dispatch(
-            "control.eeprom.run",
-            serde_json::json!({
-                "nodeId": "eeprom-node",
-                "profileId": "x5-lab",
-                "bus": "i2c-7",
-                "address": 0x50,
-                "register": 0x0010,
-                "payload": vec![0x42; YG_STEREO_P24C64G_INTRINSICS_BYTES],
-                "pageSize": 32,
-                "mapId": YG_STEREO_P24C64G_V1_MAP_ID,
-                "verifyAfterWrite": true,
-                "confirmExecution": true,
-                "expectedBeforeSha256": "a".repeat(64),
-                "ssh": eeprom_ssh_payload(),
-            }),
-            &state,
-        )
-        .expect("provision succeeds");
-
-        assert_eq!(result["execution"], "completed");
-        let requests = memory.captured_stdin();
-        assert_eq!(requests.len(), 2);
-        let provision_request: EepromHelperRequest = serde_json::from_slice(&requests[1]).unwrap();
-        let EepromHelperAction::Provision {
-            request,
-            expected_before_sha256,
-        } = provision_request.action
-        else {
-            panic!("expected provision action");
-        };
-        assert_eq!(expected_before_sha256, "a".repeat(64));
-        assert_eq!(request.serial_number, "2T02D2567K0042");
-        assert_eq!(request.segments[0].offset, 0x0010);
-    }
-
-    #[test]
     fn workflow_store_delete_removes_saved_graph() {
         let dir =
             std::env::temp_dir().join(format!("workflow-store-delete-test-{}", next_revision()));
@@ -2478,23 +1692,105 @@ mod tests {
         assert!(!is_safe_workflow_id(""));
         assert!(is_safe_workflow_id("camera_toolbox-1"));
     }
+    #[test]
+    fn workflow_store_rejects_persisted_workflow_v1() {
+        let dir = std::env::temp_dir().join(format!("workflow-v1-test-{}", next_revision()));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("legacy.ctworkflow.json"),
+            br#"{"schemaVersion":"workflow.v1"}"#,
+        )
+        .unwrap();
+        let error = WorkflowStore { dir: dir.clone() }
+            .load("legacy")
+            .expect_err("v1 must not load");
+        assert_eq!(error.0, StatusCode::BAD_REQUEST);
+        assert!(error.1.contains("workflow.v1"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn before_image_digest_uses_the_app_canonical_representation() {
+        assert_eq!(
+            before_image_digest(b"camera-toolbox"),
+            "sha256:958421a9fe0d533e8e63a5f73d2e397107202258da1e9e1432f744e9d0c5e59c"
+        );
+    }
 
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn ssh_target_uses_password_session_without_host_key_pin() {
-        let binding = SshExecutionBinding {
-            host: "camera.local".to_owned(),
-            port: 22,
-            username: "root".to_owned(),
-            credential_ref: "session:test".to_owned(),
-        };
-        let target = ssh_target_from_binding(&binding).expect("password SSH target accepted");
-        assert_eq!(target.host, "camera.local");
-        assert_eq!(target.port, 22);
-        assert_eq!(target.username, "root");
-        assert!(target.expected_host_key.is_none());
+    fn ssh_revoke_removes_connection_but_retains_credential_for_reconnect() {
+        let runtime = ControlRuntime::production();
+        let reference = runtime
+            .register_password("ssh-node", "password".to_owned())
+            .unwrap();
+        let connection = SshConnection::new(
+            "connection-1",
+            ControlTargetSpec {
+                host: "camera.local".to_owned(),
+                port: 22,
+                username: "root".to_owned(),
+                expected_host_key: None,
+            },
+        );
+        runtime
+            .sessions
+            .lock()
+            .expect("session map")
+            .insert(connection.id().to_owned(), reference.clone());
+        let control = RemoteOperationControl::new(
+            camera_toolbox_app::RemoteTimeouts {
+                connect: std::time::Duration::from_secs(1),
+                idle: std::time::Duration::from_secs(1),
+                overall: std::time::Duration::from_secs(1),
+            },
+            camera_toolbox_app::DumpCancellation::default(),
+        )
+        .unwrap();
+        SshConnectionService::revoke(&runtime, &connection, control).unwrap();
+        assert!(
+            !runtime
+                .sessions
+                .lock()
+                .expect("session map")
+                .contains_key(connection.id())
+        );
+        assert!(
+            runtime
+                .password_credential_resolver
+                .has_session(&reference)
+                .unwrap()
+        );
     }
 
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn control_connect_rejects_missing_or_malformed_pinned_host_key_before_network_io() {
+        let runtime = ControlRuntime::production();
+        for expected_host_key in [None, Some("not-an-openssh-public-key".to_owned())] {
+            let target = ControlTargetSpec {
+                host: "192.0.2.1".to_owned(),
+                port: 22,
+                username: "root".to_owned(),
+                expected_host_key,
+            };
+            let control = RemoteOperationControl::new(
+                camera_toolbox_app::RemoteTimeouts {
+                    connect: std::time::Duration::from_secs(1),
+                    idle: std::time::Duration::from_secs(1),
+                    overall: std::time::Duration::from_secs(1),
+                },
+                camera_toolbox_app::DumpCancellation::default(),
+            )
+            .unwrap();
+            let error =
+                SshConnectionService::connect(&runtime, &target, "session:missing", control)
+                    .expect_err(
+                        "invalid host keys must be rejected before credential or network use",
+                    );
+            assert!(error.contains("expected host key"));
+        }
+    }
     #[cfg(feature = "platform-ssh")]
     #[test]
     fn credential_ref_accepts_only_password_session_reference() {

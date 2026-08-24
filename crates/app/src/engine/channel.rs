@@ -4,8 +4,9 @@
 //! 帧流在 mailbox 满时丢弃「新到」的帧（`try_send` 失败即丢新），控制命令不占帧容量，避免被高频帧流堵住。
 
 use std::sync::{
+    Arc,
     atomic::{AtomicU64, AtomicUsize, Ordering},
-    mpsc, Arc,
+    mpsc,
 };
 
 use super::{node::NodeAction, packet::DataPacket, spec::PortId};
@@ -13,8 +14,10 @@ use super::{node::NodeAction, packet::DataPacket, spec::PortId};
 /// 引擎或上游节点投递给节点 actor 的消息。
 #[derive(Debug)]
 pub enum NodeMessage {
-    /// 上游数据到达某个输入端口。
+    /// 帧输入占受限容量；满时允许丢弃新帧。
     Input { port: PortId, packet: DataPacket },
+    /// 离散配置/计划/typed-field 输入走无界可靠 lane，绝不参与帧容量记账。
+    ReliableInput { port: PortId, packet: DataPacket },
     /// 控制动作（连接/断开/触发/arm/disarm）。
     Action(NodeAction),
     /// 在 actor 线程安全应用配置；sender 用于同步返回钩子结果。
@@ -159,6 +162,20 @@ mod tests {
         assert!(tx.try_send(input("a", "first")).is_ok());
         assert_eq!(tx.try_send(input("a", "second")), Err(ChannelFull));
         assert!(matches!(rx.recv(), Ok(NodeMessage::Input { port, .. }) if port == "a"));
+    }
+    #[test]
+    fn reliable_input_does_not_consume_or_underflow_frame_capacity() {
+        let (tx, rx) = create_mailbox(1);
+        tx.try_send(input("frame", "first")).unwrap();
+        tx.send(NodeMessage::ReliableInput {
+            port: "config".to_owned(),
+            packet: json("static"),
+        })
+        .unwrap();
+        assert!(matches!(rx.recv(), Ok(NodeMessage::Input { .. })));
+        assert!(matches!(rx.recv(), Ok(NodeMessage::ReliableInput { .. })));
+        tx.try_send(input("frame", "second"))
+            .expect("receiving reliable input must not poison frame capacity");
     }
 
     #[test]

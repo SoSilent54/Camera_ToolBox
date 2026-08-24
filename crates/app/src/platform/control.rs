@@ -22,6 +22,50 @@ pub struct ControlTargetSpec {
     pub expected_host_key: Option<String>,
 }
 
+/// 已建立的 SSH 会话运行时句柄。credential 只在 connector 内部使用，句柄不保存密码或私钥。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SshConnection {
+    id: String,
+    target: ControlTargetSpec,
+}
+
+impl SshConnection {
+    #[must_use]
+    pub fn new(id: impl Into<String>, target: ControlTargetSpec) -> Self {
+        Self {
+            id: id.into(),
+            target,
+        }
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    #[must_use]
+    pub const fn target(&self) -> &ControlTargetSpec {
+        &self.target
+    }
+}
+
+/// SSH 会话建立与撤销端口。实现必须把 credential ref 解析为进程内 secret，不能把 secret 回传给 app。
+pub trait SshConnectionService: Send + Sync {
+    fn connect(
+        &self,
+        target: &ControlTargetSpec,
+        credential_ref: &str,
+        control: RemoteOperationControl,
+    ) -> Result<SshConnection, String>;
+
+    /// 立即撤销会话句柄及其进程内 credential binding；撤销后任何下游 I²C 操作必须拒绝。
+    fn revoke(
+        &self,
+        connection: &SshConnection,
+        control: RemoteOperationControl,
+    ) -> Result<(), String>;
+}
+
 /// Hex Arm 可连接目标与安全控制配置。
 ///
 /// app 层只保留适配器实现所需的传输与超时语义；默认关闭控制，避免工作流配置
