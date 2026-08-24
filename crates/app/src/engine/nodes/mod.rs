@@ -58,11 +58,7 @@ pub use control_nodes::{
     SshSessionFactory, SshSessionNode, X5233DriverFactory, X5233DriverNode,
 };
 pub use detection::{ChessboardDetectorFactory, ChessboardDetectorNode};
-pub use i2c_plan_nodes::{
-    I2cInspectorFactory, I2cInspectorNode, I2cTaskBuilderFactory, I2cTaskBuilderNode,
-    I2cTaskExecutorFactory, I2cTaskExecutorNode, I2cWriteApprovalFactory, I2cWriteApprovalNode,
-    SshConnectionFactory, SshConnectionNode,
-};
+pub use i2c_plan_nodes::{I2cTaskBuilderFactory, I2cTaskBuilderNode, SshConnectionFactory, SshConnectionNode};
 pub use local_source::{LocalFileSourceFactory, LocalFileSourceNode};
 pub use pose_estimator::{PoseEstimatorFactory, PoseEstimatorNode};
 pub use rtsp_source::{RtspSourceFactory, RtspSourceNode};
@@ -106,9 +102,6 @@ pub fn register_builtin(registry: &mut NodeRegistry) {
     registry.register(Box::new(SshConnectionFactory));
     registry.register(Box::new(StructuredFieldExtractorFactory));
     registry.register(Box::new(I2cTaskBuilderFactory));
-    registry.register(Box::new(I2cInspectorFactory));
-    registry.register(Box::new(I2cWriteApprovalFactory));
-    registry.register(Box::new(I2cTaskExecutorFactory));
 }
 
 #[cfg(test)]
@@ -150,9 +143,6 @@ mod tests {
             "sshConnection",
             "structuredFieldExtractor",
             "i2cTaskBuilder",
-            "i2cWriteApproval",
-            "i2cExecutor",
-            "i2cInspector",
         ] {
             assert!(kinds.contains(&expected), "missing node kind {expected}");
         }

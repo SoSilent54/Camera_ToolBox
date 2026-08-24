@@ -90,7 +90,7 @@ export function SshConnectionNode({ data, selected }: NodeProps) {
   </Shell>;
 }
 
-function extractorOutputs(config: Record<string, unknown>): ExtractorOutput[] {
+function configuredOutputs(config: Record<string, unknown>): ExtractorOutput[] {
   const raw = config.outputs;
   if (!Array.isArray(raw)) return [];
   return raw.map((entry, index) => {
@@ -107,20 +107,20 @@ function extractorOutputs(config: Record<string, unknown>): ExtractorOutput[] {
 export function StructuredFieldExtractorNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
-  const persisted = extractorOutputs(node.config);
+  const persisted = configuredOutputs(node.config);
   const [outputs, setOutputs] = useState<ExtractorOutput[]>(persisted);
   useEffect(() => setOutputs(persisted), [JSON.stringify(persisted)]);
   const update = (index: number, key: keyof ExtractorOutput, value: string) => setOutputs((current) => current.map((output, currentIndex) => currentIndex === index ? { ...output, [key]: value } as ExtractorOutput : output));
-  const save = () => nodeData.onPlanInterfaceChange?.(node.id, { outputs });
+  const save = () => nodeData.onNodeConfigPatch?.(node.id, { outputs });
   return <Shell data={data} selected={selected}>
-    <span className="node-hint">Each output is an RFC6901 pointer to a complete primitive datum. Save updates this node and the connected Builder atomically.</span>
+    <span className="node-hint">Each output is an RFC6901 pointer to a complete primitive datum.</span>
     {outputs.map((output, index) => <div className="node-config-fields" key={index}>
       <label className="node-config-field"><code>Output id</code><input className="nodrag nowheel" value={output.id} onChange={(event) => update(index, 'id', event.target.value)} /></label>
       <label className="node-config-field"><code>JSON pointer</code><input className="nodrag nowheel" value={output.pointer} onChange={(event) => update(index, 'pointer', event.target.value)} /></label>
       <label className="node-config-field"><code>Primitive type</code><select className="nodrag nowheel" value={output.type} onChange={(event) => update(index, 'type', event.target.value)}>{PRIMITIVE_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}</select></label>
       <button className="nodrag nowheel" type="button" onClick={() => setOutputs((current) => current.filter((_output, currentIndex) => currentIndex !== index))}>Remove</button>
     </div>)}
-    <div className="node-actions"><button className="nodrag nowheel" type="button" onClick={() => setOutputs((current) => [...current, { id: `field${current.length + 1}`, pointer: '/fields/0', type: 'f64' }])}>Add field</button><button className="nodrag nowheel" type="button" disabled={!nodeData.onPlanInterfaceChange} onClick={save}>Save interface</button></div>
+    <div className="node-actions"><button className="nodrag nowheel" type="button" onClick={() => setOutputs((current) => [...current, { id: `field${current.length + 1}`, pointer: '/fields/0', type: 'f64' }])}>Add field</button><button className="nodrag nowheel" type="button" disabled={!nodeData.onNodeConfigPatch} onClick={save}>Save interface</button></div>
   </Shell>;
 }
 
@@ -142,15 +142,19 @@ export function I2cTaskBuilderNode({ data, selected }: NodeProps) {
   const parsedBus = Number(bus);
   const busValid = Number.isInteger(parsedBus) && parsedBus >= 0 && parsedBus <= 0xffff_ffff;
   const mapValid = mapMode === 'builtin' ? mapId.trim().length > 0 : mapYaml.trim().length > 0;
-  const connected = new Set(nodeData.connectedInputPortIds);
+  const configDirty = mapMode !== savedMode || mapId !== savedMapId || mapYaml !== savedMapYaml || bus !== configText(node, 'bus', '0');
+  const actionDisabled = nodeData.runtimeState === 'disabled' || Boolean(nodeData.actionPending) || !nodeData.onNodeAction || !busValid || !mapValid || configDirty;
+  const readReport = i2cReadReport(nodeData.runtimeOutput);
+  const report = executionReport(nodeData.runtimeOutput);
   const save = () => {
     if (!busValid || !mapValid) return;
     const config = mapMode === 'builtin'
       ? { mapMode, mapId: mapId.trim(), bus: parsedBus }
       : { mapMode, mapYaml, bus: parsedBus };
-    nodeData.onPlanInterfaceChange?.(node.id, config);
+    nodeData.onNodeConfigPatch?.(node.id, config);
   };
   return <Shell data={data} selected={selected}>
+    <span className="node-hint">Inputs: packet, serial.number, connection. Outputs: readReport, report.</span>
     <label className="node-config-field"><code>Map mode</code><select className="nodrag nowheel" value={mapMode} onChange={(event) => setMapMode(event.target.value as 'builtin' | 'custom')}><option value="builtin">Built-in map</option><option value="custom">Custom YAML</option></select></label>
     {mapMode === 'builtin'
       ? <label className="node-config-field"><code>Map ID</code><input className="nodrag nowheel" value={mapId} onChange={(event) => setMapId(event.target.value)} /></label>
@@ -158,116 +162,10 @@ export function I2cTaskBuilderNode({ data, selected }: NodeProps) {
     <label className="node-config-field"><code>Bus</code><input className="nodrag nowheel" type="number" min="0" max="4294967295" value={bus} onChange={(event) => setBus(event.target.value)} /></label>
     {!busValid ? <span className="node-hint">Bus must be an unsigned 32-bit integer.</span> : null}
     {mapMode === 'custom' ? <span className="node-hint">YAML is submitted verbatim; leading lines and indentation are retained so compiler line/column diagnostics match this editor.</span> : null}
-    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={!busValid || !mapValid || !nodeData.onPlanInterfaceChange} onClick={save}>Save map interface</button></div>
-    <strong>Typed input slots</strong>
-    <div className="node-config-fields">{node.inputs.map((port) => <div className="node-hint" key={port.id}><code>{port.label}</code> · {port.kind} · {connected.has(port.id) ? 'connected' : 'connectable'}</div>)}</div>
-    <span className="node-hint">The selected map owns these static typed-field inputs. Saving replaces the Builder interface atomically only after the backend compiles the map and validates every retained edge.</span>
+    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={!busValid || !mapValid || !configDirty || !nodeData.onNodeConfigPatch} onClick={save}>Apply map configuration</button><button className="nodrag nowheel" type="button" disabled={actionDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'read')}>{nodeData.actionPending ? 'Reading…' : 'Read'}</button><button className="nodrag nowheel" type="button" disabled={actionDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'write')}>{nodeData.actionPending ? 'Writing…' : 'Write'}</button></div>
+    {readReport ? <div className="node-config-fields"><strong>Read report</strong><span className="node-hint">Image SHA-256: {readReport.imageSha256}</span><span className="node-hint">Byte length: {readReport.byteLength}</span><span className="node-hint">Valid: {readReport.valid}</span><span className="node-hint">Error: {readReport.error}</span></div> : null}
+    {report ? <div className="node-config-fields"><strong>Execution report</strong><span className="node-hint">Final verification: {report.finalVerified}</span><span className="node-hint">Pages: {report.pageCount}</span><span className="node-hint">Error: {report.error}</span>{report.pages.map((page) => <span className="node-hint" key={page.offset}>Offset {page.offset}: expected {page.expectedHex}; readback {page.readbackHex ?? 'unavailable'}; error {page.error ?? 'none'}</span>)}</div> : null}
   </Shell>;
-}
-
-/** Inspector 的只读 snapshot 是审批按钮前的唯一设备状态证据。 */
-export function I2cInspectorNode({ data, selected }: NodeProps) {
-  const nodeData = data as FlowNodeData;
-  const snapshot = inspectSnapshot(nodeData.runtimeOutput);
-  return <Shell data={data} selected={selected}>
-    <span className="node-hint">Connect SSH, then wire the Builder inspect plan. Inspection is read-only and starts only when both inputs are available.</span>
-    {snapshot ? <InspectAudit snapshot={snapshot} /> : <span className="node-hint">No validated inspect snapshot yet.</span>}
-  </Shell>;
-}
-
-/** 审批必须同时看见候选写计划和同一次 inspect 的绑定快照，才允许授权。 */
-export function I2cWriteApprovalNode({ data, selected }: NodeProps) {
-  const nodeData = data as FlowNodeData;
-  const node = nodeData.workflowNode;
-  const confirmed = node.config.confirmWrite === true;
-  const [draftConfirmed, setDraftConfirmed] = useState(confirmed);
-  useEffect(() => setDraftConfirmed(confirmed), [confirmed]);
-  const candidate = candidatePlan(nodeData.inputRuntimeOutputs?.candidateWritePlan);
-  const snapshot = inspectSnapshot(nodeData.inputRuntimeOutputs?.snapshot);
-  const configPending = draftConfirmed !== confirmed;
-  const evidenceMatches = candidate !== undefined && snapshot !== undefined
-    && candidate.mapId === snapshot.mapId
-    && candidate.mapDigest === snapshot.mapDigest
-    && candidate.target === snapshot.target;
-  const disabled = nodeData.runtimeState === 'disabled' || Boolean(nodeData.actionPending) || !nodeData.onNodeAction || configPending || !evidenceMatches;
-  return <Shell data={data} selected={selected}>
-    <label className="node-config-field"><span><code>confirmWrite</code></span><input className="nodrag nowheel" type="checkbox" checked={draftConfirmed} onChange={(event) => { setDraftConfirmed(event.target.checked); nodeData.onNodeConfigChange?.(node.id, 'confirmWrite', event.target.checked); }} /></label>
-    <span className="node-hint">Changing this persisted confirmation invalidates any received candidate/snapshot. Refresh inspection before authorizing.</span>
-    {candidate ? <CandidateAudit candidate={candidate} /> : <span className="node-hint">Waiting for a candidate map/target/page plan.</span>}
-    {snapshot ? <InspectAudit snapshot={snapshot} /> : <span className="node-hint">Waiting for a validated inspector target/hash/device state.</span>}
-    {candidate && snapshot && !evidenceMatches ? <span className="node-hint">Candidate and inspector evidence do not describe the same map target; authorization remains disabled.</span> : null}
-    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={disabled || !draftConfirmed} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>{nodeData.actionPending ? 'Authorizing…' : 'Authorize write'}</button></div>
-  </Shell>;
-}
-
-type CandidatePlanAudit = {
-  mapId: string;
-  mapDigest: string;
-  planDigest: string;
-  target: string;
-  pages: Array<{ offset: number; byteLength: number; bytesHex: string }>;
-  totalBytes: number;
-  verifyAfterWrite: boolean;
-};
-
-type InspectSnapshotAudit = {
-  connectionId: string;
-  mapId: string;
-  mapDigest: string;
-  target: string;
-  beforeImageSha256: string;
-  deviceState: string;
-};
-
-function candidatePlan(value: unknown): CandidatePlanAudit | undefined {
-  const record = recordValue(value);
-  if (!record || record.type !== 'i2c.candidate-write-plan.v1') return undefined;
-  const pages = Array.isArray(record.pages) ? record.pages.flatMap((page) => {
-    const pageRecord = recordValue(page);
-    const offset = pageRecord && numberValue(pageRecord.offset);
-    const byteLength = pageRecord && numberValue(pageRecord.byteLength);
-    const bytesHex = pageRecord && stringValue(pageRecord.bytesHex);
-    return offset === undefined || byteLength === undefined || !bytesHex ? [] : [{ offset, byteLength, bytesHex }];
-  }) : [];
-  const mapId = stringValue(record.mapId);
-  const mapDigest = stringValue(record.mapDigest);
-  const planDigest = stringValue(record.planDigest);
-  const target = stringValue(record.target);
-  const totalBytes = numberValue(record.totalBytes);
-  if (!mapId || !mapDigest || !planDigest || !target || totalBytes === undefined || pages.length === 0) return undefined;
-  return { mapId, mapDigest, planDigest, target, pages, totalBytes, verifyAfterWrite: record.verifyAfterWrite === true };
-}
-
-function inspectSnapshot(value: unknown): InspectSnapshotAudit | undefined {
-  const record = recordValue(value);
-  if (!record || record.type !== 'i2c.inspect-snapshot.v1') return undefined;
-  const connectionId = stringValue(record.connectionId);
-  const mapId = stringValue(record.mapId);
-  const mapDigest = stringValue(record.mapDigest);
-  const target = stringValue(record.target);
-  const beforeImageSha256 = stringValue(record.beforeImageSha256);
-  const deviceState = stringValue(record.deviceState);
-  return connectionId && mapId && mapDigest && target && beforeImageSha256 && deviceState
-    ? { connectionId, mapId, mapDigest, target, beforeImageSha256, deviceState }
-    : undefined;
-}
-
-function CandidateAudit({ candidate }: { candidate: CandidatePlanAudit }) {
-  return <div className="node-config-fields"><strong>Candidate write plan</strong>
-    <span className="node-hint">Map: {candidate.mapId}</span><span className="node-hint">Target: {candidate.target}</span>
-    <span className="node-hint">Map digest: {candidate.mapDigest}</span><span className="node-hint">Plan digest: {candidate.planDigest}</span>
-    <span className="node-hint">Pages: {candidate.pages.map((page) => `offset ${page.offset}, ${page.byteLength} bytes (${page.bytesHex})`).join('; ')}</span>
-    <span className="node-hint">Bytes: {candidate.totalBytes}; readback: {candidate.verifyAfterWrite ? 'required' : 'not required'}</span>
-  </div>;
-}
-
-function InspectAudit({ snapshot }: { snapshot: InspectSnapshotAudit }) {
-  return <div className="node-config-fields"><strong>Validated inspector snapshot</strong>
-    <span className="node-hint">Connection: {snapshot.connectionId}; target: {snapshot.target}</span>
-    <span className="node-hint">Map: {snapshot.mapId}; digest: {snapshot.mapDigest}</span>
-    <span className="node-hint">Before-image SHA-256: {snapshot.beforeImageSha256}</span>
-    <span className="node-hint">Device state: {snapshot.deviceState}</span>
-  </div>;
 }
 
 function recordValue(value: unknown): Record<string, unknown> | undefined {
@@ -280,6 +178,17 @@ function stringValue(value: unknown): string | undefined {
 
 function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+function i2cReadReport(output: unknown): { imageSha256: string; byteLength: string; valid: string; error: string } | undefined {
+  const report = recordValue(output);
+  if (!report || report.type !== 'i2c.read-report.v1') return undefined;
+  return {
+    imageSha256: stringValue(report.imageSha256) ?? 'unavailable',
+    byteLength: typeof report.byteLength === 'number' ? String(report.byteLength) : 'unknown',
+    valid: report.valid === true ? 'yes' : 'no',
+    error: stringValue(report.error) ?? 'none',
+  };
 }
 
 function executionReport(output: unknown): { finalVerified: string; pageCount: string; error: string; pages: Array<{ offset: number; expectedHex: string; readbackHex?: string; error?: string }> } | undefined {
@@ -296,20 +205,7 @@ function executionReport(output: unknown): { finalVerified: string; pageCount: s
   return {
     finalVerified: report.finalVerified === true ? 'passed' : 'not verified',
     pageCount: typeof report.pageCount === 'number' ? String(report.pageCount) : 'unknown',
-    error: typeof report.error === 'string' && report.error ? report.error : 'none',
+    error: stringValue(report.error) ?? 'none',
     pages,
   };
-}
-
-/** Executor 只接受 SSH 与授权计划；写入结果始终以运行时 report 摘要呈现。 */
-export function I2cExecutorNode({ data, selected }: NodeProps) {
-  const nodeData = data as FlowNodeData;
-  const node = nodeData.workflowNode;
-  const report = executionReport(nodeData.runtimeOutput);
-  const disabled = nodeData.runtimeState === 'disabled' || Boolean(nodeData.actionPending) || !nodeData.onNodeAction;
-  return <Shell data={data} selected={selected}>
-    <span className="node-hint">Executes only an authorized plan. Each page is read back; no rollback is attempted on failure.</span>
-    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={disabled} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>{nodeData.actionPending ? 'Executing…' : 'Execute authorized write'}</button></div>
-    {report ? <div className="node-config-fields"><strong>Execution report</strong><span className="node-hint">Final verification: {report.finalVerified}</span><span className="node-hint">Pages: {report.pageCount}</span><span className="node-hint">Error: {report.error}</span>{report.pages.map((page) => <span className="node-hint" key={page.offset}>Offset {page.offset}: expected {page.expectedHex}; readback {page.readbackHex ?? 'unavailable'}; error {page.error ?? 'none'}</span>)}</div> : null}
-  </Shell>;
 }

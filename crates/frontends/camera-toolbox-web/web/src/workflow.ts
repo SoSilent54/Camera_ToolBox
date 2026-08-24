@@ -32,10 +32,7 @@ export type NodeKind =
   | 'poseGuide'
   | 'structuredFieldExtractor'
   | 'serialField'
-  | 'i2cTaskBuilder'
-  | 'i2cInspector'
-  | 'i2cWriteApproval'
-  | 'i2cExecutor';
+  | 'i2cTaskBuilder';
 
 export type NodeCategory = 'workspace' | 'source' | 'media' | 'viewer' | 'calibration' | 'control' | 'diagnostics';
 export type NodeRuntimeState = 'idle' | 'ready' | 'running' | 'warning' | 'error';
@@ -70,10 +67,7 @@ export type PortKind =
   | 'command.capture'
   | 'data.structured.packet.v1'
   | 'ssh.connection.v1'
-  | 'i2c.inspect-plan.v1'
-  | 'i2c.candidate-write-plan.v1'
-  | 'i2c.inspect-snapshot.v1'
-  | 'i2c.authorized-write-plan.v1'
+  | 'i2c.read-report.v1'
   | 'i2c.execution-report.v1'
   | `data.field.${'bool' | 'u8' | 'i8' | 'u16' | 'i16' | 'u32' | 'i32' | 'u64' | 'i64' | 'f32' | 'f64' | 'str' | 'bytes'}.v1`
   | 'status.metrics';
@@ -187,12 +181,6 @@ export interface SshPasswordRegistration {
   credentialRef: string;
 }
 
-/** 原子动态端口更新的后端响应；成功时 graph 已完成候选校验和运行时图替换。 */
-export interface ExtractorTaskBuilderInterfaceUpdate {
-  graph: WorkflowGraph;
-  candidatePortDiff: unknown[];
-  diagnostics: string[];
-}
 export interface CalibrationImageSize {
   width: number;
   height: number;
@@ -263,6 +251,8 @@ export type NodeActionName =
   | 'arm'
   | 'disarm'
   | 'clear'
+  | 'read'
+  | 'write'
   | DatasetSampleActionName
   | 'probe'
   | 'status'
@@ -346,8 +336,6 @@ export interface FlowNodeData extends Record<string, unknown> {
   actionPending?: boolean;
   /** `runtime.node.output` 返回的最新可序列化输出；不写回工作流图。 */
   runtimeOutput?: unknown;
-  /** 已接入输入端口的最新运行时输出；只用于显示和安全闸，不持久化。 */
-  inputRuntimeOutputs?: Readonly<Record<string, unknown>>;
   /** 由节点类型或配置显式声明的可用动作。 */
   availableActions?: readonly NodeActionControl[];
   onRtspUrlChange?: (nodeId: string, url: string) => void;
@@ -358,10 +346,6 @@ export interface FlowNodeData extends Record<string, unknown> {
   onNodeAction?: (nodeId: string, action: NodeActionName, payload?: DatasetSampleActionPayload) => void;
   /** 拉取节点最近一次输出；无输出时保留当前摘要。 */
   onRefreshNodeOutput?: (nodeId: string) => void;
-  /** 仅由 extractor/task builder 专用 UI 使用，后端原子重建两者的动态端口。 */
-  onPlanInterfaceChange?: (nodeId: string, config: Record<string, unknown>) => void;
-  /** 当前入边已占用的 typed-field 槽位；用于在 Builder 中呈现可连线状态。 */
-  connectedInputPortIds?: readonly string[];
 }
 
 export interface EdgePulseView {
@@ -472,20 +456,6 @@ export async function registerSshPassword(nodeId: string, password: string): Pro
   return request('control.ssh.password', { nodeId, password });
 }
 
-/** 同时提交 extractor 输出和 builder 配置，避免任一动态端口更新留下无效中间图。 */
-export async function updateExtractorAndTaskBuilderInterface(
-  extractorNodeId: string,
-  extractorOutputs: unknown[],
-  taskBuilderNodeId: string,
-  taskBuilderConfig: Record<string, unknown>,
-): Promise<ExtractorTaskBuilderInterfaceUpdate> {
-  return request('graph.updateExtractorAndTaskBuilderInterface', {
-    extractorNodeId,
-    extractorOutputs,
-    taskBuilderNodeId,
-    taskBuilderConfig,
-  });
-}
 
 
 

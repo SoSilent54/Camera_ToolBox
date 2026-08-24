@@ -164,52 +164,15 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
             }
             value
         }
-        DataPacket::I2cInspectPlan(plan) => json!({
-            "type": "i2c.inspect-plan.v1",
-            "mapId": plan.map_id,
-            "mapDigest": plan.map_digest,
-            "target": format!("{:?}", plan.target),
-            "readRangeCount": plan.read_ranges.len(),
-        }),
-        DataPacket::I2cCandidateWritePlan(plan) => {
-            let pages = plan
-                .pages
-                .iter()
-                .map(|page| json!({
-                    "offset": page.offset,
-                    "byteLength": page.bytes.len(),
-                    "bytesHex": page.bytes.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
-                }))
-                .collect::<Vec<_>>();
-            json!({
-                "type": "i2c.candidate-write-plan.v1",
-                "mapId": plan.map_id,
-                "mapDigest": plan.map_digest,
-                "planDigest": plan.plan_digest,
-                "target": format!("{:?}", plan.target),
-                "pages": pages,
-                "pageCount": plan.pages.len(),
-                "totalBytes": plan.pages.iter().map(|page| page.bytes.len()).sum::<usize>(),
-                "verifyAfterWrite": plan.verify_after_write,
-            })
-        }
-        DataPacket::I2cInspectSnapshot(snapshot) => json!({
-            "type": "i2c.inspect-snapshot.v1",
-            "connectionId": snapshot.connection_id,
-            "mapId": snapshot.map_id,
-            "mapDigest": snapshot.map_digest,
-            "target": format!("{:?}", snapshot.target),
-            "beforeImageSha256": snapshot.before_image_sha256,
-            "deviceState": "map-required fixed bytes, checksums, and serial state validated",
-        }),
-        DataPacket::I2cAuthorizedWritePlan(plan) => json!({
-            "type": "i2c.authorized-write-plan.v1",
-            "connectionId": plan.connection_id,
-            "expectedBeforeSha256": plan.expected_before_sha256,
-            "mapId": plan.candidate.map_id,
-            "mapDigest": plan.candidate.map_digest,
-            "planDigest": plan.candidate.plan_digest,
-            "pageCount": plan.candidate.pages.len(),
+        DataPacket::I2cReadReport(report) => json!({
+            "type": "i2c.read-report.v1",
+            "mapId": report.map_id,
+            "mapDigest": report.map_digest,
+            "target": format!("{:?}", report.target),
+            "imageSha256": report.image_sha256,
+            "byteLength": report.byte_len,
+            "valid": report.valid,
+            "error": report.error,
         }),
         DataPacket::I2cExecutionReport(report) => {
             let pages = report
@@ -319,10 +282,12 @@ pub(crate) fn parse_action_str(
         | "open_rtsp_all"
         | "close_rtsp"
         | "initialize_api_control"
-        | "calibrate"
+        |         "calibrate"
         | "clear_parking_stop"
         | "zero_current"
-        | "send_joint_positions" => Ok(NodeAction::Custom {
+        | "send_joint_positions"
+        | "read"
+        | "write" => Ok(NodeAction::Custom {
             name: action.to_owned(),
             payload,
         }),

@@ -39,7 +39,6 @@ import {
   replaceGraph,
   saveWorkflow,
   patchGraphNode,
-  updateExtractorAndTaskBuilderInterface,
   updateGraphNodePosition,
   updateGraphNodePositions,
   validateConnectionKinds,
@@ -65,10 +64,7 @@ import {
   CalibrationWorkflowNode,
   DatasetCollectorNode,
   GenericWorkflowNode,
-  I2cExecutorNode,
-  I2cInspectorNode,
   I2cTaskBuilderNode,
-  I2cWriteApprovalNode,
   NodeLibraryItem,
   RtspSourceNode,
   SshConnectionNode,
@@ -148,9 +144,6 @@ const nodeTypes = Object.fromEntries([
   ['hexArmDevice', HexArmDeviceNode],
   ['structuredFieldExtractor', StructuredFieldExtractorNode],
   ['i2cTaskBuilder', I2cTaskBuilderNode],
-  ['i2cInspector', I2cInspectorNode],
-  ['i2cWriteApproval', I2cWriteApprovalNode],
-  ['i2cExecutor', I2cExecutorNode],
   ['viewer', ViewerNode],
   ['calibrationSolver', CalibrationSolverNode],
   ['calibrationBoardParams', CalibrationParameterNode],
@@ -439,45 +432,6 @@ export function App() {
     [commitGraph],
   );
 
-  const handlePlanInterfaceChange = useCallback((nodeId: string, config: Record<string, unknown>) => {
-    const current = graphRef.current;
-    const changed = current?.nodes.find((node) => node.id === nodeId);
-    if (!current || !changed) {
-      pushEvent('无法更新接口：当前图或节点不存在');
-      return;
-    }
-    const extractors = current.nodes.filter((node) => node.kind === 'structuredFieldExtractor');
-    const builders = current.nodes.filter((node) => node.kind === 'i2cTaskBuilder');
-    const extractor = changed.kind === 'structuredFieldExtractor'
-      ? changed
-      : extractors.find((candidate) => current.edges.some((edge) => edge.source.nodeId === candidate.id && edge.target.nodeId === changed.id)) ?? (extractors.length === 1 ? extractors[0] : undefined);
-    const builder = changed.kind === 'i2cTaskBuilder'
-      ? changed
-      : builders.find((candidate) => current.edges.some((edge) => edge.source.nodeId === changed.id && edge.target.nodeId === candidate.id)) ?? (builders.length === 1 ? builders[0] : undefined);
-    if (!extractor || !builder) {
-      pushEvent('无法更新接口：需要唯一的 Extractor 和 Builder');
-      return;
-    }
-    const rawOutputs = changed.id === extractor.id ? config.outputs : extractor.config.outputs;
-    if (!Array.isArray(rawOutputs)) {
-      pushEvent('无法更新接口：Extractor outputs 必须是数组');
-      return;
-    }
-    const persistedBuilderConfig = builder.config;
-    if (!persistedBuilderConfig || typeof persistedBuilderConfig !== 'object' || Array.isArray(persistedBuilderConfig)) {
-      pushEvent('无法更新接口：Builder 配置不是对象');
-      return;
-    }
-    const taskBuilderConfig = changed.id === builder.id
-      ? { ...persistedBuilderConfig, ...config }
-      : { ...persistedBuilderConfig };
-    updateExtractorAndTaskBuilderInterface(extractor.id, rawOutputs, builder.id, taskBuilderConfig)
-      .then((response) => {
-        renderGraph(response.graph, 'Extractor/Builder 接口已原子更新', { source: 'response' });
-        pushEvent(response.candidatePortDiff.length > 0 ? `端口接口已验证并更新：${response.candidatePortDiff.length} 个节点发生变化` : '接口配置已验证；端口集合未变化');
-      })
-      .catch((error: unknown) => pushEvent(`接口更新失败：${error instanceof Error ? error.message : String(error)}`));
-  }, [pushEvent, renderGraph]);
 
   useEffect(() => {
     setNodes((current) => current.map((flowNode) => {
@@ -486,30 +440,17 @@ export function App() {
       const runtimeOutput = nodeOutputs[flowNode.id];
       const actionPending = Boolean(pendingActions[flowNode.id]);
       const availableActions = genericNodeActions(flowNode.data.workflowNode);
-      const connectedInputPortIds = edges
-        .filter((edge) => edge.target === flowNode.id)
-        .map((edge) => String(edge.targetHandle ?? ''));
-      const inputRuntimeOutputs = Object.fromEntries(edges
-        .filter((edge) => edge.target === flowNode.id && edge.targetHandle)
-        .flatMap((edge) => {
-          const output = nodeOutputs[String(edge.source)];
-          return output === undefined ? [] : [[String(edge.targetHandle), output] as const];
-        }));
       if (
         flowNode.data.onRtspUrlChange === handleRtspUrlChange
         && flowNode.data.onNodeConfigChange === handleNodeConfigChange
         && flowNode.data.onNodeConfigPatch === handleNodeConfigPatch
-        && flowNode.data.onPlanInterfaceChange === handlePlanInterfaceChange
         && flowNode.data.onNodeAction === sendAction
         && flowNode.data.onRefreshNodeOutput === refreshNodeOutput
         && flowNode.data.runtimeState === runtimeState
         && flowNode.data.runtimeDiagnostic === runtimeDiagnostic
         && flowNode.data.runtimeOutput === runtimeOutput
-        && flowNode.data.inputRuntimeOutputs === inputRuntimeOutputs
         && flowNode.data.availableActions === availableActions
         && flowNode.data.actionPending === actionPending
-        && flowNode.data.connectedInputPortIds?.length === connectedInputPortIds.length
-        && flowNode.data.connectedInputPortIds?.every((portId) => connectedInputPortIds.includes(portId))
       ) {
         return flowNode;
       }
@@ -525,15 +466,12 @@ export function App() {
           actionPending,
           onNodeConfigChange: handleNodeConfigChange,
           onNodeConfigPatch: handleNodeConfigPatch,
-          onPlanInterfaceChange: handlePlanInterfaceChange,
-          connectedInputPortIds,
-          inputRuntimeOutputs,
           onNodeAction: sendAction,
           onRefreshNodeOutput: refreshNodeOutput,
         },
       };
     }));
-  }, [edges, handleNodeConfigChange, handleNodeConfigPatch, handlePlanInterfaceChange, handleRtspUrlChange, nodeDiagnostics, nodeOutputs, nodeStates, pendingActions, refreshNodeOutput, nodes.length, sendAction, setNodes]);
+  }, [handleNodeConfigChange, handleNodeConfigPatch, handleRtspUrlChange, nodeDiagnostics, nodeOutputs, nodeStates, pendingActions, refreshNodeOutput, nodes.length, sendAction, setNodes]);
 
   const createFlowNodeAt = useCallback(
     (kind: NodeKind, position: { x: number; y: number }): FlowNode => {

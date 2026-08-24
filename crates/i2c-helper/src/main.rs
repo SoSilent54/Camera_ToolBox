@@ -195,6 +195,11 @@ fn i2c_lock_keys_for_request(request: &I2cHelperRequest) -> Vec<device_lock::I2c
                 })
             })
             .collect(),
+        I2cHelperAction::GuardedWrite { request } => vec![device_lock::I2cLockKey::new(
+            request.target.bus,
+            request.target.address,
+            device_lock::I2cAddressMode::SevenBit,
+        )],
     }
 }
 

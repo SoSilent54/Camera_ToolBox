@@ -35,11 +35,11 @@ use camera_toolbox_adapters::x5_tcp_client;
 use camera_toolbox_app::engine::{CaptureMode, CaptureTarget};
 use camera_toolbox_app::{
     CalibrationBackend, CalibrationCancellation, CommandResult, CommandService, ControlTargetSpec,
-    DecodedVideoFrame, I2cAuthorizedWritePlan, I2cHelperAction, I2cHelperOperation,
-    I2cHelperResult, I2cHelperService, I2cInspectPlan, I2cMessageData, I2cMessageSpec,
-    I2cPageWrite, I2cTaskExecutor, I2cTransactionSpec, RemoteFileStat, RemoteOperationControl,
+    DecodedVideoFrame, I2cExecutionReport, I2cHelperAction, I2cHelperOperation, I2cHelperResult,
+    I2cHelperService, I2cMessageData, I2cMessageSpec, I2cReadReport, I2cReadRequest,
+    I2cTaskExecutor, I2cTransactionSpec, I2cWriteRequest, RemoteFileStat, RemoteOperationControl,
     SftpFileReader, SshCommandExecutor, SshConnection, SshConnectionService, TypedCommandRequest,
-    X5ControlClient, X5233CapturePayload,
+    X5ControlClient, X5233CapturePayload, validate_map_image,
 };
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
@@ -270,27 +270,27 @@ impl ControlRuntime {
 
 #[cfg(feature = "platform-ssh")]
 impl I2cTaskExecutor for ControlRuntime {
-    fn inspect(
+    fn read(
         &self,
         connection: &SshConnection,
-        plan: &I2cInspectPlan,
+        request: &I2cReadRequest,
         control: RemoteOperationControl,
-    ) -> std::result::Result<Vec<u8>, String> {
-        let transactions = plan
+    ) -> std::result::Result<I2cReadReport, String> {
+        let transactions = request
             .read_ranges
             .iter()
             .map(|range| I2cTransactionSpec {
-                bus: plan.target.bus,
+                bus: request.target.bus,
                 messages: vec![
                     I2cMessageSpec {
-                        address: plan.target.address,
+                        address: request.target.address,
                         flags: Vec::new(),
                         data: I2cMessageData::Write {
-                            bytes: register_bytes(plan.target.address_width_bytes, range.offset),
+                            bytes: register_bytes(request.target.address_width_bytes, range.offset),
                         },
                     },
                     I2cMessageSpec {
-                        address: plan.target.address,
+                        address: request.target.address,
                         flags: Vec::new(),
                         data: I2cMessageData::Read {
                             byte_len: range.byte_len,
@@ -309,95 +309,41 @@ impl I2cTaskExecutor for ControlRuntime {
                 control,
             )
             .map_err(|error| format_i2c_service_error(&error))?;
-        Ok(read_result_bytes(result))
+        let image = read_result_bytes(result);
+        let error = validate_map_image(&request.validation, &image).err();
+        Ok(I2cReadReport {
+            map_id: request.map_id.clone(),
+            map_digest: request.map_digest.clone(),
+            target: request.target.clone(),
+            image_sha256: before_image_digest(&image),
+            byte_len: image.len(),
+            valid: error.is_none(),
+            error,
+        })
     }
 
-    fn verify_authorized(
+    fn write(
         &self,
         connection: &SshConnection,
-        authorized: &I2cAuthorizedWritePlan,
+        request: &I2cWriteRequest,
         control: RemoteOperationControl,
-    ) -> std::result::Result<(), String> {
-        if authorized.connection_id != connection.id() {
-            return Err("authorized write plan is bound to another SSH connection".to_owned());
-        }
-        let before = self.inspect(connection, &authorized.inspect_plan, control)?;
-        if before_image_digest(&before) != authorized.expected_before_sha256 {
-            return Err("EEPROM before-image changed since approval".to_owned());
-        }
-        Ok(())
-    }
-
-    fn write_page(
-        &self,
-        connection: &SshConnection,
-        authorized: &I2cAuthorizedWritePlan,
-        page_index: usize,
-        page: &I2cPageWrite,
-        control: RemoteOperationControl,
-    ) -> std::result::Result<Vec<u8>, String> {
-        if authorized.connection_id != connection.id() {
-            return Err("authorized write plan is bound to another SSH connection".to_owned());
-        }
-        if authorized.page_at(page_index) != Some(page) {
-            return Err(format!(
-                "authorized page {page_index} is not the exact compiled page"
-            ));
-        }
-        let transaction = I2cTransactionSpec {
-            bus: authorized.candidate.target.bus,
-            messages: vec![I2cMessageSpec {
-                address: authorized.candidate.target.address,
-                flags: Vec::new(),
-                data: I2cMessageData::Write {
-                    bytes: [
-                        register_bytes(
-                            authorized.candidate.target.address_width_bytes,
-                            page.offset,
-                        ),
-                        page.bytes.clone(),
-                    ]
-                    .concat(),
-                },
-            }],
-            settle_ms: Some(page.settle_ms),
-        };
-        let readback = I2cTransactionSpec {
-            bus: authorized.candidate.target.bus,
-            messages: vec![
-                I2cMessageSpec {
-                    address: authorized.candidate.target.address,
-                    flags: Vec::new(),
-                    data: I2cMessageData::Write {
-                        bytes: register_bytes(
-                            authorized.candidate.target.address_width_bytes,
-                            page.offset,
-                        ),
-                    },
-                },
-                I2cMessageSpec {
-                    address: authorized.candidate.target.address,
-                    flags: Vec::new(),
-                    data: I2cMessageData::Read {
-                        byte_len: u16::try_from(page.bytes.len())
-                            .map_err(|_| "page exceeds u16 length".to_owned())?,
-                    },
-                },
-            ],
-            settle_ms: None,
-        };
+    ) -> std::result::Result<I2cExecutionReport, String> {
+        let guarded = request
+            .guarded_request(None)
+            .ok_or_else(|| "I2C write request was mutated after compilation".to_owned())?;
         let result = self
             .i2c_service_for(connection)?
             .execute(
                 I2cHelperOperation {
-                    action: I2cHelperAction::Transfer {
-                        transactions: vec![transaction, readback],
-                    },
+                    action: I2cHelperAction::GuardedWrite { request: guarded },
                 },
                 control,
             )
             .map_err(|error| format_i2c_service_error(&error))?;
-        Ok(read_result_bytes(result))
+        let I2cHelperResult::GuardedWrite { report } = result else {
+            return Err("guarded write helper returned an unexpected result kind".to_owned());
+        };
+        Ok(report)
     }
 }
 

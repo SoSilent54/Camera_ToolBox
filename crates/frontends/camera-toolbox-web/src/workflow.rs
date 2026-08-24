@@ -1,5 +1,5 @@
 use camera_toolbox_adapters::platforms::ssh_managed::ServerHostKey;
-use camera_toolbox_core::{I2cMapDefinition, LogicalInputSlot, builtin_i2c_map};
+use camera_toolbox_core::{I2cMapDefinition, builtin_i2c_map};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -103,9 +103,6 @@ pub enum NodeKind {
     SerialField,
     SshConnection,
     I2cTaskBuilder,
-    I2cInspector,
-    I2cWriteApproval,
-    I2cExecutor,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -204,14 +201,8 @@ pub enum PortKind {
     StructuredPacket,
     #[serde(rename = "ssh.connection.v1")]
     SshConnection,
-    #[serde(rename = "i2c.inspect-plan.v1")]
-    I2cInspectPlan,
-    #[serde(rename = "i2c.candidate-write-plan.v1")]
-    I2cCandidateWritePlan,
-    #[serde(rename = "i2c.inspect-snapshot.v1")]
-    I2cInspectSnapshot,
-    #[serde(rename = "i2c.authorized-write-plan.v1")]
-    I2cAuthorizedWritePlan,
+    #[serde(rename = "i2c.read-report.v1")]
+    I2cReadReport,
     #[serde(rename = "i2c.execution-report.v1")]
     I2cExecutionReport,
     #[serde(rename = "data.field.bool.v1")]
@@ -341,9 +332,6 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::SerialField),
         node_definition(NodeKind::SshConnection),
         node_definition(NodeKind::I2cTaskBuilder),
-        node_definition(NodeKind::I2cInspector),
-        node_definition(NodeKind::I2cWriteApproval),
-        node_definition(NodeKind::I2cExecutor),
     ];
     // 默认构建不会向画布暴露无法实例化的硬件控制节点；启用功能后再加入目录。
     #[cfg(feature = "hex-arm-control")]
@@ -1223,123 +1211,52 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::I2cTaskBuilder => (
             NodeCategory::Control,
             "I²C Task Builder",
-            "将 map 声明的 typed-field 标定值编译为只读 inspect 与候选写计划；不执行硬件 I/O",
-            vec![],
+            "直接消费结构化标定包、SNID 与 SSH 会话；Read/Write 是原子动作，写入由目标端单次请求持锁完成逐页写入、readback 与最终校验",
             vec![
                 port(
-                    "inspectPlan",
-                    "Inspect Plan",
+                    "packet",
+                    "Structured Packet",
+                    PortDirection::Input,
+                    PortKind::StructuredPacket,
+                    "data.structured.packet.v1",
+                    Some(PortRole::Dataset),
+                ),
+                port(
+                    "serial.number",
+                    "Serial Number",
+                    PortDirection::Input,
+                    PortKind::FieldStr,
+                    "data.field.str.v1",
+                    Some(PortRole::Dataset),
+                ),
+                port(
+                    "connection",
+                    "SSH Connection",
+                    PortDirection::Input,
+                    PortKind::SshConnection,
+                    "ssh.connection.v1",
+                    Some(PortRole::Control),
+                ),
+            ],
+            vec![
+                port(
+                    "readReport",
+                    "Read Report",
                     PortDirection::Output,
-                    PortKind::I2cInspectPlan,
-                    "i2c.inspect-plan.v1",
+                    PortKind::I2cReadReport,
+                    "i2c.read-report.v1",
                     Some(PortRole::Status),
                 ),
                 port(
-                    "candidateWritePlan",
-                    "Candidate Write Plan",
+                    "report",
+                    "Execution Report",
                     PortDirection::Output,
-                    PortKind::I2cCandidateWritePlan,
-                    "i2c.candidate-write-plan.v1",
-                    Some(PortRole::Command),
+                    PortKind::I2cExecutionReport,
+                    "i2c.execution-report.v1",
+                    Some(PortRole::Status),
                 ),
             ],
             json!({"mapMode": "builtin", "mapId": "yg-stereo-p24c64g-v1", "bus": 0}),
-        ),
-        NodeKind::I2cInspector => (
-            NodeCategory::Control,
-            "I²C Inspector",
-            "通过 SSH 执行只读 inspect 计划，并输出与会话绑定的快照",
-            vec![
-                port(
-                    "connection",
-                    "SSH Connection",
-                    PortDirection::Input,
-                    PortKind::SshConnection,
-                    "ssh.connection.v1",
-                    Some(PortRole::Control),
-                ),
-                port(
-                    "inspectPlan",
-                    "Inspect Plan",
-                    PortDirection::Input,
-                    PortKind::I2cInspectPlan,
-                    "i2c.inspect-plan.v1",
-                    Some(PortRole::Status),
-                ),
-            ],
-            vec![port(
-                "snapshot",
-                "Inspect Snapshot",
-                PortDirection::Output,
-                PortKind::I2cInspectSnapshot,
-                "i2c.inspect-snapshot.v1",
-                Some(PortRole::Status),
-            )],
-            json!({}),
-        ),
-        NodeKind::I2cWriteApproval => (
-            NodeCategory::Control,
-            "I²C Write Approval",
-            "将候选写计划与 inspect 快照绑定；仅在 confirmWrite=true 时可显式 Trigger 授权",
-            vec![
-                port(
-                    "candidateWritePlan",
-                    "Candidate Write Plan",
-                    PortDirection::Input,
-                    PortKind::I2cCandidateWritePlan,
-                    "i2c.candidate-write-plan.v1",
-                    Some(PortRole::Command),
-                ),
-                port(
-                    "snapshot",
-                    "Inspect Snapshot",
-                    PortDirection::Input,
-                    PortKind::I2cInspectSnapshot,
-                    "i2c.inspect-snapshot.v1",
-                    Some(PortRole::Status),
-                ),
-            ],
-            vec![port(
-                "authorizedWritePlan",
-                "Authorized Write Plan",
-                PortDirection::Output,
-                PortKind::I2cAuthorizedWritePlan,
-                "i2c.authorized-write-plan.v1",
-                Some(PortRole::Command),
-            )],
-            json!({"confirmWrite": false}),
-        ),
-        NodeKind::I2cExecutor => (
-            NodeCategory::Control,
-            "I²C Executor",
-            "仅执行已授权计划，逐页写入并强制 readback，输出执行报告",
-            vec![
-                port(
-                    "connection",
-                    "SSH Connection",
-                    PortDirection::Input,
-                    PortKind::SshConnection,
-                    "ssh.connection.v1",
-                    Some(PortRole::Control),
-                ),
-                port(
-                    "authorizedWritePlan",
-                    "Authorized Write Plan",
-                    PortDirection::Input,
-                    PortKind::I2cAuthorizedWritePlan,
-                    "i2c.authorized-write-plan.v1",
-                    Some(PortRole::Command),
-                ),
-            ],
-            vec![port(
-                "report",
-                "Execution Report",
-                PortDirection::Output,
-                PortKind::I2cExecutionReport,
-                "i2c.execution-report.v1",
-                Some(PortRole::Status),
-            )],
-            json!({}),
         ),
     };
     NodeDefinition {
@@ -1355,15 +1272,6 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
 
 fn node_definition_for_node(node: &WorkflowNode) -> Result<NodeDefinition, String> {
     let mut definition = node_definition(node.kind);
-    if node.kind == NodeKind::I2cTaskBuilder {
-        let map = compile_i2c_task_builder_map(node)?;
-        definition.inputs = map
-            .inputs
-            .iter()
-            .map(i2c_map_input_port)
-            .collect::<Result<Vec<_>, _>>()?;
-        return Ok(definition);
-    }
     if node.kind != NodeKind::StructuredFieldExtractor {
         return Ok(definition);
     }
@@ -1423,28 +1331,7 @@ fn node_definition_for_node(node: &WorkflowNode) -> Result<NodeDefinition, Strin
     Ok(definition)
 }
 
-/// 将已编译 map 的静态 logical slot 投影为工作流端口，避免 Web 与 builder 维护两套接口。
-fn i2c_map_input_port(slot: &LogicalInputSlot) -> Result<WorkflowPort, String> {
-    let primitive = slot.primitive_type.as_str();
-    let kind = field_port_kind(primitive).ok_or_else(|| {
-        format!(
-            "I²C map input `{}` has unsupported type `{primitive}`",
-            slot.name
-        )
-    })?;
-    let mut port = port(
-        &slot.name,
-        &slot.name,
-        PortDirection::Input,
-        kind,
-        &format!("data.field.{primitive}.v1"),
-        Some(PortRole::Dataset),
-    );
-    port.required = slot.required;
-    Ok(port)
-}
-
-/// 在归一化前编译 builder map，使 mapMode/mapId/mapYaml 的错误在保存、加载与动态接口更新中一致。
+/// 在归一化前编译 builder map，使 mapMode/mapId/mapYaml 的错误在保存、加载中一致。
 fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition, String> {
     let config = node_config_object(node)?;
     let mode = config
@@ -1593,8 +1480,8 @@ pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
         },
         WorkmodeTemplate {
             id: "i2c-plan-workflow",
-            title: "I²C Plan Workflow",
-            description: "Calibration Solver → typed-field extractor → I²C plan builder; inspect, approval, executor, and SSH remain optional terminal wiring",
+            title: "I²C Workflow",
+            description: "Calibration Solver 结构化包与设备 SNID 直接进入 I²C Task Builder；Read/Write 是同一节点上的原子动作，写入由目标端持锁完成逐页写入、readback 与最终校验",
             graph: i2c_template_graph(),
         },
     ]
@@ -2873,40 +2760,18 @@ fn calibration_template_graph() -> WorkflowGraph {
     )
 }
 
-/// 在可运行的标定采集/求解图后追加显式 SNID、inspect、审批和执行的无环 I²C tail。
+/// 在可运行的标定采集/求解图后追加 SNID 与原子 I²C Read/Write 尾部。
 fn i2c_template_graph() -> WorkflowGraph {
     let mut graph = calibration_template_graph();
     graph.id = "camera-toolbox-i2c-plan-template".to_owned();
-    graph.title = "Calibration to I²C Approval Workflow".to_owned();
-
-    let mut extractor = workflow_node(
-        "field-extractor",
-        NodeKind::StructuredFieldExtractor,
-        "Calibration Field Extractor",
-        NodePosition {
-            x: 1360.0,
-            y: 680.0,
-        },
-    );
-    // 指针对应 `CalibrationSolverNode::solution_packet` 按字段名排序后的稳定 wire 数组。
-    extractor.config = json!({"outputs": [
-        {"id":"camera.model.id","pointer":"/fields/17","type":"str"}, {"id":"camera.image.width","pointer":"/fields/3","type":"u32"}, {"id":"camera.image.height","pointer":"/fields/2","type":"u32"},
-        {"id":"camera.intrinsics.fx","pointer":"/fields/6","type":"f64"}, {"id":"camera.intrinsics.fy","pointer":"/fields/7","type":"f64"}, {"id":"camera.intrinsics.cx","pointer":"/fields/4","type":"f64"}, {"id":"camera.intrinsics.cy","pointer":"/fields/5","type":"f64"},
-        {"id":"distortion.k1","pointer":"/fields/18","type":"f64"}, {"id":"distortion.k2","pointer":"/fields/19","type":"f64"}, {"id":"distortion.p1","pointer":"/fields/24","type":"f64"}, {"id":"distortion.p2","pointer":"/fields/25","type":"f64"},
-        {"id":"distortion.k3","pointer":"/fields/20","type":"f64"}, {"id":"distortion.k4","pointer":"/fields/21","type":"f64"}, {"id":"distortion.k5","pointer":"/fields/22","type":"f64"}, {"id":"distortion.k6","pointer":"/fields/23","type":"f64"},
-        {"id":"distortion.s1","pointer":"/fields/26","type":"f64"}, {"id":"distortion.s2","pointer":"/fields/27","type":"f64"}, {"id":"distortion.s3","pointer":"/fields/28","type":"f64"}, {"id":"distortion.s4","pointer":"/fields/29","type":"f64"}
-    ]});
-    let extractor_definition =
-        node_definition_for_node(&extractor).expect("static I²C extractor config is valid");
-    extractor.inputs = extractor_definition.inputs;
-    extractor.outputs = extractor_definition.outputs;
+    graph.title = "Calibration to I²C Workflow".to_owned();
 
     let mut builder = workflow_node(
         "task-builder",
         NodeKind::I2cTaskBuilder,
         "I²C Task Builder",
         NodePosition {
-            x: 1660.0,
+            x: 1360.0,
             y: 680.0,
         },
     );
@@ -2914,6 +2779,7 @@ fn i2c_template_graph() -> WorkflowGraph {
     let builder_definition =
         node_definition_for_node(&builder).expect("builtin I²C builder config is valid");
     builder.inputs = builder_definition.inputs;
+    builder.outputs = builder_definition.outputs;
 
     let serial = workflow_node(
         "serial-field",
@@ -2940,57 +2806,16 @@ fn i2c_template_graph() -> WorkflowGraph {
         "expectedHostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ",
         "credentialRef": "session:ssh-control"
     });
-    let inspector = workflow_node(
-        "i2c-inspector",
-        NodeKind::I2cInspector,
-        "I²C Inspector",
-        NodePosition {
-            x: 1960.0,
-            y: 620.0,
-        },
-    );
-    let approval = workflow_node(
-        "i2c-approval",
-        NodeKind::I2cWriteApproval,
-        "I²C Write Approval",
-        NodePosition {
-            x: 2250.0,
-            y: 720.0,
-        },
-    );
-    let executor = workflow_node(
-        "i2c-executor",
-        NodeKind::I2cExecutor,
-        "I²C Executor",
-        NodePosition {
-            x: 2540.0,
-            y: 780.0,
-        },
-    );
-
-    graph.edges.push(edge(
-        "solver-to-extractor",
-        "calib-solver",
-        "packet",
-        "field-extractor",
-        "packet",
-        PortKind::StructuredPacket,
-        "data.structured.packet.v1",
-    ));
-    for input in &builder.inputs {
-        if extractor.outputs.iter().any(|output| output.id == input.id) {
-            graph.edges.push(edge(
-                &format!("extractor-to-builder-{}", input.id),
-                "field-extractor",
-                &input.id,
-                "task-builder",
-                &input.id,
-                input.kind,
-                &input.schema,
-            ));
-        }
-    }
     graph.edges.extend([
+        edge(
+            "solver-to-builder",
+            "calib-solver",
+            "packet",
+            "task-builder",
+            "packet",
+            PortKind::StructuredPacket,
+            "data.structured.packet.v1",
+        ),
         edge(
             "serial-to-builder",
             "serial-field",
@@ -3001,63 +2826,16 @@ fn i2c_template_graph() -> WorkflowGraph {
             "data.field.str.v1",
         ),
         edge(
-            "ssh-to-inspector",
+            "ssh-to-builder",
             "ssh-control",
             "connection",
-            "i2c-inspector",
+            "task-builder",
             "connection",
             PortKind::SshConnection,
             "ssh.connection.v1",
         ),
-        edge(
-            "builder-to-inspector",
-            "task-builder",
-            "inspectPlan",
-            "i2c-inspector",
-            "inspectPlan",
-            PortKind::I2cInspectPlan,
-            "i2c.inspect-plan.v1",
-        ),
-        edge(
-            "builder-to-approval",
-            "task-builder",
-            "candidateWritePlan",
-            "i2c-approval",
-            "candidateWritePlan",
-            PortKind::I2cCandidateWritePlan,
-            "i2c.candidate-write-plan.v1",
-        ),
-        edge(
-            "inspector-to-approval",
-            "i2c-inspector",
-            "snapshot",
-            "i2c-approval",
-            "snapshot",
-            PortKind::I2cInspectSnapshot,
-            "i2c.inspect-snapshot.v1",
-        ),
-        edge(
-            "ssh-to-executor",
-            "ssh-control",
-            "connection",
-            "i2c-executor",
-            "connection",
-            PortKind::SshConnection,
-            "ssh.connection.v1",
-        ),
-        edge(
-            "approval-to-executor",
-            "i2c-approval",
-            "authorizedWritePlan",
-            "i2c-executor",
-            "authorizedWritePlan",
-            PortKind::I2cAuthorizedWritePlan,
-            "i2c.authorized-write-plan.v1",
-        ),
     ]);
-    graph.nodes.extend([
-        extractor, serial, builder, ssh, inspector, approval, executor,
-    ]);
+    graph.nodes.extend([serial, builder, ssh]);
     debug_assert!(validate_workflow(&graph).is_ok());
     graph
 }
@@ -3674,9 +3452,9 @@ mod tests {
         assert_eq!(
             catalog.len(),
             if cfg!(feature = "hex-arm-control") {
-                27
+                24
             } else {
-                26
+                23
             }
         );
         for hidden in [
@@ -3712,6 +3490,7 @@ mod tests {
         let kinds: Vec<NodeKind> = catalog.iter().map(|def| def.kind).collect();
         assert_eq!(kinds.len(), catalog.len());
     }
+
     #[test]
     fn i2c_template_is_a_complete_calibration_to_execution_flow() {
         let graph = i2c_template_graph();
@@ -3720,16 +3499,19 @@ mod tests {
         for kind in [
             NodeKind::DatasetCollector,
             NodeKind::CalibrationSolver,
-            NodeKind::StructuredFieldExtractor,
             NodeKind::SerialField,
             NodeKind::I2cTaskBuilder,
             NodeKind::SshConnection,
-            NodeKind::I2cInspector,
-            NodeKind::I2cWriteApproval,
-            NodeKind::I2cExecutor,
         ] {
             assert!(graph.nodes.iter().any(|node| node.kind == kind));
         }
+        assert!(
+            !graph
+                .nodes
+                .iter()
+                .any(|node| node.kind == NodeKind::StructuredFieldExtractor),
+            "the simplified I²C template must not need a field extractor"
+        );
 
         let builder = graph
             .nodes
@@ -3739,48 +3521,28 @@ mod tests {
         assert_eq!(builder.config["mapMode"], "builtin");
         assert_eq!(builder.config["mapId"], "yg-stereo-p24c64g-v1");
         assert_eq!(builder.config["bus"], 0);
-        assert!(
-            builder
-                .inputs
-                .iter()
-                .any(|input| input.id == "serial.number")
-        );
-        assert!(
-            builder
-                .inputs
-                .iter()
-                .all(|input| input.kind != PortKind::StructuredPacket)
-        );
+        for input in ["packet", "serial.number", "connection"] {
+            assert!(
+                builder.inputs.iter().any(|port| port.id == input),
+                "builder must expose fixed input port `{input}`"
+            );
+        }
+        for output in ["readReport", "report"] {
+            assert!(
+                builder.outputs.iter().any(|port| port.id == output),
+                "builder must expose fixed output port `{output}`"
+            );
+        }
 
         let required_edges = [
-            ("calib-solver", "packet", "field-extractor", "packet"),
+            ("calib-solver", "packet", "task-builder", "packet"),
             (
                 "serial-field",
                 "serial.number",
                 "task-builder",
                 "serial.number",
             ),
-            (
-                "task-builder",
-                "inspectPlan",
-                "i2c-inspector",
-                "inspectPlan",
-            ),
-            ("ssh-control", "connection", "i2c-inspector", "connection"),
-            (
-                "task-builder",
-                "candidateWritePlan",
-                "i2c-approval",
-                "candidateWritePlan",
-            ),
-            ("i2c-inspector", "snapshot", "i2c-approval", "snapshot"),
-            ("ssh-control", "connection", "i2c-executor", "connection"),
-            (
-                "i2c-approval",
-                "authorizedWritePlan",
-                "i2c-executor",
-                "authorizedWritePlan",
-            ),
+            ("ssh-control", "connection", "task-builder", "connection"),
         ];
         for (source_node, source_port, target_node, target_port) in required_edges {
             assert!(graph.edges.iter().any(|edge| {
@@ -3791,54 +3553,9 @@ mod tests {
             }));
         }
     }
+
     #[test]
-    fn i2c_template_solver_packet_extracts_into_builder_candidate_plan() {
-        struct TemplateCalibrationBackend;
-
-        impl CalibrationBackend for TemplateCalibrationBackend {
-            fn build_information(&self) -> Result<String, CalibrationBackendError> {
-                Ok("template-contract-test".to_owned())
-            }
-
-            fn detect_png(
-                &self,
-                _: &[u8],
-                _: CalibrationImageSize,
-                _: usize,
-                _: BoardSpec,
-                _: &CalibrationCancellation,
-            ) -> Result<ChessboardDetectionOutcome, CalibrationBackendError> {
-                unreachable!("the template solver test only triggers calibration")
-            }
-
-            fn estimate_pose(
-                &self,
-                _: &ChessboardDetection,
-                _: &InitialIntrinsics,
-                _: BoardSpec,
-                _: &CalibrationCancellation,
-            ) -> Result<ViewCalibrationResult, CalibrationBackendError> {
-                unreachable!("the template solver test only triggers calibration")
-            }
-
-            fn calibrate(
-                &self,
-                _: &CalibrationRequest,
-                _: &CalibrationCancellation,
-            ) -> Result<CalibrationSolution, CalibrationBackendError> {
-                Ok(CalibrationSolution {
-                    image_size: CalibrationImageSize::new(1920, 1080).expect("valid image size"),
-                    camera_matrix: [1500.0, 0.0, 960.0, 0.0, 1490.0, 540.0, 0.0, 0.0, 1.0],
-                    distortion_coefficients: (1..=12)
-                        .map(|value| f64::from(value) / 100.0)
-                        .collect(),
-                    rms_error: 0.25,
-                    calibration_flags: 0,
-                    views: Vec::new(),
-                })
-            }
-        }
-
+    fn i2c_template_wires_packet_serial_and_ssh_directly_into_builder() {
         let graph = i2c_template_graph();
         let node = |id: &str| {
             graph
@@ -3847,126 +3564,65 @@ mod tests {
                 .find(|node| node.id == id)
                 .expect("template node")
         };
-        let extractor = node("field-extractor");
         let builder = node("task-builder");
-        let expected_extractor_output_ids = [
-            "camera.model.id",
-            "camera.image.width",
-            "camera.image.height",
-            "camera.intrinsics.fx",
-            "camera.intrinsics.fy",
-            "camera.intrinsics.cx",
-            "camera.intrinsics.cy",
-            "distortion.k1",
-            "distortion.k2",
-            "distortion.p1",
-            "distortion.p2",
-            "distortion.k3",
-            "distortion.k4",
-            "distortion.k5",
-            "distortion.k6",
-            "distortion.s1",
-            "distortion.s2",
-            "distortion.s3",
-            "distortion.s4",
-        ];
-        let configured_output_ids = extractor.config["outputs"]
-            .as_array()
-            .expect("template extractor output definitions")
-            .iter()
-            .map(|output| output["id"].as_str().expect("template extractor output id"))
-            .collect::<Vec<_>>();
         assert_eq!(
-            configured_output_ids.as_slice(),
-            expected_extractor_output_ids.as_slice(),
-            "the persisted extractor output-ID contract changed"
+            builder
+                .inputs
+                .iter()
+                .map(|port| port.id.as_str())
+                .collect::<Vec<_>>(),
+            ["packet", "serial.number", "connection"],
+            "the simplified builder keeps exactly three fixed inputs"
         );
         assert_eq!(
-            extractor
+            builder
                 .outputs
                 .iter()
                 .map(|port| port.id.as_str())
-                .collect::<Vec<_>>()
-                .as_slice(),
-            expected_extractor_output_ids.as_slice(),
-            "the extractor runtime ports must match its persisted output IDs"
+                .collect::<Vec<_>>(),
+            ["readReport", "report"],
+            "the simplified builder exposes read report and execution report"
         );
 
-        let expected_extractor_edges = expected_extractor_output_ids
-            .iter()
-            .map(|id| {
-                (
-                    format!("extractor-to-builder-{id}"),
-                    (*id).to_owned(),
-                    (*id).to_owned(),
-                )
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        let actual_extractor_edges = graph
+        let builder_edges = graph
             .edges
             .iter()
-            .filter(|edge| edge.source.node_id == extractor.id && edge.target.node_id == builder.id)
+            .filter(|edge| edge.target.node_id == builder.id)
             .map(|edge| {
                 (
                     edge.id.clone(),
+                    edge.source.node_id.clone(),
                     edge.source.port_id.clone(),
                     edge.target.port_id.clone(),
                 )
             })
             .collect::<std::collections::BTreeSet<_>>();
         assert_eq!(
-            actual_extractor_edges, expected_extractor_edges,
-            "the persisted extractor-to-builder edge mapping changed"
+            builder_edges,
+            [
+                (
+                    "serial-to-builder".to_owned(),
+                    "serial-field".to_owned(),
+                    "serial.number".to_owned(),
+                    "serial.number".to_owned(),
+                ),
+                (
+                    "solver-to-builder".to_owned(),
+                    "calib-solver".to_owned(),
+                    "packet".to_owned(),
+                    "packet".to_owned(),
+                ),
+                (
+                    "ssh-to-builder".to_owned(),
+                    "ssh-control".to_owned(),
+                    "connection".to_owned(),
+                    "connection".to_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            "the persisted template wires exactly three edges into the builder"
         );
-        assert!(graph.edges.iter().any(|edge| {
-            edge.id == "solver-to-extractor"
-                && edge.source.node_id == "calib-solver"
-                && edge.source.port_id == "packet"
-                && edge.target.node_id == extractor.id
-                && edge.target.port_id == "packet"
-        }));
-        assert!(graph.edges.iter().any(|edge| {
-            edge.id == "serial-to-builder"
-                && edge.source.node_id == "serial-field"
-                && edge.source.port_id == "serial.number"
-                && edge.target.node_id == builder.id
-                && edge.target.port_id == "serial.number"
-        }));
-
-        let engine_runtime = crate::engine_api::EngineRuntime::new();
-        let mut engine = GraphEngine::build(
-            crate::engine_api::to_engine_spec(&graph),
-            &engine_runtime.registry,
-            EngineServices {
-                calibration: Some(Arc::new(TemplateCalibrationBackend)),
-                ..EngineServices::default()
-            },
-        )
-        .expect("persisted template graph builds with its configured ports and edges");
-        engine
-            .send_action("calib-solver", NodeAction::Trigger)
-            .expect("solver trigger enters the template graph");
-        engine
-            .send_action("serial-field", NodeAction::Trigger)
-            .expect("serial trigger enters the template graph");
-
-        let candidate = (0..100).find_map(|_| {
-            let candidate = match engine.latest_output("task-builder") {
-                Some(DataPacket::I2cCandidateWritePlan(candidate)) => Some(candidate),
-                _ => None,
-            };
-            if candidate.is_none() {
-                thread::sleep(Duration::from_millis(10));
-            }
-            candidate
-        });
-        engine.stop();
-
-        let candidate = candidate.expect(
-            "Solver packet must traverse configured extractor output IDs and template edge targets into the Builder candidate plan",
-        );
-        assert_eq!(candidate.map_id, "yg-stereo-p24c64g-v1");
-        assert!(!candidate.pages.is_empty());
     }
 
     #[test]
@@ -4249,63 +3905,6 @@ mod tests {
         assert_eq!(
             validate_workflow(&graph),
             Err("workflow graph must be acyclic".to_owned())
-        );
-    }
-
-    #[test]
-    fn i2c_terminal_control_contract_is_acyclic_and_single_direction() {
-        let inspector = node_definition(NodeKind::I2cInspector);
-        assert_eq!(
-            inspector
-                .inputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["connection", "inspectPlan"]
-        );
-        assert_eq!(
-            inspector
-                .outputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["snapshot"]
-        );
-
-        let approval = node_definition(NodeKind::I2cWriteApproval);
-        assert_eq!(
-            approval
-                .inputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["candidateWritePlan", "snapshot"]
-        );
-        assert_eq!(
-            approval
-                .outputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["authorizedWritePlan"]
-        );
-
-        let executor = node_definition(NodeKind::I2cExecutor);
-        assert_eq!(
-            executor
-                .inputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["connection", "authorizedWritePlan"]
-        );
-        assert_eq!(
-            executor
-                .outputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["report"]
         );
     }
 

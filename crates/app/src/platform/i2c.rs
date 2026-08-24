@@ -1,6 +1,6 @@
 //! 通用 Linux I²C helper 的 typed 协议与平台服务端口。
 
-use camera_toolbox_core::{ChecksumContract, I2cMapDefinition};
+use camera_toolbox_core::{ChecksumAlgorithm, ChecksumContract, I2cMapDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -32,13 +32,16 @@ pub struct I2cHelperRequest {
     pub action: I2cHelperAction,
 }
 
-/// 通用 I²C helper 只暴露 bus 枚举和原始 message 序列执行；寄存器/端序由 PC 侧配置编译。
+/// 通用 I²C helper 暴露 bus 枚举、原始 message 序列执行，以及单请求锁保护的 EEPROM 写入。
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum I2cHelperAction {
     ListBuses,
     Transfer {
         transactions: Vec<I2cTransactionSpec>,
+    },
+    GuardedWrite {
+        request: I2cGuardedWriteRequest,
     },
 }
 
@@ -121,6 +124,9 @@ pub enum I2cHelperResult {
     },
     Transfer {
         transactions: Vec<I2cTransactionResult>,
+    },
+    GuardedWrite {
+        report: I2cExecutionReport,
     },
 }
 
@@ -233,6 +239,7 @@ pub fn validate_i2c_helper_action(
         I2cHelperAction::Transfer { transactions } => {
             validate_i2c_transfer_transactions(transactions)
         }
+        I2cHelperAction::GuardedWrite { request } => validate_guarded_write_request(request),
     }
 }
 
@@ -365,20 +372,22 @@ fn validate_i2c_message_len(
     }
     Ok(())
 }
-/// inspect 所需的 EEPROM 连续读取区间。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// inspect/read/write 所需的 EEPROM 连续读取区间。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct I2cReadRange {
     pub offset: u16,
     pub byte_len: u16,
 }
 
 /// inspect/readback 使用的已编译 map 验证合同；不再按 plan.map_id 重新查找 builtin。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct I2cMapValidationContract {
-    pub(crate) image_bytes: u16,
-    pub(crate) fixed_bytes: Vec<(u16, Vec<u8>)>,
-    pub(crate) checksums: Vec<ChecksumContract>,
-    pub(crate) serial_range: Option<I2cReadRange>,
+    pub image_bytes: u16,
+    pub fixed_bytes: Vec<(u16, Vec<u8>)>,
+    pub checksums: Vec<ChecksumContract>,
+    pub serial_range: Option<I2cReadRange>,
 }
 
 impl I2cMapValidationContract {
@@ -407,8 +416,90 @@ impl I2cMapValidationContract {
     }
 }
 
+/// 校验已读镜像是否满足 map 合同：长度、固定字节、校验和与 SNID 序列号区。
+///
+/// helper 最终校验与 GUI read 报告共用同一实现，避免两端合同漂移。
+pub fn validate_map_image(
+    validation: &I2cMapValidationContract,
+    image: &[u8],
+) -> Result<(), String> {
+    if image.len() != usize::from(validation.image_bytes) {
+        return Err(format!(
+            "EEPROM image has {} bytes; map requires {}",
+            image.len(),
+            validation.image_bytes
+        ));
+    }
+    for (offset, expected) in &validation.fixed_bytes {
+        let start = usize::from(*offset);
+        let end = start
+            .checked_add(expected.len())
+            .ok_or_else(|| "fixed-byte range overflow".to_owned())?;
+        if image.get(start..end) != Some(expected.as_slice()) {
+            return Err(format!(
+                "EEPROM map-required fixed bytes at offset {start:#x} are absent"
+            ));
+        }
+    }
+    for checksum in &validation.checksums {
+        let start = usize::from(checksum.source_offset);
+        let end = start
+            .checked_add(usize::from(checksum.source_byte_len))
+            .ok_or_else(|| "checksum source range overflow".to_owned())?;
+        let source = image
+            .get(start..end)
+            .ok_or_else(|| "checksum source range is outside image".to_owned())?;
+        let expected = match checksum.algorithm {
+            ChecksumAlgorithm::SerialSumMod255PlusOne => {
+                ((source
+                    .iter()
+                    .fold(0_u16, |sum, byte| sum + u16::from(*byte))
+                    % 0xff)
+                    + 1) as u8
+            }
+        };
+        if image.get(usize::from(checksum.target_offset)) != Some(&expected) {
+            return Err(format!(
+                "EEPROM map-required checksum at offset {:#x} is invalid",
+                checksum.target_offset
+            ));
+        }
+    }
+    if let Some(serial) = &validation.serial_range {
+        let start = usize::from(serial.offset);
+        let end = start
+            .checked_add(usize::from(serial.byte_len))
+            .ok_or_else(|| "serial range overflow".to_owned())?;
+        let bytes = image
+            .get(start..end)
+            .ok_or_else(|| "serial range is outside image".to_owned())?;
+        if !valid_yg_snid(bytes) {
+            return Err(
+                "EEPROM map-required serial is blank, contains control bytes, or violates SNID format"
+                    .to_owned(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// YG 平台 SNID 布局：2T23x + 2 位数字 + 分类字符 + 2 位数字 + 字母数字 + "00"。
+fn valid_yg_snid(serial: &[u8]) -> bool {
+    serial.len() == 14
+        && matches!(&serial[..5], b"2T233" | b"2T235")
+        && serial[5..7].iter().all(u8::is_ascii_digit)
+        && matches!(serial[7], b'1'..=b'9' | b'A'..=b'C')
+        && matches!(serial[8], b'1'..=b'9' | b'A'..=b'V')
+        && matches!(serial[9], b'0'..=b'4')
+        && serial[10..12]
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric())
+        && serial[12..] == *b"00"
+}
+
 /// 一个经 map 编译并固定目标的 I²C 设备身份。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct I2cTaskTarget {
     pub bus: u32,
     pub address: u16,
@@ -417,69 +508,71 @@ pub struct I2cTaskTarget {
     pub write_cycle_ms: u16,
 }
 
-/// 只读检查计划；它不能表达写入操作。内部 seal 阻止外部 crate 伪造或篡改 map 编译结果。
+/// map 编译出的原子读请求；只读取 map 声明的范围，不表达写入。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct I2cInspectPlan {
+pub struct I2cReadRequest {
     pub map_id: String,
     pub map_digest: String,
     pub target: I2cTaskTarget,
     pub read_ranges: Vec<I2cReadRange>,
-    pub(crate) validation: I2cMapValidationContract,
+    pub validation: I2cMapValidationContract,
     seal: I2cPlanSeal,
 }
 
 /// 一页 EEPROM 写入及其强制 readback。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct I2cPageWrite {
     pub offset: u16,
     pub bytes: Vec<u8>,
     pub settle_ms: u16,
 }
 
-/// 尚未授权的候选写计划；不得直接交给 platform executor。内部 seal 只允许 map builder 创建。
+/// map 编译出的原子写请求；执行端必须在单个 helper 请求内完成 fail-stop 写入与校验。
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct I2cCandidateWritePlan {
+pub struct I2cWriteRequest {
     pub map_id: String,
     pub map_digest: String,
     pub plan_digest: String,
     pub target: I2cTaskTarget,
+    pub read_ranges: Vec<I2cReadRange>,
+    pub validation: I2cMapValidationContract,
     pub pages: Vec<I2cPageWrite>,
+    pub expected_final_image: Vec<u8>,
     pub verify_after_write: bool,
     seal: I2cPlanSeal,
 }
 
-/// inspect 返回的绑定快照。完整 before image 只保留在进程内运行时包中。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct I2cInspectSnapshot {
-    pub connection_id: String,
-    /// Inspector 消费的 sealed plan；approval 只能使用该次实际读取对应的计划。
-    pub inspect_plan: I2cInspectPlan,
+/// 目标 helper 可序列化的锁保护写请求；一次请求持有同一设备锁直到结束。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct I2cGuardedWriteRequest {
+    pub target: I2cTaskTarget,
+    pub read_ranges: Vec<I2cReadRange>,
+    pub validation: I2cMapValidationContract,
+    pub expected_before_sha256: Option<String>,
+    pub pages: Vec<I2cPageWrite>,
+    pub expected_final_image: Vec<u8>,
+    pub verify_after_write: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct I2cReadReport {
     pub map_id: String,
     pub map_digest: String,
     pub target: I2cTaskTarget,
-    pub before_image_sha256: String,
-    pub before_image: Vec<u8>,
-}
-
-/// 明确审批产生的不可伪造运行时绑定；不实现 serde，禁止落盘。
-///
-/// 平台端在首个写页前必须根据 `inspect_plan` 重读并校验 `expected_before_sha256`。
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct I2cAuthorizedWritePlan {
-    pub connection_id: String,
-    pub expected_before_sha256: String,
-    /// 授权密封的 inspect image，用于 executor 计算最终完整镜像，避免 snapshot 旁路输入。
-    pub before_image: Vec<u8>,
-    pub inspect_plan: I2cInspectPlan,
-    pub candidate: I2cCandidateWritePlan,
-    seal: I2cPlanSeal,
+    pub image_sha256: String,
+    pub byte_len: usize,
+    pub valid: bool,
+    pub error: Option<String>,
 }
 
 /// 非持久化计划的 crate-private 完整性 seal。私有字段使外部调用方不能构造它，摘要可检测 Clone 后的公开字段篡改。
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct I2cPlanSeal(String);
 
-impl I2cInspectPlan {
+impl I2cReadRequest {
     pub(crate) fn new(
         map_id: String,
         map_digest: String,
@@ -487,7 +580,7 @@ impl I2cInspectPlan {
         read_ranges: Vec<I2cReadRange>,
         validation: I2cMapValidationContract,
     ) -> Self {
-        let seal = inspect_plan_seal(&map_id, &map_digest, &target, &read_ranges, &validation);
+        let seal = read_request_seal(&map_id, &map_digest, &target, &read_ranges, &validation);
         Self {
             map_id,
             map_digest,
@@ -501,7 +594,7 @@ impl I2cInspectPlan {
     #[must_use]
     pub fn is_compiled(&self) -> bool {
         self.seal
-            == inspect_plan_seal(
+            == read_request_seal(
                 &self.map_id,
                 &self.map_digest,
                 &self.target,
@@ -511,21 +604,27 @@ impl I2cInspectPlan {
     }
 }
 
-impl I2cCandidateWritePlan {
+impl I2cWriteRequest {
     pub(crate) fn new(
         map_id: String,
         map_digest: String,
         target: I2cTaskTarget,
+        read_ranges: Vec<I2cReadRange>,
+        validation: I2cMapValidationContract,
         pages: Vec<I2cPageWrite>,
+        expected_final_image: Vec<u8>,
         verify_after_write: bool,
     ) -> Self {
-        let plan_digest = candidate_plan_digest(&map_digest, &pages);
-        let seal = candidate_plan_seal(
+        let plan_digest = write_request_digest(&map_digest, &pages, &expected_final_image);
+        let seal = write_request_seal(
             &map_id,
             &map_digest,
             &plan_digest,
             &target,
+            &read_ranges,
+            &validation,
             &pages,
+            &expected_final_image,
             verify_after_write,
         );
         Self {
@@ -533,7 +632,10 @@ impl I2cCandidateWritePlan {
             map_digest,
             plan_digest,
             target,
+            read_ranges,
+            validation,
             pages,
+            expected_final_image,
             verify_after_write,
             seal,
         }
@@ -541,146 +643,80 @@ impl I2cCandidateWritePlan {
 
     #[must_use]
     pub fn is_compiled(&self) -> bool {
-        self.plan_digest == candidate_plan_digest(&self.map_digest, &self.pages)
+        self.plan_digest == write_request_digest(&self.map_digest, &self.pages, &self.expected_final_image)
             && self.seal
-                == candidate_plan_seal(
+                == write_request_seal(
                     &self.map_id,
                     &self.map_digest,
                     &self.plan_digest,
                     &self.target,
+                    &self.read_ranges,
+                    &self.validation,
                     &self.pages,
+                    &self.expected_final_image,
                     self.verify_after_write,
                 )
     }
-}
 
-impl I2cAuthorizedWritePlan {
-    pub(crate) fn new(
-        connection_id: String,
-        expected_before_sha256: String,
-        before_image: Vec<u8>,
-        inspect_plan: I2cInspectPlan,
-        candidate: I2cCandidateWritePlan,
-    ) -> Self {
-        let seal = authorized_plan_seal(
-            &connection_id,
-            &expected_before_sha256,
-            &before_image,
-            &inspect_plan,
-            &candidate,
-        );
-        Self {
-            connection_id,
+    #[must_use]
+    pub fn guarded_request(&self, expected_before_sha256: Option<String>) -> Option<I2cGuardedWriteRequest> {
+        self.is_compiled().then(|| I2cGuardedWriteRequest {
+            target: self.target.clone(),
+            read_ranges: self.read_ranges.clone(),
+            validation: self.validation.clone(),
             expected_before_sha256,
-            before_image,
-            inspect_plan,
-            candidate,
-            seal,
-        }
-    }
-
-    #[must_use]
-    pub fn is_authorized(&self) -> bool {
-        self.inspect_plan.is_compiled()
-            && self.candidate.is_compiled()
-            && self.inspect_plan.map_id == self.candidate.map_id
-            && self.inspect_plan.map_digest == self.candidate.map_digest
-            && self.inspect_plan.target == self.candidate.target
-            && self.seal
-                == authorized_plan_seal(
-                    &self.connection_id,
-                    &self.expected_before_sha256,
-                    &self.before_image,
-                    &self.inspect_plan,
-                    &self.candidate,
-                )
-    }
-
-    #[must_use]
-    pub fn page_at(&self, index: usize) -> Option<&I2cPageWrite> {
-        self.is_authorized()
-            .then(|| self.candidate.pages.get(index))
-            .flatten()
+            pages: self.pages.clone(),
+            expected_final_image: self.expected_final_image.clone(),
+            verify_after_write: self.verify_after_write,
+        })
     }
 }
 
-fn inspect_plan_seal(
+fn read_request_seal(
     map_id: &str,
     map_digest: &str,
     target: &I2cTaskTarget,
     ranges: &[I2cReadRange],
     validation: &I2cMapValidationContract,
 ) -> I2cPlanSeal {
-    let mut digest = I2cPlanDigest::new("inspect");
+    let mut digest = I2cPlanDigest::new("read");
     digest.text(map_id);
     digest.text(map_digest);
     digest.target(target);
-    for range in ranges {
-        digest.u16(range.offset);
-        digest.u16(range.byte_len);
-    }
-    digest.u16(validation.image_bytes);
-    digest.u32(validation.fixed_bytes.len() as u32);
-    for (offset, bytes) in &validation.fixed_bytes {
-        digest.u16(*offset);
-        digest.bytes(bytes);
-    }
-    digest.u32(validation.checksums.len() as u32);
-    for checksum in &validation.checksums {
-        digest.u16(checksum.target_offset);
-        digest.u16(checksum.source_offset);
-        digest.u16(checksum.source_byte_len);
-        digest.text(&format!("{:?}", checksum.algorithm));
-    }
-    match &validation.serial_range {
-        Some(range) => {
-            digest.bool(true);
-            digest.u16(range.offset);
-            digest.u16(range.byte_len);
-        }
-        None => digest.bool(false),
-    }
+    digest.ranges(ranges);
+    digest.validation(validation);
     digest.finish()
 }
 
-fn candidate_plan_seal(
+fn write_request_seal(
     map_id: &str,
     map_digest: &str,
     plan_digest: &str,
     target: &I2cTaskTarget,
+    ranges: &[I2cReadRange],
+    validation: &I2cMapValidationContract,
     pages: &[I2cPageWrite],
+    expected_final_image: &[u8],
     verify_after_write: bool,
 ) -> I2cPlanSeal {
-    let mut digest = I2cPlanDigest::new("candidate");
+    let mut digest = I2cPlanDigest::new("write");
     digest.text(map_id);
     digest.text(map_digest);
     digest.text(plan_digest);
     digest.target(target);
+    digest.ranges(ranges);
+    digest.validation(validation);
     digest.bool(verify_after_write);
     digest.pages(pages);
+    digest.bytes(expected_final_image);
     digest.finish()
 }
 
-fn authorized_plan_seal(
-    connection_id: &str,
-    before_sha256: &str,
-    before_image: &[u8],
-    inspect: &I2cInspectPlan,
-    candidate: &I2cCandidateWritePlan,
-) -> I2cPlanSeal {
-    let mut digest = I2cPlanDigest::new("authorization");
-    digest.text(connection_id);
-    digest.text(before_sha256);
-    digest.bytes(before_image);
-    digest.text(&inspect.seal.0);
-    digest.text(&candidate.seal.0);
-    digest.finish()
-}
-
-fn candidate_plan_digest(map_digest: &str, pages: &[I2cPageWrite]) -> String {
-    let mut digest = I2cPlanDigest::new("candidate-pages");
+fn write_request_digest(map_digest: &str, pages: &[I2cPageWrite], expected_final_image: &[u8]) -> String {
+    let mut digest = I2cPlanDigest::new("write-pages");
     digest.text(map_digest);
     digest.pages(pages);
+    digest.bytes(expected_final_image);
     digest.finish().0
 }
 
@@ -689,7 +725,7 @@ struct I2cPlanDigest(Sha256);
 impl I2cPlanDigest {
     fn new(domain: &str) -> Self {
         let mut digest = Self(Sha256::new());
-        digest.text("camera-toolbox/i2c-task-plan/v1");
+        digest.text("camera-toolbox/i2c-task-plan/v2");
         digest.text(domain);
         digest
     }
@@ -716,6 +752,36 @@ impl I2cPlanDigest {
         self.u16(target.page_size_bytes);
         self.u16(target.write_cycle_ms);
     }
+    fn ranges(&mut self, ranges: &[I2cReadRange]) {
+        self.0.update((ranges.len() as u64).to_le_bytes());
+        for range in ranges {
+            self.u16(range.offset);
+            self.u16(range.byte_len);
+        }
+    }
+    fn validation(&mut self, validation: &I2cMapValidationContract) {
+        self.u16(validation.image_bytes);
+        self.u32(validation.fixed_bytes.len() as u32);
+        for (offset, bytes) in &validation.fixed_bytes {
+            self.u16(*offset);
+            self.bytes(bytes);
+        }
+        self.u32(validation.checksums.len() as u32);
+        for checksum in &validation.checksums {
+            self.u16(checksum.target_offset);
+            self.u16(checksum.source_offset);
+            self.u16(checksum.source_byte_len);
+            self.text(&format!("{:?}", checksum.algorithm));
+        }
+        match &validation.serial_range {
+            Some(range) => {
+                self.bool(true);
+                self.u16(range.offset);
+                self.u16(range.byte_len);
+            }
+            None => self.bool(false),
+        }
+    }
     fn pages(&mut self, pages: &[I2cPageWrite]) {
         self.0.update((pages.len() as u64).to_le_bytes());
         for page in pages {
@@ -736,7 +802,8 @@ impl I2cPlanDigest {
 }
 
 /// 单页执行结果；失败页也要进入报告，后续页永不执行。
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct I2cPageExecutionReport {
     pub offset: u16,
     pub expected: Vec<u8>,
@@ -744,8 +811,9 @@ pub struct I2cPageExecutionReport {
     pub error: Option<String>,
 }
 
-/// I²C 计划执行报告；没有 rollback 字段，因为本路径绝不自动回滚。
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// I²C 写入报告；没有 rollback 字段，因为本路径绝不自动回滚。
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct I2cExecutionReport {
     pub before_image_sha256: String,
     pub pages: Vec<I2cPageExecutionReport>,
@@ -753,32 +821,115 @@ pub struct I2cExecutionReport {
     pub error: Option<String>,
 }
 
-/// 计划专用 I²C 平台端口。它没有原始 transaction 或 shell 输入，调用方只能 inspect 或逐页写入。
+/// 计划专用 I²C 平台端口。读和写都是一次 helper 请求；写请求由目标端持锁完成 fail-stop 校验。
 pub trait I2cTaskExecutor: Send + Sync {
-    fn inspect(
+    fn read(
         &self,
         connection: &super::SshConnection,
-        plan: &I2cInspectPlan,
+        request: &I2cReadRequest,
         control: RemoteOperationControl,
-    ) -> Result<Vec<u8>, String>;
+    ) -> Result<I2cReadReport, String>;
 
-    /// 在首个写页前远端重读 `inspect_plan` 并拒绝 before-image/session/target 不匹配。
-    fn verify_authorized(
+    fn write(
         &self,
         connection: &super::SshConnection,
-        authorized: &I2cAuthorizedWritePlan,
+        request: &I2cWriteRequest,
         control: RemoteOperationControl,
-    ) -> Result<(), String>;
+    ) -> Result<I2cExecutionReport, String>;
+}
 
-    /// `page_index` 与 sealed authorized plan 中的页必须精确相同；实现不得把调用方传入的页当作自由 payload。
-    fn write_page(
-        &self,
-        connection: &super::SshConnection,
-        authorized: &I2cAuthorizedWritePlan,
-        page_index: usize,
-        page: &I2cPageWrite,
-        control: RemoteOperationControl,
-    ) -> Result<Vec<u8>, String>;
+fn validate_guarded_write_request(request: &I2cGuardedWriteRequest) -> Result<(), I2cHelperRequestValidationError> {
+    validate_i2c_target(&request.target)?;
+    validate_read_ranges(&request.read_ranges, Some(request.expected_final_image.len()))?;
+    if request.pages.is_empty() {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            "guarded_write requires at least one page",
+        ));
+    }
+    let transaction_budget = request
+        .read_ranges
+        .len()
+        .checked_mul(2)
+        .and_then(|value| value.checked_add(request.pages.len().saturating_mul(2)))
+        .ok_or_else(|| I2cHelperRequestValidationError::request("invalid_request", "guarded_write transaction budget overflowed"))?;
+    if transaction_budget > I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            format!("guarded_write uses {transaction_budget} logical transactions; max is {I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST}"),
+        ));
+    }
+    for (index, page) in request.pages.iter().enumerate() {
+        if page.bytes.is_empty() || page.bytes.len() > usize::from(request.target.page_size_bytes) {
+            return Err(I2cHelperRequestValidationError::transaction(
+                "invalid_transaction",
+                index,
+                format!("page byte length must be 1..={} bytes", request.target.page_size_bytes),
+            ));
+        }
+        let payload_len = usize::from(request.target.address_width_bytes)
+            .checked_add(page.bytes.len())
+            .ok_or_else(|| I2cHelperRequestValidationError::transaction("invalid_transaction", index, "page payload length overflowed"))?;
+        validate_i2c_message_len(index, 0, payload_len, "guarded_write page payload")?;
+    }
+    Ok(())
+}
+
+fn validate_i2c_target(target: &I2cTaskTarget) -> Result<(), I2cHelperRequestValidationError> {
+    if !matches!(target.address_width_bytes, 1 | 2) {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            "target address width must be 1 or 2 bytes",
+        ));
+    }
+    if target.address < 0x03 || target.address > 0x7f {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            format!("target I2C address 0x{:x} is outside accepted 7-bit range", target.address),
+        ));
+    }
+    if target.page_size_bytes == 0 {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            "target page size must be non-zero",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_read_ranges(ranges: &[I2cReadRange], expected_len: Option<usize>) -> Result<(), I2cHelperRequestValidationError> {
+    if ranges.is_empty() {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            "read ranges must not be empty",
+        ));
+    }
+    let mut total = 0_usize;
+    for (index, range) in ranges.iter().enumerate() {
+        if range.byte_len == 0 {
+            return Err(I2cHelperRequestValidationError::transaction(
+                "invalid_transaction",
+                index,
+                "read range byte length must be non-zero",
+            ));
+        }
+        total = total
+            .checked_add(usize::from(range.byte_len))
+            .ok_or_else(|| I2cHelperRequestValidationError::request("invalid_request", "read range total length overflowed"))?;
+    }
+    if total > I2C_HELPER_MAX_TOTAL_READ_BYTES {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            format!("read ranges total {total} exceeds {I2C_HELPER_MAX_TOTAL_READ_BYTES}"),
+        ));
+    }
+    if let Some(expected) = expected_len && total != expected {
+        return Err(I2cHelperRequestValidationError::request(
+            "invalid_request",
+            format!("expected final image is {expected} bytes, but read ranges cover {total}"),
+        ));
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {

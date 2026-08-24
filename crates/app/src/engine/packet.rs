@@ -11,9 +11,8 @@ use camera_toolbox_core::{
 use serde::{Deserialize, Serialize};
 
 use crate::platform::{
-    DecodedVideoFrame, I2cAuthorizedWritePlan, I2cCandidateWritePlan, I2cExecutionReport,
-    I2cInspectPlan, I2cInspectSnapshot, SourcePts, SshConnection, StreamFrameIdentity,
-    StreamSessionId,
+    DecodedVideoFrame, I2cExecutionReport, I2cReadReport, SourcePts, SshConnection,
+    StreamFrameIdentity, StreamSessionId,
 };
 
 /// 图像平面：数据与每行物理步长分开保存，不能假设所有像素格式都紧密排列。
@@ -816,15 +815,9 @@ pub enum DataPacket {
     },
     /// `ssh.connection.v1`：进程内 SSH 会话句柄；不含 credential material，不能持久化。
     SshConnection(Arc<SshConnection>),
-    /// `i2c.inspect-plan.v1`：只读 inspect 计划。
-    I2cInspectPlan(Arc<I2cInspectPlan>),
-    /// `i2c.candidate-write-plan.v1`：未授权的候选写计划。
-    I2cCandidateWritePlan(Arc<I2cCandidateWritePlan>),
-    /// `i2c.inspect-snapshot.v1`：由 inspect 产生的 before image 绑定快照。
-    I2cInspectSnapshot(Arc<I2cInspectSnapshot>),
-    /// `i2c.authorized-write-plan.v1`：审批后且绑定 connection/snapshot 的写计划。
-    I2cAuthorizedWritePlan(Arc<I2cAuthorizedWritePlan>),
-    /// `i2c.execution-report.v1`：逐页 readback 的最终执行报告。
+    /// `i2c.read-report.v1`：一次原子 read 的设备状态报告。
+    I2cReadReport(Arc<I2cReadReport>),
+    /// `i2c.execution-report.v1`：目标端 guarded write 的逐页 readback 报告。
     I2cExecutionReport(Arc<I2cExecutionReport>),
     /// `calib.coverage`：标定数据覆盖度（弱类型，`Arc<Value>` 承载）。
     Coverage(Arc<serde_json::Value>),
@@ -875,10 +868,7 @@ impl DataPacket {
                 PrimitiveType::Bytes => "data.field.bytes.v1",
             },
             Self::SshConnection(_) => "ssh.connection.v1",
-            Self::I2cInspectPlan(_) => "i2c.inspect-plan.v1",
-            Self::I2cCandidateWritePlan(_) => "i2c.candidate-write-plan.v1",
-            Self::I2cInspectSnapshot(_) => "i2c.inspect-snapshot.v1",
-            Self::I2cAuthorizedWritePlan(_) => "i2c.authorized-write-plan.v1",
+            Self::I2cReadReport(_) => "i2c.read-report.v1",
             Self::I2cExecutionReport(_) => "i2c.execution-report.v1",
             Self::Coverage(_) => "calib.coverage",
             Self::Dataset(_) => "calib.dataset",
@@ -928,10 +918,7 @@ impl DataPacket {
             | Self::StructuredPacket(_)
             | Self::TypedField { .. }
             | Self::SshConnection(_)
-            | Self::I2cInspectPlan(_)
-            | Self::I2cCandidateWritePlan(_)
-            | Self::I2cInspectSnapshot(_)
-            | Self::I2cAuthorizedWritePlan(_)
+            | Self::I2cReadReport(_)
             | Self::I2cExecutionReport(_)
             | Self::Coverage(_)
             | Self::Dataset(_)
@@ -987,21 +974,10 @@ impl std::fmt::Debug for DataPacket {
                 .debug_struct("SshConnection")
                 .field("id", &connection.id())
                 .finish(),
-            Self::I2cInspectPlan(plan) => f
-                .debug_struct("I2cInspectPlan")
-                .field("map_id", &plan.map_id)
-                .finish(),
-            Self::I2cCandidateWritePlan(plan) => f
-                .debug_struct("I2cCandidateWritePlan")
-                .field("plan_digest", &plan.plan_digest)
-                .finish(),
-            Self::I2cInspectSnapshot(snapshot) => f
-                .debug_struct("I2cInspectSnapshot")
-                .field("before_image_sha256", &snapshot.before_image_sha256)
-                .finish(),
-            Self::I2cAuthorizedWritePlan(plan) => f
-                .debug_struct("I2cAuthorizedWritePlan")
-                .field("plan_digest", &plan.candidate.plan_digest)
+            Self::I2cReadReport(report) => f
+                .debug_struct("I2cReadReport")
+                .field("map_id", &report.map_id)
+                .field("valid", &report.valid)
                 .finish(),
             Self::I2cExecutionReport(report) => f
                 .debug_struct("I2cExecutionReport")
