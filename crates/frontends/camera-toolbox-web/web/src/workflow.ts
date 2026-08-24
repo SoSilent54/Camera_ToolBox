@@ -342,6 +342,10 @@ export interface FlowNodeData extends Record<string, unknown> {
   onNodeConfigChange?: (nodeId: string, key: string, value: unknown) => void;
   /** 原子提交一组相互依赖的持久化配置，供 SSH 等整体验证节点使用。 */
   onNodeConfigPatch?: (nodeId: string, config: Record<string, unknown>) => void;
+  /** 提交 Extractor 自身的动态端口配置；App 以整图替换触发后端端口归一化与引擎重建。 */
+  onPlanInterfaceChange?: (nodeId: string, config: Record<string, unknown>) => void;
+  /** 整体替换节点配置；用于含互斥字段的配置切换，避免字段级 patch 保留旧键。 */
+  onNodeConfigReplace?: (nodeId: string, config: Record<string, unknown>) => void;
   /** 触发节点动作；样本审核 payload 仅经运行时 WS 透传，绝不持久化到图配置。 */
   onNodeAction?: (nodeId: string, action: NodeActionName, payload?: DatasetSampleActionPayload) => void;
   /** 拉取节点最近一次输出；无输出时保留当前摘要。 */
@@ -403,6 +407,11 @@ export async function patchGraphNode(nodeId: string, patch: WorkflowNodePatch): 
 export async function updateGraphNodePosition(nodeId: string, position: NodePosition): Promise<WorkflowGraph> {
   return request('graph.updateNode', { nodeId, position });
 }
+/** 整体替换节点配置，不与既有配置合并。 */
+export async function updateGraphNodeConfig(nodeId: string, config: Record<string, unknown>): Promise<WorkflowGraph> {
+  return request('graph.updateNode', { nodeId, config });
+}
+
 
 export async function updateGraphNodePositions(nodes: WorkflowNodePositionUpdate[]): Promise<WorkflowGraph> {
   return request('graph.updateNodePositions', { nodes });

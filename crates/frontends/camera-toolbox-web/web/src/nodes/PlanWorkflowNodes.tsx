@@ -54,39 +54,34 @@ export function SshConnectionNode({ data, selected }: NodeProps) {
   const savedHost = configText(node, 'host', '');
   const savedPort = configText(node, 'port', '22');
   const savedUsername = configText(node, 'username', 'root');
-  const savedHostKey = configText(node, 'expectedHostKey', '');
   const savedCredentialRef = configText(node, 'credentialRef', '');
   const [host, setHost] = useState(savedHost);
   const [port, setPort] = useState(savedPort);
   const [username, setUsername] = useState(savedUsername);
-  const [expectedHostKey, setExpectedHostKey] = useState(savedHostKey);
   const [credentialRef, setCredentialRef] = useState(savedCredentialRef);
   useEffect(() => setHost(savedHost), [savedHost]);
   useEffect(() => setPort(savedPort), [savedPort]);
   useEffect(() => setUsername(savedUsername), [savedUsername]);
-  useEffect(() => setExpectedHostKey(savedHostKey), [savedHostKey]);
   useEffect(() => setCredentialRef(savedCredentialRef), [savedCredentialRef]);
   const parsedPort = Number(port);
   const valid = host.trim().length > 0
     && Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
     && username.trim().length > 0
-    && expectedHostKey.trim().length > 0
     && credentialRef.startsWith('session:');
-  const dirty = host !== savedHost || port !== savedPort || username !== savedUsername || expectedHostKey !== savedHostKey || credentialRef !== savedCredentialRef;
+  const dirty = host !== savedHost || port !== savedPort || username !== savedUsername || credentialRef !== savedCredentialRef;
   const apply = () => nodeData.onNodeConfigPatch?.(node.id, {
-    host: host.trim(), port: String(parsedPort), username: username.trim(), expectedHostKey: expectedHostKey.trim(), credentialRef,
+    host: host.trim(), port: String(parsedPort), username: username.trim(), credentialRef,
   });
   const connectDisabled = !valid || dirty || !nodeData.onNodeAction || nodeData.actionPending;
   return <Shell data={data} selected={selected}>
     <label className="node-config-field"><code>Host</code><input className="nodrag nowheel" value={host} onChange={(event) => setHost(event.target.value)} /></label>
     <label className="node-config-field"><code>Port</code><input className="nodrag nowheel" type="number" min="1" max="65535" value={port} onChange={(event) => setPort(event.target.value)} /></label>
     <label className="node-config-field"><code>User</code><input className="nodrag nowheel" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-    <label className="node-config-field"><code>Expected host key</code><input className="nodrag nowheel" value={expectedHostKey} onChange={(event) => setExpectedHostKey(event.target.value)} /></label>
     <PasswordRegistration nodeId={node.id} credentialRef={credentialRef} onRegistered={setCredentialRef} />
     <label className="node-config-field"><code>Credential session</code><output>{credentialRef || 'Not registered'}</output></label>
-    {!valid ? <span className="node-hint">Host, numeric port, user, pinned OpenSSH host key, and password session are all required.</span> : null}
+    {!valid ? <span className="node-hint">Host, numeric port, user, and password session are all required.</span> : null}
     <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={!valid || !dirty || !nodeData.onNodeConfigPatch} onClick={apply}>Apply SSH configuration</button><button className="nodrag nowheel" type="button" disabled={connectDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'connect')}>{nodeData.actionPending ? 'Connecting…' : 'Connect'}</button></div>
-    <span className="node-hint">The OpenSSH public key and credential session are persisted together only after complete validation; editing any field requires applying again before reconnecting.</span>
+    <span className="node-hint">The credential session is persisted only after complete validation; editing any field requires applying again before reconnecting.</span>
   </Shell>;
 }
 
@@ -111,7 +106,7 @@ export function StructuredFieldExtractorNode({ data, selected }: NodeProps) {
   const [outputs, setOutputs] = useState<ExtractorOutput[]>(persisted);
   useEffect(() => setOutputs(persisted), [JSON.stringify(persisted)]);
   const update = (index: number, key: keyof ExtractorOutput, value: string) => setOutputs((current) => current.map((output, currentIndex) => currentIndex === index ? { ...output, [key]: value } as ExtractorOutput : output));
-  const save = () => nodeData.onNodeConfigPatch?.(node.id, { outputs });
+  const save = () => nodeData.onPlanInterfaceChange?.(node.id, { outputs });
   return <Shell data={data} selected={selected}>
     <span className="node-hint">Each output is an RFC6901 pointer to a complete primitive datum.</span>
     {outputs.map((output, index) => <div className="node-config-fields" key={index}>
@@ -120,7 +115,7 @@ export function StructuredFieldExtractorNode({ data, selected }: NodeProps) {
       <label className="node-config-field"><code>Primitive type</code><select className="nodrag nowheel" value={output.type} onChange={(event) => update(index, 'type', event.target.value)}>{PRIMITIVE_TYPES.map((type) => <option key={type} value={type}>{type}</option>)}</select></label>
       <button className="nodrag nowheel" type="button" onClick={() => setOutputs((current) => current.filter((_output, currentIndex) => currentIndex !== index))}>Remove</button>
     </div>)}
-    <div className="node-actions"><button className="nodrag nowheel" type="button" onClick={() => setOutputs((current) => [...current, { id: `field${current.length + 1}`, pointer: '/fields/0', type: 'f64' }])}>Add field</button><button className="nodrag nowheel" type="button" disabled={!nodeData.onNodeConfigPatch} onClick={save}>Save interface</button></div>
+    <div className="node-actions"><button className="nodrag nowheel" type="button" onClick={() => setOutputs((current) => [...current, { id: `field${current.length + 1}`, pointer: '/fields/0', type: 'f64' }])}>Add field</button><button className="nodrag nowheel" type="button" disabled={!nodeData.onPlanInterfaceChange} onClick={save}>Apply interface changes</button></div>
   </Shell>;
 }
 
@@ -151,7 +146,7 @@ export function I2cTaskBuilderNode({ data, selected }: NodeProps) {
     const config = mapMode === 'builtin'
       ? { mapMode, mapId: mapId.trim(), bus: parsedBus }
       : { mapMode, mapYaml, bus: parsedBus };
-    nodeData.onNodeConfigPatch?.(node.id, config);
+    nodeData.onNodeConfigReplace?.(node.id, config);
   };
   return <Shell data={data} selected={selected}>
     <span className="node-hint">Inputs: packet, serial.number, connection. Outputs: readReport, report.</span>
@@ -162,7 +157,7 @@ export function I2cTaskBuilderNode({ data, selected }: NodeProps) {
     <label className="node-config-field"><code>Bus</code><input className="nodrag nowheel" type="number" min="0" max="4294967295" value={bus} onChange={(event) => setBus(event.target.value)} /></label>
     {!busValid ? <span className="node-hint">Bus must be an unsigned 32-bit integer.</span> : null}
     {mapMode === 'custom' ? <span className="node-hint">YAML is submitted verbatim; leading lines and indentation are retained so compiler line/column diagnostics match this editor.</span> : null}
-    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={!busValid || !mapValid || !configDirty || !nodeData.onNodeConfigPatch} onClick={save}>Apply map configuration</button><button className="nodrag nowheel" type="button" disabled={actionDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'read')}>{nodeData.actionPending ? 'Reading…' : 'Read'}</button><button className="nodrag nowheel" type="button" disabled={actionDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'write')}>{nodeData.actionPending ? 'Writing…' : 'Write'}</button></div>
+    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={!busValid || !mapValid || !configDirty || !nodeData.onNodeConfigReplace} onClick={save}>Apply map configuration</button><button className="nodrag nowheel" type="button" disabled={actionDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'read')}>{nodeData.actionPending ? 'Reading…' : 'Read'}</button><button className="nodrag nowheel" type="button" disabled={actionDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'write')}>{nodeData.actionPending ? 'Writing…' : 'Write'}</button></div>
     {readReport ? <div className="node-config-fields"><strong>Read report</strong><span className="node-hint">Image SHA-256: {readReport.imageSha256}</span><span className="node-hint">Byte length: {readReport.byteLength}</span><span className="node-hint">Valid: {readReport.valid}</span><span className="node-hint">Error: {readReport.error}</span></div> : null}
     {report ? <div className="node-config-fields"><strong>Execution report</strong><span className="node-hint">Final verification: {report.finalVerified}</span><span className="node-hint">Pages: {report.pageCount}</span><span className="node-hint">Error: {report.error}</span>{report.pages.map((page) => <span className="node-hint" key={page.offset}>Offset {page.offset}: expected {page.expectedHex}; readback {page.readbackHex ?? 'unavailable'}; error {page.error ?? 'none'}</span>)}</div> : null}
   </Shell>;

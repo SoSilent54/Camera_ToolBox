@@ -27,8 +27,8 @@ use axum::{
 #[cfg(feature = "calibration-opencv")]
 use camera_toolbox_adapters::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, ServerHostKey,
-    SshCommandService, SshConnectionTarget, SshI2cHelperService, SshTransportFactory,
+    CredentialResolver, ProductionCredentialResolver, RusshTransportFactory, SshCommandService,
+    SshConnectionTarget, SshI2cHelperService, SshTransportFactory,
     production_recipe_registry_from_env,
 };
 use camera_toolbox_adapters::x5_tcp_client;
@@ -53,7 +53,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tower_http::services::{ServeDir, ServeFile};
-use workflow::{WorkflowGraph, validate_workflow};
+use workflow::{WorkflowGraph, normalize_workflow, validate_workflow};
 
 #[derive(Debug, Parser)]
 #[command(name = "camera-toolbox-web")]
@@ -184,24 +184,13 @@ fn ssh_target_from_spec(spec: &ControlTargetSpec) -> SshConnectionTarget {
     }
 }
 
-/// 规范化并固定工作流 SSH 目标的服务端主机密钥，避免 transport 接收未固定的目标。
+/// 构造不携带主机密钥的工作流 SSH 目标；传输层接受服务器提供的任意主机密钥。
 #[cfg(feature = "platform-ssh")]
-fn canonical_pinned_ssh_target(
-    target: &ControlTargetSpec,
-) -> std::result::Result<ControlTargetSpec, String> {
-    let expected_host_key = target
-        .expected_host_key
-        .as_deref()
-        .filter(|key| !key.trim().is_empty())
-        .ok_or_else(|| "SSH connection requires a non-empty expected host key".to_owned())?;
-    let expected_host_key = ServerHostKey::from_openssh(expected_host_key)
-        .map_err(|error| format!("SSH connection expected host key is invalid: {error}"))?
-        .openssh()
-        .to_owned();
-    Ok(ControlTargetSpec {
-        expected_host_key: Some(expected_host_key),
+fn canonical_pinned_ssh_target(target: &ControlTargetSpec) -> ControlTargetSpec {
+    ControlTargetSpec {
+        expected_host_key: None,
         ..target.clone()
-    })
+    }
 }
 
 /// 建立计划节点使用的短生命周期 SSH 连接，并把 credential ref 留在进程内绑定表。
@@ -213,7 +202,7 @@ impl SshConnectionService for ControlRuntime {
         credential_ref: &str,
         control: RemoteOperationControl,
     ) -> std::result::Result<SshConnection, String> {
-        let target = canonical_pinned_ssh_target(target)?;
+        let target = canonical_pinned_ssh_target(target);
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
         let credential = self.credential_resolver.resolve(&credential_ref)?;
         let transport_target = ssh_target_from_spec(&target);
@@ -499,7 +488,7 @@ impl SshCommandExecutor for ControlRuntime {
         request: TypedCommandRequest,
         control: RemoteOperationControl,
     ) -> Result<CommandResult, String> {
-        let target = canonical_pinned_ssh_target(target)?;
+        let target = canonical_pinned_ssh_target(target);
         let credential_ref = validate_credential_ref(credential_ref).map_err(|e| e.error)?;
         // recipe 注册表从环境变量加载；无部署 recipe 时退化为空注册表（execute 会报 RecipeNotAllowed）。
         let recipes =
@@ -1365,7 +1354,7 @@ impl WorkflowStore {
     }
 
     fn save(&self, graph: &WorkflowGraph) -> std::result::Result<(), (StatusCode, String)> {
-        validate_workflow(graph).map_err(|error| {
+        let graph = normalize_workflow(graph.clone(), graph.revision.clone()).map_err(|error| {
             (
                 StatusCode::BAD_REQUEST,
                 format!("invalid workflow for save: {error}"),
@@ -1374,7 +1363,7 @@ impl WorkflowStore {
         let path = self.path_for_id(&graph.id)?;
         fs::create_dir_all(&self.dir).map_err(internal_error)?;
         let tmp = path.with_extension("json.tmp");
-        let content = serde_json::to_vec_pretty(graph).map_err(internal_error)?;
+        let content = serde_json::to_vec_pretty(&graph).map_err(internal_error)?;
         fs::write(&tmp, content).map_err(internal_error)?;
         fs::rename(&tmp, path).map_err(internal_error)?;
         Ok(())
@@ -1467,32 +1456,19 @@ mod tests {
 
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn canonical_pinned_ssh_target_rejects_missing_or_empty_key_and_strips_comments() {
+    fn canonical_pinned_ssh_target_discards_any_host_key() {
         let target = ControlTargetSpec {
             host: "camera.local".to_owned(),
             port: 22,
             username: "root".to_owned(),
-            expected_host_key: None,
+            expected_host_key: Some("not-an-openssh-public-key".to_owned()),
         };
-        assert!(canonical_pinned_ssh_target(&target).is_err());
 
-        let target = ControlTargetSpec {
-            expected_host_key: Some(" ".to_owned()),
-            ..target
-        };
-        assert!(canonical_pinned_ssh_target(&target).is_err());
-
-        let target = ControlTargetSpec {
-            expected_host_key: Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ trusted-camera".to_owned()),
-            ..target
-        };
-        let canonical = canonical_pinned_ssh_target(&target).expect("valid OpenSSH host key");
-        assert_eq!(
-            canonical.expected_host_key.as_deref(),
-            Some(
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-            )
-        );
+        let normalized = canonical_pinned_ssh_target(&target);
+        assert_eq!(normalized.host, target.host);
+        assert_eq!(normalized.port, target.port);
+        assert_eq!(normalized.username, target.username);
+        assert_eq!(normalized.expected_host_key, None);
     }
 
     #[test]
@@ -1553,7 +1529,7 @@ mod tests {
         graph.nodes.push(crate::workflow::WorkflowNode {
             id: "ssh-pinned".to_owned(),
             kind: crate::workflow::NodeKind::SshConnection,
-            title: "Pinned SSH".to_owned(),
+            title: "SSH Connection".to_owned(),
             position: crate::workflow::NodePosition { x: 0.0, y: 0.0 },
             state: crate::workflow::NodeRuntimeState::Ready,
             category: definition.category,
@@ -1573,16 +1549,11 @@ mod tests {
         assert_eq!(loaded.id, "roundtrip");
         assert_eq!(loaded.revision, "rev-test");
         assert_eq!(loaded.nodes.len(), graph.nodes.len());
-        assert_eq!(
-            loaded
-                .nodes
-                .iter()
-                .find(|node| node.id == "ssh-pinned")
-                .and_then(|node| node.config.get("expectedHostKey")),
-            Some(&json!(
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-            ))
-        );
+        assert!(loaded
+            .nodes
+            .iter()
+            .find(|node| node.id == "ssh-pinned")
+            .is_some_and(|node| node.config.get("expectedHostKey").is_none()));
         fs::remove_dir_all(dir).ok();
     }
 
@@ -1711,7 +1682,7 @@ mod tests {
 
     #[cfg(feature = "platform-ssh")]
     #[test]
-    fn control_connect_rejects_missing_or_malformed_pinned_host_key_before_network_io() {
+    fn control_connect_does_not_validate_host_key_before_credential_resolution() {
         let runtime = ControlRuntime::production();
         for expected_host_key in [None, Some("not-an-openssh-public-key".to_owned())] {
             let target = ControlTargetSpec {
@@ -1729,12 +1700,9 @@ mod tests {
                 camera_toolbox_app::DumpCancellation::default(),
             )
             .unwrap();
-            let error =
-                SshConnectionService::connect(&runtime, &target, "session:missing", control)
-                    .expect_err(
-                        "invalid host keys must be rejected before credential or network use",
-                    );
-            assert!(error.contains("expected host key"));
+            let error = SshConnectionService::connect(&runtime, &target, "session:missing", control)
+                .expect_err("missing credential must fail before network I/O");
+            assert!(!error.contains("expected host key"));
         }
     }
     #[cfg(feature = "platform-ssh")]

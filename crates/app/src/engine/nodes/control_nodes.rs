@@ -1313,19 +1313,13 @@ impl SshSessionNode {
         let recipe_id = non_empty(config_string(&self.spec, "recipeId")).ok_or_else(|| {
             NodeError::Precondition("sshSession recipeId must be configured".to_owned())
         })?;
-        let expected_host_key = non_empty(config_string(&self.spec, "expectedHostKey"))
-            .ok_or_else(|| {
-                NodeError::Precondition(
-                    "sshSession expectedHostKey must be a non-empty OpenSSH public key".to_owned(),
-                )
-            })?;
         let target = ControlTargetSpec {
             host,
             port: config_string(&self.spec, "port")
                 .parse::<u16>()
                 .unwrap_or(22),
             username: config_string(&self.spec, "username"),
-            expected_host_key: Some(expected_host_key),
+            expected_host_key: None,
         };
         let request = TypedCommandRequest::new(recipe_id)
             .map_err(|e| NodeError::Precondition(e.to_string()))?;
@@ -1418,11 +1412,11 @@ mod tests {
         }
     }
 
-    fn ssh_session_spec(expected_host_key: Option<&str>) -> NodeSpec {
+    fn ssh_session_spec() -> NodeSpec {
         NodeSpec {
             id: "ssh-session-1".to_owned(),
             kind: "sshSession".to_owned(),
-            title: "Pinned SSH Session".to_owned(),
+            title: "SSH Session".to_owned(),
             inputs: vec![],
             outputs: vec![],
             config: serde_json::json!({
@@ -1431,7 +1425,6 @@ mod tests {
                 "username": "root",
                 "credentialRef": "session:ssh-session-1",
                 "recipeId": "capture",
-                "expectedHostKey": expected_host_key,
             }),
         }
     }
@@ -1993,33 +1986,7 @@ mod tests {
     }
 
     #[test]
-    fn ssh_session_rejects_missing_or_empty_host_key_before_command_execution() {
-        for expected_host_key in [None, Some("")] {
-            let targets = Arc::new(Mutex::new(Vec::new()));
-            let services = EngineServices {
-                ssh_command_executor: Some(Arc::new(RecordingSshCommandExecutor {
-                    targets: Arc::clone(&targets),
-                })),
-                ..EngineServices::default()
-            };
-            let (mut rt, _outputs) = runtime(services);
-            let mut node = SshSessionNode {
-                spec: ssh_session_spec(expected_host_key),
-            };
-
-            let error = node
-                .on_action(NodeAction::Trigger, &mut rt)
-                .expect_err("un-pinned SSH command must be rejected");
-
-            assert!(matches!(error, NodeError::Precondition(_)), "got {error:?}");
-            assert!(targets.lock().is_empty());
-        }
-    }
-
-    #[test]
-    fn ssh_session_passes_pinned_host_key_to_command_executor() {
-        let expected_host_key =
-            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    fn ssh_session_executes_without_host_key() {
         let targets = Arc::new(Mutex::new(Vec::new()));
         let services = EngineServices {
             ssh_command_executor: Some(Arc::new(RecordingSshCommandExecutor {
@@ -2029,11 +1996,11 @@ mod tests {
         };
         let (mut rt, _outputs) = runtime(services);
         let mut node = SshSessionNode {
-            spec: ssh_session_spec(Some(expected_host_key)),
+            spec: ssh_session_spec(),
         };
 
         node.on_action(NodeAction::Trigger, &mut rt)
-            .expect("pinned SSH command executes");
+            .expect("SSH command executes without a host key");
 
         assert_eq!(
             targets.lock().as_slice(),
@@ -2041,9 +2008,35 @@ mod tests {
                 host: "camera.local".to_owned(),
                 port: 22,
                 username: "root".to_owned(),
-                expected_host_key: Some(expected_host_key.to_owned()),
+                expected_host_key: None,
             }]
         );
+    }
+
+    #[test]
+    fn ssh_session_discards_legacy_host_key_before_command_execution() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            ssh_command_executor: Some(Arc::new(RecordingSshCommandExecutor {
+                targets: Arc::clone(&targets),
+            })),
+            ..EngineServices::default()
+        };
+        let (mut rt, _outputs) = runtime(services);
+        let mut spec = ssh_session_spec();
+        spec.config
+            .as_object_mut()
+            .expect("SSH session config is an object")
+            .insert(
+                "expectedHostKey".to_owned(),
+                serde_json::Value::String("not-an-openssh-public-key".to_owned()),
+            );
+        let mut node = SshSessionNode { spec };
+
+        node.on_action(NodeAction::Trigger, &mut rt)
+            .expect("legacy host key does not block SSH command execution");
+
+        assert_eq!(targets.lock()[0].expected_host_key, None);
     }
 
     #[test]

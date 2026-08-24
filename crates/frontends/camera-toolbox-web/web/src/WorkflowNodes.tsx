@@ -190,22 +190,20 @@ function RemoteFrame({ nodeData, selected, children }: { nodeData: FlowNodeData;
   );
 }
 
-/** SSH 节点只接受密码；密码写入服务端进程内凭据库，图仅保存 session 引用和固定的主机公钥。 */
+/** SSH 节点只接受密码；密码写入服务端进程内凭据库，图仅保存 session 引用。 */
 export function SshSessionNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
-  const expectedHostKey = configText(node, 'expectedHostKey', '');
   const set = (key: string, value: string | boolean) => nodeData.onNodeConfigChange?.(node.id, key, value);
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
       <Field id={`${node.id}-host`} label="Host" value={configText(node, 'host', '')} onChange={(value) => set('host', value)} placeholder="camera.local" />
       <Field id={`${node.id}-port`} label="Port" value={configText(node, 'port', '22')} onChange={(value) => set('port', value)} type="number" />
       <Field id={`${node.id}-username`} label="User" value={configText(node, 'username', 'root')} onChange={(value) => set('username', value)} />
-      <Field id={`${node.id}-expected-host-key`} label="Expected host key" value={expectedHostKey} onChange={(value) => set('expectedHostKey', value)} placeholder="ssh-ed25519 AAAA..." />
       <PasswordCredentialField nodeId={node.id} credentialRef={configText(node, 'credentialRef', '')} onCredentialRef={(value) => set('credentialRef', value)} />
-      <label className="node-hint">Password authentication only. The password is registered in the current server process and is never saved in the workflow. A pinned OpenSSH host key is required.</label>
+      <label className="node-hint">Password authentication only. The password is registered in the current server process and is never saved in the workflow.</label>
       <div className="node-actions">
-        <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction || expectedHostKey.trim().length === 0} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
+        <button type="button" className="nodrag nowheel" disabled={!nodeData.onNodeAction} onClick={() => nodeData.onNodeAction?.(node.id, 'trigger')}>Run recipe</button>
       </div>
     </RemoteFrame>
   );

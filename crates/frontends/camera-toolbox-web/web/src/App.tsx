@@ -40,6 +40,7 @@ import {
   saveWorkflow,
   patchGraphNode,
   updateGraphNodePosition,
+  updateGraphNodeConfig,
   updateGraphNodePositions,
   validateConnectionKinds,
   type FlowEdgeData,
@@ -431,6 +432,30 @@ export function App() {
     },
     [commitGraph],
   );
+  const handleNodeConfigReplace = useCallback(
+    (nodeId: string, config: Record<string, unknown>) => {
+      commitGraph(updateGraphNodeConfig(nodeId, config), '节点配置已整体替换');
+    },
+    [commitGraph],
+  );
+  const handlePlanInterfaceChange = useCallback(
+    (nodeId: string, config: Record<string, unknown>) => {
+      const current = graphRef.current;
+      const extractor = current?.nodes.find((node) => node.id === nodeId);
+      if (!current || extractor?.kind !== 'structuredFieldExtractor') {
+        pushEvent('无法更新接口：Extractor 节点不存在');
+        return;
+      }
+      const nextGraph: WorkflowGraph = {
+        ...current,
+        nodes: current.nodes.map((node) => node.id === nodeId
+          ? { ...node, config: { ...node.config, ...config } }
+          : node),
+      };
+      commitGraph(replaceGraph(nextGraph), 'Extractor 接口已更新');
+    },
+    [commitGraph, pushEvent],
+  );
 
 
   useEffect(() => {
@@ -444,6 +469,8 @@ export function App() {
         flowNode.data.onRtspUrlChange === handleRtspUrlChange
         && flowNode.data.onNodeConfigChange === handleNodeConfigChange
         && flowNode.data.onNodeConfigPatch === handleNodeConfigPatch
+        && flowNode.data.onNodeConfigReplace === handleNodeConfigReplace
+        && flowNode.data.onPlanInterfaceChange === handlePlanInterfaceChange
         && flowNode.data.onNodeAction === sendAction
         && flowNode.data.onRefreshNodeOutput === refreshNodeOutput
         && flowNode.data.runtimeState === runtimeState
@@ -466,12 +493,14 @@ export function App() {
           actionPending,
           onNodeConfigChange: handleNodeConfigChange,
           onNodeConfigPatch: handleNodeConfigPatch,
+          onNodeConfigReplace: handleNodeConfigReplace,
+          onPlanInterfaceChange: handlePlanInterfaceChange,
           onNodeAction: sendAction,
           onRefreshNodeOutput: refreshNodeOutput,
         },
       };
     }));
-  }, [handleNodeConfigChange, handleNodeConfigPatch, handleRtspUrlChange, nodeDiagnostics, nodeOutputs, nodeStates, pendingActions, refreshNodeOutput, nodes.length, sendAction, setNodes]);
+  }, [handleNodeConfigChange, handleNodeConfigPatch, handleNodeConfigReplace, handlePlanInterfaceChange, handleRtspUrlChange, nodeDiagnostics, nodeOutputs, nodeStates, pendingActions, refreshNodeOutput, nodes.length, sendAction, setNodes]);
 
   const createFlowNodeAt = useCallback(
     (kind: NodeKind, position: { x: number; y: number }): FlowNode => {

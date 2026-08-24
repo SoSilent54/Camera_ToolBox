@@ -614,12 +614,11 @@ fn ssh_target(spec: &NodeSpec) -> Result<ControlTargetSpec, NodeError> {
     let host = strict_required_text(config, "host")?;
     let port = config_u16(spec, "port", 22)?;
     let username = strict_optional_text(config, "username")?.unwrap_or_else(|| "root".to_owned());
-    let expected_host_key = strict_optional_text(config, "expectedHostKey")?;
     Ok(ControlTargetSpec {
         host,
         port,
         username,
-        expected_host_key,
+        expected_host_key: None,
     })
 }
 
@@ -982,6 +981,17 @@ mod tests {
             cancel: Arc::new(AtomicBool::new(false)),
             viewer_slot: None,
         })
+    }
+
+    #[test]
+    fn ssh_target_ignores_legacy_empty_host_key() {
+        let mut spec = action_spec();
+        spec.config
+            .as_object_mut()
+            .expect("SSH connection config is an object")
+            .insert("expectedHostKey".to_owned(), serde_json::json!(""));
+
+        assert_eq!(ssh_target(&spec).unwrap().expected_host_key, None);
     }
 
     #[test]

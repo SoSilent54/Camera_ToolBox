@@ -1,4 +1,3 @@
-use camera_toolbox_adapters::platforms::ssh_managed::ServerHostKey;
 use camera_toolbox_core::{I2cMapDefinition, builtin_i2c_map};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -426,7 +425,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::SshSession => (
             NodeCategory::Control,
             "SSH Session",
-            "密码认证的远程命令会话；密码仅保留在当前服务端进程，必须固定 OpenSSH 主机密钥",
+            "密码认证的远程命令会话；密码仅保留在当前服务端进程",
             vec![],
             vec![optional_port(
                 "result",
@@ -436,7 +435,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "status.metrics.v1",
                 Some(PortRole::Status),
             )],
-            json!({"profileId": "", "host": "", "port": "22", "username": "root", "expectedHostKey": "", "credentialRef": "", "recipeId": "", "autoConnect": false}),
+            json!({"profileId": "", "host": "", "port": "22", "username": "root", "credentialRef": "", "recipeId": "", "autoConnect": false}),
         ),
         // X5_233 Driver 的图端口是运行时实现的正式契约；手动快照和 capture 输入必须收敛到同一路径。
         NodeKind::X5233Driver => (
@@ -1186,7 +1185,7 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "ssh.connection.v1",
                 Some(PortRole::Control),
             )],
-            json!({"host": "", "port": "22", "username": "root", "expectedHostKey": "", "credentialRef": ""}),
+            json!({"host": "", "port": "22", "username": "root", "credentialRef": ""}),
         ),
         NodeKind::SerialField => (
             NodeCategory::Diagnostics,
@@ -1678,17 +1677,8 @@ fn normalize_source_contracts(graph: &mut WorkflowGraph) {
                 config.remove("filter");
                 config.remove("expectedHostKey");
             }
-            NodeKind::SshSession => {
-                if let Some(expected_host_key) = config_string(config, "expectedHostKey")
-                    .filter(|value| !value.trim().is_empty())
-                {
-                    if let Ok(expected_host_key) = ServerHostKey::from_openssh(expected_host_key) {
-                        config.insert(
-                            "expectedHostKey".to_owned(),
-                            json!(expected_host_key.openssh()),
-                        );
-                    }
-                }
+            NodeKind::SshSession | NodeKind::SshConnection => {
+                config.remove("expectedHostKey");
             }
             NodeKind::RtspSource => {
                 for (legacy, current) in [("expectedWidth", "width"), ("expectedHeight", "height")]
@@ -2057,7 +2047,7 @@ fn validate_integer_range(
     Ok(())
 }
 
-/// 控制节点的 SSH 证书只允许进程内 session 引用，并且必须固定可解析的主机密钥。
+/// 控制节点的 SSH 配置只允许进程内 session 引用。
 fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
     if let Some(profile_id) = config_string(config, "profileId") {
@@ -2084,23 +2074,6 @@ fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
             )
         })?;
     validate_session_credential_ref(node, config, "credentialRef")?;
-    let host_key = config
-        .get("expectedHostKey")
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            format!(
-                "node `{}` SSH configuration requires non-empty expectedHostKey",
-                node.id
-            )
-        })?;
-    validate_printable_config_text(node, "expectedHostKey", host_key)?;
-    ServerHostKey::from_openssh(host_key).map_err(|error| {
-        format!(
-            "node `{}` expectedHostKey must be a valid OpenSSH public key: {error}",
-            node.id
-        )
-    })?;
     Ok(())
 }
 
@@ -2793,7 +2766,7 @@ fn i2c_template_graph() -> WorkflowGraph {
     let mut ssh = workflow_node(
         "ssh-control",
         NodeKind::SshConnection,
-        "Pinned SSH Connection",
+        "SSH Connection",
         NodePosition {
             x: 1660.0,
             y: 920.0,
@@ -2803,7 +2776,6 @@ fn i2c_template_graph() -> WorkflowGraph {
         "host": "camera.local",
         "port": "22",
         "username": "root",
-        "expectedHostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ",
         "credentialRef": "session:ssh-control"
     });
     graph.edges.extend([
@@ -3909,70 +3881,38 @@ mod tests {
     }
 
     #[test]
-    fn normalize_persists_canonical_ssh_session_host_key_and_rejects_unpinned_configs() {
+    fn normalize_removes_explicit_ssh_session_host_key() {
         let mut graph = i2c_template_graph();
         let mut ssh = workflow_node(
             "ssh-pinned",
             NodeKind::SshSession,
-            "Pinned SSH",
+            "SSH Session",
             NodePosition { x: 0.0, y: 0.0 },
         );
         ssh.config = json!({
             "host": "camera.local",
             "port": "22",
             "username": "root",
-            "expectedHostKey": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ trusted-camera",
+            "expectedHostKey": "not-an-openssh-public-key",
             "credentialRef": "session:ssh-pinned",
             "recipeId": "capture"
         });
         graph.nodes.push(ssh);
 
         let normalized = normalize_workflow(graph, "normalized".to_owned())
-            .expect("pinned SSH graph normalizes");
-        assert_eq!(
-            normalized
-                .nodes
-                .iter()
-                .find(|node| node.id == "ssh-pinned")
-                .unwrap()
-                .config["expectedHostKey"],
-            json!(
-                "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-            )
-        );
-
-        let mut invalid = normalized;
-        invalid
+            .expect("SSH graph normalizes without a host key");
+        let config = &normalized
             .nodes
-            .iter_mut()
+            .iter()
             .find(|node| node.id == "ssh-pinned")
-            .unwrap()
-            .config["expectedHostKey"] = json!(42);
-        assert!(validate_workflow(&invalid).is_err());
-        invalid
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == "ssh-pinned")
-            .unwrap()
-            .config["expectedHostKey"] = json!("");
-        assert!(validate_workflow(&invalid).is_err());
-        invalid
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == "ssh-pinned")
-            .unwrap()
-            .config
-            .as_object_mut()
-            .expect("SSH config object")
-            .remove("expectedHostKey");
-        assert!(validate_workflow(&invalid).is_err());
-        invalid
-            .nodes
-            .iter_mut()
-            .find(|node| node.id == "ssh-pinned")
-            .unwrap()
-            .config["expectedHostKey"] = json!("not-an-openssh-public-key");
-        assert!(validate_workflow(&invalid).is_err());
+            .expect("SSH node remains")
+            .config;
+        assert!(config.get("expectedHostKey").is_none());
+        assert_eq!(config["host"], json!("camera.local"));
+        assert_eq!(config["port"], json!("22"));
+        assert_eq!(config["username"], json!("root"));
+        assert_eq!(config["credentialRef"], json!("session:ssh-pinned"));
+        validate_workflow(&normalized).expect("normalized SSH config validates");
     }
 
     #[test]
@@ -3990,9 +3930,6 @@ mod tests {
             );
             if matches!(kind, NodeKind::SshSession | NodeKind::SshConnection) {
                 node.config["host"] = json!("192.0.2.1");
-                node.config["expectedHostKey"] = json!(
-                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ"
-                );
             }
             node.config["credentialRef"] = json!("key-file:/home/user/.ssh/id_ed25519");
             let error = validate_node_config(&node).expect_err("key authentication is forbidden");
