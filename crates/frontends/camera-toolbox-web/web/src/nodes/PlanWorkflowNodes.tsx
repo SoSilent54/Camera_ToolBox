@@ -21,67 +21,54 @@ function Shell({ data, selected, children }: { data: NodeProps['data']; selected
 }
 
 
-/** SSH 密码只登记在服务端进程；成功后持久化的仅是不可解释的 credentialRef。 */
-function PasswordRegistration({ nodeId, credentialRef, onRegistered }: { nodeId: string; credentialRef: string; onRegistered: (credentialRef: string) => void }) {
-  const [password, setPassword] = useState('');
-  const [pending, setPending] = useState(false);
-  const [message, setMessage] = useState<string>();
-  const register = async () => {
-    setPending(true);
-    try {
-      const result = await registerSshPassword(nodeId, password);
-      onRegistered(result.credentialRef);
-      setPassword('');
-      setMessage('Password registered. Apply SSH configuration before connecting.');
-    } catch (error) {
-      setMessage(String(error));
-    } finally {
-      setPending(false);
-    }
-  };
-  return <>
-    <label className="node-config-field"><code>Password</code><input className="nodrag nowheel" type="password" value={password} placeholder="not saved" autoComplete="current-password" onChange={(event) => setPassword(event.target.value)} /></label>
-    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={pending || password.length === 0} onClick={register}>{pending ? 'Registering…' : 'Use password'}</button></div>
-    <span className="node-hint">{credentialRef ? 'A password session is staged locally; apply the SSH configuration to persist its reference.' : 'Register a password before applying the SSH configuration. The password is never written to this workflow.'}</span>
-    {message ? <span className="node-hint">{message}</span> : null}
-  </>;
-}
-
-/** SSH 配置由一次原子 patch 写入；节点运行时会整体验证，禁止逐字段提交中间无效状态。 */
+/** SSH 节点只持久化无密钥配置；Connect 原子登记密码、写入配置并建立会话。 */
 export function SshConnectionNode({ data, selected }: NodeProps) {
   const nodeData = data as FlowNodeData;
   const node = nodeData.workflowNode;
   const savedHost = configText(node, 'host', '');
-  const savedPort = configText(node, 'port', '22');
   const savedUsername = configText(node, 'username', 'root');
   const savedCredentialRef = configText(node, 'credentialRef', '');
   const [host, setHost] = useState(savedHost);
-  const [port, setPort] = useState(savedPort);
   const [username, setUsername] = useState(savedUsername);
   const [credentialRef, setCredentialRef] = useState(savedCredentialRef);
+  const [password, setPassword] = useState('');
+  const [connecting, setConnecting] = useState(false);
+  const [message, setMessage] = useState<string>();
   useEffect(() => setHost(savedHost), [savedHost]);
-  useEffect(() => setPort(savedPort), [savedPort]);
   useEffect(() => setUsername(savedUsername), [savedUsername]);
   useEffect(() => setCredentialRef(savedCredentialRef), [savedCredentialRef]);
-  const parsedPort = Number(port);
   const valid = host.trim().length > 0
-    && Number.isInteger(parsedPort) && parsedPort >= 1 && parsedPort <= 65535
     && username.trim().length > 0
-    && credentialRef.startsWith('session:');
-  const dirty = host !== savedHost || port !== savedPort || username !== savedUsername || credentialRef !== savedCredentialRef;
-  const apply = () => nodeData.onNodeConfigPatch?.(node.id, {
-    host: host.trim(), port: String(parsedPort), username: username.trim(), credentialRef,
-  });
-  const connectDisabled = !valid || dirty || !nodeData.onNodeAction || nodeData.actionPending;
+    && (password.length > 0 || credentialRef.startsWith('session:'));
+  const connect = async () => {
+    if (!valid || !nodeData.onNodeConfigPatch || !nodeData.onNodeAction) return;
+    setConnecting(true);
+    setMessage(undefined);
+    try {
+      let nextCredentialRef = credentialRef;
+      if (password.length > 0) {
+        const result = await registerSshPassword(node.id, password);
+        nextCredentialRef = result.credentialRef;
+        setCredentialRef(nextCredentialRef);
+        setPassword('');
+      }
+      await nodeData.onNodeConfigPatch(node.id, {
+        host: host.trim(), port: '22', username: username.trim(), credentialRef: nextCredentialRef,
+      });
+      nodeData.onNodeAction(node.id, 'connect');
+    } catch (error) {
+      setMessage(String(error));
+    } finally {
+      setConnecting(false);
+    }
+  };
+  const connectDisabled = !valid || !nodeData.onNodeConfigPatch || !nodeData.onNodeAction || nodeData.actionPending || connecting;
   return <Shell data={data} selected={selected}>
-    <label className="node-config-field"><code>Host</code><input className="nodrag nowheel" value={host} onChange={(event) => setHost(event.target.value)} /></label>
-    <label className="node-config-field"><code>Port</code><input className="nodrag nowheel" type="number" min="1" max="65535" value={port} onChange={(event) => setPort(event.target.value)} /></label>
+    <label className="node-config-field"><code>IP</code><input className="nodrag nowheel" value={host} onChange={(event) => setHost(event.target.value)} /></label>
     <label className="node-config-field"><code>User</code><input className="nodrag nowheel" value={username} onChange={(event) => setUsername(event.target.value)} /></label>
-    <PasswordRegistration nodeId={node.id} credentialRef={credentialRef} onRegistered={setCredentialRef} />
-    <label className="node-config-field"><code>Credential session</code><output>{credentialRef || 'Not registered'}</output></label>
-    {!valid ? <span className="node-hint">Host, numeric port, user, and password session are all required.</span> : null}
-    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={!valid || !dirty || !nodeData.onNodeConfigPatch} onClick={apply}>Apply SSH configuration</button><button className="nodrag nowheel" type="button" disabled={connectDisabled} onClick={() => nodeData.onNodeAction?.(node.id, 'connect')}>{nodeData.actionPending ? 'Connecting…' : 'Connect'}</button></div>
-    <span className="node-hint">The credential session is persisted only after complete validation; editing any field requires applying again before reconnecting.</span>
+    <label className="node-config-field"><code>Password</code><input className="nodrag nowheel" type="password" value={password} placeholder={credentialRef ? 'saved for this process' : 'not saved'} autoComplete="current-password" onChange={(event) => setPassword(event.target.value)} /></label>
+    <div className="node-actions"><button className="nodrag nowheel" type="button" disabled={connectDisabled} onClick={connect}>{connecting || nodeData.actionPending ? 'Connecting…' : 'Connect'}</button></div>
+    {message ? <span className="node-hint">{message}</span> : null}
   </Shell>;
 }
 

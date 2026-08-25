@@ -281,8 +281,9 @@ pub(crate) fn parse_action_str(
         | "open_rtsp_ch3"
         | "open_rtsp_all"
         | "close_rtsp"
+        | "connect_ssh"
         | "initialize_api_control"
-        |         "calibrate"
+        | "calibrate"
         | "clear_parking_stop"
         | "zero_current"
         | "send_joint_positions"
@@ -504,6 +505,7 @@ mod tests {
             "open_rtsp_ch3",
             "open_rtsp_all",
             "close_rtsp",
+            "connect_ssh",
             "initialize_api_control",
             "calibrate",
             "clear_parking_stop",

@@ -427,10 +427,17 @@ export function App() {
     [commitGraph],
   );
   const handleNodeConfigPatch = useCallback(
-    (nodeId: string, config: Record<string, unknown>) => {
-      commitGraph(patchGraphNode(nodeId, { config }), '节点配置已原子更新');
+    async (nodeId: string, config: Record<string, unknown>) => {
+      try {
+        const nextGraph = await patchGraphNode(nodeId, { config });
+        renderGraph(nextGraph, '节点配置已原子更新', { source: 'response' });
+      } catch (error) {
+        const message = `图更新失败：${error instanceof Error ? error.message : String(error)}`;
+        pushEvent(message);
+        throw new Error(message);
+      }
     },
-    [commitGraph],
+    [pushEvent, renderGraph],
   );
   const handleNodeConfigReplace = useCallback(
     (nodeId: string, config: Record<string, unknown>) => {

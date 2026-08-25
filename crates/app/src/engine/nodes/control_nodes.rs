@@ -20,10 +20,10 @@ use crate::platform::{
     CommandResult, ControlTargetSpec, DumpCancellation, HexArmJointPositionsRequest,
     HexArmTargetConfig, HexArmTransport, LatestDecodedFrameSlot, RemoteOperationControl,
     RemoteTimeouts, RtspCodec, RtspLatencyMode, RtspStreamConfig, RtspTransport, SourcePts,
-    StreamCancellation, StreamFrameIdentity, StreamOpenRequest, StreamOperationControl,
-    StreamRecordingRequest, StreamService, StreamServiceError, StreamServiceEvent, StreamSession,
-    StreamSessionId, StreamStage, StreamTerminal, StreamTimeouts, TypedCommandRequest,
-    X5233CapturePayload, host_monotonic_time_ns,
+    SshConnection, StreamCancellation, StreamFrameIdentity, StreamOpenRequest,
+    StreamOperationControl, StreamRecordingRequest, StreamService, StreamServiceError,
+    StreamServiceEvent, StreamSession, StreamSessionId, StreamStage, StreamTerminal,
+    StreamTimeouts, TypedCommandRequest, X5233CapturePayload, host_monotonic_time_ns,
 };
 use crate::ports::RasterFormat;
 
@@ -86,6 +86,7 @@ impl NodeFactory for X5233DriverFactory {
 
 pub struct X5233DriverNode {
     spec: NodeSpec,
+    ssh_connection: Option<Arc<SshConnection>>,
     video_ch0: Option<X5233VideoStream>,
     video_ch3: Option<X5233VideoStream>,
 }
@@ -100,6 +101,7 @@ impl X5233DriverNode {
     fn new(spec: NodeSpec) -> Self {
         Self {
             spec,
+            ssh_connection: None,
             video_ch0: None,
             video_ch3: None,
         }
@@ -113,6 +115,63 @@ impl X5233DriverNode {
 
     fn port(&self) -> u16 {
         self.config_u16("tcpPort", 9073)
+    }
+
+    /// X5 的 I²C 路径复用驱动 IP，但 SSH 会话仍必须由显式密码凭据建立。
+    fn ssh_target(&self) -> Result<ControlTargetSpec, NodeError> {
+        let username = non_empty(config_string(&self.spec, "sshUsername")).ok_or_else(|| {
+            NodeError::Precondition("x5233Driver sshUsername must be configured".to_owned())
+        })?;
+        Ok(ControlTargetSpec {
+            host: self.host()?,
+            port: self.config_u16("sshPort", 22),
+            username,
+            expected_host_key: None,
+        })
+    }
+
+    fn connect_ssh(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        let target = self.ssh_target()?;
+        let credential_ref =
+            password_session_credential_ref(&self.spec, "x5233Driver credentialRef")?;
+        self.revoke_ssh(rt, "SSH connection revoked before reconnect")?;
+        let connection = rt
+            .services()
+            .ssh_connection_service()?
+            .connect(&target, &credential_ref, control_timeout(10, 60)?)
+            .map_err(NodeError::Execution)?;
+        if connection.id().trim().is_empty() {
+            return Err(NodeError::Execution(
+                "SSH connection service returned an empty connection id".to_owned(),
+            ));
+        }
+        let connection = Arc::new(connection);
+        rt.emit(
+            "connection",
+            DataPacket::SshConnection(Arc::clone(&connection)),
+        )?;
+        self.ssh_connection = Some(connection);
+        rt.report_state(NodeRuntimeState::Ready, "X5_233 SSH connection established");
+        Ok(())
+    }
+
+    fn revoke_ssh(&mut self, rt: &mut NodeRuntime, state_message: &str) -> Result<(), NodeError> {
+        let Some(connection) = self.ssh_connection.as_ref() else {
+            return Ok(());
+        };
+        rt.services()
+            .ssh_connection_service()?
+            .revoke(connection, control_timeout(10, 60)?)
+            .map_err(NodeError::Execution)?;
+        self.ssh_connection = None;
+        rt.report_state(NodeRuntimeState::Idle, state_message);
+        Ok(())
+    }
+
+    fn ssh_config_changed(&self, candidate: &serde_json::Value) -> bool {
+        ["host", "sshPort", "sshUsername", "credentialRef"]
+            .iter()
+            .any(|key| self.spec.config.get(*key) != candidate.get(*key))
     }
 
     fn yuv_capture_request(&self) -> Result<CaptureRequest, NodeError> {
@@ -537,6 +596,7 @@ impl NodeInstance for X5233DriverNode {
                 self.connect_all_video(rt)
             }
             NodeAction::Custom { name, .. } if name == "close_rtsp" => self.disconnect_video(rt),
+            NodeAction::Custom { name, .. } if name == "connect_ssh" => self.connect_ssh(rt),
             NodeAction::Trigger => {
                 let status = rt
                     .services()
@@ -579,8 +639,24 @@ impl NodeInstance for X5233DriverNode {
         }
     }
 
+    fn on_config_update(
+        &mut self,
+        config: serde_json::Value,
+        rt: &mut NodeRuntime,
+    ) -> Result<(), NodeError> {
+        if self.ssh_config_changed(&config) {
+            self.revoke_ssh(
+                rt,
+                "X5_233 SSH connection revoked after configuration change",
+            )?;
+        }
+        self.spec.config = config;
+        Ok(())
+    }
+
     fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        self.disconnect_video(rt)
+        self.disconnect_video(rt)?;
+        self.revoke_ssh(rt, "X5_233 SSH connection revoked while stopping")
     }
 }
 
@@ -1412,6 +1488,30 @@ mod tests {
         }
     }
 
+    struct RecordingSshConnectionService {
+        targets: Arc<Mutex<Vec<ControlTargetSpec>>>,
+    }
+
+    impl crate::platform::SshConnectionService for RecordingSshConnectionService {
+        fn connect(
+            &self,
+            target: &ControlTargetSpec,
+            _credential_ref: &str,
+            _control: RemoteOperationControl,
+        ) -> Result<SshConnection, String> {
+            self.targets.lock().push(target.clone());
+            Ok(SshConnection::new("x5-ssh-session", target.clone()))
+        }
+
+        fn revoke(
+            &self,
+            _connection: &SshConnection,
+            _control: RemoteOperationControl,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
     fn ssh_session_spec() -> NodeSpec {
         NodeSpec {
             id: "ssh-session-1".to_owned(),
@@ -1627,6 +1727,38 @@ mod tests {
             self.requests.lock().push(request.clone());
             Ok(self.payload.clone())
         }
+    }
+
+    #[test]
+    fn ssh_connect_emits_i2c_compatible_connection() {
+        let targets = Arc::new(Mutex::new(Vec::new()));
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let services = EngineServices {
+            ssh_connection_service: Some(Arc::new(RecordingSshConnectionService {
+                targets: Arc::clone(&targets),
+            })),
+            ..EngineServices::default()
+        };
+        let mut spec = x5_spec();
+        spec.config["sshPort"] = serde_json::json!(22);
+        spec.config["sshUsername"] = serde_json::json!("root");
+        spec.config["credentialRef"] = serde_json::json!("session:x5-1");
+        let mut node = X5233DriverNode::new(spec);
+        let mut rt = runtime_with_record(services, Arc::clone(&emitted));
+
+        node.on_action(
+            NodeAction::Custom {
+                name: "connect_ssh".to_owned(),
+                payload: serde_json::Value::Null,
+            },
+            &mut rt,
+        )
+        .expect("X5 node establishes its SSH connection");
+
+        assert_eq!(targets.lock()[0].host, "camera.local");
+        assert!(emitted.lock().iter().any(|packet| {
+            matches!(packet, DataPacket::SshConnection(connection) if connection.id() == "x5-ssh-session")
+        }));
     }
 
     #[test]

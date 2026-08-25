@@ -485,6 +485,14 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                     "status.metrics.v1",
                     Some(PortRole::Status),
                 ),
+                port(
+                    "connection",
+                    "SSH Connection",
+                    PortDirection::Output,
+                    PortKind::SshConnection,
+                    "ssh.connection.v1",
+                    Some(PortRole::Control),
+                ),
             ],
             json!({
                 "host": "10.21.12.108",
@@ -496,7 +504,10 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "snapshotMode": "latest",
                 "snapshotFrameId": "",
                 "snapshotTimestampNs": "",
-                "rawCamera": 0
+                "rawCamera": 0,
+                "sshPort": 22,
+                "sshUsername": "root",
+                "credentialRef": ""
             }),
         ),
         // Hex Arm 只声明实际存在的独立控制面；它不在图内伪造帧或状态数据包。
@@ -2047,32 +2058,25 @@ fn validate_integer_range(
     Ok(())
 }
 
-/// 控制节点的 SSH 配置只允许进程内 session 引用。
+/// SSH 节点可先以未配置状态加入图；连接动作前由运行时校验完整配置。
 fn validate_password_ssh_config(node: &WorkflowNode) -> Result<(), String> {
     let config = node_config_object(node)?;
     if let Some(profile_id) = config_string(config, "profileId") {
         validate_printable_config_text(node, "profileId", profile_id)?;
     }
     for key in ["host", "username", "credentialRef"] {
-        let value = config_string(config, key)
-            .filter(|value| !value.trim().is_empty())
-            .ok_or_else(|| {
-                format!(
-                    "node `{}` SSH configuration requires non-empty `{key}`",
-                    node.id
-                )
-            })?;
-        validate_printable_config_text(node, key, value)?;
+        if let Some(value) = config_string(config, key) {
+            validate_printable_config_text(node, key, value)?;
+        }
     }
-    let _port = config_string(config, "port")
-        .and_then(|value| value.parse::<u16>().ok())
-        .filter(|port| *port != 0)
-        .ok_or_else(|| {
-            format!(
+    if let Some(port) = config_string(config, "port") {
+        if !port.trim().is_empty() && port.parse::<u16>().ok().filter(|port| *port != 0).is_none() {
+            return Err(format!(
                 "node `{}` SSH configuration requires port in 1..=65535",
                 node.id
-            )
-        })?;
+            ));
+        }
+    }
     validate_session_credential_ref(node, config, "credentialRef")?;
     Ok(())
 }
@@ -3940,6 +3944,17 @@ mod tests {
         }
     }
 
+    #[test]
+    fn unconfigured_ssh_connection_is_a_valid_workflow_draft() {
+        let node = workflow_node(
+            "ssh-draft",
+            NodeKind::SshConnection,
+            "SSH Connection",
+            NodePosition { x: 0.0, y: 0.0 },
+        );
+
+        validate_node_config(&node).expect("unconfigured SSH node can be added to a graph");
+    }
     #[test]
     fn templates_generate_valid_graphs() {
         for template in workmode_templates() {

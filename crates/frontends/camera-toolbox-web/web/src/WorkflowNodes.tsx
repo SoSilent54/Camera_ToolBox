@@ -221,10 +221,32 @@ export function X5233DriverNode({ data, selected }: NodeProps) {
   const rawCamera = numberValue(configText(node, 'rawCamera', '0'), 0);
   const [pending, setPending] = useState(false);
   const [result, setResult] = useState<X5ControlResponse | string>();
+  const [sshPassword, setSshPassword] = useState('');
+  const [sshPending, setSshPending] = useState(false);
   const set = (key: string, value: string) => nodeData.onNodeConfigChange?.(node.id, key, value);
   const call = async (operation: () => Promise<X5ControlResponse>) => {
     setPending(true);
     try { setResult(await operation()); } catch (error) { setResult(String(error)); } finally { setPending(false); }
+  };
+  const sshUsername = configText(node, 'sshUsername', 'root');
+  const sshCredentialRef = configText(node, 'credentialRef', '');
+  const connectSsh = async () => {
+    if (!host.trim() || !sshUsername.trim() || (!sshPassword && !sshCredentialRef) || !nodeData.onNodeConfigPatch || !nodeData.onNodeAction) return;
+    setSshPending(true);
+    try {
+      const credentialRef = sshPassword
+        ? (await registerSshPassword(node.id, sshPassword)).credentialRef
+        : sshCredentialRef;
+      await nodeData.onNodeConfigPatch(node.id, {
+        host: host.trim(), sshPort: 22, sshUsername: sshUsername.trim(), credentialRef,
+      });
+      setSshPassword('');
+      nodeData.onNodeAction(node.id, 'connect_ssh');
+    } catch (error) {
+      setResult(String(error));
+    } finally {
+      setSshPending(false);
+    }
   };
   const binding = { host, tcpPort };
   const actionPending = Boolean(nodeData.actionPending);
@@ -234,8 +256,12 @@ export function X5233DriverNode({ data, selected }: NodeProps) {
   return (
     <RemoteFrame nodeData={nodeData} selected={selected}>
       <strong>Connection</strong>
-      <Field id={`${node.id}-host`} label="Host" value={host} onChange={(value) => set('host', value)} />
+      <Field id={`${node.id}-host`} label="IP" value={host} onChange={(value) => set('host', value)} />
       <Field id={`${node.id}-tcp-port`} label="TCP port" value={configText(node, 'tcpPort', '9073')} onChange={(value) => set('tcpPort', value)} type="number" />
+      <strong>I²C SSH</strong>
+      <Field id={`${node.id}-ssh-user`} label="User" value={sshUsername} onChange={(value) => set('sshUsername', value)} />
+      <Field id={`${node.id}-ssh-password`} label="Password" value={sshPassword} onChange={setSshPassword} type="password" placeholder={sshCredentialRef ? 'saved for this process' : 'not saved'} />
+      <div className="node-actions"><button type="button" className="nodrag nowheel" disabled={sshPending || workflowActionDisabled || !host.trim() || !sshUsername.trim() || (!sshPassword && !sshCredentialRef)} onClick={connectSsh}>{sshPending ? 'Connecting SSH…' : 'Connect SSH'}</button></div>
 
       <strong>RTSP stream</strong>
       <Field id={`${node.id}-rtsp-channel`} label="RTSP channel" value={configText(node, 'rtspChannel', String(rtspChannel))} onChange={(value) => set('rtspChannel', value)} type="number" />

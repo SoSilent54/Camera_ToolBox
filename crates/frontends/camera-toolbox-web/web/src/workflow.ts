@@ -262,6 +262,7 @@ export type NodeActionName =
   | 'open_rtsp_ch3'
   | 'open_rtsp_all'
   | 'close_rtsp'
+  | 'connect_ssh'
   | 'initialize_api_control'
   | 'calibrate'
   | 'clear_parking_stop'
@@ -340,8 +341,8 @@ export interface FlowNodeData extends Record<string, unknown> {
   availableActions?: readonly NodeActionControl[];
   onRtspUrlChange?: (nodeId: string, url: string) => void;
   onNodeConfigChange?: (nodeId: string, key: string, value: unknown) => void;
-  /** 原子提交一组相互依赖的持久化配置，供 SSH 等整体验证节点使用。 */
-  onNodeConfigPatch?: (nodeId: string, config: Record<string, unknown>) => void;
+  /** 原子提交一组相互依赖的持久化配置，完成后才允许发送依赖该配置的节点动作。 */
+  onNodeConfigPatch?: (nodeId: string, config: Record<string, unknown>) => Promise<void>;
   /** 提交 Extractor 自身的动态端口配置；App 以整图替换触发后端端口归一化与引擎重建。 */
   onPlanInterfaceChange?: (nodeId: string, config: Record<string, unknown>) => void;
   /** 整体替换节点配置；用于含互斥字段的配置切换，避免字段级 patch 保留旧键。 */
