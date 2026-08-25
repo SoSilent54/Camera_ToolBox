@@ -5,7 +5,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc,
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
@@ -390,15 +390,6 @@ struct EepromOperationResult {
     result: Result<EepromOperationOutcome, EepromOperationFailure>,
 }
 
-#[cfg(feature = "platform-ssh")]
-static SHARED_I2C_HELPER_OPERATION_LOCK: LazyLock<Mutex<()>> =
-    LazyLock::new(|| Mutex::new(()));
-
-#[cfg(feature = "platform-ssh")]
-fn shared_i2c_helper_operation_lock() -> &'static Mutex<()> {
-    &SHARED_I2C_HELPER_OPERATION_LOCK
-}
-
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 fn run_eeprom_operation(
     target: EepromProvisioningTarget,
@@ -442,9 +433,6 @@ fn run_eeprom_operation(
     } else {
         None
     };
-    let _helper_guard = shared_i2c_helper_operation_lock()
-        .lock()
-        .map_err(|_| EepromOperationFailure::known("I²C helper operation lock is poisoned"))?;
 
 
     let helper_result = match target.service.execute(operation, control) {
@@ -545,9 +533,6 @@ fn run_i2c_bus_discovery(
         cancellation,
     )
     .map_err(|error| error.to_string())?;
-    let _helper_guard = shared_i2c_helper_operation_lock()
-        .lock()
-        .map_err(|_| EepromOperationFailure::known("I²C helper operation lock is poisoned"))?;
 
     let service = SshI2cHelperService::new(
         format!("calibration-i2c-{}", operation_id),
@@ -603,9 +588,6 @@ fn run_i2c_tools_request(
         cancellation,
     )
     .map_err(|error| error.to_string())?;
-    let _helper_guard = shared_i2c_helper_operation_lock()
-        .lock()
-        .map_err(|_| "I²C helper operation lock is poisoned".to_owned())?;
 
     let service = SshI2cHelperService::new(
         "i2c-tools".to_owned(),

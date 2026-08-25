@@ -2,7 +2,10 @@
 
 use std::{
     process,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        LazyLock, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -19,6 +22,14 @@ const HELPER_HASH_OUTPUT_LIMIT: usize = 256;
 
 static HELPER_UPLOAD_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+/// 串行化同一 helper 路径的安装发布段（remove_file + rename）。
+///
+/// 并发 worker 各自持有独立 SSH session，上传 staging 文件名带 pid+counter 不会冲突；
+/// 但 `remove_file(HELPER_PROGRAM)` 与 `rename(staging, HELPER_PROGRAM)` 之间会竞争同一
+/// 目标路径。锁只覆盖安装段（内部每个 SSH 操作都有 control 超时，有界），
+/// helper 实际执行仍并行；避免在 app 层对整个操作持无界锁导致跨面板排队。
+static HELPER_PUBLISH_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
 const HELPER_STAGING_CLEANUP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub(super) fn install_helper(
@@ -27,6 +38,9 @@ pub(super) fn install_helper(
     control: &RemoteOperationControl,
     label: &str,
 ) -> Result<(), String> {
+    let _publish_guard = HELPER_PUBLISH_LOCK
+        .lock()
+        .map_err(|_| "helper publish lock is poisoned".to_owned())?;
     ensure_remote_dir(session, "/usr/local/libexec", control, label)?;
     if remote_helper_is_current(session, helper_payload, control) {
         return chmod_helper(session, control, label);
