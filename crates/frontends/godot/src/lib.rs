@@ -4,6 +4,7 @@
 //! 运行：`godot --path crates/frontends/godot/godot`。
 
 mod preview;
+mod solve;
 mod ui;
 mod x5;
 
@@ -15,7 +16,9 @@ use std::time::Instant;
 use ui::steps::StepId;
 use ui::{theme, UiState};
 
+use camera_toolbox_core::BoardSpec;
 use preview::StreamState;
+use solve::solve_channel;
 
 /// 应用根节点：挂载 5 步向导 UI 与领域层控制器。
 #[derive(GodotClass)]
@@ -89,6 +92,16 @@ impl IControl for CalibApp {
                     self.base.__constructed_gd().cast::<CalibApp>(),
                     "on_toggle_capture_ch3",
                 ));
+            // Step 3 求解按钮。
+            state
+                .solve
+                .solve_button
+                .signals()
+                .pressed()
+                .connect(button_callback(
+                    self.base.__constructed_gd().cast::<CalibApp>(),
+                    "on_solve",
+                ));
         }
         // 合成模式（无板验证）：跳过 Step 1，直接进入双预览。
         if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1") {
@@ -156,6 +169,10 @@ impl IControl for CalibApp {
             godot_print!("双路采集完成");
             if let Some(ui) = self.ui.as_mut() {
                 ui.complete_step(StepId::Preview, "双路采集完成 · 可进入求解");
+            }
+            // 合成模式：采集完成后自动触发求解（验证检测/标定管线）。
+            if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1") {
+                self.on_solve();
             }
         }
 
@@ -271,12 +288,59 @@ impl CalibApp {
         }
     }
 
+    /// 执行标定：对双路 dataset 分别求解（后台线程）。
+    #[func]
+    fn on_solve(&mut self) {
+        let Some(streams) = self.streams.as_ref() else {
+            self.connect_status("请先完成双路采集", theme::WARN);
+            return;
+        };
+        let (cols, rows, square_mm) = {
+            let Some(ui) = self.ui.as_mut() else {
+                return;
+            };
+            (
+                ui.solve.board_cols.get_value() as u16,
+                ui.solve.board_rows.get_value() as u16,
+                ui.solve.square_mm.get_value(),
+            )
+        };
+        let board = BoardSpec {
+            inner_cols: cols,
+            inner_rows: rows,
+            square_size: square_mm,
+        };
+        if board.validate().is_err() {
+            self.connect_status("棋盘参数非法", theme::ERR);
+            return;
+        }
+        let ch0_frames = streams.ch0.captured.clone();
+        let ch3_frames = streams.ch3.captured.clone();
+        if let Some(ui) = self.ui.as_mut() {
+            ui.solve.ch0_result.set_text("CH0：求解中…");
+            ui.solve.ch3_result.set_text("CH3：求解中…");
+            ui.solve
+                .ch0_result
+                .add_theme_color_override("font_color", theme::MUTED);
+            ui.solve
+                .ch3_result
+                .add_theme_color_override("font_color", theme::MUTED);
+        }
+        self.spawn_task(move || {
+            let r0 = solve_channel(0, &ch0_frames, board);
+            let r1 = solve_channel(3, &ch3_frames, board);
+            match (r0, r1) {
+                (Ok(a), Ok(b)) => format!("{}\n{}", a.summary(), b.summary()),
+                (Ok(a), Err(e)) => format!("{}\nCH3 失败：{e}", a.summary()),
+                (Err(e), Ok(b)) => format!("CH0 失败：{e}\n{}", b.summary()),
+                (Err(e0), Err(e1)) => format!("CH0 失败：{e0}\nCH3 失败：{e1}"),
+            }
+        });
+    }
+
     /// 主线程处理后台任务结果（由 `_process` 轮询触发）。
     fn finish_task(&mut self, text: String) {
-        let ok = text.starts_with("驱动已就绪");
-        let color = if ok { theme::OK } else { theme::ERR };
-        self.connect_status(&text, color);
-        if ok {
+        if text.starts_with("驱动已就绪") {
             if let Some(state) = self.ui.as_mut() {
                 state.complete_step(StepId::Connect, "驱动已就绪 · 可连接预览");
             }
@@ -287,6 +351,26 @@ impl CalibApp {
                 .map(|state| state.connect.device_ip.get_text().to_string())
                 .unwrap_or_default();
             self.start_previews(&host);
+            self.connect_status(&text, theme::OK);
+            godot_print!("求解结果：{text}");
+            let lines: Vec<&str> = text.lines().collect();
+            let mut both_ok = true;
+            if let Some(ui) = self.ui.as_mut() {
+                let ch0_text = lines.first().copied().unwrap_or("CH0：无结果");
+                let ch3_text = lines.get(1).copied().unwrap_or("CH3：无结果");
+                ui.solve.set_result(ui.solve.ch0_result.clone(), ch0_text);
+                ui.solve.set_result(ui.solve.ch3_result.clone(), ch3_text);
+                both_ok = !ch0_text.contains("失败") && !ch3_text.contains("失败");
+            }
+            if both_ok {
+                if let Some(ui) = self.ui.as_mut() {
+                    ui.complete_step(StepId::Solve, "两路标定完成 · 可写入 EEPROM");
+                }
+            }
+        } else {
+            // probe/bootstrap 失败等：显示到 Step 1 状态行。
+            godot_print!("任务结果（失败）：{text}");
+            self.connect_status(&text, theme::ERR);
         }
     }
 

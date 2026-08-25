@@ -17,6 +17,7 @@ use crate::ui::steps::connect::ConnectStep;
 use crate::ui::steps::preview::PreviewStep;
 use crate::ui::steps::{StepId, STEP_TITLES};
 use crate::ui::theme;
+use crate::ui::steps::solve_step::SolveStep;
 
 /// 向导全部 UI 句柄与流程状态（纯 Rust，非 Godot 类）。
 pub struct UiState {
@@ -29,6 +30,7 @@ pub struct UiState {
     active: StepId,
     pub connect: ConnectStep,
     pub preview: PreviewStep,
+    pub solve: SolveStep,
     pub status_bar: Gd<Label>,
 }
 
@@ -81,6 +83,7 @@ impl UiState {
         let mut step_bodies = Vec::new();
         let mut connect: Option<ConnectStep> = None;
         let mut preview: Option<PreviewStep> = None;
+        let mut solve: Option<SolveStep> = None;
         for index in 0..4 {
             let mut panel = PanelContainer::new_alloc();
             panel.add_theme_stylebox_override("panel", &theme::panel_style(None));
@@ -113,6 +116,11 @@ impl UiState {
                 panel_v.add_child(&step.panel);
                 step_bodies.push(step.panel.clone());
                 preview = Some(step);
+            } else if index == 2 {
+                let step = SolveStep::build();
+                panel_v.add_child(&step.panel);
+                step_bodies.push(step.panel.clone());
+                solve = Some(step);
             } else {
                 let mut placeholder = Label::new_alloc();
                 placeholder.set_text("（待实现）");
@@ -128,6 +136,7 @@ impl UiState {
         }
         let connect = connect.expect("Step 1 构建失败");
         let preview = preview.expect("Step 2 构建失败");
+        let solve = solve.expect("Step 3 构建失败");
 
         // 底部状态栏。
         let mut status_bar = Label::new_alloc();
@@ -146,6 +155,7 @@ impl UiState {
             active: StepId::Connect,
             connect,
             preview,
+            solve,
             status_bar,
         };
         state.refresh();

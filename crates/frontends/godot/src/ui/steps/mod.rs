@@ -5,6 +5,7 @@
 
 pub mod connect;
 pub mod preview;
+pub mod solve_step;
 
 /// 向导步骤标识；顺序即流程顺序。
 #[derive(Clone, Copy, PartialEq, Eq)]
