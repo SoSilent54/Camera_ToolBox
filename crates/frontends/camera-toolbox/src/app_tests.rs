@@ -1,5 +1,7 @@
-use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_adapters::platforms::ssh_managed::ServerHostKey;
 use std::{path::PathBuf, sync::Arc, time::Duration};
+use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
 
 use camera_toolbox_app::{
     DirectoryRef, ExportDestination, FileRef, FileSourceId, FsCancellation, ImageOpenMode,
@@ -657,7 +659,7 @@ fn x5_233_remote_control_fallback_builds_root_connection() {
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
     app.x5_233_driver.ssh_expected_host_key = EXPECTED_HOST_KEY.to_owned();
 
-    let config = app.remote_control_connection("missing").unwrap();
+    let config = app.remote_control_connection(&context, "missing").unwrap();
 
     assert_eq!(config.host, "10.21.12.108");
     assert_eq!(config.port, 22);
@@ -672,19 +674,37 @@ fn x5_233_remote_control_fallback_builds_root_connection() {
 
 #[cfg(feature = "platform-ssh")]
 #[test]
-fn x5_233_remote_control_rejects_missing_host_key() {
+fn x5_233_remote_control_missing_host_key_triggers_auto_fetch() {
     let context = egui::Context::default();
     let mut app = CameraToolboxApp::new(&context).unwrap();
     app.x5_233_driver.device_ip = "10.21.12.108".to_owned();
 
-    let error = match app.remote_control_connection("missing") {
-        Ok(_) => panic!("a missing X5 host key must prevent SSH control"),
+    let error = match app.remote_control_connection(&context, "missing") {
+        Ok(_) => panic!("a missing X5 host key must trigger auto-fetch instead of SSH control"),
         Err(error) => error,
     };
     assert!(
-        error.starts_with("X5_233 expected SSH host key is invalid:"),
+        error.contains("SSH 主机密钥正在自动获取"),
         "unexpected error: {error}"
     );
+}
+
+#[cfg(feature = "platform-ssh")]
+#[test]
+fn x5_233_host_key_scan_poll_captures_key_without_ui_input() {
+    const EXPECTED_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.x5_233_host_key_scan = Some(rx);
+    let key = ServerHostKey::from_openssh(EXPECTED_HOST_KEY).unwrap();
+    tx.send(Ok(key)).unwrap();
+
+    app.poll_x5_233_host_key_scan();
+
+    assert_eq!(app.x5_233_driver.ssh_expected_host_key, EXPECTED_HOST_KEY);
+    assert!(app.x5_233_host_key_scan.is_none());
 }
 
 #[cfg(feature = "platform-ssh")]

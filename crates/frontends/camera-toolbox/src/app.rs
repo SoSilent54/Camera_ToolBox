@@ -67,8 +67,9 @@ use crate::{
 use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::{
-    CredentialResolver, RusshTransportFactory, ServerHostKey, SshConnectionTarget,
-    SshI2cHelperService, SshTransportFactory,
+    CredentialResolver, HostKeyAssessment, HostKeyManager, HostKeyTarget,
+    RusshServerHostKeyProbe, RusshTransportFactory, ServerHostKey, ServerHostKeyProbe,
+    SshConnectionTarget, SshI2cHelperService, SshTransportFactory,
 };
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_adapters::platforms::ssh_managed::SshEepromProvisionService;
@@ -1722,6 +1723,8 @@ fn render_x5_233_tcp_status(ui: &mut egui::Ui, summary: &x5_tcp_client::X5ProbeS
 }
 
 const X5_233_SSH_PORT: u16 = 22;
+/// X5_233 SSH 主机密钥无认证探测超时；只做 KEX 握手，不进入认证。
+const X5_233_HOST_KEY_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 const X5_233_DRIVER_BOOTSTRAP_COMMAND: &str = "cd /opt || exit 1\nif [ ! -x ./DEMO233 ]; then echo 'missing executable /opt/DEMO233' >&2; exit 2; fi\nif pgrep -f '[D]EMO233' >/dev/null 2>&1; then echo 'DEMO233 already running'; else nohup env LD_LIBRARY_PATH=/usr/hobot/lib:/usr/hobot/lib/sensor:/usr/lib:/lib:/lib64:${LD_LIBRARY_PATH:-} SC233_CALIBRATION_MODE=1 X5_TCP_CONTROL_ENABLE=1 X5_TCP_CONTROL_PORT=9073 ./DEMO233 >/tmp/pangbot-calib-tool-DEMO233.log 2>&1 </dev/null & echo 'DEMO233 start queued'; fi";
 
 const X5_233_HBN_RAW10_FORMAT_CODE: u32 = 24;
@@ -1957,6 +1960,10 @@ pub(crate) struct CameraToolboxApp {
     x5_233_driver_bootstrap_receiver: Receiver<X5233DriverBootstrapResult>,
     #[cfg(feature = "platform-ssh")]
     active_x5_233_driver_bootstrap: Option<ActiveX5233DriverBootstrap>,
+    #[cfg(feature = "platform-ssh")]
+    x5_233_host_key_scan: Option<mpsc::Receiver<Result<ServerHostKey, String>>>,
+    #[cfg(all(feature = "platform-ssh", test))]
+    x5_233_host_key_probe: Option<Arc<dyn ServerHostKeyProbe>>,
     notifications: NotificationCenter,
     next_generation: u64,
     live_runtime: LiveRuntime,
@@ -2081,6 +2088,10 @@ impl CameraToolboxApp {
             x5_233_driver_bootstrap_receiver,
             #[cfg(feature = "platform-ssh")]
             active_x5_233_driver_bootstrap: None,
+            #[cfg(feature = "platform-ssh")]
+            x5_233_host_key_scan: None,
+            #[cfg(all(feature = "platform-ssh", test))]
+            x5_233_host_key_probe: None,
             notifications: NotificationCenter::default(),
             next_generation: 1,
             live_runtime,
@@ -2131,7 +2142,8 @@ impl eframe::App for CameraToolboxApp {
         #[cfg(feature = "platform-ssh")]
         self.poll_i2c_tools_result();
         #[cfg(feature = "platform-ssh")]
-        self.poll_x5_233_driver_bootstrap_result();
+        self.poll_x5_233_host_key_scan();
+        self.poll_raw_open_result(&context);
         self.poll_raw_open_result(&context);
         self.poll_auto_open_result(&context);
         self.enqueue_auto_open_candidates();
@@ -2257,7 +2269,7 @@ impl eframe::App for CameraToolboxApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.separator();
-                                let live_open_request = self.render_x5_233_driver_workspace(ui);
+                                let live_open_request = self.render_x5_233_driver_workspace(&context, ui);
                                 ui.separator();
                                 let stream_action = self.render_workspace_stream_section(ui);
                                 self.render_stream_metrics(ui);
@@ -2836,13 +2848,13 @@ impl CameraToolboxApp {
     ) -> Option<LiveStreamOpenRequest> {
         let host_ready = !self.x5_233_driver.device_ip.trim().is_empty();
         #[cfg(feature = "platform-ssh")]
-        let ssh_host_key_ready = !self.x5_233_driver.ssh_expected_host_key.trim().is_empty();
-        #[cfg(not(feature = "platform-ssh"))]
-        let ssh_host_key_ready = true;
-        #[cfg(feature = "platform-ssh")]
         let bootstrap_running = self.active_x5_233_driver_bootstrap.is_some();
         #[cfg(not(feature = "platform-ssh"))]
         let bootstrap_running = false;
+        #[cfg(feature = "platform-ssh")]
+        let host_key_scanning = self.x5_233_host_key_scan.is_some();
+        #[cfg(not(feature = "platform-ssh"))]
+        let host_key_scanning = false;
         let driver_running = self.x5_233_driver_is_running();
         let driver_ready = host_ready && driver_running;
         let mut request = None;
@@ -2860,17 +2872,27 @@ impl CameraToolboxApp {
                 );
                 #[cfg(feature = "platform-ssh")]
                 {
-                    ui.label("SSH 主机密钥");
-                    ui.add_enabled(
-                        !bootstrap_running,
-                        egui::TextEdit::singleline(&mut self.x5_233_driver.ssh_expected_host_key)
-                            .hint_text("ssh-ed25519 AAAA...")
-                            .desired_width(280.0),
-                    );
+                    if ui
+                        .add_enabled(
+                            host_ready && !bootstrap_running && !host_key_scanning,
+                            egui::Button::new("自动获取 SSH 主机密钥"),
+                        )
+                        .on_disabled_hover_text(if host_key_scanning {
+                            "正在自动获取主机密钥，请稍候。"
+                        } else {
+                            "先输入 X5_233 设备 IP；首次使用自动探测并固定服务器身份，无需手动输入密钥。"
+                        })
+                        .clicked()
+                    {
+                        self.start_x5_233_host_key_scan(context);
+                    }
+                    if host_key_scanning {
+                        ui.spinner();
+                    }
                 }
                 if ui
                     .add_enabled(
-                        host_ready && ssh_host_key_ready && !bootstrap_running,
+                        host_ready && !bootstrap_running,
                         egui::Button::new(if driver_running {
                             "读取驱动状态"
                         } else {
@@ -2880,7 +2902,7 @@ impl CameraToolboxApp {
                     .on_disabled_hover_text(if bootstrap_running {
                         "驱动启动中，请等待结果。"
                     } else {
-                        "先输入 X5_233 设备 IP 和 SSH 主机密钥。"
+                        "先输入 X5_233 设备 IP。"
                     })
                     .clicked()
                 {
@@ -2903,7 +2925,7 @@ impl CameraToolboxApp {
                     }
                 }
             });
-            ui.weak("SSH 用户固定 root/root；GUI 会先检测 TCP 9073 是否已有驱动在运行；未运行时必须使用已固定的 OpenSSH 主机公钥通过 SSH 在 /opt 自动执行 SC233_CALIBRATION_MODE=1 ./DEMO233，并等待 TCP 9073 可用。");
+            ui.weak("SSH 使用 root/root 密码认证；首次使用时 GUI 自动探测并固定服务器身份（写入 known_hosts），服务器身份变更会被拒绝。GUI 会先检测 TCP 9073 是否已有驱动在运行；未运行时通过 SSH 在 /opt 自动执行 SC233_CALIBRATION_MODE=1 ./DEMO233，并等待 TCP 9073 可用。");
         });
 
         ui.add_space(8.0);
@@ -3058,7 +3080,10 @@ impl CameraToolboxApp {
     }
 
     #[cfg(feature = "platform-ssh")]
-    fn x5_233_control_connection(&mut self) -> Result<RemoteConnectionConfig, String> {
+    fn x5_233_control_connection(
+        &mut self,
+        context: &egui::Context,
+    ) -> Result<RemoteConnectionConfig, String> {
         let host = self.x5_233_driver.device_ip.trim();
         if host.is_empty() {
             return Err("Enter X5_233 device IP before using SSH/SFTP control.".to_owned());
@@ -3070,12 +3095,22 @@ impl CameraToolboxApp {
         if self.x5_233_driver.ssh_password.is_empty() {
             return Err("X5_233 SSH password must not be empty.".to_owned());
         }
-        let expected_host_key = ServerHostKey::from_openssh(
-            self.x5_233_driver.ssh_expected_host_key.trim(),
-        )
-        .map_err(|error| format!("X5_233 expected SSH host key is invalid: {error}"))?
-        .openssh()
-        .to_owned();
+        let expected_host_key = match self.x5_233_driver.ssh_expected_host_key.trim() {
+            "" => {
+                // GUI 不要求手动输入 host key：首次使用自动 TOFU 探测并固定，
+                // 之后自动校验；密码认证与服务器身份验证互不替代。
+                if self.x5_233_host_key_scan.is_none() {
+                    self.start_x5_233_host_key_scan(context);
+                }
+                return Err(
+                    "X5_233 SSH 主机密钥正在自动获取，请稍后重试 I²C/EEPROM 操作。".to_owned(),
+                );
+            }
+            raw => ServerHostKey::from_openssh(raw)
+                .map_err(|error| format!("X5_233 expected SSH host key is invalid: {error}"))?
+                .openssh()
+                .to_owned(),
+        };
         let host_id = x5_233_safe_id_component(host);
         let user_id = x5_233_safe_id_component(username);
         let slot_id = format!("x5-233-{user_id}-{host_id}");
@@ -3105,7 +3140,7 @@ impl CameraToolboxApp {
         if self.active_x5_233_driver_bootstrap.is_some() {
             return;
         }
-        let config = match self.x5_233_control_connection() {
+        let config = match self.x5_233_control_connection(context) {
             Ok(config) => config,
             Err(error) => {
                 self.x5_233_driver.last_error = Some(error);
@@ -3217,8 +3252,108 @@ impl CameraToolboxApp {
         }
     }
 
-    #[cfg(not(feature = "platform-ssh"))]
-    fn poll_x5_233_driver_bootstrap_result(&mut self) {}
+    #[cfg(feature = "platform-ssh")]
+    fn start_x5_233_host_key_scan(&mut self, context: &egui::Context) {
+        if self.x5_233_host_key_scan.is_some() {
+            return;
+        }
+        let host = self.x5_233_driver.device_ip.trim().to_owned();
+        if host.is_empty() {
+            self.x5_233_driver.last_error = Some(
+                "Enter X5_233 device IP before scanning the SSH host key.".to_owned(),
+            );
+            return;
+        }
+        let target = match HostKeyTarget::new(host, X5_233_SSH_PORT) {
+            Ok(target) => target,
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(format!(
+                    "X5_233 SSH host key target is invalid: {error}"
+                ));
+                return;
+            }
+        };
+        #[cfg(all(feature = "platform-ssh", test))]
+        let probe: Arc<dyn ServerHostKeyProbe> = self
+            .x5_233_host_key_probe
+            .clone()
+            .unwrap_or_else(|| Arc::new(RusshServerHostKeyProbe));
+        let (tx, rx) = mpsc::channel();
+        self.x5_233_host_key_scan = Some(rx);
+        let worker_context = context.clone();
+        let spawn_result = thread::Builder::new()
+            .name("x5-233-host-key-scan".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    #[cfg(not(test))]
+                    let manager = HostKeyManager::production()
+                        .map_err(|error| format!("X5_233 SSH host key manager failed: {error}"))?;
+                    #[cfg(all(feature = "platform-ssh", test))]
+                    let manager = HostKeyManager::with_probe(
+                        std::env::temp_dir().join("camera-toolbox-x5-233-test-known-hosts"),
+                        probe,
+                    )
+                    .map_err(|error| format!("X5_233 SSH host key manager failed: {error}"))?;
+                    match manager.scan_and_assess(&target, X5_233_HOST_KEY_SCAN_TIMEOUT) {
+                        Ok(HostKeyAssessment::Trusted(key)) => Ok(key),
+                        Ok(HostKeyAssessment::Unknown(key)) => {
+                            manager.trust(&target, &key).map_err(|error| {
+                                format!("X5_233 SSH host key trust failed: {error}")
+                            })?;
+                            Ok(key)
+                        }
+                        Ok(HostKeyAssessment::Changed(key)) => Err(format!(
+                            "X5_233 SSH host key changed since last seen ({} {}); refusing to auto-trust. Verify the board identity, then clear the stale known_hosts entry before reconnecting.",
+                            key.algorithm(),
+                            key.fingerprint()
+                        )),
+                        Err(error) => Err(format!("X5_233 SSH host key scan failed: {error}")),
+                    }
+                }))
+                .unwrap_or_else(|_| Err("X5_233 host key scan worker panicked".to_owned()));
+                let _ = tx.send(result);
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.x5_233_host_key_scan = None;
+            self.x5_233_driver.last_error = Some(format!(
+                "Failed to start X5_233 SSH host key scan: {error}"
+            ));
+        }
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn poll_x5_233_host_key_scan(&mut self) {
+        let Some(state) = &mut self.x5_233_host_key_scan else {
+            return;
+        };
+        let result = match state.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.x5_233_driver.last_error = Some(
+                    "X5_233 SSH host key scan worker stopped unexpectedly.".to_owned(),
+                );
+                self.x5_233_host_key_scan = None;
+                return;
+            }
+        };
+        self.x5_233_host_key_scan = None;
+        match result {
+            Ok(key) => {
+                self.x5_233_driver.ssh_expected_host_key = key.openssh().to_owned();
+                self.x5_233_driver.last_error = None;
+                self.x5_233_driver.last_status = Some(format!(
+                    "X5_233 SSH 主机密钥已自动捕获：{} {}",
+                    key.algorithm(),
+                    key.fingerprint()
+                ));
+            }
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(error);
+            }
+        }
+    }
 
     #[cfg(feature = "platform-ssh")]
     fn remote_control_label(&self, missing_reason: &str) -> Result<String, String> {
@@ -3232,6 +3367,7 @@ impl CameraToolboxApp {
     #[cfg(feature = "platform-ssh")]
     fn remote_control_connection(
         &mut self,
+        context: &egui::Context,
         missing_reason: &str,
     ) -> Result<RemoteConnectionConfig, String> {
         if let Some(source) = self.explorer.connected_sftp_connection().cloned() {
@@ -3240,7 +3376,7 @@ impl CameraToolboxApp {
         if self.x5_233_driver.device_ip.trim().is_empty() {
             return Err(missing_reason.to_owned());
         }
-        self.x5_233_control_connection()
+        self.x5_233_control_connection(context)
     }
     #[cfg(feature = "platform-ssh")]
     /// 从会话连接配置导出严格 pin 的 SSH target。
@@ -5133,10 +5269,12 @@ impl CameraToolboxApp {
     #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
     fn configure_eeprom_target(
         &mut self,
+        context: &egui::Context,
         workspace_key: CalibrationWorkspaceKey,
         request: CalibrationEepromTargetRequest,
     ) -> Result<String, String> {
         let source = self.remote_control_connection(
+            context,
             "Connect Explorer SFTP or enter an X5 board IP before configuring EEPROM.",
         )?;
         let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
@@ -5204,6 +5342,7 @@ impl CameraToolboxApp {
             return;
         }
         let source = match self.remote_control_connection(
+            &context,
             "Connect Explorer SFTP or enter an X5 board IP before using I²C Tools.",
         ) {
             Ok(source) => source,
@@ -5299,7 +5438,7 @@ impl CameraToolboxApp {
                 self.invalidate_eeprom_target(
                     "Reconfiguring EEPROM target; previous Inspect and Write authorization are invalid.",
                 );
-                match self.configure_eeprom_target(workspace_key.clone(), request) {
+                match self.configure_eeprom_target(context, workspace_key.clone(), request) {
                     Ok(label) => self
                         .calibration
                         .report_target_configured(&workspace_key, &label),
@@ -5329,7 +5468,8 @@ impl CameraToolboxApp {
         }
         if matches!(&intent, CalibrationProvisionIntent::DiscoverBuses) {
             let source = match self.remote_control_connection(
-                "Connect Explorer SFTP or enter an X5 board IP before discovering I²C buses.",
+                &context,
+            "Connect Explorer SFTP or enter an X5 board IP before discovering I²C buses.",
             ) {
                 Ok(source) => source,
                 Err(error) => {
@@ -6922,6 +7062,7 @@ impl CameraToolboxApp {
 
     fn render_x5_233_driver_workspace(
         &mut self,
+        context: &egui::Context,
         ui: &mut egui::Ui,
     ) -> Option<LiveStreamOpenRequest> {
         ui.heading("X5_233 Driver");
@@ -6949,20 +7090,18 @@ impl CameraToolboxApp {
                     egui::DragValue::new(&mut self.x5_233_driver.tcp_port).range(1..=u16::MAX),
                 );
             });
-            #[cfg(feature = "platform-ssh")]
-            x5_233_form_row(ui, "SSH host key", |ui, width| {
-                ui.add_sized(
-                    [width, 0.0],
-                    egui::TextEdit::singleline(&mut self.x5_233_driver.ssh_expected_host_key)
-                        .hint_text("ssh-ed25519 AAAA..."),
-                );
-            });
             let control_label = self.x5_233_control_label().unwrap_or_else(|_| {
                 format!(
                     "X5_233 {}@<ip>:{}",
                     self.x5_233_driver.ssh_user, X5_233_SSH_PORT
                 )
             });
+            #[cfg(feature = "platform-ssh")]
+            x5_233_wrapped_weak(
+                ui,
+                "SSH/SFTP control uses root/root password authentication; the server identity is auto-captured on first use (known_hosts) and changes are rejected. No host key input is required.",
+            );
+            #[cfg(not(feature = "platform-ssh"))]
             x5_233_wrapped_weak(
                 ui,
                 format!(
@@ -6970,6 +7109,28 @@ impl CameraToolboxApp {
                     self.x5_233_driver.ssh_password
                 ),
             );
+            #[cfg(feature = "platform-ssh")]
+            {
+                let host_key_scanning = self.x5_233_host_key_scan.is_some();
+                if ui
+                    .add_enabled(
+                        host_ready && !host_key_scanning,
+                        egui::Button::new("Auto-capture SSH host key")
+                            .min_size(egui::vec2(x5_233_available_width(ui), 0.0)),
+                    )
+                    .on_disabled_hover_text(if host_key_scanning {
+                        "Capturing the server identity; wait for the result."
+                    } else {
+                        "Enter Host / IP first. First use auto-captures and pins the server identity; no manual key input."
+                    })
+                    .clicked()
+                {
+                    self.start_x5_233_host_key_scan(context);
+                }
+                if host_key_scanning {
+                    ui.spinner();
+                }
+            }
             if ui
                 .add_enabled(
                     host_ready,
