@@ -28,3 +28,6 @@ Thumbs.db
 /tools/
 crates/frontends/godot/godot/target
 crates/frontends/godot/godot/.godot/
+
+# 机器本地原生依赖（指向 Camera_Toolbox 资产）
+/.deps
