@@ -1,12 +1,12 @@
 //! Step 2 双路预览与采集：CH0/CH3 并排 viewer + overlay 引导可视化层。
 //!
-//! 每路卡片 = 标题行（通道/RTSP/I²C 固定映射）+ 预览区（TextureRect
-//! 显示 RTSP 帧，透明 overlay Control 叠加引导可视化）+ 状态行。
+//! 每路卡片 = 标题行（通道/RTSP/I²C 固定映射 + 采集按钮）+ 预览区
+//! （TextureRect 显示 RTSP 帧，透明 overlay Control 叠加引导可视化）+ 状态行。
 //! 采集引导的检测框 / 位姿指示 / 计数全部画在 overlay 层上。
 
 use godot::classes::control::{LayoutPreset, MouseFilter};
 use godot::classes::texture_rect::{ExpandMode, StretchMode};
-use godot::classes::{Control, HBoxContainer, Label, TextureRect, VBoxContainer};
+use godot::classes::{Button, Control, HBoxContainer, Label, TextureRect, VBoxContainer};
 use godot::prelude::*;
 
 use crate::ui::theme;
@@ -23,6 +23,8 @@ pub struct ViewerCard {
     pub overlay_label: Gd<Label>,
     /// 卡片下方状态行（连接/解码状态）。
     pub status: Gd<Label>,
+    /// 采集开关按钮（开始/停止自动采集）。
+    pub capture_button: Gd<Button>,
 }
 
 impl ViewerCard {
@@ -31,11 +33,20 @@ impl ViewerCard {
         let mut card = VBoxContainer::new_alloc();
         card.add_theme_constant_override("separation", 6);
 
+        // 标题行：通道信息 + 采集按钮。
+        let mut header_row = HBoxContainer::new_alloc();
+        header_row.add_theme_constant_override("separation", 10);
         let mut header = Label::new_alloc();
         header.set_text(title);
         header.add_theme_font_size_override("font_size", 13);
         header.add_theme_color_override("font_color", theme::ACCENT);
-        card.add_child(&header);
+        header.set_h_size_flags(godot::classes::control::SizeFlags::EXPAND_FILL);
+        let mut capture_button = Button::new_alloc();
+        capture_button.set_text("开始采集");
+        capture_button.set_custom_minimum_size(Vector2::new(96.0, 0.0));
+        header_row.add_child(&header);
+        header_row.add_child(&capture_button);
+        card.add_child(&header_row);
 
         // 预览区：定高容器，TextureRect 铺满 + overlay 叠上层。
         let mut view = Control::new_alloc();
@@ -72,6 +83,7 @@ impl ViewerCard {
             overlay,
             overlay_label,
             status,
+            capture_button,
         }
     }
 
@@ -101,7 +113,7 @@ impl PreviewStep {
         v.add_theme_constant_override("separation", 10);
 
         let mut hint = Label::new_alloc();
-        hint.set_text("双路预览：引导信息叠加在画面上，采集计数实时更新。");
+        hint.set_text("双路预览：采集引导信息叠加在画面上，采集计数实时更新。");
         hint.add_theme_font_size_override("font_size", 13);
         hint.add_theme_color_override("font_color", theme::MUTED);
         v.add_child(&hint);

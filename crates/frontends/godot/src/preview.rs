@@ -1,7 +1,7 @@
-//! 双路 RTSP 预览：解码器管理 + 帧 → ImageTexture 上传。
+//! 双路 RTSP 预览与自动采集：解码器管理 + 帧 → ImageTexture 上传 + dataset 采集。
 //!
 //! 复用 adapters 的 `FfmpegRtspDecoder`（后台线程解码，共享帧槽）；
-//! 主线程 `pump` 轮询新帧并上传纹理，Godot 对象不跨线程。
+//! 主线程 `pump` 轮询新帧并上传纹理，`tick_capture` 按间隔采样帧入 dataset。
 //! 无板验证：`PONGBOT_SYNTH=1` 时用合成测试帧替代真实 RTSP。
 
 use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
@@ -14,14 +14,26 @@ use godot::classes::image::Format;
 use godot::classes::{Image, ImageTexture, TextureRect};
 use godot::prelude::*;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-/// 单路 RTSP 流：解码器 + 帧槽 + 已上传纹理。
+/// 每路目标采集帧数（达标自动停止并完成 Step 2）。
+pub const CAPTURE_TARGET: usize = 20;
+/// 自动采集采样间隔。
+pub const CAPTURE_INTERVAL: Duration = Duration::from_millis(600);
+
+/// 单路 RTSP 流：解码器 + 帧槽 + 已上传纹理 + 采集队列。
 pub struct RtspStream {
     decoder: Option<FfmpegRtspDecoder>,
     slot: Arc<LatestDecodedFrameSlot>,
     last: Option<Arc<DecodedVideoFrame>>,
     texture: Option<Gd<ImageTexture>>,
+    /// 自动采集开关。
+    pub capturing: bool,
+    /// 已采集帧队列（有界，达标即停）。
+    pub captured: Vec<Arc<DecodedVideoFrame>>,
+    pub target: usize,
+    last_sample: Option<Instant>,
+    interval: Duration,
 }
 
 impl RtspStream {
@@ -52,15 +64,10 @@ impl RtspStream {
             &cancellation,
         )
         .map_err(|error| format!("CH{channel} 解码器启动失败：{error}"))?;
-        Ok(Self {
-            decoder: Some(decoder),
-            slot,
-            last: None,
-            texture: None,
-        })
+        Ok(Self::new(Some(decoder), slot, channel))
     }
 
-    /// 合成测试帧模式（无板验证纹理链路）。
+    /// 合成测试帧模式（无板验证纹理与采集链路）。
     pub fn start_synth(channel: u16) -> Self {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let worker_slot = Arc::clone(&slot);
@@ -84,7 +91,7 @@ impl RtspStream {
                         rgba.extend_from_slice(&[r, g, b, 255]);
                     }
                 }
-                                worker_slot.publish(DecodedVideoFrame {
+                worker_slot.publish(DecodedVideoFrame {
                     width,
                     height,
                     rgba: rgba.into(),
@@ -104,11 +111,20 @@ impl RtspStream {
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
+        Self::new(None, slot, channel)
+    }
+
+    fn new(decoder: Option<FfmpegRtspDecoder>, slot: Arc<LatestDecodedFrameSlot>, _channel: u16) -> Self {
         Self {
-            decoder: None,
+            decoder,
             slot,
             last: None,
             texture: None,
+            capturing: false,
+            captured: Vec::with_capacity(CAPTURE_TARGET),
+            target: CAPTURE_TARGET,
+            last_sample: None,
+            interval: CAPTURE_INTERVAL,
         }
     }
 
@@ -135,6 +151,41 @@ impl RtspStream {
         };
         self.texture = Some(texture.clone());
         target.set_texture(&texture);
+        true
+    }
+
+    /// 切换采集开关；返回切换后的状态。
+    pub fn toggle_capture(&mut self) -> bool {
+        self.capturing = !self.capturing;
+        if self.capturing {
+            self.last_sample = None;
+        }
+        self.capturing
+    }
+
+    /// 采集节拍：开启且到间隔时采样最新帧；返回本次是否采到新帧。
+    pub fn tick_capture(&mut self, now: Instant) -> bool {
+        if !self.capturing || self.captured.len() >= self.target {
+            if self.capturing && self.captured.len() >= self.target {
+                self.capturing = false;
+            }
+            return false;
+        }
+        let due = self
+            .last_sample
+            .is_none_or(|last| now.duration_since(last) >= self.interval);
+        if !due {
+            return false;
+        }
+        let Some(frame) = self.slot.latest() else {
+            return false;
+        };
+        self.last = Some(frame.clone());
+        self.captured.push(frame);
+        self.last_sample = Some(now);
+        if self.captured.len() >= self.target {
+            self.capturing = false;
+        }
         true
     }
 }
@@ -167,5 +218,10 @@ impl StreamState {
                 });
             Self { ch0, ch3 }
         }
+    }
+
+    /// 两路是否都达到目标帧数。
+    pub fn both_complete(&self) -> bool {
+        self.ch0.captured.len() >= self.ch0.target && self.ch3.captured.len() >= self.ch3.target
     }
 }

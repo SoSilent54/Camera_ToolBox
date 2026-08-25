@@ -11,6 +11,7 @@ use godot::classes::control::LayoutPreset;
 use godot::classes::{Control, IControl, Texture2D};
 use godot::prelude::*;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use ui::steps::StepId;
 use ui::{theme, UiState};
 
@@ -26,6 +27,8 @@ pub struct CalibApp {
     pending_task: Option<Arc<Mutex<Option<String>>>>,
     /// 双路 RTSP 预览状态（Step 1 连通后启动）。
     streams: Option<StreamState>,
+    /// 双路采集完成标记（防止重复触发完成事件）。
+    preview_finished: bool,
     /// 调试截图请求（`PONGBOT_SCREENSHOT` 环境变量触发，5 帧后保存）。
     screenshot: Option<ScreenshotRequest>,
 }
@@ -65,10 +68,27 @@ impl IControl for CalibApp {
                     self.base.__constructed_gd().cast::<CalibApp>(),
                     "on_bootstrap",
                 ));
-        }
-        if let Ok(path) = std::env::var("PONGBOT_SCREENSHOT") {
-            self.screenshot = Some(ScreenshotRequest { path, frame: 0 });
-            godot_print!("debug: 将在 5 帧后保存截图");
+            // Step 2 采集按钮（双路独立开关）。
+            state
+                .preview
+                .ch0
+                .capture_button
+                .signals()
+                .pressed()
+                .connect(button_callback(
+                    self.base.__constructed_gd().cast::<CalibApp>(),
+                    "on_toggle_capture_ch0",
+                ));
+            state
+                .preview
+                .ch3
+                .capture_button
+                .signals()
+                .pressed()
+                .connect(button_callback(
+                    self.base.__constructed_gd().cast::<CalibApp>(),
+                    "on_toggle_capture_ch3",
+                ));
         }
         // 合成模式（无板验证）：跳过 Step 1，直接进入双预览。
         if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1") {
@@ -76,6 +96,15 @@ impl IControl for CalibApp {
                 state.complete_step(StepId::Connect, "合成模式：跳过设备连接");
             }
             self.start_previews("synth");
+            // 合成模式自动开始双路采集（验证采集链路）。
+            if let Some(streams) = self.streams.as_mut() {
+                streams.ch0.toggle_capture();
+                streams.ch3.toggle_capture();
+            }
+            if let Some(ui) = self.ui.as_mut() {
+                ui.preview.ch0.capture_button.set_text("停止采集");
+                ui.preview.ch3.capture_button.set_text("停止采集");
+            }
         }
         godot_print!("pongbot-calib-tool: wizard UI ready");
     }
@@ -92,10 +121,42 @@ impl IControl for CalibApp {
             self.finish_task(text);
         }
 
-        // 双路预览：新帧上传纹理。
-        if let (Some(streams), Some(ui)) = (self.streams.as_mut(), self.ui.as_mut()) {
+        // 双路预览与采集：新帧上传纹理 + 采集节拍 + overlay 计数刷新。
+        let capture_done = if let (Some(streams), Some(ui)) = (self.streams.as_mut(), self.ui.as_mut())
+        {
             let _ = streams.ch0.pump(&mut ui.preview.ch0.texture_rect);
             let _ = streams.ch3.pump(&mut ui.preview.ch3.texture_rect);
+            let now = Instant::now();
+            let c0 = streams.ch0.tick_capture(now);
+            let c3 = streams.ch3.tick_capture(now);
+            if c0 {
+                godot_print!("采集 CH0: {}/{}", streams.ch0.captured.len(), streams.ch0.target);
+            }
+            if c3 {
+                godot_print!("采集 CH3: {}/{}", streams.ch3.captured.len(), streams.ch3.target);
+            }
+            if c0 {
+                ui.preview.ch0.set_overlay(
+                    &format!("采集中 · {}/{}", streams.ch0.captured.len(), streams.ch0.target),
+                    theme::OK,
+                );
+            }
+            if c3 {
+                ui.preview.ch3.set_overlay(
+                    &format!("采集中 · {}/{}", streams.ch3.captured.len(), streams.ch3.target),
+                    theme::OK,
+                );
+            }
+            streams.both_complete()
+        } else {
+            false
+        };
+        if capture_done && !self.preview_finished {
+            self.preview_finished = true;
+            godot_print!("双路采集完成");
+            if let Some(ui) = self.ui.as_mut() {
+                ui.complete_step(StepId::Preview, "双路采集完成 · 可进入求解");
+            }
         }
 
         // 调试截图。
@@ -176,6 +237,38 @@ impl CalibApp {
                 Err(error) => format!("启动失败：{error}"),
             }
         });
+    }
+
+    /// CH0 采集开关。
+    #[func]
+    fn on_toggle_capture_ch0(&mut self) {
+        let on = self
+            .streams
+            .as_mut()
+            .map(|streams| streams.ch0.toggle_capture())
+            .unwrap_or(false);
+        if let Some(ui) = self.ui.as_mut() {
+            ui.preview.ch0.capture_button.set_text(if on { "停止采集" } else { "开始采集" });
+            if on {
+                ui.preview.ch0.set_overlay("采集中…", theme::OK);
+            }
+        }
+    }
+
+    /// CH3 采集开关。
+    #[func]
+    fn on_toggle_capture_ch3(&mut self) {
+        let on = self
+            .streams
+            .as_mut()
+            .map(|streams| streams.ch3.toggle_capture())
+            .unwrap_or(false);
+        if let Some(ui) = self.ui.as_mut() {
+            ui.preview.ch3.capture_button.set_text(if on { "停止采集" } else { "开始采集" });
+            if on {
+                ui.preview.ch3.set_overlay("采集中…", theme::OK);
+            }
+        }
     }
 
     /// 主线程处理后台任务结果（由 `_process` 轮询触发）。
