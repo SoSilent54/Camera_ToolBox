@@ -1955,6 +1955,7 @@ dependencies = [
  "camera-toolbox-app",
  "camera-toolbox-core",
  "godot",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",

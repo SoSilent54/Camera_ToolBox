@@ -3,7 +3,8 @@
 //! 交互模型（已与用户确认）：
 //! - 当前步骤展开，已完成步骤折叠为标题行，未完成步骤灰显；
 //! - 前一步未完成时后一步锁定（内容隐藏、面板半透明）；
-//! - 步骤状态由面板自身表达（无独立顶部指示器，避免重复）。
+//! - 步骤状态由面板自身表达（无独立顶部指示器，避免重复）；
+//! - Step 2 双路预览与采集为同一阶段（引导可视化叠加在 viewer 上）。
 
 use godot::classes::{
     control::{LayoutPreset, SizeFlags},
@@ -13,6 +14,7 @@ use godot::classes::{
 use godot::prelude::*;
 
 use crate::ui::steps::connect::ConnectStep;
+use crate::ui::steps::preview::PreviewStep;
 use crate::ui::steps::{StepId, STEP_TITLES};
 use crate::ui::theme;
 
@@ -23,9 +25,10 @@ pub struct UiState {
     step_summaries: Vec<Gd<Label>>,
     step_bodies: Vec<Gd<Control>>,
     summaries: Vec<String>,
-    completed: [bool; 5],
+    completed: [bool; 4],
     active: StepId,
     pub connect: ConnectStep,
+    pub preview: PreviewStep,
     pub status_bar: Gd<Label>,
 }
 
@@ -77,7 +80,8 @@ impl UiState {
         let mut step_summaries = Vec::new();
         let mut step_bodies = Vec::new();
         let mut connect: Option<ConnectStep> = None;
-        for index in 0..5 {
+        let mut preview: Option<PreviewStep> = None;
+        for index in 0..4 {
             let mut panel = PanelContainer::new_alloc();
             panel.add_theme_stylebox_override("panel", &theme::panel_style(None));
             let mut panel_v = VBoxContainer::new_alloc();
@@ -98,12 +102,17 @@ impl UiState {
             step_headers.push(header);
             step_summaries.push(summary);
 
-            // 各步骤正文：Step 1 为连接面板，其余为占位说明。
+            // 各步骤正文：Step 1 连接面板、Step 2 双预览，其余占位。
             if index == 0 {
                 let step = ConnectStep::build();
                 panel_v.add_child(&step.panel);
                 step_bodies.push(step.panel.clone());
                 connect = Some(step);
+            } else if index == 1 {
+                let step = PreviewStep::build();
+                panel_v.add_child(&step.panel);
+                step_bodies.push(step.panel.clone());
+                preview = Some(step);
             } else {
                 let mut placeholder = Label::new_alloc();
                 placeholder.set_text("（待实现）");
@@ -118,6 +127,7 @@ impl UiState {
             panels.push(panel);
         }
         let connect = connect.expect("Step 1 构建失败");
+        let preview = preview.expect("Step 2 构建失败");
 
         // 底部状态栏。
         let mut status_bar = Label::new_alloc();
@@ -131,10 +141,11 @@ impl UiState {
             step_headers,
             step_summaries,
             step_bodies,
-            summaries: vec![String::new(); 5],
-            completed: [false; 5],
+            summaries: vec![String::new(); 4],
+            completed: [false; 4],
             active: StepId::Connect,
             connect,
+            preview,
             status_bar,
         };
         state.refresh();
@@ -148,7 +159,7 @@ impl UiState {
         self.completed[index] = true;
         self.summaries[index] = summary.into();
         let mut next = None;
-        for candidate in 0..5 {
+        for candidate in 0..4 {
             if !self.completed[candidate] {
                 next = Some(StepId::from_index(candidate));
                 break;
@@ -160,7 +171,7 @@ impl UiState {
 
     /// 按当前状态刷新面板：当前步高亮、完成步绿、锁定步灰显半透明。
     pub fn refresh(&mut self) {
-        for index in 0..5 {
+        for index in 0..4 {
             let is_active = index == self.active as usize;
             let is_done = self.completed[index];
             let header_color = if is_done {
