@@ -625,7 +625,10 @@ impl CalibApp {
             .as_ref()
             .map(|ui| (ui.overlay_slots.0.clone(), ui.overlay_slots.1.clone()))
             .unwrap_or_default();
-        let state = StreamState::start(&host, slot0, slot1);
+        let mut state = StreamState::start(&host, slot0, slot1);
+        let board = self.current_board();
+        state.ch0.start_detect(board);
+        state.ch3.start_detect(board);
         if let Some(ui) = self.ui.as_mut() {
             ui.preview.ch0.set_status(&format!("rtsp://{host}:554/PRR"));
             ui.preview.ch3.set_status(&format!("rtsp://{host}:557/PRR"));

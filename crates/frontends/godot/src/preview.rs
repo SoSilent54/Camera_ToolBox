@@ -69,6 +69,7 @@ pub struct RtspStream {
     guide_state: Arc<Mutex<GuideState>>,
     worker: Option<std::thread::JoinHandle<()>>,
     target: usize,
+    detect_started: bool,
 }
 
 impl RtspStream {
@@ -119,10 +120,12 @@ impl RtspStream {
                     let cell = 40i32;
                     let cols = 10i32;
                     let rows = 7i32;
-                    let ox = ((width as i32 - cols * cell) / 2) + ((tick % 60) as i32 - 30);
-                    let oy = ((height as i32 - rows * cell) / 2) + ((tick % 40) as i32 - 20);
+                    // 姿态变化放慢（每 4 tick 一次 ≈ 1.2s 周期），hold 窗口内保持稳定。
+                    let slow = tick / 4;
+                    let ox = ((width as i32 - cols * cell) / 2) + ((slow % 60) as i32 - 30);
+                    let oy = ((height as i32 - rows * cell) / 2) + ((slow % 40) as i32 - 20);
                     // 错切模拟旋转：改变棋盘几何 → rvec 变化 → 新姿态。
-                    let shear = ((tick % 30) as i32 - 15) as f32 / 60.0;
+                    let shear = ((slow % 30) as i32 - 15) as f32 / 60.0;
                     for y in 0..height as i32 {
                         for x in 0..width as i32 {
                             let sx = (x as f32 + shear * (y - oy) as f32) as i32;
@@ -185,6 +188,7 @@ impl RtspStream {
             guide_state: Arc::new(Mutex::new(GuideState::default())),
             worker: None,
             target: CAPTURE_TARGET,
+            detect_started: false,
         }
     }
 
@@ -214,27 +218,34 @@ impl RtspStream {
         true
     }
 
-    /// 切换 guided 采集；启动/停止 worker 线程。
-    pub fn toggle_capture(&mut self, board: BoardSpec) -> bool {
+    /// 切换 guided 采集（检测 worker 常驻，仅切换 hold/采集阶段）。
+    pub fn toggle_capture(&mut self, _board: BoardSpec) -> bool {
         let on = !self.capturing.load(Ordering::Acquire);
         self.capturing.store(on, Ordering::Release);
         if on {
-            let capturing = Arc::clone(&self.capturing);
-            let slot = Arc::clone(&self.slot);
-            let captured = Arc::clone(&self.captured);
-            let poses = Arc::clone(&self.poses);
-            let overlay = Arc::clone(&self.overlay);
-            let guide = Arc::clone(&self.guide_state);
-            let target = self.target;
-            self.worker = Some(std::thread::spawn(move || {
-                guided_capture_loop(
-                    capturing, slot, captured, poses, guide, overlay, board, target,
-                );
-            }));
-        } else if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+            // 采集开始：重置 hold（worker 检测到 capturing 翻转会重置）。
         }
         on
+    }
+
+    /// 启动常驻检测 worker（预览开启即调用；持续检测 + 更新 overlay/引导）。
+    pub fn start_detect(&mut self, board: BoardSpec) {
+        if self.detect_started {
+            return;
+        }
+        self.detect_started = true;
+        let capturing = Arc::clone(&self.capturing);
+        let slot = Arc::clone(&self.slot);
+        let captured = Arc::clone(&self.captured);
+        let poses = Arc::clone(&self.poses);
+        let overlay = Arc::clone(&self.overlay);
+        let guide = Arc::clone(&self.guide_state);
+        let target = self.target;
+        std::thread::spawn(move || {
+            guided_capture_loop(
+                capturing, slot, captured, poses, guide, overlay, board, target,
+            );
+        });
     }
 
     /// 检测绘制数据槽（GuideOverlay attach 用）。
@@ -283,7 +294,8 @@ fn guided_capture_loop(
     let cancellation = CalibrationCancellation::default();
     let mut hold_pose: Option<[f64; 3]> = None;
     let mut hold_count: u8 = 0;
-    while capturing.load(Ordering::Acquire) {
+    godot_print!("检测 worker 已启动（目标 {target} 位姿，hold {HOLD_TARGET} 帧）");
+    loop {
         let count = {
             let poses = poses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             poses.len()
@@ -309,6 +321,7 @@ fn guided_capture_loop(
         };
         match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
+                godot_print!("检测到棋盘：{} 角点", detection.corners.len());
                 // 初始内参随帧尺寸生成（1080p 主点不再是 640x360 默认）。
                 let initial = default_initial_intrinsics(frame.width, frame.height);
                 let pose = match backend.estimate_pose(&detection, &initial, board, &cancellation)
@@ -335,6 +348,12 @@ fn guided_capture_loop(
                     });
                 }
                 // hold 状态机：与当前 hold 姿态比较，稳定保持 HOLD_TARGET 帧才采集。
+                if !capturing.load(Ordering::Acquire) {
+                    // 预览阶段：只显示检测状态，不进入 hold/采集。
+                    set_guide(&guide, "棋盘已检测 ✓（点「开始采集」进入引导）", 0, 0);
+                    std::thread::sleep(DETECT_INTERVAL);
+                    continue;
+                }
                 let mut poses = poses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let is_new = poses
                     .iter()
@@ -356,6 +375,7 @@ fn guided_capture_loop(
                             drop(captured);
                             let count = poses.len();
                             drop(poses);
+                            godot_print!("hold 达标采集：已采 {count}/{target}");
                             if count >= target {
                                 set_guide(
                                     &guide,
@@ -377,6 +397,7 @@ fn guided_capture_loop(
                         }
                     } else {
                         // 黄 N/4：保持中。
+                        godot_print!("hold 推进：{hold_count}/{HOLD_TARGET}");
                         drop(poses);
                         set_guide(
                             &guide,
@@ -387,6 +408,7 @@ fn guided_capture_loop(
                     }
                 } else {
                     // 姿态变化：开始新一轮 hold。
+                    godot_print!("新姿态，hold 1/{HOLD_TARGET}（已采 {}）", count);
                     hold_pose = Some(pose);
                     hold_count = 1;
                     drop(poses);
@@ -404,6 +426,7 @@ fn guided_capture_loop(
                 set_guide(&guide, "未检测到棋盘，请将棋盘置于画面中并调整角度", count, 0);
             }
             Err(error) => {
+                godot_print!("检测出错：{error}");
                 hold_pose = None;
                 hold_count = 0;
                 set_guide(&guide, &format!("检测失败：{error}"), count, 0);
