@@ -111,8 +111,8 @@ impl IControl for CalibApp {
             self.start_previews("synth");
             // 合成模式自动开始双路采集（验证采集链路）。
             if let Some(streams) = self.streams.as_mut() {
-                streams.ch0.toggle_capture();
-                streams.ch3.toggle_capture();
+                streams.ch0.toggle_capture(BoardSpec { inner_cols: 9, inner_rows: 6, square_size: 15.0 });
+                streams.ch3.toggle_capture(BoardSpec { inner_cols: 9, inner_rows: 6, square_size: 15.0 });
             }
             if let Some(ui) = self.ui.as_mut() {
                 ui.preview.ch0.capture_button.set_text("停止采集");
@@ -134,30 +134,23 @@ impl IControl for CalibApp {
             self.finish_task(text);
         }
 
-        // 双路预览与采集：新帧上传纹理 + 采集节拍 + overlay 计数刷新。
+        // 双路预览与 guided 采集：新帧上传纹理 + 引导文本刷新。
         let capture_done = if let (Some(streams), Some(ui)) = (self.streams.as_mut(), self.ui.as_mut())
         {
             let _ = streams.ch0.pump(&mut ui.preview.ch0.texture_rect);
             let _ = streams.ch3.pump(&mut ui.preview.ch3.texture_rect);
-            let now = Instant::now();
-            let c0 = streams.ch0.tick_capture(now);
-            let c3 = streams.ch3.tick_capture(now);
-            if c0 {
-                godot_print!("采集 CH0: {}/{}", streams.ch0.captured.len(), streams.ch0.target);
-            }
-            if c3 {
-                godot_print!("采集 CH3: {}/{}", streams.ch3.captured.len(), streams.ch3.target);
-            }
-            if c0 {
+            let (text0, count0) = streams.ch0.guide();
+            if !text0.is_empty() {
                 ui.preview.ch0.set_overlay(
-                    &format!("采集中 · {}/{}", streams.ch0.captured.len(), streams.ch0.target),
-                    theme::OK,
+                    &text0,
+                    if count0 >= preview::CAPTURE_TARGET { theme::OK } else { theme::ACCENT },
                 );
             }
-            if c3 {
+            let (text3, count3) = streams.ch3.guide();
+            if !text3.is_empty() {
                 ui.preview.ch3.set_overlay(
-                    &format!("采集中 · {}/{}", streams.ch3.captured.len(), streams.ch3.target),
-                    theme::OK,
+                    &text3,
+                    if count3 >= preview::CAPTURE_TARGET { theme::OK } else { theme::ACCENT },
                 );
             }
             streams.both_complete()
@@ -256,13 +249,14 @@ impl CalibApp {
         });
     }
 
-    /// CH0 采集开关。
+    /// CH0 采集开关（guided：按当前棋盘参数启动）。
     #[func]
     fn on_toggle_capture_ch0(&mut self) {
+        let board = self.current_board();
         let on = self
             .streams
             .as_mut()
-            .map(|streams| streams.ch0.toggle_capture())
+            .map(|streams| streams.ch0.toggle_capture(board))
             .unwrap_or(false);
         if let Some(ui) = self.ui.as_mut() {
             ui.preview.ch0.capture_button.set_text(if on { "停止采集" } else { "开始采集" });
@@ -272,19 +266,40 @@ impl CalibApp {
         }
     }
 
-    /// CH3 采集开关。
+    /// CH3 采集开关（guided：按当前棋盘参数启动）。
     #[func]
     fn on_toggle_capture_ch3(&mut self) {
+        let board = self.current_board();
         let on = self
             .streams
             .as_mut()
-            .map(|streams| streams.ch3.toggle_capture())
+            .map(|streams| streams.ch3.toggle_capture(board))
             .unwrap_or(false);
         if let Some(ui) = self.ui.as_mut() {
             ui.preview.ch3.capture_button.set_text(if on { "停止采集" } else { "开始采集" });
             if on {
                 ui.preview.ch3.set_overlay("采集中…", theme::OK);
             }
+        }
+    }
+
+    /// 从 Step 3 面板读取棋盘参数。
+    fn current_board(&self) -> BoardSpec {
+        let (cols, rows, square_mm) = self
+            .ui
+            .as_ref()
+            .map(|ui| {
+                (
+                    ui.solve.board_cols.get_value() as u16,
+                    ui.solve.board_rows.get_value() as u16,
+                    ui.solve.square_mm.get_value(),
+                )
+            })
+            .unwrap_or((9, 6, 15.0));
+        BoardSpec {
+            inner_cols: cols,
+            inner_rows: rows,
+            square_size: square_mm,
         }
     }
 
@@ -314,8 +329,8 @@ impl CalibApp {
             self.connect_status("棋盘参数非法", theme::ERR);
             return;
         }
-        let ch0_frames = streams.ch0.captured.clone();
-        let ch3_frames = streams.ch3.captured.clone();
+        let ch0_frames = streams.ch0.captured_frames();
+        let ch3_frames = streams.ch3.captured_frames();
         if let Some(ui) = self.ui.as_mut() {
             ui.solve.ch0_result.set_text("CH0：求解中…");
             ui.solve.ch3_result.set_text("CH3：求解中…");
