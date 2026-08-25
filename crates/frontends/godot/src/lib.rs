@@ -36,8 +36,7 @@ struct ScreenshotRequest {
 impl IControl for CalibApp {
     fn ready(&mut self) {
         self.base_mut().set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
-        self.base_mut().set_size(Vector2::new(1280.0, 800.0));
-        theme::install_cjk_font();
+        theme::install_window_background();
         let (state, root) = UiState::build();
         self.base_mut().add_child(&root);
         self.ui = Some(state);
