@@ -19,6 +19,7 @@ use crate::ui::steps::preview::PreviewStep;
 use crate::ui::steps::solve_step::SolveStep;
 use crate::ui::steps::{StepId, STEP_TITLES};
 use crate::ui::theme;
+use std::sync::{Arc, Mutex};
 
 /// 向导全部 UI 句柄与流程状态（纯 Rust，非 Godot 类）。
 pub struct UiState {
@@ -34,11 +35,15 @@ pub struct UiState {
     pub solve: SolveStep,
     pub eeprom: EepromStep,
     pub status_bar: Gd<Label>,
+    /// 双路检测绘制数据槽（RtspStream worker → GuideOverlay）。
+    pub overlay_slots: (Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>, Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>),
 }
 
 impl UiState {
     /// 构建完整向导；返回状态与根控件（根控件需挂到场景树）。
     pub fn build() -> (Self, Gd<Control>) {
+        let overlay_slot0 = Arc::new(Mutex::new(None));
+        let overlay_slot1 = Arc::new(Mutex::new(None));
         let mut root = Control::new_alloc();
         root.set_anchors_preset(LayoutPreset::FULL_RECT);
 
@@ -115,7 +120,7 @@ impl UiState {
                 step_bodies.push(step.panel.clone());
                 connect = Some(step);
             } else if index == 1 {
-                let step = PreviewStep::build();
+                let step = PreviewStep::build(overlay_slot0.clone(), overlay_slot1.clone());
                 panel_v.add_child(&step.panel);
                 step_bodies.push(step.panel.clone());
                 preview = Some(step);
@@ -160,6 +165,7 @@ impl UiState {
             solve,
             eeprom,
             status_bar,
+            overlay_slots: (overlay_slot0, overlay_slot1),
         };
         state.refresh();
 

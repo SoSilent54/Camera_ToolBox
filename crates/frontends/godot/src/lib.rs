@@ -3,6 +3,7 @@
 //! 全部 UI 用 Rust 代码构建（不依赖 Godot 编辑器可视化搭建）；
 //! 运行：`godot --path crates/frontends/godot/godot`。
 
+mod guide_overlay;
 mod preview;
 mod solve;
 mod ui;
@@ -136,8 +137,13 @@ impl IControl for CalibApp {
                     "on_eeprom_write",
                 ));
         }
+        // 调试截图：PONGBOT_SCREENSHOT 环境变量，5 帧后保存 viewport。
+        if let Ok(path) = std::env::var("PONGBOT_SCREENSHOT") {
+            self.screenshot = Some(ScreenshotRequest { path, frame: 0 });
+            godot_print!("debug: 将在 5 帧后保存截图");
+        }
         // 合成模式（无板验证）：跳过 Step 1，直接进入双预览。
-        if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1") {
+        if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1" || value == "board") {
             if let Some(state) = self.ui.as_mut() {
                 state.complete_step(StepId::Connect, "合成模式：跳过设备连接");
             }
@@ -167,23 +173,32 @@ impl IControl for CalibApp {
             self.finish_task(text);
         }
 
+        // 预览宽高比保持（16:9）：宽度铺满可用，高度随宽度同步。
+        if let Some(ui) = self.ui.as_mut() {
+            for mut card in [ui.preview.ch0.view.clone(), ui.preview.ch3.view.clone()] {
+                let width = card.get_size().x.max(320.0);
+                let target_height = width * 9.0 / 16.0;
+                card.set_custom_minimum_size(Vector2::new(0.0, target_height));
+            }
+        }
+
         // 双路预览与 guided 采集：新帧上传纹理 + 引导文本刷新。
         let capture_done = if let (Some(streams), Some(ui)) = (self.streams.as_mut(), self.ui.as_mut())
         {
             let _ = streams.ch0.pump(&mut ui.preview.ch0.texture_rect);
             let _ = streams.ch3.pump(&mut ui.preview.ch3.texture_rect);
-            let (text0, count0) = streams.ch0.guide();
+            let (text0, count0, hold0) = streams.ch0.guide();
             if !text0.is_empty() {
                 ui.preview.ch0.set_overlay(
                     &text0,
-                    if count0 >= preview::CAPTURE_TARGET { theme::OK } else { theme::ACCENT },
+                    overlay_color(count0, hold0),
                 );
             }
-            let (text3, count3) = streams.ch3.guide();
+            let (text3, count3, hold3) = streams.ch3.guide();
             if !text3.is_empty() {
                 ui.preview.ch3.set_overlay(
                     &text3,
-                    if count3 >= preview::CAPTURE_TARGET { theme::OK } else { theme::ACCENT },
+                    overlay_color(count3, hold3),
                 );
             }
             streams.both_complete()
@@ -197,7 +212,7 @@ impl IControl for CalibApp {
                 ui.complete_step(StepId::Preview, "双路采集完成 · 可进入求解");
             }
             // 合成模式：采集完成后自动触发求解（验证检测/标定管线）。
-            if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1") {
+            if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1" || value == "board") {
                 self.on_solve();
             }
         }
@@ -605,7 +620,12 @@ impl CalibApp {
         if host.is_empty() {
             return;
         }
-        let state = StreamState::start(&host);
+        let (slot0, slot1) = self
+            .ui
+            .as_ref()
+            .map(|ui| (ui.overlay_slots.0.clone(), ui.overlay_slots.1.clone()))
+            .unwrap_or_default();
+        let state = StreamState::start(&host, slot0, slot1);
         if let Some(ui) = self.ui.as_mut() {
             ui.preview.ch0.set_status(&format!("rtsp://{host}:554/PRR"));
             ui.preview.ch3.set_status(&format!("rtsp://{host}:557/PRR"));
@@ -647,3 +667,14 @@ struct CalibExtension;
 /// GDExtension 入口：宏自动注册所有 `#[derive(GodotClass)]` 类型。
 #[gdextension]
 unsafe impl ExtensionLibrary for CalibExtension {}
+
+/// overlay 引导文本颜色：hold 达标/采集完成绿，hold 进行中黄，其余蓝。
+fn overlay_color(count: usize, hold: u8) -> godot::builtin::Color {
+    if count >= preview::CAPTURE_TARGET || hold >= preview::HOLD_TARGET {
+        theme::OK
+    } else if hold > 0 {
+        theme::WARN
+    } else {
+        theme::ACCENT
+    }
+}

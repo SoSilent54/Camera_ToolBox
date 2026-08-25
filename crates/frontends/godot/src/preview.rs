@@ -25,11 +25,16 @@ use godot::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use crate::guide_overlay::OverlayData;
 
 /// 每路目标覆盖位姿数（达标自动停止）。
 pub const CAPTURE_TARGET: usize = 12;
 /// 最小位姿角差（度）：小于该差异视为重复姿态，不入 dataset。
 pub const MIN_POSE_ANGLE_DEG: f64 = 10.0;
+/// hold 稳定帧数：新姿态需连续保持该帧数才采集（黄 1/4 → 绿 4/4）。
+pub const HOLD_TARGET: u8 = 4;
+/// hold 期间姿态抖动容忍（度）。
+const HOLD_TOLERANCE_DEG: f64 = 3.0;
 /// 采集 worker 检测节拍。
 const DETECT_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -42,6 +47,8 @@ pub struct GuideState {
     pub captured_count: usize,
     /// 累计检测成功次数。
     pub found_count: u64,
+    /// 当前 hold 计数（0 = 未 hold）。
+    pub hold: u8,
 }
 
 /// 单路 RTSP 流：解码器 + 帧槽 + 已上传纹理 + guided 采集。
@@ -56,8 +63,10 @@ pub struct RtspStream {
     captured: Arc<Mutex<Vec<Arc<DecodedVideoFrame>>>>,
     /// 已采姿态（rvec，与 captured 一一对应）。
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
+    /// 检测绘制数据（worker 写，GuideOverlay draw 读）。
+    overlay: Arc<Mutex<Option<OverlayData>>>,
     /// 引导状态（worker 写，主线程读）。
-    guide: Arc<Mutex<GuideState>>,
+    guide_state: Arc<Mutex<GuideState>>,
     worker: Option<std::thread::JoinHandle<()>>,
     target: usize,
 }
@@ -70,6 +79,7 @@ impl RtspStream {
         channel: u16,
         width: u32,
         height: u32,
+        overlay_slot: Arc<Mutex<Option<OverlayData>>>,
     ) -> Result<Self, String> {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let cancellation = StreamCancellation::default();
@@ -90,27 +100,52 @@ impl RtspStream {
             &cancellation,
         )
         .map_err(|error| format!("CH{channel} 解码器启动失败：{error}"))?;
-        Ok(Self::new(Some(decoder), slot))
+        Ok(Self::new(Some(decoder), slot, overlay_slot))
     }
 
     /// 合成测试帧模式（无板验证纹理与引导链路）；图案为非棋盘噪点。
-    pub fn start_synth(channel: u16) -> Self {
+    pub fn start_synth(channel: u16, overlay_slot: Arc<Mutex<Option<OverlayData>>>) -> Self {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let worker_slot = Arc::clone(&slot);
         std::thread::spawn(move || {
             let (width, height) = (640u32, 360u32);
             let mut seed = u64::from(channel) + 1;
+            let board_mode = std::env::var("PONGBOT_SYNTH").is_ok_and(|v| v == "board");
+            let mut tick = 0u32;
             loop {
                 let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-                for _ in 0..width * height {
-                    // xorshift 伪随机噪点：无棋盘结构，保证检测失败（验证引导路径）。
-                    seed ^= seed << 13;
-                    seed ^= seed >> 7;
-                    seed ^= seed << 17;
-                    let v = (seed & 0xff) as u8;
-                    let (r, g, b) = (v, v.wrapping_mul(2), 255 - v);
-                    rgba.extend_from_slice(&[r, g, b, 255]);
+                if board_mode {
+                    // 合成棋盘（10x7 格 = 9x6 内角点），随 tick 平移模拟位姿变化。
+                    let cell = 40i32;
+                    let cols = 10i32;
+                    let rows = 7i32;
+                    let ox = ((width as i32 - cols * cell) / 2) + ((tick % 60) as i32 - 30);
+                    let oy = ((height as i32 - rows * cell) / 2) + ((tick % 40) as i32 - 20);
+                    // 错切模拟旋转：改变棋盘几何 → rvec 变化 → 新姿态。
+                    let shear = ((tick % 30) as i32 - 15) as f32 / 60.0;
+                    for y in 0..height as i32 {
+                        for x in 0..width as i32 {
+                            let sx = (x as f32 + shear * (y - oy) as f32) as i32;
+                            let gx = (sx - ox) / cell;
+                            let gy = (y - oy) / cell;
+                            let inside = gx >= 0 && gx < cols && gy >= 0 && gy < rows;
+                            let white = inside && ((gx + gy) % 2 == 0);
+                            let v = if white { 235u8 } else if inside { 30u8 } else { 60u8 };
+                            rgba.extend_from_slice(&[v, v, v, 255]);
+                        }
+                    }
+                } else {
+                    for _ in 0..width * height {
+                        // xorshift 伪随机噪点：无棋盘结构，保证检测失败（验证引导路径）。
+                        seed ^= seed << 13;
+                        seed ^= seed >> 7;
+                        seed ^= seed << 17;
+                        let v = (seed & 0xff) as u8;
+                        let (r, g, b) = (v, v.wrapping_mul(2), 255 - v);
+                        rgba.extend_from_slice(&[r, g, b, 255]);
+                    }
                 }
+                tick = tick.wrapping_add(1);
                 worker_slot.publish(DecodedVideoFrame {
                     width,
                     height,
@@ -119,21 +154,25 @@ impl RtspStream {
                         stream_id: StreamSessionId::new(format!("synth-ch{channel}"))
                             .expect("合成会话 id"),
                         channel,
-                        frame_sequence: seed,
+                        frame_sequence: u64::from(tick),
                         source_pts: SourcePts::Unavailable {
                             reason: "synthetic".to_owned(),
                         },
                         host_monotonic_time_ns: 0,
-                        device_timestamp_ns: Some(seed),
+                        device_timestamp_ns: Some(u64::from(tick)),
                     },
                 });
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        Self::new(None, slot)
+        Self::new(None, slot, overlay_slot)
     }
 
-    fn new(decoder: Option<FfmpegRtspDecoder>, slot: Arc<LatestDecodedFrameSlot>) -> Self {
+    fn new(
+        decoder: Option<FfmpegRtspDecoder>,
+        slot: Arc<LatestDecodedFrameSlot>,
+        overlay_slot: Arc<Mutex<Option<OverlayData>>>,
+    ) -> Self {
         Self {
             decoder,
             slot,
@@ -142,7 +181,8 @@ impl RtspStream {
             capturing: Arc::new(AtomicBool::new(false)),
             captured: Arc::new(Mutex::new(Vec::with_capacity(CAPTURE_TARGET))),
             poses: Arc::new(Mutex::new(Vec::with_capacity(CAPTURE_TARGET))),
-            guide: Arc::new(Mutex::new(GuideState::default())),
+            overlay: overlay_slot,
+            guide_state: Arc::new(Mutex::new(GuideState::default())),
             worker: None,
             target: CAPTURE_TARGET,
         }
@@ -183,11 +223,12 @@ impl RtspStream {
             let slot = Arc::clone(&self.slot);
             let captured = Arc::clone(&self.captured);
             let poses = Arc::clone(&self.poses);
-            let guide = Arc::clone(&self.guide);
+            let overlay = Arc::clone(&self.overlay);
+            let guide = Arc::clone(&self.guide_state);
             let target = self.target;
             self.worker = Some(std::thread::spawn(move || {
                 guided_capture_loop(
-                    capturing, slot, captured, poses, guide, board, target,
+                    capturing, slot, captured, poses, guide, overlay, board, target,
                 );
             }));
         } else if let Some(worker) = self.worker.take() {
@@ -196,12 +237,16 @@ impl RtspStream {
         on
     }
 
-    /// 读取引导状态（主线程）。
-    pub fn guide(&self) -> (String, usize) {
-        let guide = self.guide.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        (guide.text.clone(), guide.captured_count)
+    /// 检测绘制数据槽（GuideOverlay attach 用）。
+    pub fn overlay_slot(&self) -> Arc<Mutex<Option<OverlayData>>> {
+        Arc::clone(&self.overlay)
     }
 
+    /// 读取引导状态（主线程）。
+    pub fn guide(&self) -> (String, usize, u8) {
+        let state = self.guide_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        (state.text.clone(), state.captured_count, state.hold)
+    }
     /// 采集是否进行中。
     pub fn is_capturing(&self) -> bool {
         self.capturing.load(Ordering::Acquire)
@@ -230,19 +275,21 @@ fn guided_capture_loop(
     captured: Arc<Mutex<Vec<Arc<DecodedVideoFrame>>>>,
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
     guide: Arc<Mutex<GuideState>>,
+    overlay: Arc<Mutex<Option<OverlayData>>>,
     board: BoardSpec,
     target: usize,
 ) {
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
-    let initial = default_initial_intrinsics();
+    let mut hold_pose: Option<[f64; 3]> = None;
+    let mut hold_count: u8 = 0;
     while capturing.load(Ordering::Acquire) {
         let count = {
             let poses = poses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             poses.len()
         };
         if count >= target {
-            set_guide(&guide, &format!("已覆盖 {count}/{target} 位姿，采集完成"), count);
+            set_guide(&guide, &format!("已覆盖 {count}/{target} 位姿，采集完成"), count, 0);
             break;
         }
         let Some(frame) = slot.latest() else {
@@ -262,46 +309,104 @@ fn guided_capture_loop(
         };
         match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
+                // 初始内参随帧尺寸生成（1080p 主点不再是 640x360 默认）。
+                let initial = default_initial_intrinsics(frame.width, frame.height);
                 let pose = match backend.estimate_pose(&detection, &initial, board, &cancellation)
                 {
                     Ok(view) => view.rotation_vector,
                     Err(_) => {
-                        set_guide(&guide, "检测到棋盘，姿态估计失败，请稍作调整", count);
+                        set_guide(&guide, "检测到棋盘，姿态估计失败，请稍作调整", count, 0);
                         std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
+                // 回传绘制数据（角点 + 姿态）。
+                if let Ok(mut slot) = overlay.lock() {
+                    *slot = Some(OverlayData {
+                        found: true,
+                        corners: detection.corners.iter().map(|p| (p.x, p.y)).collect(),
+                        image_width: frame.width as f32,
+                        image_height: frame.height as f32,
+                        rotation_deg: (
+                            pose[0].to_degrees() as f32,
+                            pose[1].to_degrees() as f32,
+                            pose[2].to_degrees() as f32,
+                        ),
+                    });
+                }
+                // hold 状态机：与当前 hold 姿态比较，稳定保持 HOLD_TARGET 帧才采集。
                 let mut poses = poses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 let is_new = poses
                     .iter()
                     .all(|existing| pose_angle_deg(existing, &pose) >= MIN_POSE_ANGLE_DEG);
-                if is_new {
-                    poses.push(pose);
-                    let mut captured =
-                        captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                    captured.push(frame);
-                    let count = poses.len();
-                    drop(captured);
-                    drop(poses);
-                    if count >= target {
-                        set_guide(&guide, &format!("已覆盖 {count}/{target} 位姿，采集完成"), count);
+                let hold_matches = hold_pose
+                    .as_ref()
+                    .is_some_and(|hp| pose_angle_deg(hp, &pose) <= HOLD_TOLERANCE_DEG);
+                if hold_matches {
+                    hold_count += 1;
+                    if hold_count >= HOLD_TARGET {
+                        // hold 达标：采集（仅新姿态），黄 → 绿。
+                        hold_pose = None;
+                        hold_count = 0;
+                        if is_new {
+                            poses.push(pose);
+                            let mut captured =
+                                captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            captured.push(frame);
+                            drop(captured);
+                            let count = poses.len();
+                            drop(poses);
+                            if count >= target {
+                                set_guide(
+                                    &guide,
+                                    &format!("已覆盖 {count}/{target} 位姿，采集完成"),
+                                    count,
+                                    0,
+                                );
+                            } else {
+                                set_guide(
+                                    &guide,
+                                    &format!("已采 {count}/{target} 位姿（绿 4/4），请变换棋盘姿态"),
+                                    count,
+                                    0,
+                                );
+                            }
+                        } else {
+                            drop(poses);
+                            set_guide(&guide, "姿态重复，请变换棋盘位姿", count, 0);
+                        }
                     } else {
+                        // 黄 N/4：保持中。
+                        drop(poses);
                         set_guide(
                             &guide,
-                            &format!("已采 {count}/{target} 位姿，请变换棋盘姿态（旋转/俯仰/平移）"),
+                            &format!("保持当前姿态 · {hold_count}/{HOLD_TARGET}"),
                             count,
+                            hold_count,
                         );
                     }
                 } else {
+                    // 姿态变化：开始新一轮 hold。
+                    hold_pose = Some(pose);
+                    hold_count = 1;
                     drop(poses);
-                    set_guide(&guide, "姿态重复，请变换棋盘位姿", count);
+                    set_guide(
+                        &guide,
+                        &format!("检测到新姿态 · 1/{HOLD_TARGET}（请保持稳定）"),
+                        count,
+                        1,
+                    );
                 }
             }
             Ok(ChessboardDetectionOutcome::NotFound { .. }) => {
-                set_guide(&guide, "未检测到棋盘，请将棋盘置于画面中并调整角度", count);
+                hold_pose = None;
+                hold_count = 0;
+                set_guide(&guide, "未检测到棋盘，请将棋盘置于画面中并调整角度", count, 0);
             }
             Err(error) => {
-                set_guide(&guide, &format!("检测失败：{error}"), count);
+                hold_pose = None;
+                hold_count = 0;
+                set_guide(&guide, &format!("检测失败：{error}"), count, 0);
             }
         }
         std::thread::sleep(DETECT_INTERVAL);
@@ -323,16 +428,27 @@ fn norm(v: &[f64; 3]) -> f64 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
-fn set_guide(guide: &Arc<Mutex<GuideState>>, text: &str, count: usize) {
+fn set_guide(guide: &Arc<Mutex<GuideState>>, text: &str, count: usize, hold: u8) {
     let mut state = guide.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     state.text = text.to_owned();
     state.captured_count = count;
+    state.hold = hold;
 }
 
-/// 默认初始内参（fx=fy=900，主点居中）。
-fn default_initial_intrinsics() -> InitialIntrinsics {
+/// 默认初始内参（fx=fy=900，主点按帧尺寸居中）。
+fn default_initial_intrinsics(width: u32, height: u32) -> InitialIntrinsics {
     InitialIntrinsics {
-        camera_matrix: [900.0, 0.0, 320.0, 0.0, 900.0, 180.0, 0.0, 0.0, 1.0],
+        camera_matrix: [
+            900.0,
+            0.0,
+            f64::from(width) / 2.0,
+            0.0,
+            900.0,
+            f64::from(height) / 2.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
         distortion_coefficients: vec![0.0, 0.0, 0.0, 0.0, 0.0],
     }
 }
@@ -355,23 +471,27 @@ pub struct StreamState {
 
 impl StreamState {
     /// 按环境启动：`PONGBOT_SYNTH=1` 用合成帧，否则真实 RTSP（CH0:554 / CH3:557）。
-    pub fn start(host: &str) -> Self {
-        let synth = std::env::var("PONGBOT_SYNTH").is_ok_and(|v| v == "1");
+    pub fn start(
+        host: &str,
+        ch0_slot: Arc<Mutex<Option<OverlayData>>>,
+        ch3_slot: Arc<Mutex<Option<OverlayData>>>,
+    ) -> Self {
+        let synth = std::env::var("PONGBOT_SYNTH").is_ok_and(|v| v == "1" || v == "board");
         if synth {
             Self {
-                ch0: RtspStream::start_synth(0),
-                ch3: RtspStream::start_synth(3),
+                ch0: RtspStream::start_synth(0, ch0_slot),
+                ch3: RtspStream::start_synth(3, ch3_slot),
             }
         } else {
-            let ch0 = RtspStream::start(host, 554, 0, 1920, 1080)
+            let ch0 = RtspStream::start(host, 554, 0, 1920, 1080, ch0_slot.clone())
                 .unwrap_or_else(|error| {
                     godot_print!("CH0 预览启动失败：{error}");
-                    RtspStream::start_synth(0)
+                    RtspStream::start_synth(0, ch0_slot)
                 });
-            let ch3 = RtspStream::start(host, 557, 3, 1920, 1080)
+            let ch3 = RtspStream::start(host, 557, 3, 1920, 1080, ch3_slot.clone())
                 .unwrap_or_else(|error| {
                     godot_print!("CH3 预览启动失败：{error}");
-                    RtspStream::start_synth(3)
+                    RtspStream::start_synth(3, ch3_slot)
                 });
             Self { ch0, ch3 }
         }
@@ -382,3 +502,4 @@ impl StreamState {
         self.ch0.complete() && self.ch3.complete()
     }
 }
+
