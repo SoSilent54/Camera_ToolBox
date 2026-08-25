@@ -70,6 +70,8 @@ pub struct RtspStream {
     worker: Option<std::thread::JoinHandle<()>>,
     target: usize,
     detect_started: bool,
+    /// RTSP 解码失败信息（pump 检查 completion 写入，worker 读取显示）。
+    rtsp_error: Arc<Mutex<Option<String>>>,
 }
 
 impl RtspStream {
@@ -189,11 +191,20 @@ impl RtspStream {
             worker: None,
             target: CAPTURE_TARGET,
             detect_started: false,
+            rtsp_error: Arc::new(Mutex::new(None)),
         }
     }
 
     /// 主线程调用：有且仅在上传新帧时返回 `true`。
     pub fn pump(&mut self, target: &mut TextureRect) -> bool {
+        // 检查解码器终态：连接/解码失败时记录，供引导显示。
+        if let Some(decoder) = self.decoder.as_ref() {
+            if let Some(Err(error)) = decoder.completion() {
+                if let Ok(mut slot) = self.rtsp_error.lock() {
+                    *slot = Some(error.clone());
+                }
+            }
+        }
         let Some(frame) = self.slot.latest() else {
             return false;
         };
@@ -240,10 +251,11 @@ impl RtspStream {
         let poses = Arc::clone(&self.poses);
         let overlay = Arc::clone(&self.overlay);
         let guide = Arc::clone(&self.guide_state);
+        let rtsp_error = Arc::clone(&self.rtsp_error);
         let target = self.target;
         std::thread::spawn(move || {
             guided_capture_loop(
-                capturing, slot, captured, poses, guide, overlay, board, target,
+                capturing, slot, captured, poses, guide, overlay, rtsp_error, board, target,
             );
         });
     }
@@ -287,6 +299,7 @@ fn guided_capture_loop(
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
     guide: Arc<Mutex<GuideState>>,
     overlay: Arc<Mutex<Option<OverlayData>>>,
+    rtsp_error: Arc<Mutex<Option<String>>>,
     board: BoardSpec,
     target: usize,
 ) {
@@ -305,6 +318,16 @@ fn guided_capture_loop(
             break;
         }
         let Some(frame) = slot.latest() else {
+            // 无帧：显示 RTSP 连接/解码状态（不再静默空转）。
+            let error = rtsp_error
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(error) = error {
+                set_guide(&guide, &format!("RTSP 无帧：{error}（检查板端 DEMO233）"), 0, 0);
+            } else {
+                set_guide(&guide, "等待 RTSP 帧…", 0, 0);
+            }
             std::thread::sleep(DETECT_INTERVAL);
             continue;
         };
