@@ -155,7 +155,7 @@ impl I2cMapDefinition {
             });
         }
         for checksum in &self.checksums {
-            checksum.write(&mut image)?;
+            checksum.write(self, &mut image)?;
             written_ranges.push((checksum.target_offset, 1));
         }
         let pages = page_segments(
@@ -565,53 +565,68 @@ pub enum RoundingMode {
 #[serde(deny_unknown_fields)]
 pub struct ChecksumContract {
     pub target_offset: u16,
-    pub source_offset: u16,
-    pub source_byte_len: u16,
+    /// 设备定义的连续物理字节范围；必须和 `source_fields` 二选一。
+    pub source_offset: Option<u16>,
+    pub source_byte_len: Option<u16>,
+    /// 已映射逻辑字段的物理跨度，按声明顺序拼接后参与校验和。
+    #[serde(default)]
+    pub source_fields: Vec<String>,
     pub algorithm: ChecksumAlgorithm,
 }
 
 impl ChecksumContract {
-    fn validate(&self, map: &I2cMapDefinition) -> Result<(), I2cMapDefinitionError> {
-        validate_storage_range(
-            self.source_offset,
-            self.source_byte_len,
-            map.image_bytes,
-            "checksum source",
-        )?;
-        validate_storage_range(self.target_offset, 1, map.image_bytes, "checksum target")?;
-        if self.target_offset >= self.source_offset
-            && self.target_offset < self.source_offset + self.source_byte_len
-        {
-            return Err(I2cMapDefinitionError::Definition(
-                "checksum target must not lie in its source range".to_owned(),
-            ));
+    fn source_ranges(&self, map: &I2cMapDefinition) -> Result<Vec<(u16, u16)>, I2cMapDefinitionError> {
+        match (self.source_offset, self.source_byte_len, self.source_fields.is_empty()) {
+            (Some(offset), Some(byte_len), true) => Ok(vec![(offset, byte_len)]),
+            (None, None, false) => {
+                let mut names = BTreeSet::new();
+                self.source_fields.iter().map(|name| {
+                    if !names.insert(name.as_str()) {
+                        return Err(I2cMapDefinitionError::Definition(format!("checksum source field `{name}` is duplicated")));
+                    }
+                    let slot = map.inputs.iter().find(|slot| slot.name == *name).ok_or_else(|| {
+                        I2cMapDefinitionError::Definition(format!("checksum source field `{name}` is not declared"))
+                    })?;
+                    let target = slot.target.as_ref().ok_or_else(|| {
+                        I2cMapDefinitionError::Definition(format!("checksum source field `{name}` has no encoded storage span"))
+                    })?;
+                    Ok((target.offset, target.byte_len))
+                }).collect()
+            }
+            _ => Err(I2cMapDefinitionError::Definition(
+                "checksum requires either sourceOffset/sourceByteLen or non-empty sourceFields".to_owned(),
+            )),
         }
+    }
+
+    fn validate(&self, map: &I2cMapDefinition) -> Result<(), I2cMapDefinitionError> {
+        let ranges = self.source_ranges(map)?;
+        for (offset, byte_len) in &ranges {
+            validate_storage_range(*offset, *byte_len, map.image_bytes, "checksum source")?;
+            if self.target_offset >= *offset && self.target_offset < *offset + *byte_len {
+                return Err(I2cMapDefinitionError::Definition(
+                    "checksum target must not lie in its source range".to_owned(),
+                ));
+            }
+        }
+        validate_storage_range(self.target_offset, 1, map.image_bytes, "checksum target")?;
         Ok(())
     }
 
-    fn write(&self, image: &mut [u8]) -> Result<(), I2cMapDefinitionError> {
-        let source = image
-            .get(
-                usize::from(self.source_offset)
-                    ..usize::from(self.source_offset + self.source_byte_len),
-            )
-            .ok_or_else(|| {
+    fn write(&self, map: &I2cMapDefinition, image: &mut [u8]) -> Result<(), I2cMapDefinitionError> {
+        let ranges = self.source_ranges(map)?;
+        let sum = ranges.into_iter().try_fold(0_u32, |sum, (offset, byte_len)| {
+            let source = image.get(usize::from(offset)..usize::from(offset + byte_len)).ok_or_else(|| {
                 I2cMapDefinitionError::Definition("checksum source range is invalid".to_owned())
             })?;
+            Ok::<_, I2cMapDefinitionError>(source.iter().fold(sum, |total, byte| total + u32::from(*byte)))
+        })?;
         let value = match self.algorithm {
-            ChecksumAlgorithm::SerialSumMod255PlusOne => {
-                ((source
-                    .iter()
-                    .fold(0_u16, |sum, byte| sum + u16::from(*byte))
-                    % 0xff)
-                    + 1) as u8
-            }
+            ChecksumAlgorithm::SerialSumMod255PlusOne => ((sum % 0xff) + 1) as u8,
         };
-        *image
-            .get_mut(usize::from(self.target_offset))
-            .ok_or_else(|| {
-                I2cMapDefinitionError::Definition("checksum target range is invalid".to_owned())
-            })? = value;
+        *image.get_mut(usize::from(self.target_offset)).ok_or_else(|| {
+            I2cMapDefinitionError::Definition("checksum target range is invalid".to_owned())
+        })? = value;
         Ok(())
     }
 }
@@ -938,8 +953,10 @@ impl RawLogicalInputSlot {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct RawChecksumContract {
     target_offset: u16,
-    source_offset: u16,
-    source_byte_len: u16,
+    source_offset: Option<u16>,
+    source_byte_len: Option<u16>,
+    #[serde(default)]
+    source_fields: Vec<String>,
     algorithm: String,
 }
 impl RawChecksumContract {
@@ -948,6 +965,7 @@ impl RawChecksumContract {
             target_offset: self.target_offset,
             source_offset: self.source_offset,
             source_byte_len: self.source_byte_len,
+            source_fields: self.source_fields,
             algorithm: match self.algorithm.as_str() {
                 "serial-sum-mod-255-plus-one" => ChecksumAlgorithm::SerialSumMod255PlusOne,
                 _ => {
@@ -1110,8 +1128,9 @@ pub fn yg_stereo_i2c_map() -> I2cMapDefinition {
     map.inputs = yg_logical_inputs();
     map.checksums = vec![ChecksumContract {
         target_offset: 0x0133,
-        source_offset: 0x0125,
-        source_byte_len: 14,
+        source_offset: Some(0x0125),
+        source_byte_len: Some(14),
+        source_fields: Vec::new(),
         algorithm: ChecksumAlgorithm::SerialSumMod255PlusOne,
     }];
     map.fixed_bytes = vec![I2cMapFixedBytes {
@@ -1668,6 +1687,32 @@ mod tests {
         assert_eq!(encoded.bytes, golden);
         assert!(encoded.pages.iter().all(|page| page.offset / 32
             == (page.offset + u16::try_from(page.bytes.len()).unwrap() - 1) / 32));
+    }
+
+    #[test]
+    fn named_checksum_sources_use_declared_encoded_field_spans() {
+        let mut map = yg_stereo_i2c_map();
+        let checksum = map.checksums.first_mut().expect("YG checksum");
+        checksum.source_offset = None;
+        checksum.source_byte_len = None;
+        checksum.source_fields = vec!["serial.number".to_owned()];
+
+        let encoded = map.encode(&yg_inputs()).expect("named checksum source");
+        let golden = include_bytes!("fixtures/yg_stereo_p24c64g_script_default.bin");
+        assert_eq!(encoded.bytes, golden);
+    }
+
+    #[test]
+    fn named_checksum_source_rejects_duplicate_or_missing_fields() {
+        let mut map = yg_stereo_i2c_map();
+        let checksum = map.checksums.first_mut().expect("YG checksum");
+        checksum.source_offset = None;
+        checksum.source_byte_len = None;
+        checksum.source_fields = vec!["serial.number".to_owned(), "serial.number".to_owned()];
+        assert!(map.validate().is_err());
+
+        map.checksums[0].source_fields = vec!["missing.field".to_owned()];
+        assert!(map.validate().is_err());
     }
 
     #[test]

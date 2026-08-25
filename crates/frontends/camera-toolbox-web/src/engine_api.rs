@@ -16,11 +16,11 @@ use camera_toolbox_app::platform::{
 use serde_json::json;
 
 use crate::{
-    AppState,
     serial_field::SerialFieldFactory,
     workflow::{
         NodeKind, PortDirection, PortKind, WorkflowEdge, WorkflowGraph, WorkflowNode, WorkflowPort,
     },
+    AppState,
 };
 
 /// 引擎运行时：节点注册表 + 当前已装载的图。
@@ -145,6 +145,7 @@ pub(crate) fn packet_to_json(packet: &DataPacket) -> serde_json::Value {
         DataPacket::StructuredPacket(packet) => {
             serde_json::to_value(packet.as_ref()).unwrap_or(json!({ "type": "structured.packet" }))
         }
+        DataPacket::PacketData(packet) => packet.as_ref().clone(),
         DataPacket::SshConnection(connection) => json!({
             "type": "ssh.connection.v1",
             "id": connection.id(),
@@ -287,8 +288,7 @@ pub(crate) fn parse_action_str(
         | "clear_parking_stop"
         | "zero_current"
         | "send_joint_positions"
-        | "read"
-        | "write" => Ok(NodeAction::Custom {
+        | "execute" => Ok(NodeAction::Custom {
             name: action.to_owned(),
             payload,
         }),

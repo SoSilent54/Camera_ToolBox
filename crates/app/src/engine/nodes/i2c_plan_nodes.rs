@@ -1,17 +1,17 @@
-//! 原子 I²C read/write 工作流节点。
+//! 通用 I²C task 编码和原子执行节点。
 //!
-//! `I2cTaskBuilder` 现在直接消费结构化标定包、SNID typed field 和 SSH 会话，用户只需要触发
-//! Read 或 Write。写入仍由目标端单个 guarded helper 请求持锁完成逐页写入、精确读回和最终校验；
-//! 本模块不提供 inspect/approval/write 三段式图节点，也不保存 credential。
+//! Encoder 只把完整 datum 编码为受校验的 EEPROM task；Executor 只消费 task 和 SSH
+//! capability，不读取 map 配置、不理解业务字段，也不保存 credential material。
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::{BTreeMap, HashSet}, sync::Arc};
 
-use camera_toolbox_core::{Datum, I2cMapDefinition, StructuredPacket, TypedValue, builtin_i2c_map};
+use camera_toolbox_core::{builtin_i2c_map, Datum, I2cMapDefinition};
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::engine::{
     DataPacket, NodeAction, NodeError, NodeFactory, NodeInstance, NodeRuntime, NodeRuntimeState,
-    NodeSpec, TypedFieldSource,
+    NodeSpec,
 };
 use crate::platform::{
     ControlTargetSpec, DumpCancellation, I2cMapValidationContract, I2cPageWrite, I2cReadRange,
@@ -19,28 +19,20 @@ use crate::platform::{
     SshConnection,
 };
 
-#[cfg(test)]
-use camera_toolbox_core::YG_STEREO_P24C64G_FLAG;
-#[cfg(test)]
-const YG_MAP_ID: &str = "yg-stereo-p24c64g-v1";
-#[cfg(test)]
-const YG_MODEL: &str = "pinhole.rational-thin-prism.v1";
-#[cfg(test)]
-const YG_IMAGE_BYTES: u16 = 0x134;
+const TASK_PORT: &str = "task";
+const CONNECTION_PORT: &str = "connection";
+const FIELD_PORT_KIND: &str = "data.field.v1";
+const PACKET_PORT_KIND: &str = "data.packet.v1";
+const TASK_SCHEMA: &str = "camera-toolbox.i2c.task.v1";
 
 /// SSH source：在显式 Connect 后建立不含密钥材料的运行时句柄。
 pub struct SshConnectionFactory;
 
 impl NodeFactory for SshConnectionFactory {
-    fn kind(&self) -> &'static str {
-        "sshConnection"
-    }
+    fn kind(&self) -> &'static str { "sshConnection" }
 
     fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(SshConnectionNode {
-            spec,
-            connection: None,
-        }))
+        Ok(Box::new(SshConnectionNode { spec, connection: None }))
     }
 }
 
@@ -50,104 +42,42 @@ pub struct SshConnectionNode {
 }
 
 impl SshConnectionNode {
-    fn target(&self) -> Result<ControlTargetSpec, NodeError> {
-        ssh_target(&self.spec)
-    }
-
-    fn credential_ref(&self) -> Result<String, NodeError> {
+    fn connect(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        let target = ssh_target(&self.spec)?;
         let credential_ref = required_text(&self.spec, "credentialRef")?;
         if !credential_ref.starts_with("session:") {
-            return Err(NodeError::Precondition(
-                "sshConnection credentialRef must be a process-local session reference".to_owned(),
-            ));
+            return Err(NodeError::Precondition("sshConnection credentialRef must be a process-local session reference".to_owned()));
         }
-        Ok(credential_ref)
-    }
-
-    fn connect(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        let target = self.target()?;
-        let credential_ref = self.credential_ref()?;
-        if self.connection.is_some() {
-            self.revoke(rt, "SSH connection revoked before reconnect")?;
+        if let Some(connection) = self.connection.as_ref() {
+            rt.services().ssh_connection_service()?.revoke(connection, remote_control()?).map_err(NodeError::Execution)?;
         }
-        let connection = rt
-            .services()
-            .ssh_connection_service()?
-            .connect(&target, &credential_ref, remote_control()?)
-            .map_err(NodeError::Execution)?;
+        let connection = Arc::new(rt.services().ssh_connection_service()?.connect(&target, &credential_ref, remote_control()?).map_err(NodeError::Execution)?);
         if connection.id().trim().is_empty() {
-            return Err(NodeError::Execution(
-                "SSH connection service returned an empty connection id".to_owned(),
-            ));
+            return Err(NodeError::Execution("SSH connection service returned an empty connection id".to_owned()));
         }
-        let connection = Arc::new(connection);
-        rt.emit(
-            "connection",
-            DataPacket::SshConnection(Arc::clone(&connection)),
-        )?;
+        rt.emit(CONNECTION_PORT, DataPacket::SshConnection(Arc::clone(&connection)))?;
         self.connection = Some(connection);
         rt.report_state(NodeRuntimeState::Ready, "SSH connection established");
         Ok(())
     }
 
-    fn revoke(&mut self, rt: &mut NodeRuntime, state_message: &str) -> Result<(), NodeError> {
-        let Some(connection) = self.connection.as_ref() else {
-            rt.report_state(NodeRuntimeState::Idle, state_message);
-            return Ok(());
-        };
-        rt.services()
-            .ssh_connection_service()?
-            .revoke(connection, remote_control()?)
-            .map_err(NodeError::Execution)?;
-        self.connection = None;
-        rt.report_state(NodeRuntimeState::Idle, state_message);
-        Ok(())
-    }
-
-    fn update_config(
-        &mut self,
-        config: serde_json::Value,
-        rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        let candidate = NodeSpec {
-            config,
-            ..self.spec.clone()
-        };
-        validate_ssh_config(&candidate)?;
-        if self.connection.is_some() {
-            self.revoke(rt, "SSH connection revoked after configuration change")?;
+    fn revoke(&mut self, rt: &mut NodeRuntime, message: &str) -> Result<(), NodeError> {
+        if let Some(connection) = self.connection.as_ref() {
+            rt.services().ssh_connection_service()?.revoke(connection, remote_control()?).map_err(NodeError::Execution)?;
+            self.connection = None;
         }
-        self.spec = candidate;
-        rt.report_state(
-            NodeRuntimeState::Idle,
-            "SSH configuration updated; reconnect required",
-        );
+        rt.report_state(NodeRuntimeState::Idle, message);
         Ok(())
     }
 }
 
 impl NodeInstance for SshConnectionNode {
-    fn kind(&self) -> &'static str {
-        "sshConnection"
-    }
-
+    fn kind(&self) -> &'static str { "sshConnection" }
     fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(
-            NodeRuntimeState::Idle,
-            "connect to establish an in-memory SSH session",
-        );
+        rt.report_state(NodeRuntimeState::Idle, "connect to establish an in-memory SSH session");
         Ok(())
     }
-
-    fn on_input(
-        &mut self,
-        _port: &str,
-        _packet: DataPacket,
-        _rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        Ok(())
-    }
-
+    fn on_input(&mut self, _: &str, _: DataPacket, _: &mut NodeRuntime) -> Result<(), NodeError> { Ok(()) }
     fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         match action {
             NodeAction::Connect => self.connect(rt),
@@ -155,108 +85,53 @@ impl NodeInstance for SshConnectionNode {
             other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
         }
     }
-
-    fn on_config_update(
-        &mut self,
-        config: serde_json::Value,
-        rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        self.update_config(config, rt)
+    fn on_config_update(&mut self, config: serde_json::Value, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        // 工作流编辑可保存未配置的 SSH 草稿；Connect 时才校验连接所需字段。
+        self.revoke(rt, "SSH connection revoked after configuration change")?;
+        self.spec.config = config;
+        Ok(())
     }
-
-    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        self.revoke(rt, "SSH connection revoked while stopping")
-    }
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> { self.revoke(rt, "SSH connection revoked while stopping") }
 }
 
-pub struct I2cTaskBuilderFactory;
-
-impl NodeFactory for I2cTaskBuilderFactory {
-    fn kind(&self) -> &'static str {
-        "i2cTaskBuilder"
-    }
-
-    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> {
-        Ok(Box::new(I2cTaskBuilderNode::new(spec)?))
-    }
+/// `i2cFieldEncoder` 工厂。
+pub struct I2cFieldEncoderFactory;
+impl NodeFactory for I2cFieldEncoderFactory {
+    fn kind(&self) -> &'static str { "i2cFieldEncoder" }
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> { Ok(Box::new(I2cFieldEncoderNode::new(spec)?)) }
 }
 
 #[derive(Clone)]
-struct BuilderInput {
-    datum: Arc<Datum>,
-    source: Arc<TypedFieldSource>,
+struct EncoderInput {
+    port_id: String,
+    datum_name: String,
+    required: bool,
 }
 
-pub struct I2cTaskBuilderNode {
+/// 将通用 FieldData 编码为可交换、严格验证的 task PacketData。
+pub struct I2cFieldEncoderNode {
     map: I2cMapDefinition,
-    packet: Option<Arc<StructuredPacket>>,
-    serial: Option<BuilderInput>,
-    connection: Option<Arc<SshConnection>>,
-    read_request: Option<Arc<I2cReadRequest>>,
-    write_request: Option<Arc<I2cWriteRequest>>,
+    operation: TaskOperation,
+    inputs: Vec<EncoderInput>,
+    received: BTreeMap<String, Arc<Datum>>,
 }
 
-impl I2cTaskBuilderNode {
+impl I2cFieldEncoderNode {
     fn new(spec: NodeSpec) -> Result<Self, NodeError> {
-        let map = compile_builder_map(&spec)?;
-        validate_builder_read_before_layout(&map)?;
-        Ok(Self {
-            map,
-            packet: None,
-            serial: None,
-            connection: None,
-            read_request: None,
-            write_request: None,
-        })
+        validate_encoder_ports(&spec)?;
+        let map = compile_encoder_map(&spec)?;
+        let operation = parse_operation(&spec.config)?;
+        let inputs = parse_encoder_inputs(&spec, &map)?;
+        Ok(Self { map, operation, inputs, received: BTreeMap::new() })
     }
 
-    fn build(&self) -> Result<(I2cReadRequest, I2cWriteRequest), NodeError> {
-        let packet = self.packet.as_ref().ok_or_else(|| {
-            NodeError::Precondition("i2cTaskBuilder requires a structured calibration packet".to_owned())
-        })?;
-        let model_id = packet_model_id(packet)?;
-        self.map
-            .validate_source(&packet.schema, &model_id)
-            .map_err(|error| {
-                NodeError::Precondition(format!(
-                    "I2C map `{}` rejects structured packet source: {error}",
-                    self.map.id
-                ))
-            })?;
-
-        let by_name = packet
-            .fields
-            .iter()
-            .map(|datum| (datum.name.as_str(), datum))
-            .collect::<BTreeMap<_, _>>();
-        let mut inputs = Vec::with_capacity(self.map.inputs.len());
-        for slot in &self.map.inputs {
-            let datum = if slot.name == "serial.number" {
-                let serial = self.serial.as_ref().ok_or_else(|| {
-                    NodeError::Precondition(
-                        "i2cTaskBuilder requires serial.number before read/write".to_owned(),
-                    )
-                })?;
-                validate_map_source(&self.map, &serial.source, &slot.name)?;
-                serial.datum.as_ref()
-            } else {
-                by_name.get(slot.name.as_str()).copied().ok_or_else(|| {
-                    NodeError::Precondition(format!(
-                        "structured packet is missing I2C map input `{}`",
-                        slot.name
-                    ))
-                })?
-            };
-            validate_map_slot(datum, slot)?;
-            inputs.push(datum.clone());
+    fn emit_task_if_ready(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        if self.inputs.iter().any(|input| input.required && !self.received.contains_key(&input.port_id)) { return Ok(()); }
+        let mut fields = Vec::with_capacity(self.inputs.len());
+        for input in &self.inputs {
+            if let Some(field) = self.received.get(&input.port_id) { fields.push(field.as_ref().clone()); }
         }
-
-        let image = self.map.encode(&inputs).map_err(|error| {
-            NodeError::Precondition(format!(
-                "I2C map `{}` rejected inputs: {error}",
-                self.map.id
-            ))
-        })?;
+        let image = self.map.encode(&fields).map_err(|error| NodeError::Precondition(format!("I2C encoder rejected fields: {error}")))?;
         let target = I2cTaskTarget {
             bus: self.map.target.bus,
             address: u16::from(self.map.target.transport.i2c_address),
@@ -264,821 +139,269 @@ impl I2cTaskBuilderNode {
             page_size_bytes: self.map.target.transport.page_size_bytes,
             write_cycle_ms: self.map.target.transport.write_cycle_ms,
         };
-        let map_digest = sha256_hex(format!("{:?}", self.map).as_bytes());
-        let read_ranges = self
-            .map
-            .read_before
-            .ranges
-            .iter()
-            .map(|range| I2cReadRange {
-                offset: range.offset,
-                byte_len: range.byte_len,
-            })
-            .collect::<Vec<_>>();
-        let validation = I2cMapValidationContract::from_map(&self.map);
-        let pages = image
-            .pages
-            .into_iter()
-            .map(|page| I2cPageWrite {
-                offset: page.offset,
-                bytes: page.bytes,
-                settle_ms: target.write_cycle_ms,
-            })
-            .collect::<Vec<_>>();
-        let read = I2cReadRequest::new(
-            self.map.id.clone(),
-            map_digest.clone(),
-            target.clone(),
-            read_ranges.clone(),
-            validation.clone(),
-        );
-        let write = I2cWriteRequest::new(
-            self.map.id.clone(),
-            map_digest,
-            target,
+        let read_ranges = self.map.read_before.ranges.iter().map(|range| I2cReadRange { offset: range.offset, byte_len: range.byte_len }).collect();
+        let task = I2cTaskPacket {
+            schema: TASK_SCHEMA.to_owned(),
+            operation: self.operation,
+            map_id: self.map.id.clone(),
+            map_digest: sha256_hex(format!("{:?}", self.map).as_bytes()),
+            target: target.clone(),
             read_ranges,
-            validation,
-            pages,
-            image.bytes,
-            self.map.readback.required,
-        );
-        Ok((read, write))
-    }
-
-    fn rebuild_if_ready(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        if self.packet.is_none() || self.map.inputs.iter().any(|slot| slot.name == "serial.number") && self.serial.is_none() {
-            return Ok(());
-        }
-        let (read, write) = self.build()?;
-        self.read_request = Some(Arc::new(read));
-        self.write_request = Some(Arc::new(write));
-        rt.report_state(
-            NodeRuntimeState::Ready,
-            "I2C read/write requests are ready; use Read or Write",
-        );
-        Ok(())
-    }
-
-    fn read(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        let connection = self.connection.as_ref().ok_or_else(|| {
-            NodeError::Precondition("i2cTaskBuilder read requires SSH connection".to_owned())
-        })?;
-        let request = self.read_request.as_ref().ok_or_else(|| {
-            NodeError::Precondition("i2cTaskBuilder read requires compiled map inputs".to_owned())
-        })?;
-        if !request.is_compiled() {
-            return Err(NodeError::Precondition(
-                "i2cTaskBuilder read request was mutated after compilation".to_owned(),
-            ));
-        }
-        let report = rt
-            .services()
-            .i2c_task_executor()?
-            .read(connection, request, remote_control()?)
-            .map_err(NodeError::Execution)?;
-        let valid = report.valid;
-        let error = report.error.clone();
-        rt.emit("readReport", DataPacket::I2cReadReport(Arc::new(report)))?;
-        if valid {
-            rt.report_state(NodeRuntimeState::Ready, "I2C read completed and map state is valid");
-        } else {
-            rt.report_state(
-                NodeRuntimeState::Warning,
-                format!("I2C read completed with validation warning: {}", error.unwrap_or_else(|| "unknown".to_owned())),
-            );
-        }
-        Ok(())
-    }
-
-    fn write(&self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        let connection = self.connection.as_ref().ok_or_else(|| {
-            NodeError::Precondition("i2cTaskBuilder write requires SSH connection".to_owned())
-        })?;
-        let request = self.write_request.as_ref().ok_or_else(|| {
-            NodeError::Precondition("i2cTaskBuilder write requires compiled map inputs".to_owned())
-        })?;
-        if !request.is_compiled() {
-            return Err(NodeError::Precondition(
-                "i2cTaskBuilder write request was mutated after compilation".to_owned(),
-            ));
-        }
-        let report = rt
-            .services()
-            .i2c_task_executor()?
-            .write(connection, request, remote_control()?)
-            .map_err(NodeError::Execution)?;
-        let final_verified = report.final_verified;
-        let error = report.error.clone();
-        rt.emit("report", DataPacket::I2cExecutionReport(Arc::new(report)))?;
-        if final_verified {
-            rt.report_state(
-                NodeRuntimeState::Ready,
-                "I2C write completed; pages read back and final image verified",
-            );
-        } else {
-            rt.report_state(
-                NodeRuntimeState::Error,
-                format!("I2C write halted: {}; no rollback was attempted", error.unwrap_or_else(|| "unknown".to_owned())),
-            );
-        }
+            validation: I2cMapValidationContract::from_map(&self.map),
+            pages: image.pages.into_iter().map(|page| I2cPageWrite { offset: page.offset, bytes: page.bytes, settle_ms: target.write_cycle_ms }).collect(),
+            final_image: image.bytes,
+            verify_after_write: self.map.readback.required,
+            final_image_digest: String::new(),
+        }.with_digest();
+        task.validate().map_err(|error| NodeError::Precondition(format!("compiled I2C task is invalid: {error}")))?;
+        rt.emit(TASK_PORT, DataPacket::PacketData(Arc::new(serde_json::to_value(task).map_err(|error| NodeError::Execution(error.to_string()))?)))?;
+        rt.report_state(NodeRuntimeState::Ready, "I2C task compiled from encoded fields");
         Ok(())
     }
 }
 
-impl NodeInstance for I2cTaskBuilderNode {
-    fn kind(&self) -> &'static str {
-        "i2cTaskBuilder"
+impl NodeInstance for I2cFieldEncoderNode {
+    fn kind(&self) -> &'static str { "i2cFieldEncoder" }
+    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> { rt.report_state(NodeRuntimeState::Idle, "waiting for configured field data"); Ok(()) }
+    fn on_input(&mut self, port: &str, packet: DataPacket, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        let input = self.inputs.iter().find(|input| input.port_id == port).ok_or_else(|| NodeError::Precondition(format!("i2cFieldEncoder received input on unknown port `{port}`")))?;
+        let DataPacket::TypedField { datum, .. } = packet else { return Err(NodeError::Precondition("i2cFieldEncoder inputs require data.field.v1".to_owned())); };
+        if datum.name != input.datum_name { return Err(NodeError::Precondition(format!("encoder port `{port}` expects datum `{}`, got `{}`", input.datum_name, datum.name))); }
+        self.received.insert(port.to_owned(), datum);
+        self.emit_task_if_ready(rt)
     }
-
-    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        rt.report_state(
-            NodeRuntimeState::Idle,
-            "waiting for structured packet, serial number, and SSH connection",
-        );
+    fn on_action(&mut self, action: NodeAction, _: &mut NodeRuntime) -> Result<(), NodeError> { Err(NodeError::UnsupportedAction(action.name().to_owned())) }
+    fn on_config_update(&mut self, config: serde_json::Value, rt: &mut NodeRuntime) -> Result<(), NodeError> {
+        let spec = NodeSpec { config, ..NodeSpec { id: String::new(), kind: "i2cFieldEncoder".to_owned(), title: String::new(), inputs: Vec::new(), outputs: Vec::new(), config: serde_json::Value::Null } };
+        self.map = compile_encoder_map(&spec)?;
+        self.operation = parse_operation(&spec.config)?;
+        self.received.clear();
+        rt.report_state(NodeRuntimeState::Idle, "I2C encoder configuration updated; send fields again");
         Ok(())
     }
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> { self.received.clear(); rt.report_state(NodeRuntimeState::Idle, "stopped"); Ok(()) }
+}
 
-    fn on_input(
-        &mut self,
-        port: &str,
-        packet: DataPacket,
-        rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
+/// `i2cTaskExecutor` 工厂。
+pub struct I2cTaskExecutorFactory;
+impl NodeFactory for I2cTaskExecutorFactory {
+    fn kind(&self) -> &'static str { "i2cTaskExecutor" }
+    fn instantiate(&self, spec: NodeSpec) -> Result<Box<dyn NodeInstance>, NodeError> { validate_executor_ports(&spec)?; Ok(Box::new(I2cTaskExecutorNode { task: None, connection: None })) }
+}
+
+/// Executor 只持有 task 与 process-local SSH capability。
+pub struct I2cTaskExecutorNode { task: Option<I2cTaskPacket>, connection: Option<Arc<SshConnection>> }
+impl NodeInstance for I2cTaskExecutorNode {
+    fn kind(&self) -> &'static str { "i2cTaskExecutor" }
+    fn on_start(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> { rt.report_state(NodeRuntimeState::Idle, "waiting for task and SSH connection"); Ok(()) }
+    fn on_input(&mut self, port: &str, packet: DataPacket, rt: &mut NodeRuntime) -> Result<(), NodeError> {
         match (port, packet) {
-            ("packet", DataPacket::StructuredPacket(value)) => {
-                self.packet = Some(value);
-                self.read_request = None;
-                self.write_request = None;
-            }
-            ("serial.number", DataPacket::TypedField { datum, source, .. }) => {
-                let slot = self
-                    .map
-                    .inputs
-                    .iter()
-                    .find(|slot| slot.name == "serial.number")
-                    .ok_or_else(|| {
-                        NodeError::Precondition(
-                            "i2cTaskBuilder received serial.number but selected map has no serial slot"
-                                .to_owned(),
-                        )
-                    })?;
-                validate_map_slot(&datum, slot)?;
-                validate_map_source(&self.map, &source, "serial.number")?;
-                self.serial = Some(BuilderInput { datum, source });
-                self.read_request = None;
-                self.write_request = None;
-            }
-            ("connection", DataPacket::SshConnection(value)) => self.connection = Some(value),
-            _ => {
-                return Err(NodeError::Precondition(
-                    "i2cTaskBuilder accepts packet, serial.number, and connection".to_owned(),
-                ));
-            }
-        };
-        self.rebuild_if_ready(rt)
-    }
-
-    fn on_config_update(
-        &mut self,
-        config: serde_json::Value,
-        rt: &mut NodeRuntime,
-    ) -> Result<(), NodeError> {
-        let candidate_spec = NodeSpec {
-            config,
-            ..NodeSpec {
-                id: String::new(),
-                kind: "i2cTaskBuilder".to_owned(),
-                title: String::new(),
-                inputs: Vec::new(),
-                outputs: Vec::new(),
-                config: serde_json::Value::Null,
-            }
-        };
-        let candidate = compile_builder_map(&candidate_spec)?;
-        validate_builder_read_before_layout(&candidate)?;
-        self.map = candidate;
-        self.packet = None;
-        self.serial = None;
-        self.read_request = None;
-        self.write_request = None;
-        rt.report_state(
-            NodeRuntimeState::Idle,
-            "I2C map configuration updated; send packet and serial again",
-        );
+            (TASK_PORT, DataPacket::PacketData(value)) => self.task = Some(parse_task(&value)?),
+            (CONNECTION_PORT, DataPacket::SshConnection(connection)) => self.connection = Some(connection),
+            _ => return Err(NodeError::Precondition("i2cTaskExecutor accepts only task PacketData and SSH connection".to_owned())),
+        }
+        if self.task.is_some() && self.connection.is_some() { rt.report_state(NodeRuntimeState::Ready, "I2C task is ready to execute"); }
         Ok(())
     }
-
     fn on_action(&mut self, action: NodeAction, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        match action {
-            NodeAction::Custom { name, .. } if name == "read" => self.read(rt),
-            NodeAction::Custom { name, .. } if name == "write" => self.write(rt),
-            other => Err(NodeError::UnsupportedAction(other.name().to_owned())),
+        if !matches!(action, NodeAction::Custom { ref name, .. } if name == "execute") { return Err(NodeError::UnsupportedAction(action.name().to_owned())); }
+        let task = self.task.as_ref().ok_or_else(|| NodeError::Precondition("i2cTaskExecutor execute requires task".to_owned()))?;
+        let connection = self.connection.as_ref().ok_or_else(|| NodeError::Precondition("i2cTaskExecutor execute requires SSH connection".to_owned()))?;
+        match task.operation {
+            TaskOperation::Read => {
+                let request = task.read_request();
+                let report = rt.services().i2c_task_executor()?.read(connection, &request, remote_control()?).map_err(NodeError::Execution)?;
+                let valid = report.valid;
+                rt.emit("readReport", DataPacket::I2cReadReport(Arc::new(report)))?;
+                rt.report_state(if valid { NodeRuntimeState::Ready } else { NodeRuntimeState::Warning }, "I2C read completed");
+            }
+            TaskOperation::GuardedWrite => {
+                let request = task.write_request();
+                let report = rt.services().i2c_task_executor()?.write(connection, &request, remote_control()?).map_err(NodeError::Execution)?;
+                let verified = report.final_verified;
+                rt.emit("report", DataPacket::I2cExecutionReport(Arc::new(report)))?;
+                rt.report_state(if verified { NodeRuntimeState::Ready } else { NodeRuntimeState::Error }, "I2C guarded write completed");
+            }
         }
-    }
-
-    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> {
-        self.packet = None;
-        self.serial = None;
-        self.connection = None;
-        self.read_request = None;
-        self.write_request = None;
-        rt.report_state(NodeRuntimeState::Idle, "stopped");
         Ok(())
     }
+    fn on_stop(&mut self, rt: &mut NodeRuntime) -> Result<(), NodeError> { self.task = None; self.connection = None; rt.report_state(NodeRuntimeState::Idle, "stopped"); Ok(()) }
 }
 
-fn packet_model_id(packet: &StructuredPacket) -> Result<String, NodeError> {
-    packet
-        .fields
-        .iter()
-        .find(|datum| datum.name == "camera.model.id")
-        .and_then(|datum| match &datum.value {
-            TypedValue::Str(value) => Some(value.clone()),
-            _ => None,
-        })
-        .ok_or_else(|| {
-            NodeError::Precondition(
-                "structured packet must contain string camera.model.id for I2C map source validation"
-                    .to_owned(),
-            )
-        })
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TaskOperation { Read, GuardedWrite }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct I2cTaskPacket {
+    schema: String,
+    operation: TaskOperation,
+    map_id: String,
+    map_digest: String,
+    target: I2cTaskTarget,
+    read_ranges: Vec<I2cReadRange>,
+    validation: I2cMapValidationContract,
+    pages: Vec<I2cPageWrite>,
+    final_image: Vec<u8>,
+    verify_after_write: bool,
+    final_image_digest: String,
 }
 
-/// 编译 builder 配置中的唯一 map 来源。自定义 YAML 的 core 诊断会保留精确行列位置。
-fn compile_builder_map(spec: &NodeSpec) -> Result<I2cMapDefinition, NodeError> {
-    let mode = config_text(spec, "mapMode").ok_or_else(|| {
-        NodeError::Config(
-            "i2cTaskBuilder config `mapMode` must be `builtin` or `custom`".to_owned(),
-        )
-    })?;
+impl I2cTaskPacket {
+    fn with_digest(mut self) -> Self { self.final_image_digest = sha256_hex(&self.final_image); self }
+    fn validate(&self) -> Result<(), String> {
+        if self.schema != TASK_SCHEMA { return Err(format!("schema must be `{TASK_SCHEMA}`")); }
+        if self.map_id.trim().is_empty() || self.map_digest.trim().is_empty() { return Err("map identity must not be blank".to_owned()); }
+        if !matches!(self.target.address_width_bytes, 1 | 2) || !(0x03..=0x7f).contains(&self.target.address) || self.target.page_size_bytes == 0 { return Err("target is invalid".to_owned()); }
+        if self.final_image.is_empty() || self.final_image.len() != usize::from(self.validation.image_bytes) { return Err("final image does not match validation image size".to_owned()); }
+        if self.final_image_digest != sha256_hex(&self.final_image) { return Err("final image digest does not match image bytes".to_owned()); }
+        if self.read_ranges.is_empty() || self.read_ranges.iter().any(|range| range.byte_len == 0 || usize::from(range.offset).saturating_add(usize::from(range.byte_len)) > self.final_image.len()) { return Err("read ranges are invalid".to_owned()); }
+        if self.operation == TaskOperation::GuardedWrite && self.pages.is_empty() { return Err("guarded write task must contain pages".to_owned()); }
+        for page in &self.pages {
+            if page.bytes.is_empty() || usize::from(page.offset).saturating_add(page.bytes.len()) > self.final_image.len() || page.settle_ms != self.target.write_cycle_ms { return Err("page layout is invalid".to_owned()); }
+        }
+        Ok(())
+    }
+    fn read_request(&self) -> I2cReadRequest { I2cReadRequest::new(self.map_id.clone(), self.map_digest.clone(), self.target.clone(), self.read_ranges.clone(), self.validation.clone()) }
+    fn write_request(&self) -> I2cWriteRequest { I2cWriteRequest::new(self.map_id.clone(), self.map_digest.clone(), self.target.clone(), self.read_ranges.clone(), self.validation.clone(), self.pages.clone(), self.final_image.clone(), self.verify_after_write) }
+}
+
+fn parse_task(value: &serde_json::Value) -> Result<I2cTaskPacket, NodeError> {
+    let task: I2cTaskPacket = serde_json::from_value(value.clone()).map_err(|error| NodeError::Precondition(format!("invalid I2C task JSON: {error}")))?;
+    task.validate().map_err(|error| NodeError::Precondition(format!("invalid I2C task JSON: {error}")))?;
+    Ok(task)
+}
+
+fn compile_encoder_map(spec: &NodeSpec) -> Result<I2cMapDefinition, NodeError> {
+    let mode = config_text(spec, "mapMode").unwrap_or_else(|| "builtin".to_owned());
     let mut map = match mode.as_str() {
-        "builtin" => {
-            let map_id = config_text(spec, "mapId").ok_or_else(|| {
-                NodeError::Config(
-                    "i2cTaskBuilder builtin map requires non-empty `mapId`".to_owned(),
-                )
-            })?;
-            builtin_i2c_map(&map_id)
-                .ok_or_else(|| NodeError::Config(format!("unsupported I2C map `{map_id}`")))?
-        }
-        "custom" => {
-            let yaml = config_yaml(spec, "mapYaml").ok_or_else(|| {
-                NodeError::Config(
-                    "i2cTaskBuilder custom map requires non-empty `mapYaml`".to_owned(),
-                )
-            })?;
-            I2cMapDefinition::from_yaml(&yaml).map_err(|error| {
-                NodeError::Config(format!(
-                    "i2cTaskBuilder custom map compilation failed: {error}"
-                ))
-            })?
-        }
-        _ => {
-            return Err(NodeError::Config(format!(
-                "i2cTaskBuilder config `mapMode` must be `builtin` or `custom`, got `{mode}`"
-            )));
-        }
+        "builtin" => builtin_i2c_map(&config_text(spec, "mapId").unwrap_or_else(|| "yg-stereo-p24c64g-v1".to_owned())).ok_or_else(|| NodeError::Config("unsupported I2C map".to_owned()))?,
+        "custom" => I2cMapDefinition::from_yaml(&config_yaml(spec, "mapYaml").ok_or_else(|| NodeError::Config("i2cFieldEncoder custom map requires mapYaml".to_owned()))?).map_err(|error| NodeError::Config(format!("I2C map compilation failed: {error}")))?,
+        _ => return Err(NodeError::Config("i2cFieldEncoder mapMode must be builtin or custom".to_owned())),
     };
-    map.target.bus = config_u32(spec, "bus")?;
+    map.target.bus = config_u32(spec, "bus")?.unwrap_or(0);
+    let address = config_u16(spec, "address")?.ok_or_else(|| NodeError::Config("i2cFieldEncoder config `address` is required".to_owned()))?;
+    map.target.transport.i2c_address = u8::try_from(address).map_err(|_| NodeError::Config("address must fit u8".to_owned()))?;
+    if let Some(width) = config_u16(spec, "addressWidthBytes")? { map.target.transport.address_width_bits = u8::try_from(width.checked_mul(8).ok_or_else(|| NodeError::Config("addressWidthBytes overflow".to_owned()))?).map_err(|_| NodeError::Config("addressWidthBytes must be 1 or 2".to_owned()))?; }
+    if let Some(size) = config_u16(spec, "pageSizeBytes")? { map.target.transport.page_size_bytes = size; }
+    if let Some(cycle) = config_u16(spec, "writeCycleMs")? { map.target.transport.write_cycle_ms = cycle; }
+    // Encoder only owns physical field encoding. Source-schema constraints belonged to the removed
+    // builder and must not make generic FieldData depend on calibration business fields.
+    map.inputs.retain(|slot| slot.target.is_some());
+    map.validate().map_err(|error| NodeError::Config(format!("I2C encoder map is invalid: {error}")))?;
     Ok(map)
 }
 
-fn validate_builder_read_before_layout(map: &I2cMapDefinition) -> Result<(), NodeError> {
-    let mut expected_offset = 0_u32;
-    for (index, range) in map.read_before.ranges.iter().enumerate() {
-        if range.byte_len == 0 || u32::from(range.offset) != expected_offset {
-            return Err(NodeError::Config(format!(
-                "i2cTaskBuilder map `{}` readBefore.ranges must be an ordered contiguous cover of 0..{}; range {index} starts at {}, expected {}",
-                map.id, map.image_bytes, range.offset, expected_offset
-            )));
-        }
-        expected_offset = expected_offset
-            .checked_add(u32::from(range.byte_len))
-            .ok_or_else(|| NodeError::Config("readBefore range length overflow".to_owned()))?;
+fn parse_encoder_inputs(spec: &NodeSpec, map: &I2cMapDefinition) -> Result<Vec<EncoderInput>, NodeError> {
+    let configured = spec.config.get("inputs").and_then(serde_json::Value::as_array);
+    let rows = if let Some(rows) = configured {
+        rows.iter().map(|value| {
+            let row = value.as_object().ok_or_else(|| NodeError::Config("encoder input row must be an object".to_owned()))?;
+            let port_id = row.get("id").and_then(serde_json::Value::as_str).filter(|value| !value.trim().is_empty()).ok_or_else(|| NodeError::Config("encoder input requires id".to_owned()))?;
+            let datum_name = row.get("name").and_then(serde_json::Value::as_str).filter(|value| !value.trim().is_empty()).ok_or_else(|| NodeError::Config("encoder input requires name".to_owned()))?;
+            let required = row.get("required").and_then(serde_json::Value::as_bool).unwrap_or(true);
+            let slot = map.inputs.iter().find(|slot| slot.name == datum_name).ok_or_else(|| NodeError::Config(format!("encoder input `{port_id}` names an undeclared field `{datum_name}`")))?;
+            let target = slot.target.as_ref().ok_or_else(|| NodeError::Config(format!("encoder input `{port_id}` names a non-storage map field `{datum_name}`")))?;
+            let offset = row.get("offset").and_then(serde_json::Value::as_u64).and_then(|value| u16::try_from(value).ok()).ok_or_else(|| NodeError::Config(format!("encoder input `{port_id}` requires u16 offset")))?;
+            let byte_len = row.get("byteLength").and_then(serde_json::Value::as_u64).and_then(|value| u16::try_from(value).ok()).ok_or_else(|| NodeError::Config(format!("encoder input `{port_id}` requires u16 byteLength")))?;
+            let encoding = row.get("encoding").and_then(serde_json::Value::as_str).ok_or_else(|| NodeError::Config(format!("encoder input `{port_id}` requires encoding")))?;
+            if offset != target.offset || byte_len != target.byte_len || normalize_encoding(encoding) != normalize_encoding(&format!("{:?}", target.encoding)) {
+                return Err(NodeError::Config(format!("encoder input `{port_id}` storage layout does not match map field `{datum_name}`")));
+            }
+            Ok(EncoderInput { port_id: port_id.to_owned(), datum_name: datum_name.to_owned(), required })
+        }).collect::<Result<Vec<_>, NodeError>>()?
+    } else {
+        map.inputs.iter().map(|slot| EncoderInput { port_id: slot.name.clone(), datum_name: slot.name.clone(), required: slot.required }).collect()
+    };
+    if rows.is_empty() { return Err(NodeError::Config("i2cFieldEncoder requires at least one input".to_owned())); }
+    let mut ids = HashSet::new();
+    for row in &rows {
+        if !ids.insert(&row.port_id) || !map.inputs.iter().any(|slot| slot.name == row.datum_name) { return Err(NodeError::Config(format!("encoder input `{}` is duplicate or not declared by map", row.port_id))); }
+        let port = spec.inputs.iter().find(|port| port.id == row.port_id).ok_or_else(|| NodeError::Config(format!("encoder input `{}` has no graph port", row.port_id)))?;
+        if port.kind != FIELD_PORT_KIND { return Err(NodeError::Config(format!("encoder input `{}` must use `{FIELD_PORT_KIND}`", row.port_id))); }
     }
-    if expected_offset != u32::from(map.image_bytes) {
-        return Err(NodeError::Config(format!(
-            "i2cTaskBuilder map `{}` readBefore.ranges cover 0..{}, expected 0..{}",
-            map.id, expected_offset, map.image_bytes
-        )));
+    if spec.inputs.len() != rows.len() { return Err(NodeError::Config("encoder graph inputs must exactly match configured inputs".to_owned())); }
+    Ok(rows)
+}
+
+fn normalize_encoding(value: &str) -> String {
+    value.trim().chars().flat_map(char::to_lowercase).filter(|character| *character != '-' && *character != '_').collect()
+}
+
+fn parse_operation(config: &serde_json::Value) -> Result<TaskOperation, NodeError> {
+    match config.get("operation").and_then(serde_json::Value::as_str).unwrap_or("guarded_write") {
+        "read" => Ok(TaskOperation::Read), "guarded_write" => Ok(TaskOperation::GuardedWrite),
+        value => Err(NodeError::Config(format!("i2cFieldEncoder operation must be read or guarded_write, got `{value}`"))),
+    }
+}
+
+fn validate_encoder_ports(spec: &NodeSpec) -> Result<(), NodeError> {
+    let task = spec.outputs.iter().find(|port| port.id == TASK_PORT).ok_or_else(|| {
+        NodeError::Config("i2cFieldEncoder requires task output".to_owned())
+    })?;
+    if task.kind != PACKET_PORT_KIND || spec.outputs.len() != 1 {
+        return Err(NodeError::Config("i2cFieldEncoder has exactly one data.packet.v1 task output".to_owned()));
     }
     Ok(())
 }
 
-fn validate_map_source(
-    map: &I2cMapDefinition,
-    source: &TypedFieldSource,
-    slot_name: &str,
-) -> Result<(), NodeError> {
-    let Some(model_id) = source.model_id.as_deref() else {
-        return Err(NodeError::Precondition(format!(
-            "I2C map `{}` rejects source for input `{slot_name}`: camera model id is absent",
-            map.id
-        )));
-    };
-    map.validate_source(&source.schema, model_id)
-        .map_err(|error| {
-            NodeError::Precondition(format!(
-                "I2C map `{}` rejects source for input `{slot_name}`: {error}",
-                map.id
-            ))
-        })
-}
-
-fn validate_map_slot(
-    field: &Datum,
-    slot: &camera_toolbox_core::LogicalInputSlot,
-) -> Result<(), NodeError> {
-    if field.name != slot.name || field.primitive_type() != slot.primitive_type {
-        return Err(NodeError::Precondition(format!(
-            "field `{}` does not match map input `{}` and its primitive type",
-            field.name, slot.name
-        )));
-    }
-    if field.semantic_type.as_deref() != slot.semantic_type.as_deref()
-        || field.unit.as_deref() != slot.unit.as_deref()
-    {
-        return Err(NodeError::Precondition(format!(
-            "field `{}` does not match the map semantic type or unit contract",
-            slot.name
-        )));
-    }
+fn validate_executor_ports(spec: &NodeSpec) -> Result<(), NodeError> {
+    let expect = |id: &str, kind: &str| spec.inputs.iter().find(|port| port.id == id).filter(|port| port.kind == kind).ok_or_else(|| NodeError::Config(format!("i2cTaskExecutor requires `{id}` input of kind `{kind}`")));
+    let _ = expect(TASK_PORT, PACKET_PORT_KIND)?;
+    let _ = expect(CONNECTION_PORT, "ssh.connection.v1")?;
+    if spec.inputs.len() != 2 { return Err(NodeError::Config("i2cTaskExecutor accepts exactly task and connection".to_owned())); }
     Ok(())
 }
 
 fn ssh_target(spec: &NodeSpec) -> Result<ControlTargetSpec, NodeError> {
-    let config = spec
-        .config
-        .as_object()
-        .ok_or_else(|| NodeError::Config("sshConnection config must be an object".to_owned()))?;
-    let host = strict_required_text(config, "host")?;
-    let port = config_u16(spec, "port", 22)?;
-    let username = strict_optional_text(config, "username")?.unwrap_or_else(|| "root".to_owned());
-    Ok(ControlTargetSpec {
-        host,
-        port,
-        username,
-        expected_host_key: None,
-    })
+    let host = required_text(spec, "host")?;
+    let port = config_u16(spec, "port")?.unwrap_or(22);
+    let username = config_text(spec, "username").unwrap_or_else(|| "root".to_owned());
+    Ok(ControlTargetSpec { host, port, username, expected_host_key: None })
 }
-
-fn validate_ssh_config(spec: &NodeSpec) -> Result<(), NodeError> {
-    let _ = ssh_target(spec)?;
-    let credential_ref = required_text(spec, "credentialRef")?;
-    if !credential_ref.starts_with("session:") {
-        return Err(NodeError::Config(
-            "sshConnection credentialRef must be a process-local session reference".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-fn strict_required_text(
-    config: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<String, NodeError> {
-    strict_optional_text(config, key)?
-        .ok_or_else(|| NodeError::Config(format!("sshConnection config `{key}` is required")))
-}
-
-fn strict_optional_text(
-    config: &serde_json::Map<String, serde_json::Value>,
-    key: &str,
-) -> Result<Option<String>, NodeError> {
-    let Some(value) = config.get(key) else {
-        return Ok(None);
-    };
-    let value = value
-        .as_str()
-        .ok_or_else(|| NodeError::Config(format!("sshConnection config `{key}` must be text")))?
-        .trim();
-    if value.is_empty() {
-        return Err(NodeError::Config(format!(
-            "sshConnection config `{key}` must not be blank"
-        )));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(NodeError::Config(format!(
-            "sshConnection config `{key}` must not contain control characters"
-        )));
-    }
-    Ok(Some(value.to_owned()))
-}
-
-fn config_text(spec: &NodeSpec, key: &str) -> Option<String> {
-    spec.config
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn config_yaml(spec: &NodeSpec, key: &str) -> Option<String> {
-    spec.config
-        .get(key)
-        .and_then(serde_json::Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .map(ToOwned::to_owned)
-}
-
-fn required_text(spec: &NodeSpec, key: &str) -> Result<String, NodeError> {
-    config_text(spec, key)
-        .ok_or_else(|| NodeError::Precondition(format!("{} config `{key}` is required", spec.kind)))
-}
-
-fn config_u16(spec: &NodeSpec, key: &str, fallback: u16) -> Result<u16, NodeError> {
-    let Some(value) = spec.config.get(key) else {
-        return Ok(fallback);
-    };
-    let value = value
-        .as_u64()
-        .ok_or_else(|| NodeError::Config(format!("config `{key}` must be u16")))?;
-    u16::try_from(value).map_err(|_| NodeError::Config(format!("config `{key}` must be u16")))
-}
-
-fn config_u32(spec: &NodeSpec, key: &str) -> Result<u32, NodeError> {
-    let value = spec
-        .config
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| {
-            NodeError::Config(format!(
-                "i2cTaskBuilder config `{key}` must be an explicit u32"
-            ))
-        })?;
-    u32::try_from(value).map_err(|_| {
-        NodeError::Config(format!(
-            "i2cTaskBuilder config `{key}` must be an explicit u32"
-        ))
-    })
-}
-
-fn remote_control() -> Result<RemoteOperationControl, NodeError> {
-    RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default())
-        .map_err(|error| NodeError::Execution(error.to_string()))
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    let mut output = String::with_capacity(71);
-    output.push_str("sha256:");
-    for byte in digest {
-        use std::fmt::Write as _;
-        let _ = write!(output, "{byte:02x}");
-    }
-    output
-}
+fn config_text(spec: &NodeSpec, key: &str) -> Option<String> { spec.config.get(key).and_then(serde_json::Value::as_str).map(str::trim).filter(|value| !value.is_empty()).map(ToOwned::to_owned) }
+fn config_yaml(spec: &NodeSpec, key: &str) -> Option<String> { spec.config.get(key).and_then(serde_json::Value::as_str).filter(|value| !value.trim().is_empty()).map(ToOwned::to_owned) }
+fn required_text(spec: &NodeSpec, key: &str) -> Result<String, NodeError> { config_text(spec, key).ok_or_else(|| NodeError::Precondition(format!("{} config `{key}` is required", spec.kind))) }
+fn config_u16(spec: &NodeSpec, key: &str) -> Result<Option<u16>, NodeError> { match spec.config.get(key) { None => Ok(None), Some(value) => u16::try_from(value.as_u64().ok_or_else(|| NodeError::Config(format!("config `{key}` must be u16")))?).map(Some).map_err(|_| NodeError::Config(format!("config `{key}` must be u16"))) } }
+fn config_u32(spec: &NodeSpec, key: &str) -> Result<Option<u32>, NodeError> { match spec.config.get(key) { None => Ok(None), Some(value) => u32::try_from(value.as_u64().ok_or_else(|| NodeError::Config(format!("config `{key}` must be u32")))?).map(Some).map_err(|_| NodeError::Config(format!("config `{key}` must be u32"))) } }
+fn remote_control() -> Result<RemoteOperationControl, NodeError> { RemoteOperationControl::new(RemoteTimeouts::default(), DumpCancellation::default()).map_err(|error| NodeError::Execution(error.to_string())) }
+fn sha256_hex(bytes: &[u8]) -> String { let mut output = String::from("sha256:"); for byte in Sha256::digest(bytes) { use std::fmt::Write as _; let _ = write!(output, "{byte:02x}"); } output }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camera_toolbox_core::PacketProvenance;
-    use crate::platform::{I2cExecutionReport, I2cReadReport};
-    use crate::{
-        engine::{
-            EngineServices, NodeReporter, OutputRegistry, PortCardinality, PortSpec, SpawnContext,
-        },
-        platform::I2cTaskExecutor,
-    };
-    use parking_lot::Mutex;
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-        mpsc,
-    };
 
-    #[derive(Default)]
-    struct FakeSsh {
-        active: Arc<AtomicBool>,
-        revoked: Mutex<Vec<String>>,
-    }
-
-    impl crate::platform::SshConnectionService for FakeSsh {
-        fn connect(
-            &self,
-            target: &ControlTargetSpec,
-            _: &str,
-            _: RemoteOperationControl,
-        ) -> Result<SshConnection, String> {
-            self.active.store(true, Ordering::Release);
-            Ok(SshConnection::new("fake-session", target.clone()))
-        }
-
-        fn revoke(
-            &self,
-            connection: &SshConnection,
-            _: RemoteOperationControl,
-        ) -> Result<(), String> {
-            self.active.store(false, Ordering::Release);
-            self.revoked.lock().push(connection.id().to_owned());
-            Ok(())
-        }
-    }
-
-    struct FakeI2c {
-        read_report: Mutex<Option<I2cReadReport>>,
-        write_report: Mutex<Option<I2cExecutionReport>>,
-        active: Arc<AtomicBool>,
-    }
-
-    impl I2cTaskExecutor for FakeI2c {
-        fn read(
-            &self,
-            _: &SshConnection,
-            request: &I2cReadRequest,
-            _: RemoteOperationControl,
-        ) -> Result<I2cReadReport, String> {
-            if !self.active.load(Ordering::Acquire) {
-                return Err("SSH connection is not active".to_owned());
-            }
-            let report = self.read_report.lock().clone().unwrap_or(I2cReadReport {
-                map_id: request.map_id.clone(),
-                map_digest: request.map_digest.clone(),
-                target: request.target.clone(),
-                image_sha256: sha256_hex(&valid_image()),
-                byte_len: usize::from(YG_IMAGE_BYTES),
-                valid: true,
-                error: None,
-            });
-            Ok(report)
-        }
-
-        fn write(
-            &self,
-            _: &SshConnection,
-            request: &I2cWriteRequest,
-            _: RemoteOperationControl,
-        ) -> Result<I2cExecutionReport, String> {
-            if !self.active.load(Ordering::Acquire) {
-                return Err("SSH connection is not active".to_owned());
-            }
-            Ok(self.write_report
-                .lock()
-                .clone()
-                .unwrap_or(crate::platform::I2cExecutionReport {
-                before_image_sha256: sha256_hex(&valid_image()),
-                pages: request
-                    .pages
-                    .iter()
-                    .map(|page| crate::platform::I2cPageExecutionReport {
-                        offset: page.offset,
-                        expected: page.bytes.clone(),
-                        readback: Some(page.bytes.clone()),
-                        error: None,
-                    })
-                    .collect(),
-                final_verified: true,
-                error: None,
-            }))
-        }
-    }
-
-    fn port(id: &str, kind: &str) -> PortSpec {
-        PortSpec {
-            id: id.to_owned(),
-            label: id.to_owned(),
-            kind: kind.to_owned(),
-            cardinality: PortCardinality::One,
-            required: true,
-        }
-    }
-
-    fn builder_spec(bus: Option<u32>) -> NodeSpec {
-        let mut config = serde_json::json!({"mapMode": "builtin", "mapId": YG_MAP_ID});
-        if let Some(bus) = bus {
-            config["bus"] = serde_json::json!(bus);
-        }
-        NodeSpec {
-            id: "builder".to_owned(),
-            kind: "i2cTaskBuilder".to_owned(),
-            title: "builder".to_owned(),
-            inputs: vec![
-                port("packet", "data.structured.packet.v1"),
-                port("serial.number", "data.field.str.v1"),
-                port("connection", "ssh.connection.v1"),
-            ],
-            outputs: vec![
-                port("readReport", "i2c.read-report.v1"),
-                port("report", "i2c.execution-report.v1"),
-            ],
-            config,
-        }
-    }
-
-    fn action_spec() -> NodeSpec {
-        NodeSpec {
-            id: "ssh".to_owned(),
-            kind: "sshConnection".to_owned(),
-            title: "ssh".to_owned(),
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-            config: serde_json::json!({"host":"fake", "credentialRef":"session:fake"}),
-        }
-    }
-
-    fn source(schema: &str, model_id: &str) -> Arc<TypedFieldSource> {
-        Arc::new(TypedFieldSource::new(
-            schema,
-            PacketProvenance {
-                source_port: Some("test.serial".to_owned()),
-                ..PacketProvenance::default()
-            },
-            Some(model_id.to_owned()),
-        ))
-    }
-
-    fn serial_packet() -> DataPacket {
-        DataPacket::TypedField {
-            datum: Arc::new(
-                Datum::new(
-                    "serial.number",
-                    TypedValue::Str("2T23326AV4ZZ00".to_owned()),
-                )
-                .with_semantic_type("device.serial-number"),
-            ),
-            generation: 1,
-            source: source("camera-toolbox.calib.solution.v1", YG_MODEL),
-        }
-    }
-
-    fn solution_packet() -> Arc<StructuredPacket> {
-        let mut fields = vec![
-            Datum::new("camera.model.id", TypedValue::Str(YG_MODEL.to_owned()))
-                .with_semantic_type("camera.model-id"),
-            Datum::new("camera.image.width", TypedValue::U32(1920))
-                .with_unit("px")
-                .with_semantic_type("image.width"),
-            Datum::new("camera.image.height", TypedValue::U32(1080))
-                .with_unit("px")
-                .with_semantic_type("image.height"),
-        ];
-        for (name, semantic) in [
-            ("camera.intrinsics.fx", "camera.focal-length"),
-            ("camera.intrinsics.fy", "camera.focal-length"),
-            ("camera.intrinsics.cx", "camera.principal-point"),
-            ("camera.intrinsics.cy", "camera.principal-point"),
-        ] {
-            fields.push(
-                Datum::new(name, TypedValue::F64(1.0))
-                    .with_unit("px")
-                    .with_semantic_type(semantic),
-            );
-        }
-        for name in [
-            "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
-        ] {
-            fields.push(
-                Datum::new(format!("distortion.{name}"), TypedValue::F64(0.0))
-                    .with_unit("dimensionless")
-                    .with_semantic_type("camera.distortion-coefficient"),
-            );
-        }
-        Arc::new(
-            StructuredPacket::new(
-                "camera-toolbox.calib.solution.v1",
-                PacketProvenance::default(),
-                fields,
-            )
-            .unwrap(),
-        )
-    }
-
-    fn valid_image() -> Vec<u8> {
-        let mut image = vec![0; usize::from(YG_IMAGE_BYTES)];
-        image[..YG_STEREO_P24C64G_FLAG.len()].copy_from_slice(&YG_STEREO_P24C64G_FLAG);
-        let serial = b"2T23326AV4ZZ00";
-        image[0x125..0x133].copy_from_slice(serial);
-        image[0x133] = ((serial
-            .iter()
-            .fold(0_u16, |sum, byte| sum + u16::from(*byte))
-            % 0xff)
-            + 1) as u8;
-        image
-    }
-
-    fn connection() -> Arc<SshConnection> {
-        Arc::new(SshConnection::new(
-            "fake-session",
-            ControlTargetSpec {
-                host: "fake".to_owned(),
-                port: 22,
-                username: "root".to_owned(),
-                expected_host_key: None,
-            },
-        ))
-    }
-
-    fn runtime(services: EngineServices, outputs: Arc<Mutex<Vec<DataPacket>>>) -> NodeRuntime {
-        let (state, _) = mpsc::channel();
-        let (events, _) = mpsc::channel();
-        let mut registry = OutputRegistry::default();
-        registry.set_record(Arc::new(move |packet| outputs.lock().push(packet)));
-        NodeRuntime::new(SpawnContext {
-            outputs: registry,
-            reporter: NodeReporter::new("test".to_owned(), state, events),
-            services: Arc::new(services),
-            cancel: Arc::new(AtomicBool::new(false)),
-            viewer_slot: None,
-        })
+    fn task() -> I2cTaskPacket {
+        let map = builtin_i2c_map("yg-stereo-p24c64g-v1").expect("builtin map");
+        let target = I2cTaskTarget { bus: 0, address: 0x50, address_width_bytes: 2, page_size_bytes: 32, write_cycle_ms: 5 };
+        let image = vec![0_u8; usize::from(map.image_bytes)];
+        I2cTaskPacket {
+            schema: TASK_SCHEMA.to_owned(), operation: TaskOperation::GuardedWrite,
+            map_id: map.id.clone(), map_digest: "sha256:map".to_owned(), target: target.clone(),
+            read_ranges: vec![I2cReadRange { offset: 0, byte_len: map.image_bytes }],
+            validation: I2cMapValidationContract::from_map(&map),
+            pages: vec![I2cPageWrite { offset: 0, bytes: image.clone(), settle_ms: target.write_cycle_ms }],
+            final_image: image, verify_after_write: true, final_image_digest: String::new(),
+        }.with_digest()
     }
 
     #[test]
-    fn ssh_target_ignores_legacy_empty_host_key() {
-        let mut spec = action_spec();
-        spec.config
-            .as_object_mut()
-            .expect("SSH connection config is an object")
-            .insert("expectedHostKey".to_owned(), serde_json::json!(""));
-
-        assert_eq!(ssh_target(&spec).unwrap().expected_host_key, None);
+    fn task_json_rejects_digest_mismatch_and_reconstructs_sealed_requests() {
+        let task = task();
+        let value = serde_json::to_value(&task).expect("task JSON");
+        let parsed = parse_task(&value).expect("valid task");
+        assert!(parsed.read_request().is_compiled());
+        assert!(parsed.write_request().is_compiled());
+        let mut malformed = value;
+        malformed["finalImageDigest"] = serde_json::json!("sha256:bad");
+        assert!(parse_task(&malformed).is_err());
     }
 
     #[test]
-    fn builder_requires_explicit_bus_and_direct_packet_inputs() {
-        assert!(matches!(
-            I2cTaskBuilderNode::new(builder_spec(None)),
-            Err(NodeError::Config(_))
-        ));
-        let mut node = I2cTaskBuilderNode::new(builder_spec(Some(7))).unwrap();
-        let mut rt = runtime(EngineServices::default(), Arc::new(Mutex::new(Vec::new())));
-        node.on_input(
-            "packet",
-            DataPacket::StructuredPacket(solution_packet()),
-            &mut rt,
-        )
-        .unwrap();
-        assert!(node.read_request.is_none());
-        node.on_input("serial.number", serial_packet(), &mut rt).unwrap();
-        assert_eq!(node.read_request.as_ref().unwrap().target.bus, 7);
-        assert!(node.write_request.as_ref().unwrap().is_compiled());
-    }
-
-    #[test]
-    fn builder_read_and_write_are_actions_on_the_same_node() {
-        let active = Arc::new(AtomicBool::new(true));
-        let service = Arc::new(FakeI2c {
-            read_report: Mutex::new(None),
-            write_report: Mutex::new(None),
-            active,
-        });
-        let outputs = Arc::new(Mutex::new(Vec::new()));
-        let mut rt = runtime(
-            EngineServices {
-                i2c_task_executor: Some(service),
-                ..EngineServices::default()
-            },
-            Arc::clone(&outputs),
-        );
-        let mut node = I2cTaskBuilderNode::new(builder_spec(Some(7))).unwrap();
-        node.on_input("connection", DataPacket::SshConnection(connection()), &mut rt)
-            .unwrap();
-        node.on_input(
-            "packet",
-            DataPacket::StructuredPacket(solution_packet()),
-            &mut rt,
-        )
-        .unwrap();
-        node.on_input("serial.number", serial_packet(), &mut rt).unwrap();
-        node.on_action(
-            NodeAction::Custom {
-                name: "read".to_owned(),
-                payload: serde_json::Value::Null,
-            },
-            &mut rt,
-        )
-        .unwrap();
-        node.on_action(
-            NodeAction::Custom {
-                name: "write".to_owned(),
-                payload: serde_json::Value::Null,
-            },
-            &mut rt,
-        )
-        .unwrap();
-        assert!(matches!(outputs.lock()[0], DataPacket::I2cReadReport(_)));
-        assert!(matches!(outputs.lock()[1], DataPacket::I2cExecutionReport(_)));
-    }
-
-    #[test]
-    fn disconnect_revokes_handle_and_stale_operations_are_rejected() {
-        let ssh = Arc::new(FakeSsh {
-            active: Arc::new(AtomicBool::new(true)),
-            revoked: Mutex::new(Vec::new()),
-        });
-        let outputs = Arc::new(Mutex::new(Vec::new()));
-        let mut rt = runtime(
-            EngineServices {
-                ssh_connection_service: Some(ssh.clone()),
-                ..EngineServices::default()
-            },
-            outputs,
-        );
-        let mut node = SshConnectionNode {
-            spec: action_spec(),
-            connection: Some(connection()),
-        };
-        node.on_action(NodeAction::Disconnect, &mut rt).unwrap();
-        assert_eq!(ssh.revoked.lock().as_slice(), ["fake-session"]);
+    fn task_json_rejects_unknown_fields() {
+        let mut value = serde_json::to_value(task()).expect("task JSON");
+        value["mapYaml"] = serde_json::json!("not executor input");
+        assert!(parse_task(&value).is_err());
     }
 }

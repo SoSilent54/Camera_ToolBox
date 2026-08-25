@@ -1,4 +1,4 @@
-use camera_toolbox_core::{I2cMapDefinition, builtin_i2c_map};
+use camera_toolbox_core::{builtin_i2c_map, I2cMapDefinition};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -101,7 +101,8 @@ pub enum NodeKind {
     StructuredFieldExtractor,
     SerialField,
     SshConnection,
-    I2cTaskBuilder,
+    I2cFieldEncoder,
+    I2cTaskExecutor,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -196,40 +197,16 @@ pub enum PortKind {
     CaptureTarget,
     #[serde(rename = "command.capture")]
     CommandCapture,
-    #[serde(rename = "data.structured.packet.v1")]
-    StructuredPacket,
+    #[serde(rename = "data.packet.v1")]
+    PacketData,
     #[serde(rename = "ssh.connection.v1")]
     SshConnection,
     #[serde(rename = "i2c.read-report.v1")]
     I2cReadReport,
     #[serde(rename = "i2c.execution-report.v1")]
     I2cExecutionReport,
-    #[serde(rename = "data.field.bool.v1")]
-    FieldBool,
-    #[serde(rename = "data.field.u8.v1")]
-    FieldU8,
-    #[serde(rename = "data.field.i8.v1")]
-    FieldI8,
-    #[serde(rename = "data.field.u16.v1")]
-    FieldU16,
-    #[serde(rename = "data.field.i16.v1")]
-    FieldI16,
-    #[serde(rename = "data.field.u32.v1")]
-    FieldU32,
-    #[serde(rename = "data.field.i32.v1")]
-    FieldI32,
-    #[serde(rename = "data.field.u64.v1")]
-    FieldU64,
-    #[serde(rename = "data.field.i64.v1")]
-    FieldI64,
-    #[serde(rename = "data.field.f32.v1")]
-    FieldF32,
-    #[serde(rename = "data.field.f64.v1")]
-    FieldF64,
-    #[serde(rename = "data.field.str.v1")]
-    FieldStr,
-    #[serde(rename = "data.field.bytes.v1")]
-    FieldBytes,
+    #[serde(rename = "data.field.v1")]
+    FieldData,
     #[serde(rename = "status.metrics")]
     StatusMetrics,
 }
@@ -330,7 +307,8 @@ pub fn node_catalog() -> Vec<NodeDefinition> {
         node_definition(NodeKind::StructuredFieldExtractor),
         node_definition(NodeKind::SerialField),
         node_definition(NodeKind::SshConnection),
-        node_definition(NodeKind::I2cTaskBuilder),
+        node_definition(NodeKind::I2cFieldEncoder),
+        node_definition(NodeKind::I2cTaskExecutor),
     ];
     // 默认构建不会向画布暴露无法实例化的硬件控制节点；启用功能后再加入目录。
     #[cfg(feature = "hex-arm-control")]
@@ -1078,8 +1056,8 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
                 "packet",
                 "Structured Packet",
                 PortDirection::Output,
-                PortKind::StructuredPacket,
-                "data.structured.packet.v1",
+                PortKind::PacketData,
+                "data.packet.v1",
                 Some(PortRole::Dataset),
             )],
             json!({
@@ -1171,15 +1149,8 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
         NodeKind::StructuredFieldExtractor => (
             NodeCategory::Diagnostics,
             "Structured Field Extractor",
-            "从结构化数据包按 RFC6901 路径提取精确 primitive 字段",
-            vec![port(
-                "packet",
-                "Structured Packet",
-                PortDirection::Input,
-                PortKind::StructuredPacket,
-                "data.structured.packet.v1",
-                Some(PortRole::Dataset),
-            )],
+            "从通用 PacketData 按 RFC6901 路径提取完整 Datum",
+            vec![port("packet", "Packet Data", PortDirection::Input, PortKind::PacketData, "data.packet.v1", Some(PortRole::Dataset))],
             vec![],
             json!({"outputs": []}),
         ),
@@ -1188,85 +1159,38 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
             "SSH Connection",
             "建立不含凭据材料的进程内 SSH 会话句柄",
             vec![],
-            vec![port(
-                "connection",
-                "Connection",
-                PortDirection::Output,
-                PortKind::SshConnection,
-                "ssh.connection.v1",
-                Some(PortRole::Control),
-            )],
+            vec![port("connection", "Connection", PortDirection::Output, PortKind::SshConnection, "ssh.connection.v1", Some(PortRole::Control))],
             json!({"host": "", "port": "22", "username": "root", "credentialRef": ""}),
         ),
         NodeKind::SerialField => (
             NodeCategory::Diagnostics,
             "Serial Field",
-            "显式输入设备序列号，并以声明的 schema、provenance 和 camera model 输出严格 typed field",
+            "显式输入设备序列号并输出通用 FieldData",
             vec![],
-            vec![port(
-                "serial.number",
-                "Serial number",
-                PortDirection::Output,
-                PortKind::FieldStr,
-                "data.field.str.v1",
-                Some(PortRole::Dataset),
-            )],
-            json!({
-                "value": "2T23326AV4ZZ00",
-                "sourceSchema": "camera-toolbox.calib.solution.v1",
-                "sourceModelId": "pinhole.rational-thin-prism.v1",
-                "trigger": "manual"
-            }),
+            vec![port("field", "Field Data", PortDirection::Output, PortKind::FieldData, "data.field.v1", Some(PortRole::Dataset))],
+            json!({"value": "2T23326AV4ZZ00", "sourceSchema": "camera-toolbox.calib.solution.v1", "sourceModelId": "pinhole.rational-thin-prism.v1", "trigger": "manual"}),
         ),
-        NodeKind::I2cTaskBuilder => (
+        NodeKind::I2cFieldEncoder => (
             NodeCategory::Control,
-            "I²C Task Builder",
-            "直接消费结构化标定包、SNID 与 SSH 会话；Read/Write 是原子动作，写入由目标端单次请求持锁完成逐页写入、readback 与最终校验",
+            "I²C Field Encoder",
+            "将通用 FieldData 编码为严格 I²C task PacketData；不连接设备、不执行 I²C",
+            vec![],
+            vec![port("task", "Task", PortDirection::Output, PortKind::PacketData, "data.packet.v1", Some(PortRole::Dataset))],
+            json!({"mapMode": "builtin", "mapId": "yg-stereo-p24c64g-v1", "bus": 0, "address": null, "addressWidthBytes": 2, "pageSizeBytes": 32, "writeCycleMs": 5, "operation": "guarded_write", "inputs": []}),
+        ),
+        NodeKind::I2cTaskExecutor => (
+            NodeCategory::Control,
+            "I²C Task Executor",
+            "执行严格校验的 I²C task；输入仅为 task PacketData 与 SSH connection",
             vec![
-                port(
-                    "packet",
-                    "Structured Packet",
-                    PortDirection::Input,
-                    PortKind::StructuredPacket,
-                    "data.structured.packet.v1",
-                    Some(PortRole::Dataset),
-                ),
-                port(
-                    "serial.number",
-                    "Serial Number",
-                    PortDirection::Input,
-                    PortKind::FieldStr,
-                    "data.field.str.v1",
-                    Some(PortRole::Dataset),
-                ),
-                port(
-                    "connection",
-                    "SSH Connection",
-                    PortDirection::Input,
-                    PortKind::SshConnection,
-                    "ssh.connection.v1",
-                    Some(PortRole::Control),
-                ),
+                port("task", "Task", PortDirection::Input, PortKind::PacketData, "data.packet.v1", Some(PortRole::Dataset)),
+                port("connection", "SSH Connection", PortDirection::Input, PortKind::SshConnection, "ssh.connection.v1", Some(PortRole::Control)),
             ],
             vec![
-                port(
-                    "readReport",
-                    "Read Report",
-                    PortDirection::Output,
-                    PortKind::I2cReadReport,
-                    "i2c.read-report.v1",
-                    Some(PortRole::Status),
-                ),
-                port(
-                    "report",
-                    "Execution Report",
-                    PortDirection::Output,
-                    PortKind::I2cExecutionReport,
-                    "i2c.execution-report.v1",
-                    Some(PortRole::Status),
-                ),
+                port("readReport", "Read Report", PortDirection::Output, PortKind::I2cReadReport, "i2c.read-report.v1", Some(PortRole::Status)),
+                port("report", "Execution Report", PortDirection::Output, PortKind::I2cExecutionReport, "i2c.execution-report.v1", Some(PortRole::Status)),
             ],
-            json!({"mapMode": "builtin", "mapId": "yg-stereo-p24c64g-v1", "bus": 0}),
+            json!({"operation": "execute"}),
         ),
     };
     NodeDefinition {
@@ -1282,74 +1206,83 @@ pub fn node_definition(kind: NodeKind) -> NodeDefinition {
 
 fn node_definition_for_node(node: &WorkflowNode) -> Result<NodeDefinition, String> {
     let mut definition = node_definition(node.kind);
-    if node.kind != NodeKind::StructuredFieldExtractor {
-        return Ok(definition);
-    }
-    let Some(outputs) = node
-        .config
-        .get("outputs")
-        .and_then(serde_json::Value::as_array)
-    else {
-        return Err(format!(
-            "node `{}` extractor config.outputs must be an array",
-            node.id
-        ));
+    let (key, direction, noun) = match node.kind {
+        NodeKind::StructuredFieldExtractor => {
+            ("outputs", PortDirection::Output, "extractor output")
+        }
+        NodeKind::I2cFieldEncoder => ("inputs", PortDirection::Input, "encoder input"),
+        _ => return Ok(definition),
     };
+    let entries = node
+        .config
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("node `{}` {key} must be an array", node.id))?;
     let mut seen = std::collections::BTreeSet::new();
-    for output in outputs {
-        let object = output
+    for entry in entries {
+        let object = entry
             .as_object()
-            .ok_or_else(|| format!("node `{}` extractor output must be an object", node.id))?;
+            .ok_or_else(|| format!("node `{}` {noun} must be an object", node.id))?;
         let id = object
             .get("id")
             .and_then(serde_json::Value::as_str)
             .unwrap_or("")
             .trim();
-        let pointer = object
-            .get("pointer")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        let primitive = object
-            .get("type")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-        if id.is_empty()
-            || pointer.is_empty()
-            || !pointer.starts_with('/')
-            || !seen.insert(id.to_owned())
-        {
+        if id.is_empty() || !seen.insert(id.to_owned()) {
             return Err(format!(
-                "node `{}` extractor output id/pointer is invalid or duplicated",
+                "node `{}` {noun} id is empty or duplicated",
                 node.id
             ));
         }
-        let Some(kind) = field_port_kind(primitive) else {
+        if node.kind == NodeKind::StructuredFieldExtractor {
+            let pointer = object
+                .get("pointer")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if !pointer.starts_with('/') {
+                return Err(format!(
+                    "node `{}` extractor output `{id}` requires an RFC6901 pointer",
+                    node.id
+                ));
+            }
+        } else if object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_none()
+        {
             return Err(format!(
-                "node `{}` extractor output `{id}` has unsupported type `{primitive}`",
+                "node `{}` encoder input `{id}` requires a datum name",
                 node.id
             ));
-        };
-        definition.outputs.push(port(
+        }
+        let port = port(
             id,
             id,
-            PortDirection::Output,
-            kind,
-            &format!("data.field.{primitive}.v1"),
+            direction,
+            PortKind::FieldData,
+            "data.field.v1",
             Some(PortRole::Dataset),
-        ));
+        );
+        if direction == PortDirection::Input {
+            definition.inputs.push(port);
+        } else {
+            definition.outputs.push(port);
+        }
     }
     Ok(definition)
 }
 
-/// 在归一化前编译 builder map，使 mapMode/mapId/mapYaml 的错误在保存、加载中一致。
-fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition, String> {
+/// 在归一化前编译 encoder map，使 mapMode/mapId/mapYaml 的错误在保存、加载中一致。
+fn compile_i2c_field_encoder_map(node: &WorkflowNode) -> Result<I2cMapDefinition, String> {
     let config = node_config_object(node)?;
     let mode = config
         .get("mapMode")
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| {
             format!(
-                "node `{}` i2cTaskBuilder requires mapMode `builtin` or `custom`",
+                "node `{}` i2cFieldEncoder requires mapMode `builtin` or `custom`",
                 node.id
             )
         })?;
@@ -1357,7 +1290,7 @@ fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition,
         "builtin" => {
             if config.contains_key("mapYaml") {
                 return Err(format!(
-                    "node `{}` builtin i2cTaskBuilder must not contain mapYaml",
+                    "node `{}` builtin i2cFieldEncoder must not contain mapYaml",
                     node.id
                 ));
             }
@@ -1367,13 +1300,13 @@ fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition,
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
                     format!(
-                        "node `{}` builtin i2cTaskBuilder requires non-empty mapId",
+                        "node `{}` builtin i2cFieldEncoder requires non-empty mapId",
                         node.id
                     )
                 })?;
             builtin_i2c_map(map_id).ok_or_else(|| {
                 format!(
-                    "node `{}` i2cTaskBuilder does not support builtin map `{map_id}`",
+                    "node `{}` i2cFieldEncoder does not support builtin map `{map_id}`",
                     node.id
                 )
             })?
@@ -1381,7 +1314,7 @@ fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition,
         "custom" => {
             if config.contains_key("mapId") {
                 return Err(format!(
-                    "node `{}` custom i2cTaskBuilder must not contain mapId",
+                    "node `{}` custom i2cFieldEncoder must not contain mapId",
                     node.id
                 ));
             }
@@ -1392,7 +1325,7 @@ fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition,
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
                     format!(
-                        "node `{}` custom i2cTaskBuilder requires non-empty mapYaml",
+                        "node `{}` custom i2cFieldEncoder requires non-empty mapYaml",
                         node.id
                     )
                 })?;
@@ -1405,7 +1338,7 @@ fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition,
         }
         _ => {
             return Err(format!(
-                "node `{}` i2cTaskBuilder mapMode must be `builtin` or `custom`",
+                "node `{}` i2cFieldEncoder mapMode must be `builtin` or `custom`",
                 node.id
             ));
         }
@@ -1415,39 +1348,20 @@ fn compile_i2c_task_builder_map(node: &WorkflowNode) -> Result<I2cMapDefinition,
         .and_then(serde_json::Value::as_u64)
         .ok_or_else(|| {
             format!(
-                "node `{}` i2cTaskBuilder requires explicit unsigned bus",
+                "node `{}` i2cFieldEncoder requires explicit unsigned bus",
                 node.id
             )
         })?;
     let bus = u32::try_from(bus)
-        .map_err(|_| format!("node `{}` i2cTaskBuilder bus must fit u32", node.id))?;
+        .map_err(|_| format!("node `{}` i2cFieldEncoder bus must fit u32", node.id))?;
     let mut map = map;
     map.target.bus = bus;
     Ok(map)
 }
 
-fn validate_i2c_task_builder_config(node: &WorkflowNode) -> Result<(), String> {
-    let _ = compile_i2c_task_builder_map(node)?;
+fn validate_i2c_field_encoder_config(node: &WorkflowNode) -> Result<(), String> {
+    let _ = compile_i2c_field_encoder_map(node)?;
     Ok(())
-}
-
-fn field_port_kind(primitive: &str) -> Option<PortKind> {
-    Some(match primitive {
-        "bool" => PortKind::FieldBool,
-        "u8" => PortKind::FieldU8,
-        "i8" => PortKind::FieldI8,
-        "u16" => PortKind::FieldU16,
-        "i16" => PortKind::FieldI16,
-        "u32" => PortKind::FieldU32,
-        "i32" => PortKind::FieldI32,
-        "u64" => PortKind::FieldU64,
-        "i64" => PortKind::FieldI64,
-        "f32" => PortKind::FieldF32,
-        "f64" => PortKind::FieldF64,
-        "str" => PortKind::FieldStr,
-        "bytes" => PortKind::FieldBytes,
-        _ => return None,
-    })
 }
 
 pub fn workmode_templates() -> Vec<WorkmodeTemplate> {
@@ -1913,7 +1827,8 @@ fn validate_node_config(node: &WorkflowNode) -> Result<(), String> {
         NodeKind::SftpFileSource => validate_sftp_file_source_config(node),
         NodeKind::LocalFileSource => validate_local_file_source_config(node),
         NodeKind::HexArmDevice => validate_hex_arm_device_config(node),
-        NodeKind::I2cTaskBuilder => validate_i2c_task_builder_config(node),
+        NodeKind::I2cFieldEncoder => validate_i2c_field_encoder_config(node),
+        NodeKind::I2cTaskExecutor => Ok(()),
         NodeKind::SerialField => validate_serial_field_config(node),
         _ => Ok(()),
     }
@@ -2737,33 +2652,40 @@ fn calibration_template_graph() -> WorkflowGraph {
     )
 }
 
-/// 在可运行的标定采集/求解图后追加 SNID 与原子 I²C Read/Write 尾部。
+/// 在可运行的标定采集/求解图后追加通用 FieldData 编码与单一 I²C 执行尾部。
 fn i2c_template_graph() -> WorkflowGraph {
     let mut graph = calibration_template_graph();
     graph.id = "camera-toolbox-i2c-plan-template".to_owned();
     graph.title = "Calibration to I²C Workflow".to_owned();
-
-    let mut builder = workflow_node(
-        "task-builder",
-        NodeKind::I2cTaskBuilder,
-        "I²C Task Builder",
+    let mut encoder = workflow_node(
+        "i2c-encoder",
+        NodeKind::I2cFieldEncoder,
+        "I²C Field Encoder",
         NodePosition {
             x: 1360.0,
             y: 680.0,
         },
     );
-    builder.config = json!({"mapMode": "builtin", "mapId": "yg-stereo-p24c64g-v1", "bus": 0});
-    let builder_definition =
-        node_definition_for_node(&builder).expect("builtin I²C builder config is valid");
-    builder.inputs = builder_definition.inputs;
-    builder.outputs = builder_definition.outputs;
-
+    encoder.config = json!({"mapMode":"builtin","mapId":"yg-stereo-p24c64g-v1","bus":0,"address":80,"addressWidthBytes":2,"pageSizeBytes":32,"writeCycleMs":10,"operation":"guarded_write","inputs":[{"id":"width","name":"camera.image.width","required":true,"offset":16,"byteLength":4,"encoding":"u32-le"},{"id":"height","name":"camera.image.height","required":true,"offset":20,"byteLength":4,"encoding":"u32-le"},{"id":"fx","name":"camera.intrinsics.fx","required":true,"offset":24,"byteLength":4,"encoding":"f32-le"},{"id":"fy","name":"camera.intrinsics.fy","required":true,"offset":28,"byteLength":4,"encoding":"f32-le"},{"id":"cx","name":"camera.intrinsics.cx","required":true,"offset":32,"byteLength":4,"encoding":"f32-le"},{"id":"cy","name":"camera.intrinsics.cy","required":true,"offset":36,"byteLength":4,"encoding":"f32-le"},{"id":"k1","name":"distortion.k1","required":true,"offset":40,"byteLength":4,"encoding":"f32-le"},{"id":"k2","name":"distortion.k2","required":true,"offset":44,"byteLength":4,"encoding":"f32-le"},{"id":"p1","name":"distortion.p1","required":true,"offset":48,"byteLength":4,"encoding":"f32-le"},{"id":"p2","name":"distortion.p2","required":true,"offset":52,"byteLength":4,"encoding":"f32-le"},{"id":"k3","name":"distortion.k3","required":true,"offset":56,"byteLength":4,"encoding":"f32-le"},{"id":"k4","name":"distortion.k4","required":true,"offset":60,"byteLength":4,"encoding":"f32-le"},{"id":"k5","name":"distortion.k5","required":true,"offset":64,"byteLength":4,"encoding":"f32-le"},{"id":"k6","name":"distortion.k6","required":true,"offset":68,"byteLength":4,"encoding":"f32-le"},{"id":"s1","name":"distortion.s1","required":true,"offset":72,"byteLength":4,"encoding":"f32-le"},{"id":"s2","name":"distortion.s2","required":true,"offset":76,"byteLength":4,"encoding":"f32-le"},{"id":"s3","name":"distortion.s3","required":true,"offset":80,"byteLength":4,"encoding":"f32-le"},{"id":"s4","name":"distortion.s4","required":true,"offset":84,"byteLength":4,"encoding":"f32-le"},{"id":"serial","name":"serial.number","required":true,"offset":293,"byteLength":14,"encoding":"ascii"}]});
+    let encoder_definition =
+        node_definition_for_node(&encoder).expect("builtin I²C encoder config is valid");
+    encoder.inputs = encoder_definition.inputs;
+    encoder.outputs = encoder_definition.outputs;
+    let extractor = workflow_node(
+        "packet-extractor",
+        NodeKind::StructuredFieldExtractor,
+        "Packet Field Extractor",
+        NodePosition {
+            x: 1060.0,
+            y: 680.0,
+        },
+    );
     let serial = workflow_node(
         "serial-field",
         NodeKind::SerialField,
         "Device SNID",
         NodePosition {
-            x: 1360.0,
+            x: 1060.0,
             y: 920.0,
         },
     );
@@ -2776,42 +2698,57 @@ fn i2c_template_graph() -> WorkflowGraph {
             y: 920.0,
         },
     );
-    ssh.config = json!({
-        "host": "camera.local",
-        "port": "22",
-        "username": "root",
-        "credentialRef": "session:ssh-control"
-    });
+    ssh.config = json!({"host": "camera.local", "port": "22", "username": "root", "credentialRef": "session:ssh-control"});
+    let executor = workflow_node(
+        "i2c-executor",
+        NodeKind::I2cTaskExecutor,
+        "I²C Task Executor",
+        NodePosition {
+            x: 1660.0,
+            y: 680.0,
+        },
+    );
     graph.edges.extend([
         edge(
-            "solver-to-builder",
+            "solver-to-extractor",
             "calib-solver",
             "packet",
-            "task-builder",
+            "packet-extractor",
             "packet",
-            PortKind::StructuredPacket,
-            "data.structured.packet.v1",
+            PortKind::PacketData,
+            "data.packet.v1",
         ),
         edge(
-            "serial-to-builder",
+            "serial-to-encoder",
             "serial-field",
-            "serial.number",
-            "task-builder",
-            "serial.number",
-            PortKind::FieldStr,
-            "data.field.str.v1",
+            "field",
+            "i2c-encoder",
+            "serial",
+            PortKind::FieldData,
+            "data.field.v1",
         ),
         edge(
-            "ssh-to-builder",
+            "encoder-to-executor",
+            "i2c-encoder",
+            "task",
+            "i2c-executor",
+            "task",
+            PortKind::PacketData,
+            "data.packet.v1",
+        ),
+        edge(
+            "ssh-to-executor",
             "ssh-control",
             "connection",
-            "task-builder",
+            "i2c-executor",
             "connection",
             PortKind::SshConnection,
             "ssh.connection.v1",
         ),
     ]);
-    graph.nodes.extend([serial, builder, ssh]);
+    graph
+        .nodes
+        .extend([extractor, serial, encoder, ssh, executor]);
     debug_assert!(validate_workflow(&graph).is_ok());
     graph
 }
@@ -2962,8 +2899,8 @@ mod tests {
     use std::{sync::Arc, thread, time::Duration};
 
     use camera_toolbox_app::{
-        CalibrationBackend, CalibrationBackendError, CalibrationCancellation,
         engine::{DataPacket, EngineServices, GraphEngine, NodeAction},
+        CalibrationBackend, CalibrationBackendError, CalibrationCancellation,
     };
     use camera_toolbox_core::{
         BoardSpec, CalibrationImageSize, CalibrationRequest, CalibrationSolution,
@@ -2974,22 +2911,18 @@ mod tests {
     fn seed_graph_is_x5233_preview_with_unified_image_contract() {
         let graph = seed_workflow_graph();
         validate_workflow(&graph).expect("seed graph is valid");
-        assert!(
-            graph.nodes.iter().any(|node| {
-                node.kind == NodeKind::X5233Driver && node.title == "X5_233 Driver"
-            })
-        );
-        assert!(
-            graph.edges.iter().any(|edge| {
-                edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1"
-            })
-        );
-        assert!(
-            !graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::OverlayComposer)
-        );
+        assert!(graph
+            .nodes
+            .iter()
+            .any(|node| { node.kind == NodeKind::X5233Driver && node.title == "X5_233 Driver" }));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| { edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1" }));
+        assert!(!graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::OverlayComposer));
     }
 
     #[test]
@@ -3151,24 +3084,18 @@ mod tests {
                 && port.kind == PortKind::StatusMetrics
                 && port.schema == "status.metrics.v1"
         }));
-        assert!(
-            graph
-                .edges
-                .iter()
-                .all(|edge| edge.id != "obsolete-x5-snapshot")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "x5-yuv-to-image-layer")
-        );
-        assert!(
-            graph
-                .edges
-                .iter()
-                .any(|edge| edge.id == "x5-capture-request")
-        );
+        assert!(graph
+            .edges
+            .iter()
+            .all(|edge| edge.id != "obsolete-x5-snapshot"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.id == "x5-yuv-to-image-layer"));
+        assert!(graph
+            .edges
+            .iter()
+            .any(|edge| edge.id == "x5-capture-request"));
     }
 
     #[test]
@@ -3368,17 +3295,13 @@ mod tests {
     fn node_catalog_exposes_hex_arm_only_when_feature_enabled() {
         let catalog = node_catalog();
         #[cfg(feature = "hex-arm-control")]
-        assert!(
-            catalog
-                .iter()
-                .any(|definition| definition.kind == NodeKind::HexArmDevice)
-        );
+        assert!(catalog
+            .iter()
+            .any(|definition| definition.kind == NodeKind::HexArmDevice));
         #[cfg(not(feature = "hex-arm-control"))]
-        assert!(
-            !catalog
-                .iter()
-                .any(|definition| definition.kind == NodeKind::HexArmDevice)
-        );
+        assert!(!catalog
+            .iter()
+            .any(|definition| definition.kind == NodeKind::HexArmDevice));
     }
 
     #[test]
@@ -3428,9 +3351,9 @@ mod tests {
         assert_eq!(
             catalog.len(),
             if cfg!(feature = "hex-arm-control") {
-                24
+                25
             } else {
-                23
+                24
             }
         );
         for hidden in [
@@ -3468,137 +3391,35 @@ mod tests {
     }
 
     #[test]
-    fn i2c_template_is_a_complete_calibration_to_execution_flow() {
+    fn i2c_template_separates_encoding_from_execution() {
         let graph = i2c_template_graph();
         validate_workflow(&graph).expect("I²C template is valid and acyclic");
-
-        for kind in [
-            NodeKind::DatasetCollector,
-            NodeKind::CalibrationSolver,
-            NodeKind::SerialField,
-            NodeKind::I2cTaskBuilder,
-            NodeKind::SshConnection,
-        ] {
-            assert!(graph.nodes.iter().any(|node| node.kind == kind));
-        }
-        assert!(
-            !graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::StructuredFieldExtractor),
-            "the simplified I²C template must not need a field extractor"
-        );
-
-        let builder = graph
+        let encoder = graph
             .nodes
             .iter()
-            .find(|node| node.id == "task-builder")
-            .expect("template builder");
-        assert_eq!(builder.config["mapMode"], "builtin");
-        assert_eq!(builder.config["mapId"], "yg-stereo-p24c64g-v1");
-        assert_eq!(builder.config["bus"], 0);
-        for input in ["packet", "serial.number", "connection"] {
-            assert!(
-                builder.inputs.iter().any(|port| port.id == input),
-                "builder must expose fixed input port `{input}`"
-            );
-        }
-        for output in ["readReport", "report"] {
-            assert!(
-                builder.outputs.iter().any(|port| port.id == output),
-                "builder must expose fixed output port `{output}`"
-            );
-        }
-
-        let required_edges = [
-            ("calib-solver", "packet", "task-builder", "packet"),
-            (
-                "serial-field",
-                "serial.number",
-                "task-builder",
-                "serial.number",
-            ),
-            ("ssh-control", "connection", "task-builder", "connection"),
-        ];
-        for (source_node, source_port, target_node, target_port) in required_edges {
-            assert!(graph.edges.iter().any(|edge| {
-                edge.source.node_id == source_node
-                    && edge.source.port_id == source_port
-                    && edge.target.node_id == target_node
-                    && edge.target.port_id == target_port
-            }));
-        }
-    }
-
-    #[test]
-    fn i2c_template_wires_packet_serial_and_ssh_directly_into_builder() {
-        let graph = i2c_template_graph();
-        let node = |id: &str| {
-            graph
-                .nodes
-                .iter()
-                .find(|node| node.id == id)
-                .expect("template node")
-        };
-        let builder = node("task-builder");
+            .find(|node| node.kind == NodeKind::I2cFieldEncoder)
+            .expect("encoder");
+        let executor = graph
+            .nodes
+            .iter()
+            .find(|node| node.kind == NodeKind::I2cTaskExecutor)
+            .expect("executor");
+        assert!(encoder
+            .outputs
+            .iter()
+            .any(|port| port.id == "task" && port.kind == PortKind::PacketData));
         assert_eq!(
-            builder
+            executor
                 .inputs
                 .iter()
                 .map(|port| port.id.as_str())
                 .collect::<Vec<_>>(),
-            ["packet", "serial.number", "connection"],
-            "the simplified builder keeps exactly three fixed inputs"
+            ["task", "connection"]
         );
-        assert_eq!(
-            builder
-                .outputs
-                .iter()
-                .map(|port| port.id.as_str())
-                .collect::<Vec<_>>(),
-            ["readReport", "report"],
-            "the simplified builder exposes read report and execution report"
-        );
-
-        let builder_edges = graph
+        assert!(graph
             .edges
             .iter()
-            .filter(|edge| edge.target.node_id == builder.id)
-            .map(|edge| {
-                (
-                    edge.id.clone(),
-                    edge.source.node_id.clone(),
-                    edge.source.port_id.clone(),
-                    edge.target.port_id.clone(),
-                )
-            })
-            .collect::<std::collections::BTreeSet<_>>();
-        assert_eq!(
-            builder_edges,
-            [
-                (
-                    "serial-to-builder".to_owned(),
-                    "serial-field".to_owned(),
-                    "serial.number".to_owned(),
-                    "serial.number".to_owned(),
-                ),
-                (
-                    "solver-to-builder".to_owned(),
-                    "calib-solver".to_owned(),
-                    "packet".to_owned(),
-                    "packet".to_owned(),
-                ),
-                (
-                    "ssh-to-builder".to_owned(),
-                    "ssh-control".to_owned(),
-                    "connection".to_owned(),
-                    "connection".to_owned(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            "the persisted template wires exactly three edges into the builder"
-        );
+            .any(|edge| edge.source.node_id == encoder.id && edge.target.node_id == executor.id));
     }
 
     #[test]
@@ -3683,72 +3504,55 @@ mod tests {
 
         let solver = node_definition(NodeKind::CalibrationSolver);
         assert_eq!(solver.inputs.len(), 4);
-        assert!(
-            solver
-                .inputs
-                .iter()
-                .any(|p| p.id == "board" && p.kind == PortKind::CalibBoardParams && !p.required)
-        );
-        assert!(
-            solver.inputs.iter().any(|p| p.id == "cameraModel"
-                && p.kind == PortKind::CalibCameraModel
-                && !p.required)
-        );
+        assert!(solver
+            .inputs
+            .iter()
+            .any(|p| p.id == "board" && p.kind == PortKind::CalibBoardParams && !p.required));
+        assert!(solver
+            .inputs
+            .iter()
+            .any(|p| p.id == "cameraModel" && p.kind == PortKind::CalibCameraModel && !p.required));
         assert!(solver.inputs.iter().any(|p| p.id == "distortionModel"
             && p.kind == PortKind::CalibDistortionModel
             && !p.required));
         assert!(solver.outputs.iter().any(|p| p.id == "packet"
-            && p.kind == PortKind::StructuredPacket
-            && p.schema == "data.structured.packet.v1"));
+            && p.kind == PortKind::PacketData
+            && p.schema == "data.packet.v1"));
 
         let dataset = node_definition(NodeKind::DatasetCollector);
         assert_eq!(dataset.inputs.len(), 4);
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "frames" && p.kind == PortKind::StreamVideoFrame && !p.required)
-        );
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "image" && p.kind == PortKind::ImageFrame && !p.required)
-        );
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "detection" && p.kind == PortKind::CalibDetection)
-        );
-        assert!(
-            dataset
-                .inputs
-                .iter()
-                .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required)
-        );
-        assert!(
-            dataset
-                .outputs
-                .iter()
-                .any(|p| p.id == "dataset" && p.kind == PortKind::CalibDataset)
-        );
-        assert!(
-            dataset
-                .outputs
-                .iter()
-                .any(|p| { p.id == "preview" && p.kind == PortKind::ImageFrame && !p.required })
-        );
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "frames" && p.kind == PortKind::StreamVideoFrame && !p.required));
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "image" && p.kind == PortKind::ImageFrame && !p.required));
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "detection" && p.kind == PortKind::CalibDetection));
+        assert!(dataset
+            .inputs
+            .iter()
+            .any(|p| p.id == "score" && p.kind == PortKind::CaptureScore && !p.required));
+        assert!(dataset
+            .outputs
+            .iter()
+            .any(|p| p.id == "dataset" && p.kind == PortKind::CalibDataset));
+        assert!(dataset
+            .outputs
+            .iter()
+            .any(|p| { p.id == "preview" && p.kind == PortKind::ImageFrame && !p.required }));
         assert_eq!(dataset.title, "Calibration Dataset Browser");
         assert!(dataset.description.contains("选中样本即输出预览"));
         assert!(dataset.description.contains("采纳/拒绝"));
         assert!(dataset.description.contains("启用/停用"));
         assert!(dataset.description.contains("不内联图像 bytes"));
-        assert!(
-            dataset
-                .description
-                .contains("有界 Arc<ImageFrame> 预览缓存")
-        );
+        assert!(dataset
+            .description
+            .contains("有界 Arc<ImageFrame> 预览缓存"));
 
         let scorer = node_definition(NodeKind::CalibrationFrameScorer);
         assert_eq!(scorer.inputs[0].kind, PortKind::CalibDetection);
@@ -3763,34 +3567,29 @@ mod tests {
         assert_eq!(hold.outputs[0].kind, PortKind::CaptureTrigger);
 
         let arm = node_definition(NodeKind::AutoCaptureController);
-        assert!(
-            arm.inputs
-                .iter()
-                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger)
-        );
-        assert!(
-            arm.outputs
-                .iter()
-                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger)
-        );
+        assert!(arm
+            .inputs
+            .iter()
+            .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger));
+        assert!(arm
+            .outputs
+            .iter()
+            .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger));
 
         let request = node_definition(NodeKind::CaptureRequestBuilder);
-        assert!(
-            request
-                .inputs
-                .iter()
-                .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger && !p.required)
-        );
+        assert!(request
+            .inputs
+            .iter()
+            .any(|p| p.id == "trigger" && p.kind == PortKind::CaptureTrigger && !p.required));
         assert!(request.outputs.iter().any(|p| p.id == "capture"
             && p.kind == PortKind::CommandCapture
             && p.schema == "command.capture.request.v1"));
 
         let pose = node_definition(NodeKind::PoseGuide);
-        assert!(
-            pose.outputs
-                .iter()
-                .any(|p| p.id == "target" && p.label == "Image-grid Target")
-        );
+        assert!(pose
+            .outputs
+            .iter()
+            .any(|p| p.id == "target" && p.label == "Image-grid Target"));
     }
     #[test]
     fn validation_rejects_mismatched_image_format_hints() {
@@ -3979,11 +3778,11 @@ mod tests {
                 .expect("required workmode template")
         };
         let x5233_preview = find("x5233-preview");
-        assert!(
-            x5233_preview.graph.edges.iter().any(|edge| {
-                edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1"
-            })
-        );
+        assert!(x5233_preview
+            .graph
+            .edges
+            .iter()
+            .any(|edge| { edge.kind == PortKind::ImageFrame && edge.schema == "image.frame.v1" }));
         let rtsp_snapshot = find("rtsp-snapshot");
         assert!(rtsp_snapshot.graph.edges.iter().any(|edge| {
             edge.id == "rtsp-snapshot-image-viewer" && edge.kind == PortKind::ImageFrame
@@ -4010,12 +3809,11 @@ mod tests {
                     && port.format_hint.as_deref() == Some("BayerRaw")
             })
         }));
-        assert!(
-            raw.graph
-                .nodes
-                .iter()
-                .any(|node| node.kind == NodeKind::Demosaic)
-        );
+        assert!(raw
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.kind == NodeKind::Demosaic));
         assert!(raw.graph.edges.iter().any(|edge| {
             edge.id == "x5233-raw-driver-demosaic" && edge.kind == PortKind::ImageFrame
         }));
@@ -4024,18 +3822,14 @@ mod tests {
     #[test]
     fn local_file_source_emits_image_and_file_ref() {
         let source = node_definition(NodeKind::LocalFileSource);
-        assert!(
-            source
-                .outputs
-                .iter()
-                .any(|p| p.kind == PortKind::ImageFrame)
-        );
-        assert!(
-            source
-                .outputs
-                .iter()
-                .any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1")
-        );
+        assert!(source
+            .outputs
+            .iter()
+            .any(|p| p.kind == PortKind::ImageFrame));
+        assert!(source
+            .outputs
+            .iter()
+            .any(|p| p.kind == PortKind::FileRef && p.schema == "file.ref.v1"));
     }
 
     #[test]

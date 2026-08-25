@@ -32,7 +32,8 @@ export type NodeKind =
   | 'poseGuide'
   | 'structuredFieldExtractor'
   | 'serialField'
-  | 'i2cTaskBuilder';
+  | 'i2cFieldEncoder'
+  | 'i2cTaskExecutor';
 
 export type NodeCategory = 'workspace' | 'source' | 'media' | 'viewer' | 'calibration' | 'control' | 'diagnostics';
 export type NodeRuntimeState = 'idle' | 'ready' | 'running' | 'warning' | 'error';
@@ -65,11 +66,11 @@ export type PortKind =
   | 'capture.trigger'
   | 'capture.target'
   | 'command.capture'
-  | 'data.structured.packet.v1'
+  | 'data.packet.v1'
   | 'ssh.connection.v1'
   | 'i2c.read-report.v1'
   | 'i2c.execution-report.v1'
-  | `data.field.${'bool' | 'u8' | 'i8' | 'u16' | 'i16' | 'u32' | 'i32' | 'u64' | 'i64' | 'f32' | 'f64' | 'str' | 'bytes'}.v1`
+  | 'data.field.v1'
   | 'status.metrics';
 
 export type PortRole = 'workspace' | 'endpoint' | 'stream' | 'image' | 'layer' | 'overlay' | 'control' | 'status' | 'dataset' | 'solution' | 'command';
@@ -251,8 +252,7 @@ export type NodeActionName =
   | 'arm'
   | 'disarm'
   | 'clear'
-  | 'read'
-  | 'write'
+  | 'execute'
   | DatasetSampleActionName
   | 'probe'
   | 'status'

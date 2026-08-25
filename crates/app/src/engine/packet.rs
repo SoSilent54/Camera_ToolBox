@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use camera_toolbox_core::{
-    CalibrationImageSize, ChessboardDetection, Datum, PacketProvenance, PrimitiveType,
+    CalibrationImageSize, ChessboardDetection, Datum, PacketProvenance,
     StructuredPacket,
 };
 use serde::{Deserialize, Serialize};
@@ -804,9 +804,11 @@ pub enum DataPacket {
     DistortionModelParams(Arc<DistortionModelParams>),
     /// `calib.pose`：检测帧中标定板的 `T_camera_board` 姿态。
     DetectionPose(Arc<DetectionPose>),
-    /// `data.structured.packet.v1`：可交换、可审计的结构化数据包。
+    /// `data.packet.v1`：可交换、可审计的结构化业务数据包。
     StructuredPacket(Arc<StructuredPacket>),
-    /// `data.field.<primitive>.v1`：从一个结构化包提取的严格类型字段。
+    /// `data.packet.v1`：通用 JSON packet；I²C task 等严格子合同在消费者处解析。
+    PacketData(Arc<serde_json::Value>),
+    /// `data.field.v1`：从一个结构化包提取的完整 datum 及其来源。
     /// generation 在 extractor 的一次输入内相同，供多端口 fan-in 原子组装。
     TypedField {
         datum: Arc<Datum>,
@@ -851,22 +853,8 @@ impl DataPacket {
             Self::CameraModelParams(_) => "calib.camera.model",
             Self::DistortionModelParams(_) => "calib.distortion.model",
             Self::DetectionPose(_) => "calib.pose",
-            Self::StructuredPacket(_) => "data.structured.packet.v1",
-            Self::TypedField { datum: field, .. } => match field.primitive_type() {
-                PrimitiveType::Bool => "data.field.bool.v1",
-                PrimitiveType::U8 => "data.field.u8.v1",
-                PrimitiveType::I8 => "data.field.i8.v1",
-                PrimitiveType::U16 => "data.field.u16.v1",
-                PrimitiveType::I16 => "data.field.i16.v1",
-                PrimitiveType::U32 => "data.field.u32.v1",
-                PrimitiveType::I32 => "data.field.i32.v1",
-                PrimitiveType::U64 => "data.field.u64.v1",
-                PrimitiveType::I64 => "data.field.i64.v1",
-                PrimitiveType::F32 => "data.field.f32.v1",
-                PrimitiveType::F64 => "data.field.f64.v1",
-                PrimitiveType::Str => "data.field.str.v1",
-                PrimitiveType::Bytes => "data.field.bytes.v1",
-            },
+            Self::StructuredPacket(_) | Self::PacketData(_) => "data.packet.v1",
+            Self::TypedField { .. } => "data.field.v1",
             Self::SshConnection(_) => "ssh.connection.v1",
             Self::I2cReadReport(_) => "i2c.read-report.v1",
             Self::I2cExecutionReport(_) => "i2c.execution-report.v1",
@@ -916,6 +904,7 @@ impl DataPacket {
             | Self::CameraModelParams(_)
             | Self::DistortionModelParams(_)
             | Self::StructuredPacket(_)
+            | Self::PacketData(_)
             | Self::TypedField { .. }
             | Self::SshConnection(_)
             | Self::I2cReadReport(_)
@@ -957,6 +946,10 @@ impl std::fmt::Debug for DataPacket {
                 .debug_struct("StructuredPacket")
                 .field("schema", &packet.schema)
                 .field("fields", &packet.fields.len())
+                .finish(),
+            Self::PacketData(packet) => f
+                .debug_struct("PacketData")
+                .field("schema", &packet.get("schema"))
                 .finish(),
             Self::TypedField {
                 datum: field,
@@ -1241,37 +1234,23 @@ mod tests {
         assert_eq!(signal.port_kind(), "capture.signal");
         assert_eq!(trigger.port_kind(), "capture.trigger");
         assert_eq!(target.port_kind(), "capture.target");
-        assert_eq!(structured.port_kind(), "data.structured.packet.v1");
+        assert_eq!(structured.port_kind(), "data.packet.v1");
         assert_eq!(structured.flow_sequence(), None);
     }
 
     #[test]
-    fn typed_field_packets_use_exact_primitive_port_kinds() {
-        for (value, expected_kind) in [
-            (TypedValue::Bool(true), "data.field.bool.v1"),
-            (TypedValue::U8(1), "data.field.u8.v1"),
-            (TypedValue::I8(-1), "data.field.i8.v1"),
-            (TypedValue::U16(1), "data.field.u16.v1"),
-            (TypedValue::I16(-1), "data.field.i16.v1"),
-            (TypedValue::U32(1), "data.field.u32.v1"),
-            (TypedValue::I32(-1), "data.field.i32.v1"),
-            (TypedValue::U64(1), "data.field.u64.v1"),
-            (TypedValue::I64(-1), "data.field.i64.v1"),
-            (TypedValue::F32(1.0), "data.field.f32.v1"),
-            (TypedValue::F64(1.0), "data.field.f64.v1"),
-            (TypedValue::Str("value".to_owned()), "data.field.str.v1"),
-            (TypedValue::Bytes(vec![0x12]), "data.field.bytes.v1"),
+    fn typed_field_packets_use_generic_field_port_kind() {
+        for value in [
+            TypedValue::Bool(true), TypedValue::U8(1), TypedValue::I8(-1), TypedValue::U16(1),
+            TypedValue::I16(-1), TypedValue::U32(1), TypedValue::I32(-1), TypedValue::U64(1),
+            TypedValue::I64(-1), TypedValue::F32(1.0), TypedValue::F64(1.0),
+            TypedValue::Str("value".to_owned()), TypedValue::Bytes(vec![0x12]),
         ] {
             let field = DataPacket::TypedField {
-                datum: Arc::new(Datum::new("example.field", value)),
-                generation: 1,
-                source: Arc::new(TypedFieldSource::new(
-                    "example.packet.v1",
-                    PacketProvenance::default(),
-                    Some("example.model.v1".to_owned()),
-                )),
+                datum: Arc::new(Datum::new("example.field", value)), generation: 1,
+                source: Arc::new(TypedFieldSource::new("example.packet.v1", PacketProvenance::default(), Some("example.model.v1".to_owned()))),
             };
-            assert_eq!(field.port_kind(), expected_kind);
+            assert_eq!(field.port_kind(), "data.field.v1");
             assert_eq!(field.flow_sequence(), None);
         }
     }

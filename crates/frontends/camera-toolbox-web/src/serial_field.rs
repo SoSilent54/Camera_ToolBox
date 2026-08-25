@@ -1,7 +1,7 @@
 //! Web 工作流的显式序列号 typed-field source。
 //!
 //! 该节点不接触硬件；用户显式触发后才把已验证的序列号以及声明的 schema、provenance
-//! 和 camera model 组成 `data.field.str.v1`。I²C builder 仍按每个字段独立校验来源合同。
+//! 和 camera model 组成 `data.field.v1`。编码器按通用 FieldData 合同独立校验每个字段。
 
 use std::sync::Arc;
 
@@ -11,8 +11,8 @@ use camera_toolbox_app::engine::{
 };
 use camera_toolbox_core::{Datum, PacketProvenance, TypedValue};
 
-const OUTPUT_PORT: &str = "serial.number";
-const OUTPUT_KIND: &str = "data.field.str.v1";
+const OUTPUT_PORT: &str = "field";
+const OUTPUT_KIND: &str = "data.field.v1";
 
 pub(crate) struct SerialFieldFactory;
 
@@ -77,7 +77,7 @@ impl SerialFieldNode {
         self.generation = self.generation.checked_add(1).ok_or_else(|| {
             NodeError::Execution("serial field generation counter exhausted".to_owned())
         })?;
-        let datum = Datum::new(OUTPUT_PORT, TypedValue::Str(self.value.clone()))
+        let datum = Datum::new("serial.number", TypedValue::Str(self.value.clone()))
             .with_semantic_type("device.serial-number");
         rt.emit(
             OUTPUT_PORT,

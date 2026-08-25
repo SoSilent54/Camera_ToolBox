@@ -1,7 +1,7 @@
 //! 标定求解节点：手动触发的按钮节点（范式样板）。
 //!
 //! `on_action(Trigger)` 时用节点 config 构造 `CalibrationRequest`，经 `CalibrationBackend`
-//! 求解并输出 `data.structured.packet.v1`。这是「按钮触发 → 后端计算 → 结果输出」的完整样板。
+//! 求解并输出通用 `data.packet.v1`；业务 schema 仍由 StructuredPacket 内容严格表达。
 
 use std::sync::Arc;
 
@@ -502,7 +502,7 @@ mod tests {
             outputs: vec![crate::engine::PortSpec {
                 id: "packet".to_owned(),
                 label: "Calibration packet".to_owned(),
-                kind: "data.structured.packet.v1".to_owned(),
+                kind: "data.packet.v1".to_owned(),
                 cardinality: crate::engine::PortCardinality::One,
                 required: false,
             }],
@@ -888,7 +888,7 @@ mod tests {
         );
         assert_eq!(
             DataPacket::StructuredPacket(Arc::clone(packet)).port_kind(),
-            "data.structured.packet.v1"
+            "data.packet.v1"
         );
         assert!(packet.fields.iter().any(|field| {
             field.name == "camera.intrinsics.fx"

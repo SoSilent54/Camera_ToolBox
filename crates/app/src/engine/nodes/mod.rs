@@ -58,7 +58,10 @@ pub use control_nodes::{
     SshSessionFactory, SshSessionNode, X5233DriverFactory, X5233DriverNode,
 };
 pub use detection::{ChessboardDetectorFactory, ChessboardDetectorNode};
-pub use i2c_plan_nodes::{I2cTaskBuilderFactory, I2cTaskBuilderNode, SshConnectionFactory, SshConnectionNode};
+pub use i2c_plan_nodes::{
+    I2cFieldEncoderFactory, I2cFieldEncoderNode, I2cTaskExecutorFactory, I2cTaskExecutorNode,
+    SshConnectionFactory, SshConnectionNode,
+};
 pub use local_source::{LocalFileSourceFactory, LocalFileSourceNode};
 pub use pose_estimator::{PoseEstimatorFactory, PoseEstimatorNode};
 pub use rtsp_source::{RtspSourceFactory, RtspSourceNode};
@@ -101,7 +104,8 @@ pub fn register_builtin(registry: &mut NodeRegistry) {
     registry.register(Box::new(HexArmDeviceFactory));
     registry.register(Box::new(SshConnectionFactory));
     registry.register(Box::new(StructuredFieldExtractorFactory));
-    registry.register(Box::new(I2cTaskBuilderFactory));
+    registry.register(Box::new(I2cFieldEncoderFactory));
+    registry.register(Box::new(I2cTaskExecutorFactory));
 }
 
 #[cfg(test)]
@@ -142,7 +146,8 @@ mod tests {
             "x5233Driver",
             "sshConnection",
             "structuredFieldExtractor",
-            "i2cTaskBuilder",
+            "i2cFieldEncoder",
+            "i2cTaskExecutor",
         ] {
             assert!(kinds.contains(&expected), "missing node kind {expected}");
         }
