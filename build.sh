@@ -33,8 +33,10 @@ Usage: ./build.sh [profile]
 Builds the `camera-toolbox`, `pangbot-calib-tool`, and `camera-toolbox-web`
 executables for the current native host with Local, CV610, SSH-managed
 providers, pinned FFmpeg 8.1.2, and pinned OpenCV 5 calibration enabled
-together. Verified native dependencies are cached under `.deps/ffmpeg` and
-`.deps/opencv5`; their runtime libraries are copied beside the GUI executables.
+together. It also places the deployable Linux AArch64 I²C helper beside the
+Egui executables; this helper is required for EEPROM operations. Verified
+native dependencies are cached under `.deps/ffmpeg` and `.deps/opencv5`; their
+runtime libraries are copied beside the GUI executables.
 Set CAMERA_TOOLBOX_CALIBRATION=0 to omit only OpenCV.
 
 Profiles:
@@ -140,14 +142,26 @@ printf 'Building web assets: profile=%s\n' "$profile"
 )
 
 cargo "${frontend_args[@]}"
-if [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
+
+# EEPROM helpers run on the remote X5, not the GUI host.  A host-native helper
+# is unusable on x86_64/Windows/macOS and previously left local release builds
+# without the filename the Egui client loads.  Prefer the CI-provided artifact;
+# an AArch64 Linux workstation can build the static sidecar itself.
+helper_sidecar="${project_root}/helper-sidecar/camera-i2c-helper"
+helper_output="${target_dir}/${profile}/camera-i2c-helper-linux-aarch64"
+if [[ -f $helper_sidecar ]]; then
+    install -m 755 "$helper_sidecar" "$helper_output"
+elif [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
         cargo "${helper_args[@]}" --target aarch64-unknown-linux-gnu
     install -m 755 \
         "${target_dir}/aarch64-unknown-linux-gnu/${profile}/camera-i2c-helper" \
-        "${target_dir}/${profile}/camera-i2c-helper-linux-aarch64"
+        "$helper_output"
 else
-    cargo "${helper_args[@]}"
+    printf '%s\n' \
+        'error: EEPROM-enabled build requires helper-sidecar/camera-i2c-helper (Linux AArch64)' \
+        '       Download the CI i2c-helper-linux-aarch64 artifact before running build.sh.' >&2
+    exit 1
 fi
 
 "$python_command" "$ffmpeg_dependency_tool" bundle \
