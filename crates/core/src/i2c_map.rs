@@ -575,7 +575,7 @@ pub struct ChecksumContract {
 }
 
 impl ChecksumContract {
-    fn source_ranges(&self, map: &I2cMapDefinition) -> Result<Vec<(u16, u16)>, I2cMapDefinitionError> {
+    pub fn source_ranges(&self, map: &I2cMapDefinition) -> Result<Vec<(u16, u16)>, I2cMapDefinitionError> {
         match (self.source_offset, self.source_byte_len, self.source_fields.is_empty()) {
             (Some(offset), Some(byte_len), true) => Ok(vec![(offset, byte_len)]),
             (None, None, false) => {

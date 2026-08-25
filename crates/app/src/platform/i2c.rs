@@ -1,6 +1,5 @@
-//! 通用 Linux I²C helper 的 typed 协议与平台服务端口。
 
-use camera_toolbox_core::{ChecksumAlgorithm, ChecksumContract, I2cMapDefinition};
+use camera_toolbox_core::{ChecksumAlgorithm, I2cMapDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -386,8 +385,17 @@ pub struct I2cReadRange {
 pub struct I2cMapValidationContract {
     pub image_bytes: u16,
     pub fixed_bytes: Vec<(u16, Vec<u8>)>,
-    pub checksums: Vec<ChecksumContract>,
+    /// 已解析到物理字节跨度，helper 不需要理解 map 逻辑字段。
+    pub checksums: Vec<I2cChecksumValidation>,
     pub serial_range: Option<I2cReadRange>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct I2cChecksumValidation {
+    pub target_offset: u16,
+    pub source_ranges: Vec<I2cReadRange>,
+    pub algorithm: ChecksumAlgorithm,
 }
 
 impl I2cMapValidationContract {
@@ -399,7 +407,20 @@ impl I2cMapValidationContract {
                 .iter()
                 .map(|fixed| (fixed.offset, fixed.bytes.clone()))
                 .collect(),
-            checksums: map.checksums.clone(),
+            checksums: map
+                .checksums
+                .iter()
+                .map(|checksum| I2cChecksumValidation {
+                    target_offset: checksum.target_offset,
+                    source_ranges: checksum
+                        .source_ranges(map)
+                        .expect("validated I2C map must resolve checksum source ranges")
+                        .into_iter()
+                        .map(|(offset, byte_len)| I2cReadRange { offset, byte_len })
+                        .collect(),
+                    algorithm: checksum.algorithm,
+                })
+                .collect(),
             serial_range: (map.id == "yg-stereo-p24c64g-v1")
                 .then(|| {
                     map.inputs
@@ -442,21 +463,18 @@ pub fn validate_map_image(
         }
     }
     for checksum in &validation.checksums {
-        let start = usize::from(checksum.source_offset);
-        let end = start
-            .checked_add(usize::from(checksum.source_byte_len))
-            .ok_or_else(|| "checksum source range overflow".to_owned())?;
-        let source = image
-            .get(start..end)
-            .ok_or_else(|| "checksum source range is outside image".to_owned())?;
+        let sum = checksum.source_ranges.iter().try_fold(0_u32, |sum, range| {
+            let start = usize::from(range.offset);
+            let end = start
+                .checked_add(usize::from(range.byte_len))
+                .ok_or_else(|| "checksum source range overflow".to_owned())?;
+            let source = image
+                .get(start..end)
+                .ok_or_else(|| "checksum source range is outside image".to_owned())?;
+            Ok::<_, String>(source.iter().fold(sum, |total, byte| total + u32::from(*byte)))
+        })?;
         let expected = match checksum.algorithm {
-            ChecksumAlgorithm::SerialSumMod255PlusOne => {
-                ((source
-                    .iter()
-                    .fold(0_u16, |sum, byte| sum + u16::from(*byte))
-                    % 0xff)
-                    + 1) as u8
-            }
+            ChecksumAlgorithm::SerialSumMod255PlusOne => ((sum % 0xff) + 1) as u8,
         };
         if image.get(usize::from(checksum.target_offset)) != Some(&expected) {
             return Err(format!(
@@ -769,8 +787,11 @@ impl I2cPlanDigest {
         self.u32(validation.checksums.len() as u32);
         for checksum in &validation.checksums {
             self.u16(checksum.target_offset);
-            self.u16(checksum.source_offset);
-            self.u16(checksum.source_byte_len);
+            self.u32(checksum.source_ranges.len() as u32);
+            for range in &checksum.source_ranges {
+                self.u16(range.offset);
+                self.u16(range.byte_len);
+            }
             self.text(&format!("{:?}", checksum.algorithm));
         }
         match &validation.serial_range {
