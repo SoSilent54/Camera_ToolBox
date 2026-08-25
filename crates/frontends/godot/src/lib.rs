@@ -5,7 +5,8 @@
 
 mod ui;
 
-use godot::classes::{Control, IControl};
+use godot::classes::control::LayoutPreset;
+use godot::classes::{Control, IControl, Texture2D};
 use godot::prelude::*;
 
 use camera_toolbox_adapters::x5_tcp_client;
@@ -21,11 +22,21 @@ pub struct CalibApp {
     ui: Option<UiState>,
     /// 后台 probe 结果槽：worker 线程写入，主线程 `_process` 轮询取走。
     pending_probe: Option<Arc<Mutex<Option<String>>>>,
+    /// 调试截图请求（`PONGBOT_SCREENSHOT` 环境变量触发，5 帧后保存）。
+    screenshot: Option<ScreenshotRequest>,
+}
+
+/// 调试截图请求。
+struct ScreenshotRequest {
+    path: String,
+    frame: u32,
 }
 
 #[godot_api]
 impl IControl for CalibApp {
     fn ready(&mut self) {
+        self.base_mut().set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
+        self.base_mut().set_size(Vector2::new(1280.0, 800.0));
         theme::install_cjk_font();
         let (state, root) = UiState::build();
         self.base_mut().add_child(&root);
@@ -45,10 +56,14 @@ impl IControl for CalibApp {
                 .pressed()
                 .connect(button_callback(self.base.__constructed_gd().cast::<CalibApp>(), "on_bootstrap"));
         }
+        if let Ok(path) = std::env::var("PONGBOT_SCREENSHOT") {
+            self.screenshot = Some(ScreenshotRequest { path, frame: 0 });
+            godot_print!("debug: 将在 5 帧后保存截图");
+        }
         godot_print!("pongbot-calib-tool: wizard UI ready");
     }
 
-    /// 主线程帧回调：轮询后台 probe 结果。
+    /// 主线程帧回调：轮询后台 probe 结果；处理调试截图。
     fn process(&mut self, _delta: f64) {
         let text = self
             .pending_probe
@@ -58,6 +73,26 @@ impl IControl for CalibApp {
         if let Some(text) = text {
             self.pending_probe = None;
             self.finish_probe(text);
+        }
+
+        if let Some(request) = self.screenshot.as_mut() {
+            request.frame += 1;
+            if request.frame >= 5 {
+                let request = self.screenshot.take().expect("screenshot 请求存在");
+                let gd = self.base.__constructed_gd();
+                let image = gd
+                    .get_viewport()
+                    .and_then(|viewport| viewport.get_texture())
+                    .map(|texture| texture.upcast::<Texture2D>())
+                    .and_then(|texture| texture.get_image());
+                match image {
+                    Some(image) => {
+                        let result = image.save_png(request.path.as_str());
+                        godot_print!("debug: 截图保存结果 {result:?} -> {}", request.path);
+                    }
+                    None => godot_print!("debug: 截图失败：viewport 图像不可用"),
+                }
+            }
         }
     }
 }
@@ -124,6 +159,7 @@ fn button_callback(base: Gd<CalibApp>, method: &'static str) -> impl FnMut() + '
         base.call_deferred(method, &[]);
     }
 }
+
 struct CalibExtension;
 
 /// GDExtension 入口：宏自动注册所有 `#[derive(GodotClass)]` 类型。
