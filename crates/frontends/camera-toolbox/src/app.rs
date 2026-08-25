@@ -5,16 +5,19 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex,
         mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
     time::{Duration, Instant},
 };
 
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+use crate::calibration_eeprom::{CalibrationEepromTargetRequest, CalibrationProvisionIntent};
 #[cfg(feature = "calibration-opencv")]
 use crate::calibration_workspace::{
-    CalibrationExport, CalibrationViewerOverlay, CalibrationViewerPresentation,
+    CalibrationExport, CalibrationLiveWorkspaceSummary, CalibrationProvisionRequest,
+    CalibrationViewerOverlay, CalibrationViewerPresentation, CalibrationWorkspaceKey,
     CalibrationWorkspaceManager, ViewerDetectionOverlay, ViewerGuidedPoseArrowOverlay,
     ViewerGuidedPoseOverlay, ViewerGuidedPoseRotationArcOverlay,
     ViewerGuidedPoseRotationRingsOverlay, ViewerGuidedPoseStatusOverlay, ViewerPoseAxisOverlay,
@@ -22,6 +25,8 @@ use crate::calibration_workspace::{
 
 #[cfg(feature = "platform-ssh")]
 use crate::explorer::RemoteConnectionCommit;
+#[cfg(feature = "platform-ssh")]
+use crate::i2c_tools::{I2cToolsAction, I2cToolsWorkspace};
 use crate::{
     analysis_panel::{DesiredAnalysis, render_analysis_panel},
     analysis_worker::{
@@ -63,13 +68,15 @@ use camera_toolbox_adapters::ImageRasterCodec;
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::{
     CredentialResolver, RusshTransportFactory, ServerHostKey, SshConnectionTarget,
-    SshTransportFactory,
+    SshI2cHelperService, SshTransportFactory,
 };
-#[cfg(feature = "platform-ssh")]
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+use camera_toolbox_adapters::platforms::ssh_managed::SshEepromProvisionService;
 use camera_toolbox_adapters::x5_tcp_client::{self, X5RtspEncoderConfig};
 use camera_toolbox_app::{
     AutoOpenActivation, CapabilityResolutionKey, DecodedVideoFrame, EntryName, ExportDestination,
-    ExportReceipt, FileRef, FileSystem, FsCancellation, FsControl, ImageFileKind, ImageOpenMode,
+    ExportReceipt, FileRef, FileSystem, FsCancellation, FsControl, I2cBusInfo, I2cHelperAction,
+    I2cHelperOperation, I2cHelperResult, I2cHelperService, ImageFileKind, ImageOpenMode,
     ImageOpenPipeline, ImageOpenResult, ImageSourceHandle, LocalRawAnalyzeReport,
     LocalRawAnalyzeRequest, OperationId, PlatformProfileId, RasterImageCodec, RawDecodeParams,
     RawInterpretation, RawOpenMode, RawOpenPipeline, ResolvedLocalBindings, ResolvedTargetBindings,
@@ -79,8 +86,13 @@ use camera_toolbox_app::{
 };
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_app::{
-    DumpCancellation, RemoteAuthentication, RemoteConnectionConfig, RemoteConnectionId,
-    RemoteOperationControl, RemoteTimeouts,
+    DumpCancellation, I2cHelperServiceError, RemoteAuthentication, RemoteConnectionConfig,
+    RemoteConnectionId, RemoteOperationControl, RemoteTimeouts,
+};
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+use camera_toolbox_app::{
+    EepromHelperResult, EepromInspectResult, EepromProvisionOperation, EepromProvisionService,
+    EepromProvisionServiceError, EepromWriteResult,
 };
 use camera_toolbox_core::{
     AssetId, BayerPattern, CaptureMetadata, ChromaOrder, EphemeralAsset, IntegrityState,
@@ -217,6 +229,53 @@ struct ColorExportResult {
     result: Result<ExportReceipt, String>,
 }
 
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Clone)]
+struct EepromProvisioningTarget {
+    service: Arc<dyn EepromProvisionService>,
+    snapshot_hash: SnapshotHash,
+    label: String,
+    workspace_key: CalibrationWorkspaceKey,
+    i2c_bus: u32,
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Debug)]
+enum EepromOperationOutcome {
+    Inspect(EepromInspectResult),
+    BusDiscovery {
+        buses: Vec<I2cBusInfo>,
+    },
+    Provision {
+        result: EepromWriteResult,
+        history_file: String,
+    },
+    ProvisionAuditFailed {
+        result: EepromWriteResult,
+        error: String,
+    },
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EepromOperationKind {
+    Inspect,
+    BusDiscovery,
+    Provision,
+}
+
+#[cfg(feature = "platform-ssh")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum I2cToolsOperationKind {
+    BusDiscovery,
+    Transfer,
+}
+
+#[cfg(feature = "platform-ssh")]
+struct I2cToolsOperationResult {
+    kind: I2cToolsOperationKind,
+    result: Result<I2cHelperResult, String>,
+}
 
 #[cfg(feature = "platform-ssh")]
 struct X5233DriverBootstrapResult {
@@ -292,12 +351,886 @@ fn run_x5_233_driver_bootstrap(
     ))
 }
 
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+#[derive(Debug)]
+struct EepromOperationFailure {
+    message: String,
+    provision_state_unknown: bool,
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+impl EepromOperationFailure {
+    fn known(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            provision_state_unknown: false,
+        }
+    }
+
+    fn unknown(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            provision_state_unknown: true,
+        }
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+impl From<String> for EepromOperationFailure {
+    fn from(message: String) -> Self {
+        Self::known(message)
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+struct EepromOperationResult {
+    workspace_key: CalibrationWorkspaceKey,
+    kind: EepromOperationKind,
+    target_label: String,
+    result: Result<EepromOperationOutcome, EepromOperationFailure>,
+}
+
+#[cfg(feature = "platform-ssh")]
+static SHARED_I2C_HELPER_OPERATION_LOCK: LazyLock<Mutex<()>> =
+    LazyLock::new(|| Mutex::new(()));
+
+#[cfg(feature = "platform-ssh")]
+fn shared_i2c_helper_operation_lock() -> &'static Mutex<()> {
+    &SHARED_I2C_HELPER_OPERATION_LOCK
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn run_eeprom_operation(
+    target: EepromProvisioningTarget,
+    intent: CalibrationProvisionIntent,
+    operation_id: u64,
+    cancellation: DumpCancellation,
+) -> Result<EepromOperationOutcome, EepromOperationFailure> {
+    let action = intent
+        .helper_action()
+        .ok_or_else(|| "cancel is not an executable EEPROM helper action".to_owned())?;
+
+    let control = RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(30),
+            overall: Duration::from_secs(120),
+        },
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let operation = EepromProvisionOperation {
+        action: action.clone(),
+    };
+    let prewrite_backup_file = if let CalibrationProvisionIntent::Provision {
+        request,
+        expected_before_sha256,
+        before_backup,
+        ..
+    } = &intent
+    {
+        let backup_sha256 = SnapshotHash::digest_bytes(before_backup).to_hex();
+        if backup_sha256 != *expected_before_sha256 {
+            return Err(EepromOperationFailure::known(format!(
+                "EEPROM backup SHA-256 {backup_sha256} does not match inspected image {expected_before_sha256}; re-run Inspect before writing"
+            )));
+        }
+        Some(
+            persist_eeprom_prewrite_backup(&request.serial_number, operation_id, before_backup)
+                .map_err(EepromOperationFailure::known)?,
+        )
+    } else {
+        None
+    };
+    let _helper_guard = shared_i2c_helper_operation_lock()
+        .lock()
+        .map_err(|_| EepromOperationFailure::known("I²C helper operation lock is poisoned"))?;
+
+
+    let helper_result = match target.service.execute(operation, control) {
+        Ok(result) => result,
+        Err(error) => {
+            let provision_state_unknown = matches!(
+                (&intent, &error),
+                (
+                    CalibrationProvisionIntent::Provision { .. },
+                    EepromProvisionServiceError::Transport(_)
+                        | EepromProvisionServiceError::Protocol(_)
+                )
+            ) || matches!(
+                (&intent, &error),
+                (
+                    CalibrationProvisionIntent::Provision { .. },
+                    EepromProvisionServiceError::Helper(failure)
+                ) if failure.rollback == camera_toolbox_app::EepromRollbackState::Failed
+            );
+            let mut message = format_eeprom_service_error(&error);
+            if let CalibrationProvisionIntent::Provision { request, .. } = &intent {
+                let document = serde_json::json!({
+                    "schema_version": 2,
+                    "operation": "eeprom_provision_failure",
+                    "operation_id": operation_id,
+                    "target": eeprom_target_json(&target),
+                    "request": eeprom_action_parameters_json(&action),
+                    "failure": eeprom_failure_json(&error),
+                    "device_state_unknown": provision_state_unknown,
+                    "prewrite_backup_file": prewrite_backup_file,
+                });
+                match persist_eeprom_write_history_yaml(
+                    &request.serial_number,
+                    operation_id,
+                    &document,
+                ) {
+                    Ok(label) => message.push_str(&format!("; failure audit: {label}")),
+                    Err(audit_error) => message
+                        .push_str(&format!("; failure audit save also failed: {audit_error}")),
+                }
+            }
+            return Err(if provision_state_unknown {
+                EepromOperationFailure::unknown(message)
+            } else {
+                EepromOperationFailure::known(message)
+            });
+        }
+    };
+
+    match (intent, helper_result) {
+        (CalibrationProvisionIntent::Inspect { .. }, EepromHelperResult::Inspect(result)) => {
+            Ok(EepromOperationOutcome::Inspect(result))
+        }
+        (
+            CalibrationProvisionIntent::Provision { request, .. },
+            EepromHelperResult::Provision(result),
+        ) => {
+            let document = serde_json::json!({
+                "schema_version": 2,
+                "operation": "eeprom_provision_success",
+                "operation_id": operation_id,
+                "target": eeprom_target_json(&target),
+                "request": eeprom_action_parameters_json(&action),
+                "prewrite_backup_file": prewrite_backup_file,
+                "result": eeprom_write_result_json(&result),
+            });
+            match persist_eeprom_write_history_yaml(&request.serial_number, operation_id, &document)
+            {
+                Ok(history_file) => Ok(EepromOperationOutcome::Provision {
+                    result,
+                    history_file,
+                }),
+                Err(error) => Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }),
+            }
+        }
+
+        (_, unexpected) => Err(EepromOperationFailure::known(format!(
+            "EEPROM helper returned an unexpected result kind: {unexpected:?}"
+        ))),
+    }
+}
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn run_i2c_bus_discovery(
+    connection: SshConnectionTarget,
+    credential_ref: String,
+    helper_payload: Arc<[u8]>,
+    resolver: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::CredentialResolver>,
+    transport: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::SshTransportFactory>,
+    operation_id: u64,
+    cancellation: DumpCancellation,
+) -> Result<EepromOperationOutcome, EepromOperationFailure> {
+    let control = RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(15),
+            overall: Duration::from_secs(45),
+        },
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let _helper_guard = shared_i2c_helper_operation_lock()
+        .lock()
+        .map_err(|_| EepromOperationFailure::known("I²C helper operation lock is poisoned"))?;
+
+    let service = SshI2cHelperService::new(
+        format!("calibration-i2c-{}", operation_id),
+        connection,
+        credential_ref,
+        65_536,
+        helper_payload,
+        resolver,
+        transport,
+    )
+    .map_err(|error: camera_toolbox_app::I2cHelperServiceError| {
+        EepromOperationFailure::known(error.to_string())
+    })?;
+    let result = service
+        .execute(
+            I2cHelperOperation {
+                action: I2cHelperAction::ListBuses,
+            },
+            control,
+        )
+        .map_err(|error: camera_toolbox_app::I2cHelperServiceError| {
+            EepromOperationFailure::known(error.to_string())
+        })?;
+    match result {
+        I2cHelperResult::BusList { buses } => Ok(EepromOperationOutcome::BusDiscovery { buses }),
+        unexpected => Err(EepromOperationFailure::known(format!(
+            "I2C helper returned an unexpected result kind: {unexpected:?}"
+        ))),
+    }
+}
+
+#[cfg(feature = "platform-ssh")]
+fn run_i2c_tools_request(
+    connection: SshConnectionTarget,
+    credential_ref: String,
+    helper_payload: Arc<[u8]>,
+    resolver: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::CredentialResolver>,
+    transport: Arc<dyn camera_toolbox_adapters::platforms::ssh_managed::SshTransportFactory>,
+    action: I2cHelperAction,
+    cancellation: DumpCancellation,
+) -> Result<I2cHelperResult, String> {
+    let (idle, overall) = match action {
+        I2cHelperAction::ListBuses => (Duration::from_secs(15), Duration::from_secs(45)),
+        I2cHelperAction::Transfer { .. } => (Duration::from_secs(30), Duration::from_secs(120)),
+        I2cHelperAction::GuardedWrite { .. } => (Duration::from_secs(30), Duration::from_secs(120)),
+    };
+    let control = RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle,
+            overall,
+        },
+        cancellation,
+    )
+    .map_err(|error| error.to_string())?;
+    let _helper_guard = shared_i2c_helper_operation_lock()
+        .lock()
+        .map_err(|_| "I²C helper operation lock is poisoned".to_owned())?;
+
+    let service = SshI2cHelperService::new(
+        "i2c-tools".to_owned(),
+        connection,
+        credential_ref,
+        1_048_576,
+        helper_payload,
+        resolver,
+        transport,
+    )
+    .map_err(|error| error.to_string())?;
+    service
+        .execute(I2cHelperOperation { action }, control)
+        .map_err(|error| format_i2c_service_error(&error))
+}
+
+#[cfg(feature = "platform-ssh")]
+fn format_i2c_service_error(error: &I2cHelperServiceError) -> String {
+    match error {
+        I2cHelperServiceError::Helper(failure) => format!(
+            "I2C helper failure: code={}, message={}, transaction={:?}, message={:?}",
+            failure.code, failure.message, failure.transaction_index, failure.message_index
+        ),
+        _ => error.to_string(),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn format_eeprom_service_error(error: &EepromProvisionServiceError) -> String {
+    match error {
+        EepromProvisionServiceError::Helper(failure) => format!(
+            "EEPROM helper failure: code={}, message={}, rollback={:?}, rollback_error={}",
+            failure.code,
+            failure.message,
+            failure.rollback,
+            failure.rollback_error.as_deref().unwrap_or("none")
+        ),
+        _ => error.to_string(),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_FLAG_OFFSET: u16 = 0x0000;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_CALIBRATION_OFFSET: u16 = 0x0010;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_SERIAL_OFFSET: u16 = 0x0125;
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+const EEPROM_SERIAL_BYTES: usize = 14;
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_failure_json(error: &EepromProvisionServiceError) -> serde_json::Value {
+    match error {
+        EepromProvisionServiceError::Helper(failure) => serde_json::json!({
+            "kind": "helper",
+            "code": failure.code,
+            "message": failure.message,
+            "before": failure.before,
+            "backup_sha256": SnapshotHash::digest_bytes(&failure.backup).to_hex(),
+            "backup_bytes": failure.backup.len(),
+            "rollback": failure.rollback,
+            "rollback_error": failure.rollback_error,
+        }),
+        _ => serde_json::json!({
+            "kind": "service",
+            "message": error.to_string(),
+        }),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_write_result_json(result: &EepromWriteResult) -> serde_json::Value {
+    serde_json::json!({
+        "before": result.before,
+        "after": result.after,
+        "backup_sha256": SnapshotHash::digest_bytes(&result.backup).to_hex(),
+        "backup_bytes": result.backup.len(),
+        "page_plan": result.page_plan,
+        "bytewise_verified": result.bytewise_verified,
+        "rollback": result.rollback,
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_target_json(target: &EepromProvisioningTarget) -> serde_json::Value {
+    serde_json::json!({
+        "label": target.label,
+        "i2c_bus": target.i2c_bus,
+        "target_snapshot_sha256": target.snapshot_hash.to_hex(),
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_action_parameters_json(
+    action: &camera_toolbox_app::EepromHelperAction,
+) -> serde_json::Value {
+    match action {
+        camera_toolbox_app::EepromHelperAction::Inspect => serde_json::json!({
+            "action": "inspect",
+        }),
+        camera_toolbox_app::EepromHelperAction::Provision {
+            request,
+            expected_before_sha256,
+        } => serde_json::json!({
+            "action": "provision",
+            "expected_before_sha256": expected_before_sha256,
+            "request": eeprom_request_parameters_json(request),
+        }),
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn expected_eeprom_target_label(intent: &CalibrationProvisionIntent) -> Option<&str> {
+    match intent {
+        CalibrationProvisionIntent::Inspect {
+            expected_target_label,
+        }
+        | CalibrationProvisionIntent::Provision {
+            expected_target_label,
+            ..
+        } => Some(expected_target_label.as_str()),
+        CalibrationProvisionIntent::Cancel
+        | CalibrationProvisionIntent::ConfigureTarget(_)
+        | CalibrationProvisionIntent::DiscoverBuses => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_request_parameters_json(
+    request: &camera_toolbox_core::EepromProvisionRequest,
+) -> serde_json::Value {
+    let calibration_parameters = eeprom_calibration_parameters_json(request);
+    serde_json::json!({
+        "map_id": request.map_id,
+        "mode": request.mode,
+        "serial_number": request.serial_number,
+        "overwrite_existing_serial": request.overwrite_existing_serial,
+        "snid": eeprom_snid_json(&request.serial_number),
+        "calibration_parameters": calibration_parameters,
+        "write_segments": request.segments.iter().map(eeprom_write_segment_json).collect::<Vec<_>>(),
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_write_segment_json(
+    segment: &camera_toolbox_core::EepromWriteSegment,
+) -> serde_json::Value {
+    serde_json::json!({
+        "offset": format!("0x{:04x}", segment.offset),
+        "offset_u16": segment.offset,
+        "byte_len": segment.bytes.len(),
+        "purpose": eeprom_segment_purpose(segment.offset),
+        "payload_sha256": SnapshotHash::digest_bytes(&segment.bytes).to_hex(),
+        "semantic_value": eeprom_segment_semantic_json(segment),
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_segment_purpose(offset: u16) -> &'static str {
+    match offset {
+        EEPROM_FLAG_OFFSET => "valid_flag",
+        EEPROM_CALIBRATION_OFFSET => "calibration_parameters",
+        EEPROM_SERIAL_OFFSET => "serial_number_and_checksum",
+        _ => "custom_segment",
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_segment_semantic_json(
+    segment: &camera_toolbox_core::EepromWriteSegment,
+) -> serde_json::Value {
+    match segment.offset {
+        EEPROM_FLAG_OFFSET if segment.bytes == b"hessian\0" => serde_json::json!({
+            "flag_ascii": "hessian\\0",
+        }),
+        EEPROM_CALIBRATION_OFFSET => {
+            decode_calibration_segment_json(&segment.bytes).unwrap_or(serde_json::Value::Null)
+        }
+        EEPROM_SERIAL_OFFSET if segment.bytes.len() >= EEPROM_SERIAL_BYTES => {
+            let serial = std::str::from_utf8(&segment.bytes[..EEPROM_SERIAL_BYTES]).ok();
+            serde_json::json!({
+                "serial_number": serial,
+                "snid": serial.map(eeprom_snid_json),
+                "checksum_u8": segment.bytes.get(EEPROM_SERIAL_BYTES).copied(),
+                "checksum_hex": segment.bytes.get(EEPROM_SERIAL_BYTES).map(|value| format!("0x{value:02x}")),
+            })
+        }
+        _ => serde_json::Value::Null,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_calibration_parameters_json(
+    request: &camera_toolbox_core::EepromProvisionRequest,
+) -> serde_json::Value {
+    request
+        .segments
+        .iter()
+        .find(|segment| segment.offset == EEPROM_CALIBRATION_OFFSET)
+        .and_then(|segment| decode_calibration_segment_json(&segment.bytes))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_calibration_segment_json(bytes: &[u8]) -> Option<serde_json::Value> {
+    let width = read_u32_le(bytes, 0)?;
+    let height = read_u32_le(bytes, 4)?;
+    let fx = read_f32_le(bytes, 8)?;
+    let fy = read_f32_le(bytes, 12)?;
+    let cx = read_f32_le(bytes, 16)?;
+    let cy = read_f32_le(bytes, 20)?;
+    let distortion = (0..12)
+        .map(|index| read_f32_le(bytes, 24 + index * 4))
+        .collect::<Option<Vec<_>>>()?;
+    Some(serde_json::json!({
+        "image_size": {
+            "width": width,
+            "height": height,
+        },
+        "camera_matrix": {
+            "fx": fx,
+            "fy": fy,
+            "cx": cx,
+            "cy": cy,
+            "matrix_3x3": [
+                [fx, 0.0, cx],
+                [0.0, fy, cy],
+                [0.0, 0.0, 1.0],
+            ],
+        },
+        "distortion": {
+            "model": "opencv_pinhole_radtan_thin_prism_d12",
+            "coefficients": {
+                "k1": distortion[0],
+                "k2": distortion[1],
+                "p1": distortion[2],
+                "p2": distortion[3],
+                "k3": distortion[4],
+                "k4": distortion[5],
+                "k5": distortion[6],
+                "k6": distortion[7],
+                "s1": distortion[8],
+                "s2": distortion[9],
+                "s3": distortion[10],
+                "s4": distortion[11],
+            },
+        },
+    }))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    Some(u32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn read_f32_le(bytes: &[u8], offset: usize) -> Option<f32> {
+    Some(f32::from_le_bytes(
+        bytes.get(offset..offset + 4)?.try_into().ok()?,
+    ))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_snid_json(serial_number: &str) -> serde_json::Value {
+    let bytes = serial_number.as_bytes();
+    if bytes.len() != EEPROM_SERIAL_BYTES {
+        return serde_json::json!({
+            "raw": serial_number,
+            "decoded": null,
+            "error": "SNID must be 14 ASCII bytes",
+        });
+    }
+    let module = std::str::from_utf8(&bytes[2..5]).unwrap_or("");
+    let year = std::str::from_utf8(&bytes[5..7]).unwrap_or("");
+    let sequence = decode_snid_sequence(bytes[10], bytes[11]);
+    serde_json::json!({
+        "resolution": {
+            "code": char::from(bytes[0]).to_string(),
+            "meaning": if bytes[0] == b'2' { "FHD" } else { "unknown" },
+        },
+        "vendor": {
+            "code": char::from(bytes[1]).to_string(),
+            "meaning": if bytes[1] == b'T' { "SmartSens" } else { "unknown" },
+        },
+        "module": module,
+        "year": year,
+        "month": {
+            "input_decimal": decode_snid_month(bytes[7]),
+            "encoded": char::from(bytes[7]).to_string(),
+        },
+        "day": {
+            "input_decimal": decode_snid_day(bytes[8]),
+            "encoded": char::from(bytes[8]).to_string(),
+        },
+        "optical_axis_class": {
+            "input": decode_ascii_digit(bytes[9]),
+            "encoded": char::from(bytes[9]).to_string(),
+        },
+        "sequence": {
+            "input_decimal": sequence,
+            "encoded_high": char::from(bytes[10]).to_string(),
+            "encoded_low": char::from(bytes[11]).to_string(),
+        },
+        "algorithm_version": char::from(bytes[12]).to_string(),
+        "reserved": char::from(bytes[13]).to_string(),
+        "checksum_expected": {
+            "offset": "0x0133",
+            "algorithm": "sum(serial_bytes) % 0xff + 1",
+            "value_u8": serial_checksum_value(bytes),
+            "value_hex": format!("0x{:02x}", serial_checksum_value(bytes)),
+        },
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_ascii_digit(byte: u8) -> Option<u8> {
+    byte.is_ascii_digit().then_some(byte - b'0')
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_snid_month(byte: u8) -> Option<u8> {
+    match byte {
+        b'1'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'C' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_snid_day(byte: u8) -> Option<u8> {
+    match byte {
+        b'1'..=b'9' => Some(byte - b'0'),
+        b'A'..=b'V' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_base62_digit(byte: u8) -> Option<u16> {
+    match byte {
+        b'0'..=b'9' => Some(u16::from(byte - b'0')),
+        b'a'..=b'z' => Some(u16::from(byte - b'a') + 10),
+        b'A'..=b'Z' => Some(u16::from(byte - b'A') + 36),
+        _ => None,
+    }
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn decode_snid_sequence(high: u8, low: u8) -> Option<u16> {
+    Some(decode_base62_digit(high)? * 62 + decode_base62_digit(low)? + 1)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn serial_checksum_value(bytes: &[u8]) -> u8 {
+    ((bytes.iter().map(|byte| u16::from(*byte)).sum::<u16>() % 0xff) + 1) as u8
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
+    let file_name = safe_eeprom_history_file_name(serial_number)?;
+    Ok(PathBuf::from("write_history").join(file_name))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn safe_eeprom_history_stem(serial_number: &str) -> Result<String, String> {
+    let serial = serial_number.trim();
+    if serial.is_empty() {
+        return Err("EEPROM serial number is empty; cannot create write history file".to_owned());
+    }
+    if !serial
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(format!(
+            "EEPROM serial number {serial:?} cannot be used as a write history filename"
+        ));
+    }
+    Ok(serial.to_owned())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn safe_eeprom_history_file_name(serial_number: &str) -> Result<String, String> {
+    let serial = safe_eeprom_history_stem(serial_number)?;
+    let bytes = serial.as_bytes();
+    if bytes.len() != EEPROM_SERIAL_BYTES {
+        return Err(format!(
+            "EEPROM serial number {serial:?} must contain exactly {EEPROM_SERIAL_BYTES} ASCII bytes to create write history filename"
+        ));
+    }
+    let prefix = format!(
+        "{}{}{}",
+        std::str::from_utf8(&bytes[0..5]).expect("safe EEPROM serial stem is ASCII"),
+        char::from(bytes[9]),
+        std::str::from_utf8(&bytes[12..14]).expect("safe EEPROM serial stem is ASCII")
+    );
+    let year = std::str::from_utf8(&bytes[5..7]).expect("safe EEPROM serial stem is ASCII");
+    let month = decode_snid_month(bytes[7])
+        .ok_or_else(|| format!("EEPROM serial number {serial:?} has invalid encoded month"))?;
+    let day = decode_snid_day(bytes[8])
+        .ok_or_else(|| format!("EEPROM serial number {serial:?} has invalid encoded day"))?;
+    let sequence = decode_snid_sequence(bytes[10], bytes[11])
+        .ok_or_else(|| format!("EEPROM serial number {serial:?} has invalid encoded sequence"))?;
+    Ok(format!("{prefix}_{year}{month:02}{day:02}_{sequence}.yaml"))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn ensure_eeprom_history_slot_available(serial_number: &str) -> Result<(), String> {
+    new_eeprom_history_path(serial_number).map(|_| ())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
+    let serial = safe_eeprom_history_stem(serial_number)?;
+    let target_path = eeprom_history_path(&serial)?;
+    let target_name = eeprom_file_name_to_string(&target_path)?;
+    let history_dir = Path::new("write_history");
+    let entries = match fs::read_dir(history_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target_path),
+        Err(error) => {
+            return Err(format!(
+                "Failed to inspect EEPROM write history directory {} before writing SN {serial}: {error}",
+                history_dir.display()
+            ));
+        }
+    };
+    let mut occupied_target_path = None;
+
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "Failed to inspect EEPROM write history directory {} before writing SN {serial}: {error}",
+                history_dir.display()
+            )
+        })?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str().map(str::to_owned) else {
+            continue;
+        };
+        let path = entry.path();
+        if eeprom_history_may_record_snid(&file_name)
+            && eeprom_history_recorded_serial_number(&path).as_deref() == Some(serial.as_str())
+        {
+            return Err(format!(
+                "Write history already records SN {serial}: {}. Refusing to start EEPROM write; rename or archive the existing file before retrying.",
+                path.display()
+            ));
+        }
+        if file_name.eq_ignore_ascii_case(&target_name) {
+            occupied_target_path = Some(path);
+        }
+    }
+
+    if let Some(path) = occupied_target_path {
+        return Err(format!(
+            "EEPROM write history filename for SN {serial} is already occupied by {} but that file does not record the same SNID. Refusing to start EEPROM write; archive or repair the history file before retrying.",
+            path.display()
+        ));
+    }
+
+    Ok(target_path)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_file_name_to_string(path: &Path) -> Result<String, String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            format!(
+                "EEPROM write history path {} has no UTF-8 file name",
+                path.display()
+            )
+        })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_may_record_snid(file_name: &str) -> bool {
+    file_name.rsplit_once('.').is_some_and(|(_, extension)| {
+        extension.eq_ignore_ascii_case("yaml") || extension.eq_ignore_ascii_case("json")
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn eeprom_history_recorded_serial_number(path: &Path) -> Option<String> {
+    let bytes = fs::read(path).ok()?;
+    let document: serde_json::Value = serde_yaml::from_slice(&bytes).ok()?;
+    // Windows 目录可按大小写不敏感方式命中文件名；重复判断只信审计内容里的原始 SNID。
+    document
+        .pointer("/request/request/serial_number")
+        .or_else(|| document.pointer("/request/request/snid/raw"))
+        .or_else(|| document.pointer("/request/serial_number"))
+        .or_else(|| document.pointer("/request/snid/raw"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn path_parent_or_current(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh", not(windows)))]
+fn sync_directory(path: &Path, label: &str) -> Result<(), String> {
+    let directory = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "failed to open {label} directory {} for sync: {error}",
+            path.display()
+        )
+    })?;
+    directory.sync_all().map_err(|error| {
+        format!(
+            "failed to sync {label} directory {}: {error}",
+            path.display()
+        )
+    })
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh", windows))]
+fn sync_directory(_path: &Path, _label: &str) -> Result<(), String> {
+    // Windows 标准库不能用 File::open 打开目录做 sync；文件本身已 sync_all。
+    Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn ensure_directory_durable(path: &Path, label: &str) -> Result<(), String> {
+    let existed = path.exists();
+    fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "failed to create {label} directory {}: {error}",
+            path.display()
+        )
+    })?;
+    if !existed {
+        // 新目录入口在父目录中，必须同步父目录后才能称为持久化。
+        sync_directory(path_parent_or_current(path), label)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn create_new_file(
+    path: &Path,
+    bytes: &[u8],
+    operation_id: u64,
+    label: &str,
+) -> Result<(), String> {
+    let parent = path.parent().map(Path::to_path_buf);
+    if let Some(parent) = parent.as_deref() {
+        ensure_directory_durable(parent, label)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|error| {
+            format!(
+                "failed to create {label} for operation {operation_id} at {}: {error}",
+                path.display()
+            )
+        })?;
+    std::io::Write::write_all(&mut file, bytes).map_err(|error| {
+        format!(
+            "failed to write {label} for operation {operation_id} at {}: {error}",
+            path.display()
+        )
+    })?;
+    file.sync_all().map_err(|error| {
+        format!(
+            "failed to sync {label} for operation {operation_id} at {}: {error}",
+            path.display()
+        )
+    })?;
+    if let Some(parent) = parent.as_deref() {
+        sync_directory(parent, label)?;
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn serialize_eeprom_yaml(document: &serde_json::Value) -> Result<Vec<u8>, String> {
+    let mut text = serde_yaml::to_string(document).map_err(|error| error.to_string())?;
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    Ok(text.into_bytes())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn persist_eeprom_write_history_yaml(
+    serial_number: &str,
+    operation_id: u64,
+    document: &serde_json::Value,
+) -> Result<String, String> {
+    let path = new_eeprom_history_path(serial_number)?;
+    let bytes = serialize_eeprom_yaml(document)?;
+    create_new_file(&path, &bytes, operation_id, "EEPROM write history")?;
+    Ok(path.display().to_string())
+}
+
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+fn persist_eeprom_prewrite_backup(
+    serial_number: &str,
+    operation_id: u64,
+    backup: &[u8],
+) -> Result<String, String> {
+    let serial = safe_eeprom_history_stem(serial_number)?;
+    let path = PathBuf::from("write_history").join(format!(
+        "{serial}_op{operation_id:016x}_prewrite_backup.bin"
+    ));
+    create_new_file(&path, backup, operation_id, "EEPROM pre-write backup")?;
+    Ok(path.display().to_string())
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum ProductWorkspace {
     #[default]
     Viewer,
     Color,
+    #[cfg(feature = "platform-ssh")]
+    I2cTools,
     #[cfg(feature = "calibration-opencv")]
     Calibration,
 }
@@ -351,6 +1284,7 @@ struct X5233DriverWorkspace {
     device_ip: String,
     ssh_user: String,
     ssh_password: String,
+    #[cfg(feature = "platform-ssh")]
     ssh_expected_host_key: String,
     tcp_port: u16,
     configure_before_connect: bool,
@@ -380,28 +1314,33 @@ struct X5233ChannelMapping {
     driver_channel: u16,
     rtsp_port: u16,
     label: &'static str,
+    i2c_bus: u16,
 }
 
 const X5_233_DRIVER_CHANNELS: [X5233ChannelMapping; 4] = [
     X5233ChannelMapping {
         driver_channel: 0,
         rtsp_port: 554,
+        i2c_bus: 4,
         label: "CH0 cam0 H",
     },
     X5233ChannelMapping {
         driver_channel: 1,
         rtsp_port: 555,
         label: "CH1 cam0 L",
+        i2c_bus: 5,
     },
     X5233ChannelMapping {
         driver_channel: 3,
         rtsp_port: 557,
         label: "CH3 cam1 H",
+        i2c_bus: 6,
     },
     X5233ChannelMapping {
         driver_channel: 4,
         rtsp_port: 558,
         label: "CH4 cam1 L",
+        i2c_bus: 7,
     },
 ];
 
@@ -428,6 +1367,7 @@ impl Default for X5233DriverWorkspace {
             device_ip: String::new(),
             ssh_user: "root".to_owned(),
             ssh_password: "root".to_owned(),
+            #[cfg(feature = "platform-ssh")]
             ssh_expected_host_key: String::new(),
             tcp_port: 9073,
             configure_before_connect: true,
@@ -1007,6 +1947,28 @@ pub(crate) struct CameraToolboxApp {
     calibration_export_sender: Sender<CalibrationExportResult>,
     #[cfg(feature = "calibration-opencv")]
     calibration_export_receiver: Receiver<CalibrationExportResult>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    eeprom_target: Option<EepromProvisioningTarget>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    eeprom_operation_sender: Sender<EepromOperationResult>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    eeprom_operation_receiver: Receiver<EepromOperationResult>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    active_eeprom_cancellation: Option<DumpCancellation>,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    active_eeprom_cancellable: bool,
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    next_eeprom_operation: u64,
+    #[cfg(feature = "platform-ssh")]
+    i2c_tools: I2cToolsWorkspace,
+    #[cfg(feature = "platform-ssh")]
+    i2c_tools_sender: Sender<I2cToolsOperationResult>,
+    #[cfg(feature = "platform-ssh")]
+    i2c_tools_receiver: Receiver<I2cToolsOperationResult>,
+    #[cfg(feature = "platform-ssh")]
+    active_i2c_tools_cancellation: Option<DumpCancellation>,
+    #[cfg(feature = "platform-ssh")]
+    active_i2c_tools_cancellable: bool,
     #[cfg(feature = "platform-ssh")]
     x5_233_driver_bootstrap_sender: Sender<X5233DriverBootstrapResult>,
     #[cfg(feature = "platform-ssh")]
@@ -1062,6 +2024,10 @@ impl CameraToolboxApp {
         let (color_export_sender, color_export_receiver) = mpsc::channel();
         #[cfg(feature = "calibration-opencv")]
         let (calibration_export_sender, calibration_export_receiver) = mpsc::channel();
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        let (eeprom_operation_sender, eeprom_operation_receiver) = mpsc::channel();
+        #[cfg(feature = "platform-ssh")]
+        let (i2c_tools_sender, i2c_tools_receiver) = mpsc::channel();
         #[cfg(feature = "platform-ssh")]
         let (x5_233_driver_bootstrap_sender, x5_233_driver_bootstrap_receiver) = mpsc::channel();
         let live_runtime = LiveRuntime::new().map_err(std::io::Error::other)?;
@@ -1075,7 +2041,10 @@ impl CameraToolboxApp {
             ui_flavor,
             product_workspace: match ui_flavor {
                 UiFlavor::Full => ProductWorkspace::Viewer,
+                #[cfg(feature = "calibration-opencv")]
                 UiFlavor::PangbotSimplified => ProductWorkspace::Calibration,
+                #[cfg(not(feature = "calibration-opencv"))]
+                UiFlavor::PangbotSimplified => ProductWorkspace::Viewer,
             },
             #[cfg(feature = "calibration-opencv")]
             calibration: CalibrationWorkspaceManager::new(context)?,
@@ -1102,6 +2071,28 @@ impl CameraToolboxApp {
             calibration_export_sender,
             #[cfg(feature = "calibration-opencv")]
             calibration_export_receiver,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            eeprom_target: None,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            eeprom_operation_sender,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            eeprom_operation_receiver,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            active_eeprom_cancellation: None,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            active_eeprom_cancellable: false,
+            #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+            next_eeprom_operation: 1,
+            #[cfg(feature = "platform-ssh")]
+            i2c_tools: I2cToolsWorkspace::default(),
+            #[cfg(feature = "platform-ssh")]
+            i2c_tools_sender,
+            #[cfg(feature = "platform-ssh")]
+            i2c_tools_receiver,
+            #[cfg(feature = "platform-ssh")]
+            active_i2c_tools_cancellation: None,
+            #[cfg(feature = "platform-ssh")]
+            active_i2c_tools_cancellable: false,
             #[cfg(feature = "platform-ssh")]
             x5_233_driver_bootstrap_sender,
             #[cfg(feature = "platform-ssh")]
@@ -1135,6 +2126,17 @@ impl CameraToolboxApp {
 impl eframe::App for CameraToolboxApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let context = ui.ctx().clone();
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        if self.active_eeprom_cancellation.is_some() && !self.active_eeprom_cancellable {
+            if context.input(|input| input.viewport().close_requested()) {
+                context.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                let workspace_key = self.calibration.active_key().clone();
+                self.calibration.report_provision_error(
+                    &workspace_key,
+                    "EEPROM write is still running; wait for Provision to finish before closing Camera Toolbox.",
+                );
+            }
+        }
         self.poll_color_result(&context);
         self.poll_analysis_result();
         self.poll_spatial_highlight_result();
@@ -1142,6 +2144,10 @@ impl eframe::App for CameraToolboxApp {
         self.poll_color_export_result(&context);
         #[cfg(feature = "calibration-opencv")]
         self.poll_calibration_export_result(&context);
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        self.poll_eeprom_operation_result(&context);
+        #[cfg(feature = "platform-ssh")]
+        self.poll_i2c_tools_result();
         #[cfg(feature = "platform-ssh")]
         self.poll_x5_233_driver_bootstrap_result();
         self.poll_raw_open_result(&context);
@@ -1353,6 +2359,43 @@ impl eframe::App for CameraToolboxApp {
             self.handle_color_inspection_action(&context, action);
         }
 
+        #[cfg(feature = "platform-ssh")]
+        let i2c_tools_sftp_label: Result<String, String> = self.remote_control_label(
+            "Connect Explorer SFTP or enter an X5 board IP before using I²C Tools.",
+        );
+        #[cfg(feature = "platform-ssh")]
+        let mut i2c_tools_action = None;
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_sftp_label: Result<String, String> = {
+            #[cfg(feature = "platform-ssh")]
+            {
+                self.remote_control_label(
+                    "Connect Explorer SFTP or enter an X5 board IP before configuring EEPROM.",
+                )
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                Err("This build does not include SSH/SFTP control.".to_owned())
+            }
+        };
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_provision_label: Result<String, String> = {
+            #[cfg(feature = "platform-ssh")]
+            {
+                self.eeprom_target
+                    .as_ref()
+                    .filter(|target| &target.workspace_key == self.calibration.active_key())
+                    .map(|target| target.label.clone())
+                    .ok_or_else(|| {
+                        "Use the available SSH/SFTP control source for this workspace's EEPROM, then Inspect."
+                            .to_owned()
+                    })
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                Err("This build does not include SSH EEPROM provisioning.".to_owned())
+            }
+        };
         let calibration_export_error = self.explorer.export_dialog_prefill(&context).err();
         #[cfg(feature = "calibration-opencv")]
         self.sync_active_calibration_live_document();
@@ -1367,6 +2410,18 @@ impl eframe::App for CameraToolboxApp {
         let color_workspace = self.is_color_workspace();
         let viewer_output = egui::CentralPanel::default()
             .show(ui, |ui| {
+                #[cfg(feature = "platform-ssh")]
+                if self.product_workspace == ProductWorkspace::I2cTools {
+                    let rect = ui.available_rect_before_wrap();
+                    i2c_tools_action = self.i2c_tools.render(
+                        ui,
+                        i2c_tools_sftp_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
+                    );
+                    return ViewerOutput { rect, action: None };
+                }
                 #[cfg(feature = "calibration-opencv")]
                 if self.is_calibration_workspace() {
                     let has_live_inspection = {
@@ -1383,6 +2438,14 @@ impl eframe::App for CameraToolboxApp {
                         ui,
                         calibration_export_error.is_none(),
                         calibration_export_error.as_deref(),
+                        calibration_sftp_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
+                        calibration_provision_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
                         has_live_inspection,
                         |ui| {
                             let document = workspace.active_live_mut()?;
@@ -1486,6 +2549,14 @@ impl eframe::App for CameraToolboxApp {
         if let Some(action) = viewer_output.action {
             self.handle_viewer_action(action);
         }
+        #[cfg(feature = "platform-ssh")]
+        if let Some(action) = i2c_tools_action {
+            self.begin_i2c_tools_operation(&context, action);
+        }
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        if let Some(intent) = self.calibration.take_provision_intent() {
+            self.begin_eeprom_operation(&context, intent);
+        }
         #[cfg(feature = "calibration-opencv")]
         if let Some(export) = self.calibration.take_export() {
             self.begin_calibration_export(&context, export);
@@ -1515,7 +2586,14 @@ impl eframe::App for CameraToolboxApp {
 
 impl CameraToolboxApp {
     fn render_pangbot_simplified_ui(&mut self, context: &egui::Context, ui: &mut egui::Ui) {
-        self.product_workspace = ProductWorkspace::Calibration;
+        #[cfg(feature = "calibration-opencv")]
+        {
+            self.product_workspace = ProductWorkspace::Calibration;
+        }
+        #[cfg(not(feature = "calibration-opencv"))]
+        {
+            self.product_workspace = ProductWorkspace::Viewer;
+        }
         self.explorer_panel_expanded = false;
         self.x5_233_driver.driver_channel_0 = true;
         self.x5_233_driver.driver_channel_1 = false;
@@ -1527,16 +2605,87 @@ impl CameraToolboxApp {
         #[cfg(feature = "calibration-opencv")]
         self.sync_active_calibration_live_document();
         #[cfg(feature = "calibration-opencv")]
-        let calibration_viewer_presentation = self.workspace.active_live().and_then(|document| {
-            self.calibration.live_viewer_presentation(
-                document.displayed_frame().map(Arc::as_ref),
-                Some(&document.source),
-            )
-        });
+        struct PangbotViewerCard {
+            document_id: Option<DocumentId>,
+            channel: u16,
+            rtsp_port: u16,
+            i2c_bus: u16,
+            title: String,
+            detail: String,
+            summary: Option<CalibrationLiveWorkspaceSummary>,
+            presentation: Option<CalibrationViewerPresentation>,
+        }
+
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_viewer_cards = [0_u16, 3_u16]
+            .into_iter()
+            .map(|channel| {
+                let mapping = x5_233_channel_mapping(channel)
+                    .expect("pangbot simplified calibration channel is fixed");
+                if let Some(document) = self
+                    .workspace
+                    .live_documents()
+                    .iter()
+                    .find(|document| document.source.channel() == channel)
+                {
+                    PangbotViewerCard {
+                        document_id: Some(document.id),
+                        channel,
+                        rtsp_port: mapping.rtsp_port,
+                        i2c_bus: mapping.i2c_bus,
+                        title: document.source.title(),
+                        detail: document.source.detail(),
+                        summary: self.calibration.live_workspace_summary(&document.source),
+                        presentation: self.calibration.live_viewer_presentation(
+                            document.displayed_frame().map(Arc::as_ref),
+                            Some(&document.source),
+                        ),
+                    }
+                } else {
+                    PangbotViewerCard {
+                        document_id: None,
+                        channel,
+                        rtsp_port: mapping.rtsp_port,
+                        i2c_bus: mapping.i2c_bus,
+                        title: format!("CH{channel} viewer"),
+                        detail: "等待第一步启动驱动并建立 RTSP。".to_owned(),
+                        summary: None,
+                        presentation: None,
+                    }
+                }
+            })
+            .collect::<Vec<_>>();
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_sftp_label: Result<String, String> = {
+            #[cfg(feature = "platform-ssh")]
+            {
+                self.remote_control_label("输入设备 IP 后可用于 EEPROM 写入。")
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                Err("当前构建不包含 SSH / EEPROM 写入能力。".to_owned())
+            }
+        };
+        #[cfg(feature = "calibration-opencv")]
+        let calibration_provision_label: Result<String, String> = {
+            #[cfg(feature = "platform-ssh")]
+            {
+                self.eeprom_target
+                    .as_ref()
+                    .map(|target| target.label.clone())
+                    .ok_or_else(|| "先在第 5 步配置固定 I²C 写入目标。".to_owned())
+            }
+            #[cfg(not(feature = "platform-ssh"))]
+            {
+                Err("当前构建不包含 SSH EEPROM 写入。".to_owned())
+            }
+        };
 
         egui::Panel::top("pangbot_header").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.heading("pangbot-calib-tool · X5_233 简化标定");
+                ui.separator();
+                ui.label("固定 CH0→i2c-4，CH3→i2c-6");
             });
         });
         egui::Panel::bottom("pangbot_status_bar").show(ui, |ui| {
@@ -1572,16 +2721,97 @@ impl CameraToolboxApp {
                         ui,
                         calibration_export_error.is_none(),
                         calibration_export_error.as_deref(),
+                        calibration_sftp_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
+                        calibration_provision_label
+                            .as_ref()
+                            .map(|label| label.as_str())
+                            .map_err(|error| error.as_str()),
                         has_live_inspection,
                         |ui| {
-                            let document = workspace.active_live_mut()?;
-                            let _ = Self::render_live_viewer(
-                                ui,
-                                document,
-                                true,
-                                calibration_viewer_presentation.as_ref(),
-                            );
+                            for (index, card) in calibration_viewer_cards.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(8.0);
+                                }
+                                ui.group(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.heading(format!("CH{} viewer", card.channel));
+                                        ui.separator();
+                                        ui.monospace(format!(
+                                            "RTSP {} · i2c-{}",
+                                            card.rtsp_port, card.i2c_bus
+                                        ));
+                                    });
+                                    ui.label(&card.title);
+                                    ui.label(&card.detail);
+                                    if let Some(summary) = card.summary.as_ref() {
+                                        ui.label(format!(
+                                            "数据集：{} 张",
+                                            summary.dataset_item_count
+                                        ));
+                                        if let Some(label) =
+                                            summary.selected_dataset_label.as_deref()
+                                        {
+                                            ui.label(format!("当前选中：{label}"));
+                                        } else {
+                                            ui.weak("当前没有选中数据集项。");
+                                        }
+                                        ui.label(format!("状态：{}", summary.status));
+                                    } else {
+                                        ui.weak("数据集：等待该路预览建立后初始化。");
+                                    }
+                                    if let Some(document_id) = card.document_id {
+                                        if let Some(document) = workspace.live_mut(document_id) {
+                                            let _ = Self::render_live_viewer(
+                                                ui,
+                                                document,
+                                                true,
+                                                card.presentation.as_ref(),
+                                            );
+                                        }
+                                    } else {
+                                        ui.weak("暂无画面。完成第一步后自动显示该路预览。");
+                                    }
+                                });
+                            }
                             None
+                        },
+                        |ui| {
+                            for (index, card) in calibration_viewer_cards.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(6.0);
+                                }
+                                ui.group(|ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.heading(format!("CH{} 数据集", card.channel));
+                                        ui.separator();
+                                        ui.monospace(format!(
+                                            "RTSP {} · i2c-{}",
+                                            card.rtsp_port, card.i2c_bus
+                                        ));
+                                    });
+                                    if let Some(summary) = card.summary.as_ref() {
+                                        ui.label(format!(
+                                            "已收入 {} 张",
+                                            summary.dataset_item_count
+                                        ));
+                                        if let Some(label) =
+                                            summary.selected_dataset_label.as_deref()
+                                        {
+                                            ui.label(format!("当前选中：{label}"));
+                                        } else {
+                                            ui.weak("当前没有选中数据集项。");
+                                        }
+                                        ui.label(format!("状态：{}", summary.status));
+                                    } else {
+                                        ui.weak("等待该路 viewer 建立后创建独立数据集。");
+                                    }
+                                });
+                            }
                         },
                     );
                     rect
@@ -1597,6 +2827,10 @@ impl CameraToolboxApp {
             })
             .inner;
 
+        #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+        if let Some(intent) = self.calibration.take_provision_intent() {
+            self.begin_eeprom_operation(context, intent);
+        }
         #[cfg(feature = "calibration-opencv")]
         if let Some(export) = self.calibration.take_export() {
             self.begin_calibration_export(context, export);
@@ -1619,11 +2853,16 @@ impl CameraToolboxApp {
         ui: &mut egui::Ui,
     ) -> Option<LiveStreamOpenRequest> {
         let host_ready = !self.x5_233_driver.device_ip.trim().is_empty();
+        #[cfg(feature = "platform-ssh")]
         let ssh_host_key_ready = !self.x5_233_driver.ssh_expected_host_key.trim().is_empty();
-        let driver_ready = host_ready
-            && self.x5_233_driver.last_tcp_status.is_some()
-            && self.active_x5_233_driver_bootstrap.is_none();
+        #[cfg(not(feature = "platform-ssh"))]
+        let ssh_host_key_ready = true;
+        #[cfg(feature = "platform-ssh")]
         let bootstrap_running = self.active_x5_233_driver_bootstrap.is_some();
+        #[cfg(not(feature = "platform-ssh"))]
+        let bootstrap_running = false;
+        let driver_running = self.x5_233_driver_is_running();
+        let driver_ready = host_ready && driver_running;
         let mut request = None;
 
         ui.group(|ui| {
@@ -1637,22 +2876,33 @@ impl CameraToolboxApp {
                         .hint_text("例如 10.21.12.108")
                         .desired_width(180.0),
                 );
-                ui.label("SSH 主机密钥");
-                ui.add_enabled(
-                    !bootstrap_running,
-                    egui::TextEdit::singleline(&mut self.x5_233_driver.ssh_expected_host_key)
-                        .hint_text("ssh-ed25519 AAAA...")
-                        .desired_width(280.0),
-                );
+                #[cfg(feature = "platform-ssh")]
+                {
+                    ui.label("SSH 主机密钥");
+                    ui.add_enabled(
+                        !bootstrap_running,
+                        egui::TextEdit::singleline(&mut self.x5_233_driver.ssh_expected_host_key)
+                            .hint_text("ssh-ed25519 AAAA...")
+                            .desired_width(280.0),
+                    );
+                }
                 if ui
                     .add_enabled(
                         host_ready && ssh_host_key_ready && !bootstrap_running,
-                        egui::Button::new("启动驱动并读取状态"),
+                        egui::Button::new(if driver_running {
+                            "读取驱动状态"
+                        } else {
+                            "检测驱动并必要时启动"
+                        }),
                     )
-                    .on_disabled_hover_text("先输入 X5_233 设备 IP 和 SSH 主机密钥；启动中请等待结果。")
+                    .on_disabled_hover_text(if bootstrap_running {
+                        "驱动启动中，请等待结果。"
+                    } else {
+                        "先输入 X5_233 设备 IP 和 SSH 主机密钥。"
+                    })
                     .clicked()
                 {
-                    self.start_x5_233_driver_bootstrap(context);
+                    self.refresh_or_bootstrap_x5_233_driver(context);
                 }
                 if ui
                     .add_enabled(
@@ -1671,7 +2921,7 @@ impl CameraToolboxApp {
                     }
                 }
             });
-            ui.weak("SSH 用户固定 root/root；必须提供设备的 OpenSSH 主机公钥，GUI 会在已固定密钥的 SSH 连接上执行 /opt/DEMO233，并等待 TCP 9073 可用。");
+            ui.weak("SSH 用户固定 root/root；GUI 会先检测 TCP 9073 是否已有驱动在运行；未运行时必须使用已固定的 OpenSSH 主机公钥通过 SSH 在 /opt 自动执行 SC233_CALIBRATION_MODE=1 ./DEMO233，并等待 TCP 9073 可用。");
         });
 
         ui.add_space(8.0);
@@ -1683,7 +2933,7 @@ impl CameraToolboxApp {
             ui.horizontal_wrapped(|ui| {
                 if ui
                     .add_enabled(driver_ready, egui::Button::new("连接 CH0 / CH3 预览"))
-                    .on_disabled_hover_text("第一步启动驱动并读取到 TCP 状态后才能连接 RTSP 预览。")
+                    .on_disabled_hover_text("第一步确认驱动已开启后才能连接 RTSP 预览。")
                     .clicked()
                 {
                     request = Some(LiveStreamOpenRequest::X5233Selected);
@@ -1752,6 +3002,8 @@ impl CameraToolboxApp {
         match self.product_workspace {
             ProductWorkspace::Viewer => CaptureTarget::Viewer,
             ProductWorkspace::Color => CaptureTarget::Color,
+            #[cfg(feature = "platform-ssh")]
+            ProductWorkspace::I2cTools => CaptureTarget::Viewer,
             #[cfg(feature = "calibration-opencv")]
             ProductWorkspace::Calibration => CaptureTarget::Calibration,
         }
@@ -1759,10 +3011,55 @@ impl CameraToolboxApp {
 
     fn capture_route_label(&self) -> String {
         let target = self.capture_target_for_current_workspace();
+        #[cfg(feature = "platform-ssh")]
+        if self.product_workspace == ProductWorkspace::I2cTools {
+            return format!(
+                "Capture route follows current workspace: {} (I²C Tools has no image consumer)",
+                target.label()
+            );
+        }
         format!(
             "Capture route follows current workspace: {}",
             target.label()
         )
+    }
+
+    fn x5_233_driver_is_running(&self) -> bool {
+        #[cfg(feature = "platform-ssh")]
+        let bootstrap_running = self.active_x5_233_driver_bootstrap.is_some();
+        #[cfg(not(feature = "platform-ssh"))]
+        let bootstrap_running = false;
+        !bootstrap_running
+            && self
+                .x5_233_driver
+                .last_tcp_status
+                .as_ref()
+                .is_some_and(|summary| summary.rtsp_started)
+    }
+
+    fn refresh_or_bootstrap_x5_233_driver(&mut self, context: &egui::Context) {
+        match x5_tcp_client::probe(&self.x5_233_driver.device_ip, self.x5_233_driver.tcp_port) {
+            Ok(summary) => {
+                let running = summary.rtsp_started;
+                if let Some(fps) = summary.fps {
+                    self.x5_233_driver.fps = fps;
+                }
+                if let Some(bitrate_kbps) = summary.bitrate_kbps {
+                    self.x5_233_driver.bitrate_kbps = bitrate_kbps;
+                }
+                self.x5_233_driver.last_tcp_status = Some(summary);
+                if running {
+                    self.x5_233_driver.last_status = Some("驱动已在运行。".to_owned());
+                    self.x5_233_driver.last_error = None;
+                } else {
+                    self.start_x5_233_driver_bootstrap(context);
+                }
+            }
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(error);
+                self.start_x5_233_driver_bootstrap(context);
+            }
+        }
     }
 
     fn x5_233_control_label(&self) -> Result<String, String> {
@@ -1838,13 +3135,12 @@ impl CameraToolboxApp {
             return;
         };
         let credential_ref = format!("session:{slot_id}");
-        let connection = SshConnectionTarget {
-            host: config.host.clone(),
-            port: config.port,
-            username: config.username.clone(),
-            expected_host_key: config.expected_host_key.clone(),
-            command_subsystem: None,
-            remote_event_subsystem: None,
+        let connection = match Self::verified_ssh_connection_target(&config) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.x5_233_driver.last_error = Some(error);
+                return;
+            }
         };
         let generation = self.next_generation;
         self.next_generation = self.next_generation.wrapping_add(1).max(1);
@@ -1959,8 +3255,41 @@ impl CameraToolboxApp {
         if let Some(source) = self.explorer.connected_sftp_connection().cloned() {
             return Ok(source);
         }
+        if self.x5_233_driver.device_ip.trim().is_empty() {
+            return Err(missing_reason.to_owned());
+        }
         self.x5_233_control_connection()
-            .map_err(|_| missing_reason.to_owned())
+    }
+    #[cfg(feature = "platform-ssh")]
+    /// 从会话连接配置导出严格 pin 的 SSH target。
+    ///
+    /// EEPROM 与 I²C 等设备控制绝不允许将未验证的 host key 下传给 transport。
+    fn verified_ssh_connection_target(
+        source: &RemoteConnectionConfig,
+    ) -> Result<SshConnectionTarget, String> {
+        let expected_host_key = source.expected_host_key.as_deref().ok_or_else(|| {
+            format!(
+                "SSH host-key verification is required for remote device control ({})",
+                source.display_name
+            )
+        })?;
+        let expected_host_key = ServerHostKey::from_openssh(expected_host_key)
+            .map_err(|error| {
+                format!(
+                    "SSH host key for remote device control ({}) is invalid: {error}",
+                    source.display_name
+                )
+            })?
+            .openssh()
+            .to_owned();
+        Ok(SshConnectionTarget {
+            host: source.host.clone(),
+            port: source.port,
+            username: source.username.clone(),
+            expected_host_key: Some(expected_host_key),
+            command_subsystem: None,
+            remote_event_subsystem: None,
+        })
     }
     fn render_product_workspace_switch(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
@@ -1973,6 +3302,12 @@ impl CameraToolboxApp {
                 &mut self.product_workspace,
                 ProductWorkspace::Color,
                 "Color",
+            );
+            #[cfg(feature = "platform-ssh")]
+            ui.selectable_value(
+                &mut self.product_workspace,
+                ProductWorkspace::I2cTools,
+                "I²C Tools",
             );
             #[cfg(feature = "calibration-opencv")]
             ui.selectable_value(
@@ -3091,6 +4426,17 @@ impl CameraToolboxApp {
                 config,
                 session_password,
             }) => {
+                #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+                if self.active_eeprom_cancellation.is_some() {
+                    self.explorer.set_remote_connection_error(
+                        "Wait for the active EEPROM operation to finish before replacing Explorer SFTP.",
+                    );
+                    return;
+                }
+                #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+                self.invalidate_eeprom_target(
+                    "Explorer SFTP connection changed. Select it again for EEPROM and Inspect.",
+                );
                 let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
                     &config.authentication
                 else {
@@ -3722,6 +5068,527 @@ impl CameraToolboxApp {
         }
     }
 
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn invalidate_eeprom_target(&mut self, message: impl Into<String>) {
+        self.eeprom_target = None;
+        self.calibration.report_target_invalidated(message);
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn local_i2c_helper_program_name() -> &'static str {
+        "camera-i2c-helper-linux-aarch64"
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn local_i2c_helper_candidates() -> Result<Vec<PathBuf>, String> {
+        let current = std::env::current_exe()
+            .map_err(|error| format!("Resolve current executable failed: {error}"))?;
+        let parent = current
+            .parent()
+            .ok_or_else(|| format!("Current executable has no parent: {}", current.display()))?;
+        let program = Self::local_i2c_helper_program_name();
+        let mut candidates = vec![parent.join(&program)];
+        if parent
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "deps")
+            && let Some(profile_dir) = parent.parent()
+        {
+            candidates.push(profile_dir.join(program));
+        }
+        Ok(candidates)
+    }
+
+    /// 远端 I²C helper 固定为 Linux AArch64 ELF，避免将 GUI 宿主二进制上传后执行失败。
+    fn validate_i2c_helper_payload(bytes: &[u8], candidate: &Path) -> Result<(), String> {
+        const ELF_HEADER_BYTES: usize = 20;
+        const ELF64_CLASS: u8 = 2;
+        const LITTLE_ENDIAN: u8 = 1;
+        const AARCH64_MACHINE: [u8; 2] = [0xb7, 0x00];
+
+        let valid = bytes.len() >= ELF_HEADER_BYTES
+            && bytes.starts_with(b"\x7fELF")
+            && bytes[4] == ELF64_CLASS
+            && bytes[5] == LITTLE_ENDIAN
+            && bytes[18..20] == AARCH64_MACHINE;
+        if valid {
+            Ok(())
+        } else {
+            Err(format!(
+                "I2C helper {} is not a Linux AArch64 ELF binary",
+                candidate.display()
+            ))
+        }
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn read_local_i2c_helper_payload() -> Result<Arc<[u8]>, String> {
+        let candidates = Self::local_i2c_helper_candidates()?;
+        let mut missing = Vec::new();
+        for candidate in &candidates {
+            match fs::read(candidate) {
+                Ok(bytes) => {
+                    Self::validate_i2c_helper_payload(&bytes, candidate)?;
+                    return Ok(Arc::<[u8]>::from(bytes.into_boxed_slice()));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(candidate.display().to_string());
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "Read I2C helper {} failed: {error}",
+                        candidate.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "I2C helper binary not found; expected {}",
+            missing.join(" or ")
+        ))
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn configure_eeprom_target(
+        &mut self,
+        workspace_key: CalibrationWorkspaceKey,
+        request: CalibrationEepromTargetRequest,
+    ) -> Result<String, String> {
+        let source = self.remote_control_connection(
+            "Connect Explorer SFTP or enter an X5 board IP before configuring EEPROM.",
+        )?;
+        let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
+        else {
+            return Err("EEPROM requires a process-only SSH/SFTP password".to_owned());
+        };
+        let credential_ref = format!("session:{slot_id}");
+        let connection = Self::verified_ssh_connection_target(&source)?;
+        let target_document = serde_json::json!({
+            "connection_id": source.id.as_str(),
+            "host": source.host,
+            "port": source.port,
+            "username": source.username,
+            "i2c_bus": request.i2c_bus,
+            "map_id": camera_toolbox_core::YG_STEREO_P24C64G_V1_MAP_ID,
+        });
+        let target_bytes =
+            serde_json::to_vec(&target_document).map_err(|error| error.to_string())?;
+        let snapshot_hash = SnapshotHash::digest_bytes(&target_bytes);
+        let helper_payload = Self::read_local_i2c_helper_payload()?;
+        let service = SshEepromProvisionService::new(
+            format!("calibration-eeprom-{}", &snapshot_hash.to_hex()[..12]),
+            connection,
+            credential_ref,
+            65_536,
+            request.i2c_bus,
+            helper_payload,
+            self.live_runtime.ssh_resolver(),
+            Arc::new(RusshTransportFactory),
+        )
+        .map_err(|error| error.to_string())?;
+        let label = format!(
+            "{}@{}:{} / i2c-{} @{}",
+            target_document["username"].as_str().unwrap_or(""),
+            target_document["host"].as_str().unwrap_or(""),
+            target_document["port"].as_u64().unwrap_or(0),
+            request.i2c_bus,
+            &snapshot_hash.to_hex()[..12],
+        );
+        self.eeprom_target = Some(EepromProvisioningTarget {
+            service: Arc::new(service),
+            snapshot_hash,
+            label: label.clone(),
+            workspace_key,
+            i2c_bus: u32::from(request.i2c_bus),
+        });
+        Ok(label)
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn begin_i2c_tools_operation(&mut self, context: &egui::Context, action: I2cToolsAction) {
+        if matches!(action, I2cToolsAction::Cancel) {
+            if !self.active_i2c_tools_cancellable {
+                self.i2c_tools
+                    .report_error("No cancellable I²C Tools operation is active.");
+            } else if let Some(cancellation) = &self.active_i2c_tools_cancellation {
+                cancellation.cancel();
+                self.i2c_tools.report_cancelled();
+            }
+            return;
+        }
+        if self.active_i2c_tools_cancellation.is_some() {
+            self.i2c_tools
+                .report_error("An I²C Tools operation is already active.");
+            return;
+        }
+        let source = match self.remote_control_connection(
+            "Connect Explorer SFTP or enter an X5 board IP before using I²C Tools.",
+        ) {
+            Ok(source) => source,
+            Err(error) => {
+                self.i2c_tools.report_error(error);
+                return;
+            }
+        };
+        let camera_toolbox_app::RemoteAuthentication::Password { slot_id } = &source.authentication
+        else {
+            self.i2c_tools
+                .report_error("I²C Tools requires a process-only SSH/SFTP password.");
+            return;
+        };
+        let helper_payload = match Self::read_local_i2c_helper_payload() {
+            Ok(payload) => payload,
+            Err(error) => {
+                self.i2c_tools.report_error(error);
+                return;
+            }
+        };
+        let (kind, helper_action) = match action {
+            I2cToolsAction::DiscoverBuses => (
+                I2cToolsOperationKind::BusDiscovery,
+                I2cHelperAction::ListBuses,
+            ),
+            I2cToolsAction::ExecuteTransfer(transactions) => (
+                I2cToolsOperationKind::Transfer,
+                I2cHelperAction::Transfer { transactions },
+            ),
+            I2cToolsAction::Cancel => unreachable!("cancel returns before worker dispatch"),
+        };
+        let credential_ref = format!("session:{slot_id}");
+        let connection = match Self::verified_ssh_connection_target(&source) {
+            Ok(connection) => connection,
+            Err(error) => {
+                self.i2c_tools.report_error(error);
+                return;
+            }
+        };
+        let cancellation = DumpCancellation::default();
+        self.active_i2c_tools_cancellation = Some(cancellation.clone());
+        self.active_i2c_tools_cancellable = true;
+        let sender = self.i2c_tools_sender.clone();
+        let worker_context = context.clone();
+        let resolver = self.live_runtime.ssh_resolver();
+        let transport = Arc::new(RusshTransportFactory);
+        let spawn_result = thread::Builder::new()
+            .name("camera-toolbox-i2c-tools".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_i2c_tools_request(
+                        connection,
+                        credential_ref,
+                        helper_payload,
+                        resolver,
+                        transport,
+                        helper_action,
+                        cancellation,
+                    )
+                }))
+                .unwrap_or_else(|_| Err("I²C Tools worker panicked".to_owned()));
+                let _ = sender.send(I2cToolsOperationResult { kind, result });
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.active_i2c_tools_cancellation = None;
+            self.active_i2c_tools_cancellable = false;
+            self.i2c_tools
+                .report_error(format!("Failed to start I²C Tools worker: {error}"));
+        }
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn begin_eeprom_operation(
+        &mut self,
+        context: &egui::Context,
+        request: CalibrationProvisionRequest,
+    ) {
+        let CalibrationProvisionRequest {
+            workspace_key,
+            intent,
+        } = request;
+        let intent = match intent {
+            CalibrationProvisionIntent::ConfigureTarget(request) => {
+                if self.active_eeprom_cancellation.is_some() {
+                    self.calibration.report_provision_error(
+                        &workspace_key,
+                        "Wait for the active EEPROM operation to finish before reconfiguring its target.",
+                    );
+                    return;
+                }
+                self.invalidate_eeprom_target(
+                    "Reconfiguring EEPROM target; previous Inspect and Write authorization are invalid.",
+                );
+                match self.configure_eeprom_target(workspace_key.clone(), request) {
+                    Ok(label) => self
+                        .calibration
+                        .report_target_configured(&workspace_key, &label),
+                    Err(error) => self
+                        .calibration
+                        .report_target_configuration_failed(&workspace_key, error),
+                }
+                return;
+            }
+            other => other,
+        };
+        if matches!(&intent, CalibrationProvisionIntent::Cancel) {
+            if !self.active_eeprom_cancellable {
+                self.calibration.report_provision_error(
+                    &workspace_key,
+                    "No cancellable EEPROM read operation is active.",
+                );
+            } else if let Some(cancellation) = &self.active_eeprom_cancellation {
+                cancellation.cancel();
+            }
+            return;
+        }
+        if self.active_eeprom_cancellation.is_some() {
+            self.calibration
+                .report_provision_error(&workspace_key, "An EEPROM operation is already active.");
+            return;
+        }
+        if matches!(&intent, CalibrationProvisionIntent::DiscoverBuses) {
+            let source = match self.remote_control_connection(
+                "Connect Explorer SFTP or enter an X5 board IP before discovering I²C buses.",
+            ) {
+                Ok(source) => source,
+                Err(error) => {
+                    self.calibration
+                        .report_bus_discovery_failed(&workspace_key, error);
+                    return;
+                }
+            };
+            let camera_toolbox_app::RemoteAuthentication::Password { slot_id } =
+                &source.authentication
+            else {
+                self.calibration.report_bus_discovery_failed(
+                    &workspace_key,
+                    "I²C bus discovery requires a process-only SSH/SFTP password",
+                );
+                return;
+            };
+            let credential_ref = format!("session:{slot_id}");
+            let connection = match Self::verified_ssh_connection_target(&source) {
+                Ok(connection) => connection,
+                Err(error) => {
+                    self.calibration
+                        .report_bus_discovery_failed(&workspace_key, error);
+                    return;
+                }
+            };
+            let helper_payload = match Self::read_local_i2c_helper_payload() {
+                Ok(payload) => payload,
+                Err(error) => {
+                    self.calibration
+                        .report_bus_discovery_failed(&workspace_key, error);
+                    return;
+                }
+            };
+            let operation_id = self.next_eeprom_operation;
+            self.next_eeprom_operation = self.next_eeprom_operation.wrapping_add(1).max(1);
+            let cancellation = DumpCancellation::default();
+            self.active_eeprom_cancellation = Some(cancellation.clone());
+            self.active_eeprom_cancellable = true;
+            let sender = self.eeprom_operation_sender.clone();
+            let worker_context = context.clone();
+            let target_label = format!(
+                "{}@{}:{} / i2c-buses",
+                source.username, source.host, source.port,
+            );
+            let resolver = self.live_runtime.ssh_resolver();
+            let transport = Arc::new(RusshTransportFactory);
+            let operation_workspace_key = workspace_key.clone();
+            let spawn_result = thread::Builder::new()
+                .name("camera-toolbox-i2c-discovery".to_owned())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_i2c_bus_discovery(
+                            connection,
+                            credential_ref,
+                            helper_payload,
+                            resolver,
+                            transport,
+                            operation_id,
+                            cancellation,
+                        )
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(EepromOperationFailure::known(
+                            "I²C bus discovery worker panicked",
+                        ))
+                    });
+                    let _ = sender.send(EepromOperationResult {
+                        kind: EepromOperationKind::BusDiscovery,
+                        target_label,
+                        workspace_key: operation_workspace_key,
+                        result,
+                    });
+                    worker_context.request_repaint();
+                });
+            if let Err(error) = spawn_result {
+                self.active_eeprom_cancellation = None;
+                self.active_eeprom_cancellable = false;
+                self.calibration.report_bus_discovery_failed(
+                    &workspace_key,
+                    format!("Failed to start I²C bus discovery worker: {error}"),
+                );
+            }
+            return;
+        }
+
+        let target = match self.eeprom_target.clone() {
+            Some(target) => target,
+            None => {
+                self.calibration.report_provision_error(
+                    &workspace_key,
+                    "Configure the EEPROM SSH target in the Calibration panel.",
+                );
+                return;
+            }
+        };
+        if target.workspace_key != workspace_key {
+            self.calibration.report_provision_error(
+                &workspace_key,
+                "EEPROM target belongs to another calibration workspace. Re-select the I²C bus and Inspect in this workspace before writing.",
+            );
+            return;
+        }
+        if let Some(expected_target_label) = expected_eeprom_target_label(&intent)
+            && target.label != expected_target_label
+        {
+            self.calibration.report_provision_error(
+                &workspace_key,
+                format!(
+                    "EEPROM target changed before execution: selected {expected_target_label}, current {}. Re-select the I²C bus and Inspect again before writing.",
+                    target.label
+                ),
+            );
+            return;
+        }
+        if let CalibrationProvisionIntent::Provision { request, .. } = &intent
+            && let Err(error) = ensure_eeprom_history_slot_available(&request.serial_number)
+        {
+            self.calibration
+                .report_provision_error(&workspace_key, error);
+            return;
+        }
+        let operation_id = self.next_eeprom_operation;
+        self.next_eeprom_operation = self.next_eeprom_operation.wrapping_add(1).max(1);
+        let cancellation = DumpCancellation::default();
+        self.active_eeprom_cancellation = Some(cancellation.clone());
+        self.active_eeprom_cancellable =
+            !matches!(&intent, CalibrationProvisionIntent::Provision { .. });
+        let sender = self.eeprom_operation_sender.clone();
+        let worker_context = context.clone();
+        let target_label = target.label.clone();
+        let provision_attempt = matches!(&intent, CalibrationProvisionIntent::Provision { .. });
+        let kind = match &intent {
+            CalibrationProvisionIntent::Inspect { .. } => EepromOperationKind::Inspect,
+            CalibrationProvisionIntent::Provision { .. } => EepromOperationKind::Provision,
+            CalibrationProvisionIntent::Cancel
+            | CalibrationProvisionIntent::ConfigureTarget(_)
+            | CalibrationProvisionIntent::DiscoverBuses => {
+                unreachable!("non-worker EEPROM intents return before worker dispatch")
+            }
+        };
+        let operation_workspace_key = workspace_key.clone();
+        let spawn_result = thread::Builder::new()
+            .name("camera-toolbox-eeprom-operation".to_owned())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_eeprom_operation(target, intent, operation_id, cancellation)
+                }))
+                .unwrap_or_else(|_| {
+                    Err(if provision_attempt {
+                        EepromOperationFailure::unknown("EEPROM operation worker panicked")
+                    } else {
+                        EepromOperationFailure::known("EEPROM operation worker panicked")
+                    })
+                });
+                let _ = sender.send(EepromOperationResult {
+                    workspace_key: operation_workspace_key,
+                    kind,
+                    target_label,
+                    result,
+                });
+                worker_context.request_repaint();
+            });
+        if let Err(error) = spawn_result {
+            self.active_eeprom_cancellation = None;
+            self.active_eeprom_cancellable = false;
+            self.calibration.report_provision_error(
+                &workspace_key,
+                format!("Failed to start EEPROM operation worker: {error}"),
+            );
+        }
+    }
+
+    #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+    fn poll_eeprom_operation_result(&mut self, _context: &egui::Context) {
+        while let Ok(operation) = self.eeprom_operation_receiver.try_recv() {
+            self.active_eeprom_cancellation = None;
+            self.active_eeprom_cancellable = false;
+            match operation.result {
+                Ok(EepromOperationOutcome::Inspect(result)) => {
+                    self.calibration.report_eeprom_inspect(
+                        &operation.workspace_key,
+                        operation.target_label,
+                        result,
+                    )
+                }
+                Ok(EepromOperationOutcome::BusDiscovery { buses }) => {
+                    self.calibration
+                        .report_bus_discovery(&operation.workspace_key, buses);
+                }
+                Ok(EepromOperationOutcome::Provision {
+                    result,
+                    history_file,
+                }) => self.calibration.report_eeprom_provision(
+                    &operation.workspace_key,
+                    operation.target_label,
+                    &result,
+                    history_file,
+                ),
+                Ok(EepromOperationOutcome::ProvisionAuditFailed { result, error }) => {
+                    self.calibration.report_eeprom_provision_audit_error(
+                        &operation.workspace_key,
+                        operation.target_label,
+                        &result,
+                        &error,
+                    )
+                }
+                Err(error) if error.provision_state_unknown => self
+                    .calibration
+                    .report_eeprom_provision_unknown(&operation.workspace_key, error.message),
+                Err(error) if operation.kind == EepromOperationKind::BusDiscovery => {
+                    self.calibration
+                        .report_bus_discovery_failed(&operation.workspace_key, error.message);
+                }
+                Err(error) => self
+                    .calibration
+                    .report_provision_error(&operation.workspace_key, error.message),
+            }
+        }
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    fn poll_i2c_tools_result(&mut self) {
+        while let Ok(operation) = self.i2c_tools_receiver.try_recv() {
+            self.active_i2c_tools_cancellation = None;
+            self.active_i2c_tools_cancellable = false;
+            match (operation.kind, operation.result) {
+                (I2cToolsOperationKind::BusDiscovery, Ok(I2cHelperResult::BusList { buses })) => {
+                    self.i2c_tools.report_buses(buses)
+                }
+                (
+                    I2cToolsOperationKind::Transfer,
+                    Ok(I2cHelperResult::Transfer { transactions }),
+                ) => self.i2c_tools.report_transfer(transactions),
+                (kind, Ok(unexpected)) => self.i2c_tools.report_error(format!(
+                    "I²C helper returned an unexpected result for {kind:?}: {unexpected:?}"
+                )),
+                (_, Err(error)) => self.i2c_tools.report_error(error),
+            }
+        }
+    }
 
     fn active_yuv_save_defaults(&self) -> (YuvMatrix, YuvRange) {
         if let Some(document) = self.workspace.active_image()
@@ -5094,17 +6961,18 @@ impl CameraToolboxApp {
                         .hint_text("X5 board IP"),
                 );
             });
+            x5_233_form_row(ui, "TCP port", |ui, width| {
+                ui.add_sized(
+                    [width, 0.0],
+                    egui::DragValue::new(&mut self.x5_233_driver.tcp_port).range(1..=u16::MAX),
+                );
+            });
+            #[cfg(feature = "platform-ssh")]
             x5_233_form_row(ui, "SSH host key", |ui, width| {
                 ui.add_sized(
                     [width, 0.0],
                     egui::TextEdit::singleline(&mut self.x5_233_driver.ssh_expected_host_key)
                         .hint_text("ssh-ed25519 AAAA..."),
-                );
-            });
-            x5_233_form_row(ui, "TCP port", |ui, width| {
-                ui.add_sized(
-                    [width, 0.0],
-                    egui::DragValue::new(&mut self.x5_233_driver.tcp_port).range(1..=u16::MAX),
                 );
             });
             let control_label = self.x5_233_control_label().unwrap_or_else(|_| {
@@ -5116,7 +6984,8 @@ impl CameraToolboxApp {
             x5_233_wrapped_weak(
                 ui,
                 format!(
-                    "SSH/SFTP control: {control_label}; an OpenSSH server key is required for SSH operations."
+                    "SSH/SFTP control: {control_label}; process-only password defaults to {}.",
+                    self.x5_233_driver.ssh_password
                 ),
             );
             if ui

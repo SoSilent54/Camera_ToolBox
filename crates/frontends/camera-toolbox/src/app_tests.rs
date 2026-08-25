@@ -393,6 +393,8 @@ fn x5_233_driver_defaults_match_driver_contract() {
     assert!(app.x5_233_driver.device_ip.is_empty());
     assert_eq!(app.x5_233_driver.ssh_user, "root");
     assert_eq!(app.x5_233_driver.ssh_password, "root");
+    #[cfg(feature = "platform-ssh")]
+    assert!(app.x5_233_driver.ssh_expected_host_key.is_empty());
     assert_eq!(app.x5_233_driver.tcp_port, 9073);
     assert!(app.x5_233_driver.configure_before_connect);
     assert_eq!(app.x5_233_driver.width, 1920);
@@ -651,7 +653,9 @@ fn x5_233_remote_control_fallback_builds_root_connection() {
     let context = egui::Context::default();
     let mut app = CameraToolboxApp::new(&context).unwrap();
     app.x5_233_driver.device_ip = "10.21.12.108".to_owned();
-    app.x5_233_driver.ssh_expected_host_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ".to_owned();
+    const EXPECTED_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    app.x5_233_driver.ssh_expected_host_key = EXPECTED_HOST_KEY.to_owned();
 
     let config = app.remote_control_connection("missing").unwrap();
 
@@ -659,14 +663,55 @@ fn x5_233_remote_control_fallback_builds_root_connection() {
     assert_eq!(config.port, 22);
     assert_eq!(config.username, "root");
     assert_eq!(config.display_name, "X5_233 root@10.21.12.108:22");
-    assert_eq!(
-        config.expected_host_key.as_deref(),
-        Some("ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ")
-    );
+    assert_eq!(config.expected_host_key.as_deref(), Some(EXPECTED_HOST_KEY));
     assert!(matches!(
         config.authentication,
         camera_toolbox_app::RemoteAuthentication::Password { .. }
     ));
+}
+
+#[cfg(feature = "platform-ssh")]
+#[test]
+fn x5_233_remote_control_rejects_missing_host_key() {
+    let context = egui::Context::default();
+    let mut app = CameraToolboxApp::new(&context).unwrap();
+    app.x5_233_driver.device_ip = "10.21.12.108".to_owned();
+
+    let error = match app.remote_control_connection("missing") {
+        Ok(_) => panic!("a missing X5 host key must prevent SSH control"),
+        Err(error) => error,
+    };
+    assert!(
+        error.starts_with("X5_233 expected SSH host key is invalid:"),
+        "unexpected error: {error}"
+    );
+}
+
+#[cfg(feature = "platform-ssh")]
+#[test]
+fn verified_ssh_target_preserves_pin_for_eeprom_and_i2c_helpers() {
+    const EXPECTED_HOST_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+    let mut connection = camera_toolbox_app::RemoteConnectionConfig {
+        id: camera_toolbox_app::RemoteConnectionId::new("verified-control-test").unwrap(),
+        display_name: "root@camera.test:2222".to_owned(),
+        host: "camera.test".to_owned(),
+        port: 2222,
+        username: "root".to_owned(),
+        expected_host_key: Some(EXPECTED_HOST_KEY.to_owned()),
+        authentication: camera_toolbox_app::RemoteAuthentication::Password {
+            slot_id: "test".to_owned(),
+        },
+    };
+
+    let target = CameraToolboxApp::verified_ssh_connection_target(&connection).unwrap();
+    assert_eq!(target.host, connection.host);
+    assert_eq!(target.port, connection.port);
+    assert_eq!(target.username, connection.username);
+    assert_eq!(target.expected_host_key.as_deref(), Some(EXPECTED_HOST_KEY));
+
+    connection.expected_host_key = None;
+    assert!(CameraToolboxApp::verified_ssh_connection_target(&connection).is_err());
 }
 
 #[test]
@@ -1902,13 +1947,11 @@ fn pangbot_simplified_flavor_renders_chinese_step_flow() {
 
     assert!(visible.contains("pangbot-calib-tool · X5_233 简化标定"));
     assert!(visible.contains("第一步：连接设备并启动驱动"));
-    assert!(visible.contains("第二步：预览与通道确认"));
-    assert!(visible.contains("第三步：标定采集"));
+    assert!(visible.contains("第二步：双 viewer 预览与通道确认"));
+    assert!(visible.contains("第三步：双路数据集采集与筛选"));
     assert!(visible.contains("第四步：求解与检查"));
-    assert!(visible.contains("第五步：保存标定结果"));
+    assert!(visible.contains("第五步：写入并保存历史"));
     assert!(visible.contains("CH0 → RTSP 554 → i2c-4；CH3 → RTSP 557 → i2c-6"));
-    assert!(!visible.contains("EEPROM Provisioning"));
-    assert!(!visible.contains("I²C Tools"));
     assert!(!visible.contains("Minimum automatic Gain"));
     assert!(!visible.contains("Dataset Gain"));
 }
@@ -2145,7 +2188,7 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     assert!(!visible.contains("Negotiating"));
     assert!(visible.contains("Intrinsic Calibration"));
     assert!(visible.contains("Dataset (0)"));
-    assert!(!visible.contains("EEPROM Provisioning"));
+    assert!(visible.contains("EEPROM Provisioning"));
     assert!(visible.contains("Capture"));
     assert!(!visible.contains("Capture → Calibration dataset"));
     assert_eq!(accessibility_exact_label_count(&output, "Capture"), 1);
@@ -2244,6 +2287,54 @@ fn calibration_workspace_embeds_live_viewer_in_primary_inspection() {
     output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 7.0);
     assert!(accessibility_text(&output).contains("Dataset (0)"));
 
+    let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(eeprom),
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 8.0);
+    assert!(accessibility_text(&output).contains("YgStereo SNID"));
+    let eeprom = accesskit_rect_center(accesskit_bounds(&output, "EEPROM Provisioning"));
+    output = run_app_frame_with_viewport(
+        &context,
+        &mut app,
+        &mut frame,
+        viewport,
+        vec![
+            egui::Event::PointerMoved(eeprom),
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            },
+            egui::Event::PointerButton {
+                pos: eeprom,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            },
+        ],
+    );
+    output = settle_app_frame_with_viewport(&context, &mut app, &mut frame, viewport, 9.0);
+    assert!(!accessibility_text(&output).contains("YgStereo SNID"));
     let capture = accesskit_rect_center(accesskit_bounds(&output, "Capture"));
     output = run_app_frame_with_viewport(
         &context,
@@ -2586,6 +2677,683 @@ fn inactive_stream_capture_activates_clicked_row_and_uses_snapshot() {
     assert!(!visible.contains("RTSP ch1 frame 7"));
 }
 
+#[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
+mod eeprom_operation_tests {
+    use super::super::*;
+    use std::{fs, path::PathBuf, sync::Arc};
+
+    use camera_toolbox_adapters::platforms::ssh_managed::{
+        CredentialResolver, MemorySshTransport, SshTransportFactory,
+    };
+    use camera_toolbox_app::{
+        EepromDeviceState, EepromHelperFailure, EepromProvisionService, EepromRollbackState,
+        EepromSerialState, RemoteAuthentication, RemoteConnectionConfig, RemoteConnectionId,
+        SnapshotHash,
+    };
+    use camera_toolbox_core::{
+        EepromProvisionRequest, EepromProvisioningMode, EepromWriteSegment,
+        YG_STEREO_P24C64G_IMAGE_BYTES, YG_STEREO_P24C64G_V1_MAP_ID,
+    };
+
+    #[derive(Clone)]
+    struct FixedEepromService {
+        result: Result<EepromHelperResult, EepromProvisionServiceError>,
+    }
+
+    impl EepromProvisionService for FixedEepromService {
+        fn service_id(&self) -> &str {
+            "fixed-test-eeprom"
+        }
+
+        fn execute(
+            &self,
+            _request: EepromProvisionOperation,
+            _control: RemoteOperationControl,
+        ) -> Result<EepromHelperResult, EepromProvisionServiceError> {
+            self.result.clone()
+        }
+    }
+
+    fn state(hash: char) -> EepromDeviceState {
+        EepromDeviceState {
+            image_sha256: hash.to_string().repeat(64),
+            flag_valid: false,
+            serial: EepromSerialState::Empty,
+        }
+    }
+
+    fn request() -> EepromProvisionRequest {
+        request_with_sn("2T02D2567K0042")
+    }
+
+    fn request_with_sn(serial_number: &str) -> EepromProvisionRequest {
+        EepromProvisionRequest {
+            map_id: YG_STEREO_P24C64G_V1_MAP_ID.to_owned(),
+            mode: EepromProvisioningMode::UpdateCalibration,
+            serial_number: serial_number.to_owned(),
+            overwrite_existing_serial: false,
+            segments: Vec::new(),
+        }
+    }
+
+    fn calibration_segment(width: u32, height: u32, fx: f32, fy: f32, cx: f32, cy: f32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&width.to_le_bytes());
+        bytes.extend_from_slice(&height.to_le_bytes());
+        for value in [fx, fy, cx, cy] {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        for index in 0..12_u32 {
+            bytes.extend_from_slice(&(0.1_f32 + index as f32).to_le_bytes());
+        }
+        bytes
+    }
+
+    fn request_with_calibration_segment(serial_number: &str) -> EepromProvisionRequest {
+        let mut request = request_with_sn(serial_number);
+        request.segments = vec![EepromWriteSegment {
+            offset: 0x0010,
+            bytes: calibration_segment(1920, 1080, 1234.5, 1235.5, 960.25, 540.75),
+        }];
+        request
+    }
+
+    fn provision_intent(request: EepromProvisionRequest) -> CalibrationProvisionIntent {
+        let before_backup = vec![0xa5; 16];
+        CalibrationProvisionIntent::Provision {
+            expected_target_label: "root@camera / i2c-7".to_owned(),
+            request,
+            expected_before_sha256: SnapshotHash::digest_bytes(&before_backup).to_hex(),
+            before_backup,
+        }
+    }
+
+    fn target(
+        result: Result<EepromHelperResult, EepromProvisionServiceError>,
+    ) -> EepromProvisioningTarget {
+        EepromProvisioningTarget {
+            service: Arc::new(FixedEepromService { result }),
+            snapshot_hash: SnapshotHash::digest_bytes(b"target"),
+            label: "root@camera.local:22 / i2c-7 @test".to_owned(),
+            workspace_key: CalibrationWorkspaceKey::manual(),
+            i2c_bus: 7,
+        }
+    }
+
+    fn history_path(serial_number: &str) -> PathBuf {
+        eeprom_history_path(serial_number).unwrap()
+    }
+
+    fn legacy_history_path(serial_number: &str) -> PathBuf {
+        std::path::Path::new("write_history").join(format!("{serial_number}.json"))
+    }
+
+    fn history_file_path(file_name: &str) -> PathBuf {
+        std::path::Path::new("write_history").join(file_name)
+    }
+
+    fn write_history_with_recorded_snid(file_name: &str, serial_number: &str) -> PathBuf {
+        fs::create_dir_all("write_history").unwrap();
+        let path = history_file_path(file_name);
+        let document = serde_json::json!({
+            "schema_version": 2,
+            "request": {
+                "request": {
+                    "serial_number": serial_number,
+                },
+            },
+        });
+        fs::write(&path, serde_yaml::to_string(&document).unwrap()).unwrap();
+        path
+    }
+
+    fn remove_history_file(file_name: &str) {
+        let _ = fs::remove_file(history_file_path(file_name));
+    }
+
+    fn remove_history(serial_number: &str) {
+        let _ = fs::remove_file(history_path(serial_number));
+        let _ = fs::remove_file(legacy_history_path(serial_number));
+        if let Ok(serial) = safe_eeprom_history_stem(serial_number)
+            && let Ok(entries) = fs::read_dir("write_history")
+        {
+            let prefix = format!("{serial}_op");
+            for entry in entries.flatten() {
+                let file_name = entry.file_name();
+                if file_name.to_str().is_some_and(|name| {
+                    name.starts_with(&prefix) && name.ends_with("_prewrite_backup.bin")
+                }) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+    }
+
+    fn read_history(serial_number: &str) -> serde_json::Value {
+        serde_yaml::from_slice(&fs::read(history_path(serial_number)).unwrap()).unwrap()
+    }
+
+    fn read_history_file(path: &std::path::Path) -> serde_json::Value {
+        serde_yaml::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn cleanup_history(serial_number: &str) {
+        remove_history(serial_number);
+    }
+
+    #[test]
+    fn provision_success_writes_yaml_with_bus_and_original_parameters() {
+        let serial = "2T233268101900";
+        remove_history(serial);
+        let request = request_with_calibration_segment(serial);
+        let helper = EepromHelperResult::Provision(EepromWriteResult {
+            before: state('a'),
+            after: state('c'),
+            backup: vec![0x44; YG_STEREO_P24C64G_IMAGE_BYTES],
+            page_plan: Vec::new(),
+            bytewise_verified: true,
+            rollback: EepromRollbackState::NotRequired,
+        });
+
+        let outcome = run_eeprom_operation(
+            target(Ok(helper)),
+            provision_intent(request),
+            45,
+            DumpCancellation::default(),
+        )
+        .unwrap();
+
+        let EepromOperationOutcome::Provision { history_file, .. } = outcome else {
+            panic!("expected provision outcome")
+        };
+        assert_eq!(history_file, history_path(serial).display().to_string());
+        let audit = read_history(serial);
+        assert_eq!(audit["schema_version"], 2);
+        assert_eq!(audit["operation"], "eeprom_provision_success");
+        assert_eq!(audit["target"]["i2c_bus"], 7);
+        assert_eq!(audit["request"]["request"]["mode"], "update_calibration");
+        assert_eq!(
+            audit["request"]["request"]["calibration_parameters"]["image_size"]["width"],
+            1920
+        );
+        assert_eq!(
+            audit["request"]["request"]["calibration_parameters"]["image_size"]["height"],
+            1080
+        );
+        assert_eq!(
+            audit["request"]["request"]["calibration_parameters"]["camera_matrix"]["fx"],
+            1234.5
+        );
+        assert_eq!(
+            audit["request"]["request"]["write_segments"][0]["semantic_value"]["camera_matrix"]["cx"],
+            960.25
+        );
+        assert_eq!(
+            audit["result"]["backup_bytes"],
+            YG_STEREO_P24C64G_IMAGE_BYTES
+        );
+        assert!(audit["result"].get("backup").is_none());
+        cleanup_history(serial);
+    }
+
+    #[test]
+    fn history_file_name_converts_snid_date_and_sequence_to_decimal() {
+        assert_eq!(
+            safe_eeprom_history_file_name("2T233268101a00").unwrap(),
+            "2T233000_260801_73.yaml"
+        );
+        assert_eq!(
+            safe_eeprom_history_file_name("2T23326CV0ZZ00").unwrap(),
+            "2T233000_261231_3844.yaml"
+        );
+    }
+
+    #[test]
+    fn history_slot_allows_case_distinct_snids() {
+        let existing = "2T233268101a00";
+        let requested = "2T233268101A00";
+        remove_history(existing);
+        remove_history(requested);
+        let existing_path = write_history_with_recorded_snid("2T233268101a00.yaml", existing);
+
+        let result = ensure_eeprom_history_slot_available(requested);
+        fs::remove_file(existing_path).unwrap();
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn history_slot_rejects_exact_snid_across_case_distinct_filename() {
+        let requested = "2T233268201A00";
+        remove_history(requested);
+        remove_history_file("2T233268201a00.yaml");
+        let existing_path = write_history_with_recorded_snid("2T233268201a00.yaml", requested);
+
+        let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
+        fs::remove_file(existing_path).unwrap();
+
+        assert!(error.contains("already records SN 2T233268201A00"));
+    }
+
+    #[test]
+    fn history_slot_checks_all_history_candidates_by_recorded_snid() {
+        let requested = "2T233268301B00";
+        remove_history(requested);
+        remove_history_file("2T233268301b00.yaml");
+        remove_history_file("legacy-case-candidate-03.json");
+        let yaml_path = write_history_with_recorded_snid("2T233268301b00.yaml", "2T233268301b00");
+        let json_path =
+            write_history_with_recorded_snid("legacy-case-candidate-03.json", requested);
+
+        let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
+        fs::remove_file(yaml_path).unwrap();
+        fs::remove_file(json_path).unwrap();
+
+        assert!(error.contains("already records SN 2T233268301B00"));
+    }
+
+    #[test]
+    fn history_slot_rejects_occupied_decimal_filename_without_matching_snid() {
+        let requested = "2T233268401C00";
+        let occupant = "2T233268401c00";
+        remove_history(requested);
+        let occupied_name = safe_eeprom_history_file_name(requested).unwrap();
+        remove_history_file(&occupied_name);
+        let occupied_path = write_history_with_recorded_snid(&occupied_name, occupant);
+
+        let error = ensure_eeprom_history_slot_available(requested).unwrap_err();
+        fs::remove_file(occupied_path).unwrap();
+
+        assert!(error.contains("filename for SN 2T233268401C00 is already occupied"));
+    }
+
+    #[test]
+    fn persist_history_uses_decimal_snid_filename() {
+        let requested = "2T233268501Z00";
+        remove_history(requested);
+        let expected_name = "2T233000_260805_124.yaml";
+        remove_history_file(expected_name);
+        let document = serde_json::json!({
+            "request": {
+                "request": {
+                    "serial_number": requested,
+                },
+            },
+        });
+
+        let history_file = persist_eeprom_write_history_yaml(requested, 8, &document).unwrap();
+        let saved_path = PathBuf::from(&history_file);
+        let saved_audit = read_history_file(&saved_path);
+        fs::remove_file(&saved_path).unwrap();
+
+        assert_eq!(saved_path, history_file_path(expected_name));
+        assert_eq!(
+            saved_audit["request"]["request"]["serial_number"],
+            requested
+        );
+    }
+
+    #[test]
+    fn provision_failure_saves_structured_rollback_audit() {
+        let failure = EepromHelperFailure {
+            code: "write_failed".to_owned(),
+            message: "simulated page failure".to_owned(),
+            before: Some(state('a')),
+            backup: vec![0x5a; YG_STEREO_P24C64G_IMAGE_BYTES],
+            rollback: EepromRollbackState::Restored,
+            rollback_error: None,
+        };
+        let serial = "2T233268101d00";
+        remove_history(serial);
+
+        let error = run_eeprom_operation(
+            target(Err(EepromProvisionServiceError::Helper(failure))),
+            provision_intent(request_with_sn(serial)),
+            43,
+            DumpCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("rollback=Restored"));
+        assert!(!error.provision_state_unknown);
+        let audit = read_history(serial);
+        assert_eq!(audit["operation"], "eeprom_provision_failure");
+        assert_eq!(audit["failure"]["code"], "write_failed");
+        assert_eq!(audit["failure"]["rollback"], "restored");
+        assert!(audit["failure"].get("backup").is_none());
+        cleanup_history(serial);
+    }
+
+    #[test]
+    fn provision_failed_rollback_marks_device_unknown() {
+        let failure = EepromHelperFailure {
+            code: "rollback_failed".to_owned(),
+            message: "write and rollback both failed".to_owned(),
+            before: Some(state('a')),
+            backup: vec![0x5a; YG_STEREO_P24C64G_IMAGE_BYTES],
+            rollback: EepromRollbackState::Failed,
+            rollback_error: Some("read-back mismatch".to_owned()),
+        };
+        let serial = "2T233268101e00";
+        remove_history(serial);
+        let error = run_eeprom_operation(
+            target(Err(EepromProvisionServiceError::Helper(failure))),
+            provision_intent(request_with_sn(serial)),
+            44,
+            DumpCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.provision_state_unknown);
+        assert!(error.message.contains("rollback=Failed"));
+        cleanup_history(serial);
+    }
+
+    #[test]
+    fn provision_transport_failure_marks_device_unknown() {
+        let serial = "2T233268101f00";
+        remove_history(serial);
+
+        let error = run_eeprom_operation(
+            target(Err(EepromProvisionServiceError::Transport(
+                "SSH response was lost".to_owned(),
+            ))),
+            provision_intent(request_with_sn(serial)),
+            44,
+            DumpCancellation::default(),
+        )
+        .unwrap_err();
+
+        assert!(error.provision_state_unknown);
+        assert!(error.message.contains("SSH response was lost"));
+        let audit = read_history(serial);
+        assert_eq!(audit["device_state_unknown"], true);
+        cleanup_history(serial);
+    }
+    #[test]
+    fn failed_reconfiguration_drops_previous_eeprom_target() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.eeprom_target = Some(target(Err(EepromProvisionServiceError::Transport(
+            "unused fixture".to_owned(),
+        ))));
+
+        app.begin_eeprom_operation(
+            &context,
+            CalibrationProvisionRequest {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                intent: CalibrationProvisionIntent::ConfigureTarget(
+                    CalibrationEepromTargetRequest { i2c_bus: 7 },
+                ),
+            },
+        );
+
+        assert!(app.eeprom_target.is_none());
+    }
+    #[test]
+    fn configures_eeprom_from_password_sftp_with_verified_host_identity() {
+        const EXPECTED_HOST_KEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJdD7y3aLq454yWBdwLWbieU1ebz9/cu7/QEXn9OIeZJ";
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        let helper_path = CameraToolboxApp::local_i2c_helper_candidates()
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        fs::write(
+            &helper_path,
+            b"\x7fELF\x02\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xb7\x00",
+        )
+        .unwrap();
+        let memory = Arc::new(MemorySshTransport::new(EXPECTED_HOST_KEY));
+        memory.allow_credential("session:test");
+        let credentials: Arc<dyn CredentialResolver> = memory.clone();
+        let transport: Arc<dyn SshTransportFactory> = memory.clone();
+        app.explorer = ExplorerState::new(credentials, transport);
+        app.explorer
+            .finish_sftp_connection(
+                RemoteConnectionConfig {
+                    id: RemoteConnectionId::new("memory-eeprom").unwrap(),
+                    display_name: "root@camera.test:22".to_owned(),
+                    host: "camera.test".to_owned(),
+                    port: 22,
+                    username: "root".to_owned(),
+                    expected_host_key: Some(EXPECTED_HOST_KEY.to_owned()),
+                    authentication: RemoteAuthentication::Password {
+                        slot_id: "test".to_owned(),
+                    },
+                },
+                &context,
+            )
+            .unwrap();
+
+        app.begin_eeprom_operation(
+            &context,
+            CalibrationProvisionRequest {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                intent: CalibrationProvisionIntent::ConfigureTarget(
+                    CalibrationEepromTargetRequest { i2c_bus: 7 },
+                ),
+            },
+        );
+
+        let target = app
+            .eeprom_target
+            .as_ref()
+            .expect("EEPROM target configured");
+        assert!(target.label.starts_with("root@camera.test:22 / i2c-7 @"));
+        let _ = fs::remove_file(helper_path);
+    }
+
+    #[test]
+    fn rejects_non_linux_aarch64_eeprom_helper_payload() {
+        let path = PathBuf::from("wrong-helper");
+        let error =
+            CameraToolboxApp::validate_i2c_helper_payload(b"not an ELF", &path).unwrap_err();
+        assert!(error.contains("not a Linux AArch64 ELF"));
+    }
+
+    #[test]
+    fn active_operation_rejects_target_reconfiguration_without_dropping_target() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.eeprom_target = Some(target(Err(EepromProvisionServiceError::Transport(
+            "unused fixture".to_owned(),
+        ))));
+        app.active_eeprom_cancellation = Some(DumpCancellation::default());
+
+        app.begin_eeprom_operation(
+            &context,
+            CalibrationProvisionRequest {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                intent: CalibrationProvisionIntent::ConfigureTarget(
+                    CalibrationEepromTargetRequest { i2c_bus: 7 },
+                ),
+            },
+        );
+
+        assert!(app.eeprom_target.is_some());
+        assert!(app.active_eeprom_cancellation.is_some());
+    }
+
+    #[test]
+    fn eeprom_bus_discovery_result_updates_workspace_state() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.active_eeprom_cancellation = Some(DumpCancellation::default());
+        app.active_eeprom_cancellable = true;
+
+        app.eeprom_operation_sender
+            .send(EepromOperationResult {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                kind: EepromOperationKind::BusDiscovery,
+                target_label: "root@camera.test:22 / i2c-buses".to_owned(),
+                result: Ok(EepromOperationOutcome::BusDiscovery {
+                    buses: vec![
+                        camera_toolbox_app::I2cBusInfo {
+                            bus: 4,
+                            dev_path: "/dev/i2c-4".to_owned(),
+                            name: Some("i2c-4".to_owned()),
+                            dev_node_exists: true,
+                        },
+                        camera_toolbox_app::I2cBusInfo {
+                            bus: 6,
+                            dev_path: "/dev/i2c-6".to_owned(),
+                            name: Some("i2c-6".to_owned()),
+                            dev_node_exists: true,
+                        },
+                    ],
+                }),
+            })
+            .unwrap();
+
+        app.poll_eeprom_operation_result(&context);
+
+        assert!(app.active_eeprom_cancellation.is_none());
+        assert!(!app.active_eeprom_cancellable);
+        let eeprom = app.calibration.active_eeprom_for_test();
+        assert_eq!(eeprom.discovered_buses_for_test().len(), 2);
+        assert_eq!(eeprom.target_i2c_bus_for_test(), 4);
+        assert!(
+            eeprom
+                .status_for_test()
+                .contains("Discovered 2 I²C bus(es).")
+        );
+        assert!(!eeprom.busy_for_test());
+        assert!(eeprom.bus_discovery_error_for_test().is_none());
+    }
+
+    #[test]
+    fn eeprom_inspect_result_updates_workspace_state() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.active_eeprom_cancellation = Some(DumpCancellation::default());
+        app.active_eeprom_cancellable = true;
+        let target_label = "root@camera.test:22 / i2c-4 @abcd".to_owned();
+
+        app.eeprom_operation_sender
+            .send(EepromOperationResult {
+                workspace_key: CalibrationWorkspaceKey::manual(),
+                kind: EepromOperationKind::Inspect,
+                target_label: target_label.clone(),
+                result: Ok(EepromOperationOutcome::Inspect(
+                    camera_toolbox_app::EepromInspectResult {
+                        state: state('b'),
+                        backup: vec![0x42; 16],
+                    },
+                )),
+            })
+            .unwrap();
+
+        app.poll_eeprom_operation_result(&context);
+
+        assert!(app.active_eeprom_cancellation.is_none());
+        assert!(!app.active_eeprom_cancellable);
+        let eeprom = app.calibration.active_eeprom_for_test();
+        assert_eq!(
+            eeprom.inspected_target_for_test(),
+            Some(target_label.as_str())
+        );
+        assert_eq!(
+            eeprom.device_for_test().unwrap().image_sha256,
+            "b".repeat(64)
+        );
+        assert_eq!(
+            eeprom.status_for_test(),
+            "EEPROM read completed. Review the current state before writing."
+        );
+        assert!(!eeprom.busy_for_test());
+    }
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn i2c_tools_bus_discovery_result_updates_workspace_state() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.active_i2c_tools_cancellation = Some(DumpCancellation::default());
+        app.active_i2c_tools_cancellable = true;
+
+        app.i2c_tools_sender
+            .send(I2cToolsOperationResult {
+                kind: I2cToolsOperationKind::BusDiscovery,
+                result: Ok(camera_toolbox_app::I2cHelperResult::BusList {
+                    buses: vec![
+                        camera_toolbox_app::I2cBusInfo {
+                            bus: 4,
+                            dev_path: "/dev/i2c-4".to_owned(),
+                            name: Some("i2c-4".to_owned()),
+                            dev_node_exists: true,
+                        },
+                        camera_toolbox_app::I2cBusInfo {
+                            bus: 6,
+                            dev_path: "/dev/i2c-6".to_owned(),
+                            name: Some("i2c-6".to_owned()),
+                            dev_node_exists: true,
+                        },
+                    ],
+                }),
+            })
+            .unwrap();
+
+        app.poll_i2c_tools_result();
+
+        assert!(app.active_i2c_tools_cancellation.is_none());
+        assert!(!app.active_i2c_tools_cancellable);
+        assert_eq!(app.i2c_tools.buses_for_test().len(), 2);
+        assert_eq!(app.i2c_tools.selected_bus_for_test(), 4);
+        assert!(
+            app.i2c_tools
+                .status_for_test()
+                .contains("Discovered 2 I²C bus(es).")
+        );
+        assert!(!app.i2c_tools.busy_for_test());
+    }
+
+    #[cfg(feature = "platform-ssh")]
+    #[test]
+    fn i2c_tools_transfer_result_records_result_and_clears_active_state() {
+        let context = egui::Context::default();
+        let mut app = CameraToolboxApp::new(&context).unwrap();
+        app.active_i2c_tools_cancellation = Some(DumpCancellation::default());
+        app.active_i2c_tools_cancellable = true;
+
+        app.i2c_tools_sender
+            .send(I2cToolsOperationResult {
+                kind: I2cToolsOperationKind::Transfer,
+                result: Ok(camera_toolbox_app::I2cHelperResult::Transfer {
+                    transactions: vec![camera_toolbox_app::I2cTransactionResult {
+                        bus: 4,
+                        transferred_messages: 2,
+                        messages: vec![
+                            camera_toolbox_app::I2cMessageResult {
+                                address: 0x50,
+                                direction: camera_toolbox_app::I2cMessageDirection::Write,
+                                byte_len: 2,
+                                bytes: vec![0x00, 0x10],
+                            },
+                            camera_toolbox_app::I2cMessageResult {
+                                address: 0x50,
+                                direction: camera_toolbox_app::I2cMessageDirection::Read,
+                                byte_len: 4,
+                                bytes: vec![0x11, 0x22, 0x33, 0x44],
+                            },
+                        ],
+                    }],
+                }),
+            })
+            .unwrap();
+
+        app.poll_i2c_tools_result();
+
+        assert!(app.active_i2c_tools_cancellation.is_none());
+        assert!(!app.active_i2c_tools_cancellable);
+        assert!(app.i2c_tools.result_transactions_for_test().is_some());
+        assert_eq!(app.i2c_tools.status_for_test(), "I²C transfer completed.");
+        let report = app.i2c_tools.result_transactions_for_test().unwrap();
+        assert_eq!(report[0].bus, 4);
+        assert_eq!(report[0].transferred_messages, 2);
+    }
+}
 
 #[cfg(feature = "calibration-opencv")]
 #[test]

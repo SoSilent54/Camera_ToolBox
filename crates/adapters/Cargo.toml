@@ -8,7 +8,7 @@ publish.workspace = true
 [features]
 default = ["platform-all"]
 platform-all = ["platform-local", "platform-cv610", "platform-ssh"]
-calibration-opencv = ["dep:opencv"]
+calibration-opencv = ["dep:opencv", "dep:serde_json"]
 platform-local = ["dep:serde_json"]
 hex-arm-control = [
     "dep:futures-util",

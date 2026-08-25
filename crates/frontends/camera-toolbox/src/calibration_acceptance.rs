@@ -2152,10 +2152,10 @@ mod tests {
     #[test]
     fn coverage_labels_preserve_final_depth_boundary_and_pose_convention() {
         let criteria = DatasetAcceptanceDraft::default().parse().unwrap();
-        assert_eq!(depth_interval_label(&criteria, 0), "[400, 900)");
-        assert_eq!(depth_interval_label(&criteria, 3), "[1900, 2400]");
+        assert_eq!(depth_interval_label(&criteria, 0), "[400, 550)");
+        assert_eq!(depth_interval_label(&criteria, 3), "[850, 1000]");
         assert_eq!(pose_bin_label(&criteria, 0), "Center: tilt < 5.0°");
-        assert!(pose_bin_label(&criteria, 1).contains("azimuth [0°, 45°)"));
+        assert!(pose_bin_label(&criteria, 1).contains("azimuth [0°, 60°)"));
     }
 
     #[test]

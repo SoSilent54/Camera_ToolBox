@@ -464,6 +464,53 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_host_key_before_connecting() {
+        let mut draft = RemoteConnectionDraft {
+            endpoint: "root@camera.test:22".to_owned(),
+            ..Default::default()
+        };
+        draft
+            .password
+            .expose_secret_mut()
+            .push_str("memory-test-secret");
+
+        let error = match draft.connect_request() {
+            Ok(_) => panic!("a missing host key must prevent connection"),
+            Err(error) => error,
+        };
+        assert_eq!(error, "Expected SSH host key must not be empty");
+    }
+
+    #[test]
+    fn validates_and_canonicalizes_host_key_before_connecting() {
+        let mut draft = RemoteConnectionDraft {
+            endpoint: "root@camera.test:22".to_owned(),
+            expected_host_key: format!("  {KEY_A}  "),
+            ..Default::default()
+        };
+        draft
+            .password
+            .expose_secret_mut()
+            .push_str("memory-test-secret");
+
+        let request = match draft.connect_request() {
+            Ok(request) => request,
+            Err(error) => panic!("valid host key must be accepted: {error}"),
+        };
+        assert_eq!(request.expected_host_key, KEY_A);
+
+        draft.expected_host_key = "not-an-openssh-key".to_owned();
+        let error = match draft.connect_request() {
+            Ok(_) => panic!("invalid host key must prevent connection"),
+            Err(error) => error,
+        };
+        assert!(
+            error.starts_with("Expected SSH host key is invalid:"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
     fn connector_uses_password_with_host_key_pin() {
         let memory = Arc::new(MemorySshTransport::new(KEY_A));
         memory.insert_directory(SFTP_NAMESPACE_ROOT);

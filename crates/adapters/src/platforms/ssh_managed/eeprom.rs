@@ -34,7 +34,7 @@ impl SshEepromProvisionService {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         service_id: String,
-        mut target: SshConnectionTarget,
+        target: SshConnectionTarget,
         credential_ref: String,
         output_limit_bytes: u64,
         i2c_bus: u16,
@@ -42,8 +42,7 @@ impl SshEepromProvisionService {
         resolver: Arc<dyn CredentialResolver>,
         transport: Arc<dyn SshTransportFactory>,
     ) -> Result<Self, EepromProvisionServiceError> {
-        // EEPROM 复用 Explorer SFTP 的密码会话；与 SFTP 一致，不持久化或校验 SSH host key。
-        target.expected_host_key = None;
+        // 保留前端已验证的 pin；transport 在连接前拒绝不匹配的服务器主机密钥。
         if !(1_024..=1_048_576).contains(&output_limit_bytes) {
             return Err(EepromProvisionServiceError::Protocol(
                 "EEPROM helper output limit must be within 1024..=1048576".to_owned(),
@@ -463,26 +462,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_host_key_does_not_prevent_helper_invocation() {
+    fn stale_host_key_is_rejected_before_helper_invocation() {
         let memory = Arc::new(MemorySshTransport::new("rotated-host-key"));
-        memory.set_command_output(output(EepromHelperResult::Inspect(EepromInspectResult {
-            state: device_state('a'),
-            backup: vec![0; YG_STEREO_P24C64G_IMAGE_BYTES],
-        })));
         let service = service_with_target(&memory, target(Some(STALE_HOST_KEY)));
 
-        let result = service
+        let error = service
             .execute(
                 EepromProvisionOperation {
                     action: EepromHelperAction::Inspect,
                 },
                 control(),
             )
-            .unwrap();
+            .unwrap_err();
 
-        assert!(matches!(result, EepromHelperResult::Inspect(_)));
-        assert_eq!(memory.captured_argv().len(), 2);
-        assert_eq!(memory.captured_stdin().len(), 1);
+        assert!(matches!(
+            error,
+            EepromProvisionServiceError::Transport(message)
+                if message == "EEPROM SSH connection failed: SSH host key mismatch"
+        ));
+        assert!(memory.captured_argv().is_empty());
+        assert!(memory.captured_stdin().is_empty());
     }
 
     #[test]
