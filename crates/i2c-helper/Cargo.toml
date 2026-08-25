@@ -1,0 +1,24 @@
+[package]
+name = "camera-i2c-helper"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+autobins = false
+
+[[bin]]
+name = "camera-i2c-helper"
+path = "src/main.rs"
+
+[dependencies]
+camera-toolbox-app.workspace = true
+camera-toolbox-core.workspace = true
+fs2.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+i2cdev.workspace = true
+
+[lints]
+workspace = true

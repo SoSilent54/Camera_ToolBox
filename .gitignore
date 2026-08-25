@@ -1,0 +1,30 @@
+# Generated and local-only artifacts
+/target/
+/.deps/
+/.ai_doc/
+/.cargo/opencv5.local.toml
+/.cargo/ffmpeg.local.toml
+/crates/frontends/workflow-web/web/node_modules/
+/crates/frontends/workflow-web/web/dist/
+/crates/frontends/workflow-web/.workflow-web/
+
+# Local project data and settings
+/local_data/
+/write_history/
+/.env
+/.env.*
+!/.env.example
+
+# Local diagnostics and OS metadata
+*.log
+.DS_Store
+Thumbs.db
+
+# Local tooling index and vendor driver workspace
+/.codegraph/
+/X5_Driver/
+
+# Godot 本地工具链与缓存
+/tools/
+crates/frontends/godot/godot/target
+crates/frontends/godot/godot/.godot/

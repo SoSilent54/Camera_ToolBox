@@ -1,0 +1,661 @@
+// This file contains mainly two sections:
+// 1. Must read types.
+// 2. Extended reading types.
+// We ONLY SUPPORT EXPLAINING Must read types. Extended reading types are not guaranteed to be explained.
+
+syntax = "proto3";
+
+// ---------------------
+//////// Must read types //////////
+// ---------------------
+
+enum RobotType {
+    // Invalid Robot Type. This is the default value when you do a factory reset.
+    RtUnknown = 0;
+
+    ////// Bases //////
+    RtTriggerA3Lr1 = 1;
+    RtMaverX4D = 2;
+    RtMaverL4D = 20;
+    RtArk2Lr1 = 5;
+    RtMaverX3H1 = 23;
+
+    ////// Linear Lifts //////
+    // Linear Lifts can only be controlled by position with max speed.
+    RtIotaP1 = 8;
+    RtIotaVc1 = 18;
+    RtTheta1 = 24;
+
+    ////// Rotational Lifts //////
+    RtZetaVc2 = 19;
+    RtIotaVc2 = 22;
+
+    ////// Arm //////
+    // Current MainStream Products
+    RtArmArcherD6Y_P1 = 16;
+    RtArmArcherY6L_V1 = 17;
+    RtArmArcherY6_H1 = 25;
+    RtHelloArcherY6_H1 = 26;
+    RtArmFireflyY6_H1 = 27;
+    RtHelloFireflyY6_H1 = 28;
+    
+    ////// Special modes //////
+    // Forward CAN bus just using messages defined here.
+    // Baudrates, fd, etc should be predefined via config file.
+    // KCP is mandatory for this robot. Websocket will not work.
+    // Also, please make sure only one connection is using this robot type. (KCP + Websocket pair is counted as one connection)
+    // If you use multiple connections, you will loss can messages from the robot.
+    RtPureForwardOnlyV2 = 101;
+    // todo might adding cannelloni, if it out performs KCP in performance.
+
+    ////// About to move on //////
+    RtZetaVc1 = 13;
+    RtArmSaberD6x = 14;
+    RtArmSaberD7x = 15;
+    // Working purely as a can bus forwarder.
+    RtPureForwardOnly = 100;
+
+    ////// Deprecated //////
+    reserved 4, 6, 7, 9 to 12, 21;
+}
+
+enum SecondaryDeviceType {
+    SdtUnknown = 0;
+    SdtHandGp100 = 1;
+    SdtHandGp100P050 = 100;
+    SdtHandGp100P050Handle = 101;
+    SdtHandGp100Handle = 102;
+    SdtGamepad = 2;
+    SdtImuY200 = 3;
+    SdtHandGp80G1 = 4;
+    // | Vendor ID    | 0x00686578 |
+    // | Product ID   | 0x00001146 |
+    SdtHello1J1T4BV1 = 5;
+}
+
+//////// Base //////////
+
+// Base State
+enum BaseState {
+    BsParked = 0;
+    BsAlgrithmControl = 1;
+    BsOvertakeSpeedControl = 2;
+    BsOvertakeZeroResistanceControl = 3;
+    BsEmergencyStop = 4;
+}
+
+message BaseEstimatedOdometry {
+    float speed_x = 1; // m/s
+    float speed_y = 2; // m/s
+    float speed_z = 3; // rad/s
+    double pos_x = 4; // m
+    double pos_y = 5; // m
+    double pos_z = 6; // rad
+}
+
+message BaseStatus {
+    BaseState state = 1;
+
+    // Weather the API control is initialized.
+    bool api_control_initialized = 2;
+    float battery_voltage = 3;                  // V
+    uint32 battery_thousandth = 4;              // 1/1000
+    repeated MotorStatus motor_status = 5;
+    uint32 session_holder = 6;                  // 0 means no session holder
+
+    // Only avalible on vehicles that have BMS.
+    optional bool battery_charging = 10;
+    optional float battery_current = 14;
+    optional ParkingStopDetail parking_stop_detail = 11;
+    optional WarningCategory warning = 12;
+    // Not all base types support this!
+    optional BaseEstimatedOdometry estimated_odometry = 13;
+}
+
+message XyzSpeed {
+    float speed_x = 1;
+    float speed_y = 2;
+    float speed_z = 3;
+}
+
+message SimpleBaseMoveCommand {
+    oneof command{
+        XyzSpeed xyz_speed = 1;
+        bool zero_resistance = 2;
+        bool brake = 3;
+    }
+}
+
+message BaseCommand {
+    // The session holder can send all commands.
+    // Non-session holders can only send clear_parking_stop command.
+    oneof command{
+        // Only after api_control_initialize is set, can the vehicle be controlled by the API.
+        bool api_control_initialize = 1;
+        // If currently has a clearable parking stop, the parking stop state will be cleared.
+        // This is the ONLY command that can be sent by non-session holders.
+        bool clear_parking_stop = 2;
+        // You have to continuesly send this command if you want to use api control. (Start sending these commands and keep sending it first, then send api_control_initialize)
+        // Note only force controlled base types support this.
+        // MotorTargets and SimpleBaseMoveCommand are mutually exclusive. Once you send one of them, the other will be ignored until deinitialize.
+        MotorTargets motor_targets = 3;
+        SimpleBaseMoveCommand simple_move_command = 5;
+    }
+}
+
+//////// Lift //////////
+
+enum LiftState {
+    LsBrake = 0;
+    LsCalibrating = 1;
+    LsAlgrithmControl = 2;
+    LsOvertakeControl = 3;
+    LsEmergencyStop = 4;
+}
+
+message RotateLiftStatus {
+    bool calibrated = 1;
+    LiftState state = 2;
+    repeated MotorStatus motor_status = 3;
+    // field 4,5 will soon be removed. Users should read limitations from URDF.
+    repeated int32 max_pos = 4;
+    repeated int32 min_pos = 5;
+    // 0 means no session holder.
+    uint32 session_holder = 6;
+    optional ParkingStopDetail parking_stop_detail = 10;
+}
+
+message RotateLiftRuntimeConfig {
+    // Set max speed for position control. Must not be negative.
+    repeated double pos_mode_max_speed = 1;
+}
+
+// Must keep sending. If not, will apply brake after timeout. (Will not cause Parking Stop)
+message RotateLiftCommand {
+    oneof command{
+        bool calibrate = 1;
+        MotorTargets motor_targets = 2;
+        RotateLiftRuntimeConfig runtime_config = 3;
+    }
+}
+
+// Read motor_status of APIUp to get current position
+message LinearLiftStatus {
+    bool calibrated = 1;
+    LiftState state = 2;
+    // The max position you can set using software.
+    int64 max_pos = 3;
+    int64 current_pos = 4;
+    // Number of pulses per rotation, output asix
+    // Number of pulses per meter, for linear motor
+    uint32 pulse_per_rotation = 5;
+    // Pulses per second. ReadOnly, defines the max speed of the lift.
+    uint32 max_speed = 6;
+    // Pulses per second
+    uint32 speed = 7;
+    optional ParkingStopDetail parking_stop_detail = 10;
+    optional bool custom_button_pressed = 11;
+}
+
+message LinearLiftCommand {
+    oneof command{
+        // No matter calibrate is true or false, will always start calibration when oneof selects this.
+        // Unlike base you have the clear parking stop option (E.g. If triggered by limit switch, the exact moment you clear it, it get triggered again)
+        // Therefore to clear clearable parking stop, send calibrate command directly.
+        // DO NOT frequently send calibrate command.
+        bool calibrate = 1;
+        // Encoder position.
+        // You can calculate this from meters by multiplying with pulse_per_rotation.
+        // Value you send will be clamped to [0, max_pos].
+        // Unlike base, you don't have to keep sending target_pos, though it is recommended to do so.
+        int64 target_pos = 2;
+        // No matter brake is true or false, brake will be applied when oneof selects this.
+        // Once recieved, will apply brake immediately and get into LsBrake mode.
+        // You can exit LsBrake mode by sending target_pos command or calibrate command.
+        // You don't have to keep sending brake command, though it is recommended to do so.
+        bool brake = 3;
+        // Set speed.
+        uint32 set_speed = 4;
+    }
+}
+
+//////// Arm //////////
+
+message ArmStatus {
+    // Weather the API control is initialized.
+    bool api_control_initialized = 1;
+    reserved 2;
+    bool calibrated = 3;
+    repeated MotorStatus motor_status = 4;
+    uint32 session_holder = 6;
+
+    // Arm is special. Api timeout will not be treated as fatal error, it will just send a log and disable it self, releasing the session id.
+    // Switching to mode the user sets as default disabled mode. (AmBrake, AmFreeDrag, AmZeroCurrent)
+    optional ParkingStopDetail parking_stop_detail = 5;
+}
+
+message HandStatus {
+    reserved 1;
+    repeated MotorStatus motor_status = 2;
+}
+
+message HandCommand {
+    MotorTargets motor_targets = 1;
+}
+
+message AccelerationSource {
+    oneof source {
+        ImuAcceleration custom_acceleration = 1;
+        // Its possible to add e.g. onboard accelerometer in the future.
+    }
+}
+
+// Putting an empty message here for now.
+// Making it possible to extend in the future, e.g. adding percentage of friction compensation.
+message ArmApiFreeDragCommand {
+    // Must not be none. If so will fail
+    AccelerationSource acceleration_source = 1;
+}
+
+message ArmApiZeroCurrentCommand {}
+
+message Pose {
+    double px = 1;
+    double py = 2;
+    double pz = 3;
+    double qw = 4;
+    double qx = 5;
+    double qy = 6;
+    double qz = 7;
+}
+
+message ArmApiEndEffectorCommand {
+    Pose end_pose = 1;
+    // Optional. If not provided, gravity compensation will not be applied.
+    optional AccelerationSource acceleration_source = 2;
+}
+
+message ArmApiControlCommand {
+    reserved 6;
+    oneof command {
+        // Lowest API. Gives you direct control over motors.
+        MotorTargets motor_targets = 1;
+        // Put the robotic arm into free movement mode with gravity compensation.
+        ArmApiFreeDragCommand arm_api_free_drag_command = 2;
+        // Put all the motors of the arm into zero-torque mode.
+        ArmApiZeroCurrentCommand arm_api_zero_current_command = 3;
+        // End effector pose control. Please note that this mode will no longer be applicable if the robotic arm has been modified.
+        ArmApiEndEffectorCommand arm_api_end_effector_command = 4;
+        // A more convenient positioning mode that will plan the target position before moving.
+        ArmApiJointPositionCommand arm_api_joint_position_command = 5;
+        // Compensated MIT control mode. It will be more precise.
+        ArmApiCompensatedMitMotorTargets arm_api_compensated_mit_motor_targets = 7;
+    }
+}
+
+message ArmApiCompensatedMitMotorTargets {
+    // Both must not be none.
+    repeated MitMotorTarget mit_target = 1;
+    AccelerationSource acceleration_source = 2;
+}
+
+message ArmApiJointPositionCommand {
+    // Joint positions in rad.
+    repeated double joint_positions = 1;
+}
+
+message ArmSharedCommand {
+    oneof command{
+        bool clear_parking_stop = 1;
+        ParkingStopDetail enter_parking_stop = 2;
+    }
+}
+
+message ArmExclusiveCommand {
+    reserved 2, 3, 5;
+    oneof exclusive_command {
+        // Only after api_control_initialize is set, can the vehicle be controlled by the API.
+        bool api_control_initialize = 1;
+        // You have to continuesly send this command if you want to use api control.
+        ArmApiControlCommand arm_api_control_command = 6;
+        // Just in case
+        bool calibrate = 4;
+    }
+}
+
+message ArmCommand {
+    oneof command{
+        // Only the session holder can send this command. Ohterwise will be ignored.
+        ArmExclusiveCommand arm_exclusive_command = 1; 
+        ArmSharedCommand arm_shared_command = 2;
+    }
+}
+
+// ---------------------
+//////// Extended reading types //////////
+// ---------------------
+
+message GamepadRead {
+    float left_stick_x = 1;
+    float left_stick_y = 2;
+    float right_stick_x = 3;
+    float right_stick_y = 4;
+    bool left_bumper = 5;
+    bool right_bumper = 6;
+    float left_trigger = 7;
+    float right_trigger = 8;
+    bool a_button = 9;
+    bool b_button = 10;
+    bool x_button = 11;
+    bool y_button = 12;
+    bool select_button = 13;
+    bool start_button = 14;
+    bool left_stick_button = 15;
+    bool right_stick_button = 16;
+    bool dpad_up = 17;
+    bool dpad_down = 18;
+    bool dpad_left = 19;
+    bool dpad_right = 20;
+}
+
+enum ReportFrequency { 
+    Rf1000Hz = 0;
+    Rf500Hz = 3;
+    Rf250Hz = 4;
+    Rf100Hz = 1;
+    Rf50Hz = 2;
+    // 1Hz to keep the KCP alive
+    // When using KCP Option, if websocket dies, KCP connection is considered dead too.
+    // The report frequency of KCP and Websocket of the same session id is independent.
+    Rf1Hz = 5;
+}
+
+message EnableKcp {
+    // KCP message must come from the same IP and port specified here.
+    // Peer message not from this will be ignored.
+    // Can not use 0.
+    uint32 client_peer_port = 1;
+    KcpConfig kcp_config = 2;
+}
+
+message KcpServerStatus {
+    // For now server_port will change with different connections.
+    // This might be changed in the future, to use a fixed port for all KCP connections.
+    uint32 server_port = 1;
+    KcpConfig kcp_config = 2;
+}
+
+message KcpConfig {
+    // Must be positive.
+    // Please just use 64, unless you really know what you are doing.
+    int32 window_size_snd_wnd = 1;
+    // Must be positive.
+    // Please just use 64, unless you really know what you are doing.
+    int32 window_size_rcv_wnd = 2;
+    // Please just use 10, unless you really know what you are doing.
+    int32 interval_ms = 3;
+    // Enable no delay.
+    // PLEASE send TRUE. DO NOT send FALSE.
+    bool no_delay = 4;
+    // Disable congestion control.
+    // PLEASE send TRUE. DO NOT send FALSE.
+    bool nc = 5;
+    // Please just use 2. DO NOT CHANGE
+    // Must be positive.
+    int32 resend = 6;
+}
+
+
+message ImuAcceleration {
+    float ax = 1; // m/s^2
+    float ay = 2; // m/s^2
+    float az = 3; // m/s^2
+}
+
+message ImuAngularVelocity {
+    float wx = 1; // rad/s
+    float wy = 2; // rad/s
+    float wz = 3; // rad/s
+}
+
+message ImuQuaternion {
+    float qx = 1; // unitless
+    float qy = 2; // unitless
+    float qz = 3; // unitless
+    float qw = 4; // unitless
+}
+
+message ImuData {
+    ImuAcceleration acceleration = 1;
+    ImuAngularVelocity angular_velocity = 2;
+    ImuQuaternion quaternion = 3;
+}
+
+
+// Deliberately named to ParkingStop instead of EmergencyStop, to indicate that it is NOT emergency stop. Do not use this for safety related operations.
+// 故意命名为 ParkingStop 而不是 EmergencyStop，以表明它不是紧急停止。不要用于安全相关操作。
+enum ParkingStopCategory {
+    PscEmergencyStopButton = 0;
+    PscMotorHasError = 1;
+    PscBatteryProtection = 2;
+    PscGamepadTriggered = 3;
+    PscUnknownParkingStopCategory = 4;
+    PscAPICommunicationTimeout = 5;
+    PscLimitSwitchTriggered = 6;
+    PscBmsTimeout = 7;
+}
+
+// Parking stop detail.
+// 停车停止详细信息。
+message ParkingStopDetail {
+    // For human reading. Do not use this for programmatic operations.
+    // 仅供人类阅读。不要用于编程操作。
+    string reason = 1;
+    // Parking stop category. This can be used for programmatic operations.
+    // 停车停止类别。可用于编程操作。
+    ParkingStopCategory category = 2;
+    // If this parking stop can be cleared remotely. Some errors can be recovered remotely (e.g. API Communication Timeout). 
+    // Some are not, and can only be cleared by when errors are gone, e.g. Battery Protection.
+    // 表明这个停车停止可以远程清除。有些错误可以远程清除（例如 API 通信超时）。有些错误不能远程清除，只能当错误消失时清除，例如电池保护。
+    bool is_remotely_clearable = 3;
+}
+
+// Warning category.
+enum WarningCategory {
+    WcUnknownWarningCategory = 0;
+    WcBatteryLow = 1;
+}
+
+//////// Motor //////////
+message SingleMotorTarget{
+    reserved 6;
+    oneof target{
+        double torque = 1;  // Nm
+        double speed = 2;   // rad/s
+        int64 position = 3; // encoder position
+        bool brake = 4;     // No matter set to true or false, brake will always be applied. Be aware that putting into brake mode might cause motor to lose position information.
+        MitMotorTarget mit_target = 5;   // Not all motors support this.
+        FollowMotorTarget follow_motor_target = 7;  // Not all motors support this. A more responsive position-following mode.
+    }
+}
+
+message FollowMotorTarget {
+    double speed = 2;   // rad/s
+    int64 position = 3; // encoder position
+}
+
+// todo Add speed with max torque, and position with max torque and speed.
+
+message MitMotorTarget {
+    double torque = 1;  // Nm
+    double speed = 2;   // rad/s
+    double position = 3; // encoder position
+    double kp = 4;
+    double kd = 5;
+}
+
+message MotorTargets {
+    repeated SingleMotorTarget targets = 1;
+}
+
+enum MotorError{
+    MeCommunicationError = 0;
+    MeOverCurrent = 1;
+    MeOverVoltage = 2;
+    MeUnderVoltage = 3;
+    MeMotorOverTemperature = 4;
+    MeDriverOverTemperature = 5;
+    MeGeneralError = 6;
+}
+
+message MotorStatus {
+    // Nm
+    double torque = 2; 
+    // In general positivive is counter-clockwise(Right hand). But view angle is defined differently for different robot types.
+    // View XSTD guide for detailed definition of positive direction.
+    // m/s, direction is not defined, for linear motor
+    double speed = 3;
+    // encoder position
+    int64 position = 4;
+    // Number of pulses per rotation, output asix
+    // Number of pulses per meter, for linear motor
+    uint32 pulse_per_rotation = 5;
+    // If given 0.0 or negative, means wheel_radius is not known or applicable.
+    double wheel_radius = 6;
+
+    repeated MotorError error = 7;
+    optional string motor_warning = 14;
+    SingleMotorTarget current_target = 8;
+
+    optional float driver_temperature = 11;
+    optional float motor_temperature = 12;
+    // Current supplied voltage
+    optional float voltage = 13;
+}
+
+// Hello actully stands for HexGello :)
+// HexGelloSingleJoystickSingleTrigger4BtnControllerStatus
+message Hello1J1T4BStatus {
+    // -1.0 to 1.0
+    float joystick_x = 1;
+    // -1.0 to 1.0
+    float joystick_y = 2;
+    // -1.0 to 1.0
+    float trigger = 3;
+    bool btn_x = 6;
+    bool btn_y = 7;
+    bool btn_z = 4;
+    bool btn_w= 5;
+}
+
+message RGBStripeCommand{
+    // Though it is int32, only 24 bits are used. The highest 8 bits are ignored(For now).
+    // Convert this int32 into little endian u8, [0] will be Red channel, [1] will be Green channel, [2] will be Blue channel. [3] is ignored.
+    repeated int32 rgbs = 1;
+}
+
+// Naming inspired by GELLO
+// HELLOSingleJoystickSingleTrigger4BtnControllerCommand
+message Hello1J1T4BCmd {
+    oneof command{
+        // When sending less than required number of rgbs, the remaining rgbs will remain its current color.
+        // When sending more than required number of rgbs, the extra rgbs will be ignored.
+        RGBStripeCommand rgb_stripe_command = 1;
+    }
+}
+
+// Hand, 3+3 Arms, etc
+message SecondaryDeviceStatus {
+    // Can be used to tell from different devices, e.g. Imu1, Imu2, Hand1, Hand2, Gamepad1, Gamepad2, etc.
+    // This number should not change once allocated.
+    // It is possible for this number to be dynamically allocated, but we don't see any need for now. Therefore for all RobotType we currently have,
+    //   all of its SecondaryDevices will have certain device_id. (e.g. For Base, IMU is always 1, Gamepad is always 2, etc.)
+    // When sending command down, device_id must match the device_id in the command.
+    uint32 device_id = 1;
+    SecondaryDeviceType device_type = 2;
+    // For future expansion.
+    reserved 3 to 10;
+    oneof status{
+        // Imu's raw data. Independent of mounting position. This is tricky because different robot types have different mounting positions. Not all robot types have imu.
+        // Imu 的原始数据。与安装位置无关。请特别注意不同机器人类型有不同的安装位置。不是所有机器人类型都有 imu。
+        ImuData imu_data = 11;
+        // Hand status. Optional.
+        // 机械手的数据。不是所有机器人类型都有机械手。
+        HandStatus hand_status = 12;
+        // Gamepad read. Optional.
+        // 遥控器读取的数据。仅供参考
+        GamepadRead gamepad_read = 13;
+        Hello1J1T4BStatus hello1j1t4b_status = 14;
+    }
+}
+
+message SecondaryDeviceCommand {
+    // Basically the same as device_id in SecondaryDeviceStatus.
+    uint32 device_id = 1;
+    reserved 2 to 10;
+    oneof command{
+        HandCommand hand_command = 12;
+        Hello1J1T4BCmd hello1j1t4b_controller_command = 14;
+    }
+}
+
+message MonotonicTimeStamp {
+    uint64 seconds = 1;
+    uint32 nanoseconds = 2;
+}
+
+message PtpTimeStamp {
+    uint64 seconds = 1;
+    uint32 nanoseconds = 2;
+    bool calibrated = 3;
+}
+
+message TimeStamp {
+    MonotonicTimeStamp monotonic_time_stamp = 1;
+    PtpTimeStamp ptp_time_stamp = 2;
+}
+
+/// ---------------------
+//////// CAN Forwarding API V2 //////////
+// Invalid frames will be dropped with a log.
+/// ---------------------
+
+enum HexCanApiCanBusNumber {
+    HcanInvalid = 0;
+    Hcan0 = 1;
+    Hcan1 = 2;
+    Hcan2 = 3;
+}
+
+message HexCanApiCanAnyFrames {
+    repeated HexCanApiCanAnyFrame frames = 1;
+}
+
+message HexCanApiCanAnyFrame {
+    HexCanApiCanBusNumber bus_number = 1;
+    oneof frame {
+        HexCanApiCanDataFrame can_data_frame = 2;
+        HexCanApiCanFdFrame can_fd_frame = 3;
+        // todo add remote and error later
+    }
+}
+
+message HexCanApiCanDataFrame {
+    HexCanApiCanId id = 1;
+    bytes data = 2;
+}
+
+message HexCanApiCanFdFrame {
+    HexCanApiCanId id = 1;
+    bytes data = 2;
+    // Well there are three flags, CANFD_BRS, CANFD_ESI, CANFD_FDF. Only brs is meaningful for now.
+    // For more info, check uapi/linux/can.h
+    bool brs = 4;
+}
+
+message HexCanApiCanId {
+    oneof id {
+        uint32 standard_id = 1;
+        uint32 extended_id = 2;
+    }
+}

@@ -1,0 +1,8 @@
+[configuration]
+entry_symbol = "gdext_rust_init"
+compatibility_minimum = 4.1
+reloadable = true
+
+[libraries]
+linux.debug.arm64 = "res://target/debug/libpongbot_calib_tool.so"
+linux.release.arm64 = "res://target/release/libpongbot_calib_tool.so"
