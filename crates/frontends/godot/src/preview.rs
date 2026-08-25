@@ -17,7 +17,8 @@ use camera_toolbox_app::ports::calibration::{
     CalibrationBackend, CalibrationCancellation,
 };
 use camera_toolbox_core::{
-    BoardSpec, CalibrationImageSize, ChessboardDetectionOutcome, InitialIntrinsics,
+    BoardSpec, CalibrationImageSize, CalibrationPoint, ChessboardDetection,
+    ChessboardDetectionOutcome, InitialIntrinsics,
 };
 use godot::classes::image::Format;
 use godot::classes::{Image, ImageTexture, TextureRect};
@@ -331,7 +332,10 @@ fn guided_capture_loop(
             std::thread::sleep(DETECT_INTERVAL);
             continue;
         };
-        let png = match encode_png(&frame.rgba, frame.width, frame.height) {
+        // 降采样检测：1080p 下棋盘格子易过大导致 findChessboardCorners 失败，
+        // 缩放到最大边 960px 后检测更鲁棒；角点坐标映射回原图。
+        let (detect_rgba, detect_w, detect_h, detect_scale) = resize_for_detect(&frame.rgba, frame.width, frame.height);
+        let png = match encode_png(&detect_rgba, detect_w, detect_h) {
             Ok(png) => png,
             Err(_) => {
                 std::thread::sleep(DETECT_INTERVAL);
@@ -339,12 +343,27 @@ fn guided_capture_loop(
             }
         };
         let expected = CalibrationImageSize {
-            width: frame.width,
-            height: frame.height,
+            width: detect_w,
+            height: detect_h,
         };
         match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
-                godot_print!("检测到棋盘：{} 角点", detection.corners.len());
+                // 角点映射回原图坐标（检测/绘制/姿态估计统一用原图）。
+                let scaled_corners: Vec<CalibrationPoint> = detection
+                    .corners
+                    .iter()
+                    .map(|c| CalibrationPoint {
+                        x: c.x / detect_scale,
+                        y: c.y / detect_scale,
+                    })
+                    .collect();
+                let detection = ChessboardDetection {
+                    image_size: CalibrationImageSize {
+                        width: frame.width,
+                        height: frame.height,
+                    },
+                    corners: scaled_corners,
+                };
                 // 初始内参随帧尺寸生成（1080p 主点不再是 640x360 默认）。
                 let initial = default_initial_intrinsics(frame.width, frame.height);
                 let pose = match backend.estimate_pose(&detection, &initial, board, &cancellation)
@@ -497,6 +516,27 @@ fn default_initial_intrinsics(width: u32, height: u32) -> InitialIntrinsics {
         ],
         distortion_coefficients: vec![0.0, 0.0, 0.0, 0.0, 0.0],
     }
+}
+
+/// 降采样到最大边 960px（超过才缩）；返回 (缩后 RGBA, w, h, 缩放比例)。
+fn resize_for_detect(rgba: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32, f32) {
+    const MAX_DETECT_WIDTH: u32 = 960;
+    if width <= MAX_DETECT_WIDTH {
+        return (rgba.to_vec(), width, height, 1.0);
+    }
+    let scale = MAX_DETECT_WIDTH as f32 / width as f32;
+    let new_height = ((height as f32) * scale).round().max(1.0) as u32;
+    let img = match image::RgbaImage::from_raw(width, height, rgba.to_vec()) {
+        Some(img) => img,
+        None => return (rgba.to_vec(), width, height, 1.0),
+    };
+    let resized = image::imageops::resize(
+        &img,
+        MAX_DETECT_WIDTH,
+        new_height,
+        image::imageops::FilterType::Triangle,
+    );
+    (resized.into_raw(), MAX_DETECT_WIDTH, new_height, scale)
 }
 
 /// RGBA 帧编码为 PNG 字节。
