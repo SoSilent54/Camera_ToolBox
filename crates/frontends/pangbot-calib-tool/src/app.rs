@@ -549,6 +549,7 @@ fn run_i2c_tools_request(
     let (idle, overall) = match action {
         I2cHelperAction::ListBuses => (Duration::from_secs(15), Duration::from_secs(45)),
         I2cHelperAction::Transfer { .. } => (Duration::from_secs(30), Duration::from_secs(120)),
+        I2cHelperAction::GuardedWrite { .. } => (Duration::from_secs(30), Duration::from_secs(120)),
     };
     let control = RemoteOperationControl::new(
         RemoteTimeouts {
