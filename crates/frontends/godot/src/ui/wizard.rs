@@ -14,10 +14,11 @@ use godot::classes::{
 use godot::prelude::*;
 
 use crate::ui::steps::connect::ConnectStep;
+use crate::ui::steps::eeprom_step::EepromStep;
 use crate::ui::steps::preview::PreviewStep;
+use crate::ui::steps::solve_step::SolveStep;
 use crate::ui::steps::{StepId, STEP_TITLES};
 use crate::ui::theme;
-use crate::ui::steps::solve_step::SolveStep;
 
 /// 向导全部 UI 句柄与流程状态（纯 Rust，非 Godot 类）。
 pub struct UiState {
@@ -31,6 +32,7 @@ pub struct UiState {
     pub connect: ConnectStep,
     pub preview: PreviewStep,
     pub solve: SolveStep,
+    pub eeprom: EepromStep,
     pub status_bar: Gd<Label>,
 }
 
@@ -84,6 +86,7 @@ impl UiState {
         let mut connect: Option<ConnectStep> = None;
         let mut preview: Option<PreviewStep> = None;
         let mut solve: Option<SolveStep> = None;
+        let mut eeprom: Option<EepromStep> = None;
         for index in 0..4 {
             let mut panel = PanelContainer::new_alloc();
             panel.add_theme_stylebox_override("panel", &theme::panel_style(None));
@@ -105,7 +108,7 @@ impl UiState {
             step_headers.push(header);
             step_summaries.push(summary);
 
-            // 各步骤正文：Step 1 连接面板、Step 2 双预览，其余占位。
+            // 各步骤正文：Step 1 连接、Step 2 双预览、Step 3 求解、Step 4 EEPROM。
             if index == 0 {
                 let step = ConnectStep::build();
                 panel_v.add_child(&step.panel);
@@ -122,12 +125,10 @@ impl UiState {
                 step_bodies.push(step.panel.clone());
                 solve = Some(step);
             } else {
-                let mut placeholder = Label::new_alloc();
-                placeholder.set_text("（待实现）");
-                placeholder.add_theme_font_size_override("font_size", 14);
-                placeholder.add_theme_color_override("font_color", theme::MUTED);
-                panel_v.add_child(&placeholder);
-                step_bodies.push(placeholder.upcast());
+                let step = EepromStep::build();
+                panel_v.add_child(&step.panel);
+                step_bodies.push(step.panel.clone());
+                eeprom = Some(step);
             }
 
             panel.add_child(&panel_v);
@@ -137,6 +138,7 @@ impl UiState {
         let connect = connect.expect("Step 1 构建失败");
         let preview = preview.expect("Step 2 构建失败");
         let solve = solve.expect("Step 3 构建失败");
+        let eeprom = eeprom.expect("Step 4 构建失败");
 
         // 底部状态栏。
         let mut status_bar = Label::new_alloc();
@@ -156,6 +158,7 @@ impl UiState {
             connect,
             preview,
             solve,
+            eeprom,
             status_bar,
         };
         state.refresh();

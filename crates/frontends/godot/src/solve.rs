@@ -1,7 +1,7 @@
 //! 标定求解：dataset 帧 → PNG → 棋盘检测 → OpenCV 内参标定。
 //!
 //! 复用 adapters 的 `OpenCvCalibrationBackend`（feature calibration-opencv）；
-//! 后台线程执行，结果回主线程展示。
+//! 后台线程执行，结果回主线程展示；完整 `CalibrationSolution` 供 EEPROM 写入。
 
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_app::platform::DecodedVideoFrame;
@@ -12,23 +12,25 @@ use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest,
     CalibrationSolution, ChessboardDetectionOutcome, InitialIntrinsics,
 };
-use std::sync::Arc;
 use godot::prelude::*;
+use std::sync::Arc;
 
-/// 单路求解结果（主线程展示用）。
+/// 单路求解结果（主线程展示 + EEPROM 写入用）。
 pub struct SolveResult {
     pub channel: u16,
     pub views_used: usize,
     pub rms_error: f64,
     pub camera_matrix: [f64; 9],
     pub distortion_coefficients: Vec<f64>,
+    /// 完整标定解（EEPROM 写入使用）。
+    pub solution: CalibrationSolution,
 }
 
 impl SolveResult {
     /// 结果摘要文本（中文，就地展示）。
     pub fn summary(&self) -> String {
-        let [_, _, _, _, fy, _, _, _, _] = self.camera_matrix;
         let fx = self.camera_matrix[0];
+        let fy = self.camera_matrix[4];
         let cx = self.camera_matrix[2];
         let cy = self.camera_matrix[5];
         format!(
@@ -60,13 +62,7 @@ pub fn solve_channel(
             width: frame.width,
             height: frame.height,
         };
-        match backend.detect_png(
-            &png,
-            expected,
-            256 * 1024 * 1024,
-            board,
-            &cancellation,
-        ) {
+        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 image_size = Some(detection.image_size);
                 image_points.push(detection.corners);
@@ -107,20 +103,20 @@ pub fn solve_channel(
     };
     let solution: CalibrationSolution = backend
         .calibrate(&request, &cancellation)
-        .map_err(|error| format!("CH{channel} 标定失败：{error}"))?;
+        .map_err(|error| format!("标定失败：{error}"))?;
     Ok(SolveResult {
         channel,
         views_used: solution.views.len(),
         rms_error: solution.rms_error,
         camera_matrix: solution.camera_matrix,
-        distortion_coefficients: solution.distortion_coefficients,
+        distortion_coefficients: solution.distortion_coefficients.clone(),
+        solution,
     })
 }
 
 /// RGBA 帧编码为 PNG 字节。
 fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let img =
-        image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or("帧尺寸非法")?;
+    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or("帧尺寸非法")?;
     let mut buf = Vec::new();
     image::DynamicImage::ImageRgba8(img)
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
