@@ -1,8 +1,9 @@
 //! GuideOverlay：RTSP viewer 上的引导可视化层（自定义绘制）。
 //!
 //! worker 线程（guided 采集）把检测结果写入共享槽；主线程 `draw` 读取并绘制：
-//! - 检测到棋盘：角点网格（绿色 polyline，图像 → 控件坐标映射）+ 中心标记
-//! - 未检测到：不绘制（引导文本由上层 Label 承担）
+//! - 目标棋盘外框/网格：黄色表示未对齐，绿色表示进入 hold。
+//! - 检测结果：只画检测棋盘外框和中心，不画内角点连线，避免遮挡棋盘。
+//! - 姿态误差：对齐原版的 roll/pitch/yaw 圆弧误差环，不绘制背景文字面板。
 
 use godot::classes::{Control, IControl};
 use godot::prelude::*;
@@ -26,22 +27,43 @@ pub struct OverlayStatus {
     pub matched: bool,
 }
 
+/// 单轴旋转误差弧：base 是参考环，arc 是当前误差扫角。
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct OverlayRotationArc {
+    pub base_uv: Vec<[f32; 2]>,
+    pub arc_uv: Vec<[f32; 2]>,
+    pub tick_uv: [f32; 2],
+}
+
+#[derive(Clone, Default, Debug, PartialEq)]
+pub struct OverlayRotationRings {
+    pub center_uv: [f32; 2],
+    pub roll: OverlayRotationArc,
+    pub pitch: OverlayRotationArc,
+    pub yaw: OverlayRotationArc,
+}
+
+#[derive(Clone, Copy, Default, Debug, PartialEq)]
+pub struct OverlayPoseArrow {
+    pub start_uv: [f32; 2],
+    pub end_uv: [f32; 2],
+}
+
 /// 一帧检测 / 目标引导的绘制数据（worker → 主线程）。
 #[derive(Clone, Default)]
 pub struct OverlayData {
-    pub found: bool,
-    /// 图像像素坐标的角点（行优先，与 OpenCV 一致）。
-    pub corners: Vec<(f32, f32)>,
     /// 图像尺寸（坐标映射用）。
     pub image_width: f32,
     pub image_height: f32,
-    /// 姿态（rvec 转角度，度）：俯仰/偏航/翻滚近似。
-    pub rotation_deg: (f32, f32, f32),
+    /// 检测棋盘外框（图像像素坐标）：只画外框，不画内角点连线。
+    pub detected_outline_px: Option<[[f32; 2]; 4]>,
     /// 当前目标姿态的投影中心 / 外框 / 网格。
     pub target_center_uv: Option<[f32; 2]>,
     pub target_outline_uv: Option<[[f32; 2]; 4]>,
     pub target_grid_lines: Vec<OverlayGridLine>,
     pub target_matched: bool,
+    pub rotation_rings: Option<OverlayRotationRings>,
+    pub pose_arrow: Option<OverlayPoseArrow>,
     pub status: Option<OverlayStatus>,
 }
 
@@ -93,70 +115,161 @@ impl IControl for GuideOverlay {
             Vector2::new(offset_x + x * scale, offset_y + y * scale)
         };
 
-        // 先画原版 guide 目标框：未匹配黄色，匹配绿色。
+        // 目标框：黄 = 继续对齐；绿 = 已匹配/hold。保留网格但降低透明度。
         let target_color = if data.target_matched {
-            Color::from_rgba(0.31, 0.90, 0.47, 0.95)
+            Color::from_rgba(0.22, 0.92, 0.48, 0.96)
         } else {
-            Color::from_rgba(1.0, 0.82, 0.31, 0.95)
+            Color::from_rgba(1.0, 0.76, 0.18, 0.96)
         };
-        let grid_color = if data.target_matched {
-            Color::from_rgba(0.31, 0.90, 0.47, 0.45)
+        let target_grid_color = if data.target_matched {
+            Color::from_rgba(0.22, 0.92, 0.48, 0.22)
         } else {
-            Color::from_rgba(1.0, 0.82, 0.31, 0.42)
+            Color::from_rgba(1.0, 0.76, 0.18, 0.20)
         };
         for line in &data.target_grid_lines {
-            self.base_mut().draw_line(
-                uv_to_view(line.start_uv),
-                uv_to_view(line.end_uv),
-                grid_color,
-            );
+            self.base_mut()
+                .draw_line_ex(
+                    uv_to_view(line.start_uv),
+                    uv_to_view(line.end_uv),
+                    target_grid_color,
+                )
+                .width(1.0)
+                .antialiased(true)
+                .done();
         }
         if let Some(outline) = data.target_outline_uv {
             for i in 0..4 {
-                self.base_mut().draw_line(
-                    uv_to_view(outline[i]),
-                    uv_to_view(outline[(i + 1) % 4]),
-                    target_color,
+                self.base_mut()
+                    .draw_line_ex(
+                        uv_to_view(outline[i]),
+                        uv_to_view(outline[(i + 1) % 4]),
+                        target_color,
+                    )
+                    .width(2.0)
+                    .antialiased(true)
+                    .done();
+            }
+        }
+
+        // 检测结果只画外框和中心，不再画 88 个内角点的折线。
+        if let Some(outline) = data.detected_outline_px {
+            let detected_color = Color::from_rgba(0.18, 0.90, 0.46, 0.98);
+            for i in 0..4 {
+                self.base_mut()
+                    .draw_line_ex(
+                        px_to_view(outline[i][0], outline[i][1]),
+                        px_to_view(outline[(i + 1) % 4][0], outline[(i + 1) % 4][1]),
+                        detected_color,
+                    )
+                    .width(2.4)
+                    .antialiased(true)
+                    .done();
+            }
+            for corner in outline {
+                self.base_mut()
+                    .draw_circle(px_to_view(corner[0], corner[1]), 3.0, detected_color);
+            }
+        }
+
+        if let Some(arrow) = data.pose_arrow {
+            self.base_mut()
+                .draw_line_ex(
+                    uv_to_view(arrow.start_uv),
+                    uv_to_view(arrow.end_uv),
+                    Color::from_rgba(0.42, 0.68, 1.0, 0.86),
+                )
+                .width(2.0)
+                .antialiased(true)
+                .done();
+        }
+
+        if let Some(rings) = &data.rotation_rings {
+            draw_rotation_arc(
+                self,
+                &rings.roll,
+                Color::from_rgba(1.0, 0.58, 0.20, 0.95),
+                &uv_to_view,
+            );
+            draw_rotation_arc(
+                self,
+                &rings.pitch,
+                Color::from_rgba(0.30, 0.78, 1.0, 0.95),
+                &uv_to_view,
+            );
+            draw_rotation_arc(
+                self,
+                &rings.yaw,
+                Color::from_rgba(0.92, 0.42, 1.0, 0.95),
+                &uv_to_view,
+            );
+            self.base_mut().draw_circle(
+                uv_to_view(rings.center_uv),
+                4.0,
+                Color::from_rgba(1.0, 1.0, 1.0, 0.92),
+            );
+        }
+
+        // hold 进度用 3 个小点表达，不加背景文字面板。
+        if let (Some(status), Some(center)) = (&data.status, data.target_center_uv) {
+            let center = uv_to_view(center);
+            let total = status.hold_target.max(1);
+            let filled = status.hold_frames.min(total);
+            let start_x = center.x - (f32::from(total.saturating_sub(1)) * 12.0) * 0.5;
+            for index in 0..total {
+                let color = if index < filled {
+                    Color::from_rgba(0.22, 0.92, 0.48, 0.95)
+                } else if status.matched {
+                    Color::from_rgba(1.0, 0.76, 0.18, 0.82)
+                } else {
+                    Color::from_rgba(1.0, 1.0, 1.0, 0.38)
+                };
+                self.base_mut().draw_circle(
+                    Vector2::new(start_x + f32::from(index) * 12.0, center.y - 22.0),
+                    4.0,
+                    color,
                 );
             }
         }
-        if let Some(center) = data.target_center_uv {
-            let c = uv_to_view(center);
-            self.base_mut().draw_line(
-                c + Vector2::new(-10.0, 0.0),
-                c + Vector2::new(10.0, 0.0),
-                target_color,
-            );
-            self.base_mut().draw_line(
-                c + Vector2::new(0.0, -10.0),
-                c + Vector2::new(0.0, 10.0),
-                target_color,
-            );
-        }
-
-        if !data.found || data.corners.is_empty() {
-            return;
-        }
-        let mut points = PackedVector2Array::new();
-        for (x, y) in &data.corners {
-            points.push(px_to_view(*x, *y));
-        }
-        self.base_mut()
-            .draw_polyline(&points, Color::from_rgba(0.26, 0.82, 0.48, 0.9));
-
-        // 当前检测包围盒中心标记。
-        let mut min_x = f32::MAX;
-        let mut min_y = f32::MAX;
-        let mut max_x = f32::MIN;
-        let mut max_y = f32::MIN;
-        for (x, y) in &data.corners {
-            min_x = min_x.min(*x);
-            min_y = min_y.min(*y);
-            max_x = max_x.max(*x);
-            max_y = max_y.max(*y);
-        }
-        let center = px_to_view((min_x + max_x) * 0.5, (min_y + max_y) * 0.5);
-        self.base_mut()
-            .draw_circle(center, 4.0, Color::from_rgba(1.0, 0.71, 0.33, 1.0));
     }
+}
+
+fn draw_rotation_arc(
+    overlay: &mut GuideOverlay,
+    arc: &OverlayRotationArc,
+    color: Color,
+    uv_to_view: &impl Fn([f32; 2]) -> Vector2,
+) {
+    draw_uv_polyline(
+        overlay,
+        &arc.base_uv,
+        Color::from_rgba(1.0, 1.0, 1.0, 0.28),
+        1.2,
+        uv_to_view,
+    );
+    draw_uv_polyline(overlay, &arc.arc_uv, color, 3.0, uv_to_view);
+    overlay
+        .base_mut()
+        .draw_circle(uv_to_view(arc.tick_uv), 3.0, color);
+}
+
+fn draw_uv_polyline(
+    overlay: &mut GuideOverlay,
+    points: &[[f32; 2]],
+    color: Color,
+    width: f32,
+    uv_to_view: &impl Fn([f32; 2]) -> Vector2,
+) {
+    if points.len() < 2 {
+        return;
+    }
+    let mut packed = PackedVector2Array::new();
+    for point in points {
+        packed.push(uv_to_view(*point));
+    }
+    overlay
+        .base_mut()
+        .draw_polyline_ex(&packed, color)
+        .width(width)
+        .antialiased(true)
+        .done();
 }
