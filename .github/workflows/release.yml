@@ -140,10 +140,12 @@ jobs:
           Expand-Archive -Path $zipName -DestinationPath tools -Force
           Move-Item "tools/Godot_v${env:GODOT_VERSION}_win64.exe" "tools/godot-win64.exe" -Force
       - name: Build gdext extension
-        shell: bash
+        # 必须用 pwsh：bash 会把 Git Bash 的 /usr/bin/link.exe 前置到 PATH，
+        # cargo 链接时解析到 coreutils link 而非 MSVC link.exe，导致链接失败。
+        shell: pwsh
         run: |
           cargo build --release --locked -p pongbot-calib-tool
-          test -f target/release/pongbot_calib_tool.dll
+          if (-not (Test-Path target/release/pongbot_calib_tool.dll)) { throw "pongbot_calib_tool.dll 未生成" }
       - name: Package Windows release
         shell: pwsh
         run: |
