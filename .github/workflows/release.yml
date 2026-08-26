@@ -1,0 +1,250 @@
+name: Release
+
+# pongbot-calib-tool 独立发布流水线（Godot 4.4 + gdext 前端）。
+# 仅存在于 calib_tool_godot 分支；tag v* 推送或手动触发。
+# 模式对齐 Camera_ToolBox 的 release.yml：i2c-helper 静态 sidecar +
+# Linux 双架构容器构建 + 依赖 bundle + GitHub Release 发布。
+
+"on":
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v0.1.0"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+
+jobs:
+  validate-release:
+    name: Validate release version
+    runs-on: ubuntu-22.04
+    outputs:
+      release_version: ${{ steps.version.outputs.release_version }}
+    steps:
+      - name: Validate release tag
+        id: version
+        shell: bash
+        run: |
+          version="${RELEASE_TAG}"
+          if [[ ! "${version}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?(\+[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "Release tag must be a safe semantic version like v0.1.0 or v0.1.0-rc.1: ${version}" >&2
+            exit 1
+          fi
+          echo "release_version=${version}" >> "${GITHUB_OUTPUT}"
+
+  build-i2c-helper-linux-aarch64:
+    name: Build static Linux AArch64 I2C helper
+    needs: validate-release
+    runs-on: ubuntu-22.04-arm
+    container:
+      image: ubuntu:20.04
+
+    steps:
+      - name: Install helper build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            git \
+            pkg-config
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build static helper
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS: -C target-feature=+crt-static
+        run: |
+          cargo build --release --locked --target aarch64-unknown-linux-gnu \
+            --package camera-i2c-helper \
+            --bin camera-i2c-helper
+          helper=target/aarch64-unknown-linux-gnu/release/camera-i2c-helper
+          file "$helper" | grep -Eq 'ELF 64-bit LSB.*ARM aarch64'
+          if readelf -l "$helper" | grep -q 'Requesting program interpreter'; then
+            echo 'I2C helper must be statically linked' >&2
+            exit 1
+          fi
+      - name: Upload Linux AArch64 helper
+        uses: actions/upload-artifact@v4
+        with:
+          name: i2c-helper-linux-aarch64
+          path: target/aarch64-unknown-linux-gnu/release/camera-i2c-helper
+          if-no-files-found: error
+
+  build-linux:
+    name: Build ${{ matrix.environment }}
+    needs:
+      - validate-release
+      - build-i2c-helper-linux-aarch64
+    runs-on: ${{ matrix.runner }}
+    container:
+      image: ubuntu:${{ matrix.ubuntu_version }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+      GODOT_VERSION: 4.4.1-stable
+
+    strategy:
+      fail-fast: false
+      matrix:
+        environment:
+          - linux-x86_64-ubuntu20
+          - linux-x86_64-ubuntu22
+          - linux-aarch64-ubuntu20
+          - linux-aarch64-ubuntu22
+        include:
+          - environment: linux-x86_64-ubuntu20
+            runner: ubuntu-22.04
+            ubuntu_version: "20.04"
+            godot_arch: x86_64
+          - environment: linux-x86_64-ubuntu22
+            runner: ubuntu-22.04
+            ubuntu_version: "22.04"
+            godot_arch: x86_64
+          - environment: linux-aarch64-ubuntu20
+            runner: ubuntu-22.04-arm
+            ubuntu_version: "20.04"
+            godot_arch: arm64
+          - environment: linux-aarch64-ubuntu22
+            runner: ubuntu-22.04-arm
+            ubuntu_version: "22.04"
+            godot_arch: arm64
+
+    steps:
+      - name: Install Linux build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            ca-certificates \
+            curl \
+            git \
+            libclang-dev \
+            python3 \
+            pkg-config \
+            unzip
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Prepare pinned OpenCV 5 dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/opencv5_dependency.py prepare
+          --github-env "$GITHUB_ENV"
+          --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          python3 scripts/ffmpeg_dependency.py prepare
+          --github-env "$GITHUB_ENV"
+          --github-path "$GITHUB_PATH"
+      - name: Download Linux AArch64 I2C helper
+        uses: actions/download-artifact@v4
+        with:
+          name: i2c-helper-linux-aarch64
+          path: helper-sidecar
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Download Godot ${{ env.GODOT_VERSION }} (${{ matrix.godot_arch }})
+        run: |
+          arch="${{ matrix.godot_arch }}"
+          zip_name="Godot_v${GODOT_VERSION}_linux.${arch}.zip"
+          curl -fL --retry 3 -o "${zip_name}" \
+            "https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}/${zip_name}"
+          unzip -o "${zip_name}"
+          bin_name="Godot_v${GODOT_VERSION}_linux.${arch}"
+          chmod +x "${bin_name}"
+          install -d tools
+          mv "${bin_name}" "tools/godot-${arch}"
+      - name: Build gdext extension
+        run: |
+          cargo build --release --locked -p pongbot-calib-tool
+          test -f target/release/libpongbot_calib_tool.so
+      - name: Package Linux release
+        env:
+          ENVIRONMENT: ${{ matrix.environment }}
+        run: |
+          bundle="pongbot-calib-tool-${ENVIRONMENT}"
+          archive="pongbot-calib-tool-${RELEASE_VERSION}-${ENVIRONMENT}"
+          mkdir -p "dist/${bundle}"
+          install -m 755 "tools/godot-${{ matrix.godot_arch }}" "dist/${bundle}/godot"
+          cp -r "crates/frontends/godot/godot" "dist/${bundle}/godot-project"
+          install -d "dist/${bundle}/godot-project/target/release"
+          install -m 755 "target/release/libpongbot_calib_tool.so" \
+            "dist/${bundle}/godot-project/target/release/"
+          install -m 755 "helper-sidecar/camera-i2c-helper" \
+            "dist/${bundle}/camera-i2c-helper-linux-aarch64"
+          install -m 644 README.md "dist/${bundle}/"
+          "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
+          "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
+          # headless 冒烟：加载 gdext 扩展并正常退出，捕获动态库加载失败
+          set +e
+          env -u LD_LIBRARY_PATH \
+            "dist/${bundle}/godot" --headless --path "dist/${bundle}/godot-project" --quit \
+            >smoke.log 2>&1
+          smoke_code=$?
+          set -e
+          if [[ ${smoke_code} -ne 0 ]]; then
+            echo 'godot headless smoke failed' >&2
+            cat smoke.log >&2
+            exit 1
+          fi
+          if grep -Eq "Can't open dynamic library|error while loading shared libraries|gdext|GDExtension" smoke.log; then
+            echo 'gdext extension load reported an error' >&2
+            cat smoke.log >&2
+            exit 1
+          fi
+          tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.environment }}
+          path: dist/pongbot-calib-tool-${{ env.RELEASE_VERSION }}-${{ matrix.environment }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub Release
+    needs:
+      - validate-release
+      - build-linux
+    runs-on: ubuntu-22.04
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Verify release archives
+        run: |
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-x86_64-ubuntu20.tar.gz"
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-x86_64-ubuntu22.tar.gz"
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-aarch64-ubuntu20.tar.gz"
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-aarch64-ubuntu22.tar.gz"
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/pongbot-calib-tool-*.tar.gz
