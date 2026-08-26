@@ -50,10 +50,10 @@ impl IControl for ReprojectionBarChart {
             return;
         }
         let values = self.values.clone();
-        let max_value = values.iter().copied().fold(self.limit, f64::max).max(0.1);
+        let max_value = reprojection_axis_max(&values);
         let n = values.len() as f32;
         let slot = chart_w / n;
-        let bar_w = (slot * 0.72).clamp(2.0, 12.0);
+        let bar_w = (slot * 0.90).clamp(2.0, 24.0);
         for (index, value) in values.into_iter().enumerate() {
             let value = value.max(0.0);
             let ratio = (value / max_value).clamp(0.0, 1.0) as f32;
@@ -81,6 +81,10 @@ impl IControl for ReprojectionBarChart {
             Color::from_rgba(1.0, 0.76, 0.18, 0.70),
         );
     }
+}
+
+fn reprojection_axis_max(values: &[f64]) -> f64 {
+    values.iter().copied().fold(0.0_f64, f64::max).max(0.1)
 }
 /// Step 3 的控件句柄。
 pub struct SolveStep {
@@ -197,5 +201,16 @@ impl SolveStep {
     pub fn clear_charts(&mut self) {
         self.ch0_chart.bind_mut().clear_values();
         self.ch3_chart.bind_mut().clear_values();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reprojection_axis_uses_max_view_error_not_limit() {
+        assert_eq!(reprojection_axis_max(&[0.12, 0.35, 0.21]), 0.35);
+        assert_eq!(reprojection_axis_max(&[]), 0.1);
     }
 }

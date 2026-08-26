@@ -1809,13 +1809,15 @@ enum GuidedPoseRotationRingPlane {
 
 fn detected_outline_pixels(measurement: &GuidedPoseMeasurement) -> [[f32; 2]; 4] {
     let board = measurement.board;
-    let last_col = f64::from(board.inner_cols.saturating_sub(1));
-    let last_row = f64::from(board.inner_rows.saturating_sub(1));
+    let left = -1.0;
+    let top = -1.0;
+    let right = f64::from(board.inner_cols);
+    let bottom = f64::from(board.inner_rows);
     let points = [
-        guided_pose_board_point(board, 0.0, 0.0),
-        guided_pose_board_point(board, last_col, 0.0),
-        guided_pose_board_point(board, last_col, last_row),
-        guided_pose_board_point(board, 0.0, last_row),
+        guided_pose_board_point(board, left, top),
+        guided_pose_board_point(board, right, top),
+        guided_pose_board_point(board, right, bottom),
+        guided_pose_board_point(board, left, bottom),
     ];
     points.map(|point| {
         project_board_point_image(
@@ -2379,6 +2381,34 @@ mod tests {
         for (actual, expected) in centers.iter().zip(expected) {
             assert!((f64::from(actual[0]) - expected[0]).abs() <= 0.005);
             assert!((f64::from(actual[1]) - expected[1]).abs() <= 0.005);
+        }
+    }
+
+    #[test]
+    fn detected_outline_uses_same_outer_board_frame_as_target_overlay() {
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let image_size = CalibrationImageSize::new(1920, 1080).unwrap();
+        let intrinsics = InitialIntrinsics {
+            camera_matrix: [900.0, 0.0, 980.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        let target = standard_guided_pose_plan(board, &intrinsics, image_size)
+            .unwrap()
+            .remove(0);
+        let measurement = GuidedPoseMeasurement {
+            pose: target.pose,
+            board,
+            initial_intrinsics: intrinsics,
+            image_size,
+        };
+        let detected = detected_outline_pixels(&measurement);
+        for (actual, expected_uv) in detected.iter().zip(target.outline_uv) {
+            let expected = [
+                expected_uv[0] * image_size.width as f32,
+                expected_uv[1] * image_size.height as f32,
+            ];
+            assert!((actual[0] - expected[0]).abs() <= 1.0e-3);
+            assert!((actual[1] - expected[1]).abs() <= 1.0e-3);
         }
     }
 }
