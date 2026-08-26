@@ -23,12 +23,7 @@ Thumbs.db
 # Local tooling index and vendor driver workspace
 /.codegraph/
 /X5_Driver/
-
-# Godot 本地工具链与缓存
 /tools/
-crates/frontends/godot/godot/target
-crates/frontends/godot/godot/.godot/
-crates/frontends/godot/godot/write_history/
 
 # 机器本地原生依赖（指向 Camera_Toolbox 资产）
 /.deps

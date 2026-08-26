@@ -12,8 +12,8 @@ use camera_toolbox_app::platform::{DumpCancellation, RemoteOperationControl, Rem
 use camera_toolbox_app::platform::{
     EepromHelperAction, EepromHelperResult, EepromProvisionOperation, EepromProvisionService,
 };
-use camera_toolbox_core::calibration_eeprom::FullEepromImage;
 use camera_toolbox_core::CalibrationSolution;
+use camera_toolbox_core::calibration_eeprom::FullEepromImage;
 use secrecy::SecretString;
 use std::sync::Arc;
 use std::time::Duration;

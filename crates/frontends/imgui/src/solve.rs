@@ -10,7 +10,6 @@ use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
     ChessboardDetectionOutcome, InitialIntrinsics,
 };
-use godot::prelude::*;
 use std::sync::Arc;
 
 /// 单路求解结果（主线程展示 + EEPROM 写入用）。
@@ -27,27 +26,82 @@ impl SolveResult {
     }
 }
 
-/// 标定结果几何摘要：内参、FOV、光心偏移角、畸变与单图误差统计。
+/// 单路标定结果的结构化指标（Step 3 列表/图表展示用）。
+#[derive(Clone, Debug)]
+pub struct SolutionDetail {
+    pub label: String,
+    pub view_count: usize,
+    pub rms: f64,
+    pub max_view_rmse: f64,
+    pub fx: f64,
+    pub fy: f64,
+    pub cx: f64,
+    pub cy: f64,
+    pub hfov_degrees: f64,
+    pub vfov_degrees: f64,
+    pub optical_x_degrees: f64,
+    pub optical_y_degrees: f64,
+    pub distortion: Vec<f64>,
+}
+
+impl SolutionDetail {
+    /// 从完整标定解提取内参几何与单图误差统计。
+    #[must_use]
+    pub fn from_solution(label: &str, solution: &CalibrationSolution) -> Self {
+        let k = solution.camera_matrix;
+        let half_w = f64::from(solution.image_size.width) * 0.5;
+        let half_h = f64::from(solution.image_size.height) * 0.5;
+        let fx = k[0];
+        let fy = k[4];
+        let cx = k[2];
+        let cy = k[5];
+        let max_view_rmse = view_rmse_values(solution)
+            .iter()
+            .copied()
+            .fold(0.0_f64, f64::max);
+        Self {
+            label: label.to_owned(),
+            view_count: solution.views.len(),
+            rms: solution.rms_error,
+            max_view_rmse,
+            fx,
+            fy,
+            cx,
+            cy,
+            hfov_degrees: 2.0 * (half_w / fx).atan().to_degrees(),
+            vfov_degrees: 2.0 * (half_h / fy).atan().to_degrees(),
+            optical_x_degrees: ((cx - half_w) / fx).atan().to_degrees(),
+            optical_y_degrees: ((cy - half_h) / fy).atan().to_degrees(),
+            distortion: solution.distortion_coefficients.clone(),
+        }
+    }
+
+    /// 与 `solution_detail_summary` 等价的展示文本（日志/兜底用）。
+    #[must_use]
+    pub fn summary_text(&self) -> String {
+        format!(
+            "{} 求解完成：{} 帧有效 · RMS {:.3} px · 单图最大 {:.3} px\nK: fx={:.2} fy={:.2} cx={:.2} cy={:.2} · FOV H/V={:.2}°/{:.2}° · 光心偏移 x/y={:+.3}°/{:+.3}°\n畸变：{}",
+            self.label,
+            self.view_count,
+            self.rms,
+            self.max_view_rmse,
+            self.fx,
+            self.fy,
+            self.cx,
+            self.cy,
+            self.hfov_degrees,
+            self.vfov_degrees,
+            self.optical_x_degrees,
+            self.optical_y_degrees,
+            distortion_summary(&self.distortion)
+        )
+    }
+}
+
+/// 标定结果几何摘要文本（兼容旧调用；内容与 `SolutionDetail::summary_text` 一致）。
+#[must_use]
 pub fn solution_detail_summary(label: &str, solution: &CalibrationSolution) -> String {
-    let k = solution.camera_matrix;
-    let distortion = distortion_summary(&solution.distortion_coefficients);
-    let rmse_values = view_rmse_values(solution);
-    let max_view_rmse = rmse_values.iter().copied().fold(0.0_f64, f64::max);
-    format!(
-        "{label} 求解完成：{} 帧有效 · RMS {:.3} px · 单图最大 {:.3} px\n{}\n畸变：{}",
-        solution.views.len(),
-        solution.rms_error,
-        max_view_rmse,
-        format_intrinsics_geometry(
-            solution.image_size.width,
-            solution.image_size.height,
-            k[0],
-            k[4],
-            k[2],
-            k[5]
-        ),
-        distortion
-    )
+    SolutionDetail::from_solution(label, solution).summary_text()
 }
 
 /// EEPROM/求解共用的内参几何展示。
@@ -122,7 +176,7 @@ pub fn solve_channel(
             Ok(ChessboardDetectionOutcome::NotFound { .. }) => {}
             Err(error) => {
                 // 单帧检测失败不中断整体求解（如运动模糊帧）。
-                godot_print!("CH{channel} 检测失败（跳过）：{error}");
+                tracing::warn!("CH{channel} 检测失败（跳过）：{error}");
             }
         }
     }
@@ -172,7 +226,7 @@ fn encode_luma_png(luma: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camera_toolbox_core::{ViewCalibrationResult, PANGBOT_CALIBRATION_FLAGS};
+    use camera_toolbox_core::{PANGBOT_CALIBRATION_FLAGS, ViewCalibrationResult};
 
     fn solution() -> CalibrationSolution {
         CalibrationSolution {

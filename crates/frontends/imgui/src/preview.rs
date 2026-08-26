@@ -10,8 +10,8 @@ use crate::guide_overlay::{
     OverlayStatus,
 };
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
-use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
 use camera_toolbox_adapters::media::FfmpegRtspTransport;
+use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
 use camera_toolbox_adapters::x5_tcp_client::{self, X5YuvSnapshot};
 use camera_toolbox_app::platform::{
     DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, SourcePts, StreamCancellation,
@@ -22,9 +22,6 @@ use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, ChessboardDetection,
     ChessboardDetectionOutcome, InitialIntrinsics, ViewCalibrationResult,
 };
-use godot::classes::image::Format;
-use godot::classes::{Image, ImageTexture, TextureRect};
-use godot::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -36,18 +33,18 @@ pub const HOLD_TARGET: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
 const GUIDED_HOLD_JITTER_Z_LIMIT: f64 = 0.04;
 const GUIDED_HOLD_JITTER_RPY_DEGREES: f64 = 2.0;
-const GUIDED_POSE_X_TOLERANCE: f64 = 0.10;
-const GUIDED_POSE_Y_TOLERANCE: f64 = 0.10;
-const GUIDED_POSE_Z_TOLERANCE: f64 = 0.24;
-const GUIDED_POSE_ROLL_TOLERANCE_DEGREES: f64 = 10.0;
-const GUIDED_POSE_PITCH_TOLERANCE_DEGREES: f64 = 10.0;
+const GUIDED_POSE_X_TOLERANCE: f64 = 0.15;
+const GUIDED_POSE_Y_TOLERANCE: f64 = 0.15;
+const GUIDED_POSE_Z_TOLERANCE: f64 = 0.30;
+const GUIDED_POSE_ROLL_TOLERANCE_DEGREES: f64 = 15.0;
+const GUIDED_POSE_PITCH_TOLERANCE_DEGREES: f64 = 15.0;
 const GUIDED_POSE_YAW_TOLERANCE_DEGREES: f64 = 15.0;
 const GUIDED_POSE_MATCH_SCORE_LIMIT: f64 = 1.0;
 const GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS: usize = 12;
 const GUIDED_POSE_RING_SEGMENTS: usize = 96;
 const GUIDED_POSE_HALF_RING_SEGMENTS: usize = 48;
-const GUIDED_POSE_RING_SMALL_ERROR_GAIN: f32 = 3.0;
-const GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES: f32 = 8.0;
+const GUIDED_POSE_RING_SMALL_ERROR_GAIN: f32 = 5.0;
+const GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES: f32 = 12.0;
 /// 采集 worker 检测节拍。
 const DETECT_INTERVAL: Duration = Duration::from_millis(150);
 
@@ -83,7 +80,7 @@ enum DatasetCaptureSource {
 }
 
 /// worker → 主线程的引导状态。
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct GuideState {
     /// overlay 引导文本（未检测到棋盘 / 姿态重复 / 已覆盖 N 位姿）。
     pub text: String,
@@ -93,12 +90,11 @@ pub struct GuideState {
     pub hold: u8,
 }
 
-/// 单路 RTSP 流：解码器 + 帧槽 + 已上传纹理 + guided 采集。
+/// 单路 RTSP 流：解码器 + 帧槽 + guided 采集。
 pub struct RtspStream {
     decoder: Option<FfmpegRtspDecoder>,
     slot: Arc<LatestDecodedFrameSlot>,
     last: Option<Arc<DecodedVideoFrame>>,
-    texture: Option<Gd<ImageTexture>>,
     /// 采集开关（worker 与主线程共享）。
     capturing: Arc<AtomicBool>,
     /// 已采 dataset 帧（真实设备为 TCP NV12/Y plane；worker 写，solve 读）。
@@ -118,7 +114,7 @@ pub struct RtspStream {
 }
 
 impl RtspStream {
-    /// 启动真实 RTSP 解码（Tcp 传输，低延迟模式）。
+    /// 启动真实 RTSP 解码（Tcp 传输，稳定缓冲模式）。
     pub fn start(
         host: &str,
         rtsp_port: u16,
@@ -135,7 +131,7 @@ impl RtspStream {
         let decoder = FfmpegRtspDecoder::start(
             &url,
             FfmpegRtspTransport::Tcp,
-            RtspLatencyMode::Low,
+            RtspLatencyMode::Stable,
             width,
             height,
             session,
@@ -242,7 +238,6 @@ impl RtspStream {
             decoder,
             slot,
             last: None,
-            texture: None,
             capturing: Arc::new(AtomicBool::new(false)),
             captured: Arc::new(Mutex::new(Vec::with_capacity(CAPTURE_TARGET))),
             poses: Arc::new(Mutex::new(Vec::with_capacity(CAPTURE_TARGET))),
@@ -255,8 +250,8 @@ impl RtspStream {
         }
     }
 
-    /// 主线程调用：有且仅在上传新帧时返回 `true`。
-    pub fn pump(&mut self, target: &mut TextureRect) -> bool {
+    /// 主线程调用：返回自上次调用以来的最新新帧；不触碰任何 UI/GPU 对象。
+    pub fn poll_frame(&mut self) -> Option<Arc<DecodedVideoFrame>> {
         // 检查解码器终态：连接/解码失败时记录，供引导显示。
         if let Some(decoder) = self.decoder.as_ref() {
             if let Some(Err(error)) = decoder.completion() {
@@ -265,32 +260,24 @@ impl RtspStream {
                 }
             }
         }
-        let Some(frame) = self.slot.latest() else {
-            return false;
-        };
+        let frame = self.slot.latest()?;
         if self
             .last
             .as_ref()
             .is_some_and(|old| Arc::ptr_eq(old, &frame))
         {
-            return false;
+            return None;
         }
         self.last = Some(frame.clone());
-        let Some(image) = Image::create_from_data(
-            frame.width as i32,
-            frame.height as i32,
-            false,
-            Format::RGBA8,
-            &PackedByteArray::from(&frame.rgba[..]),
-        ) else {
-            return false;
-        };
-        let Some(texture) = ImageTexture::create_from_image(&image) else {
-            return false;
-        };
-        self.texture = Some(texture.clone());
-        target.set_texture(&texture);
-        true
+        Some(frame)
+    }
+
+    /// 读取当前 overlay 数据快照；绘制由前端完成。
+    pub fn overlay(&self) -> Option<OverlayData> {
+        self.overlay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// 启动 guide auto_capture（RTSP 预览连接后自动开启）。
@@ -383,7 +370,8 @@ impl Default for GuidedPoseTolerance {
 struct GuidedPose6Dof {
     /// 棋盘中心在相机坐标系下的 XYZ；单位继承 BoardSpec::square_size。
     xyz: [f64; 3],
-    /// board->camera 旋转矩阵按 ZYX 分解得到的 roll/pitch/yaw，单位 degree。
+    /// board->camera 旋转矩阵按 ZYX 分解得到的 roll/pitch/yaw，单位 degree；
+    /// 语义对齐标定板坐标轴：roll 绕板 Z（法线）、pitch 绕板 X（横纹理）、yaw 绕板 Y（竖纹理）。
     rpy_degrees: [f64; 3],
     rotation: [[f64; 3]; 3],
     translation: [f64; 3],
@@ -547,7 +535,10 @@ fn guided_capture_loop(
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
     let mut runtime: Option<GuidedCaptureRuntime> = None;
-    godot_print!("guide auto_capture worker 已启动（27 动作：15 正视 + 8 倾斜 + 4 远距，hold {HOLD_TARGET} 帧）");
+    let mut published_target_step: Option<usize> = None;
+    tracing::info!(
+        "guide auto_capture worker 已启动（27 动作：15 正视 + 8 倾斜 + 4 远距，hold {HOLD_TARGET} 帧）"
+    );
     loop {
         if runtime
             .as_ref()
@@ -600,14 +591,17 @@ fn guided_capture_loop(
         let Some(target_pose) = rt.current_target().cloned() else {
             continue;
         };
-        publish_target_overlay(
-            &overlay,
-            frame.width,
-            frame.height,
-            &target_pose,
-            None,
-            None,
-        );
+        if published_target_step != Some(rt.current_step) {
+            publish_target_overlay(
+                &overlay,
+                frame.width,
+                frame.height,
+                &target_pose,
+                None,
+                None,
+            );
+            published_target_step = Some(rt.current_step);
+        }
 
         let (detect_rgba, detect_w, detect_h, detect_scale) =
             resize_for_detect(&frame.rgba, frame.width, frame.height);
@@ -831,225 +825,162 @@ fn standard_guided_pose_plan(
     initial_intrinsics: &InitialIntrinsics,
     image_size: CalibrationImageSize,
 ) -> Result<Vec<GuidedPoseTarget>, String> {
-    const FRONTO_SCALE: f64 = 0.62;
-    const MID_TILT_SCALE: f64 = 0.43;
-    const FAR_CORNER_SCALE: f64 = 0.22;
-    const MID_TILT_DEGREES: f64 = 32.0;
+    const FRONTO_TZ_MM: f64 = 600.0;
+    const TILT_TZ_MM: f64 = 700.0;
+    const TILT_RING_RADIUS_MM: f64 = 80.0;
+    const TILT_DEGREES: f64 = 22.0;
+    const FAR_CENTER_Z_MM: f64 = 800.0;
+    const FAR_TILT_DEGREES: f64 = 45.0;
+
     let tolerance = GuidedPoseTolerance::default();
     let mut plan = Vec::with_capacity(CAPTURE_TARGET);
-    let mut push = |label: &'static str,
-                    center_uv: [f64; 2],
-                    scale: f64,
-                    tilt_degrees: f64,
-                    azimuth_degrees: f64|
+    let matrix = initial_intrinsics.camera_matrix;
+    if matrix[0] <= 0.0 || matrix[4] <= 0.0 {
+        return Err("guided pose 初始内参 fx/fy 必须为正".to_owned());
+    }
+
+    let inner_width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
+    let inner_height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
+    let outer_width = f64::from(board.inner_cols + 1) * board.square_size;
+    let outer_height = f64::from(board.inner_rows + 1) * board.square_size;
+    let short_side = f64::from(image_size.width.min(image_size.height));
+    let image_width = f64::from(image_size.width);
+    let image_height = f64::from(image_size.height);
+    let fronto_scale = ((inner_width * matrix[0] / FRONTO_TZ_MM)
+        .max(inner_height * matrix[4] / FRONTO_TZ_MM))
+        / short_side;
+    let fronto_outer_width_uv = outer_width * matrix[0] / FRONTO_TZ_MM / image_width;
+    let fronto_outer_height_uv = outer_height * matrix[4] / FRONTO_TZ_MM / image_height;
+    if !(0.0..1.0).contains(&fronto_outer_width_uv) || !(0.0..1.0).contains(&fronto_outer_height_uv)
+    {
+        return Err("guided pose 正视外框尺寸超出画面，无法生成 3x5 边缘覆盖".to_owned());
+    }
+    let fronto_x_step = (1.0 - fronto_outer_width_uv) / 4.0;
+    let fronto_columns = [
+        fronto_outer_width_uv * 0.5,
+        fronto_outer_width_uv * 0.5 + fronto_x_step,
+        fronto_outer_width_uv * 0.5 + fronto_x_step * 2.0,
+        fronto_outer_width_uv * 0.5 + fronto_x_step * 3.0,
+        1.0 - fronto_outer_width_uv * 0.5,
+    ];
+    let fronto_rows = [
+        fronto_outer_height_uv * 0.5,
+        0.5,
+        1.0 - fronto_outer_height_uv * 0.5,
+    ];
+
+    let mut push_projected =
+        |label: &'static str, projection: GuidedPoseGridProjection| -> Result<(), String> {
+            plan.push(GuidedPoseTarget {
+                label,
+                pose: projection.pose,
+                tolerance,
+                outline_uv: projection.outline_uv,
+                grid_lines: projection.grid_lines,
+            });
+            Ok(())
+        };
+    let mut push_center_scale = |label: &'static str,
+                                 center_uv: [f64; 2],
+                                 scale: f64|
      -> Result<(), String> {
         let projection = guided_pose_grid_projection(
             board,
             center_uv,
             scale,
-            tilt_degrees,
-            azimuth_degrees,
+            0.0,
+            0.0,
             initial_intrinsics,
             image_size,
         )
         .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
-        plan.push(GuidedPoseTarget {
-            label,
-            pose: projection.pose,
-            tolerance,
-            outline_uv: projection.outline_uv,
-            grid_lines: projection.grid_lines,
-        });
-        Ok(())
+        push_projected(label, projection)
     };
-    // Phase A: 近距正视 3x5 蛇形 raster，先用高像素尺度扫完整画面覆盖。
-    push(
-        "F01 Fronto upper left",
-        [0.33, 0.31],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F02 Fronto upper mid-left",
-        [0.415, 0.31],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F03 Fronto upper center",
-        [0.50, 0.31],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F04 Fronto upper mid-right",
-        [0.585, 0.31],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F05 Fronto upper right",
-        [0.67, 0.31],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F06 Fronto middle right",
-        [0.67, 0.50],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F07 Fronto middle mid-right",
-        [0.585, 0.50],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push("F08 Fronto center", [0.50, 0.50], FRONTO_SCALE, 0.0, 0.0)?;
-    push(
-        "F09 Fronto middle mid-left",
-        [0.415, 0.50],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F10 Fronto middle left",
-        [0.33, 0.50],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F11 Fronto lower left",
-        [0.33, 0.69],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F12 Fronto lower mid-left",
-        [0.415, 0.69],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F13 Fronto lower center",
-        [0.50, 0.69],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F14 Fronto lower mid-right",
-        [0.585, 0.69],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "F15 Fronto lower right",
-        [0.67, 0.69],
-        FRONTO_SCALE,
-        0.0,
-        0.0,
-    )?;
 
-    // Phase B: 中距 8 点大倾斜圆弧；相机位置小幅移动，主要通过姿态变化获得透视激励。
-    push(
-        "T01 Tilt lower right",
-        [0.60, 0.61],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        315.0,
-    )?;
-    push(
-        "T02 Tilt right",
-        [0.63, 0.50],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        0.0,
-    )?;
-    push(
-        "T03 Tilt upper right",
-        [0.60, 0.39],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        45.0,
-    )?;
-    push(
-        "T04 Tilt top",
-        [0.50, 0.36],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        90.0,
-    )?;
-    push(
-        "T05 Tilt upper left",
-        [0.40, 0.39],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        135.0,
-    )?;
-    push(
-        "T06 Tilt left",
-        [0.37, 0.50],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        180.0,
-    )?;
-    push(
-        "T07 Tilt lower left",
-        [0.40, 0.61],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        225.0,
-    )?;
-    push(
-        "T08 Tilt bottom",
-        [0.50, 0.64],
-        MID_TILT_SCALE,
-        MID_TILT_DEGREES,
-        270.0,
-    )?;
+    // Phase A: 正视 3x5 均匀分布。四角动作让外侧棋盘边缘贴到图像边缘，重叠率由分辨率和 12x9 外框比例反推。
+    for (row_index, row) in fronto_rows.iter().copied().enumerate() {
+        let column_order: [usize; 5] = if row_index % 2 == 0 {
+            [0, 1, 2, 3, 4]
+        } else {
+            [4, 3, 2, 1, 0]
+        };
+        for column_index in column_order {
+            let label = match (row_index, column_index) {
+                (0, 0) => "F01 Fronto upper left",
+                (0, 1) => "F02 Fronto upper mid-left",
+                (0, 2) => "F03 Fronto upper center",
+                (0, 3) => "F04 Fronto upper mid-right",
+                (0, 4) => "F05 Fronto upper right",
+                (1, 4) => "F06 Fronto middle right",
+                (1, 3) => "F07 Fronto middle mid-right",
+                (1, 2) => "F08 Fronto center",
+                (1, 1) => "F09 Fronto middle mid-left",
+                (1, 0) => "F10 Fronto middle left",
+                (2, 0) => "F11 Fronto lower left",
+                (2, 1) => "F12 Fronto lower mid-left",
+                (2, 2) => "F13 Fronto lower center",
+                (2, 3) => "F14 Fronto lower mid-right",
+                (2, 4) => "F15 Fronto lower right",
+                _ => return Err("guided pose 正视标签生成失败".to_owned()),
+            };
+            push_center_scale(label, [fronto_columns[column_index], row], fronto_scale)?;
+        }
+    }
 
-    // Phase C: 远距四角 off-axis；保持相机中心在圆柱空间内，靠朝向把小棋盘送到四角。
-    push(
-        "C01 Far lower right",
-        [0.86, 0.82],
-        FAR_CORNER_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "C02 Far upper right",
-        [0.86, 0.18],
-        FAR_CORNER_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "C03 Far upper left",
-        [0.14, 0.18],
-        FAR_CORNER_SCALE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "C04 Far lower left",
-        [0.14, 0.82],
-        FAR_CORNER_SCALE,
-        0.0,
-        0.0,
-    )?;
+    // Phase B: 斜视绕环。直接用相机坐标系内角点中心 (tz, r) 和倾角 theta 生成目标，不再手调画面中心/scale。
+    let tilt_specs = [
+        ("T01 Tilt lower right", 315.0),
+        ("T02 Tilt right", 0.0),
+        ("T03 Tilt upper right", 45.0),
+        ("T04 Tilt top", 90.0),
+        ("T05 Tilt upper left", 135.0),
+        ("T06 Tilt left", 180.0),
+        ("T07 Tilt lower left", 225.0),
+        ("T08 Tilt bottom", 270.0),
+    ];
+    for (label, azimuth_degrees) in tilt_specs {
+        let azimuth = f64::to_radians(azimuth_degrees);
+        let rotation = guided_pose_rotation(TILT_DEGREES, azimuth_degrees);
+        let center_xyz = [
+            TILT_RING_RADIUS_MM * azimuth.cos(),
+            -TILT_RING_RADIUS_MM * azimuth.sin(),
+            TILT_TZ_MM,
+        ];
+        let translation = guided_pose_translation_for_center(board, rotation, center_xyz);
+        let projection = guided_pose_grid_projection_from_rotation_translation(
+            board,
+            rotation,
+            translation,
+            initial_intrinsics,
+            image_size,
+        )
+        .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
+        push_projected(label, projection)?;
+    }
+
+    // Phase C: 四个最远斜视目标。内角点中心固定在相机 Z 光轴 (0, 0, 800mm)，
+    // 绕指向对应角落的切向轴旋转，避免原先靠平移把棋盘角点推到画面角落。
+    let corner_specs = [
+        ("C01 Far oblique lower right", 1.0, 1.0, 45.0),
+        ("C02 Far oblique upper right", 1.0, -1.0, 315.0),
+        ("C03 Far oblique upper left", -1.0, -1.0, 225.0),
+        ("C04 Far oblique lower left", -1.0, 1.0, 135.0),
+    ];
+    for (label, _screen_x_sign, _screen_y_sign, azimuth_degrees) in corner_specs {
+        let rotation = guided_pose_rotation(FAR_TILT_DEGREES, azimuth_degrees);
+        let center_xyz = [0.0, 0.0, FAR_CENTER_Z_MM];
+        let translation = guided_pose_translation_for_center(board, rotation, center_xyz);
+        let projection = guided_pose_grid_projection_from_rotation_translation(
+            board,
+            rotation,
+            translation,
+            initial_intrinsics,
+            image_size,
+        )
+        .ok_or_else(|| format!("guided target '{label}' cannot be projected"))?;
+        push_projected(label, projection)?;
+    }
+
     Ok(plan)
 }
 
@@ -1080,6 +1011,22 @@ fn guided_pose_grid_projection(
         initial_intrinsics,
         image_size,
     )?;
+    guided_pose_grid_projection_from_rotation_translation(
+        board,
+        rotation,
+        translation,
+        initial_intrinsics,
+        image_size,
+    )
+}
+
+fn guided_pose_grid_projection_from_rotation_translation(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<GuidedPoseGridProjection> {
     let left = -1.0;
     let top = -1.0;
     let right = f64::from(board.inner_cols);
@@ -1180,6 +1127,19 @@ fn guided_pose_grid_projection(
         ],
         grid_lines,
     })
+}
+
+fn guided_pose_translation_for_center(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    center_xyz: [f64; 3],
+) -> [f64; 3] {
+    let rotated_center = rotate_guided_pose_point(rotation, guided_pose_inner_center_point(board));
+    [
+        center_xyz[0] - rotated_center[0],
+        center_xyz[1] - rotated_center[1],
+        center_xyz[2] - rotated_center[2],
+    ]
 }
 
 fn guided_pose_target_translation(
@@ -1439,21 +1399,27 @@ fn guided_pose_6dof_is_finite(pose: &GuidedPose6Dof) -> bool {
         && pose.center_uv.iter().all(|value| value.is_finite())
 }
 
+/// board->camera 旋转矩阵按 R = Rz(yaw)·Ry(pitch)·Rx(roll)（ZYX）分解。
+///
+/// 返回的 [roll, pitch, yaw] 语义对齐标定板坐标轴（OpenCV x 右 / y 下 / z 前）：
+/// roll 绕板 Z 轴（平面法线）、pitch 绕板 X 轴（横纹理）、yaw 绕板 Y 轴（竖纹理），
+/// 单位 degree。符号沿用分解公式（右手系，从轴正端看正角为逆时针）。
 fn guided_pose_rotation_to_rpy_degrees(rotation: [[f64; 3]; 3]) -> Option<[f64; 3]> {
     if rotation.iter().flatten().any(|value| !value.is_finite()) {
         return None;
     }
-    let pitch = (-rotation[2][0]).clamp(-1.0, 1.0).asin();
-    let cos_pitch = pitch.cos();
-    let (roll, yaw) = if cos_pitch.abs() > 1.0e-9 {
+    // ZYX 分解：β 绕板 Y（竖）、α 绕板 X（横）、γ 绕板 Z（法线）。
+    let beta = (-rotation[2][0]).clamp(-1.0, 1.0).asin();
+    let cos_beta = beta.cos();
+    let (gamma, alpha) = if cos_beta.abs() > 1.0e-9 {
         (
-            rotation[2][1].atan2(rotation[2][2]),
             rotation[1][0].atan2(rotation[0][0]),
+            rotation[2][1].atan2(rotation[2][2]),
         )
     } else {
-        (0.0, (-rotation[0][1]).atan2(rotation[1][1]))
+        ((-rotation[0][1]).atan2(rotation[1][1]), 0.0)
     };
-    let rpy = [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()];
+    let rpy = [gamma.to_degrees(), alpha.to_degrees(), beta.to_degrees()];
     rpy.iter().all(|value| value.is_finite()).then_some(rpy)
 }
 
@@ -1471,11 +1437,7 @@ fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 
 fn signed_angle_distance_degrees(left: f64, right: f64) -> f64 {
     let delta = (left - right).rem_euclid(360.0);
-    if delta > 180.0 {
-        delta - 360.0
-    } else {
-        delta
-    }
+    if delta > 180.0 { delta - 360.0 } else { delta }
 }
 
 fn guided_pose_signed_rotation_error_components(
@@ -1489,12 +1451,11 @@ fn guided_pose_signed_rotation_error_components(
     {
         return None;
     }
-    let raw_zyx = [
+    Some([
         signed_angle_distance_degrees(target_rpy_degrees[0], measurement_rpy_degrees[0]),
         signed_angle_distance_degrees(target_rpy_degrees[1], measurement_rpy_degrees[1]),
         signed_angle_distance_degrees(target_rpy_degrees[2], measurement_rpy_degrees[2]),
-    ];
-    Some([raw_zyx[2], raw_zyx[0], raw_zyx[1]])
+    ])
 }
 
 fn guided_pose_rotation_error_score(components: [f64; 3], tolerance: GuidedPoseTolerance) -> f64 {
@@ -1710,8 +1671,11 @@ fn assess_guided_pose(
     let signed_rotation_error_degrees =
         guided_pose_rotation_error_degrees(&measurement.pose, &target.pose, target.tolerance)
             .ok_or_else(|| "guided pose rotation error is not finite".to_owned())?;
-    let [signed_roll_degrees, signed_pitch_degrees, signed_yaw_degrees] =
-        signed_rotation_error_degrees;
+    let [
+        signed_roll_degrees,
+        signed_pitch_degrees,
+        signed_yaw_degrees,
+    ] = signed_rotation_error_degrees;
     let error = GuidedPoseError {
         x: (measurement.pose.xyz[0] - target.pose.xyz[0]).abs() / depth_scale,
         y: (measurement.pose.xyz[1] - target.pose.xyz[1]).abs() / depth_scale,
@@ -1954,7 +1918,7 @@ fn guided_pose_rotation_arc_overlay(
         .unwrap_or(0.0)
         .to_radians()
         .clamp(-arc_sweep_limit.abs(), arc_sweep_limit.abs());
-    let arc_uv = if visual_sweep.abs() > 0.5_f32.to_radians() {
+    let arc_uv = if visual_sweep.abs() > 0.1_f32.to_radians() {
         guided_pose_project_rotation_ring_points(
             measurement,
             plane,
@@ -1975,6 +1939,10 @@ fn guided_pose_rotation_arc_overlay(
         ),
         arc_uv,
         tick_uv: guided_pose_project_rotation_ring_point(measurement, plane, arc_start_angle),
+        error_degrees: error_degrees
+            .is_finite()
+            .then_some(error_degrees as f32)
+            .unwrap_or(0.0),
     }
 }
 
@@ -2284,13 +2252,13 @@ impl StreamState {
         } else {
             let ch0 = RtspStream::start(host, 554, 0, 1920, 1080, ch0_slot.clone()).unwrap_or_else(
                 |error| {
-                    godot_print!("CH0 预览启动失败：{error}");
+                    tracing::warn!("CH0 预览启动失败：{error}");
                     RtspStream::start_synth(0, ch0_slot)
                 },
             );
             let ch3 = RtspStream::start(host, 557, 3, 1920, 1080, ch3_slot.clone()).unwrap_or_else(
                 |error| {
-                    godot_print!("CH3 预览启动失败：{error}");
+                    tracing::warn!("CH3 预览启动失败：{error}");
                     RtspStream::start_synth(3, ch3_slot)
                 },
             );
@@ -2318,69 +2286,168 @@ mod tests {
         standard_guided_pose_plan(board, &intrinsics, image_size).unwrap()
     }
 
+    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
+        assert!(
+            (actual - expected).abs() <= tolerance,
+            "actual {actual:.9} expected {expected:.9} tolerance {tolerance:.9}"
+        );
+    }
+
+    fn assert_uv_close(actual: [f32; 2], expected: [f64; 2], tolerance: f64) {
+        assert_close(f64::from(actual[0]), expected[0], tolerance);
+        assert_close(f64::from(actual[1]), expected[1], tolerance);
+    }
+
+    fn projected_inner_corner_uvs(
+        board: BoardSpec,
+        intrinsics: &InitialIntrinsics,
+        image_size: CalibrationImageSize,
+        target: &GuidedPoseTarget,
+    ) -> Vec<[f64; 2]> {
+        let mut points =
+            Vec::with_capacity(usize::from(board.inner_cols) * usize::from(board.inner_rows));
+        for row in 0..board.inner_rows {
+            for column in 0..board.inner_cols {
+                let point = project_board_point_image(
+                    target.pose.rotation,
+                    target.pose.translation,
+                    guided_pose_board_point(board, f64::from(column), f64::from(row)),
+                    intrinsics,
+                )
+                .expect("inner corner should project inside camera space");
+                points.push([
+                    f64::from(point.x) / f64::from(image_size.width),
+                    f64::from(point.y) / f64::from(image_size.height),
+                ]);
+            }
+        }
+        points
+    }
+
     #[test]
     fn guided_plan_has_structured_27_pose_phases() {
         let plan = reference_plan();
         assert_eq!(plan.len(), CAPTURE_TARGET);
         assert_eq!(CAPTURE_TARGET, 27);
-        assert!(plan[..15]
-            .iter()
-            .all(|target| target.label.starts_with('F')));
-        assert!(plan[15..23]
-            .iter()
-            .all(|target| target.label.starts_with('T')));
-        assert!(plan[23..]
-            .iter()
-            .all(|target| target.label.starts_with('C')));
+        assert!(
+            plan[..15]
+                .iter()
+                .all(|target| target.label.starts_with('F'))
+        );
+        assert!(
+            plan[15..23]
+                .iter()
+                .all(|target| target.label.starts_with('T'))
+        );
+        assert!(
+            plan[23..]
+                .iter()
+                .all(|target| target.label.starts_with('C'))
+        );
         assert_eq!(plan[0].label, "F01 Fronto upper left");
         assert_eq!(plan[14].label, "F15 Fronto lower right");
         assert_eq!(plan[22].label, "T08 Tilt bottom");
-        assert_eq!(plan[26].label, "C04 Far lower left");
+        assert_eq!(plan[26].label, "C04 Far oblique lower left");
     }
 
     #[test]
-    fn guided_plan_depth_ratio_and_fronto_motion_match_constraints() {
+    fn guided_plan_uses_physical_depth_ring_and_tilt_parameters() {
         let plan = reference_plan();
-        let min_z = plan
-            .iter()
-            .map(|target| target.pose.xyz[2])
-            .fold(f64::INFINITY, f64::min);
+
+        for target in &plan[..15] {
+            assert_close(target.pose.xyz[2], 600.0, 1.0e-6);
+            assert!(
+                target
+                    .pose
+                    .rpy_degrees
+                    .iter()
+                    .all(|angle| angle.abs() <= 1.0e-6)
+            );
+        }
+
+        for target in &plan[15..23] {
+            assert_close(target.pose.xyz[2], 700.0, 1.0e-6);
+            assert_close(target.pose.xyz[0].hypot(target.pose.xyz[1]), 80.0, 1.0e-6);
+            let tilt_degrees = target.pose.rotation[2][2]
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            assert_close(tilt_degrees, 22.0, 1.0e-6);
+        }
+
+        for target in &plan[23..] {
+            assert_close(target.pose.xyz[0], 0.0, 1.0e-6);
+            assert_close(target.pose.xyz[1], 0.0, 1.0e-6);
+            assert_close(target.pose.xyz[2], 800.0, 1.0e-6);
+            let tilt_degrees = target.pose.rotation[2][2]
+                .clamp(-1.0, 1.0)
+                .acos()
+                .to_degrees();
+            assert_close(tilt_degrees, 45.0, 1.0e-6);
+        }
         let max_z = plan
             .iter()
             .map(|target| target.pose.xyz[2])
             .fold(0.0_f64, f64::max);
-        let ratio = max_z / min_z;
-        assert!(
-            (2.0..=5.0).contains(&ratio),
-            "depth ratio {ratio:.3} out of range"
-        );
-
-        for target in &plan[..15] {
-            let radius = target.pose.xyz[0].hypot(target.pose.xyz[1]);
-            assert!(
-                radius <= 255.0,
-                "{} radius {radius:.1}mm exceeds fronto motion budget",
-                target.label
-            );
-            assert!(target
-                .pose
-                .rpy_degrees
-                .iter()
-                .all(|angle| angle.abs() <= 1.0e-6));
-        }
+        assert_close(max_z, 800.0, 1.0e-6);
     }
 
     #[test]
-    fn guided_plan_far_corner_centers_cover_four_image_corners() {
+    fn guided_plan_fronto_grid_edges_and_overlap_follow_outer_board_ratio() {
         let plan = reference_plan();
-        let centers = plan[23..]
-            .iter()
-            .map(|target| target.pose.center_uv)
-            .collect::<Vec<_>>();
-        let expected = [[0.86, 0.82], [0.86, 0.18], [0.14, 0.18], [0.14, 0.82]];
-        for (actual, expected) in centers.iter().zip(expected) {
-            assert!((f64::from(actual[0]) - expected[0]).abs() <= 0.005);
-            assert!((f64::from(actual[1]) - expected[1]).abs() <= 0.005);
+        assert_uv_close(plan[0].outline_uv[0], [0.0, 0.0], 1.0e-5);
+        assert_uv_close(plan[4].outline_uv[1], [1.0, 0.0], 1.0e-5);
+        assert_uv_close(plan[10].outline_uv[3], [0.0, 1.0], 1.0e-5);
+        assert_uv_close(plan[14].outline_uv[2], [1.0, 1.0], 1.0e-5);
+
+        let first_width = f64::from(plan[0].outline_uv[1][0] - plan[0].outline_uv[0][0]);
+        let first_height = f64::from(plan[0].outline_uv[3][1] - plan[0].outline_uv[0][1]);
+        assert_close(first_width, 0.375, 1.0e-5);
+        assert_close(first_height, 0.5, 1.0e-5);
+        let horizontal_step = f64::from(plan[1].pose.center_uv[0] - plan[0].pose.center_uv[0]);
+        let vertical_step = f64::from(plan[5].pose.center_uv[1] - plan[0].pose.center_uv[1]);
+        assert_close(
+            (first_width - horizontal_step) / first_width,
+            7.0 / 12.0,
+            1.0e-4,
+        );
+        assert_close((first_height - vertical_step) / first_height, 0.5, 1.0e-5);
+    }
+
+    #[test]
+    fn guided_plan_fronto_inner_corners_cover_full_statistical_grid() {
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let image_size = CalibrationImageSize::new(1920, 1080).unwrap();
+        let intrinsics = InitialIntrinsics {
+            camera_matrix: [900.0, 0.0, 980.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        let plan = standard_guided_pose_plan(board, &intrinsics, image_size).unwrap();
+        let mut occupied = [[false; 12]; 8];
+        for target in &plan[..15] {
+            for [u, v] in projected_inner_corner_uvs(board, &intrinsics, image_size, target) {
+                let x = ((u * 12.0).floor() as usize).min(11);
+                let y = ((v * 8.0).floor() as usize).min(7);
+                occupied[y][x] = true;
+            }
+        }
+        let count = occupied.iter().flatten().filter(|cell| **cell).count();
+        assert_eq!(
+            count, 96,
+            "fronto inner corner occupancy should cover every 12x8 cell"
+        );
+    }
+
+    #[test]
+    fn guided_plan_far_corners_are_centered_oblique_targets() {
+        let plan = reference_plan();
+        let expected_center = [980.0 / 1920.0, 540.0 / 1080.0];
+        for target in &plan[23..] {
+            assert!(target.label.contains("Far oblique"));
+            assert_close(target.pose.xyz[0], 0.0, 1.0e-6);
+            assert_close(target.pose.xyz[1], 0.0, 1.0e-6);
+            assert_close(target.pose.xyz[2], 800.0, 1.0e-6);
+            assert_uv_close(target.pose.center_uv, expected_center, 1.0e-6);
         }
     }
 

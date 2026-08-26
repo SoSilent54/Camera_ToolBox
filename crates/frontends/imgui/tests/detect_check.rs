@@ -19,7 +19,13 @@ fn synth_board_rgba(width: u32, height: u32, cell: i32, shear: f32) -> Vec<u8> {
             let gy = (y - oy) / cell;
             let inside = gx >= 0 && gx < cols && gy >= 0 && gy < rows;
             let white = inside && ((gx + gy) % 2 == 0);
-            let v = if white { 235u8 } else if inside { 30u8 } else { 60u8 };
+            let v = if white {
+                235u8
+            } else if inside {
+                30u8
+            } else {
+                60u8
+            };
             rgba.extend_from_slice(&[v, v, v, 255]);
         }
     }

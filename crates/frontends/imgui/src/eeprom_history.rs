@@ -27,7 +27,7 @@ pub fn persist_write_history(
         .full_provision_request(false);
     let document = json!({
         "schema_version": "camera-toolbox.eeprom-write-history.v1",
-        "tool": "pongbot-calib-tool-godot",
+        "tool": "pongbot-calib-tool",
         "operation_id": format!("{operation_id:016x}"),
         "timestamp_unix_secs": SystemTime::now()
             .duration_since(UNIX_EPOCH)

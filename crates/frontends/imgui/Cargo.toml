@@ -5,11 +5,11 @@ version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-[lib]
-crate-type = ["cdylib"]
+[[bin]]
+name = "pongbot-calib-tool"
+path = "src/main.rs"
 
 [dependencies]
-godot = { version = "0.5", features = ["api-4-4"] }
 camera-toolbox-app = { workspace = true }
 camera-toolbox-core = { workspace = true }
 camera-toolbox-adapters = { workspace = true, features = ["platform-local", "platform-ssh", "calibration-opencv"] }
@@ -20,8 +20,17 @@ serde_json.workspace = true
 thiserror.workspace = true
 serde_yaml.workspace = true
 sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+imgui.workspace = true
+imgui-winit-support.workspace = true
+imgui-glow-renderer.workspace = true
+glow.workspace = true
+winit.workspace = true
+glutin.workspace = true
+glutin-winit.workspace = true
+raw-window-handle.workspace = true
 
-# gdext 的 `#[gdextension]` 宏展开需要 unsafe；覆盖 workspace 的 forbid。
 [lints.rust]
 unsafe_code = "allow"
 
