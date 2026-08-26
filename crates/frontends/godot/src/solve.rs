@@ -5,9 +5,7 @@
 
 use crate::preview::CapturedDatasetFrame;
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
-use camera_toolbox_app::ports::calibration::{
-    CalibrationBackend, CalibrationCancellation, SubpixelRefinementOptions,
-};
+use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
     ChessboardDetectionOutcome, InitialIntrinsics,
@@ -96,8 +94,8 @@ pub fn distortion_summary(values: &[f64]) -> String {
 
 /// 对单路 dataset 求解（后台线程调用）。
 ///
-/// dataset 已在采集时转换成 luma：真实设备来自 TCP NV12 的 Y plane；检测显式启用
-/// `cornerSubPix`，避免落回 findChessboardCorners 初始角点。
+/// dataset 已在采集时转换成 luma：真实设备来自 TCP NV12 的 Y plane；检测走原版
+/// `detect_png()` 路径，内部使用自适应 `cornerSubPix` 与稳定性筛选。
 pub fn solve_channel(
     channel: u16,
     frames: &[Arc<CapturedDatasetFrame>],
@@ -108,7 +106,6 @@ pub fn solve_channel(
     }
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
-    let subpixel_options = default_subpixel_options();
     let mut image_points: Vec<Vec<CalibrationPoint>> = Vec::new();
     let mut image_size = None;
     for frame in frames {
@@ -117,14 +114,7 @@ pub fn solve_channel(
             width: frame.width,
             height: frame.height,
         };
-        match backend.detect_png_with_options(
-            &png,
-            expected,
-            256 * 1024 * 1024,
-            board,
-            subpixel_options,
-            &cancellation,
-        ) {
+        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 image_size = Some(detection.image_size);
                 image_points.push(detection.corners);
@@ -177,15 +167,6 @@ fn encode_luma_png(luma: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Stri
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|error| format!("PNG 编码失败：{error}"))?;
     Ok(buf)
-}
-
-fn default_subpixel_options() -> SubpixelRefinementOptions {
-    SubpixelRefinementOptions {
-        enabled: true,
-        window_radius: 5,
-        max_iterations: 30,
-        epsilon: 0.01,
-    }
 }
 
 #[cfg(test)]

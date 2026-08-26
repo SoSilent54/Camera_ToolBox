@@ -17,9 +17,7 @@ use camera_toolbox_app::platform::{
     DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, SourcePts, StreamCancellation,
     StreamFrameIdentity, StreamSessionId,
 };
-use camera_toolbox_app::ports::calibration::{
-    CalibrationBackend, CalibrationCancellation, SubpixelRefinementOptions,
-};
+use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, ChessboardDetection,
     ChessboardDetectionOutcome, InitialIntrinsics, ViewCalibrationResult,
@@ -548,7 +546,6 @@ fn guided_capture_loop(
 ) {
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
-    let subpixel_options = default_subpixel_options();
     let mut runtime: Option<GuidedCaptureRuntime> = None;
     godot_print!("guide auto_capture worker 已启动（原版 45 动作，hold {HOLD_TARGET} 帧）");
     loop {
@@ -631,14 +628,7 @@ fn guided_capture_loop(
             width: detect_w,
             height: detect_h,
         };
-        match backend.detect_png_with_options(
-            &png,
-            expected,
-            256 * 1024 * 1024,
-            board,
-            subpixel_options,
-            &cancellation,
-        ) {
+        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 let corners: Vec<CalibrationPoint> = detection
                     .corners
@@ -2290,15 +2280,6 @@ fn dataset_frame_from_decoded_rgba(
         luma: luma.into(),
         source: CapturedDatasetSource::SyntheticRgba { frame_sequence },
     })
-}
-
-fn default_subpixel_options() -> SubpixelRefinementOptions {
-    SubpixelRefinementOptions {
-        enabled: true,
-        window_radius: 5,
-        max_iterations: 30,
-        epsilon: 0.01,
-    }
 }
 
 fn set_guide(guide: &Arc<Mutex<GuideState>>, text: &str, count: usize, hold: u8) {
