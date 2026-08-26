@@ -1,11 +1,87 @@
-//! Step 3 求解检查：棋盘参数 + 执行标定 + 双路结果展示。
+//! Step 3 求解检查：棋盘参数 + 标定结果几何摘要 + 单图重投影误差柱状图。
 
 use godot::classes::text_server::AutowrapMode;
-use godot::classes::{Button, Control, HBoxContainer, Label, SpinBox, VBoxContainer};
+use godot::classes::{Button, Control, HBoxContainer, IControl, Label, SpinBox, VBoxContainer};
 use godot::prelude::*;
 
 use crate::ui::theme;
 
+/// 单路每张图重投影 RMSE 柱状图。
+#[derive(GodotClass)]
+#[class(init, base = Control)]
+pub struct ReprojectionBarChart {
+    base: Base<Control>,
+    values: Vec<f64>,
+    limit: f64,
+}
+
+impl ReprojectionBarChart {
+    /// 更新柱状图数据；单位为 pixel RMSE。
+    pub fn set_values(&mut self, values: Vec<f64>, limit: f64) {
+        self.values = values;
+        self.limit = limit.max(0.1);
+        self.base_mut().queue_redraw();
+    }
+
+    pub fn clear_values(&mut self) {
+        self.values.clear();
+        self.base_mut().queue_redraw();
+    }
+}
+
+#[godot_api]
+impl IControl for ReprojectionBarChart {
+    fn draw(&mut self) {
+        let rect = self.base().get_rect();
+        let size = rect.size;
+        let origin = Vector2::new(8.0, size.y - 18.0);
+        let chart_w = (size.x - 16.0).max(1.0);
+        let chart_h = (size.y - 28.0).max(1.0);
+        let axis = Color::from_rgba(1.0, 1.0, 1.0, 0.22);
+        self.base_mut().draw_line(
+            Vector2::new(8.0, origin.y),
+            Vector2::new(size.x - 8.0, origin.y),
+            axis,
+        );
+        self.base_mut()
+            .draw_line(Vector2::new(8.0, origin.y), Vector2::new(8.0, 8.0), axis);
+
+        if self.values.is_empty() {
+            return;
+        }
+        let values = self.values.clone();
+        let max_value = values.iter().copied().fold(self.limit, f64::max).max(0.1);
+        let n = values.len() as f32;
+        let slot = chart_w / n;
+        let bar_w = (slot * 0.72).clamp(2.0, 12.0);
+        for (index, value) in values.into_iter().enumerate() {
+            let value = value.max(0.0);
+            let ratio = (value / max_value).clamp(0.0, 1.0) as f32;
+            let h = chart_h * ratio;
+            let x = 8.0 + index as f32 * slot + (slot - bar_w) * 0.5;
+            let y = origin.y - h;
+            let color = if value <= self.limit {
+                Color::from_rgba(0.22, 0.92, 0.48, 0.90)
+            } else {
+                Color::from_rgba(1.0, 0.46, 0.36, 0.95)
+            };
+            self.base_mut().draw_rect(
+                Rect2 {
+                    position: Vector2::new(x, y),
+                    size: Vector2::new(bar_w, h.max(1.0)),
+                },
+                color,
+            );
+        }
+
+        let limit_y = origin.y - chart_h * (self.limit / max_value).clamp(0.0, 1.0) as f32;
+        self.base_mut().draw_line(
+            Vector2::new(8.0, limit_y),
+            Vector2::new(size.x - 8.0, limit_y),
+            Color::from_rgba(1.0, 0.76, 0.18, 0.70),
+        );
+    }
+}
 /// Step 3 的控件句柄。
 pub struct SolveStep {
     pub panel: Gd<Control>,
@@ -15,6 +91,8 @@ pub struct SolveStep {
     pub solve_button: Gd<Button>,
     pub ch0_result: Gd<Label>,
     pub ch3_result: Gd<Label>,
+    pub ch0_chart: Gd<ReprojectionBarChart>,
+    pub ch3_chart: Gd<ReprojectionBarChart>,
 }
 
 impl SolveStep {
@@ -75,6 +153,9 @@ impl SolveStep {
         ch0_result.add_theme_color_override("font_color", theme::MUTED);
         ch0_result.set_autowrap_mode(AutowrapMode::WORD_SMART);
         v.add_child(&ch0_result);
+        let mut ch0_chart = ReprojectionBarChart::new_alloc();
+        ch0_chart.set_custom_minimum_size(Vector2::new(0.0, 96.0));
+        v.add_child(&ch0_chart);
 
         let mut ch3_result = Label::new_alloc();
         ch3_result.set_text("CH3：待求解");
@@ -82,6 +163,9 @@ impl SolveStep {
         ch3_result.add_theme_color_override("font_color", theme::MUTED);
         ch3_result.set_autowrap_mode(AutowrapMode::WORD_SMART);
         v.add_child(&ch3_result);
+        let mut ch3_chart = ReprojectionBarChart::new_alloc();
+        ch3_chart.set_custom_minimum_size(Vector2::new(0.0, 96.0));
+        v.add_child(&ch3_chart);
 
         let panel: Gd<Control> = v.upcast();
         Self {
@@ -92,6 +176,8 @@ impl SolveStep {
             solve_button,
             ch0_result,
             ch3_result,
+            ch0_chart,
+            ch3_chart,
         }
     }
 
@@ -101,5 +187,15 @@ impl SolveStep {
         let mut label = label;
         label.set_text(text);
         label.add_theme_color_override("font_color", if ok { theme::OK } else { theme::ERR });
+    }
+
+    /// 更新单路单图 RMSE 柱状图。
+    pub fn set_chart(&mut self, mut chart: Gd<ReprojectionBarChart>, values: Vec<f64>, limit: f64) {
+        chart.bind_mut().set_values(values, limit);
+    }
+
+    pub fn clear_charts(&mut self) {
+        self.ch0_chart.bind_mut().clear_values();
+        self.ch3_chart.bind_mut().clear_values();
     }
 }

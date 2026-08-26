@@ -22,9 +22,13 @@ use ui::{theme, UiState};
 use camera_toolbox_app::platform::{
     EepromHelperResult, EepromInspectResult, EepromSerialState, EepromWriteResult,
 };
+use camera_toolbox_core::calibration_eeprom::yg_stereo_p24c64g_v1;
 use camera_toolbox_core::{BoardSpec, CalibrationSolution};
 use preview::StreamState;
-use solve::solve_channel;
+use solve::{
+    distortion_summary, format_intrinsics_geometry, solution_detail_summary, solve_channel,
+    view_rmse_values,
+};
 
 /// 应用根节点：挂载三步向导 UI 与领域层控制器。
 #[derive(GodotClass)]
@@ -474,7 +478,9 @@ impl CalibApp {
                     );
                     match (h0, h3) {
                         (Ok(path0), Ok(path3)) => format!(
-                            "写入 EEPROM 成功：\n{}\n{}\nwrite_history：\nCH0 {path0}\nCH3 {path3}",
+                            "写入 EEPROM 成功：\n待写入标定：\n{}\n{}\n写入状态：\n{}\n{}\nwrite_history：\nCH0 {path0}\nCH3 {path3}",
+                            solution_detail_summary("CH0", &solution0),
+                            solution_detail_summary("CH3", &solution3),
                             write_summary("CH0/i2c-4", &a),
                             write_summary("CH3/i2c-6", &b)
                         ),
@@ -525,6 +531,7 @@ impl CalibApp {
         if let Some(ui) = self.ui.as_mut() {
             ui.solve.ch0_result.set_text("CH0：求解中…");
             ui.solve.ch3_result.set_text("CH3：求解中…");
+            ui.solve.clear_charts();
             ui.solve
                 .ch0_result
                 .add_theme_color_override("font_color", theme::MUTED);
@@ -566,26 +573,53 @@ impl CalibApp {
                 .unwrap_or_default();
             self.start_previews(&host);
             self.connect_status(&text, theme::OK);
-        } else if text.contains("求解完成") {
-            // 双路求解结果：CH0 / CH3 分行展示。
+        } else if text.contains("求解完成")
+            || text.contains("CH0 失败")
+            || text.contains("CH3 失败")
+        {
+            // 双路求解结果：成功时用完整解渲染几何摘要和单图 RMSE 柱状图。
             godot_print!("求解结果：{text}");
-            let lines: Vec<&str> = text.lines().collect();
-            let mut both_ok = true;
-            if let Some(ui) = self.ui.as_mut() {
-                let ch0_text = lines.first().copied().unwrap_or("CH0：无结果");
-                let ch3_text = lines.get(1).copied().unwrap_or("CH3：无结果");
-                ui.solve.set_result(ui.solve.ch0_result.clone(), ch0_text);
-                ui.solve.set_result(ui.solve.ch3_result.clone(), ch3_text);
-                both_ok = !ch0_text.contains("失败") && !ch3_text.contains("失败");
-            }
-            // 取回完整标定解（EEPROM 写入使用）。
+            let mut both_ok = false;
+            let mut solved_pair = None;
             if let Some(slot) = self.pending_solutions.take() {
                 if let Ok(mut value) = slot.lock() {
                     if let Some((s0, s1)) = value.take() {
-                        if let (Some(a), Some(b)) = (s0, s1) {
-                            self.solutions = Some((a, b));
+                        match (s0, s1) {
+                            (Some(a), Some(b)) => {
+                                self.solutions = Some((a.clone(), b.clone()));
+                                solved_pair = Some((a, b));
+                                both_ok = true;
+                            }
+                            _ => {}
                         }
                     }
+                }
+            }
+            if let Some(ui) = self.ui.as_mut() {
+                if let Some((solution0, solution3)) = solved_pair.as_ref() {
+                    ui.solve.set_result(
+                        ui.solve.ch0_result.clone(),
+                        &solution_detail_summary("CH0", solution0),
+                    );
+                    ui.solve.set_result(
+                        ui.solve.ch3_result.clone(),
+                        &solution_detail_summary("CH3", solution3),
+                    );
+                    ui.solve.set_chart(
+                        ui.solve.ch0_chart.clone(),
+                        view_rmse_values(solution0),
+                        solution0.rms_error.max(0.5),
+                    );
+                    ui.solve.set_chart(
+                        ui.solve.ch3_chart.clone(),
+                        view_rmse_values(solution3),
+                        solution3.rms_error.max(0.5),
+                    );
+                } else {
+                    ui.solve.set_result(ui.solve.ch0_result.clone(), &text);
+                    ui.solve
+                        .set_result(ui.solve.ch3_result.clone(), "CH3：见上方错误详情");
+                    ui.solve.clear_charts();
                 }
             }
             if both_ok && self.solutions.is_some() {
@@ -737,7 +771,7 @@ impl CalibApp {
             return;
         };
         let host = ui.connect.device_ip.get_text().to_string();
-        if host.trim().is_empty() || host == "synth" {
+        if host.trim().is_empty() {
             return;
         }
         self.last_connection_probe = Some(Instant::now());
@@ -762,18 +796,84 @@ fn serial_state_label(serial: &EepromSerialState) -> String {
         EepromSerialState::Invalid { raw_hex, .. } => format!("无效：{raw_hex}"),
     }
 }
-
 fn inspect_summary(label: &str, inspect: &EepromInspectResult) -> String {
+    let calibration = eeprom_backup_calibration_summary(&inspect.backup)
+        .unwrap_or_else(|error| format!("EEPROM 标定解析失败：{error}"));
     format!(
-        "{label} before={} FLAG={} SN={}",
+        "{label} before={} FLAG={} SN={}\n{}",
         &inspect.state.image_sha256[..8.min(inspect.state.image_sha256.len())],
         if inspect.state.flag_valid {
             "有效"
         } else {
             "无效"
         },
-        serial_state_label(&inspect.state.serial)
+        serial_state_label(&inspect.state.serial),
+        calibration
     )
+}
+
+fn eeprom_backup_calibration_summary(backup: &[u8]) -> Result<String, String> {
+    let map = yg_stereo_p24c64g_v1();
+    let image_size = storage_field_range(map, "image_size")?;
+    let camera = storage_field_range(map, "camera_matrix")?;
+    let distortion = storage_field_range(map, "distortion")?;
+    let width = read_u32_le(backup, image_size.start, "width")?;
+    let height = read_u32_le(backup, image_size.start + 4, "height")?;
+    let fx = f64::from(read_f32_le(backup, camera.start, "fx")?);
+    let fy = f64::from(read_f32_le(backup, camera.start + 4, "fy")?);
+    let cx = f64::from(read_f32_le(backup, camera.start + 8, "cx")?);
+    let cy = f64::from(read_f32_le(backup, camera.start + 12, "cy")?);
+    let mut distortion_values = Vec::with_capacity(12);
+    let distortion_count = distortion.len() / std::mem::size_of::<f32>();
+    for index in 0..distortion_count.min(12) {
+        distortion_values.push(f64::from(read_f32_le(
+            backup,
+            distortion.start + index * std::mem::size_of::<f32>(),
+            "distortion",
+        )?));
+    }
+    Ok(format!(
+        "当前 EEPROM 标定：{}\n畸变：{}",
+        format_intrinsics_geometry(width, height, fx, fy, cx, cy),
+        distortion_summary(&distortion_values)
+    ))
+}
+
+fn storage_field_range(
+    map: &camera_toolbox_core::calibration_eeprom::CalibrationStorageMap,
+    name: &str,
+) -> Result<std::ops::Range<usize>, String> {
+    let field = map
+        .fields
+        .iter()
+        .find(|field| field.name == name)
+        .ok_or_else(|| format!("EEPROM map 缺少字段 {name}"))?;
+    let start = usize::from(field.offset);
+    let end = start + usize::from(field.byte_len);
+    Ok(start..end)
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize, name: &str) -> Result<u32, String> {
+    let data = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| format!("EEPROM {name} 字段越界"))?;
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(data);
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_f32_le(bytes: &[u8], offset: usize, name: &str) -> Result<f32, String> {
+    let data = bytes
+        .get(offset..offset + 4)
+        .ok_or_else(|| format!("EEPROM {name} 字段越界"))?;
+    let mut value = [0_u8; 4];
+    value.copy_from_slice(data);
+    let value = f32::from_le_bytes(value);
+    if value.is_finite() {
+        Ok(value)
+    } else {
+        Err(format!("EEPROM {name} 字段不是有限数"))
+    }
 }
 
 fn write_summary(label: &str, result: &EepromWriteResult) -> String {
