@@ -29,8 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// 每路目标覆盖位姿数（达标自动停止）。
-pub const CAPTURE_TARGET: usize = 45;
+/// 每路目标覆盖位姿数：15 张正视 raster + 8 张中距倾斜环绕 + 4 张远距四角。
+pub const CAPTURE_TARGET: usize = 27;
 /// guide auto_capture 的 hold 稳定帧数（黄 1/3 → 绿 3/3）。
 pub const HOLD_TARGET: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
@@ -444,7 +444,7 @@ struct GuidedCaptureRuntime {
 }
 
 impl GuidedCaptureRuntime {
-    fn standard_45(
+    fn standard_27(
         board: BoardSpec,
         initial_intrinsics: &InitialIntrinsics,
         image_size: CalibrationImageSize,
@@ -547,7 +547,7 @@ fn guided_capture_loop(
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
     let mut runtime: Option<GuidedCaptureRuntime> = None;
-    godot_print!("guide auto_capture worker 已启动（原版 45 动作，hold {HOLD_TARGET} 帧）");
+    godot_print!("guide auto_capture worker 已启动（27 动作：15 正视 + 8 倾斜 + 4 远距，hold {HOLD_TARGET} 帧）");
     loop {
         if runtime
             .as_ref()
@@ -587,7 +587,7 @@ fn guided_capture_loop(
         };
         let initial = default_initial_intrinsics(frame.width, frame.height);
         if runtime.is_none() {
-            match GuidedCaptureRuntime::standard_45(board, &initial, image_size) {
+            match GuidedCaptureRuntime::standard_27(board, &initial, image_size) {
                 Ok(rt) => runtime = Some(rt),
                 Err(error) => {
                     set_guide(&guide, &format!("guide 目标投影失败：{error}"), 0, 0);
@@ -831,17 +831,10 @@ fn standard_guided_pose_plan(
     initial_intrinsics: &InitialIntrinsics,
     image_size: CalibrationImageSize,
 ) -> Result<Vec<GuidedPoseTarget>, String> {
-    const FAR_TILTED: f64 = 0.56;
-    const MID: f64 = 0.64;
-    const NEAR: f64 = 0.72;
-    const FAR_MIDDLE: f64 = 0.42;
-    const CLOSE_CORNER: f64 = 0.68;
-    const OUTER_CORNER: f64 = 0.64;
-    const LOW_MIDDLE: f64 = 0.56;
-    const LOW_EDGE: f64 = 0.64;
-    const LOW_TILT: f64 = 12.0;
-    const MID_TILT: f64 = 20.0;
-    const HIGH_TILT: f64 = 28.0;
+    const FRONTO_SCALE: f64 = 0.62;
+    const MID_TILT_SCALE: f64 = 0.43;
+    const FAR_CORNER_SCALE: f64 = 0.22;
+    const MID_TILT_DEGREES: f64 = 32.0;
     let tolerance = GuidedPoseTolerance::default();
     let mut plan = Vec::with_capacity(CAPTURE_TARGET);
     let mut push = |label: &'static str,
@@ -869,264 +862,191 @@ fn standard_guided_pose_plan(
         });
         Ok(())
     };
-    push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
+    // Phase A: 近距正视 3x5 蛇形 raster，先用高像素尺度扫完整画面覆盖。
     push(
-        "Lower right · mid tilt",
-        [0.578, 0.578],
-        NEAR,
-        MID_TILT,
+        "F01 Fronto upper left",
+        [0.33, 0.31],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F02 Fronto upper mid-left",
+        [0.415, 0.31],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F03 Fronto upper center",
+        [0.50, 0.31],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F04 Fronto upper mid-right",
+        [0.585, 0.31],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F05 Fronto upper right",
+        [0.67, 0.31],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F06 Fronto middle right",
+        [0.67, 0.50],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F07 Fronto middle mid-right",
+        [0.585, 0.50],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push("F08 Fronto center", [0.50, 0.50], FRONTO_SCALE, 0.0, 0.0)?;
+    push(
+        "F09 Fronto middle mid-left",
+        [0.415, 0.50],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F10 Fronto middle left",
+        [0.33, 0.50],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F11 Fronto lower left",
+        [0.33, 0.69],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F12 Fronto lower mid-left",
+        [0.415, 0.69],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F13 Fronto lower center",
+        [0.50, 0.69],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F14 Fronto lower mid-right",
+        [0.585, 0.69],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "F15 Fronto lower right",
+        [0.67, 0.69],
+        FRONTO_SCALE,
+        0.0,
+        0.0,
+    )?;
+
+    // Phase B: 中距 8 点大倾斜圆弧；相机位置小幅移动，主要通过姿态变化获得透视激励。
+    push(
+        "T01 Tilt lower right",
+        [0.60, 0.61],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
         315.0,
     )?;
-    push("Right · mid tilt", [0.60, 0.50], NEAR, MID_TILT, 0.0)?;
     push(
-        "Upper right · mid tilt",
-        [0.578, 0.422],
-        NEAR,
-        MID_TILT,
-        45.0,
-    )?;
-    push(
-        "Upper right corner · low tilt",
-        [0.62, 0.38],
-        LOW_EDGE,
-        LOW_TILT,
-        45.0,
-    )?;
-    push(
-        "Upper right · low tilt",
-        [0.57, 0.43],
-        LOW_MIDDLE,
-        LOW_TILT,
-        45.0,
-    )?;
-    push(
-        "Upper right · high tilt",
-        [0.559, 0.441],
-        FAR_TILTED,
-        HIGH_TILT,
-        45.0,
-    )?;
-    push(
-        "Top · high tilt",
-        [0.50, 0.425],
-        FAR_TILTED,
-        HIGH_TILT,
-        90.0,
-    )?;
-    push("Top · low tilt", [0.50, 0.41], LOW_MIDDLE, LOW_TILT, 90.0)?;
-    push(
-        "Top edge · low tilt",
-        [0.50, 0.34],
-        LOW_EDGE,
-        LOW_TILT,
-        90.0,
-    )?;
-    push("Top · mid tilt", [0.50, 0.40], NEAR, MID_TILT, 90.0)?;
-    push(
-        "Upper left · mid tilt",
-        [0.422, 0.422],
-        NEAR,
-        MID_TILT,
-        135.0,
-    )?;
-    push("Left · mid tilt", [0.40, 0.50], NEAR, MID_TILT, 180.0)?;
-    push(
-        "Lower left · mid tilt",
-        [0.422, 0.578],
-        NEAR,
-        MID_TILT,
-        225.0,
-    )?;
-    push("Bottom · mid tilt", [0.50, 0.60], NEAR, MID_TILT, 270.0)?;
-    push(
-        "Bottom edge · low tilt",
-        [0.50, 0.66],
-        LOW_EDGE,
-        LOW_TILT,
-        270.0,
-    )?;
-    push(
-        "Bottom · low tilt",
-        [0.50, 0.59],
-        LOW_MIDDLE,
-        LOW_TILT,
-        270.0,
-    )?;
-    push(
-        "Bottom · high tilt",
-        [0.50, 0.575],
-        FAR_TILTED,
-        HIGH_TILT,
-        270.0,
-    )?;
-    push(
-        "Lower left · high tilt",
-        [0.441, 0.559],
-        FAR_TILTED,
-        HIGH_TILT,
-        225.0,
-    )?;
-    push(
-        "Lower left · low tilt",
-        [0.43, 0.57],
-        LOW_MIDDLE,
-        LOW_TILT,
-        225.0,
-    )?;
-    push("Left · low tilt", [0.41, 0.50], LOW_MIDDLE, LOW_TILT, 180.0)?;
-    push(
-        "Left · high tilt",
-        [0.425, 0.50],
-        FAR_TILTED,
-        HIGH_TILT,
-        180.0,
-    )?;
-    push(
-        "Lower left corner · low tilt",
-        [0.38, 0.62],
-        LOW_EDGE,
-        LOW_TILT,
-        225.0,
-    )?;
-    push(
-        "Close lower left corner · fronto",
-        [0.30, 0.70],
-        CLOSE_CORNER,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Outer lower left corner · fronto",
-        [0.28, 0.72],
-        OUTER_CORNER,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Left edge · low tilt",
-        [0.34, 0.50],
-        LOW_EDGE,
-        LOW_TILT,
-        180.0,
-    )?;
-    push(
-        "Outer upper left corner · fronto",
-        [0.28, 0.28],
-        OUTER_CORNER,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Close upper left corner · fronto",
-        [0.30, 0.30],
-        CLOSE_CORNER,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Upper left corner · low tilt",
-        [0.38, 0.38],
-        LOW_EDGE,
-        LOW_TILT,
-        135.0,
-    )?;
-    push(
-        "Upper left · low tilt",
-        [0.43, 0.43],
-        LOW_MIDDLE,
-        LOW_TILT,
-        135.0,
-    )?;
-    push(
-        "Upper left · high tilt",
-        [0.441, 0.441],
-        FAR_TILTED,
-        HIGH_TILT,
-        135.0,
-    )?;
-    push(
-        "Far left field · fronto",
-        [0.37, 0.50],
-        FAR_MIDDLE,
-        0.0,
-        0.0,
-    )?;
-    push(
-        "Far bottom field · fronto",
-        [0.50, 0.63],
-        FAR_MIDDLE,
-        0.0,
-        0.0,
-    )?;
-    push("Far top field · fronto", [0.50, 0.37], FAR_MIDDLE, 0.0, 0.0)?;
-    push(
-        "Far right field · fronto",
+        "T02 Tilt right",
         [0.63, 0.50],
-        FAR_MIDDLE,
-        0.0,
-        0.0,
-    )?;
-    push("Right · low tilt", [0.59, 0.50], LOW_MIDDLE, LOW_TILT, 0.0)?;
-    push(
-        "Right · high tilt",
-        [0.575, 0.50],
-        FAR_TILTED,
-        HIGH_TILT,
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
         0.0,
     )?;
     push(
-        "Lower right · high tilt",
-        [0.559, 0.559],
-        FAR_TILTED,
-        HIGH_TILT,
-        315.0,
+        "T03 Tilt upper right",
+        [0.60, 0.39],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
+        45.0,
     )?;
     push(
-        "Lower right · low tilt",
-        [0.57, 0.57],
-        LOW_MIDDLE,
-        LOW_TILT,
-        315.0,
+        "T04 Tilt top",
+        [0.50, 0.36],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
+        90.0,
     )?;
     push(
-        "Lower right corner · low tilt",
-        [0.62, 0.62],
-        LOW_EDGE,
-        LOW_TILT,
-        315.0,
+        "T05 Tilt upper left",
+        [0.40, 0.39],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
+        135.0,
     )?;
     push(
-        "Close lower right corner · fronto",
-        [0.70, 0.70],
-        CLOSE_CORNER,
-        0.0,
-        0.0,
+        "T06 Tilt left",
+        [0.37, 0.50],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
+        180.0,
     )?;
     push(
-        "Outer lower right corner · fronto",
-        [0.72, 0.72],
-        OUTER_CORNER,
-        0.0,
-        0.0,
+        "T07 Tilt lower left",
+        [0.40, 0.61],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
+        225.0,
     )?;
     push(
-        "Right edge · low tilt",
-        [0.66, 0.50],
-        LOW_EDGE,
-        LOW_TILT,
-        0.0,
+        "T08 Tilt bottom",
+        [0.50, 0.64],
+        MID_TILT_SCALE,
+        MID_TILT_DEGREES,
+        270.0,
     )?;
+
+    // Phase C: 远距四角 off-axis；保持相机中心在圆柱空间内，靠朝向把小棋盘送到四角。
     push(
-        "Close upper right corner · fronto",
-        [0.70, 0.30],
-        CLOSE_CORNER,
+        "C01 Far lower right",
+        [0.86, 0.82],
+        FAR_CORNER_SCALE,
         0.0,
         0.0,
     )?;
     push(
-        "Outer upper right corner · fronto",
-        [0.72, 0.28],
-        OUTER_CORNER,
+        "C02 Far upper right",
+        [0.86, 0.18],
+        FAR_CORNER_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "C03 Far upper left",
+        [0.14, 0.18],
+        FAR_CORNER_SCALE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "C04 Far lower left",
+        [0.14, 0.82],
+        FAR_CORNER_SCALE,
         0.0,
         0.0,
     )?;
@@ -2379,5 +2299,86 @@ impl StreamState {
     /// 两路是否都达到目标位姿数。
     pub fn both_complete(&self) -> bool {
         self.ch0.complete() && self.ch3.complete()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn reference_plan() -> Vec<GuidedPoseTarget> {
+        let board = BoardSpec::new(11, 8, 40.0).unwrap();
+        let image_size = CalibrationImageSize::new(1920, 1080).unwrap();
+        let intrinsics = InitialIntrinsics {
+            camera_matrix: [900.0, 0.0, 980.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 12],
+        };
+        standard_guided_pose_plan(board, &intrinsics, image_size).unwrap()
+    }
+
+    #[test]
+    fn guided_plan_has_structured_27_pose_phases() {
+        let plan = reference_plan();
+        assert_eq!(plan.len(), CAPTURE_TARGET);
+        assert_eq!(CAPTURE_TARGET, 27);
+        assert!(plan[..15]
+            .iter()
+            .all(|target| target.label.starts_with('F')));
+        assert!(plan[15..23]
+            .iter()
+            .all(|target| target.label.starts_with('T')));
+        assert!(plan[23..]
+            .iter()
+            .all(|target| target.label.starts_with('C')));
+        assert_eq!(plan[0].label, "F01 Fronto upper left");
+        assert_eq!(plan[14].label, "F15 Fronto lower right");
+        assert_eq!(plan[22].label, "T08 Tilt bottom");
+        assert_eq!(plan[26].label, "C04 Far lower left");
+    }
+
+    #[test]
+    fn guided_plan_depth_ratio_and_fronto_motion_match_constraints() {
+        let plan = reference_plan();
+        let min_z = plan
+            .iter()
+            .map(|target| target.pose.xyz[2])
+            .fold(f64::INFINITY, f64::min);
+        let max_z = plan
+            .iter()
+            .map(|target| target.pose.xyz[2])
+            .fold(0.0_f64, f64::max);
+        let ratio = max_z / min_z;
+        assert!(
+            (2.0..=5.0).contains(&ratio),
+            "depth ratio {ratio:.3} out of range"
+        );
+
+        for target in &plan[..15] {
+            let radius = target.pose.xyz[0].hypot(target.pose.xyz[1]);
+            assert!(
+                radius <= 255.0,
+                "{} radius {radius:.1}mm exceeds fronto motion budget",
+                target.label
+            );
+            assert!(target
+                .pose
+                .rpy_degrees
+                .iter()
+                .all(|angle| angle.abs() <= 1.0e-6));
+        }
+    }
+
+    #[test]
+    fn guided_plan_far_corner_centers_cover_four_image_corners() {
+        let plan = reference_plan();
+        let centers = plan[23..]
+            .iter()
+            .map(|target| target.pose.center_uv)
+            .collect::<Vec<_>>();
+        let expected = [[0.86, 0.82], [0.86, 0.18], [0.14, 0.18], [0.14, 0.82]];
+        for (actual, expected) in centers.iter().zip(expected) {
+            assert!((f64::from(actual[0]) - expected[0]).abs() <= 0.005);
+            assert!((f64::from(actual[1]) - expected[1]).abs() <= 0.005);
+        }
     }
 }
