@@ -3,17 +3,19 @@
 //! 全部 UI 用 Rust 代码构建（不依赖 Godot 编辑器可视化搭建）；
 //! 运行：`godot --path crates/frontends/godot/godot`。
 
+mod eeprom;
+mod eeprom_history;
 mod guide_overlay;
 mod preview;
 mod solve;
 mod ui;
 mod x5;
-mod eeprom;
 
 use godot::classes::control::LayoutPreset;
 use godot::classes::{Control, IControl, Texture2D};
 use godot::prelude::*;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use ui::steps::StepId;
 use ui::{theme, UiState};
 
@@ -24,7 +26,7 @@ use camera_toolbox_core::{BoardSpec, CalibrationSolution};
 use preview::StreamState;
 use solve::solve_channel;
 
-/// 应用根节点：挂载 5 步向导 UI 与领域层控制器。
+/// 应用根节点：挂载三步向导 UI 与领域层控制器。
 #[derive(GodotClass)]
 #[class(init, base = Control)]
 pub struct CalibApp {
@@ -44,9 +46,13 @@ pub struct CalibApp {
     /// 最近一次双路 EEPROM Inspect 结果（写入时校验 before 镜像）。
     eeprom_inspect: Option<(EepromInspectResult, EepromInspectResult)>,
     /// EEPROM Inspect 结果共享槽（闭包 → 主线程）。
-    pending_inspect: Option<Arc<Mutex<Option<(Option<EepromInspectResult>, Option<EepromInspectResult>)>>>>,
+    pending_inspect:
+        Option<Arc<Mutex<Option<(Option<EepromInspectResult>, Option<EepromInspectResult>)>>>>,
     /// EEPROM 写入二次确认标志。
     write_armed: bool,
+    /// Step 1 持续连接检查结果槽。
+    pending_connection_probe: Option<Arc<Mutex<Option<String>>>>,
+    last_connection_probe: Option<Instant>,
     /// 调试截图请求（`PONGBOT_SCREENSHOT` 环境变量触发，默认 5 帧后保存）。
     screenshot: Option<ScreenshotRequest>,
 }
@@ -62,7 +68,8 @@ struct ScreenshotRequest {
 impl IControl for CalibApp {
     fn ready(&mut self) {
         // 场景根 Control 由手写 .tscn 声明、无尺寸：必须显式铺满窗口。
-        self.base_mut().set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
+        self.base_mut()
+            .set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
         self.base_mut().set_size(Vector2::new(1280.0, 800.0));
         theme::install_cjk_font();
         theme::install_window_background();
@@ -77,7 +84,10 @@ impl IControl for CalibApp {
                 .probe_button
                 .signals()
                 .pressed()
-                .connect(button_callback(self.base.__constructed_gd().cast::<CalibApp>(), "on_probe"));
+                .connect(button_callback(
+                    self.base.__constructed_gd().cast::<CalibApp>(),
+                    "on_probe",
+                ));
             state
                 .connect
                 .bootstrap_button
@@ -97,7 +107,7 @@ impl IControl for CalibApp {
                     self.base.__constructed_gd().cast::<CalibApp>(),
                     "on_solve",
                 ));
-            // Step 4 EEPROM 按钮。
+            // Step 3 EEPROM / Reset 按钮。
             state
                 .eeprom
                 .inspect_button
@@ -116,6 +126,15 @@ impl IControl for CalibApp {
                     self.base.__constructed_gd().cast::<CalibApp>(),
                     "on_eeprom_write",
                 ));
+            state
+                .eeprom
+                .reset_button
+                .signals()
+                .pressed()
+                .connect(button_callback(
+                    self.base.__constructed_gd().cast::<CalibApp>(),
+                    "on_reset_flow",
+                ));
         }
         // 调试截图：PONGBOT_SCREENSHOT 环境变量，默认 5 帧后保存 viewport。
         if let Ok(path) = std::env::var("PONGBOT_SCREENSHOT") {
@@ -124,7 +143,11 @@ impl IControl for CalibApp {
                 .and_then(|value| value.parse::<u32>().ok())
                 .unwrap_or(5)
                 .max(1);
-            self.screenshot = Some(ScreenshotRequest { path, frame: 0, target_frame });
+            self.screenshot = Some(ScreenshotRequest {
+                path,
+                frame: 0,
+                target_frame,
+            });
             godot_print!("debug: 将在 {target_frame} 帧后保存截图");
         }
         // 合成模式（无板验证）：跳过 Step 1，直接进入双预览。
@@ -149,6 +172,8 @@ impl IControl for CalibApp {
             self.finish_task(text);
         }
 
+        self.poll_connection_probe();
+
         // 预览宽高比保持（16:9）：宽度铺满可用，高度随宽度同步。
         if let Some(ui) = self.ui.as_mut() {
             for mut card in [ui.preview.ch0.view.clone(), ui.preview.ch3.view.clone()] {
@@ -159,32 +184,30 @@ impl IControl for CalibApp {
         }
 
         // 双路预览与 guided 采集：新帧上传纹理 + 引导文本刷新。
-        let capture_done = if let (Some(streams), Some(ui)) = (self.streams.as_mut(), self.ui.as_mut())
-        {
-            let _ = streams.ch0.pump(&mut ui.preview.ch0.texture_rect);
-            let _ = streams.ch3.pump(&mut ui.preview.ch3.texture_rect);
-            // GuideOverlay 的绘制数据由 worker 写入 Arc 槽；Godot 自定义 Control
-            // 不会因 Rust 共享槽变化自动重绘，必须主线程逐帧请求刷新。
-            ui.preview.ch0.guide_overlay.queue_redraw();
-            ui.preview.ch3.guide_overlay.queue_redraw();
-            let (text0, count0, hold0) = streams.ch0.guide();
-            if !text0.is_empty() {
-                ui.preview.ch0.set_overlay(
-                    &text0,
-                    overlay_color(count0, hold0),
-                );
-            }
-            let (text3, count3, hold3) = streams.ch3.guide();
-            if !text3.is_empty() {
-                ui.preview.ch3.set_overlay(
-                    &text3,
-                    overlay_color(count3, hold3),
-                );
-            }
-            streams.both_complete()
-        } else {
-            false
-        };
+        let capture_done =
+            if let (Some(streams), Some(ui)) = (self.streams.as_mut(), self.ui.as_mut()) {
+                let _ = streams.ch0.pump(&mut ui.preview.ch0.texture_rect);
+                let _ = streams.ch3.pump(&mut ui.preview.ch3.texture_rect);
+                // GuideOverlay 的绘制数据由 worker 写入 Arc 槽；Godot 自定义 Control
+                // 不会因 Rust 共享槽变化自动重绘，必须主线程逐帧请求刷新。
+                ui.preview.ch0.guide_overlay.queue_redraw();
+                ui.preview.ch3.guide_overlay.queue_redraw();
+                let (text0, count0, hold0) = streams.ch0.guide();
+                if !text0.is_empty() {
+                    ui.preview
+                        .ch0
+                        .set_overlay(&text0, overlay_color(count0, hold0));
+                }
+                let (text3, count3, hold3) = streams.ch3.guide();
+                if !text3.is_empty() {
+                    ui.preview
+                        .ch3
+                        .set_overlay(&text3, overlay_color(count3, hold3));
+                }
+                streams.both_complete()
+            } else {
+                false
+            };
         if capture_done && !self.preview_finished {
             self.preview_finished = true;
             godot_print!("双路采集完成");
@@ -365,12 +388,28 @@ impl CalibApp {
     /// 写入双路标定结果（FullProvision：FLAG + 内参 + SN；二次确认）。
     #[func]
     fn on_eeprom_write(&mut self) {
+        let Some((serial0, serial3)) = self
+            .ui
+            .as_mut()
+            .map(|ui| ui.eeprom.serial_pair())
+            .transpose()
+            .unwrap_or_else(|error| {
+                if let Some(ui) = self.ui.as_mut() {
+                    ui.eeprom.set_status(&error, false);
+                }
+                None
+            })
+        else {
+            return;
+        };
         if !self.write_armed {
             self.write_armed = true;
             if let Some(ui) = self.ui.as_mut() {
                 ui.eeprom.write_button.set_text("确认写入 CH0/CH3？");
-                ui.eeprom
-                    .set_status("请确认 SN、当前 EEPROM 状态与目标相机一致；再次点击开始写入。", true);
+                ui.eeprom.set_status(
+                    &format!("请确认 SNID：CH0={serial0}，CH3={serial3}；再次点击开始写入。"),
+                    true,
+                );
             }
             return;
         }
@@ -396,19 +435,6 @@ impl CalibApp {
             }
             return;
         };
-        let serial = self
-            .ui
-            .as_ref()
-            .map(|ui| ui.eeprom.serial_input.get_text().to_string())
-            .unwrap_or_default()
-            .trim()
-            .to_owned();
-        if serial.is_empty() {
-            if let Some(ui) = self.ui.as_mut() {
-                ui.eeprom.set_status("请输入 SN 码", false);
-            }
-            return;
-        }
         let before0 = inspect0.state.image_sha256.clone();
         let before3 = inspect3.state.image_sha256.clone();
         let (host, user, password) = self.connect_credentials();
@@ -424,19 +450,40 @@ impl CalibApp {
                 4,
                 Arc::clone(&helper),
                 &solution0,
-                &serial,
+                &serial0,
                 &before0,
             );
             let ch3 = eeprom::provision_full_calibration(
-                &host, &user, &password, 6, helper, &solution3, &serial, &before3,
+                &host, &user, &password, 6, helper, &solution3, &serial3, &before3,
             );
             match (ch0, ch3) {
                 (Ok(EepromHelperResult::Provision(a)), Ok(EepromHelperResult::Provision(b))) => {
-                    format!(
-                        "写入 EEPROM 成功：\n{}\n{}",
-                        write_summary("CH0/i2c-4", &a),
-                        write_summary("CH3/i2c-6", &b)
-                    )
+                    let h0 = eeprom_history::persist_write_history(
+                        "CH0/i2c-4",
+                        4,
+                        &serial0,
+                        &solution0,
+                        &a,
+                    );
+                    let h3 = eeprom_history::persist_write_history(
+                        "CH3/i2c-6",
+                        6,
+                        &serial3,
+                        &solution3,
+                        &b,
+                    );
+                    match (h0, h3) {
+                        (Ok(path0), Ok(path3)) => format!(
+                            "写入 EEPROM 成功：\n{}\n{}\nwrite_history：\nCH0 {path0}\nCH3 {path3}",
+                            write_summary("CH0/i2c-4", &a),
+                            write_summary("CH3/i2c-6", &b)
+                        ),
+                        (a_history, b_history) => format!(
+                            "写入 EEPROM 成功，但保存 write_history 失败：CH0={}；CH3={}",
+                            history_result_label(&a_history),
+                            history_result_label(&b_history)
+                        ),
+                    }
                 }
                 (a, b) => format!(
                     "写入 EEPROM 失败：CH0={}；CH3={}",
@@ -543,7 +590,7 @@ impl CalibApp {
             }
             if both_ok && self.solutions.is_some() {
                 if let Some(ui) = self.ui.as_mut() {
-                    ui.complete_step(StepId::Solve, "两路标定完成 · 等待 SN 与 EEPROM 写入");
+                    ui.complete_step(StepId::Solve, "两路标定完成 · 等待双路 SNID 与 EEPROM 写入");
                     ui.eeprom.inspect_button.set_disabled(false);
                     ui.eeprom.write_button.set_disabled(true);
                 }
@@ -561,13 +608,7 @@ impl CalibApp {
             if let Some(ui) = self.ui.as_mut() {
                 let ok = text.contains("EEPROM 状态") && self.eeprom_inspect.is_some();
                 if ok {
-                    if let Some((inspect0, inspect3)) = self.eeprom_inspect.as_ref() {
-                        if let EepromSerialState::Valid { value } = &inspect0.state.serial {
-                            ui.eeprom.serial_input.set_text(value);
-                        } else if let EepromSerialState::Valid { value } = &inspect3.state.serial {
-                            ui.eeprom.serial_input.set_text(value);
-                        }
-                    }
+                    ui.eeprom.refresh_snid_previews();
                 }
                 ui.eeprom.set_status(&text, ok);
                 ui.eeprom.write_button.set_disabled(!ok);
@@ -576,10 +617,10 @@ impl CalibApp {
             // EEPROM 写入结果。
             godot_print!("{text}");
             if let Some(ui) = self.ui.as_mut() {
-                let ok = text.contains("写入成功");
+                let ok = text.contains("写入 EEPROM 成功") && !text.contains("write_history 失败");
                 ui.eeprom.set_status(&text, ok);
                 if ok {
-                    ui.complete_step(StepId::Eeprom, "EEPROM 写入完成");
+                    ui.complete_step(StepId::Solve, "EEPROM 写入完成");
                 }
             }
         } else {
@@ -612,8 +653,12 @@ impl CalibApp {
         if let Some(ui) = self.ui.as_mut() {
             ui.preview.ch0.set_status(&format!("rtsp://{host}:554/PRR"));
             ui.preview.ch3.set_status(&format!("rtsp://{host}:557/PRR"));
-            ui.preview.ch0.set_overlay("guide auto_capture 启动中…", theme::MUTED);
-            ui.preview.ch3.set_overlay("guide auto_capture 启动中…", theme::MUTED);
+            ui.preview
+                .ch0
+                .set_overlay("guide auto_capture 启动中…", theme::MUTED);
+            ui.preview
+                .ch3
+                .set_overlay("guide auto_capture 启动中…", theme::MUTED);
         }
         self.streams = Some(state);
     }
@@ -635,6 +680,79 @@ impl CalibApp {
             state.connect.set_status(text, color);
         }
     }
+
+    /// Reset 当前工件流程，保留预输入连接信息和 SNID 批次字段。
+    #[func]
+    fn on_reset_flow(&mut self) {
+        self.streams = None;
+        self.pending_task = None;
+        self.pending_solutions = None;
+        self.solutions = None;
+        self.eeprom_inspect = None;
+        self.pending_inspect = None;
+        self.preview_finished = false;
+        self.write_armed = false;
+        if let Some(ui) = self.ui.as_mut() {
+            if let Ok(mut slot) = ui.overlay_slots.0.lock() {
+                *slot = None;
+            }
+            if let Ok(mut slot) = ui.overlay_slots.1.lock() {
+                *slot = None;
+            }
+            ui.reset_flow();
+        }
+        self.start_connection_probe();
+    }
+
+    fn poll_connection_probe(&mut self) {
+        let probe_text = self
+            .pending_connection_probe
+            .as_ref()
+            .and_then(|slot| slot.lock().ok())
+            .and_then(|mut value| value.take());
+        if let Some(text) = probe_text {
+            self.pending_connection_probe = None;
+            let color = if text.starts_with("连接正常") {
+                theme::OK
+            } else {
+                theme::WARN
+            };
+            self.connect_status(&text, color);
+        }
+        let should_probe = self.pending_connection_probe.is_none()
+            && self.streams.is_none()
+            && self
+                .last_connection_probe
+                .is_none_or(|last| last.elapsed() >= Duration::from_secs(2));
+        if should_probe {
+            self.start_connection_probe();
+        }
+    }
+
+    fn start_connection_probe(&mut self) {
+        if self.pending_connection_probe.is_some() {
+            return;
+        }
+        let Some(ui) = self.ui.as_ref() else {
+            return;
+        };
+        let host = ui.connect.device_ip.get_text().to_string();
+        if host.trim().is_empty() || host == "synth" {
+            return;
+        }
+        self.last_connection_probe = Some(Instant::now());
+        let slot = Arc::new(Mutex::new(None));
+        self.pending_connection_probe = Some(Arc::clone(&slot));
+        std::thread::spawn(move || {
+            let text = match x5::probe(host.trim(), 9073) {
+                Ok(summary) => format!("连接正常：TCP 9073 可用 · {summary:?}"),
+                Err(error) => format!("持续检查：设备/驱动未就绪（{error}）"),
+            };
+            if let Ok(mut value) = slot.lock() {
+                *value = Some(text);
+            }
+        });
+    }
 }
 
 fn serial_state_label(serial: &EepromSerialState) -> String {
@@ -649,7 +767,11 @@ fn inspect_summary(label: &str, inspect: &EepromInspectResult) -> String {
     format!(
         "{label} before={} FLAG={} SN={}",
         &inspect.state.image_sha256[..8.min(inspect.state.image_sha256.len())],
-        if inspect.state.flag_valid { "有效" } else { "无效" },
+        if inspect.state.flag_valid {
+            "有效"
+        } else {
+            "无效"
+        },
         serial_state_label(&inspect.state.serial)
     )
 }
@@ -677,6 +799,13 @@ fn provision_result_label(result: &Result<EepromHelperResult, String>) -> String
     match result {
         Ok(EepromHelperResult::Provision(_)) => "ok".to_owned(),
         Ok(_) => "unexpected helper result".to_owned(),
+        Err(error) => error.clone(),
+    }
+}
+
+fn history_result_label(result: &Result<String, String>) -> String {
+    match result {
+        Ok(path) => path.clone(),
         Err(error) => error.clone(),
     }
 }

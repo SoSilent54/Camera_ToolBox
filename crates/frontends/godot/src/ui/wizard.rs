@@ -4,7 +4,7 @@
 //! - 当前步骤展开，已完成步骤折叠为标题行，未完成步骤灰显；
 //! - 前一步未完成时后一步锁定（内容隐藏、面板半透明）；
 //! - 步骤状态由面板自身表达（无独立顶部指示器，避免重复）；
-//! - Step 2 双路预览与采集为同一阶段（引导可视化叠加在 viewer 上）。
+//! - Step 3 合并求解检查与 EEPROM 写入，求解后等待双路独立 SNID 草稿确认。
 
 use godot::classes::{
     control::{LayoutPreset, SizeFlags},
@@ -28,7 +28,7 @@ pub struct UiState {
     step_summaries: Vec<Gd<Label>>,
     step_bodies: Vec<Gd<Control>>,
     summaries: Vec<String>,
-    completed: [bool; 4],
+    completed: [bool; 3],
     active: StepId,
     pub connect: ConnectStep,
     pub preview: PreviewStep,
@@ -36,7 +36,10 @@ pub struct UiState {
     pub eeprom: EepromStep,
     pub status_bar: Gd<Label>,
     /// 双路检测绘制数据槽（RtspStream worker → GuideOverlay）。
-    pub overlay_slots: (Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>, Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>),
+    pub overlay_slots: (
+        Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>,
+        Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>,
+    ),
 }
 
 impl UiState {
@@ -65,7 +68,7 @@ impl UiState {
 
         // 标题。
         let mut title = Label::new_alloc();
-        title.set_text("pongbot-calib-tool · X5_233 标定");
+        title.set_text("pongbot-calib-tool");
         title.add_theme_font_size_override("font_size", 22);
         title.add_theme_color_override("font_color", theme::TEXT);
         outer.add_child(&title);
@@ -92,7 +95,7 @@ impl UiState {
         let mut preview: Option<PreviewStep> = None;
         let mut solve: Option<SolveStep> = None;
         let mut eeprom: Option<EepromStep> = None;
-        for index in 0..4 {
+        for index in 0..3 {
             let mut panel = PanelContainer::new_alloc();
             panel.add_theme_stylebox_override("panel", &theme::panel_style(None));
             let mut panel_v = VBoxContainer::new_alloc();
@@ -113,7 +116,7 @@ impl UiState {
             step_headers.push(header);
             step_summaries.push(summary);
 
-            // 各步骤正文：Step 1 连接、Step 2 双预览、Step 3 求解、Step 4 EEPROM。
+            // 各步骤正文：Step 1 连接、Step 2 双预览、Step 3 求解 + EEPROM。
             if index == 0 {
                 let step = ConnectStep::build();
                 panel_v.add_child(&step.panel);
@@ -124,16 +127,18 @@ impl UiState {
                 panel_v.add_child(&step.panel);
                 step_bodies.push(step.panel.clone());
                 preview = Some(step);
-            } else if index == 2 {
-                let step = SolveStep::build();
-                panel_v.add_child(&step.panel);
-                step_bodies.push(step.panel.clone());
-                solve = Some(step);
             } else {
-                let step = EepromStep::build();
-                panel_v.add_child(&step.panel);
-                step_bodies.push(step.panel.clone());
-                eeprom = Some(step);
+                let solve_step = SolveStep::build();
+                let eeprom_step = EepromStep::build();
+                let mut combined = VBoxContainer::new_alloc();
+                combined.add_theme_constant_override("separation", 12);
+                combined.add_child(&solve_step.panel);
+                combined.add_child(&eeprom_step.panel);
+                let combined: Gd<Control> = combined.upcast();
+                panel_v.add_child(&combined);
+                step_bodies.push(combined);
+                solve = Some(solve_step);
+                eeprom = Some(eeprom_step);
             }
 
             panel.add_child(&panel_v);
@@ -142,8 +147,8 @@ impl UiState {
         }
         let connect = connect.expect("Step 1 构建失败");
         let preview = preview.expect("Step 2 构建失败");
-        let solve = solve.expect("Step 3 构建失败");
-        let eeprom = eeprom.expect("Step 4 构建失败");
+        let solve = solve.expect("Step 3 求解面板构建失败");
+        let eeprom = eeprom.expect("Step 3 EEPROM 面板构建失败");
 
         // 底部状态栏。
         let mut status_bar = Label::new_alloc();
@@ -157,8 +162,8 @@ impl UiState {
             step_headers,
             step_summaries,
             step_bodies,
-            summaries: vec![String::new(); 4],
-            completed: [false; 4],
+            summaries: vec![String::new(); 3],
+            completed: [false; 3],
             active: StepId::Connect,
             connect,
             preview,
@@ -178,7 +183,7 @@ impl UiState {
         self.completed[index] = true;
         self.summaries[index] = summary.into();
         let mut next = None;
-        for candidate in 0..4 {
+        for candidate in 0..3 {
             if !self.completed[candidate] {
                 next = Some(StepId::from_index(candidate));
                 break;
@@ -188,9 +193,30 @@ impl UiState {
         self.refresh();
     }
 
+    /// Reset 到第一步：保留连接输入与 SNID 批次字段，只清本轮运行数据和序列号。
+    pub fn reset_flow(&mut self) {
+        self.completed = [false; 3];
+        self.summaries = vec![String::new(); 3];
+        self.active = StepId::Connect;
+        self.preview.ch0.set_status("未连接");
+        self.preview.ch3.set_status("未连接");
+        self.preview.ch0.set_overlay("未连接", theme::MUTED);
+        self.preview.ch3.set_overlay("未连接", theme::MUTED);
+        self.solve.ch0_result.set_text("CH0：待求解");
+        self.solve.ch3_result.set_text("CH3：待求解");
+        self.solve
+            .ch0_result
+            .add_theme_color_override("font_color", theme::MUTED);
+        self.solve
+            .ch3_result
+            .add_theme_color_override("font_color", theme::MUTED);
+        self.eeprom.reset_for_next_unit();
+        self.refresh();
+    }
+
     /// 按当前状态刷新面板：当前步高亮、完成步绿、锁定步灰显半透明。
     pub fn refresh(&mut self) {
-        for index in 0..4 {
+        for index in 0..3 {
             let is_active = index == self.active as usize;
             let is_done = self.completed[index];
             let header_color = if is_done {
@@ -207,9 +233,8 @@ impl UiState {
             } else {
                 "·"
             };
-            self.step_headers[index].set_text(
-                format!("{prefix} Step {} · {}", index + 1, STEP_TITLES[index]).as_str(),
-            );
+            self.step_headers[index]
+                .set_text(format!("{prefix} Step {} · {}", index + 1, STEP_TITLES[index]).as_str());
             self.step_headers[index].add_theme_color_override("font_color", header_color);
             self.step_summaries[index].set_text(self.summaries[index].as_str());
             self.step_bodies[index].set_visible(is_active);
@@ -219,8 +244,7 @@ impl UiState {
                 self.panels[index]
                     .add_theme_stylebox_override("panel", &theme::panel_style(Some(theme::ACCENT)));
             } else {
-                self.panels[index]
-                    .add_theme_stylebox_override("panel", &theme::panel_style(None));
+                self.panels[index].add_theme_stylebox_override("panel", &theme::panel_style(None));
             }
             self.panels[index].set_modulate(if is_active || is_done {
                 Color::from_rgba(1.0, 1.0, 1.0, 1.0)

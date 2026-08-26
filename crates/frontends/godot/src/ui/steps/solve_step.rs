@@ -1,10 +1,8 @@
 //! Step 3 求解检查：棋盘参数 + 执行标定 + 双路结果展示。
 
-use godot::classes::{
-    Button, Control, HBoxContainer, Label, SpinBox, VBoxContainer,
-};
-use godot::prelude::*;
 use godot::classes::text_server::AutowrapMode;
+use godot::classes::{Button, Control, HBoxContainer, Label, SpinBox, VBoxContainer};
+use godot::prelude::*;
 
 use crate::ui::theme;
 

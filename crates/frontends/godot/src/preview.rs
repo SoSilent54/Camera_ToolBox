@@ -6,6 +6,7 @@
 //! 引导文本（未检测到棋盘 / 姿态重复 / 已覆盖 N 位姿）。
 //! 无板验证：`PONGBOT_SYNTH=1` 用非棋盘合成帧（保证检测失败，验证引导路径）。
 
+use crate::guide_overlay::{OverlayData, OverlayGridLine, OverlayStatus};
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
 use camera_toolbox_adapters::media::FfmpegRtspTransport;
@@ -13,9 +14,7 @@ use camera_toolbox_app::platform::{
     DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, SourcePts, StreamCancellation,
     StreamFrameIdentity, StreamSessionId,
 };
-use camera_toolbox_app::ports::calibration::{
-    CalibrationBackend, CalibrationCancellation,
-};
+use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, ChessboardDetection,
     ChessboardDetectionOutcome, InitialIntrinsics, ViewCalibrationResult,
@@ -26,7 +25,6 @@ use godot::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use crate::guide_overlay::{OverlayData, OverlayGridLine, OverlayStatus};
 
 /// 每路目标覆盖位姿数（达标自动停止）。
 pub const CAPTURE_TARGET: usize = 45;
@@ -140,7 +138,13 @@ impl RtspStream {
                             let gy = (y - oy) / cell;
                             let inside = gx >= 0 && gx < cols && gy >= 0 && gy < rows;
                             let white = inside && ((gx + gy) % 2 == 0);
-                            let v = if white { 235u8 } else if inside { 30u8 } else { 60u8 };
+                            let v = if white {
+                                235u8
+                            } else if inside {
+                                30u8
+                            } else {
+                                60u8
+                            };
                             rgba.extend_from_slice(&[v, v, v, 255]);
                         }
                     }
@@ -212,7 +216,11 @@ impl RtspStream {
         let Some(frame) = self.slot.latest() else {
             return false;
         };
-        if self.last.as_ref().is_some_and(|old| Arc::ptr_eq(old, &frame)) {
+        if self
+            .last
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &frame))
+        {
             return false;
         }
         self.last = Some(frame.clone());
@@ -261,13 +269,19 @@ impl RtspStream {
 
     /// 读取引导状态（主线程）。
     pub fn guide(&self) -> (String, usize, u8) {
-        let state = self.guide_state.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = self
+            .guide_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         (state.text.clone(), state.captured_count, state.hold)
     }
 
     /// 是否达到目标位姿数。
     pub fn complete(&self) -> bool {
-        let poses = self.poses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let poses = self
+            .poses
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         poses.len() >= self.target
     }
 
@@ -365,7 +379,11 @@ struct GuidedCaptureRuntime {
 }
 
 impl GuidedCaptureRuntime {
-    fn standard_45(board: BoardSpec, initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Result<Self, String> {
+    fn standard_45(
+        board: BoardSpec,
+        initial_intrinsics: &InitialIntrinsics,
+        image_size: CalibrationImageSize,
+    ) -> Result<Self, String> {
         Ok(Self {
             plan: standard_guided_pose_plan(board, initial_intrinsics, image_size)?,
             current_step: 0,
@@ -385,27 +403,40 @@ impl GuidedCaptureRuntime {
 
     fn current_step_label(&self) -> String {
         match self.current_target() {
-            Some(target) => format!("动作 {} / {} · {}", self.current_step + 1, self.plan.len(), target.label),
+            Some(target) => format!(
+                "动作 {} / {} · {}",
+                self.current_step + 1,
+                self.plan.len(),
+                target.label
+            ),
             None => "guide auto_capture 完成".to_owned(),
         }
     }
 
-    fn update_hold(&mut self, mut assessment: GuidedPoseAssessment, sample: GuidedHoldSample) -> Option<GuidedHoldSample> {
+    fn update_hold(
+        &mut self,
+        mut assessment: GuidedPoseAssessment,
+        sample: GuidedHoldSample,
+    ) -> Option<GuidedHoldSample> {
         if assessment.matched {
-            let jitter_score = self
-                .last_hold_measurement
-                .as_ref()
-                .map_or(0.0, |previous| guided_hold_jitter_score(previous, &assessment.measurement));
+            let jitter_score = self.last_hold_measurement.as_ref().map_or(0.0, |previous| {
+                guided_hold_jitter_score(previous, &assessment.measurement)
+            });
             if jitter_score > 1.0 {
                 assessment.matched = false;
-                assessment.reason = Some(format!("hold jitter {:.2} exceeds stability limit", jitter_score));
+                assessment.reason = Some(format!(
+                    "hold jitter {:.2} exceeds stability limit",
+                    jitter_score
+                ));
                 self.reset_hold();
                 return None;
             }
             self.hold_frames = self.hold_frames.saturating_add(1).min(HOLD_TARGET);
             self.last_hold_measurement = Some(assessment.measurement.clone());
             let mut sample = sample;
-            sample.stability_score = sample.stability_score.min(assessment.pose_error_score + jitter_score);
+            sample.stability_score = sample
+                .stability_score
+                .min(assessment.pose_error_score + jitter_score);
             let replace_best = self
                 .best_hold_sample
                 .as_ref()
@@ -452,9 +483,17 @@ fn guided_capture_loop(
     let mut runtime: Option<GuidedCaptureRuntime> = None;
     godot_print!("guide auto_capture worker 已启动（原版 45 动作，hold {HOLD_TARGET} 帧）");
     loop {
-        if runtime.as_ref().is_some_and(GuidedCaptureRuntime::is_complete) {
+        if runtime
+            .as_ref()
+            .is_some_and(GuidedCaptureRuntime::is_complete)
+        {
             let count = runtime.as_ref().map_or(target, |rt| rt.plan.len());
-            set_guide(&guide, &format!("已完成 {count}/{count} guide 动作，采集完成"), count, 0);
+            set_guide(
+                &guide,
+                &format!("已完成 {count}/{count} guide 动作，采集完成"),
+                count,
+                0,
+            );
             break;
         }
         let Some(frame) = slot.latest() else {
@@ -463,7 +502,12 @@ fn guided_capture_loop(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(error) = error {
-                set_guide(&guide, &format!("RTSP 无帧：{error}（检查板端 DEMO233）"), 0, 0);
+                set_guide(
+                    &guide,
+                    &format!("RTSP 无帧：{error}（检查板端 DEMO233）"),
+                    0,
+                    0,
+                );
             } else {
                 set_guide(&guide, "等待 RTSP 帧…", 0, 0);
             }
@@ -471,7 +515,10 @@ fn guided_capture_loop(
             continue;
         };
 
-        let image_size = CalibrationImageSize { width: frame.width, height: frame.height };
+        let image_size = CalibrationImageSize {
+            width: frame.width,
+            height: frame.height,
+        };
         let initial = default_initial_intrinsics(frame.width, frame.height);
         if runtime.is_none() {
             match GuidedCaptureRuntime::standard_45(board, &initial, image_size) {
@@ -487,30 +534,59 @@ fn guided_capture_loop(
         let Some(target_pose) = rt.current_target().cloned() else {
             continue;
         };
-        publish_target_overlay(&overlay, frame.width, frame.height, &target_pose, false, None, Vec::new(), (0.0, 0.0, 0.0));
+        publish_target_overlay(
+            &overlay,
+            frame.width,
+            frame.height,
+            &target_pose,
+            false,
+            None,
+            Vec::new(),
+            (0.0, 0.0, 0.0),
+        );
 
-        let (detect_rgba, detect_w, detect_h, detect_scale) = resize_for_detect(&frame.rgba, frame.width, frame.height);
+        let (detect_rgba, detect_w, detect_h, detect_scale) =
+            resize_for_detect(&frame.rgba, frame.width, frame.height);
         let png = match encode_png(&detect_rgba, detect_w, detect_h) {
             Ok(png) => png,
             Err(error) => {
-                set_guide(&guide, &format!("PNG 编码失败：{error}"), rt.current_step, 0);
+                set_guide(
+                    &guide,
+                    &format!("PNG 编码失败：{error}"),
+                    rt.current_step,
+                    0,
+                );
                 std::thread::sleep(DETECT_INTERVAL);
                 continue;
             }
         };
-        let expected = CalibrationImageSize { width: detect_w, height: detect_h };
+        let expected = CalibrationImageSize {
+            width: detect_w,
+            height: detect_h,
+        };
         match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 let corners: Vec<CalibrationPoint> = detection
                     .corners
                     .iter()
-                    .map(|c| CalibrationPoint { x: c.x / detect_scale, y: c.y / detect_scale })
+                    .map(|c| CalibrationPoint {
+                        x: c.x / detect_scale,
+                        y: c.y / detect_scale,
+                    })
                     .collect();
-                let detection = ChessboardDetection { image_size, corners };
+                let detection = ChessboardDetection {
+                    image_size,
+                    corners,
+                };
                 let view = match backend.estimate_pose(&detection, &initial, board, &cancellation) {
                     Ok(view) => view,
                     Err(error) => {
-                        set_guide(&guide, &format!("检测到棋盘，姿态估计失败：{error}"), rt.current_step, 0);
+                        set_guide(
+                            &guide,
+                            &format!("检测到棋盘，姿态估计失败：{error}"),
+                            rt.current_step,
+                            0,
+                        );
                         std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
@@ -526,13 +602,22 @@ fn guided_capture_loop(
                 ) {
                     Ok(assessment) => assessment,
                     Err(error) => {
-                        set_guide(&guide, &format!("guide 姿态评估失败：{error}"), rt.current_step, 0);
+                        set_guide(
+                            &guide,
+                            &format!("guide 姿态评估失败：{error}"),
+                            rt.current_step,
+                            0,
+                        );
                         std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
                 let status = guided_pose_status_overlay(&assessment, rt.hold_frames);
-                let corners_draw = detection.corners.iter().map(|p| (p.x, p.y)).collect::<Vec<_>>();
+                let corners_draw = detection
+                    .corners
+                    .iter()
+                    .map(|p| (p.x, p.y))
+                    .collect::<Vec<_>>();
                 publish_target_overlay(
                     &overlay,
                     frame.width,
@@ -550,7 +635,12 @@ fn guided_capture_loop(
 
                 let step_label = rt.current_step_label();
                 if !capturing.load(Ordering::Acquire) {
-                    set_guide(&guide, &format!("{step_label} · 等待自动采集启动"), rt.current_step, 0);
+                    set_guide(
+                        &guide,
+                        &format!("{step_label} · 等待自动采集启动"),
+                        rt.current_step,
+                        0,
+                    );
                     std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
@@ -565,30 +655,70 @@ fn guided_capture_loop(
                 let captured_sample = rt.update_hold(assessment, sample);
                 if let Some(sample) = captured_sample {
                     {
-                        let mut captured = captured.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut captured = captured
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         captured.push(sample.frame);
                     }
                     {
-                        let mut poses = poses.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let mut poses = poses
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         poses.push(sample.pose_vector);
                     }
                     rt.advance_after_commit();
                     let done = rt.current_step;
                     if rt.is_complete() {
-                        set_guide(&guide, &format!("已完成 {done}/{done} guide 动作，采集完成"), done, 0);
+                        set_guide(
+                            &guide,
+                            &format!("已完成 {done}/{done} guide 动作，采集完成"),
+                            done,
+                            0,
+                        );
                     } else {
-                        set_guide(&guide, &format!("已保存最稳帧 {done}/{} · 下一动作：{}", rt.plan.len(), rt.current_step_label()), done, 0);
+                        set_guide(
+                            &guide,
+                            &format!(
+                                "已保存最稳帧 {done}/{} · 下一动作：{}",
+                                rt.plan.len(),
+                                rt.current_step_label()
+                            ),
+                            done,
+                            0,
+                        );
                     }
                 } else if matched {
-                    set_guide(&guide, &format!("{step_label} · 对齐完成，请保持稳定 {}/{}", rt.hold_frames, HOLD_TARGET), rt.current_step, rt.hold_frames);
+                    set_guide(
+                        &guide,
+                        &format!(
+                            "{step_label} · 对齐完成，请保持稳定 {}/{}",
+                            rt.hold_frames, HOLD_TARGET
+                        ),
+                        rt.current_step,
+                        rt.hold_frames,
+                    );
                 } else {
-                    let reason = reason.unwrap_or_else(|| guided_pose_error_reason(&error, &target_pose));
-                    set_guide(&guide, &format!("{step_label} · {reason}"), rt.current_step, 0);
+                    let reason =
+                        reason.unwrap_or_else(|| guided_pose_error_reason(&error, &target_pose));
+                    set_guide(
+                        &guide,
+                        &format!("{step_label} · {reason}"),
+                        rt.current_step,
+                        0,
+                    );
                 }
             }
             Ok(ChessboardDetectionOutcome::NotFound { .. }) => {
                 rt.reset_hold();
-                set_guide(&guide, &format!("{} · 未检测到棋盘，请把 11×8 / 40mm 棋盘移入黄框", rt.current_step_label()), rt.current_step, 0);
+                set_guide(
+                    &guide,
+                    &format!(
+                        "{} · 未检测到棋盘，请把 11×8 / 40mm 棋盘移入黄框",
+                        rt.current_step_label()
+                    ),
+                    rt.current_step,
+                    0,
+                );
             }
             Err(error) => {
                 rt.reset_hold();
@@ -643,57 +773,292 @@ fn standard_guided_pose_plan(
     const HIGH_TILT: f64 = 28.0;
     let tolerance = GuidedPoseTolerance::default();
     let mut plan = Vec::with_capacity(CAPTURE_TARGET);
-    let mut push = |label: &'static str, center_uv: [f64; 2], scale: f64, tilt_degrees: f64, azimuth_degrees: f64| -> Result<(), String> {
-        let projection = guided_pose_grid_projection(board, center_uv, scale, tilt_degrees, azimuth_degrees, initial_intrinsics, image_size)
-            .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
-        plan.push(GuidedPoseTarget { label, pose: projection.pose, tolerance, outline_uv: projection.outline_uv, grid_lines: projection.grid_lines });
+    let mut push = |label: &'static str,
+                    center_uv: [f64; 2],
+                    scale: f64,
+                    tilt_degrees: f64,
+                    azimuth_degrees: f64|
+     -> Result<(), String> {
+        let projection = guided_pose_grid_projection(
+            board,
+            center_uv,
+            scale,
+            tilt_degrees,
+            azimuth_degrees,
+            initial_intrinsics,
+            image_size,
+        )
+        .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
+        plan.push(GuidedPoseTarget {
+            label,
+            pose: projection.pose,
+            tolerance,
+            outline_uv: projection.outline_uv,
+            grid_lines: projection.grid_lines,
+        });
         Ok(())
     };
     push("Center · mid · flat", [0.50, 0.50], MID, 0.0, 0.0)?;
-    push("Lower right · mid tilt", [0.578, 0.578], NEAR, MID_TILT, 315.0)?;
+    push(
+        "Lower right · mid tilt",
+        [0.578, 0.578],
+        NEAR,
+        MID_TILT,
+        315.0,
+    )?;
     push("Right · mid tilt", [0.60, 0.50], NEAR, MID_TILT, 0.0)?;
-    push("Upper right · mid tilt", [0.578, 0.422], NEAR, MID_TILT, 45.0)?;
-    push("Upper right corner · low tilt", [0.62, 0.38], LOW_EDGE, LOW_TILT, 45.0)?;
-    push("Upper right · low tilt", [0.57, 0.43], LOW_MIDDLE, LOW_TILT, 45.0)?;
-    push("Upper right · high tilt", [0.559, 0.441], FAR_TILTED, HIGH_TILT, 45.0)?;
-    push("Top · high tilt", [0.50, 0.425], FAR_TILTED, HIGH_TILT, 90.0)?;
+    push(
+        "Upper right · mid tilt",
+        [0.578, 0.422],
+        NEAR,
+        MID_TILT,
+        45.0,
+    )?;
+    push(
+        "Upper right corner · low tilt",
+        [0.62, 0.38],
+        LOW_EDGE,
+        LOW_TILT,
+        45.0,
+    )?;
+    push(
+        "Upper right · low tilt",
+        [0.57, 0.43],
+        LOW_MIDDLE,
+        LOW_TILT,
+        45.0,
+    )?;
+    push(
+        "Upper right · high tilt",
+        [0.559, 0.441],
+        FAR_TILTED,
+        HIGH_TILT,
+        45.0,
+    )?;
+    push(
+        "Top · high tilt",
+        [0.50, 0.425],
+        FAR_TILTED,
+        HIGH_TILT,
+        90.0,
+    )?;
     push("Top · low tilt", [0.50, 0.41], LOW_MIDDLE, LOW_TILT, 90.0)?;
-    push("Top edge · low tilt", [0.50, 0.34], LOW_EDGE, LOW_TILT, 90.0)?;
+    push(
+        "Top edge · low tilt",
+        [0.50, 0.34],
+        LOW_EDGE,
+        LOW_TILT,
+        90.0,
+    )?;
     push("Top · mid tilt", [0.50, 0.40], NEAR, MID_TILT, 90.0)?;
-    push("Upper left · mid tilt", [0.422, 0.422], NEAR, MID_TILT, 135.0)?;
+    push(
+        "Upper left · mid tilt",
+        [0.422, 0.422],
+        NEAR,
+        MID_TILT,
+        135.0,
+    )?;
     push("Left · mid tilt", [0.40, 0.50], NEAR, MID_TILT, 180.0)?;
-    push("Lower left · mid tilt", [0.422, 0.578], NEAR, MID_TILT, 225.0)?;
+    push(
+        "Lower left · mid tilt",
+        [0.422, 0.578],
+        NEAR,
+        MID_TILT,
+        225.0,
+    )?;
     push("Bottom · mid tilt", [0.50, 0.60], NEAR, MID_TILT, 270.0)?;
-    push("Bottom edge · low tilt", [0.50, 0.66], LOW_EDGE, LOW_TILT, 270.0)?;
-    push("Bottom · low tilt", [0.50, 0.59], LOW_MIDDLE, LOW_TILT, 270.0)?;
-    push("Bottom · high tilt", [0.50, 0.575], FAR_TILTED, HIGH_TILT, 270.0)?;
-    push("Lower left · high tilt", [0.441, 0.559], FAR_TILTED, HIGH_TILT, 225.0)?;
-    push("Lower left · low tilt", [0.43, 0.57], LOW_MIDDLE, LOW_TILT, 225.0)?;
+    push(
+        "Bottom edge · low tilt",
+        [0.50, 0.66],
+        LOW_EDGE,
+        LOW_TILT,
+        270.0,
+    )?;
+    push(
+        "Bottom · low tilt",
+        [0.50, 0.59],
+        LOW_MIDDLE,
+        LOW_TILT,
+        270.0,
+    )?;
+    push(
+        "Bottom · high tilt",
+        [0.50, 0.575],
+        FAR_TILTED,
+        HIGH_TILT,
+        270.0,
+    )?;
+    push(
+        "Lower left · high tilt",
+        [0.441, 0.559],
+        FAR_TILTED,
+        HIGH_TILT,
+        225.0,
+    )?;
+    push(
+        "Lower left · low tilt",
+        [0.43, 0.57],
+        LOW_MIDDLE,
+        LOW_TILT,
+        225.0,
+    )?;
     push("Left · low tilt", [0.41, 0.50], LOW_MIDDLE, LOW_TILT, 180.0)?;
-    push("Left · high tilt", [0.425, 0.50], FAR_TILTED, HIGH_TILT, 180.0)?;
-    push("Lower left corner · low tilt", [0.38, 0.62], LOW_EDGE, LOW_TILT, 225.0)?;
-    push("Close lower left corner · fronto", [0.30, 0.70], CLOSE_CORNER, 0.0, 0.0)?;
-    push("Outer lower left corner · fronto", [0.28, 0.72], OUTER_CORNER, 0.0, 0.0)?;
-    push("Left edge · low tilt", [0.34, 0.50], LOW_EDGE, LOW_TILT, 180.0)?;
-    push("Outer upper left corner · fronto", [0.28, 0.28], OUTER_CORNER, 0.0, 0.0)?;
-    push("Close upper left corner · fronto", [0.30, 0.30], CLOSE_CORNER, 0.0, 0.0)?;
-    push("Upper left corner · low tilt", [0.38, 0.38], LOW_EDGE, LOW_TILT, 135.0)?;
-    push("Upper left · low tilt", [0.43, 0.43], LOW_MIDDLE, LOW_TILT, 135.0)?;
-    push("Upper left · high tilt", [0.441, 0.441], FAR_TILTED, HIGH_TILT, 135.0)?;
-    push("Far left field · fronto", [0.37, 0.50], FAR_MIDDLE, 0.0, 0.0)?;
-    push("Far bottom field · fronto", [0.50, 0.63], FAR_MIDDLE, 0.0, 0.0)?;
+    push(
+        "Left · high tilt",
+        [0.425, 0.50],
+        FAR_TILTED,
+        HIGH_TILT,
+        180.0,
+    )?;
+    push(
+        "Lower left corner · low tilt",
+        [0.38, 0.62],
+        LOW_EDGE,
+        LOW_TILT,
+        225.0,
+    )?;
+    push(
+        "Close lower left corner · fronto",
+        [0.30, 0.70],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer lower left corner · fronto",
+        [0.28, 0.72],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Left edge · low tilt",
+        [0.34, 0.50],
+        LOW_EDGE,
+        LOW_TILT,
+        180.0,
+    )?;
+    push(
+        "Outer upper left corner · fronto",
+        [0.28, 0.28],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Close upper left corner · fronto",
+        [0.30, 0.30],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Upper left corner · low tilt",
+        [0.38, 0.38],
+        LOW_EDGE,
+        LOW_TILT,
+        135.0,
+    )?;
+    push(
+        "Upper left · low tilt",
+        [0.43, 0.43],
+        LOW_MIDDLE,
+        LOW_TILT,
+        135.0,
+    )?;
+    push(
+        "Upper left · high tilt",
+        [0.441, 0.441],
+        FAR_TILTED,
+        HIGH_TILT,
+        135.0,
+    )?;
+    push(
+        "Far left field · fronto",
+        [0.37, 0.50],
+        FAR_MIDDLE,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Far bottom field · fronto",
+        [0.50, 0.63],
+        FAR_MIDDLE,
+        0.0,
+        0.0,
+    )?;
     push("Far top field · fronto", [0.50, 0.37], FAR_MIDDLE, 0.0, 0.0)?;
-    push("Far right field · fronto", [0.63, 0.50], FAR_MIDDLE, 0.0, 0.0)?;
+    push(
+        "Far right field · fronto",
+        [0.63, 0.50],
+        FAR_MIDDLE,
+        0.0,
+        0.0,
+    )?;
     push("Right · low tilt", [0.59, 0.50], LOW_MIDDLE, LOW_TILT, 0.0)?;
-    push("Right · high tilt", [0.575, 0.50], FAR_TILTED, HIGH_TILT, 0.0)?;
-    push("Lower right · high tilt", [0.559, 0.559], FAR_TILTED, HIGH_TILT, 315.0)?;
-    push("Lower right · low tilt", [0.57, 0.57], LOW_MIDDLE, LOW_TILT, 315.0)?;
-    push("Lower right corner · low tilt", [0.62, 0.62], LOW_EDGE, LOW_TILT, 315.0)?;
-    push("Close lower right corner · fronto", [0.70, 0.70], CLOSE_CORNER, 0.0, 0.0)?;
-    push("Outer lower right corner · fronto", [0.72, 0.72], OUTER_CORNER, 0.0, 0.0)?;
-    push("Right edge · low tilt", [0.66, 0.50], LOW_EDGE, LOW_TILT, 0.0)?;
-    push("Close upper right corner · fronto", [0.70, 0.30], CLOSE_CORNER, 0.0, 0.0)?;
-    push("Outer upper right corner · fronto", [0.72, 0.28], OUTER_CORNER, 0.0, 0.0)?;
+    push(
+        "Right · high tilt",
+        [0.575, 0.50],
+        FAR_TILTED,
+        HIGH_TILT,
+        0.0,
+    )?;
+    push(
+        "Lower right · high tilt",
+        [0.559, 0.559],
+        FAR_TILTED,
+        HIGH_TILT,
+        315.0,
+    )?;
+    push(
+        "Lower right · low tilt",
+        [0.57, 0.57],
+        LOW_MIDDLE,
+        LOW_TILT,
+        315.0,
+    )?;
+    push(
+        "Lower right corner · low tilt",
+        [0.62, 0.62],
+        LOW_EDGE,
+        LOW_TILT,
+        315.0,
+    )?;
+    push(
+        "Close lower right corner · fronto",
+        [0.70, 0.70],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer lower right corner · fronto",
+        [0.72, 0.72],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Right edge · low tilt",
+        [0.66, 0.50],
+        LOW_EDGE,
+        LOW_TILT,
+        0.0,
+    )?;
+    push(
+        "Close upper right corner · fronto",
+        [0.70, 0.30],
+        CLOSE_CORNER,
+        0.0,
+        0.0,
+    )?;
+    push(
+        "Outer upper right corner · fronto",
+        [0.72, 0.28],
+        OUTER_CORNER,
+        0.0,
+        0.0,
+    )?;
     Ok(plan)
 }
 
@@ -703,10 +1068,27 @@ struct GuidedPoseGridProjection {
     grid_lines: Vec<OverlayGridLine>,
 }
 
-fn guided_pose_grid_projection(board: BoardSpec, center_uv: [f64; 2], scale: f64, tilt_degrees: f64, azimuth_degrees: f64, initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Option<GuidedPoseGridProjection> {
-    if center_uv.iter().any(|value| !value.is_finite()) || !scale.is_finite() || scale <= 0.0 { return None; }
+fn guided_pose_grid_projection(
+    board: BoardSpec,
+    center_uv: [f64; 2],
+    scale: f64,
+    tilt_degrees: f64,
+    azimuth_degrees: f64,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<GuidedPoseGridProjection> {
+    if center_uv.iter().any(|value| !value.is_finite()) || !scale.is_finite() || scale <= 0.0 {
+        return None;
+    }
     let rotation = guided_pose_rotation(tilt_degrees, azimuth_degrees);
-    let translation = guided_pose_target_translation(board, center_uv, scale, rotation, initial_intrinsics, image_size)?;
+    let translation = guided_pose_target_translation(
+        board,
+        center_uv,
+        scale,
+        rotation,
+        initial_intrinsics,
+        image_size,
+    )?;
     let left = -1.0;
     let top = -1.0;
     let right = f64::from(board.inner_cols);
@@ -714,84 +1096,252 @@ fn guided_pose_grid_projection(board: BoardSpec, center_uv: [f64; 2], scale: f64
     let mut grid_lines = Vec::with_capacity(usize::from(board.inner_cols + board.inner_rows) + 4);
     for column in 0..=usize::from(board.inner_cols) + 1 {
         let x = column as f64 - 1.0;
-        grid_lines.push(OverlayGridLine { start_uv: guided_pose_project_board_uv(board, rotation, translation, x, top, initial_intrinsics, image_size)?, end_uv: guided_pose_project_board_uv(board, rotation, translation, x, bottom, initial_intrinsics, image_size)? });
+        grid_lines.push(OverlayGridLine {
+            start_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                x,
+                top,
+                initial_intrinsics,
+                image_size,
+            )?,
+            end_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                x,
+                bottom,
+                initial_intrinsics,
+                image_size,
+            )?,
+        });
     }
     for row in 0..=usize::from(board.inner_rows) + 1 {
         let y = row as f64 - 1.0;
-        grid_lines.push(OverlayGridLine { start_uv: guided_pose_project_board_uv(board, rotation, translation, left, y, initial_intrinsics, image_size)?, end_uv: guided_pose_project_board_uv(board, rotation, translation, right, y, initial_intrinsics, image_size)? });
+        grid_lines.push(OverlayGridLine {
+            start_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                left,
+                y,
+                initial_intrinsics,
+                image_size,
+            )?,
+            end_uv: guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                right,
+                y,
+                initial_intrinsics,
+                image_size,
+            )?,
+        });
     }
-    let pose = guided_pose_6dof_from_rotation_translation(board, rotation, translation, initial_intrinsics, image_size)?;
-    Some(GuidedPoseGridProjection { pose, outline_uv: [
-        guided_pose_project_board_uv(board, rotation, translation, left, top, initial_intrinsics, image_size)?,
-        guided_pose_project_board_uv(board, rotation, translation, right, top, initial_intrinsics, image_size)?,
-        guided_pose_project_board_uv(board, rotation, translation, right, bottom, initial_intrinsics, image_size)?,
-        guided_pose_project_board_uv(board, rotation, translation, left, bottom, initial_intrinsics, image_size)?,
-    ], grid_lines })
+    let pose = guided_pose_6dof_from_rotation_translation(
+        board,
+        rotation,
+        translation,
+        initial_intrinsics,
+        image_size,
+    )?;
+    Some(GuidedPoseGridProjection {
+        pose,
+        outline_uv: [
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                left,
+                top,
+                initial_intrinsics,
+                image_size,
+            )?,
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                right,
+                top,
+                initial_intrinsics,
+                image_size,
+            )?,
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                right,
+                bottom,
+                initial_intrinsics,
+                image_size,
+            )?,
+            guided_pose_project_board_uv(
+                board,
+                rotation,
+                translation,
+                left,
+                bottom,
+                initial_intrinsics,
+                image_size,
+            )?,
+        ],
+        grid_lines,
+    })
 }
 
-fn guided_pose_target_translation(board: BoardSpec, center_uv: [f64; 2], target_scale: f64, rotation: [[f64; 3]; 3], initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Option<[f64; 3]> {
-    let target_pixel = [center_uv[0] * f64::from(image_size.width), center_uv[1] * f64::from(image_size.height)];
+fn guided_pose_target_translation(
+    board: BoardSpec,
+    center_uv: [f64; 2],
+    target_scale: f64,
+    rotation: [[f64; 3]; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<[f64; 3]> {
+    let target_pixel = [
+        center_uv[0] * f64::from(image_size.width),
+        center_uv[1] * f64::from(image_size.height),
+    ];
     let center_ray = undistort_image_pixel_to_normalized(target_pixel, initial_intrinsics)?;
     let inner_center = guided_pose_inner_center_point(board);
     let rotated_center = rotate_guided_pose_point(rotation, inner_center);
     let minimum_depth = guided_pose_minimum_center_depth(board, rotation, inner_center);
-    let mut center_depth = guided_pose_initial_center_depth(board, target_scale, initial_intrinsics, image_size)?.max(minimum_depth);
+    let mut center_depth =
+        guided_pose_initial_center_depth(board, target_scale, initial_intrinsics, image_size)?
+            .max(minimum_depth);
     let mut last_translation = None;
     for _ in 0..GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS {
-        let translation = guided_pose_translation_at_depth(board, rotation, rotated_center, center_ray, target_pixel, center_depth, initial_intrinsics)?;
-        let current_scale = guided_pose_projected_inner_scale(board, rotation, translation, initial_intrinsics, image_size)?;
+        let translation = guided_pose_translation_at_depth(
+            board,
+            rotation,
+            rotated_center,
+            center_ray,
+            target_pixel,
+            center_depth,
+            initial_intrinsics,
+        )?;
+        let current_scale = guided_pose_projected_inner_scale(
+            board,
+            rotation,
+            translation,
+            initial_intrinsics,
+            image_size,
+        )?;
         last_translation = Some(translation);
         let scale_ratio = current_scale / target_scale;
-        if !scale_ratio.is_finite() || scale_ratio <= 0.0 { return last_translation; }
-        if (current_scale - target_scale).abs() <= target_scale * 1.0e-4 { return last_translation; }
+        if !scale_ratio.is_finite() || scale_ratio <= 0.0 {
+            return last_translation;
+        }
+        if (current_scale - target_scale).abs() <= target_scale * 1.0e-4 {
+            return last_translation;
+        }
         let next_depth = (center_depth * scale_ratio).max(minimum_depth);
-        if (next_depth - center_depth).abs() <= center_depth * 1.0e-5 { return last_translation; }
+        if (next_depth - center_depth).abs() <= center_depth * 1.0e-5 {
+            return last_translation;
+        }
         center_depth = next_depth;
     }
     last_translation
 }
 
-fn guided_pose_initial_center_depth(board: BoardSpec, target_scale: f64, initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Option<f64> {
-    if !target_scale.is_finite() || target_scale <= 0.0 { return None; }
+fn guided_pose_initial_center_depth(
+    board: BoardSpec,
+    target_scale: f64,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<f64> {
+    if !target_scale.is_finite() || target_scale <= 0.0 {
+        return None;
+    }
     let short_side = f64::from(image_size.width.min(image_size.height));
     let inner_width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
     let inner_height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
     let matrix = initial_intrinsics.camera_matrix;
-    let depth = (inner_width * matrix[0]).max(inner_height * matrix[4]) / (target_scale * short_side);
-    depth.is_finite().then_some(depth.max(board.square_size.max(1.0)))
+    let depth =
+        (inner_width * matrix[0]).max(inner_height * matrix[4]) / (target_scale * short_side);
+    depth
+        .is_finite()
+        .then_some(depth.max(board.square_size.max(1.0)))
 }
 
-fn guided_pose_translation_at_depth(board: BoardSpec, rotation: [[f64; 3]; 3], rotated_center: [f64; 3], center_ray: [f64; 2], target_pixel: [f64; 2], center_depth: f64, initial_intrinsics: &InitialIntrinsics) -> Option<[f64; 3]> {
-    if !center_depth.is_finite() || center_depth <= 0.0 { return None; }
+fn guided_pose_translation_at_depth(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    rotated_center: [f64; 3],
+    center_ray: [f64; 2],
+    target_pixel: [f64; 2],
+    center_depth: f64,
+    initial_intrinsics: &InitialIntrinsics,
+) -> Option<[f64; 3]> {
+    if !center_depth.is_finite() || center_depth <= 0.0 {
+        return None;
+    }
     let matrix = initial_intrinsics.camera_matrix;
-    let mut translation = [center_ray[0] * center_depth - rotated_center[0], center_ray[1] * center_depth - rotated_center[1], center_depth - rotated_center[2]];
+    let mut translation = [
+        center_ray[0] * center_depth - rotated_center[0],
+        center_ray[1] * center_depth - rotated_center[1],
+        center_depth - rotated_center[2],
+    ];
     for _ in 0..8 {
-        let (minimum, maximum) = guided_pose_projected_inner_pixel_bounds(board, rotation, translation, initial_intrinsics)?;
-        let current_center = [(minimum[0] + maximum[0]) * 0.5, (minimum[1] + maximum[1]) * 0.5];
-        let error = [target_pixel[0] - current_center[0], target_pixel[1] - current_center[1]];
-        if error[0].abs().max(error[1].abs()) <= 1.0e-3 { break; }
+        let (minimum, maximum) = guided_pose_projected_inner_pixel_bounds(
+            board,
+            rotation,
+            translation,
+            initial_intrinsics,
+        )?;
+        let current_center = [
+            (minimum[0] + maximum[0]) * 0.5,
+            (minimum[1] + maximum[1]) * 0.5,
+        ];
+        let error = [
+            target_pixel[0] - current_center[0],
+            target_pixel[1] - current_center[1],
+        ];
+        if error[0].abs().max(error[1].abs()) <= 1.0e-3 {
+            break;
+        }
         translation[0] += error[0] / matrix[0] * center_depth;
         translation[1] += error[1] / matrix[4] * center_depth;
-        if translation.iter().any(|value| !value.is_finite()) { return None; }
+        if translation.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
     }
     Some(translation)
 }
 
-fn guided_pose_projected_inner_scale(board: BoardSpec, rotation: [[f64; 3]; 3], translation: [f64; 3], initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Option<f64> {
-    let (minimum, maximum) = guided_pose_projected_inner_pixel_bounds(board, rotation, translation, initial_intrinsics)?;
+fn guided_pose_projected_inner_scale(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<f64> {
+    let (minimum, maximum) =
+        guided_pose_projected_inner_pixel_bounds(board, rotation, translation, initial_intrinsics)?;
     let short_side = f64::from(image_size.width.min(image_size.height));
     let scale = (maximum[0] - minimum[0]).max(maximum[1] - minimum[1]) / short_side;
     scale.is_finite().then_some(scale)
 }
 
-fn guided_pose_projected_inner_pixel_bounds(board: BoardSpec, rotation: [[f64; 3]; 3], translation: [f64; 3], initial_intrinsics: &InitialIntrinsics) -> Option<([f64; 2], [f64; 2])> {
+fn guided_pose_projected_inner_pixel_bounds(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+) -> Option<([f64; 2], [f64; 2])> {
     let right = f64::from(board.inner_cols.saturating_sub(1));
     let bottom = f64::from(board.inner_rows.saturating_sub(1));
     let corners = [[0.0, 0.0], [right, 0.0], [right, bottom], [0.0, bottom]];
     let mut minimum = [f64::INFINITY, f64::INFINITY];
     let mut maximum = [f64::NEG_INFINITY, f64::NEG_INFINITY];
     for [x, y] in corners {
-        let point = project_board_point_image(rotation, translation, guided_pose_board_point(board, x, y), initial_intrinsics)?;
+        let point = project_board_point_image(
+            rotation,
+            translation,
+            guided_pose_board_point(board, x, y),
+            initial_intrinsics,
+        )?;
         let image = [f64::from(point.x), f64::from(point.y)];
         minimum[0] = minimum[0].min(image[0]);
         minimum[1] = minimum[1].min(image[1]);
@@ -801,7 +1351,11 @@ fn guided_pose_projected_inner_pixel_bounds(board: BoardSpec, rotation: [[f64; 3
     Some((minimum, maximum))
 }
 
-fn guided_pose_minimum_center_depth(board: BoardSpec, rotation: [[f64; 3]; 3], inner_center: [f64; 3]) -> f64 {
+fn guided_pose_minimum_center_depth(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    inner_center: [f64; 3],
+) -> f64 {
     let center_z = rotate_guided_pose_point(rotation, inner_center)[2];
     let right = f64::from(board.inner_cols);
     let bottom = f64::from(board.inner_rows);
@@ -811,47 +1365,100 @@ fn guided_pose_minimum_center_depth(board: BoardSpec, rotation: [[f64; 3]; 3], i
         minimum.min(z - center_z)
     });
     let margin = board.square_size.max(1.0) * 0.05;
-    if min_delta < 0.0 { -min_delta + margin } else { margin }
+    if min_delta < 0.0 {
+        -min_delta + margin
+    } else {
+        margin
+    }
 }
 
 fn guided_pose_inner_center_point(board: BoardSpec) -> [f64; 3] {
-    guided_pose_board_point(board, f64::from(board.inner_cols.saturating_sub(1)) * 0.5, f64::from(board.inner_rows.saturating_sub(1)) * 0.5)
+    guided_pose_board_point(
+        board,
+        f64::from(board.inner_cols.saturating_sub(1)) * 0.5,
+        f64::from(board.inner_rows.saturating_sub(1)) * 0.5,
+    )
 }
 
 fn guided_pose_board_point(board: BoardSpec, x: f64, y: f64) -> [f64; 3] {
     [x * board.square_size, y * board.square_size, 0.0]
 }
 
-fn guided_pose_project_board_uv(board: BoardSpec, rotation: [[f64; 3]; 3], translation: [f64; 3], x: f64, y: f64, initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Option<[f32; 2]> {
-    let point = project_board_point_image(rotation, translation, guided_pose_board_point(board, x, y), initial_intrinsics)?;
-    Some([point.x / image_size.width as f32, point.y / image_size.height as f32])
+fn guided_pose_project_board_uv(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    x: f64,
+    y: f64,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<[f32; 2]> {
+    let point = project_board_point_image(
+        rotation,
+        translation,
+        guided_pose_board_point(board, x, y),
+        initial_intrinsics,
+    )?;
+    Some([
+        point.x / image_size.width as f32,
+        point.y / image_size.height as f32,
+    ])
 }
 
-fn guided_pose_6dof_from_rotation_translation(board: BoardSpec, rotation: [[f64; 3]; 3], translation: [f64; 3], initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Option<GuidedPose6Dof> {
+fn guided_pose_6dof_from_rotation_translation(
+    board: BoardSpec,
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Option<GuidedPose6Dof> {
     let center_point = guided_pose_inner_center_point(board);
     let rotated_center = rotate_guided_pose_point(rotation, center_point);
-    let xyz = [rotated_center[0] + translation[0], rotated_center[1] + translation[1], rotated_center[2] + translation[2]];
-    let center_image = project_board_point_image(rotation, translation, center_point, initial_intrinsics)?;
-    let center_uv = [center_image.x / image_size.width as f32, center_image.y / image_size.height as f32];
+    let xyz = [
+        rotated_center[0] + translation[0],
+        rotated_center[1] + translation[1],
+        rotated_center[2] + translation[2],
+    ];
+    let center_image =
+        project_board_point_image(rotation, translation, center_point, initial_intrinsics)?;
+    let center_uv = [
+        center_image.x / image_size.width as f32,
+        center_image.y / image_size.height as f32,
+    ];
     let rpy_degrees = guided_pose_rotation_to_rpy_degrees(rotation)?;
-    let pose = GuidedPose6Dof { xyz, rpy_degrees, rotation, translation, center_uv };
+    let pose = GuidedPose6Dof {
+        xyz,
+        rpy_degrees,
+        rotation,
+        translation,
+        center_uv,
+    };
     guided_pose_6dof_is_finite(&pose).then_some(pose)
 }
 
 fn guided_pose_6dof_is_finite(pose: &GuidedPose6Dof) -> bool {
     pose.xyz.iter().all(|value| value.is_finite())
         && pose.rpy_degrees.iter().all(|value| value.is_finite())
-        && pose.rotation.iter().flatten().all(|value| value.is_finite())
+        && pose
+            .rotation
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
         && pose.translation.iter().all(|value| value.is_finite())
         && pose.center_uv.iter().all(|value| value.is_finite())
 }
 
 fn guided_pose_rotation_to_rpy_degrees(rotation: [[f64; 3]; 3]) -> Option<[f64; 3]> {
-    if rotation.iter().flatten().any(|value| !value.is_finite()) { return None; }
+    if rotation.iter().flatten().any(|value| !value.is_finite()) {
+        return None;
+    }
     let pitch = (-rotation[2][0]).clamp(-1.0, 1.0).asin();
     let cos_pitch = pitch.cos();
     let (roll, yaw) = if cos_pitch.abs() > 1.0e-9 {
-        (rotation[2][1].atan2(rotation[2][2]), rotation[1][0].atan2(rotation[0][0]))
+        (
+            rotation[2][1].atan2(rotation[2][2]),
+            rotation[1][0].atan2(rotation[0][0]),
+        )
     } else {
         (0.0, (-rotation[0][1]).atan2(rotation[1][1]))
     };
@@ -863,7 +1470,9 @@ fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
     let mut output = [[0.0; 3]; 3];
     for row in 0..3 {
         for column in 0..3 {
-            output[row][column] = left[row][0] * right[0][column] + left[row][1] * right[1][column] + left[row][2] * right[2][column];
+            output[row][column] = left[row][0] * right[0][column]
+                + left[row][1] * right[1][column]
+                + left[row][2] * right[2][column];
         }
     }
     output
@@ -871,11 +1480,24 @@ fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
 
 fn signed_angle_distance_degrees(left: f64, right: f64) -> f64 {
     let delta = (left - right).rem_euclid(360.0);
-    if delta > 180.0 { delta - 360.0 } else { delta }
+    if delta > 180.0 {
+        delta - 360.0
+    } else {
+        delta
+    }
 }
 
-fn guided_pose_signed_rotation_error_components(measurement_rpy_degrees: [f64; 3], target_rpy_degrees: [f64; 3]) -> Option<[f64; 3]> {
-    if measurement_rpy_degrees.iter().chain(&target_rpy_degrees).any(|value| !value.is_finite()) { return None; }
+fn guided_pose_signed_rotation_error_components(
+    measurement_rpy_degrees: [f64; 3],
+    target_rpy_degrees: [f64; 3],
+) -> Option<[f64; 3]> {
+    if measurement_rpy_degrees
+        .iter()
+        .chain(&target_rpy_degrees)
+        .any(|value| !value.is_finite())
+    {
+        return None;
+    }
     let raw_zyx = [
         signed_angle_distance_degrees(target_rpy_degrees[0], measurement_rpy_degrees[0]),
         signed_angle_distance_degrees(target_rpy_degrees[1], measurement_rpy_degrees[1]),
@@ -890,31 +1512,60 @@ fn guided_pose_rotation_error_score(components: [f64; 3], tolerance: GuidedPoseT
         .max(components[2].abs() / tolerance.yaw_degrees)
 }
 
-fn guided_pose_rotation_error_degrees(measurement: &GuidedPose6Dof, target: &GuidedPose6Dof, tolerance: GuidedPoseTolerance) -> Option<[f64; 3]> {
-    let direct = guided_pose_signed_rotation_error_components(measurement.rpy_degrees, target.rpy_degrees)?;
+fn guided_pose_rotation_error_degrees(
+    measurement: &GuidedPose6Dof,
+    target: &GuidedPose6Dof,
+    tolerance: GuidedPoseTolerance,
+) -> Option<[f64; 3]> {
+    let direct =
+        guided_pose_signed_rotation_error_components(measurement.rpy_degrees, target.rpy_degrees)?;
     let board_half_turn = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]];
     let symmetric_measurement = mat3_mul(measurement.rotation, board_half_turn);
     let symmetric_rpy = guided_pose_rotation_to_rpy_degrees(symmetric_measurement)?;
-    let symmetric = guided_pose_signed_rotation_error_components(symmetric_rpy, target.rpy_degrees)?;
+    let symmetric =
+        guided_pose_signed_rotation_error_components(symmetric_rpy, target.rpy_degrees)?;
     let direct_score = guided_pose_rotation_error_score(direct, tolerance);
     let symmetric_score = guided_pose_rotation_error_score(symmetric, tolerance);
-    Some(if symmetric_score < direct_score { symmetric } else { direct })
+    Some(if symmetric_score < direct_score {
+        symmetric
+    } else {
+        direct
+    })
 }
 
-fn undistort_image_pixel_to_normalized(pixel: [f64; 2], initial_intrinsics: &InitialIntrinsics) -> Option<[f64; 2]> {
+fn undistort_image_pixel_to_normalized(
+    pixel: [f64; 2],
+    initial_intrinsics: &InitialIntrinsics,
+) -> Option<[f64; 2]> {
     let matrix = initial_intrinsics.camera_matrix;
-    if matrix[0] <= 0.0 || matrix[4] <= 0.0 || pixel.iter().any(|value| !value.is_finite()) { return None; }
-    let distorted = [(pixel[0] - matrix[2]) / matrix[0], (pixel[1] - matrix[5]) / matrix[4]];
-    if distorted.iter().any(|value| !value.is_finite()) { return None; }
+    if matrix[0] <= 0.0 || matrix[4] <= 0.0 || pixel.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let distorted = [
+        (pixel[0] - matrix[2]) / matrix[0],
+        (pixel[1] - matrix[5]) / matrix[4],
+    ];
+    if distorted.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
     let mut undistorted = distorted;
     for _ in 0..12 {
-        let projected = distort_normalized_point(undistorted[0], undistorted[1], &initial_intrinsics.distortion_coefficients)?;
+        let projected = distort_normalized_point(
+            undistorted[0],
+            undistorted[1],
+            &initial_intrinsics.distortion_coefficients,
+        )?;
         let error = [projected[0] - distorted[0], projected[1] - distorted[1]];
         undistorted[0] -= error[0];
         undistorted[1] -= error[1];
-        if error[0].abs().max(error[1].abs()) <= 1.0e-12 { break; }
+        if error[0].abs().max(error[1].abs()) <= 1.0e-12 {
+            break;
+        }
     }
-    undistorted.iter().all(|value| value.is_finite()).then_some(undistorted)
+    undistorted
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(undistorted)
 }
 
 fn distort_normalized_point(x: f64, y: f64, distortion: &[f64]) -> Option<[f64; 2]> {
@@ -924,38 +1575,89 @@ fn distort_normalized_point(x: f64, y: f64, distortion: &[f64]) -> Option<[f64; 
     let r6 = r4 * r2;
     let numerator = 1.0 + coefficient(0) * r2 + coefficient(1) * r4 + coefficient(4) * r6;
     let denominator = 1.0 + coefficient(5) * r2 + coefficient(6) * r4 + coefficient(7) * r6;
-    if !denominator.is_finite() || denominator.abs() <= f64::EPSILON { return None; }
+    if !denominator.is_finite() || denominator.abs() <= f64::EPSILON {
+        return None;
+    }
     let radial = numerator / denominator;
     let distorted = [
-        x * radial + 2.0 * coefficient(2) * x * y + coefficient(3) * (r2 + 2.0 * x * x) + coefficient(8) * r2 + coefficient(9) * r4,
-        y * radial + coefficient(2) * (r2 + 2.0 * y * y) + 2.0 * coefficient(3) * x * y + coefficient(10) * r2 + coefficient(11) * r4,
+        x * radial
+            + 2.0 * coefficient(2) * x * y
+            + coefficient(3) * (r2 + 2.0 * x * x)
+            + coefficient(8) * r2
+            + coefficient(9) * r4,
+        y * radial
+            + coefficient(2) * (r2 + 2.0 * y * y)
+            + 2.0 * coefficient(3) * x * y
+            + coefficient(10) * r2
+            + coefficient(11) * r4,
     ];
-    distorted.iter().all(|value| value.is_finite()).then_some(distorted)
+    distorted
+        .iter()
+        .all(|value| value.is_finite())
+        .then_some(distorted)
 }
 
 fn guided_pose_rotation(tilt_degrees: f64, azimuth_degrees: f64) -> [[f64; 3]; 3] {
     let tilt = tilt_degrees.to_radians();
-    if tilt.abs() <= f64::EPSILON { return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; }
+    if tilt.abs() <= f64::EPSILON {
+        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    }
     let azimuth = azimuth_degrees.to_radians();
     let axis = [-azimuth.sin(), azimuth.cos(), 0.0];
     let (sin_theta, cos_theta) = tilt.sin_cos();
     let one_minus_cos = 1.0 - cos_theta;
     let [x, y, z] = axis;
     [
-        [cos_theta + x * x * one_minus_cos, x * y * one_minus_cos - z * sin_theta, x * z * one_minus_cos + y * sin_theta],
-        [y * x * one_minus_cos + z * sin_theta, cos_theta + y * y * one_minus_cos, y * z * one_minus_cos - x * sin_theta],
-        [z * x * one_minus_cos - y * sin_theta, z * y * one_minus_cos + x * sin_theta, cos_theta + z * z * one_minus_cos],
+        [
+            cos_theta + x * x * one_minus_cos,
+            x * y * one_minus_cos - z * sin_theta,
+            x * z * one_minus_cos + y * sin_theta,
+        ],
+        [
+            y * x * one_minus_cos + z * sin_theta,
+            cos_theta + y * y * one_minus_cos,
+            y * z * one_minus_cos - x * sin_theta,
+        ],
+        [
+            z * x * one_minus_cos - y * sin_theta,
+            z * y * one_minus_cos + x * sin_theta,
+            cos_theta + z * z * one_minus_cos,
+        ],
     ]
 }
 
-fn guided_hold_jitter_score(previous: &GuidedPoseMeasurement, current: &GuidedPoseMeasurement) -> f64 {
-    let depth_scale = previous.pose.xyz[2].abs().max(current.pose.xyz[2].abs()).max(1.0);
-    let xyz_score = ((previous.pose.xyz[0] - current.pose.xyz[0]).abs() / depth_scale / GUIDED_HOLD_JITTER_XYZ_LIMIT)
-        .max((previous.pose.xyz[1] - current.pose.xyz[1]).abs() / depth_scale / GUIDED_HOLD_JITTER_XYZ_LIMIT)
-        .max((previous.pose.xyz[2] - current.pose.xyz[2]).abs() / depth_scale / GUIDED_HOLD_JITTER_Z_LIMIT);
-    let rpy_score = guided_pose_signed_rotation_error_components(previous.pose.rpy_degrees, current.pose.rpy_degrees)
-        .map(|components| components.into_iter().map(|component| component.abs() / GUIDED_HOLD_JITTER_RPY_DEGREES).fold(0.0_f64, f64::max))
-        .unwrap_or(f64::INFINITY);
+fn guided_hold_jitter_score(
+    previous: &GuidedPoseMeasurement,
+    current: &GuidedPoseMeasurement,
+) -> f64 {
+    let depth_scale = previous.pose.xyz[2]
+        .abs()
+        .max(current.pose.xyz[2].abs())
+        .max(1.0);
+    let xyz_score = ((previous.pose.xyz[0] - current.pose.xyz[0]).abs()
+        / depth_scale
+        / GUIDED_HOLD_JITTER_XYZ_LIMIT)
+        .max(
+            (previous.pose.xyz[1] - current.pose.xyz[1]).abs()
+                / depth_scale
+                / GUIDED_HOLD_JITTER_XYZ_LIMIT,
+        )
+        .max(
+            (previous.pose.xyz[2] - current.pose.xyz[2]).abs()
+                / depth_scale
+                / GUIDED_HOLD_JITTER_Z_LIMIT,
+        );
+    let rpy_score = guided_pose_signed_rotation_error_components(
+        previous.pose.rpy_degrees,
+        current.pose.rpy_degrees,
+    )
+    .map(|components| {
+        components
+            .into_iter()
+            .map(|component| component.abs() / GUIDED_HOLD_JITTER_RPY_DEGREES)
+            .fold(0.0_f64, f64::max)
+    })
+    .unwrap_or(f64::INFINITY);
     xyz_score.max(rpy_score)
 }
 
@@ -967,22 +1669,53 @@ fn rotate_guided_pose_point(rotation: [[f64; 3]; 3], point: [f64; 3]) -> [f64; 3
     ]
 }
 
-fn guided_pose_measurement(view: &ViewCalibrationResult, board: BoardSpec, initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Result<GuidedPoseMeasurement, String> {
-    let rotation = rodrigues_matrix_for_preview(view.rotation_vector).ok_or_else(|| "guided pose rotation is not finite".to_owned())?;
-    let pose = guided_pose_6dof_from_rotation_translation(board, rotation, view.translation_vector, initial_intrinsics, image_size)
-        .ok_or_else(|| "guided pose 6DoF projection is invalid".to_owned())?;
-    if pose.xyz[2] <= 0.0 { return Err("guided pose measurement contains non-positive depth".to_owned()); }
+fn guided_pose_measurement(
+    view: &ViewCalibrationResult,
+    board: BoardSpec,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Result<GuidedPoseMeasurement, String> {
+    let rotation = rodrigues_matrix_for_preview(view.rotation_vector)
+        .ok_or_else(|| "guided pose rotation is not finite".to_owned())?;
+    let pose = guided_pose_6dof_from_rotation_translation(
+        board,
+        rotation,
+        view.translation_vector,
+        initial_intrinsics,
+        image_size,
+    )
+    .ok_or_else(|| "guided pose 6DoF projection is invalid".to_owned())?;
+    if pose.xyz[2] <= 0.0 {
+        return Err("guided pose measurement contains non-positive depth".to_owned());
+    }
     Ok(GuidedPoseMeasurement { pose })
 }
 
-fn assess_guided_pose(step_index: usize, target: &GuidedPoseTarget, detection: &ChessboardDetection, view: &ViewCalibrationResult, board: BoardSpec, initial_intrinsics: &InitialIntrinsics, image_size: CalibrationImageSize) -> Result<GuidedPoseAssessment, String> {
-    if detection.corners.is_empty() { return Err("guided pose requires detected board corners".to_owned()); }
-    if detection.image_size != image_size { return Err("guided pose detection image size does not match target binding".to_owned()); }
+fn assess_guided_pose(
+    step_index: usize,
+    target: &GuidedPoseTarget,
+    detection: &ChessboardDetection,
+    view: &ViewCalibrationResult,
+    board: BoardSpec,
+    initial_intrinsics: &InitialIntrinsics,
+    image_size: CalibrationImageSize,
+) -> Result<GuidedPoseAssessment, String> {
+    if detection.corners.is_empty() {
+        return Err("guided pose requires detected board corners".to_owned());
+    }
+    if detection.image_size != image_size {
+        return Err("guided pose detection image size does not match target binding".to_owned());
+    }
     let measurement = guided_pose_measurement(view, board, initial_intrinsics, image_size)?;
-    let depth_scale = target.pose.xyz[2].abs().max(measurement.pose.xyz[2].abs()).max(board.square_size.max(1.0));
-    let signed_rotation_error_degrees = guided_pose_rotation_error_degrees(&measurement.pose, &target.pose, target.tolerance)
-        .ok_or_else(|| "guided pose rotation error is not finite".to_owned())?;
-    let [signed_roll_degrees, signed_pitch_degrees, signed_yaw_degrees] = signed_rotation_error_degrees;
+    let depth_scale = target.pose.xyz[2]
+        .abs()
+        .max(measurement.pose.xyz[2].abs())
+        .max(board.square_size.max(1.0));
+    let signed_rotation_error_degrees =
+        guided_pose_rotation_error_degrees(&measurement.pose, &target.pose, target.tolerance)
+            .ok_or_else(|| "guided pose rotation error is not finite".to_owned())?;
+    let [signed_roll_degrees, signed_pitch_degrees, signed_yaw_degrees] =
+        signed_rotation_error_degrees;
     let error = GuidedPoseError {
         x: (measurement.pose.xyz[0] - target.pose.xyz[0]).abs() / depth_scale,
         y: (measurement.pose.xyz[1] - target.pose.xyz[1]).abs() / depth_scale,
@@ -997,22 +1730,66 @@ fn assess_guided_pose(step_index: usize, target: &GuidedPoseTarget, detection: &
         .max(error.roll_degrees / target.tolerance.roll_degrees)
         .max(error.pitch_degrees / target.tolerance.pitch_degrees)
         .max(error.yaw_degrees / target.tolerance.yaw_degrees);
-    if !pose_error_score.is_finite() { return Err("guided pose score is not finite".to_owned()); }
+    if !pose_error_score.is_finite() {
+        return Err("guided pose score is not finite".to_owned());
+    }
     let matched = pose_error_score <= GUIDED_POSE_MATCH_SCORE_LIMIT;
     let reason = (!matched).then(|| guided_pose_error_reason(&error, target));
-    Ok(GuidedPoseAssessment { step_index, target_label: target.label, measurement, error, signed_rotation_error_degrees, pose_error_score, matched, reason })
+    Ok(GuidedPoseAssessment {
+        step_index,
+        target_label: target.label,
+        measurement,
+        error,
+        signed_rotation_error_degrees,
+        pose_error_score,
+        matched,
+        reason,
+    })
 }
 
 fn guided_pose_error_reason(error: &GuidedPoseError, target: &GuidedPoseTarget) -> String {
     let values = [
-        ("横向", error.x / target.tolerance.x, error.x, target.tolerance.x),
-        ("纵向", error.y / target.tolerance.y, error.y, target.tolerance.y),
-        ("距离", error.z / target.tolerance.z, error.z, target.tolerance.z),
-        ("roll", error.roll_degrees / target.tolerance.roll_degrees, error.roll_degrees, target.tolerance.roll_degrees),
-        ("pitch", error.pitch_degrees / target.tolerance.pitch_degrees, error.pitch_degrees, target.tolerance.pitch_degrees),
-        ("yaw", error.yaw_degrees / target.tolerance.yaw_degrees, error.yaw_degrees, target.tolerance.yaw_degrees),
+        (
+            "横向",
+            error.x / target.tolerance.x,
+            error.x,
+            target.tolerance.x,
+        ),
+        (
+            "纵向",
+            error.y / target.tolerance.y,
+            error.y,
+            target.tolerance.y,
+        ),
+        (
+            "距离",
+            error.z / target.tolerance.z,
+            error.z,
+            target.tolerance.z,
+        ),
+        (
+            "roll",
+            error.roll_degrees / target.tolerance.roll_degrees,
+            error.roll_degrees,
+            target.tolerance.roll_degrees,
+        ),
+        (
+            "pitch",
+            error.pitch_degrees / target.tolerance.pitch_degrees,
+            error.pitch_degrees,
+            target.tolerance.pitch_degrees,
+        ),
+        (
+            "yaw",
+            error.yaw_degrees / target.tolerance.yaw_degrees,
+            error.yaw_degrees,
+            target.tolerance.yaw_degrees,
+        ),
     ];
-    let (label, _, value, limit) = values.into_iter().max_by(|a, b| a.1.total_cmp(&b.1)).unwrap();
+    let (label, _, value, limit) = values
+        .into_iter()
+        .max_by(|a, b| a.1.total_cmp(&b.1))
+        .unwrap();
     format!("对齐黄框：{label} 误差 {value:.2}/{limit:.2}")
 }
 
@@ -1027,41 +1804,86 @@ fn guided_pose_status_overlay(assessment: &GuidedPoseAssessment, hold_frames: u8
     }
 }
 
-fn project_board_point_image(rotation: [[f64; 3]; 3], translation: [f64; 3], point: [f64; 3], intrinsics: &InitialIntrinsics) -> Option<CalibrationPoint> {
+fn project_board_point_image(
+    rotation: [[f64; 3]; 3],
+    translation: [f64; 3],
+    point: [f64; 3],
+    intrinsics: &InitialIntrinsics,
+) -> Option<CalibrationPoint> {
     let camera = [
-        rotation[0][0] * point[0] + rotation[0][1] * point[1] + rotation[0][2] * point[2] + translation[0],
-        rotation[1][0] * point[0] + rotation[1][1] * point[1] + rotation[1][2] * point[2] + translation[1],
-        rotation[2][0] * point[0] + rotation[2][1] * point[1] + rotation[2][2] * point[2] + translation[2],
+        rotation[0][0] * point[0]
+            + rotation[0][1] * point[1]
+            + rotation[0][2] * point[2]
+            + translation[0],
+        rotation[1][0] * point[0]
+            + rotation[1][1] * point[1]
+            + rotation[1][2] * point[2]
+            + translation[1],
+        rotation[2][0] * point[0]
+            + rotation[2][1] * point[1]
+            + rotation[2][2] * point[2]
+            + translation[2],
     ];
-    if camera.iter().any(|value| !value.is_finite()) || camera[2] <= 0.0 { return None; }
+    if camera.iter().any(|value| !value.is_finite()) || camera[2] <= 0.0 {
+        return None;
+    }
     let x = camera[0] / camera[2];
     let y = camera[1] / camera[2];
-    let [x_distorted, y_distorted] = distort_normalized_point(x, y, &intrinsics.distortion_coefficients)?;
+    let [x_distorted, y_distorted] =
+        distort_normalized_point(x, y, &intrinsics.distortion_coefficients)?;
     let matrix = intrinsics.camera_matrix;
     let image_x = matrix[0] * x_distorted + matrix[2];
     let image_y = matrix[4] * y_distorted + matrix[5];
-    if !image_x.is_finite() || !image_y.is_finite() { return None; }
-    Some(CalibrationPoint { x: image_x as f32, y: image_y as f32 })
+    if !image_x.is_finite() || !image_y.is_finite() {
+        return None;
+    }
+    Some(CalibrationPoint {
+        x: image_x as f32,
+        y: image_y as f32,
+    })
 }
 
 fn rodrigues_matrix_for_preview(rotation_vector: [f64; 3]) -> Option<[[f64; 3]; 3]> {
-    if rotation_vector.iter().any(|value| !value.is_finite()) { return None; }
-    let theta = rotation_vector[0].hypot(rotation_vector[1]).hypot(rotation_vector[2]);
-    if theta <= f64::EPSILON { return Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]); }
-    let axis = [rotation_vector[0] / theta, rotation_vector[1] / theta, rotation_vector[2] / theta];
+    if rotation_vector.iter().any(|value| !value.is_finite()) {
+        return None;
+    }
+    let theta = rotation_vector[0]
+        .hypot(rotation_vector[1])
+        .hypot(rotation_vector[2]);
+    if theta <= f64::EPSILON {
+        return Some([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    }
+    let axis = [
+        rotation_vector[0] / theta,
+        rotation_vector[1] / theta,
+        rotation_vector[2] / theta,
+    ];
     let (sin_theta, cos_theta) = theta.sin_cos();
     let one_minus_cos = 1.0 - cos_theta;
     let [x, y, z] = axis;
     Some([
-        [cos_theta + x * x * one_minus_cos, x * y * one_minus_cos - z * sin_theta, x * z * one_minus_cos + y * sin_theta],
-        [y * x * one_minus_cos + z * sin_theta, cos_theta + y * y * one_minus_cos, y * z * one_minus_cos - x * sin_theta],
-        [z * x * one_minus_cos - y * sin_theta, z * y * one_minus_cos + x * sin_theta, cos_theta + z * z * one_minus_cos],
+        [
+            cos_theta + x * x * one_minus_cos,
+            x * y * one_minus_cos - z * sin_theta,
+            x * z * one_minus_cos + y * sin_theta,
+        ],
+        [
+            y * x * one_minus_cos + z * sin_theta,
+            cos_theta + y * y * one_minus_cos,
+            y * z * one_minus_cos - x * sin_theta,
+        ],
+        [
+            z * x * one_minus_cos - y * sin_theta,
+            z * y * one_minus_cos + x * sin_theta,
+            cos_theta + z * z * one_minus_cos,
+        ],
     ])
 }
 
-
 fn set_guide(guide: &Arc<Mutex<GuideState>>, text: &str, count: usize, hold: u8) {
-    let mut state = guide.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut state = guide
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.text = text.to_owned();
     state.captured_count = count;
     state.hold = hold;
@@ -1136,16 +1958,18 @@ impl StreamState {
                 ch3: RtspStream::start_synth(3, ch3_slot),
             }
         } else {
-            let ch0 = RtspStream::start(host, 554, 0, 1920, 1080, ch0_slot.clone())
-                .unwrap_or_else(|error| {
+            let ch0 = RtspStream::start(host, 554, 0, 1920, 1080, ch0_slot.clone()).unwrap_or_else(
+                |error| {
                     godot_print!("CH0 预览启动失败：{error}");
                     RtspStream::start_synth(0, ch0_slot)
-                });
-            let ch3 = RtspStream::start(host, 557, 3, 1920, 1080, ch3_slot.clone())
-                .unwrap_or_else(|error| {
+                },
+            );
+            let ch3 = RtspStream::start(host, 557, 3, 1920, 1080, ch3_slot.clone()).unwrap_or_else(
+                |error| {
                     godot_print!("CH3 预览启动失败：{error}");
                     RtspStream::start_synth(3, ch3_slot)
-                });
+                },
+            );
             Self { ch0, ch3 }
         }
     }
@@ -1155,4 +1979,3 @@ impl StreamState {
         self.ch0.complete() && self.ch3.complete()
     }
 }
-

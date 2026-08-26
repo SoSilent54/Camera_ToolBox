@@ -105,17 +105,33 @@ impl IControl for GuideOverlay {
             Color::from_rgba(1.0, 0.82, 0.31, 0.42)
         };
         for line in &data.target_grid_lines {
-            self.base_mut().draw_line(uv_to_view(line.start_uv), uv_to_view(line.end_uv), grid_color);
+            self.base_mut().draw_line(
+                uv_to_view(line.start_uv),
+                uv_to_view(line.end_uv),
+                grid_color,
+            );
         }
         if let Some(outline) = data.target_outline_uv {
             for i in 0..4 {
-                self.base_mut().draw_line(uv_to_view(outline[i]), uv_to_view(outline[(i + 1) % 4]), target_color);
+                self.base_mut().draw_line(
+                    uv_to_view(outline[i]),
+                    uv_to_view(outline[(i + 1) % 4]),
+                    target_color,
+                );
             }
         }
         if let Some(center) = data.target_center_uv {
             let c = uv_to_view(center);
-            self.base_mut().draw_line(c + Vector2::new(-10.0, 0.0), c + Vector2::new(10.0, 0.0), target_color);
-            self.base_mut().draw_line(c + Vector2::new(0.0, -10.0), c + Vector2::new(0.0, 10.0), target_color);
+            self.base_mut().draw_line(
+                c + Vector2::new(-10.0, 0.0),
+                c + Vector2::new(10.0, 0.0),
+                target_color,
+            );
+            self.base_mut().draw_line(
+                c + Vector2::new(0.0, -10.0),
+                c + Vector2::new(0.0, 10.0),
+                target_color,
+            );
         }
 
         if !data.found || data.corners.is_empty() {

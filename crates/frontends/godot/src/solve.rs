@@ -5,12 +5,10 @@
 
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_app::platform::DecodedVideoFrame;
-use camera_toolbox_app::ports::calibration::{
-    CalibrationBackend, CalibrationCancellation,
-};
+use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{
-    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest,
-    CalibrationSolution, ChessboardDetectionOutcome, InitialIntrinsics,
+    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
+    ChessboardDetectionOutcome, InitialIntrinsics,
 };
 use godot::prelude::*;
 use std::sync::Arc;

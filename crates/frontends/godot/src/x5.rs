@@ -4,7 +4,7 @@
 //! 通过 adapters 的 russh transport 执行，不触碰 Godot 对象。
 
 use camera_toolbox_adapters::platforms::ssh_managed::connection::{
-    RusshTransportFactory, SshConnectionTarget, SshCredential,SshTransportFactory,
+    RusshTransportFactory, SshConnectionTarget, SshCredential, SshTransportFactory,
 };
 use camera_toolbox_adapters::x5_tcp_client::{self, X5ProbeSummary};
 use camera_toolbox_app::platform::DumpCancellation;

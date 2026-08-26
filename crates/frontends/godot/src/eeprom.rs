@@ -8,11 +8,9 @@ use camera_toolbox_adapters::platforms::ssh_managed::connection::{
     CredentialResolver, RusshTransportFactory, SshConnectionTarget, SshCredential,
 };
 use camera_toolbox_adapters::platforms::ssh_managed::eeprom::SshEepromProvisionService;
+use camera_toolbox_app::platform::{DumpCancellation, RemoteOperationControl, RemoteTimeouts};
 use camera_toolbox_app::platform::{
     EepromHelperAction, EepromHelperResult, EepromProvisionOperation, EepromProvisionService,
-};
-use camera_toolbox_app::platform::{
-    DumpCancellation, RemoteOperationControl, RemoteTimeouts,
 };
 use camera_toolbox_core::calibration_eeprom::FullEepromImage;
 use camera_toolbox_core::CalibrationSolution;
@@ -27,7 +25,9 @@ struct PasswordResolver {
 
 impl CredentialResolver for PasswordResolver {
     fn resolve(&self, _credential_ref: &str) -> Result<SshCredential, String> {
-        Ok(SshCredential::Password(SecretString::from(self.password.clone())))
+        Ok(SshCredential::Password(SecretString::from(
+            self.password.clone(),
+        )))
     }
 }
 
@@ -52,7 +52,6 @@ pub fn inspect(
         .map_err(|error| format!("读取 EEPROM 失败：{error}"))
 }
 
-
 /// 完整烧录：写入 FLAG + 内参 + SN。若设备已有不同 SN，helper 会拒绝（不默认覆盖）。
 #[allow(clippy::too_many_arguments)]
 pub fn provision_full_calibration(
@@ -65,7 +64,17 @@ pub fn provision_full_calibration(
     serial: &str,
     expected_before_sha256: &str,
 ) -> Result<EepromHelperResult, String> {
-    provision_with_mode(host, ssh_user, ssh_password, i2c_bus, helper_payload, solution, serial, expected_before_sha256, true)
+    provision_with_mode(
+        host,
+        ssh_user,
+        ssh_password,
+        i2c_bus,
+        helper_payload,
+        solution,
+        serial,
+        expected_before_sha256,
+        true,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]

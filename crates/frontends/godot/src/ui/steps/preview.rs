@@ -31,7 +31,10 @@ pub struct ViewerCard {
 
 impl ViewerCard {
     /// 构建单路卡片；`title` 形如 "CH0 · RTSP 554 · i2c-4"。
-    fn build(title: &str, overlay_slot: Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>) -> Self {
+    fn build(
+        title: &str,
+        overlay_slot: Arc<Mutex<Option<crate::guide_overlay::OverlayData>>>,
+    ) -> Self {
         let mut card = VBoxContainer::new_alloc();
         card.add_theme_constant_override("separation", 6);
         card.set_h_size_flags(godot::classes::control::SizeFlags::EXPAND_FILL);
@@ -94,7 +97,8 @@ impl ViewerCard {
     /// 更新 overlay 状态文本（引导可视化主入口）。
     pub fn set_overlay(&mut self, text: &str, color: godot::builtin::Color) {
         self.overlay_label.set_text(text);
-        self.overlay_label.add_theme_color_override("font_color", color);
+        self.overlay_label
+            .add_theme_color_override("font_color", color);
     }
 
     /// 更新卡片状态行。
@@ -120,7 +124,9 @@ impl PreviewStep {
         v.add_theme_constant_override("separation", 10);
 
         let mut hint = Label::new_alloc();
-        hint.set_text("双路预览：连接 RTSP 后自动按 guide 目标框采集；黄框未匹配，绿框进入 hold 倒数。");
+        hint.set_text(
+            "双路预览：连接 RTSP 后自动按 guide 目标框采集；黄框未匹配，绿框进入 hold 倒数。",
+        );
         hint.add_theme_font_size_override("font_size", 13);
         hint.add_theme_color_override("font_color", theme::MUTED);
         v.add_child(&hint);
