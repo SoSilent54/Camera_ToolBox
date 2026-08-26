@@ -119,10 +119,10 @@ impl RtspStream {
             loop {
                 let mut rgba = Vec::with_capacity((width * height * 4) as usize);
                 if board_mode {
-                    // 合成棋盘（10x7 格 = 9x6 内角点），随 tick 平移模拟位姿变化。
-                    let cell = 40i32;
-                    let cols = 10i32;
-                    let rows = 7i32;
+                    // 合成棋盘（12x9 格 = 11x8 内角点），随 tick 平移模拟位姿变化。
+                    let cell = 32i32;
+                    let cols = 12i32;
+                    let rows = 9i32;
                     // 姿态变化放慢（每 4 tick 一次 ≈ 1.2s 周期），hold 窗口内保持稳定。
                     let slow = tick / 4;
                     let ox = ((width as i32 - cols * cell) / 2) + ((slow % 60) as i32 - 30);

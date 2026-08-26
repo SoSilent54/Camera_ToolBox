@@ -150,8 +150,8 @@ impl IControl for CalibApp {
             self.start_previews("synth");
             // 合成模式自动开始双路采集（验证采集链路）。
             if let Some(streams) = self.streams.as_mut() {
-                streams.ch0.toggle_capture(BoardSpec { inner_cols: 9, inner_rows: 6, square_size: 15.0 });
-                streams.ch3.toggle_capture(BoardSpec { inner_cols: 9, inner_rows: 6, square_size: 15.0 });
+                streams.ch0.toggle_capture(BoardSpec { inner_cols: 11, inner_rows: 8, square_size: 40.0 });
+                streams.ch3.toggle_capture(BoardSpec { inner_cols: 11, inner_rows: 8, square_size: 40.0 });
             }
             if let Some(ui) = self.ui.as_mut() {
                 ui.preview.ch0.capture_button.set_text("停止采集");
@@ -343,7 +343,7 @@ impl CalibApp {
                     ui.solve.square_mm.get_value(),
                 )
             })
-            .unwrap_or((9, 6, 15.0));
+            .unwrap_or((11, 8, 40.0));
         BoardSpec {
             inner_cols: cols,
             inner_rows: rows,

@@ -33,7 +33,7 @@ impl SolveStep {
         cols_label.set_text("棋盘内角点");
         cols_label.add_theme_font_size_override("font_size", 14);
         let mut cols = SpinBox::new_alloc();
-        cols.set_value(9.0);
+        cols.set_value(11.0);
         cols.set_min(3.0);
         cols.set_max(64.0);
         cols.set_custom_minimum_size(Vector2::new(70.0, 0.0));
@@ -43,7 +43,7 @@ impl SolveStep {
         cross.add_theme_font_size_override("font_size", 14);
 
         let mut rows = SpinBox::new_alloc();
-        rows.set_value(6.0);
+        rows.set_value(8.0);
         rows.set_min(3.0);
         rows.set_max(64.0);
         rows.set_custom_minimum_size(Vector2::new(70.0, 0.0));
@@ -53,7 +53,7 @@ impl SolveStep {
         mm_label.add_theme_font_size_override("font_size", 14);
 
         let mut square = SpinBox::new_alloc();
-        square.set_value(15.0);
+        square.set_value(40.0);
         square.set_min(0.5);
         square.set_max(100.0);
         square.set_custom_minimum_size(Vector2::new(80.0, 0.0));

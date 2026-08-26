@@ -5,10 +5,10 @@ use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{BoardSpec, CalibrationImageSize, ChessboardDetectionOutcome};
 
-/// 生成棋盘测试图（10x7 格 = 9x6 内角点），可选错切。
+/// 生成棋盘测试图（12x9 格 = 11x8 内角点），可选错切。
 fn synth_board_rgba(width: u32, height: u32, cell: i32, shear: f32) -> Vec<u8> {
-    let cols = 10i32;
-    let rows = 7i32;
+    let cols = 12i32;
+    let rows = 9i32;
     let ox = (width as i32 - cols * cell) / 2;
     let oy = (height as i32 - rows * cell) / 2;
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
@@ -58,15 +58,16 @@ fn detect(
 #[test]
 fn synth_board_detects_at_multiple_shears() {
     let board = BoardSpec {
-        inner_cols: 9,
-        inner_rows: 6,
-        square_size: 15.0,
+        inner_cols: 11,
+        inner_rows: 8,
+        square_size: 40.0,
     };
     for shear in [-0.1f32, 0.0, 0.05, 0.1, 0.2] {
         let rgba = synth_board_rgba(640, 360, 40, shear);
         match detect(&rgba, 640, 360, board) {
             Ok(ChessboardDetectionOutcome::Found(d)) => {
-                println!("shear={shear}: Found {} 角点", d.corners.len());
+                assert_eq!(d.corners.len(), 88, "11x8 内角点应为 88");
+                println!("shear={shear}: Found {} 角点 ✓", d.corners.len());
             }
             Ok(ChessboardDetectionOutcome::NotFound { .. }) => {
                 println!("shear={shear}: NotFound");
@@ -79,14 +80,15 @@ fn synth_board_detects_at_multiple_shears() {
 #[test]
 fn synth_board_detects_1080p() {
     let board = BoardSpec {
-        inner_cols: 9,
-        inner_rows: 6,
-        square_size: 15.0,
+        inner_cols: 11,
+        inner_rows: 8,
+        square_size: 40.0,
     };
     let rgba = synth_board_rgba(1920, 1080, 80, 0.0);
     match detect(&rgba, 1920, 1080, board) {
         Ok(ChessboardDetectionOutcome::Found(d)) => {
-            println!("1080p: Found {} 角点", d.corners.len());
+            assert_eq!(d.corners.len(), 88, "11x8 内角点应为 88");
+            println!("1080p: Found {} 角点 ✓", d.corners.len());
         }
         Ok(ChessboardDetectionOutcome::NotFound { .. }) => println!("1080p: NotFound"),
         Err(e) => println!("1080p: Err {e}"),
@@ -96,9 +98,9 @@ fn synth_board_detects_1080p() {
 #[test]
 fn noise_does_not_detect() {
     let board = BoardSpec {
-        inner_cols: 9,
-        inner_rows: 6,
-        square_size: 15.0,
+        inner_cols: 11,
+        inner_rows: 8,
+        square_size: 40.0,
     };
     let mut rgba = vec![0u8; 640 * 360 * 4];
     for (i, chunk) in rgba.chunks_mut(4).enumerate() {
