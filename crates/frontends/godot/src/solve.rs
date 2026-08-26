@@ -1,11 +1,13 @@
-//! 标定求解：dataset 帧 → PNG → 棋盘检测 → OpenCV 内参标定。
+//! 标定求解：dataset TCP YUV/luma 帧 → Gray PNG → 亚像素棋盘检测 → OpenCV 内参标定。
 //!
 //! 复用 adapters 的 `OpenCvCalibrationBackend`（feature calibration-opencv）；
 //! 后台线程执行，结果回主线程展示；完整 `CalibrationSolution` 供 EEPROM 写入。
 
+use crate::preview::CapturedDatasetFrame;
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
-use camera_toolbox_app::platform::DecodedVideoFrame;
-use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
+use camera_toolbox_app::ports::calibration::{
+    CalibrationBackend, CalibrationCancellation, SubpixelRefinementOptions,
+};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
     ChessboardDetectionOutcome, InitialIntrinsics,
@@ -40,11 +42,11 @@ impl SolveResult {
 
 /// 对单路 dataset 求解（后台线程调用）。
 ///
-/// 帧先编码为 PNG（backend 仅接受 PNG 输入），逐帧检测棋盘；
-/// 有效检测不足 5 帧返回错误。
+/// dataset 已在采集时转换成 luma：真实设备来自 TCP NV12 的 Y plane；检测显式启用
+/// `cornerSubPix`，避免落回 findChessboardCorners 初始角点。
 pub fn solve_channel(
     channel: u16,
-    frames: &[Arc<DecodedVideoFrame>],
+    frames: &[Arc<CapturedDatasetFrame>],
     board: BoardSpec,
 ) -> Result<SolveResult, String> {
     if frames.is_empty() {
@@ -52,15 +54,23 @@ pub fn solve_channel(
     }
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
+    let subpixel_options = default_subpixel_options();
     let mut image_points: Vec<Vec<CalibrationPoint>> = Vec::new();
     let mut image_size = None;
     for frame in frames {
-        let png = encode_png(&frame.rgba, frame.width, frame.height)?;
+        let png = encode_luma_png(&frame.luma, frame.width, frame.height)?;
         let expected = CalibrationImageSize {
             width: frame.width,
             height: frame.height,
         };
-        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
+        match backend.detect_png_with_options(
+            &png,
+            expected,
+            256 * 1024 * 1024,
+            board,
+            subpixel_options,
+            &cancellation,
+        ) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 image_size = Some(detection.image_size);
                 image_points.push(detection.corners);
@@ -112,12 +122,21 @@ pub fn solve_channel(
     })
 }
 
-/// RGBA 帧编码为 PNG 字节。
-fn encode_png(rgba: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
-    let img = image::RgbaImage::from_raw(width, height, rgba.to_vec()).ok_or("帧尺寸非法")?;
+/// Gray8 luma 帧编码为 PNG 字节；真实设备输入来自 TCP NV12 的 Y plane。
+fn encode_luma_png(luma: &[u8], width: u32, height: u32) -> Result<Vec<u8>, String> {
+    let img = image::GrayImage::from_raw(width, height, luma.to_vec()).ok_or("luma 帧尺寸非法")?;
     let mut buf = Vec::new();
-    image::DynamicImage::ImageRgba8(img)
+    image::DynamicImage::ImageLuma8(img)
         .write_to(&mut std::io::Cursor::new(&mut buf), image::ImageFormat::Png)
         .map_err(|error| format!("PNG 编码失败：{error}"))?;
     Ok(buf)
+}
+
+fn default_subpixel_options() -> SubpixelRefinementOptions {
+    SubpixelRefinementOptions {
+        enabled: true,
+        window_radius: 5,
+        max_iterations: 30,
+        epsilon: 0.01,
+    }
 }

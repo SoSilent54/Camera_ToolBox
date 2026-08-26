@@ -1,20 +1,22 @@
 //! 双路 RTSP 预览与 guided 自动采集。
 //!
-//! 预览：复用 `FfmpegRtspDecoder`（后台解码，共享帧槽），主线程上传纹理。
-//! 采集：worker 线程按帧检测棋盘 → `estimate_pose` 计算姿态 → 与已采姿态
-//! 比较（最小角差阈值），只有"新姿态"才采入 dataset；overlay 实时给出
-//! 引导文本（未检测到棋盘 / 姿态重复 / 已覆盖 N 位姿）。
+//! 预览/引导：RTSP H.264 解码帧用于实时显示、棋盘检测和 guide pose 评估。
+//! dataset：真实 X5 采集在 hold 通过后按 RTSP SEI `timestamp_ns` 从 TCP 9073
+//! 精确回查同源 NV12/YUV 原图；合成模式仅用于本机 UI 测试，保留 RGBA→luma fallback。
 //! 无板验证：`PONGBOT_SYNTH=1` 用非棋盘合成帧（保证检测失败，验证引导路径）。
 
 use crate::guide_overlay::{OverlayData, OverlayGridLine, OverlayStatus};
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
 use camera_toolbox_adapters::media::FfmpegRtspTransport;
+use camera_toolbox_adapters::x5_tcp_client::{self, X5YuvSnapshot};
 use camera_toolbox_app::platform::{
     DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, SourcePts, StreamCancellation,
     StreamFrameIdentity, StreamSessionId,
 };
-use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
+use camera_toolbox_app::ports::calibration::{
+    CalibrationBackend, CalibrationCancellation, SubpixelRefinementOptions,
+};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, ChessboardDetection,
     ChessboardDetectionOutcome, InitialIntrinsics, ViewCalibrationResult,
@@ -44,6 +46,37 @@ const GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS: usize = 12;
 /// 采集 worker 检测节拍。
 const DETECT_INTERVAL: Duration = Duration::from_millis(150);
 
+/// X5 TCP 控制端口；RTSP 只做引导，dataset 通过该端口抓同源 NV12 原图。
+const X5_TCP_CONTROL_PORT: u16 = 9073;
+
+/// 进入标定 dataset 的权威帧：真实设备为 TCP NV12 的 Y plane，合成模式为 RGBA 转 luma。
+#[derive(Clone, Debug, PartialEq)]
+pub struct CapturedDatasetFrame {
+    pub channel: u16,
+    pub width: u32,
+    pub height: u32,
+    pub luma: Arc<[u8]>,
+    pub source: CapturedDatasetSource,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CapturedDatasetSource {
+    X5TcpYuv { frame_id: u64, timestamp_ns: u64 },
+    SyntheticRgba { frame_sequence: u64 },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DatasetCaptureSource {
+    X5TcpYuv {
+        host: String,
+        tcp_port: u16,
+        channel: u16,
+    },
+    Synthetic {
+        channel: u16,
+    },
+}
+
 /// worker → 主线程的引导状态。
 #[derive(Default)]
 pub struct GuideState {
@@ -63,8 +96,8 @@ pub struct RtspStream {
     texture: Option<Gd<ImageTexture>>,
     /// 采集开关（worker 与主线程共享）。
     capturing: Arc<AtomicBool>,
-    /// 已采 dataset 帧（worker 写，solve 读；主线程只读计数）。
-    captured: Arc<Mutex<Vec<Arc<DecodedVideoFrame>>>>,
+    /// 已采 dataset 帧（真实设备为 TCP NV12/Y plane；worker 写，solve 读）。
+    captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
     /// 已采姿态（rvec，与 captured 一一对应）。
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
     /// 检测绘制数据（worker 写，GuideOverlay draw 读）。
@@ -75,6 +108,8 @@ pub struct RtspStream {
     detect_started: bool,
     /// RTSP 解码失败信息（pump 检查 completion 写入，worker 读取显示）。
     rtsp_error: Arc<Mutex<Option<String>>>,
+    /// dataset 的权威抓帧来源；真实设备必须走 TCP YUV，RTSP 不直接入库。
+    capture_source: DatasetCaptureSource,
 }
 
 impl RtspStream {
@@ -106,7 +141,12 @@ impl RtspStream {
             &cancellation,
         )
         .map_err(|error| format!("CH{channel} 解码器启动失败：{error}"))?;
-        Ok(Self::new(Some(decoder), slot, overlay_slot))
+        let capture_source = DatasetCaptureSource::X5TcpYuv {
+            host: host.to_owned(),
+            tcp_port: X5_TCP_CONTROL_PORT,
+            channel,
+        };
+        Ok(Self::new(Some(decoder), slot, overlay_slot, capture_source))
     }
 
     /// 合成测试帧模式（无板验证纹理与引导链路）；图案为非棋盘噪点。
@@ -179,13 +219,19 @@ impl RtspStream {
                 std::thread::sleep(Duration::from_millis(100));
             }
         });
-        Self::new(None, slot, overlay_slot)
+        Self::new(
+            None,
+            slot,
+            overlay_slot,
+            DatasetCaptureSource::Synthetic { channel },
+        )
     }
 
     fn new(
         decoder: Option<FfmpegRtspDecoder>,
         slot: Arc<LatestDecodedFrameSlot>,
         overlay_slot: Arc<Mutex<Option<OverlayData>>>,
+        capture_source: DatasetCaptureSource,
     ) -> Self {
         Self {
             decoder,
@@ -200,6 +246,7 @@ impl RtspStream {
             target: CAPTURE_TARGET,
             detect_started: false,
             rtsp_error: Arc::new(Mutex::new(None)),
+            capture_source,
         }
     }
 
@@ -259,10 +306,20 @@ impl RtspStream {
         let overlay = Arc::clone(&self.overlay);
         let guide = Arc::clone(&self.guide_state);
         let rtsp_error = Arc::clone(&self.rtsp_error);
+        let capture_source = self.capture_source.clone();
         let target = self.target;
         std::thread::spawn(move || {
             guided_capture_loop(
-                capturing, slot, captured, poses, guide, overlay, rtsp_error, board, target,
+                capturing,
+                slot,
+                captured,
+                poses,
+                guide,
+                overlay,
+                rtsp_error,
+                capture_source,
+                board,
+                target,
             );
         });
     }
@@ -285,8 +342,8 @@ impl RtspStream {
         poses.len() >= self.target
     }
 
-    /// 取已采 dataset 帧（solve 用）。
-    pub fn captured_frames(&self) -> Vec<Arc<DecodedVideoFrame>> {
+    /// 取已采 dataset 帧（solve 用；真实设备为 TCP NV12/Y plane）。
+    pub fn captured_frames(&self) -> Vec<Arc<CapturedDatasetFrame>> {
         self.captured
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -470,16 +527,18 @@ impl GuidedCaptureRuntime {
 fn guided_capture_loop(
     capturing: Arc<AtomicBool>,
     slot: Arc<LatestDecodedFrameSlot>,
-    captured: Arc<Mutex<Vec<Arc<DecodedVideoFrame>>>>,
+    captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
     guide: Arc<Mutex<GuideState>>,
     overlay: Arc<Mutex<Option<OverlayData>>>,
     rtsp_error: Arc<Mutex<Option<String>>>,
+    capture_source: DatasetCaptureSource,
     board: BoardSpec,
     target: usize,
 ) {
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
+    let subpixel_options = default_subpixel_options();
     let mut runtime: Option<GuidedCaptureRuntime> = None;
     godot_print!("guide auto_capture worker 已启动（原版 45 动作，hold {HOLD_TARGET} 帧）");
     loop {
@@ -564,7 +623,14 @@ fn guided_capture_loop(
             width: detect_w,
             height: detect_h,
         };
-        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
+        match backend.detect_png_with_options(
+            &png,
+            expected,
+            256 * 1024 * 1024,
+            board,
+            subpixel_options,
+            &cancellation,
+        ) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 let corners: Vec<CalibrationPoint> = detection
                     .corners
@@ -654,11 +720,26 @@ fn guided_capture_loop(
                 let error = assessment.error;
                 let captured_sample = rt.update_hold(assessment, sample);
                 if let Some(sample) = captured_sample {
+                    let dataset_frame = match capture_dataset_frame(&capture_source, &sample.frame)
+                    {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            rt.reset_hold();
+                            set_guide(
+                                &guide,
+                                &format!("{step_label} · TCP YUV 原图抓取失败：{error}"),
+                                rt.current_step,
+                                0,
+                            );
+                            std::thread::sleep(DETECT_INTERVAL);
+                            continue;
+                        }
+                    };
                     {
                         let mut captured = captured
                             .lock()
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        captured.push(sample.frame);
+                        captured.push(Arc::new(dataset_frame));
                     }
                     {
                         let mut poses = poses
@@ -1878,6 +1959,127 @@ fn rodrigues_matrix_for_preview(rotation_vector: [f64; 3]) -> Option<[[f64; 3]; 
             cos_theta + z * z * one_minus_cos,
         ],
     ])
+}
+
+fn capture_dataset_frame(
+    source: &DatasetCaptureSource,
+    guide_frame: &DecodedVideoFrame,
+) -> Result<CapturedDatasetFrame, String> {
+    match source {
+        DatasetCaptureSource::X5TcpYuv {
+            host,
+            tcp_port,
+            channel,
+        } => {
+            if guide_frame.identity.channel != *channel {
+                return Err(format!(
+                    "RTSP 通道 {} 与 TCP 抓图通道 {channel} 不一致",
+                    guide_frame.identity.channel
+                ));
+            }
+            let timestamp_ns = guide_frame.identity.device_timestamp_ns.ok_or_else(|| {
+                "RTSP 帧缺少 X5 SEI timestamp_ns，无法精确回查 TCP NV12 原图".to_owned()
+            })?;
+            let snapshot = x5_tcp_client::capture_yuv_snapshot_by_timestamp_ns(
+                host,
+                *tcp_port,
+                *channel,
+                timestamp_ns,
+            )?;
+            dataset_frame_from_yuv_snapshot(snapshot)
+        }
+        DatasetCaptureSource::Synthetic { channel } => dataset_frame_from_decoded_rgba(
+            *channel,
+            guide_frame.width,
+            guide_frame.height,
+            guide_frame.identity.frame_sequence,
+            &guide_frame.rgba,
+        ),
+    }
+}
+
+fn dataset_frame_from_yuv_snapshot(
+    snapshot: X5YuvSnapshot,
+) -> Result<CapturedDatasetFrame, String> {
+    let expected_y_len = usize::try_from(snapshot.width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(snapshot.height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| "TCP NV12 尺寸溢出".to_owned())?;
+    if snapshot.y_len != expected_y_len {
+        return Err(format!(
+            "TCP NV12 Y plane 非紧密排列：expected {expected_y_len}, got {}",
+            snapshot.y_len
+        ));
+    }
+    if snapshot.payload.len() < snapshot.y_len {
+        return Err(format!(
+            "TCP NV12 payload 太短：y_len={}, payload={}",
+            snapshot.y_len,
+            snapshot.payload.len()
+        ));
+    }
+    Ok(CapturedDatasetFrame {
+        channel: snapshot.channel,
+        width: snapshot.width,
+        height: snapshot.height,
+        luma: snapshot.payload[..snapshot.y_len].to_vec().into(),
+        source: CapturedDatasetSource::X5TcpYuv {
+            frame_id: snapshot.frame_id,
+            timestamp_ns: snapshot.timestamp_ns,
+        },
+    })
+}
+
+fn dataset_frame_from_decoded_rgba(
+    channel: u16,
+    width: u32,
+    height: u32,
+    frame_sequence: u64,
+    rgba: &[u8],
+) -> Result<CapturedDatasetFrame, String> {
+    let pixel_count = usize::try_from(width)
+        .ok()
+        .and_then(|width| {
+            usize::try_from(height)
+                .ok()
+                .and_then(|height| width.checked_mul(height))
+        })
+        .ok_or_else(|| "合成帧尺寸溢出".to_owned())?;
+    if rgba.len() != pixel_count.saturating_mul(4) {
+        return Err(format!(
+            "合成 RGBA 长度不匹配：expected {}, got {}",
+            pixel_count.saturating_mul(4),
+            rgba.len()
+        ));
+    }
+    let mut luma = Vec::with_capacity(pixel_count);
+    for pixel in rgba.chunks_exact(4) {
+        let value = (77_u16 * u16::from(pixel[0])
+            + 150_u16 * u16::from(pixel[1])
+            + 29_u16 * u16::from(pixel[2]))
+            >> 8;
+        luma.push(value as u8);
+    }
+    Ok(CapturedDatasetFrame {
+        channel,
+        width,
+        height,
+        luma: luma.into(),
+        source: CapturedDatasetSource::SyntheticRgba { frame_sequence },
+    })
+}
+
+fn default_subpixel_options() -> SubpixelRefinementOptions {
+    SubpixelRefinementOptions {
+        enabled: true,
+        window_radius: 5,
+        max_iterations: 30,
+        epsilon: 0.01,
+    }
 }
 
 fn set_guide(guide: &Arc<Mutex<GuideState>>, text: &str, count: usize, hold: u8) {

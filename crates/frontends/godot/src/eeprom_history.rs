@@ -6,10 +6,10 @@ use camera_toolbox_core::{
 };
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{env, fs};
 
 const EEPROM_SERIAL_BYTES: usize = 14;
 
@@ -213,10 +213,10 @@ fn serialize_yaml(document: &serde_json::Value) -> Result<Vec<u8>, String> {
 
 fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
     let serial = safe_eeprom_history_stem(serial_number)?;
-    let target_path = eeprom_history_path(&serial)?;
+    let history_dir = eeprom_history_dir();
+    let target_path = eeprom_history_path_in(&history_dir, &serial)?;
     let target_name = eeprom_file_name_to_string(&target_path)?;
-    let history_dir = Path::new("write_history");
-    let entries = match fs::read_dir(history_dir) {
+    let entries = match fs::read_dir(&history_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(target_path),
         Err(error) => {
@@ -260,9 +260,18 @@ fn new_eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
     Ok(target_path)
 }
 
-fn eeprom_history_path(serial_number: &str) -> Result<PathBuf, String> {
+fn eeprom_history_path_in(history_dir: &Path, serial_number: &str) -> Result<PathBuf, String> {
     let file_name = safe_eeprom_history_file_name(serial_number)?;
-    Ok(PathBuf::from("write_history").join(file_name))
+    Ok(history_dir.join(file_name))
+}
+
+fn eeprom_history_dir() -> PathBuf {
+    env::var_os("PONGBOT_WRITE_HISTORY_DIR")
+        .and_then(|value| {
+            let path = PathBuf::from(value);
+            (!path.as_os_str().is_empty()).then_some(path)
+        })
+        .unwrap_or_else(|| PathBuf::from("write_history"))
 }
 
 fn safe_eeprom_history_stem(serial_number: &str) -> Result<String, String> {
