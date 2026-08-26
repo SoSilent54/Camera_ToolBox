@@ -14,15 +14,15 @@ use godot::classes::control::LayoutPreset;
 use godot::classes::{Control, IControl, Texture2D};
 use godot::prelude::*;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
 use ui::steps::StepId;
 use ui::{theme, UiState};
 
-use camera_toolbox_app::platform::EepromInspectResult;
-use camera_toolbox_core::CalibrationSolution;
+use camera_toolbox_app::platform::{
+    EepromHelperResult, EepromInspectResult, EepromSerialState, EepromWriteResult,
+};
+use camera_toolbox_core::{BoardSpec, CalibrationSolution};
 use preview::StreamState;
 use solve::solve_channel;
-use camera_toolbox_core::BoardSpec;
 
 /// 应用根节点：挂载 5 步向导 UI 与领域层控制器。
 #[derive(GodotClass)]
@@ -41,13 +41,13 @@ pub struct CalibApp {
         Option<Arc<Mutex<Option<(Option<CalibrationSolution>, Option<CalibrationSolution>)>>>>,
     /// 最近一次双路求解解（EEPROM 写入使用）。
     solutions: Option<(CalibrationSolution, CalibrationSolution)>,
-    /// 最近一次 EEPROM Inspect 结果（写入时校验 before 镜像）。
-    eeprom_inspect: Option<EepromInspectResult>,
+    /// 最近一次双路 EEPROM Inspect 结果（写入时校验 before 镜像）。
+    eeprom_inspect: Option<(EepromInspectResult, EepromInspectResult)>,
     /// EEPROM Inspect 结果共享槽（闭包 → 主线程）。
-    pending_inspect: Option<Arc<Mutex<Option<EepromInspectResult>>>>,
+    pending_inspect: Option<Arc<Mutex<Option<(Option<EepromInspectResult>, Option<EepromInspectResult>)>>>>,
     /// EEPROM 写入二次确认标志。
     write_armed: bool,
-    /// 调试截图请求（`PONGBOT_SCREENSHOT` 环境变量触发，5 帧后保存）。
+    /// 调试截图请求（`PONGBOT_SCREENSHOT` 环境变量触发，默认 5 帧后保存）。
     screenshot: Option<ScreenshotRequest>,
 }
 
@@ -55,6 +55,7 @@ pub struct CalibApp {
 struct ScreenshotRequest {
     path: String,
     frame: u32,
+    target_frame: u32,
 }
 
 #[godot_api]
@@ -86,27 +87,6 @@ impl IControl for CalibApp {
                     self.base.__constructed_gd().cast::<CalibApp>(),
                     "on_bootstrap",
                 ));
-            // Step 2 采集按钮（双路独立开关）。
-            state
-                .preview
-                .ch0
-                .capture_button
-                .signals()
-                .pressed()
-                .connect(button_callback(
-                    self.base.__constructed_gd().cast::<CalibApp>(),
-                    "on_toggle_capture_ch0",
-                ));
-            state
-                .preview
-                .ch3
-                .capture_button
-                .signals()
-                .pressed()
-                .connect(button_callback(
-                    self.base.__constructed_gd().cast::<CalibApp>(),
-                    "on_toggle_capture_ch3",
-                ));
             // Step 3 求解按钮。
             state
                 .solve
@@ -137,10 +117,15 @@ impl IControl for CalibApp {
                     "on_eeprom_write",
                 ));
         }
-        // 调试截图：PONGBOT_SCREENSHOT 环境变量，5 帧后保存 viewport。
+        // 调试截图：PONGBOT_SCREENSHOT 环境变量，默认 5 帧后保存 viewport。
         if let Ok(path) = std::env::var("PONGBOT_SCREENSHOT") {
-            self.screenshot = Some(ScreenshotRequest { path, frame: 0 });
-            godot_print!("debug: 将在 5 帧后保存截图");
+            let target_frame = std::env::var("PONGBOT_SCREENSHOT_FRAME")
+                .ok()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(5)
+                .max(1);
+            self.screenshot = Some(ScreenshotRequest { path, frame: 0, target_frame });
+            godot_print!("debug: 将在 {target_frame} 帧后保存截图");
         }
         // 合成模式（无板验证）：跳过 Step 1，直接进入双预览。
         if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1" || value == "board") {
@@ -148,15 +133,6 @@ impl IControl for CalibApp {
                 state.complete_step(StepId::Connect, "合成模式：跳过设备连接");
             }
             self.start_previews("synth");
-            // 合成模式自动开始双路采集（验证采集链路）。
-            if let Some(streams) = self.streams.as_mut() {
-                streams.ch0.toggle_capture(BoardSpec { inner_cols: 11, inner_rows: 8, square_size: 40.0 });
-                streams.ch3.toggle_capture(BoardSpec { inner_cols: 11, inner_rows: 8, square_size: 40.0 });
-            }
-            if let Some(ui) = self.ui.as_mut() {
-                ui.preview.ch0.capture_button.set_text("停止采集");
-                ui.preview.ch3.capture_button.set_text("停止采集");
-            }
         }
         godot_print!("pongbot-calib-tool: wizard UI ready");
     }
@@ -187,6 +163,10 @@ impl IControl for CalibApp {
         {
             let _ = streams.ch0.pump(&mut ui.preview.ch0.texture_rect);
             let _ = streams.ch3.pump(&mut ui.preview.ch3.texture_rect);
+            // GuideOverlay 的绘制数据由 worker 写入 Arc 槽；Godot 自定义 Control
+            // 不会因 Rust 共享槽变化自动重绘，必须主线程逐帧请求刷新。
+            ui.preview.ch0.guide_overlay.queue_redraw();
+            ui.preview.ch3.guide_overlay.queue_redraw();
             let (text0, count0, hold0) = streams.ch0.guide();
             if !text0.is_empty() {
                 ui.preview.ch0.set_overlay(
@@ -211,16 +191,14 @@ impl IControl for CalibApp {
             if let Some(ui) = self.ui.as_mut() {
                 ui.complete_step(StepId::Preview, "双路采集完成 · 可进入求解");
             }
-            // 合成模式：采集完成后自动触发求解（验证检测/标定管线）。
-            if std::env::var("PONGBOT_SYNTH").is_ok_and(|value| value == "1" || value == "board") {
-                self.on_solve();
-            }
+            // guide auto_capture 完成后自动触发双路求解。
+            self.on_solve();
         }
 
         // 调试截图。
         if let Some(request) = self.screenshot.as_mut() {
             request.frame += 1;
-            if request.frame >= 5 {
+            if request.frame >= request.target_frame {
                 let request = self.screenshot.take().expect("screenshot 请求存在");
                 let gd = self.base.__constructed_gd();
                 let image = gd
@@ -297,40 +275,6 @@ impl CalibApp {
         });
     }
 
-    /// CH0 采集开关（guided：按当前棋盘参数启动）。
-    #[func]
-    fn on_toggle_capture_ch0(&mut self) {
-        let board = self.current_board();
-        let on = self
-            .streams
-            .as_mut()
-            .map(|streams| streams.ch0.toggle_capture(board))
-            .unwrap_or(false);
-        if let Some(ui) = self.ui.as_mut() {
-            ui.preview.ch0.capture_button.set_text(if on { "停止采集" } else { "开始采集" });
-            if on {
-                ui.preview.ch0.set_overlay("采集中…", theme::OK);
-            }
-        }
-    }
-
-    /// CH3 采集开关（guided：按当前棋盘参数启动）。
-    #[func]
-    fn on_toggle_capture_ch3(&mut self) {
-        let board = self.current_board();
-        let on = self
-            .streams
-            .as_mut()
-            .map(|streams| streams.ch3.toggle_capture(board))
-            .unwrap_or(false);
-        if let Some(ui) = self.ui.as_mut() {
-            ui.preview.ch3.capture_button.set_text(if on { "停止采集" } else { "开始采集" });
-            if on {
-                ui.preview.ch3.set_overlay("采集中…", theme::OK);
-            }
-        }
-    }
-
     /// 从 Step 3 面板读取棋盘参数。
     fn current_board(&self) -> BoardSpec {
         let (cols, rows, square_mm) = self
@@ -365,12 +309,15 @@ impl CalibApp {
             .unwrap_or_default()
     }
 
-    /// 读取当前 EEPROM 状态（Inspect）。
+    /// 读取双路 EEPROM 状态（Inspect）。
     #[func]
     fn on_eeprom_inspect(&mut self) {
         let Some(helper) = eeprom::locate_helper() else {
             if let Some(ui) = self.ui.as_mut() {
-                ui.eeprom.set_status("未找到 camera-i2c-helper（先 cargo build -p camera-i2c-helper）", false);
+                ui.eeprom.set_status(
+                    "未找到 camera-i2c-helper（先 cargo build -p camera-i2c-helper --release）",
+                    false,
+                );
             }
             return;
         };
@@ -382,51 +329,48 @@ impl CalibApp {
             return;
         }
         if let Some(ui) = self.ui.as_mut() {
-            ui.eeprom.set_status("正在读取 EEPROM 状态…", false);
+            ui.eeprom.set_status("正在读取 CH0/CH3 EEPROM 状态…", false);
         }
         let inspect_slot = Arc::new(Mutex::new(None));
         self.pending_inspect = Some(Arc::clone(&inspect_slot));
         self.spawn_task(move || {
-            let result = eeprom::inspect(&host, &user, &password, 4, helper.into());
-            match result {
-                Ok(camera_toolbox_app::platform::EepromHelperResult::Inspect(inspect)) => {
-                    if let Ok(mut slot) = inspect_slot.lock() {
-                        *slot = Some(inspect.clone());
-                    }
-                    let serial = match &inspect.state.serial {
-                        camera_toolbox_app::platform::EepromSerialState::Valid { value } => {
-                            value.clone()
-                        }
-                        camera_toolbox_app::platform::EepromSerialState::Empty => {
-                            "（空）".to_owned()
-                        }
-                        camera_toolbox_app::platform::EepromSerialState::Invalid {
-                            raw_hex,
-                            ..
-                        } => format!("（无效：{raw_hex}）"),
-                    };
+            let helper: Arc<[u8]> = helper.into();
+            let ch0 = eeprom::inspect(&host, &user, &password, 4, Arc::clone(&helper));
+            let ch3 = eeprom::inspect(&host, &user, &password, 6, helper);
+            let mut inspect0 = None;
+            let mut inspect3 = None;
+            let text = match (ch0, ch3) {
+                (Ok(EepromHelperResult::Inspect(a)), Ok(EepromHelperResult::Inspect(b))) => {
+                    inspect0 = Some(a.clone());
+                    inspect3 = Some(b.clone());
                     format!(
-                        "EEPROM 状态：镜像 {} · FLAG {} · SN {}",
-                        &inspect.state.image_sha256[..8.min(inspect.state.image_sha256.len())],
-                        if inspect.state.flag_valid { "有效" } else { "无效" },
-                        serial
+                        "EEPROM 状态：\n{}\n{}",
+                        inspect_summary("CH0/i2c-4", &a),
+                        inspect_summary("CH3/i2c-6", &b)
                     )
                 }
-                Ok(_) => "EEPROM 状态：未知响应".to_owned(),
-                Err(error) => format!("读取 EEPROM 失败：{error}"),
+                (a, b) => format!(
+                    "读取 EEPROM 失败：CH0={}；CH3={}",
+                    inspect_result_label(&a),
+                    inspect_result_label(&b)
+                ),
+            };
+            if let Ok(mut slot) = inspect_slot.lock() {
+                *slot = Some((inspect0, inspect3));
             }
+            text
         });
     }
 
-    /// 写入标定结果（UpdateCalibration，二次确认）。
+    /// 写入双路标定结果（FullProvision：FLAG + 内参 + SN；二次确认）。
     #[func]
     fn on_eeprom_write(&mut self) {
         if !self.write_armed {
             self.write_armed = true;
             if let Some(ui) = self.ui.as_mut() {
+                ui.eeprom.write_button.set_text("确认写入 CH0/CH3？");
                 ui.eeprom
-                    .write_button
-                    .set_text("确认写入？（将覆盖内参区）");
+                    .set_status("请确认 SN、当前 EEPROM 状态与目标相机一致；再次点击开始写入。", true);
             }
             return;
         }
@@ -440,45 +384,65 @@ impl CalibApp {
             }
             return;
         };
-        let Some((solution, _)) = self.solutions.clone() else {
+        let Some((solution0, solution3)) = self.solutions.clone() else {
             if let Some(ui) = self.ui.as_mut() {
                 ui.eeprom.set_status("请先完成标定求解（Step 3）", false);
             }
             return;
         };
-        let Some(inspect) = self.eeprom_inspect.clone() else {
+        let Some((inspect0, inspect3)) = self.eeprom_inspect.clone() else {
             if let Some(ui) = self.ui.as_mut() {
                 ui.eeprom.set_status("请先读取 EEPROM 状态", false);
             }
             return;
         };
-        let serial = match &inspect.state.serial {
-            camera_toolbox_app::platform::EepromSerialState::Valid { value } => value.clone(),
-            camera_toolbox_app::platform::EepromSerialState::Empty => {
-                if let Some(ui) = self.ui.as_mut() {
-                    ui.eeprom.set_status("EEPROM 无 SN，无法写入", false);
-                }
-                return;
+        let serial = self
+            .ui
+            .as_ref()
+            .map(|ui| ui.eeprom.serial_input.get_text().to_string())
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        if serial.is_empty() {
+            if let Some(ui) = self.ui.as_mut() {
+                ui.eeprom.set_status("请输入 SN 码", false);
             }
-            camera_toolbox_app::platform::EepromSerialState::Invalid { .. } => {
-                if let Some(ui) = self.ui.as_mut() {
-                    ui.eeprom.set_status("EEPROM SN 无效，无法写入", false);
-                }
-                return;
-            }
-        };
-        let before_sha256 = inspect.state.image_sha256.clone();
+            return;
+        }
+        let before0 = inspect0.state.image_sha256.clone();
+        let before3 = inspect3.state.image_sha256.clone();
         let (host, user, password) = self.connect_credentials();
         if let Some(ui) = self.ui.as_mut() {
-            ui.eeprom.set_status("正在写入 EEPROM…", false);
+            ui.eeprom.set_status("正在写入 CH0/CH3 EEPROM…", false);
         }
         self.spawn_task(move || {
-            let result = eeprom::provision_calibration(
-                &host, &user, &password, 4, helper.into(), &solution, &serial, &before_sha256,
+            let helper: Arc<[u8]> = helper.into();
+            let ch0 = eeprom::provision_full_calibration(
+                &host,
+                &user,
+                &password,
+                4,
+                Arc::clone(&helper),
+                &solution0,
+                &serial,
+                &before0,
             );
-            match result {
-                Ok(_) => "写入 EEPROM 成功".to_owned(),
-                Err(error) => format!("写入 EEPROM 失败：{error}"),
+            let ch3 = eeprom::provision_full_calibration(
+                &host, &user, &password, 6, helper, &solution3, &serial, &before3,
+            );
+            match (ch0, ch3) {
+                (Ok(EepromHelperResult::Provision(a)), Ok(EepromHelperResult::Provision(b))) => {
+                    format!(
+                        "写入 EEPROM 成功：\n{}\n{}",
+                        write_summary("CH0/i2c-4", &a),
+                        write_summary("CH3/i2c-6", &b)
+                    )
+                }
+                (a, b) => format!(
+                    "写入 EEPROM 失败：CH0={}；CH3={}",
+                    provision_result_label(&a),
+                    provision_result_label(&b)
+                ),
             }
         });
     }
@@ -579,20 +543,34 @@ impl CalibApp {
             }
             if both_ok && self.solutions.is_some() {
                 if let Some(ui) = self.ui.as_mut() {
-                    ui.complete_step(StepId::Solve, "两路标定完成 · 可写入 EEPROM");
-                    ui.eeprom.write_button.set_disabled(false);
+                    ui.complete_step(StepId::Solve, "两路标定完成 · 等待 SN 与 EEPROM 写入");
+                    ui.eeprom.inspect_button.set_disabled(false);
+                    ui.eeprom.write_button.set_disabled(true);
                 }
+                self.on_eeprom_inspect();
             }
         } else if text.contains("EEPROM 状态") || text.contains("读取 EEPROM 失败") {
             // EEPROM Inspect 结果。
-            if let Some(ui) = self.ui.as_mut() {
-                let ok = text.contains("EEPROM 状态");
-                ui.eeprom.set_status(&text, ok);
-                if ok {
-                    ui.eeprom
-                        .write_button
-                        .set_disabled(self.eeprom_inspect.is_none());
+            if let Some(slot) = self.pending_inspect.take() {
+                if let Ok(mut value) = slot.lock() {
+                    if let Some((Some(a), Some(b))) = value.take() {
+                        self.eeprom_inspect = Some((a, b));
+                    }
                 }
+            }
+            if let Some(ui) = self.ui.as_mut() {
+                let ok = text.contains("EEPROM 状态") && self.eeprom_inspect.is_some();
+                if ok {
+                    if let Some((inspect0, inspect3)) = self.eeprom_inspect.as_ref() {
+                        if let EepromSerialState::Valid { value } = &inspect0.state.serial {
+                            ui.eeprom.serial_input.set_text(value);
+                        } else if let EepromSerialState::Valid { value } = &inspect3.state.serial {
+                            ui.eeprom.serial_input.set_text(value);
+                        }
+                    }
+                }
+                ui.eeprom.set_status(&text, ok);
+                ui.eeprom.write_button.set_disabled(!ok);
             }
         } else if text.contains("写入 EEPROM") {
             // EEPROM 写入结果。
@@ -629,11 +607,13 @@ impl CalibApp {
         let board = self.current_board();
         state.ch0.start_detect(board);
         state.ch3.start_detect(board);
+        state.ch0.start_capture();
+        state.ch3.start_capture();
         if let Some(ui) = self.ui.as_mut() {
             ui.preview.ch0.set_status(&format!("rtsp://{host}:554/PRR"));
             ui.preview.ch3.set_status(&format!("rtsp://{host}:557/PRR"));
-            ui.preview.ch0.set_overlay("预览启动中…", theme::MUTED);
-            ui.preview.ch3.set_overlay("预览启动中…", theme::MUTED);
+            ui.preview.ch0.set_overlay("guide auto_capture 启动中…", theme::MUTED);
+            ui.preview.ch3.set_overlay("guide auto_capture 启动中…", theme::MUTED);
         }
         self.streams = Some(state);
     }
@@ -654,6 +634,50 @@ impl CalibApp {
         if let Some(state) = self.ui.as_mut() {
             state.connect.set_status(text, color);
         }
+    }
+}
+
+fn serial_state_label(serial: &EepromSerialState) -> String {
+    match serial {
+        EepromSerialState::Empty => "空".to_owned(),
+        EepromSerialState::Valid { value } => value.clone(),
+        EepromSerialState::Invalid { raw_hex, .. } => format!("无效：{raw_hex}"),
+    }
+}
+
+fn inspect_summary(label: &str, inspect: &EepromInspectResult) -> String {
+    format!(
+        "{label} before={} FLAG={} SN={}",
+        &inspect.state.image_sha256[..8.min(inspect.state.image_sha256.len())],
+        if inspect.state.flag_valid { "有效" } else { "无效" },
+        serial_state_label(&inspect.state.serial)
+    )
+}
+
+fn write_summary(label: &str, result: &EepromWriteResult) -> String {
+    format!(
+        "{label} before={} SN={} → after={} SN={} verified={}",
+        &result.before.image_sha256[..8.min(result.before.image_sha256.len())],
+        serial_state_label(&result.before.serial),
+        &result.after.image_sha256[..8.min(result.after.image_sha256.len())],
+        serial_state_label(&result.after.serial),
+        result.bytewise_verified
+    )
+}
+
+fn inspect_result_label(result: &Result<EepromHelperResult, String>) -> String {
+    match result {
+        Ok(EepromHelperResult::Inspect(_)) => "ok".to_owned(),
+        Ok(_) => "unexpected helper result".to_owned(),
+        Err(error) => error.clone(),
+    }
+}
+
+fn provision_result_label(result: &Result<EepromHelperResult, String>) -> String {
+    match result {
+        Ok(EepromHelperResult::Provision(_)) => "ok".to_owned(),
+        Ok(_) => "unexpected helper result".to_owned(),
+        Err(error) => error.clone(),
     }
 }
 

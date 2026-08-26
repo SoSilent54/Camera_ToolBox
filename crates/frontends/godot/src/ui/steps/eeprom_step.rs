@@ -1,6 +1,6 @@
 //! Step 4 EEPROM 写入：固定 I²C bus 映射 + 读取状态 + 写入标定结果（强确认）。
 
-use godot::classes::{Button, Control, HBoxContainer, Label, VBoxContainer};
+use godot::classes::{Button, Control, HBoxContainer, Label, LineEdit, VBoxContainer};
 use godot::prelude::*;
 
 use crate::ui::theme;
@@ -10,6 +10,7 @@ pub struct EepromStep {
     pub panel: Gd<Control>,
     pub inspect_button: Gd<Button>,
     pub write_button: Gd<Button>,
+    pub serial_input: Gd<LineEdit>,
     pub status: Gd<Label>,
 }
 
@@ -25,6 +26,19 @@ impl EepromStep {
         mapping.add_theme_font_size_override("font_size", 14);
         mapping.add_theme_color_override("font_color", theme::MUTED);
         v.add_child(&mapping);
+
+        // SN 输入：完整烧录使用，已有 EEPROM SN 必须一致。
+        let mut sn_row = HBoxContainer::new_alloc();
+        sn_row.add_theme_constant_override("separation", 8);
+        let mut sn_label = Label::new_alloc();
+        sn_label.set_text("SN 码");
+        sn_label.add_theme_font_size_override("font_size", 14);
+        let mut serial_input = LineEdit::new_alloc();
+        serial_input.set_placeholder("14 位 SN（字母/数字）");
+        serial_input.set_custom_minimum_size(Vector2::new(220.0, 0.0));
+        sn_row.add_child(&sn_label);
+        sn_row.add_child(&serial_input);
+        v.add_child(&sn_row);
 
         // 动作行。
         let mut row = HBoxContainer::new_alloc();
@@ -51,6 +65,7 @@ impl EepromStep {
             panel,
             inspect_button,
             write_button,
+            serial_input,
             status,
         }
     }

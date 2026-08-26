@@ -29,7 +29,8 @@ impl ConnectStep {
         ip_label.add_theme_font_size_override("font_size", 15);
 
         let mut ip = LineEdit::new_alloc();
-        ip.set_placeholder("192.168.1.100");
+        ip.set_placeholder("10.21.12.x");
+        ip.set_text("10.21.12.");
         ip.set_custom_minimum_size(Vector2::new(220.0, 0.0));
 
         let mut port_label = Label::new_alloc();

@@ -1,12 +1,12 @@
 //! Step 2 双路预览与采集：CH0/CH3 并排 viewer + overlay 引导可视化层。
 //!
-//! 每路卡片 = 标题行（通道/RTSP/I²C 固定映射 + 采集按钮）+ 预览区
-//! （TextureRect 显示 RTSP 帧，GuideOverlay 绘制检测框/姿态引导，
+//! 每路卡片 = 标题行（通道/RTSP/I²C 固定映射）+ 预览区
+//! （TextureRect 显示 RTSP 帧，GuideOverlay 绘制 guide 目标框/检测框，
 //! overlay Label 显示 hold 计数与引导文本）+ 状态行。
 
 use godot::classes::control::{LayoutPreset, MouseFilter};
 use godot::classes::texture_rect::{ExpandMode, StretchMode};
-use godot::classes::{Button, Control, HBoxContainer, Label, TextureRect, VBoxContainer};
+use godot::classes::{Control, HBoxContainer, Label, TextureRect, VBoxContainer};
 use godot::prelude::*;
 
 use crate::guide_overlay::GuideOverlay;
@@ -25,8 +25,6 @@ pub struct ViewerCard {
     pub overlay_label: Gd<Label>,
     /// 卡片下方状态行（连接/解码状态）。
     pub status: Gd<Label>,
-    /// 采集开关按钮（开始/停止自动采集）。
-    pub capture_button: Gd<Button>,
     /// 预览容器（宽度铺满，高度按 16:9 由上层同步）。
     pub view: Gd<Control>,
 }
@@ -38,20 +36,12 @@ impl ViewerCard {
         card.add_theme_constant_override("separation", 6);
         card.set_h_size_flags(godot::classes::control::SizeFlags::EXPAND_FILL);
 
-        // 标题行：通道信息 + 采集按钮。
-        let mut header_row = HBoxContainer::new_alloc();
-        header_row.add_theme_constant_override("separation", 10);
+        // 标题行：通道信息。RTSP 连接后自动进入 guide auto_capture。
         let mut header = Label::new_alloc();
         header.set_text(title);
         header.add_theme_font_size_override("font_size", 13);
         header.add_theme_color_override("font_color", theme::ACCENT);
-        header.set_h_size_flags(godot::classes::control::SizeFlags::EXPAND_FILL);
-        let mut capture_button = Button::new_alloc();
-        capture_button.set_text("开始采集");
-        capture_button.set_custom_minimum_size(Vector2::new(96.0, 0.0));
-        header_row.add_child(&header);
-        header_row.add_child(&capture_button);
-        card.add_child(&header_row);
+        card.add_child(&header);
 
         // 预览区：定高容器，TextureRect 铺满 + overlay 叠上层。
         let mut view = Control::new_alloc();
@@ -59,18 +49,18 @@ impl ViewerCard {
         view.set_h_size_flags(godot::classes::control::SizeFlags::EXPAND_FILL);
 
         let mut texture_rect = TextureRect::new_alloc();
-        texture_rect.set_anchors_preset(LayoutPreset::FULL_RECT);
+        texture_rect.set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
         texture_rect.set_stretch_mode(StretchMode::KEEP_ASPECT_CENTERED);
         texture_rect.set_expand_mode(ExpandMode::IGNORE_SIZE);
         view.add_child(&texture_rect);
 
         // overlay 层：GuideOverlay（绘制）+ Label（hold/引导文本）。
         let mut overlay = Control::new_alloc();
-        overlay.set_anchors_preset(LayoutPreset::FULL_RECT);
+        overlay.set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
         overlay.set_mouse_filter(MouseFilter::IGNORE);
 
         let mut guide_overlay = GuideOverlay::new_alloc();
-        guide_overlay.set_anchors_preset(LayoutPreset::FULL_RECT);
+        guide_overlay.set_anchors_and_offsets_preset(LayoutPreset::FULL_RECT);
         guide_overlay.set_mouse_filter(MouseFilter::IGNORE);
         guide_overlay.bind_mut().attach(overlay_slot);
         overlay.add_child(&guide_overlay);
@@ -97,7 +87,6 @@ impl ViewerCard {
             guide_overlay,
             overlay_label,
             status,
-            capture_button,
             view,
         }
     }
@@ -131,7 +120,7 @@ impl PreviewStep {
         v.add_theme_constant_override("separation", 10);
 
         let mut hint = Label::new_alloc();
-        hint.set_text("双路预览：引导信息叠加在画面上，hold 计数达标自动采集。");
+        hint.set_text("双路预览：连接 RTSP 后自动按 guide 目标框采集；黄框未匹配，绿框进入 hold 倒数。");
         hint.add_theme_font_size_override("font_size", 13);
         hint.add_theme_color_override("font_color", theme::MUTED);
         v.add_child(&hint);

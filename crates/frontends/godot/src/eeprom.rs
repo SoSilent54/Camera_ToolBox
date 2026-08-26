@@ -52,11 +52,10 @@ pub fn inspect(
         .map_err(|error| format!("读取 EEPROM 失败：{error}"))
 }
 
-/// 更新标定内参（UpdateCalibration：SN 只作身份校验，不写入）。
-///
-/// `serial` 与 `expected_before_sha256` 必须来自同一次 Inspect。
+
+/// 完整烧录：写入 FLAG + 内参 + SN。若设备已有不同 SN，helper 会拒绝（不默认覆盖）。
 #[allow(clippy::too_many_arguments)]
-pub fn provision_calibration(
+pub fn provision_full_calibration(
     host: &str,
     ssh_user: &str,
     ssh_password: &str,
@@ -66,9 +65,28 @@ pub fn provision_calibration(
     serial: &str,
     expected_before_sha256: &str,
 ) -> Result<EepromHelperResult, String> {
+    provision_with_mode(host, ssh_user, ssh_password, i2c_bus, helper_payload, solution, serial, expected_before_sha256, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provision_with_mode(
+    host: &str,
+    ssh_user: &str,
+    ssh_password: &str,
+    i2c_bus: u16,
+    helper_payload: Arc<[u8]>,
+    solution: &CalibrationSolution,
+    serial: &str,
+    expected_before_sha256: &str,
+    full: bool,
+) -> Result<EepromHelperResult, String> {
     let image = FullEepromImage::from_solution(solution, serial)
         .map_err(|error| format!("构造 EEPROM 镜像失败：{error}"))?;
-    let request = image.update_calibration_request();
+    let request = if full {
+        image.full_provision_request(false)
+    } else {
+        image.update_calibration_request()
+    };
     let service = build_service(host, ssh_user, ssh_password, i2c_bus, helper_payload)?;
     let control = control();
     service
