@@ -29,6 +29,11 @@ use winit::{
 };
 
 fn main() {
+    // CI 冒烟/用户查版本：--version 直接退出，不初始化窗口与 GL。
+    if std::env::args().any(|arg| arg == "--version" || arg == "-V") {
+        println!("pongbot-calib-tool {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     init_tracing();
     if let Err(error) = run() {
         eprintln!("pongbot-calib-tool 启动失败：{error}");
@@ -448,6 +453,90 @@ impl App {
         ui.child_window("##ch3_card")
             .size([card_width, card_height])
             .build(|| self.show_preview_card(ui, 1, 3, "CH3 · RTSP 557 · i2c-6"));
+        ui.separator();
+        // 覆盖质量面板与预览卡片同宽并排（CH0 左 / CH3 右）。
+        let panel_height = 160.0;
+        ui.child_window("##ch0_coverage")
+            .size([card_width, panel_height])
+            .build(|| self.show_coverage_panel(ui, 0));
+        ui.same_line();
+        ui.child_window("##ch3_coverage")
+            .size([card_width, panel_height])
+            .build(|| self.show_coverage_panel(ui, 1));
+    }
+
+    /// 采集覆盖质量面板：条状容器按覆盖范围点亮（对齐 ROS X/Y/Size/Skew 语义）。
+    fn show_coverage_panel(&mut self, ui: &imgui::Ui, index: usize) {
+        let coverage = if index == 0 {
+            self.controller.state.preview.ch0.coverage.clone()
+        } else {
+            self.controller.state.preview.ch3.coverage.clone()
+        };
+        let label = if index == 0 { "CH0" } else { "CH3" };
+        let total = coverage.total();
+        ui.text_colored(theme::ACCENT, &format!("{label} 采集覆盖质量 {total}/18"));
+        // child_window 内取实际可用宽度，预留 label 与计数文本空间。
+        let width = (ui.content_region_avail()[0] - 110.0).max(120.0);
+        self.coverage_range_bar(ui, "X 位置", &coverage.x, width);
+        self.coverage_range_bar(ui, "Y 位置", &coverage.y, width);
+        self.coverage_range_bar(ui, "距离", &coverage.size, width);
+        self.coverage_range_bar(ui, "倾斜", &coverage.skew, width);
+        if coverage.is_complete() {
+            ui.text_colored(theme::OK, "覆盖完成，即将自动进入求解");
+        } else if let Some(hint) = coverage.first_missing_hint() {
+            ui.text_colored(theme::WARN, hint);
+        }
+    }
+
+    /// 单条覆盖条：连续条状容器，按覆盖范围分段点亮。
+    fn coverage_range_bar(&self, ui: &imgui::Ui, label: &str, bins: &[bool], width: f32) {
+        ui.text(label);
+        // label 固定列宽（4 个汉字位）：四条条从同一 x 起点绘制，左边缘对齐。
+        const LABEL_COLUMN: f32 = 76.0;
+        ui.same_line();
+        let cursor = ui.cursor_pos();
+        if cursor[0] < LABEL_COLUMN {
+            ui.set_cursor_pos([LABEL_COLUMN, cursor[1]]);
+        }
+        let draw = ui.get_window_draw_list();
+        let origin = ui.cursor_screen_pos();
+        let height = 14.0;
+        let n = bins.len().max(1) as f32;
+        let segment = width / n;
+        draw.add_rect(
+            [origin[0], origin[1]],
+            [origin[0] + width, origin[1] + height],
+            [0.16, 0.17, 0.22, 1.0],
+        )
+        .filled(true)
+        .build();
+        for (index, filled) in bins.iter().enumerate() {
+            let x0 = origin[0] + index as f32 * segment;
+            if *filled {
+                draw.add_rect(
+                    [x0, origin[1]],
+                    [x0 + segment, origin[1] + height],
+                    theme::OK,
+                )
+                .filled(true)
+                .build();
+            }
+            draw.add_line(
+                [x0, origin[1]],
+                [x0, origin[1] + height],
+                [0.5, 0.55, 0.65, 0.5],
+            )
+            .build();
+        }
+        draw.add_rect(
+            [origin[0], origin[1]],
+            [origin[0] + width, origin[1] + height],
+            [0.85, 0.88, 0.95, 0.8],
+        )
+        .build();
+        let filled = bins.iter().filter(|filled| **filled).count();
+        ui.same_line();
+        ui.text_disabled(&format!("{filled}/{}", bins.len()));
     }
 
     fn show_preview_card(&mut self, ui: &imgui::Ui, slot_index: usize, channel: u16, label: &str) {
@@ -510,11 +599,11 @@ impl App {
         let avail = ui.content_region_avail();
         let card_width = (avail[0] - 12.0) * 0.5;
         ui.child_window("##solve_ch0_card")
-            .size([card_width, 0.0])
+            .size([card_width, 340.0])
             .build(|| self.show_solve_card(ui, 0));
         ui.same_line();
         ui.child_window("##solve_ch3_card")
-            .size([card_width, 0.0])
+            .size([card_width, 340.0])
             .build(|| self.show_solve_card(ui, 1));
     }
 
@@ -631,11 +720,11 @@ impl App {
         let editor_width = (avail[0] - 12.0) * 0.5;
 
         ui.child_window("##snid_ch0")
-            .size([editor_width, 0.0])
+            .size([editor_width, 230.0])
             .build(|| self.show_snid_editor(ui, 0, "CH0 SNID"));
         ui.same_line();
         ui.child_window("##snid_ch3")
-            .size([editor_width, 0.0])
+            .size([editor_width, 230.0])
             .build(|| self.show_snid_editor(ui, 1, "CH3 SNID"));
 
         ui.separator();
@@ -658,11 +747,11 @@ impl App {
         let avail = ui.content_region_avail();
         let card_width = (avail[0] - 12.0) * 0.5;
         ui.child_window("##eeprom_ch0_card")
-            .size([card_width, 0.0])
+            .size([card_width, 500.0])
             .build(|| self.show_eeprom_card(ui, 0));
         ui.same_line();
         ui.child_window("##eeprom_ch3_card")
-            .size([card_width, 0.0])
+            .size([card_width, 500.0])
             .build(|| self.show_eeprom_card(ui, 1));
 
         ui.separator();
@@ -678,28 +767,16 @@ impl App {
         match &inspect {
             Some((a, b)) => {
                 let detail = if index == 0 { a } else { b };
-                ui.text_colored(
-                    if detail.flag_valid {
-                        theme::OK
-                    } else {
-                        theme::WARN
-                    },
-                    "当前 EEPROM 状态",
-                );
                 self.key_value_list(
                     ui,
-                    &[
-                        ("镜像 hash", detail.sha8.clone()),
-                        (
-                            "FLAG",
-                            if detail.flag_valid {
-                                "有效".to_owned()
-                            } else {
-                                "无效".to_owned()
-                            },
-                        ),
-                        ("SN", detail.serial.clone()),
-                    ],
+                    &[(
+                        "FLAG",
+                        if detail.flag_valid {
+                            "有效".to_owned()
+                        } else {
+                            "无效".to_owned()
+                        },
+                    )],
                 );
                 if let Some(calibration) = &detail.calibration {
                     ui.separator();
@@ -744,7 +821,7 @@ impl App {
                 }
             }
             None => {
-                ui.text_colored(theme::MUTED, "当前 EEPROM 状态：未读取");
+                ui.text_colored(theme::MUTED, "未读取");
             }
         }
         ui.separator();
@@ -755,10 +832,14 @@ impl App {
                 self.key_value_list(
                     ui,
                     &[
-                        ("写入前 hash", detail.before_sha8.clone()),
-                        ("写入前 SN", detail.before_serial.clone()),
-                        ("写入后 hash", detail.after_sha8.clone()),
-                        ("写入后 SN", detail.after_serial.clone()),
+                        (
+                            "hash",
+                            format!("{} -> {}", detail.before_sha8, detail.after_sha8),
+                        ),
+                        (
+                            "SN",
+                            format!("{} -> {}", detail.before_serial, detail.after_serial),
+                        ),
                         (
                             "逐字节校验",
                             if detail.verified {
@@ -803,7 +884,26 @@ impl App {
         changed |= ui.input_text("月份", &mut month).build();
         changed |= ui.input_text("日期", &mut day).build();
         changed |= ui.combo_simple_string("光轴等级", &mut axis, &SnidDraft::AXES);
-        changed |= ui.input_text("序列号", &mut sequence).build();
+        // 序列号步进按钮：十进制 -1 / +1，有效范围 1..=3844（两位 base62 上限）。
+        changed |= ui.input_text("序列号", &mut sequence).width(120.0).build();
+        ui.same_line();
+        if ui.small_button(format!("-1##seq_{index}")) {
+            if let Ok(value) = sequence.trim().parse::<u16>() {
+                if value > 1 {
+                    sequence = (value - 1).to_string();
+                    changed = true;
+                }
+            }
+        }
+        ui.same_line();
+        if ui.small_button(format!("+1##seq_{index}")) {
+            if let Ok(value) = sequence.trim().parse::<u16>() {
+                if value < 3844 {
+                    sequence = (value + 1).to_string();
+                    changed = true;
+                }
+            }
+        }
         if changed {
             let draft = if index == 0 {
                 &mut self.controller.state.eeprom.ch0_snid
@@ -842,18 +942,15 @@ fn fit_rect(avail: [f32; 2], width: u32, height: u32) -> ([f32; 2], [f32; 2]) {
     ([x0, y0], [x0 + draw_width, y0 + draw_height])
 }
 
-/// 用 ImGui draw list 在图像矩形上绘制 guide overlay（检测框/目标框/网格/旋转环/姿态箭头）。
+/// 用 ImGui draw list 在图像矩形上绘制采集 overlay（检测框 + hold 状态）。
 fn draw_overlay(draw: &imgui::DrawListMut, overlay: &OverlayData, min: [f32; 2], max: [f32; 2]) {
     let image_width = overlay.image_width.max(1.0);
     let image_height = overlay.image_height.max(1.0);
-    let to_screen = |point: [f32; 2]| -> [f32; 2] {
-        [
-            min[0] + point[0] * (max[0] - min[0]),
-            min[1] + point[1] * (max[1] - min[1]),
-        ]
-    };
     let px_to_screen = |point: [f32; 2]| -> [f32; 2] {
-        to_screen([point[0] / image_width, point[1] / image_height])
+        [
+            min[0] + point[0] / image_width * (max[0] - min[0]),
+            min[1] + point[1] / image_height * (max[1] - min[1]),
+        ]
     };
 
     if let Some(outline) = overlay.detected_outline_px {
@@ -865,80 +962,9 @@ fn draw_overlay(draw: &imgui::DrawListMut, overlay: &OverlayData, min: [f32; 2],
         }
     }
 
-    if let Some(outline) = overlay.target_outline_uv {
-        let color = if overlay.target_matched {
-            theme::OK
-        } else {
-            theme::WARN
-        };
-        let corners: Vec<[f32; 2]> = outline.iter().map(|point| to_screen(*point)).collect();
-        for index in 0..4 {
-            draw.add_line(corners[index], corners[(index + 1) % 4], color)
-                .thickness(3.0)
-                .build();
-        }
-    }
-
-    for line in &overlay.target_grid_lines {
-        draw.add_line(
-            to_screen(line.start_uv),
-            to_screen(line.end_uv),
-            [0.9, 0.9, 0.9, 0.45],
-        )
-        .thickness(1.0)
-        .build();
-    }
-
-    if let Some(rings) = &overlay.rotation_rings {
-        let center = to_screen(rings.center_uv);
-        let arcs = [(&rings.roll, "R"), (&rings.pitch, "P"), (&rings.yaw, "Y")];
-        for (index, (arc, axis)) in arcs.into_iter().enumerate() {
-            if arc.base_uv.len() >= 2 {
-                let points: Vec<[f32; 2]> =
-                    arc.base_uv.iter().map(|point| to_screen(*point)).collect();
-                draw.add_polyline(points, [0.60, 0.65, 0.75, 0.95])
-                    .thickness(2.0)
-                    .build();
-            }
-            if arc.arc_uv.len() >= 2 {
-                let points: Vec<[f32; 2]> =
-                    arc.arc_uv.iter().map(|point| to_screen(*point)).collect();
-                draw.add_polyline(points, theme::ACCENT)
-                    .thickness(4.0)
-                    .build();
-            }
-            draw.add_line(center, to_screen(arc.tick_uv), theme::WARN)
-                .thickness(3.0)
-                .build();
-            draw.add_text(
-                [min[0] + 8.0, min[1] + 52.0 + index as f32 * 18.0],
-                theme::ACCENT,
-                format!("{axis} {:+.1} deg", arc.error_degrees),
-            );
-        }
-    }
-
-    if let Some(arrow) = overlay.pose_arrow {
-        draw.add_line(
-            to_screen(arrow.start_uv),
-            to_screen(arrow.end_uv),
-            theme::OK,
-        )
-        .thickness(3.0)
-        .build();
-    }
-
     if let Some(status) = &overlay.status {
-        let text = format!(
-            "hold {}/{} · {} {:.2}/{:.2} {}",
-            status.hold_frames,
-            status.hold_target,
-            status.detail_label,
-            status.detail_value,
-            status.detail_limit,
-            if status.matched { "✓" } else { "" }
-        );
-        let color = if status.matched {
+        let text = format!("hold {}/{}", status.hold_frames, status.hold_target);
+        let color = if status.hold_frames >= status.hold_target {
             theme::OK
         } else if status.hold_frames > 0 {
             theme::WARN
@@ -946,5 +972,33 @@ fn draw_overlay(draw: &imgui::DrawListMut, overlay: &OverlayData, min: [f32; 2],
             theme::ACCENT
         };
         draw.add_text([min[0] + 8.0, min[1] + 30.0], color, text);
+    }
+
+    // 成功拍摄帧的棋盘内角点网格：金色连线 + 绿点（确认触发瞬间采到的姿态）。
+    if let Some((cols, rows, points)) = &overlay.captured_corners_px {
+        if *cols > 1 && *rows > 1 && points.len() == cols * rows {
+            let screen: Vec<[f32; 2]> = points.iter().map(|point| px_to_screen(*point)).collect();
+            let grid_color = [1.0, 0.78, 0.35, 0.9];
+            for row in 0..*rows {
+                for col in 0..*cols {
+                    let index = row * cols + col;
+                    if col + 1 < *cols {
+                        draw.add_line(screen[index], screen[index + 1], grid_color)
+                            .thickness(1.2)
+                            .build();
+                    }
+                    if row + 1 < *rows {
+                        draw.add_line(screen[index], screen[index + *cols], grid_color)
+                            .thickness(1.2)
+                            .build();
+                    }
+                }
+            }
+            for point in &screen {
+                draw.add_circle(*point, 2.5, theme::OK)
+                    .thickness(1.6)
+                    .build();
+            }
+        }
     }
 }

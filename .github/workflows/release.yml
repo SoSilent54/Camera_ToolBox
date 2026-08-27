@@ -1,9 +1,9 @@
 name: Release
 
-# pongbot-calib-tool 独立发布流水线（Godot 4.4 + gdext 前端）。
+# pongbot-calib-tool 独立发布流水线（原生 ImGui + winit 前端）。
 # 仅存在于 calib_tool_godot 分支；tag v* 推送或手动触发。
 # 模式对齐 Camera_ToolBox 的 release.yml：i2c-helper 静态 sidecar +
-# Windows x86_64 构建 + 依赖 bundle + GitHub Release 发布。
+# Windows x86_64 构建 + OpenCV/FFmpeg 依赖 bundle + GitHub Release 发布。
 
 "on":
   push:
@@ -91,7 +91,6 @@ jobs:
     runs-on: windows-latest
     env:
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
-      GODOT_VERSION: 4.4.1-stable
 
     steps:
       - name: Check out source
@@ -130,47 +129,29 @@ jobs:
             --github-path "$GITHUB_PATH"
       - name: Install stable Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Download Godot ${{ env.GODOT_VERSION }} (win64)
-        shell: pwsh
-        run: |
-          $zipName = "Godot_v${env:GODOT_VERSION}_win64.exe.zip"
-          curl.exe -fL --retry 3 -o $zipName `
-            "https://github.com/godotengine/godot/releases/download/${env:GODOT_VERSION}/${zipName}"
-          New-Item -ItemType Directory -Force -Path tools | Out-Null
-          Expand-Archive -Path $zipName -DestinationPath tools -Force
-          Move-Item "tools/Godot_v${env:GODOT_VERSION}_win64.exe" "tools/godot-win64.exe" -Force
-      - name: Build gdext extension
-        # 必须用 pwsh：bash 会把 Git Bash 的 /usr/bin/link.exe 前置到 PATH，
-        # cargo 链接时解析到 coreutils link 而非 MSVC link.exe，导致链接失败。
+      - name: Build native ImGui frontend
         shell: pwsh
         run: |
           cargo build --release --locked -p pongbot-calib-tool
-          if (-not (Test-Path target/release/pongbot_calib_tool.dll)) { throw "pongbot_calib_tool.dll 未生成" }
+          if (-not (Test-Path target/release/pongbot-calib-tool.exe)) { throw "pongbot-calib-tool.exe 未生成" }
       - name: Package Windows release
         shell: pwsh
         run: |
           $bundle = "pongbot-calib-tool-windows-x86_64"
           $archive = "pongbot-calib-tool-$env:RELEASE_VERSION-windows-x86_64"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
-          Copy-Item "tools/godot-win64.exe" "dist/$bundle/godot.exe"
-          Copy-Item -Recurse "crates/frontends/godot/godot" "dist/$bundle/godot-project"
-          New-Item -ItemType Directory -Force -Path "dist/$bundle/godot-project/target/release" | Out-Null
-          Copy-Item "target/release/pongbot_calib_tool.dll" "dist/$bundle/godot-project/target/release/"
+          Copy-Item "target/release/pongbot-calib-tool.exe" "dist/$bundle/"
           Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper-linux-aarch64"
           Copy-Item README.md "dist/$bundle/"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
-          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-          $smokeLog = "smoke.log"
-          & "dist/$bundle/godot.exe" --headless --path "dist/$bundle/godot-project" --quit *>&1 | Tee-Object -FilePath $smokeLog
+          # 冒烟：--version 不初始化窗口/GL，直接验证二进制可执行且依赖 bundle 齐全。
+          $versionOut = & "dist/$bundle/pongbot-calib-tool.exe" --version
           if ($LASTEXITCODE -ne 0) {
-            Get-Content $smokeLog
-            throw "godot headless smoke failed"
+            Get-Content "$bundle-smoke.log" -ErrorAction SilentlyContinue
+            throw "pongbot-calib-tool.exe --version failed with exit $LASTEXITCODE"
           }
-          if (Select-String -Path $smokeLog -Pattern "Can't open dynamic library|error while loading shared libraries|gdext|GDExtension" -Quiet) {
-            Get-Content $smokeLog
-            throw "gdext extension load reported an error"
-          }
+          if ("$versionOut" -notmatch 'pongbot-calib-tool') { throw "unexpected --version output: $versionOut" }
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$archive.zip" -Force
       - name: Upload release archive
         uses: actions/upload-artifact@v4
