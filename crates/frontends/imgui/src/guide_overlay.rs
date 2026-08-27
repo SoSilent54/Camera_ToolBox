@@ -35,6 +35,34 @@ impl DensityHeatmap {
                 .checked_mul(self.rows)
                 .is_some_and(|len| len == self.samples.len())
     }
+    /// 以密度网格单元中心为采样点，在边界钳制后对渲染/质量分析共用的连续场双线性采样。
+    ///
+    /// 非法快照或坐标没有密度证据，返回零，避免错误数据伪造绿色覆盖。
+    #[must_use]
+    pub fn sample_bilinear(&self, u: f32, v: f32) -> f32 {
+        if !self.is_valid() || !u.is_finite() || !v.is_finite() {
+            return 0.0;
+        }
+        let max_col = self.cols.saturating_sub(1);
+        let max_row = self.rows.saturating_sub(1);
+        let source_x = (u * self.cols as f32 - 0.5).clamp(0.0, max_col as f32);
+        let source_y = (v * self.rows as f32 - 0.5).clamp(0.0, max_row as f32);
+        let left = source_x.floor() as usize;
+        let top = source_y.floor() as usize;
+        let right = (left + 1).min(max_col);
+        let bottom = (top + 1).min(max_row);
+        let tx = source_x - left as f32;
+        let ty = source_y - top as f32;
+        let at = |col: usize, row: usize| self.samples[row * self.cols + col];
+        let upper = at(left, top) + (at(right, top) - at(left, top)) * tx;
+        let lower = at(left, bottom) + (at(right, bottom) - at(left, bottom)) * tx;
+        let density = upper + (lower - upper) * ty;
+        if density.is_finite() {
+            density.clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
 }
 
 impl Default for DensityHeatmap {
