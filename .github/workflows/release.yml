@@ -343,7 +343,7 @@ jobs:
       - build-windows
       - build-linux
       - build-macos
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     env:
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
     permissions:
@@ -363,11 +363,17 @@ jobs:
           test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-x86_64-ubuntu22.04.tar.gz"
           test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-macos-aarch64.zip"
       - name: Create or update GitHub Release
-        uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          target_commitish: ${{ github.sha }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
-            dist/pongbot-calib-tool-*
+        # softprops v3.0.2 在 Node 24 强制环境（2026-08 起）下用 GITHUB_TOKEN 创建/更新
+        # release 一律 403（softprops#836）；GITHUB_TOKEN 本身权限正常（curl 直调 201）。
+        # 改用官方 gh CLI（Go 实现，无 Node 运行时依赖）。
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release edit "${RELEASE_TAG}" --title "${RELEASE_TAG}" --target "${GITHUB_SHA}"
+            gh release upload "${RELEASE_TAG}" dist/pongbot-calib-tool-* --clobber
+          else
+            gh release create "${RELEASE_TAG}" dist/pongbot-calib-tool-* \
+              --title "${RELEASE_TAG}" --target "${GITHUB_SHA}" --generate-notes
+          fi
