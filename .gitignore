@@ -27,3 +27,7 @@ Thumbs.db
 
 # 机器本地原生依赖（指向 Camera_Toolbox 资产）
 /.deps
+
+# Release 产物与 AgentTeam 会话状态
+*.tar.gz
+.omp-agent-team/
