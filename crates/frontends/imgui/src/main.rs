@@ -2,7 +2,8 @@
 //!
 //! 技术栈：winit（事件循环）+ glutin/glutin-winit（OpenGL 窗口与 context）+
 //! glow（GL 调用）+ imgui-rs / imgui-winit-support / imgui-glow-renderer（UI）。
-//! 双路 RTSP 预览帧以 RGBA8 上传为 GL texture，guide overlay 用 ImGui draw list 绘制。
+//! 双路 RTSP 预览帧保持原始 RGBA8；连续密度场单独平滑采样为 RGBA heatmap 纹理，
+//! 再以同一 fitted rectangle 叠加，guide overlay 仍由 ImGui draw list 绘制。
 
 use glow::HasContext;
 use glutin::{
@@ -16,10 +17,11 @@ use imgui_glow_renderer::Renderer as ImGuiGlowRenderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
 use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
-use pongbot_calib_tool::guide_overlay::OverlayData;
+use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
 use pongbot_calib_tool::theme;
 use raw_window_handle::HasWindowHandle;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 use std::time::Instant;
 use winit::{
     dpi::LogicalSize,
@@ -202,7 +204,7 @@ fn imgui_init(window: &Window) -> Result<(WinitPlatform, imgui::Context), String
     Ok((winit_platform, imgui_context))
 }
 
-/// 每路预览一个 GL texture（用户确认的纹理策略）。
+/// RGBA 图像的 GPU texture 生命周期；视频与密度 heatmap 分别持有实例。
 struct VideoTexture {
     gl_texture: Option<glow::Texture>,
     id: Option<TextureId>,
@@ -220,76 +222,30 @@ impl VideoTexture {
         }
     }
 
-    fn destroy(&mut self, gl: &glow::Context) {
-        if let Some(texture) = self.gl_texture.take() {
-            unsafe { gl.delete_texture(texture) };
-        }
-        self.id = None;
-    }
-}
-
-/// 上次绘制的活跃步骤；变化时触发向导滚动。
-struct App {
-    controller: CalibController,
-    video: [VideoTexture; 2],
-    /// 上次绘制的活跃步骤；变化时触发向导滚动。
-    last_active: StepId,
-    /// 待滚动的步骤锚点（绘制完成后消费）。
-    pending_scroll: Option<usize>,
-}
-
-impl App {
-    fn new() -> Self {
-        Self {
-            controller: CalibController::new(),
-            video: [VideoTexture::new(), VideoTexture::new()],
-            last_active: StepId::Connect,
-            pending_scroll: None,
-        }
-    }
-
-    fn destroy(&mut self, gl: &glow::Context) {
-        for slot in &mut self.video {
-            slot.destroy(gl);
-        }
-    }
-
-    /// 每帧：推进流程状态机 + 把最新解码帧上传为 GL texture。
-    fn frame(&mut self, gl: &glow::Context, textures: &mut imgui::Textures<glow::Texture>) {
-        self.controller.tick();
-        self.update_video(gl, textures, 0, 0);
-        self.update_video(gl, textures, 1, 3);
-    }
-    fn update_video(
+    /// 上传一张 RGBA8 图像；尺寸变化时重分配，否则只更新像素内容。
+    fn upload_rgba(
         &mut self,
         gl: &glow::Context,
         textures: &mut imgui::Textures<glow::Texture>,
-        slot_index: usize,
-        channel: u16,
-    ) {
-        let Some(frame) = self.controller.poll_frame(channel) else {
-            return;
-        };
-        let width = frame.width;
-        let height = frame.height;
-        let expected_len = (width as usize)
-            .checked_mul(height as usize)
-            .and_then(|pixels| pixels.checked_mul(4));
-        if expected_len != Some(frame.rgba.len()) {
-            tracing::warn!(
-                channel,
-                width,
-                height,
-                actual_bytes = frame.rgba.len(),
-                "丢弃尺寸与 RGBA8 载荷不一致的视频帧"
-            );
-            return;
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        internal_format: u32,
+    ) -> Result<(), String> {
+        let expected_len =
+            rgba_byte_len(width, height).ok_or_else(|| "RGBA 图像尺寸溢出".to_owned())?;
+        if rgba.len() != expected_len {
+            return Err(format!(
+                "RGBA8 载荷长度不匹配：expected {expected_len}, got {}",
+                rgba.len()
+            ));
         }
-        let slot = &mut self.video[slot_index];
         unsafe {
             gl.pixel_store_i32(glow::UNPACK_ALIGNMENT, 1);
-            if slot.gl_texture.is_none() {
-                let texture = gl.create_texture().expect("创建预览 GL texture 失败");
+            if self.gl_texture.is_none() {
+                let texture = gl
+                    .create_texture()
+                    .map_err(|error| format!("创建 GL texture 失败：{error}"))?;
                 gl.bind_texture(glow::TEXTURE_2D, Some(texture));
                 gl.tex_parameter_i32(
                     glow::TEXTURE_2D,
@@ -312,25 +268,24 @@ impl App {
                     glow::CLAMP_TO_EDGE as i32,
                 );
                 let id = textures.insert(texture);
-                slot.gl_texture = Some(texture);
-                slot.id = Some(id);
+                self.gl_texture = Some(texture);
+                self.id = Some(id);
             }
-            gl.bind_texture(glow::TEXTURE_2D, slot.gl_texture);
-            if slot.width != width || slot.height != height {
+            gl.bind_texture(glow::TEXTURE_2D, self.gl_texture);
+            if self.width != width || self.height != height {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
-                    // FFmpeg 输出的是显示编码后的 RGBA8；仅标注纹理为 sRGB，不改写帧字节。
-                    glow::SRGB8_ALPHA8 as i32,
+                    internal_format as i32,
                     width as i32,
                     height as i32,
                     0,
                     glow::RGBA,
                     glow::UNSIGNED_BYTE,
-                    Some(&frame.rgba),
+                    Some(rgba),
                 );
-                slot.width = width;
-                slot.height = height;
+                self.width = width;
+                self.height = height;
             } else {
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
@@ -341,13 +296,179 @@ impl App {
                     height as i32,
                     glow::RGBA,
                     glow::UNSIGNED_BYTE,
-                    glow::PixelUnpackData::Slice(&frame.rgba),
+                    glow::PixelUnpackData::Slice(rgba),
                 );
             }
             let error = gl.get_error();
             if error != glow::NO_ERROR {
-                tracing::warn!(channel, ?error, "视频纹理上传产生 GL 错误");
+                return Err(format!("GL 错误 {error:#x}"));
             }
+        }
+        Ok(())
+    }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        if let Some(texture) = self.gl_texture.take() {
+            unsafe { gl.delete_texture(texture) };
+        }
+        self.id = None;
+        self.width = 0;
+        self.height = 0;
+    }
+}
+
+/// 每路独立的平滑密度纹理及其源快照身份缓存。
+struct HeatmapTexture {
+    texture: VideoTexture,
+    source_samples: Option<Arc<[f32]>>,
+    source_cols: usize,
+    source_rows: usize,
+    rgba: Vec<u8>,
+}
+
+impl HeatmapTexture {
+    fn new() -> Self {
+        Self {
+            texture: VideoTexture::new(),
+            source_samples: None,
+            source_cols: 0,
+            source_rows: 0,
+            rgba: Vec::new(),
+        }
+    }
+
+    fn source_matches(&self, heatmap: &DensityHeatmap, width: u32, height: u32) -> bool {
+        self.texture.width == width
+            && self.texture.height == height
+            && self.source_cols == heatmap.cols
+            && self.source_rows == heatmap.rows
+            && self
+                .source_samples
+                .as_ref()
+                .is_some_and(|samples| Arc::ptr_eq(samples, &heatmap.samples))
+    }
+
+    fn image_id(&self, heatmap: &DensityHeatmap, width: u32, height: u32) -> Option<TextureId> {
+        self.source_matches(heatmap, width, height)
+            .then_some(self.texture.id)
+            .flatten()
+    }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        self.texture.destroy(gl);
+        self.source_samples = None;
+        self.rgba.clear();
+    }
+}
+
+/// 上次绘制的活跃步骤；变化时触发向导滚动。
+struct App {
+    controller: CalibController,
+    video: [VideoTexture; 2],
+    heatmap: [HeatmapTexture; 2],
+    /// 上次绘制的活跃步骤；变化时触发向导滚动。
+    last_active: StepId,
+    /// 待滚动的步骤锚点（绘制完成后消费）。
+    pending_scroll: Option<usize>,
+}
+
+impl App {
+    fn new() -> Self {
+        Self {
+            controller: CalibController::new(),
+            video: [VideoTexture::new(), VideoTexture::new()],
+            heatmap: [HeatmapTexture::new(), HeatmapTexture::new()],
+            last_active: StepId::Connect,
+            pending_scroll: None,
+        }
+    }
+
+    fn destroy(&mut self, gl: &glow::Context) {
+        for slot in &mut self.video {
+            slot.destroy(gl);
+        }
+        for slot in &mut self.heatmap {
+            slot.destroy(gl);
+        }
+    }
+
+    /// 每帧推进控制器，视频帧照常上传；热力图只在密度 Arc 身份或视频尺寸改变时上传。
+    fn frame(&mut self, gl: &glow::Context, textures: &mut imgui::Textures<glow::Texture>) {
+        self.controller.tick();
+        self.update_video(gl, textures, 0, 0);
+        self.update_video(gl, textures, 1, 3);
+        self.update_heatmap(gl, textures, 0);
+        self.update_heatmap(gl, textures, 1);
+    }
+
+    fn update_video(
+        &mut self,
+        gl: &glow::Context,
+        textures: &mut imgui::Textures<glow::Texture>,
+        slot_index: usize,
+        channel: u16,
+    ) {
+        let Some(frame) = self.controller.poll_frame(channel) else {
+            return;
+        };
+        let width = frame.width;
+        let height = frame.height;
+        if let Err(error) = self.video[slot_index].upload_rgba(
+            gl,
+            textures,
+            width,
+            height,
+            &frame.rgba,
+            // FFmpeg 输出的是显示编码后的 RGBA8；仅标记为 sRGB，不改写视频字节。
+            glow::SRGB8_ALPHA8,
+        ) {
+            tracing::warn!(
+                channel,
+                width,
+                height,
+                actual_bytes = frame.rgba.len(),
+                "视频纹理上传失败：{error}"
+            );
+        }
+    }
+
+    fn update_heatmap(
+        &mut self,
+        gl: &glow::Context,
+        textures: &mut imgui::Textures<glow::Texture>,
+        slot_index: usize,
+    ) {
+        let (width, height) = {
+            let video = &self.video[slot_index];
+            (video.width, video.height)
+        };
+        if width == 0 || height == 0 {
+            return;
+        }
+        let heatmap = match slot_index {
+            0 => self.controller.state.preview.ch0.quality.heatmap.clone(),
+            _ => self.controller.state.preview.ch3.quality.heatmap.clone(),
+        };
+        if !heatmap.is_valid() {
+            return;
+        }
+        let slot = &mut self.heatmap[slot_index];
+        if slot.source_matches(&heatmap, width, height) {
+            return;
+        }
+        if !rasterize_density_heatmap(&heatmap, width, height, &mut slot.rgba) {
+            return;
+        }
+        match slot
+            .texture
+            .upload_rgba(gl, textures, width, height, &slot.rgba, glow::SRGB8_ALPHA8)
+        {
+            Ok(()) => {
+                slot.source_samples = Some(heatmap.samples);
+                slot.source_cols = heatmap.cols;
+                slot.source_rows = heatmap.rows;
+            }
+            Err(error) => tracing::warn!(slot_index, width, height, "热力图纹理上传失败：{error}"),
         }
     }
 
@@ -454,8 +575,8 @@ impl App {
             .size([card_width, card_height])
             .build(|| self.show_preview_card(ui, 1, 3, "CH3 · RTSP 557 · i2c-6"));
         ui.separator();
-        // 覆盖质量面板与预览卡片同宽并排（CH0 左 / CH3 右）。
-        let panel_height = 160.0;
+        // 仅显示连续空间状态与用户要求保留的距离/倾斜条。
+        let panel_height = 178.0;
         ui.child_window("##ch0_coverage")
             .size([card_width, panel_height])
             .build(|| self.show_coverage_panel(ui, 0));
@@ -465,33 +586,100 @@ impl App {
             .build(|| self.show_coverage_panel(ui, 1));
     }
 
-    /// 采集覆盖质量面板：条状容器按覆盖范围点亮（对齐 ROS X/Y/Size/Skew 语义）。
+    /// 紧凑质量面板：中心、四边、四角，以及保留的距离和倾斜覆盖。
     fn show_coverage_panel(&mut self, ui: &imgui::Ui, index: usize) {
-        let coverage = if index == 0 {
-            self.controller.state.preview.ch0.coverage.clone()
+        let quality = if index == 0 {
+            self.controller.state.preview.ch0.quality.clone()
         } else {
-            self.controller.state.preview.ch3.coverage.clone()
+            self.controller.state.preview.ch3.quality.clone()
         };
         let label = if index == 0 { "CH0" } else { "CH3" };
-        let total = coverage.total();
-        ui.text_colored(theme::ACCENT, &format!("{label} 采集覆盖质量 {total}/18"));
-        // child_window 内取实际可用宽度，预留 label 与计数文本空间。
+        ui.text_colored(theme::ACCENT, format!("{label} 采集质量"));
         let width = (ui.content_region_avail()[0] - 110.0).max(120.0);
-        self.coverage_range_bar(ui, "X 位置", &coverage.x, width);
-        self.coverage_range_bar(ui, "Y 位置", &coverage.y, width);
-        self.coverage_range_bar(ui, "距离", &coverage.size, width);
-        self.coverage_range_bar(ui, "倾斜", &coverage.skew, width);
-        if coverage.is_complete() {
-            ui.text_colored(theme::OK, "覆盖完成，即将自动进入求解");
-        } else if let Some(hint) = coverage.first_missing_hint() {
-            ui.text_colored(theme::WARN, hint);
+        self.quality_progress_bar(
+            ui,
+            "中心",
+            quality.center_progress(),
+            width,
+            if quality.center_complete() {
+                "已覆盖"
+            } else {
+                "待覆盖"
+            },
+        );
+        self.quality_progress_bar(
+            ui,
+            "边缘",
+            quality.edge_progress(),
+            width,
+            &format!("{}/4", quality.covered_edges()),
+        );
+        self.quality_progress_bar(
+            ui,
+            "四角",
+            quality.corner_progress(),
+            width,
+            &format!("{}/4", quality.covered_corners()),
+        );
+        self.retained_coverage_bar(ui, "距离", &quality.depth, width);
+        self.retained_coverage_bar(ui, "倾斜", &quality.skew, width);
+        if quality.is_complete() {
+            ui.text_colored(theme::OK, "质量完成，即将自动进入求解");
         }
     }
 
-    /// 单条覆盖条：连续条状容器，按覆盖范围分段点亮。
-    fn coverage_range_bar(&self, ui: &imgui::Ui, label: &str, bins: &[bool], width: f32) {
+    /// 连续质量的单条紧凑进度条。
+    fn quality_progress_bar(
+        &self,
+        ui: &imgui::Ui,
+        label: &str,
+        progress: f32,
+        width: f32,
+        status: &str,
+    ) {
         ui.text(label);
-        // label 固定列宽（4 个汉字位）：四条条从同一 x 起点绘制，左边缘对齐。
+        const LABEL_COLUMN: f32 = 76.0;
+        ui.same_line();
+        let cursor = ui.cursor_pos();
+        if cursor[0] < LABEL_COLUMN {
+            ui.set_cursor_pos([LABEL_COLUMN, cursor[1]]);
+        }
+        let draw = ui.get_window_draw_list();
+        let origin = ui.cursor_screen_pos();
+        let height = 14.0;
+        let progress = progress
+            .is_finite()
+            .then_some(progress.clamp(0.0, 1.0))
+            .unwrap_or(0.0);
+        draw.add_rect(
+            [origin[0], origin[1]],
+            [origin[0] + width, origin[1] + height],
+            [0.16, 0.17, 0.22, 1.0],
+        )
+        .filled(true)
+        .build();
+        if progress > 0.0 {
+            draw.add_rect(
+                [origin[0], origin[1]],
+                [origin[0] + width * progress, origin[1] + height],
+                theme::OK,
+            )
+            .filled(true)
+            .build();
+        }
+        draw.add_rect(
+            [origin[0], origin[1]],
+            [origin[0] + width, origin[1] + height],
+            [0.85, 0.88, 0.95, 0.8],
+        )
+        .build();
+        ui.same_line();
+        ui.text_disabled(status);
+    }
+
+    /// 保留的距离/倾斜四档条；X/Y 位置条已被连续空间分析取代。
+    fn retained_coverage_bar(&self, ui: &imgui::Ui, label: &str, bins: &[bool], width: f32) {
+        ui.text(label);
         const LABEL_COLUMN: f32 = 76.0;
         ui.same_line();
         let cursor = ui.cursor_pos();
@@ -536,7 +724,7 @@ impl App {
         .build();
         let filled = bins.iter().filter(|filled| **filled).count();
         ui.same_line();
-        ui.text_disabled(&format!("{filled}/{}", bins.len()));
+        ui.text_disabled(format!("{filled}/{}", bins.len()));
     }
 
     fn show_preview_card(&mut self, ui: &imgui::Ui, slot_index: usize, channel: u16, label: &str) {
@@ -552,13 +740,23 @@ impl App {
 
         match (slot.id, slot.width, slot.height) {
             (Some(id), width, height) if width > 0 && height > 0 => {
-                // DrawList 使用屏幕绝对坐标；fit_rect 返回 child 内的相对偏移。
                 let origin = ui.cursor_screen_pos();
                 let (offset_min, offset_max) = fit_rect(area, width, height);
                 let min = [origin[0] + offset_min[0], origin[1] + offset_min[1]];
                 let max = [origin[0] + offset_max[0], origin[1] + offset_max[1]];
+                let size = [max[0] - min[0], max[1] - min[1]];
+                let heatmap_id = self.heatmap[slot_index].image_id(
+                    &channel_state.quality.heatmap,
+                    width,
+                    height,
+                );
+                // 严格同一 fit_rect：video Image → 平滑 heatmap Image → 既有 draw-list overlay。
                 ui.set_cursor_screen_pos(min);
-                imgui::Image::new(id, [max[0] - min[0], max[1] - min[1]]).build(ui);
+                imgui::Image::new(id, size).build(ui);
+                if let Some(heatmap_id) = heatmap_id {
+                    ui.set_cursor_screen_pos(min);
+                    imgui::Image::new(heatmap_id, size).build(ui);
+                }
                 let draw = ui.get_window_draw_list();
                 if let Some(overlay) = self.controller.overlay(channel) {
                     draw_overlay(&draw, &overlay, min, max);
@@ -885,7 +1083,8 @@ impl App {
         changed |= ui.input_text("日期", &mut day).build();
         changed |= ui.combo_simple_string("光轴等级", &mut axis, &SnidDraft::AXES);
         // 序列号步进按钮：十进制 -1 / +1，有效范围 1..=3844（两位 base62 上限）。
-        changed |= ui.input_text("序列号", &mut sequence).width(120.0).build();
+        ui.set_next_item_width(120.0);
+        changed |= ui.input_text("序列号", &mut sequence).build();
         ui.same_line();
         if ui.small_button(format!("-1##seq_{index}")) {
             if let Ok(value) = sequence.trim().parse::<u16>() {
@@ -928,6 +1127,89 @@ impl App {
         };
         ui.text_colored(if preview_ok { theme::OK } else { theme::WARN }, preview);
     }
+}
+
+fn rgba_byte_len(width: u32, height: u32) -> Option<usize> {
+    usize::try_from(width)
+        .ok()?
+        .checked_mul(usize::try_from(height).ok()?)
+        .and_then(|pixels| pixels.checked_mul(4))
+}
+
+/// 零密度仍保留微弱红色，既能表意又不会遮挡原始视频；充分密度更不透明。
+const HEATMAP_ZERO_ALPHA: f32 = 0.16;
+const HEATMAP_SUFFICIENT_ALPHA: f32 = 0.44;
+
+/// 将低分辨率连续密度场按双线性插值平滑采样为与视频同尺寸的 RGBA8 纹理。
+fn rasterize_density_heatmap(
+    heatmap: &DensityHeatmap,
+    width: u32,
+    height: u32,
+    output: &mut Vec<u8>,
+) -> bool {
+    if !heatmap.is_valid() {
+        return false;
+    }
+    let (Some(byte_len), Ok(output_width), Ok(output_height)) = (
+        rgba_byte_len(width, height),
+        usize::try_from(width),
+        usize::try_from(height),
+    ) else {
+        return false;
+    };
+    if output_width == 0 || output_height == 0 {
+        return false;
+    }
+    output.resize(byte_len, 0);
+    let width_f = width as f32;
+    let height_f = height as f32;
+    for y in 0..output_height {
+        let v = (y as f32 + 0.5) / height_f;
+        for x in 0..output_width {
+            let u = (x as f32 + 0.5) / width_f;
+            let density = sample_density_bilinear(heatmap, u, v);
+            let red_to_green = [
+                theme::ERR[0] + (theme::OK[0] - theme::ERR[0]) * density,
+                theme::ERR[1] + (theme::OK[1] - theme::ERR[1]) * density,
+                theme::ERR[2] + (theme::OK[2] - theme::ERR[2]) * density,
+            ];
+            let alpha =
+                HEATMAP_ZERO_ALPHA + (HEATMAP_SUFFICIENT_ALPHA - HEATMAP_ZERO_ALPHA) * density;
+            let index = (y * output_width + x) * 4;
+            output[index] = rgba_channel(red_to_green[0]);
+            output[index + 1] = rgba_channel(red_to_green[1]);
+            output[index + 2] = rgba_channel(red_to_green[2]);
+            output[index + 3] = rgba_channel(alpha);
+        }
+    }
+    true
+}
+
+/// 以密度网格单元中心为采样点，在边界钳制后进行双线性插值。
+fn sample_density_bilinear(heatmap: &DensityHeatmap, u: f32, v: f32) -> f32 {
+    let max_col = heatmap.cols.saturating_sub(1);
+    let max_row = heatmap.rows.saturating_sub(1);
+    let source_x = (u * heatmap.cols as f32 - 0.5).clamp(0.0, max_col as f32);
+    let source_y = (v * heatmap.rows as f32 - 0.5).clamp(0.0, max_row as f32);
+    let left = source_x.floor() as usize;
+    let top = source_y.floor() as usize;
+    let right = (left + 1).min(max_col);
+    let bottom = (top + 1).min(max_row);
+    let tx = source_x - left as f32;
+    let ty = source_y - top as f32;
+    let at = |col: usize, row: usize| heatmap.samples[row * heatmap.cols + col];
+    let upper = at(left, top) + (at(right, top) - at(left, top)) * tx;
+    let lower = at(left, bottom) + (at(right, bottom) - at(left, bottom)) * tx;
+    let density = upper + (lower - upper) * ty;
+    if density.is_finite() {
+        density.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn rgba_channel(value: f32) -> u8 {
+    (value.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
 /// 在 `avail` 区域内按原比例缩放显示 `width×height` 图像，返回窗口坐标矩形。

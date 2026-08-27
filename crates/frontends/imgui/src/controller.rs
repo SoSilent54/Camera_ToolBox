@@ -112,6 +112,8 @@ pub struct PreviewChannelState {
     pub status: String,
     pub overlay_text: String,
     pub overlay_color: [f32; 4],
+    /// 采集质量快照（worker 转发，Step 2 指示器展示）。
+    pub quality: preview::DatasetQuality,
 }
 
 impl PreviewChannelState {
@@ -120,6 +122,7 @@ impl PreviewChannelState {
             status: status.to_owned(),
             overlay_text: "未连接".to_owned(),
             overlay_color: theme::WARN,
+            quality: preview::DatasetQuality::default(),
         }
     }
 }
@@ -293,11 +296,6 @@ impl SnidDraft {
                 Err(error)
             }
         }
-    }
-
-    pub fn clear_sequence(&mut self) {
-        self.sequence.clear();
-        let _ = self.refresh_preview();
     }
 }
 
@@ -666,12 +664,11 @@ impl CalibController {
         self.state.preview = PreviewState::default();
         self.state.solve = SolveState::default();
         self.state.eeprom.status_ok = true;
-        self.state.eeprom.status = "已 Reset：保留设备 IP/SSH 与型号/日期/光轴等级；已清空两路序列号、dataset 与标定结果。".to_owned();
+        self.state.eeprom.status =
+            "已 Reset：保留设备 IP/SSH 与 SNID 输入；已清空 dataset 与标定结果。".to_owned();
         self.state.eeprom.inspect_enabled = false;
         self.state.eeprom.write_enabled = false;
         self.state.eeprom.write_armed = false;
-        self.state.eeprom.ch0_snid.clear_sequence();
-        self.state.eeprom.ch3_snid.clear_sequence();
         if let Ok(mut slot) = self.ch0_overlay_slot.lock() {
             *slot = None;
         }
@@ -743,16 +740,18 @@ impl CalibController {
         let Some(streams) = self.streams.as_ref() else {
             return;
         };
-        let (text0, count0, hold0) = streams.ch0.guide();
+        let (text0, _count0, hold0, quality0) = streams.ch0.guide();
         if !text0.is_empty() {
             self.state.preview.ch0.overlay_text = text0;
-            self.state.preview.ch0.overlay_color = overlay_color(count0, hold0);
+            self.state.preview.ch0.overlay_color = overlay_color(&quality0, hold0);
         }
-        let (text3, count3, hold3) = streams.ch3.guide();
+        self.state.preview.ch0.quality = quality0;
+        let (text3, _count3, hold3, quality3) = streams.ch3.guide();
         if !text3.is_empty() {
             self.state.preview.ch3.overlay_text = text3;
-            self.state.preview.ch3.overlay_color = overlay_color(count3, hold3);
+            self.state.preview.ch3.overlay_color = overlay_color(&quality3, hold3);
         }
+        self.state.preview.ch3.quality = quality3;
     }
 
     fn finish_pending_task(&mut self) {
@@ -1145,8 +1144,8 @@ fn history_result_label(result: &Result<String, String>) -> String {
     }
 }
 
-fn overlay_color(count: usize, hold: u8) -> [f32; 4] {
-    if count >= preview::CAPTURE_TARGET || hold >= preview::HOLD_TARGET {
+fn overlay_color(quality: &preview::DatasetQuality, hold: u8) -> [f32; 4] {
+    if quality.is_complete() || hold >= preview::HOLD_TARGET {
         theme::OK
     } else if hold > 0 {
         theme::WARN

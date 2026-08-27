@@ -1,14 +1,13 @@
-//! 双路 RTSP 预览与 guided 自动采集。
+//! 双路 RTSP 预览与稳定检测自动采集。
 //!
-//! 预览/引导：RTSP H.264 解码帧用于实时显示、棋盘检测和 guide pose 评估。
+//! 预览：RTSP H.264 解码帧用于实时显示与棋盘检测；检测到棋盘后按帧间
+//! 位姿抖动（jitter）做稳定判定，连续 hold 满 `HOLD_TARGET` 帧即触发采集。
 //! dataset：真实 X5 采集在 hold 通过后按 RTSP SEI `timestamp_ns` 从 TCP 9073
 //! 精确回查同源 NV12/YUV 原图；合成模式仅用于本机 UI 测试，保留 RGBA→luma fallback。
-//! 无板验证：`PONGBOT_SYNTH=1` 用非棋盘合成帧（保证检测失败，验证引导路径）。
-
-use crate::guide_overlay::{
-    OverlayData, OverlayGridLine, OverlayPoseArrow, OverlayRotationArc, OverlayRotationRings,
-    OverlayStatus,
-};
+//! 无板验证：`PONGBOT_SYNTH=1` 用非棋盘合成帧（保证检测失败，验证采集链路）。
+//! 采集质量：每张已采帧的全部内角点写入连续密度场；中心、四边和四角的
+//! 密度证据与既有距离/倾斜 4 档共同决定完成。近重复位姿在 TCP 抓原图前拒绝。
+use crate::guide_overlay::{DensityHeatmap, OverlayData, OverlayStatus};
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::media::FfmpegRtspTransport;
 use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
@@ -26,30 +25,162 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// 每路目标覆盖位姿数：15 张正视 raster + 8 张中距倾斜环绕 + 4 张远距四角。
-pub const CAPTURE_TARGET: usize = 27;
-/// guide auto_capture 的 hold 稳定帧数（黄 1/3 → 绿 3/3）。
+/// 保留的距离（投影尺寸）和倾斜覆盖档数。
+const DEPTH_COVERAGE_BINS: usize = 4;
+const SKEW_COVERAGE_BINS: usize = 4;
+const SPATIAL_EDGE_COUNT: usize = 4;
+const SPATIAL_CORNER_COUNT: usize = 4;
+/// 连续密度场的固定分辨率；只保存累计场，不保存角点历史。
+const DENSITY_COLS: usize = 64;
+const DENSITY_ROWS: usize = 36;
+const DENSITY_KERNEL_SIGMA: f64 = 0.035;
+/// 单个角点高斯核的峰值，也是空间区域的充分密度阈值。
+const DENSITY_SUFFICIENT: f32 = 1.0;
+/// 中心区域半径占图像半对角线的比例。
+const CENTER_RADIUS: f64 = 0.30;
+/// 边缘和四角区域只接受接近画面外围的角点。
+const OUTER_RADIUS_THRESHOLD: f64 = 0.80;
+/// 归一化图像坐标中的边缘/角落带宽。
+const OUTER_REGION_BAND: f64 = 0.20;
+/// 仅保留有限个已采视角摘要，保证去重累加器内存有上界。
+const MAX_VIEW_SUMMARIES: usize = 64;
+/// 小于该既有姿态 jitter 分数时，视为近重复视角。
+const DUPLICATE_VIEW_JITTER_LIMIT: f64 = 0.40;
+/// 稳定检测的 hold 连续帧数（满则触发采集）。
 pub const HOLD_TARGET: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
 const GUIDED_HOLD_JITTER_Z_LIMIT: f64 = 0.04;
 const GUIDED_HOLD_JITTER_RPY_DEGREES: f64 = 2.0;
-const GUIDED_POSE_X_TOLERANCE: f64 = 0.15;
-const GUIDED_POSE_Y_TOLERANCE: f64 = 0.15;
-const GUIDED_POSE_Z_TOLERANCE: f64 = 0.30;
-const GUIDED_POSE_ROLL_TOLERANCE_DEGREES: f64 = 15.0;
-const GUIDED_POSE_PITCH_TOLERANCE_DEGREES: f64 = 15.0;
-const GUIDED_POSE_YAW_TOLERANCE_DEGREES: f64 = 15.0;
-const GUIDED_POSE_MATCH_SCORE_LIMIT: f64 = 1.0;
-const GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS: usize = 12;
-const GUIDED_POSE_RING_SEGMENTS: usize = 96;
-const GUIDED_POSE_HALF_RING_SEGMENTS: usize = 48;
-const GUIDED_POSE_RING_SMALL_ERROR_GAIN: f32 = 5.0;
-const GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES: f32 = 12.0;
 /// 采集 worker 检测节拍。
 const DETECT_INTERVAL: Duration = Duration::from_millis(150);
+/// 成功拍摄后角点 overlay 保留显示时长（确认触发瞬间采到的棋盘姿态）。
+const CAPTURE_CORNERS_DISPLAY: Duration = Duration::from_millis(1500);
 
 /// X5 TCP 控制端口；RTSP 只做引导，dataset 通过该端口抓同源 NV12 原图。
 const X5_TCP_CONTROL_PORT: u16 = 9073;
+
+/// 数据集质量的 UI 快照。
+///
+/// 空间证据来自全部已接受内角点的连续密度累加；距离和倾斜则保留原有四档
+/// 覆盖语义。没有帧数、尺度比或姿态族的额外完成门限。
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatasetQuality {
+    /// 已接受且已写入 dataset 的帧数，仅用于引导文本与诊断，不是完成门限。
+    pub accepted_frames: usize,
+    pub heatmap: DensityHeatmap,
+    /// 指定中心半径内的累计密度。
+    pub center_density: f32,
+    /// 左、右、上、下四个外缘区域的累计密度。
+    pub edge_density: [f32; SPATIAL_EDGE_COUNT],
+    /// 左上、右上、右下、左下四个外围角落的累计密度。
+    pub corner_density: [f32; SPATIAL_CORNER_COUNT],
+    /// 保留的投影尺寸（远→近）四档覆盖。
+    pub depth: [bool; DEPTH_COVERAGE_BINS],
+    /// 保留的板法线倾角（正视→大倾）四档覆盖。
+    pub skew: [bool; SKEW_COVERAGE_BINS],
+}
+
+impl Default for DatasetQuality {
+    fn default() -> Self {
+        Self {
+            accepted_frames: 0,
+            heatmap: DensityHeatmap::zeroed(DENSITY_COLS, DENSITY_ROWS),
+            center_density: 0.0,
+            edge_density: [0.0; SPATIAL_EDGE_COUNT],
+            corner_density: [0.0; SPATIAL_CORNER_COUNT],
+            depth: [false; DEPTH_COVERAGE_BINS],
+            skew: [false; SKEW_COVERAGE_BINS],
+        }
+    }
+}
+
+impl DatasetQuality {
+    /// 连续空间、保留距离和保留倾斜证据全部充分时结束采集。
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.center_complete()
+            && self.edges_complete()
+            && self.corners_complete()
+            && self.depth.iter().all(|covered| *covered)
+            && self.skew.iter().all(|covered| *covered)
+    }
+
+    #[must_use]
+    pub fn center_complete(&self) -> bool {
+        self.center_density >= DENSITY_SUFFICIENT
+    }
+
+    #[must_use]
+    pub fn edges_complete(&self) -> bool {
+        self.edge_density
+            .iter()
+            .all(|density| *density >= DENSITY_SUFFICIENT)
+    }
+
+    #[must_use]
+    pub fn corners_complete(&self) -> bool {
+        self.corner_density
+            .iter()
+            .all(|density| *density >= DENSITY_SUFFICIENT)
+    }
+
+    #[must_use]
+    pub fn center_progress(&self) -> f32 {
+        density_progress(self.center_density)
+    }
+
+    #[must_use]
+    pub fn edge_progress(&self) -> f32 {
+        self.edge_density
+            .iter()
+            .map(|density| density_progress(*density))
+            .sum::<f32>()
+            / SPATIAL_EDGE_COUNT as f32
+    }
+
+    #[must_use]
+    pub fn corner_progress(&self) -> f32 {
+        self.corner_density
+            .iter()
+            .map(|density| density_progress(*density))
+            .sum::<f32>()
+            / SPATIAL_CORNER_COUNT as f32
+    }
+
+    #[must_use]
+    pub fn covered_edges(&self) -> usize {
+        self.edge_density
+            .iter()
+            .filter(|density| **density >= DENSITY_SUFFICIENT)
+            .count()
+    }
+
+    #[must_use]
+    pub fn covered_corners(&self) -> usize {
+        self.corner_density
+            .iter()
+            .filter(|density| **density >= DENSITY_SUFFICIENT)
+            .count()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct AcceptedViewSummary {
+    xyz: [f64; 3],
+    rpy_degrees: [f64; 3],
+}
+
+/// 单路常量内存的角点质量累加器。
+struct CornerDensityMap {
+    field: Vec<f32>,
+    center_density: f32,
+    edge_density: [f32; SPATIAL_EDGE_COUNT],
+    corner_density: [f32; SPATIAL_CORNER_COUNT],
+    depth: [bool; DEPTH_COVERAGE_BINS],
+    skew: [bool; SKEW_COVERAGE_BINS],
+    views: Vec<AcceptedViewSummary>,
+    accepted_frames: usize,
+}
 
 /// 进入标定 dataset 的权威帧：真实设备为 TCP NV12 的 Y plane，合成模式为 RGBA 转 luma。
 #[derive(Clone, Debug, PartialEq)]
@@ -79,15 +210,16 @@ enum DatasetCaptureSource {
     },
 }
 
-/// worker → 主线程的引导状态。
 #[derive(Clone, Debug, Default)]
 pub struct GuideState {
-    /// overlay 引导文本（未检测到棋盘 / 姿态重复 / 已覆盖 N 位姿）。
+    /// overlay 引导文本（未检测到棋盘 / 空间与距离倾斜质量状态）。
     pub text: String,
-    /// 已采位姿数。
+    /// 已采帧数。
     pub captured_count: usize,
     /// 当前 hold 计数（0 = 未 hold）。
     pub hold: u8,
+    /// 数据集质量快照（worker 每次接受帧后更新）。
+    pub quality: DatasetQuality,
 }
 
 /// 单路 RTSP 流：解码器 + 帧槽 + guided 采集。
@@ -105,7 +237,6 @@ pub struct RtspStream {
     overlay: Arc<Mutex<Option<OverlayData>>>,
     /// 引导状态（worker 写，主线程读）。
     guide_state: Arc<Mutex<GuideState>>,
-    target: usize,
     detect_started: bool,
     /// RTSP 解码失败信息（pump 检查 completion 写入，worker 读取显示）。
     rtsp_error: Arc<Mutex<Option<String>>>,
@@ -155,23 +286,35 @@ impl RtspStream {
         let slot = Arc::new(LatestDecodedFrameSlot::default());
         let worker_slot = Arc::clone(&slot);
         std::thread::spawn(move || {
-            let (width, height) = (640u32, 360u32);
+            let (width, height) = (960u32, 540u32);
             let mut seed = u64::from(channel) + 1;
             let board_mode = std::env::var("PONGBOT_SYNTH").is_ok_and(|v| v == "board");
             let mut tick = 0u32;
             loop {
                 let mut rgba = Vec::with_capacity((width * height * 4) as usize);
                 if board_mode {
-                    // 合成棋盘（12x9 格 = 11x8 内角点），随 tick 平移模拟位姿变化。
-                    let cell = 32i32;
+                    // 合成棋盘（12x9 格 = 11x8 内角点）：四阶段自动动作模拟标定覆盖，
+                    // X 平移 → Y 平移 → 尺寸缩放 → 倾斜；每阶段 60 步（400ms/步 ≈ 24s），
+                    // 四阶段约 96s 扫完 18 bin 全覆盖（无板验证全流程）。
                     let cols = 12i32;
                     let rows = 9i32;
-                    // 姿态变化放慢（每 4 tick 一次 ≈ 1.2s 周期），hold 窗口内保持稳定。
                     let slow = tick / 4;
-                    let ox = ((width as i32 - cols * cell) / 2) + ((slow % 60) as i32 - 30);
-                    let oy = ((height as i32 - rows * cell) / 2) + ((slow % 40) as i32 - 20);
-                    // 错切模拟旋转：改变棋盘几何 → rvec 变化 → 新姿态。
-                    let shear = ((slow % 30) as i32 - 15) as f32 / 60.0;
+                    let stage_len = 60u32;
+                    let phase = (slow / stage_len) % 4;
+                    let t = (slow % stage_len) as f32 / (stage_len - 1) as f32;
+                    let (center_x, center_y, cell, shear) = match phase {
+                        // X 扫描：小棋盘（宽 192px）横向扫过 10%..90% → X 5 bin 全覆盖。
+                        0 => (0.1 + 0.8 * t, 0.5, 16.0, 0.0),
+                        // Y 扫描：棋盘高 144px，纵向扫过 15%..85% → Y 5 bin 全覆盖。
+                        1 => (0.5, 0.15 + 0.7 * t, 16.0, 0.0),
+                        // 尺寸：cell 13→54（棋盘占画面 0.16..0.68）→ Size 4 bin。
+                        2 => (0.5, 0.5, 13.0 + 41.0 * t, 0.0),
+                        // 倾斜：shear 0→0.75（板法线与光轴夹角 0..37°）→ Skew 4 bin。
+                        _ => (0.5, 0.5, 32.0, 0.75 * t),
+                    };
+                    let cell = cell as i32;
+                    let ox = (center_x * width as f32 - (cols * cell) as f32 * 0.5) as i32;
+                    let oy = (center_y * height as f32 - (rows * cell) as f32 * 0.5) as i32;
                     for y in 0..height as i32 {
                         for x in 0..width as i32 {
                             let sx = (x as f32 + shear * (y - oy) as f32) as i32;
@@ -239,11 +382,10 @@ impl RtspStream {
             slot,
             last: None,
             capturing: Arc::new(AtomicBool::new(false)),
-            captured: Arc::new(Mutex::new(Vec::with_capacity(CAPTURE_TARGET))),
-            poses: Arc::new(Mutex::new(Vec::with_capacity(CAPTURE_TARGET))),
+            captured: Arc::new(Mutex::new(Vec::new())),
+            poses: Arc::new(Mutex::new(Vec::new())),
             overlay: overlay_slot,
             guide_state: Arc::new(Mutex::new(GuideState::default())),
-            target: CAPTURE_TARGET,
             detect_started: false,
             rtsp_error: Arc::new(Mutex::new(None)),
             capture_source,
@@ -299,9 +441,8 @@ impl RtspStream {
         let guide = Arc::clone(&self.guide_state);
         let rtsp_error = Arc::clone(&self.rtsp_error);
         let capture_source = self.capture_source.clone();
-        let target = self.target;
         std::thread::spawn(move || {
-            guided_capture_loop(
+            capture_loop(
                 capturing,
                 slot,
                 captured,
@@ -311,27 +452,31 @@ impl RtspStream {
                 rtsp_error,
                 capture_source,
                 board,
-                target,
             );
         });
     }
 
-    /// 读取引导状态（主线程）。
-    pub fn guide(&self) -> (String, usize, u8) {
+    /// 读取引导状态（主线程）：文本、已采帧数、hold、质量快照。
+    pub fn guide(&self) -> (String, usize, u8, DatasetQuality) {
         let state = self
             .guide_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        (state.text.clone(), state.captured_count, state.hold)
+        (
+            state.text.clone(),
+            state.captured_count,
+            state.hold,
+            state.quality.clone(),
+        )
     }
 
-    /// 是否达到目标位姿数。
+    /// 是否满足连续空间与保留距离/倾斜覆盖质量。
     pub fn complete(&self) -> bool {
-        let poses = self
-            .poses
+        let state = self
+            .guide_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        poses.len() >= self.target
+        state.quality.is_complete()
     }
 
     /// 取已采 dataset 帧（solve 用；真实设备为 TCP NV12/Y plane）。
@@ -342,30 +487,6 @@ impl RtspStream {
             .clone()
     }
 }
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GuidedPoseTolerance {
-    x: f64,
-    y: f64,
-    z: f64,
-    roll_degrees: f64,
-    pitch_degrees: f64,
-    yaw_degrees: f64,
-}
-
-impl Default for GuidedPoseTolerance {
-    fn default() -> Self {
-        Self {
-            x: GUIDED_POSE_X_TOLERANCE,
-            y: GUIDED_POSE_Y_TOLERANCE,
-            z: GUIDED_POSE_Z_TOLERANCE,
-            roll_degrees: GUIDED_POSE_ROLL_TOLERANCE_DEGREES,
-            pitch_degrees: GUIDED_POSE_PITCH_TOLERANCE_DEGREES,
-            yaw_degrees: GUIDED_POSE_YAW_TOLERANCE_DEGREES,
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct GuidedPose6Dof {
     /// 棋盘中心在相机坐标系下的 XYZ；单位继承 BoardSpec::square_size。
@@ -379,15 +500,6 @@ struct GuidedPose6Dof {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-struct GuidedPoseTarget {
-    label: &'static str,
-    pose: GuidedPose6Dof,
-    tolerance: GuidedPoseTolerance,
-    outline_uv: [[f32; 2]; 4],
-    grid_lines: Vec<OverlayGridLine>,
-}
-
-#[derive(Clone, Debug, PartialEq)]
 struct GuidedPoseMeasurement {
     pose: GuidedPose6Dof,
     board: BoardSpec,
@@ -395,132 +507,9 @@ struct GuidedPoseMeasurement {
     image_size: CalibrationImageSize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct GuidedPoseError {
-    x: f64,
-    y: f64,
-    z: f64,
-    roll_degrees: f64,
-    pitch_degrees: f64,
-    yaw_degrees: f64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct GuidedPoseAssessment {
-    step_index: usize,
-    target_label: &'static str,
-    measurement: GuidedPoseMeasurement,
-    error: GuidedPoseError,
-    signed_rotation_error_degrees: [f64; 3],
-    pose_error_score: f64,
-    matched: bool,
-    reason: Option<String>,
-}
-
-struct GuidedHoldSample {
-    frame: Arc<DecodedVideoFrame>,
-    pose_vector: [f64; 3],
-    stability_score: f64,
-}
-
-struct GuidedCaptureRuntime {
-    plan: Vec<GuidedPoseTarget>,
-    current_step: usize,
-    hold_frames: u8,
-    last_hold_measurement: Option<GuidedPoseMeasurement>,
-    best_hold_sample: Option<GuidedHoldSample>,
-}
-
-impl GuidedCaptureRuntime {
-    fn standard_27(
-        board: BoardSpec,
-        initial_intrinsics: &InitialIntrinsics,
-        image_size: CalibrationImageSize,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            plan: standard_guided_pose_plan(board, initial_intrinsics, image_size)?,
-            current_step: 0,
-            hold_frames: 0,
-            last_hold_measurement: None,
-            best_hold_sample: None,
-        })
-    }
-
-    fn current_target(&self) -> Option<&GuidedPoseTarget> {
-        self.plan.get(self.current_step)
-    }
-
-    fn is_complete(&self) -> bool {
-        self.current_step >= self.plan.len()
-    }
-
-    fn current_step_label(&self) -> String {
-        match self.current_target() {
-            Some(target) => format!(
-                "动作 {} / {} · {}",
-                self.current_step + 1,
-                self.plan.len(),
-                target.label
-            ),
-            None => "guide auto_capture 完成".to_owned(),
-        }
-    }
-
-    fn update_hold(
-        &mut self,
-        mut assessment: GuidedPoseAssessment,
-        sample: GuidedHoldSample,
-    ) -> Option<GuidedHoldSample> {
-        if assessment.matched {
-            let jitter_score = self.last_hold_measurement.as_ref().map_or(0.0, |previous| {
-                guided_hold_jitter_score(previous, &assessment.measurement)
-            });
-            if jitter_score > 1.0 {
-                assessment.matched = false;
-                assessment.reason = Some(format!(
-                    "hold jitter {:.2} exceeds stability limit",
-                    jitter_score
-                ));
-                self.reset_hold();
-                return None;
-            }
-            self.hold_frames = self.hold_frames.saturating_add(1).min(HOLD_TARGET);
-            self.last_hold_measurement = Some(assessment.measurement.clone());
-            let mut sample = sample;
-            sample.stability_score = sample
-                .stability_score
-                .min(assessment.pose_error_score + jitter_score);
-            let replace_best = self
-                .best_hold_sample
-                .as_ref()
-                .is_none_or(|best| sample.stability_score < best.stability_score);
-            if replace_best {
-                self.best_hold_sample = Some(sample);
-            }
-            if self.hold_frames >= HOLD_TARGET {
-                return self.best_hold_sample.take();
-            }
-        } else {
-            self.reset_hold();
-        }
-        None
-    }
-
-    fn advance_after_commit(&mut self) {
-        self.current_step = self.current_step.saturating_add(1);
-        self.reset_hold();
-    }
-
-    fn reset_hold(&mut self) {
-        self.hold_frames = 0;
-        self.last_hold_measurement = None;
-        self.best_hold_sample = None;
-    }
-}
-
-/// guided 采集循环（worker 线程）：投影目标框 → 检测 → 姿态误差 → hold 选择最稳帧 → 下个动作。
+/// 稳定检测采集循环：hold 满后先拒绝无效/近重复视角，再抓 TCP 原图并更新连续质量。
 #[allow(clippy::too_many_arguments)]
-fn guided_capture_loop(
+fn capture_loop(
     capturing: Arc<AtomicBool>,
     slot: Arc<LatestDecodedFrameSlot>,
     captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
@@ -530,26 +519,25 @@ fn guided_capture_loop(
     rtsp_error: Arc<Mutex<Option<String>>>,
     capture_source: DatasetCaptureSource,
     board: BoardSpec,
-    target: usize,
 ) {
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
-    let mut runtime: Option<GuidedCaptureRuntime> = None;
-    let mut published_target_step: Option<usize> = None;
-    tracing::info!(
-        "guide auto_capture worker 已启动（27 动作：15 正视 + 8 倾斜 + 4 远距，hold {HOLD_TARGET} 帧）"
-    );
+    let mut hold_frames: u8 = 0;
+    let mut last_measurement: Option<GuidedPoseMeasurement> = None;
+    let mut density = CornerDensityMap::new();
+    let mut quality = DatasetQuality::default();
+    let mut last_capture: Option<(std::time::Instant, Vec<[f32; 2]>)> = None;
+    tracing::info!("稳定检测采集 worker 已启动（hold {HOLD_TARGET} 帧，连续空间 + 距离/倾斜质量）");
     loop {
-        if runtime
-            .as_ref()
-            .is_some_and(GuidedCaptureRuntime::is_complete)
-        {
-            let count = runtime.as_ref().map_or(target, |rt| rt.plan.len());
-            set_guide(
+        if quality.is_complete() {
+            set_guide_quality(
                 &guide,
-                &format!("已完成 {count}/{count} guide 动作，采集完成"),
-                count,
+                &format!(
+                    "采集质量完成（已采 {} 张），采集结束",
+                    quality.accepted_frames
+                ),
                 0,
+                &quality,
             );
             break;
         }
@@ -559,14 +547,14 @@ fn guided_capture_loop(
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .clone();
             if let Some(error) = error {
-                set_guide(
+                set_guide_quality(
                     &guide,
                     &format!("RTSP 无帧：{error}（检查板端 DEMO233）"),
                     0,
-                    0,
+                    &quality,
                 );
             } else {
-                set_guide(&guide, "等待 RTSP 帧…", 0, 0);
+                set_guide_quality(&guide, "等待 RTSP 帧…", 0, &quality);
             }
             std::thread::sleep(DETECT_INTERVAL);
             continue;
@@ -577,43 +565,24 @@ fn guided_capture_loop(
             height: frame.height,
         };
         let initial = default_initial_intrinsics(frame.width, frame.height);
-        if runtime.is_none() {
-            match GuidedCaptureRuntime::standard_27(board, &initial, image_size) {
-                Ok(rt) => runtime = Some(rt),
-                Err(error) => {
-                    set_guide(&guide, &format!("guide 目标投影失败：{error}"), 0, 0);
-                    std::thread::sleep(DETECT_INTERVAL);
-                    continue;
-                }
-            }
-        }
-        let rt = runtime.as_mut().expect("runtime initialized");
-        let Some(target_pose) = rt.current_target().cloned() else {
-            continue;
-        };
-        if published_target_step != Some(rt.current_step) {
-            publish_target_overlay(
-                &overlay,
-                frame.width,
-                frame.height,
-                &target_pose,
-                None,
-                None,
-            );
-            published_target_step = Some(rt.current_step);
-        }
+        // 拍摄角点 overlay：拍摄后短暂保留显示，供确认触发瞬间的棋盘姿态。
+        let captured_corners = last_capture
+            .as_ref()
+            .filter(|(time, _)| time.elapsed() < CAPTURE_CORNERS_DISPLAY)
+            .map(|(_, corners)| {
+                (
+                    usize::from(board.inner_cols),
+                    usize::from(board.inner_rows),
+                    corners.clone(),
+                )
+            });
 
         let (detect_rgba, detect_w, detect_h, detect_scale) =
             resize_for_detect(&frame.rgba, frame.width, frame.height);
         let png = match encode_png(&detect_rgba, detect_w, detect_h) {
             Ok(png) => png,
             Err(error) => {
-                set_guide(
-                    &guide,
-                    &format!("PNG 编码失败：{error}"),
-                    rt.current_step,
-                    0,
-                );
+                set_guide_quality(&guide, &format!("PNG 编码失败：{error}"), 0, &quality);
                 std::thread::sleep(DETECT_INTERVAL);
                 continue;
             }
@@ -627,9 +596,9 @@ fn guided_capture_loop(
                 let corners: Vec<CalibrationPoint> = detection
                     .corners
                     .iter()
-                    .map(|c| CalibrationPoint {
-                        x: c.x / detect_scale,
-                        y: c.y / detect_scale,
+                    .map(|corner| CalibrationPoint {
+                        x: corner.x / detect_scale,
+                        y: corner.y / detect_scale,
                     })
                     .collect();
                 let detection = ChessboardDetection {
@@ -639,687 +608,483 @@ fn guided_capture_loop(
                 let view = match backend.estimate_pose(&detection, &initial, board, &cancellation) {
                     Ok(view) => view,
                     Err(error) => {
-                        set_guide(
+                        hold_frames = 0;
+                        last_measurement = None;
+                        set_guide_quality(
                             &guide,
                             &format!("检测到棋盘，姿态估计失败：{error}"),
-                            rt.current_step,
                             0,
+                            &quality,
                         );
                         std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
-                let assessment = match assess_guided_pose(
-                    rt.current_step,
-                    &target_pose,
-                    &detection,
-                    &view,
-                    board,
-                    &initial,
-                    image_size,
-                ) {
-                    Ok(assessment) => assessment,
+                let measurement = match guided_pose_measurement(&view, board, &initial, image_size)
+                {
+                    Ok(measurement) => measurement,
                     Err(error) => {
-                        set_guide(
-                            &guide,
-                            &format!("guide 姿态评估失败：{error}"),
-                            rt.current_step,
-                            0,
-                        );
+                        hold_frames = 0;
+                        last_measurement = None;
+                        set_guide_quality(&guide, &format!("棋盘位姿无效：{error}"), 0, &quality);
                         std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
-                let status = guided_pose_status_overlay(&assessment, rt.hold_frames);
-                publish_target_overlay(
+                publish_overlay(
                     &overlay,
                     frame.width,
                     frame.height,
-                    &target_pose,
-                    Some(&assessment),
-                    Some(status.clone()),
+                    Some(&measurement),
+                    Some(hold_frames),
+                    captured_corners.clone(),
                 );
 
-                let step_label = rt.current_step_label();
                 if !capturing.load(Ordering::Acquire) {
-                    set_guide(
+                    set_guide_quality(&guide, "等待自动采集启动…", 0, &quality);
+                    std::thread::sleep(DETECT_INTERVAL);
+                    continue;
+                }
+
+                let jitter_score = last_measurement.as_ref().map_or(0.0, |previous| {
+                    guided_hold_jitter_score(previous, &measurement)
+                });
+                if jitter_score > 1.0 {
+                    hold_frames = 0;
+                    last_measurement = None;
+                    set_guide_quality(
                         &guide,
-                        &format!("{step_label} · 等待自动采集启动"),
-                        rt.current_step,
+                        &format!("棋盘在移动（jitter {jitter_score:.2}），请保持稳定"),
                         0,
+                        &quality,
                     );
                     std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
-                let sample = GuidedHoldSample {
-                    frame: frame.clone(),
-                    pose_vector: view.rotation_vector,
-                    stability_score: assessment.pose_error_score,
+                hold_frames = hold_frames.saturating_add(1).min(HOLD_TARGET);
+                last_measurement = Some(measurement.clone());
+                if hold_frames < HOLD_TARGET {
+                    set_guide_quality(
+                        &guide,
+                        &format!("已检测棋盘，保持稳定 {hold_frames}/{HOLD_TARGET}"),
+                        hold_frames,
+                        &quality,
+                    );
+                    std::thread::sleep(DETECT_INTERVAL);
+                    continue;
+                }
+                if !density.has_usable_corners(&detection) {
+                    hold_frames = 0;
+                    last_measurement = None;
+                    set_guide_quality(&guide, "检测角点无效，未抓取原图", 0, &quality);
+                    std::thread::sleep(DETECT_INTERVAL);
+                    continue;
+                }
+                if density.is_near_duplicate(&measurement) {
+                    hold_frames = 0;
+                    last_measurement = None;
+                    set_guide_quality(
+                        &guide,
+                        "近重复视角已拒绝，请移动或转动棋盘后再保持稳定",
+                        0,
+                        &quality,
+                    );
+                    std::thread::sleep(DETECT_INTERVAL);
+                    continue;
+                }
+
+                // 去重通过后才允许抓 TCP 原图，避免重复数据进入 solver dataset。
+                let dataset_frame = match capture_dataset_frame(&capture_source, &frame) {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        hold_frames = 0;
+                        last_measurement = None;
+                        set_guide_quality(
+                            &guide,
+                            &format!("TCP YUV 原图抓取失败：{error}"),
+                            0,
+                            &quality,
+                        );
+                        std::thread::sleep(DETECT_INTERVAL);
+                        continue;
+                    }
                 };
-                let matched = assessment.matched;
-                let reason = assessment.reason.clone();
-                let error = assessment.error;
-                let captured_sample = rt.update_hold(assessment, sample);
-                if let Some(sample) = captured_sample {
-                    let dataset_frame = match capture_dataset_frame(&capture_source, &sample.frame)
-                    {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            rt.reset_hold();
-                            set_guide(
-                                &guide,
-                                &format!("{step_label} · TCP YUV 原图抓取失败：{error}"),
-                                rt.current_step,
-                                0,
-                            );
-                            std::thread::sleep(DETECT_INTERVAL);
-                            continue;
-                        }
-                    };
-                    {
-                        let mut captured = captured
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        captured.push(Arc::new(dataset_frame));
-                    }
-                    {
-                        let mut poses = poses
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner);
-                        poses.push(sample.pose_vector);
-                    }
-                    rt.advance_after_commit();
-                    let done = rt.current_step;
-                    if rt.is_complete() {
-                        set_guide(
-                            &guide,
-                            &format!("已完成 {done}/{done} guide 动作，采集完成"),
-                            done,
-                            0,
-                        );
-                    } else {
-                        set_guide(
-                            &guide,
-                            &format!(
-                                "已保存最稳帧 {done}/{} · 下一动作：{}",
-                                rt.plan.len(),
-                                rt.current_step_label()
-                            ),
-                            done,
-                            0,
-                        );
-                    }
-                } else if matched {
-                    set_guide(
+                {
+                    let mut captured = captured
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    captured.push(Arc::new(dataset_frame));
+                }
+                {
+                    let mut poses = poses
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    poses.push(view.rotation_vector);
+                }
+                let added = density.add_frame(&detection, &measurement);
+                debug_assert!(added);
+                quality = density.snapshot();
+
+                // 记录本次拍摄的角点（image 像素坐标）并立即发布 overlay 确认。
+                let corners_px: Vec<[f32; 2]> = detection
+                    .corners
+                    .iter()
+                    .map(|corner| [corner.x, corner.y])
+                    .collect();
+                last_capture = Some((std::time::Instant::now(), corners_px));
+                publish_overlay(
+                    &overlay,
+                    frame.width,
+                    frame.height,
+                    Some(&measurement),
+                    Some(HOLD_TARGET),
+                    last_capture.as_ref().map(|(_, corners)| {
+                        (
+                            usize::from(board.inner_cols),
+                            usize::from(board.inner_rows),
+                            corners.clone(),
+                        )
+                    }),
+                );
+                hold_frames = 0;
+                last_measurement = None;
+                if quality.is_complete() {
+                    set_guide_quality(
                         &guide,
                         &format!(
-                            "{step_label} · 对齐完成，请保持稳定 {}/{}",
-                            rt.hold_frames, HOLD_TARGET
+                            "采集质量完成（已采 {} 张），采集结束",
+                            quality.accepted_frames
                         ),
-                        rt.current_step,
-                        rt.hold_frames,
-                    );
-                } else {
-                    let reason =
-                        reason.unwrap_or_else(|| guided_pose_error_reason(&error, &target_pose));
-                    set_guide(
-                        &guide,
-                        &format!("{step_label} · {reason}"),
-                        rt.current_step,
                         0,
+                        &quality,
                     );
+                    break;
                 }
-            }
-            Ok(ChessboardDetectionOutcome::NotFound { .. }) => {
-                rt.reset_hold();
-                set_guide(
+                set_guide_quality(
                     &guide,
                     &format!(
-                        "{} · 未检测到棋盘，请把 11×8 / 40mm 棋盘移入黄框",
-                        rt.current_step_label()
+                        "已采集 {} 张 · {}",
+                        quality.accepted_frames,
+                        quality_missing_hint(&quality)
                     ),
-                    rt.current_step,
                     0,
+                    &quality,
+                );
+            }
+            Ok(ChessboardDetectionOutcome::NotFound { .. }) => {
+                hold_frames = 0;
+                last_measurement = None;
+                publish_overlay(
+                    &overlay,
+                    frame.width,
+                    frame.height,
+                    None,
+                    None,
+                    captured_corners.clone(),
+                );
+                set_guide_quality(
+                    &guide,
+                    "未检测到棋盘 · 请把 11×8 / 40mm 棋盘移入画面",
+                    0,
+                    &quality,
                 );
             }
             Err(error) => {
-                rt.reset_hold();
-                set_guide(&guide, &format!("检测失败：{error}"), rt.current_step, 0);
+                hold_frames = 0;
+                last_measurement = None;
+                publish_overlay(
+                    &overlay,
+                    frame.width,
+                    frame.height,
+                    None,
+                    None,
+                    captured_corners.clone(),
+                );
+                set_guide_quality(&guide, &format!("检测失败：{error}"), 0, &quality);
             }
         }
         std::thread::sleep(DETECT_INTERVAL);
     }
 }
 
-fn publish_target_overlay(
+/// 发布当前帧的 overlay 绘制数据（检测外框 + hold 状态 + 拍摄角点）。
+fn publish_overlay(
     overlay: &Arc<Mutex<Option<OverlayData>>>,
     width: u32,
     height: u32,
-    target: &GuidedPoseTarget,
-    assessment: Option<&GuidedPoseAssessment>,
-    status: Option<OverlayStatus>,
+    measurement: Option<&GuidedPoseMeasurement>,
+    hold_frames: Option<u8>,
+    captured_corners_px: Option<(usize, usize, Vec<[f32; 2]>)>,
 ) {
     if let Ok(mut slot) = overlay.lock() {
         *slot = Some(OverlayData {
             image_width: width as f32,
             image_height: height as f32,
-            detected_outline_px: assessment
-                .map(|assessment| detected_outline_pixels(&assessment.measurement)),
-            target_center_uv: Some(target.pose.center_uv),
-            target_outline_uv: Some(target.outline_uv),
-            target_grid_lines: target.grid_lines.clone(),
-            target_matched: assessment.is_some_and(|assessment| assessment.matched),
-            rotation_rings: assessment
-                .map(|assessment| guided_pose_rotation_rings_overlay(assessment, target)),
-            pose_arrow: assessment.map(|assessment| OverlayPoseArrow {
-                start_uv: assessment.measurement.pose.center_uv,
-                end_uv: target.pose.center_uv,
+            detected_outline_px: measurement.map(detected_outline_pixels),
+            status: hold_frames.map(|frames| OverlayStatus {
+                hold_frames: frames.min(HOLD_TARGET),
+                hold_target: HOLD_TARGET,
             }),
-            status,
+            captured_corners_px,
         });
     }
 }
 
-fn standard_guided_pose_plan(
-    board: BoardSpec,
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Result<Vec<GuidedPoseTarget>, String> {
-    const FRONTO_TZ_MM: f64 = 600.0;
-    const TILT_TZ_MM: f64 = 700.0;
-    const TILT_RING_RADIUS_MM: f64 = 80.0;
-    const TILT_DEGREES: f64 = 22.0;
-    const FAR_CENTER_Z_MM: f64 = 800.0;
-    const FAR_TILT_DEGREES: f64 = 45.0;
-
-    let tolerance = GuidedPoseTolerance::default();
-    let mut plan = Vec::with_capacity(CAPTURE_TARGET);
-    let matrix = initial_intrinsics.camera_matrix;
-    if matrix[0] <= 0.0 || matrix[4] <= 0.0 {
-        return Err("guided pose 初始内参 fx/fy 必须为正".to_owned());
-    }
-
-    let inner_width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
-    let inner_height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
-    let outer_width = f64::from(board.inner_cols + 1) * board.square_size;
-    let outer_height = f64::from(board.inner_rows + 1) * board.square_size;
-    let short_side = f64::from(image_size.width.min(image_size.height));
-    let image_width = f64::from(image_size.width);
-    let image_height = f64::from(image_size.height);
-    let fronto_scale = ((inner_width * matrix[0] / FRONTO_TZ_MM)
-        .max(inner_height * matrix[4] / FRONTO_TZ_MM))
-        / short_side;
-    let fronto_outer_width_uv = outer_width * matrix[0] / FRONTO_TZ_MM / image_width;
-    let fronto_outer_height_uv = outer_height * matrix[4] / FRONTO_TZ_MM / image_height;
-    if !(0.0..1.0).contains(&fronto_outer_width_uv) || !(0.0..1.0).contains(&fronto_outer_height_uv)
-    {
-        return Err("guided pose 正视外框尺寸超出画面，无法生成 3x5 边缘覆盖".to_owned());
-    }
-    let fronto_x_step = (1.0 - fronto_outer_width_uv) / 4.0;
-    let fronto_columns = [
-        fronto_outer_width_uv * 0.5,
-        fronto_outer_width_uv * 0.5 + fronto_x_step,
-        fronto_outer_width_uv * 0.5 + fronto_x_step * 2.0,
-        fronto_outer_width_uv * 0.5 + fronto_x_step * 3.0,
-        1.0 - fronto_outer_width_uv * 0.5,
-    ];
-    let fronto_rows = [
-        fronto_outer_height_uv * 0.5,
-        0.5,
-        1.0 - fronto_outer_height_uv * 0.5,
-    ];
-
-    let mut push_projected =
-        |label: &'static str, projection: GuidedPoseGridProjection| -> Result<(), String> {
-            plan.push(GuidedPoseTarget {
-                label,
-                pose: projection.pose,
-                tolerance,
-                outline_uv: projection.outline_uv,
-                grid_lines: projection.grid_lines,
-            });
-            Ok(())
-        };
-    let mut push_center_scale = |label: &'static str,
-                                 center_uv: [f64; 2],
-                                 scale: f64|
-     -> Result<(), String> {
-        let projection = guided_pose_grid_projection(
-            board,
-            center_uv,
-            scale,
-            0.0,
-            0.0,
-            initial_intrinsics,
-            image_size,
-        )
-        .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
-        push_projected(label, projection)
-    };
-
-    // Phase A: 正视 3x5 均匀分布。四角动作让外侧棋盘边缘贴到图像边缘，重叠率由分辨率和 12x9 外框比例反推。
-    for (row_index, row) in fronto_rows.iter().copied().enumerate() {
-        let column_order: [usize; 5] = if row_index % 2 == 0 {
-            [0, 1, 2, 3, 4]
-        } else {
-            [4, 3, 2, 1, 0]
-        };
-        for column_index in column_order {
-            let label = match (row_index, column_index) {
-                (0, 0) => "F01 Fronto upper left",
-                (0, 1) => "F02 Fronto upper mid-left",
-                (0, 2) => "F03 Fronto upper center",
-                (0, 3) => "F04 Fronto upper mid-right",
-                (0, 4) => "F05 Fronto upper right",
-                (1, 4) => "F06 Fronto middle right",
-                (1, 3) => "F07 Fronto middle mid-right",
-                (1, 2) => "F08 Fronto center",
-                (1, 1) => "F09 Fronto middle mid-left",
-                (1, 0) => "F10 Fronto middle left",
-                (2, 0) => "F11 Fronto lower left",
-                (2, 1) => "F12 Fronto lower mid-left",
-                (2, 2) => "F13 Fronto lower center",
-                (2, 3) => "F14 Fronto lower mid-right",
-                (2, 4) => "F15 Fronto lower right",
-                _ => return Err("guided pose 正视标签生成失败".to_owned()),
-            };
-            push_center_scale(label, [fronto_columns[column_index], row], fronto_scale)?;
-        }
-    }
-
-    // Phase B: 斜视绕环。直接用相机坐标系内角点中心 (tz, r) 和倾角 theta 生成目标，不再手调画面中心/scale。
-    let tilt_specs = [
-        ("T01 Tilt lower right", 315.0),
-        ("T02 Tilt right", 0.0),
-        ("T03 Tilt upper right", 45.0),
-        ("T04 Tilt top", 90.0),
-        ("T05 Tilt upper left", 135.0),
-        ("T06 Tilt left", 180.0),
-        ("T07 Tilt lower left", 225.0),
-        ("T08 Tilt bottom", 270.0),
-    ];
-    for (label, azimuth_degrees) in tilt_specs {
-        let azimuth = f64::to_radians(azimuth_degrees);
-        let rotation = guided_pose_rotation(TILT_DEGREES, azimuth_degrees);
-        let center_xyz = [
-            TILT_RING_RADIUS_MM * azimuth.cos(),
-            -TILT_RING_RADIUS_MM * azimuth.sin(),
-            TILT_TZ_MM,
-        ];
-        let translation = guided_pose_translation_for_center(board, rotation, center_xyz);
-        let projection = guided_pose_grid_projection_from_rotation_translation(
-            board,
-            rotation,
-            translation,
-            initial_intrinsics,
-            image_size,
-        )
-        .ok_or_else(|| format!("guided target '{label}' cannot be projected with current K/D12"))?;
-        push_projected(label, projection)?;
-    }
-
-    // Phase C: 四个最远斜视目标。内角点中心固定在相机 Z 光轴 (0, 0, 800mm)，
-    // 绕指向对应角落的切向轴旋转，避免原先靠平移把棋盘角点推到画面角落。
-    let corner_specs = [
-        ("C01 Far oblique lower right", 1.0, 1.0, 45.0),
-        ("C02 Far oblique upper right", 1.0, -1.0, 315.0),
-        ("C03 Far oblique upper left", -1.0, -1.0, 225.0),
-        ("C04 Far oblique lower left", -1.0, 1.0, 135.0),
-    ];
-    for (label, _screen_x_sign, _screen_y_sign, azimuth_degrees) in corner_specs {
-        let rotation = guided_pose_rotation(FAR_TILT_DEGREES, azimuth_degrees);
-        let center_xyz = [0.0, 0.0, FAR_CENTER_Z_MM];
-        let translation = guided_pose_translation_for_center(board, rotation, center_xyz);
-        let projection = guided_pose_grid_projection_from_rotation_translation(
-            board,
-            rotation,
-            translation,
-            initial_intrinsics,
-            image_size,
-        )
-        .ok_or_else(|| format!("guided target '{label}' cannot be projected"))?;
-        push_projected(label, projection)?;
-    }
-
-    Ok(plan)
-}
-
-struct GuidedPoseGridProjection {
-    pose: GuidedPose6Dof,
-    outline_uv: [[f32; 2]; 4],
-    grid_lines: Vec<OverlayGridLine>,
-}
-
-fn guided_pose_grid_projection(
-    board: BoardSpec,
-    center_uv: [f64; 2],
-    scale: f64,
-    tilt_degrees: f64,
-    azimuth_degrees: f64,
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<GuidedPoseGridProjection> {
-    if center_uv.iter().any(|value| !value.is_finite()) || !scale.is_finite() || scale <= 0.0 {
-        return None;
-    }
-    let rotation = guided_pose_rotation(tilt_degrees, azimuth_degrees);
-    let translation = guided_pose_target_translation(
-        board,
-        center_uv,
-        scale,
-        rotation,
-        initial_intrinsics,
-        image_size,
-    )?;
-    guided_pose_grid_projection_from_rotation_translation(
-        board,
-        rotation,
-        translation,
-        initial_intrinsics,
-        image_size,
-    )
-}
-
-fn guided_pose_grid_projection_from_rotation_translation(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    translation: [f64; 3],
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<GuidedPoseGridProjection> {
-    let left = -1.0;
-    let top = -1.0;
-    let right = f64::from(board.inner_cols);
-    let bottom = f64::from(board.inner_rows);
-    let mut grid_lines = Vec::with_capacity(usize::from(board.inner_cols + board.inner_rows) + 4);
-    for column in 0..=usize::from(board.inner_cols) + 1 {
-        let x = column as f64 - 1.0;
-        grid_lines.push(OverlayGridLine {
-            start_uv: guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                x,
-                top,
-                initial_intrinsics,
-                image_size,
-            )?,
-            end_uv: guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                x,
-                bottom,
-                initial_intrinsics,
-                image_size,
-            )?,
-        });
-    }
-    for row in 0..=usize::from(board.inner_rows) + 1 {
-        let y = row as f64 - 1.0;
-        grid_lines.push(OverlayGridLine {
-            start_uv: guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                left,
-                y,
-                initial_intrinsics,
-                image_size,
-            )?,
-            end_uv: guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                right,
-                y,
-                initial_intrinsics,
-                image_size,
-            )?,
-        });
-    }
-    let pose = guided_pose_6dof_from_rotation_translation(
-        board,
-        rotation,
-        translation,
-        initial_intrinsics,
-        image_size,
-    )?;
-    Some(GuidedPoseGridProjection {
-        pose,
-        outline_uv: [
-            guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                left,
-                top,
-                initial_intrinsics,
-                image_size,
-            )?,
-            guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                right,
-                top,
-                initial_intrinsics,
-                image_size,
-            )?,
-            guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                right,
-                bottom,
-                initial_intrinsics,
-                image_size,
-            )?,
-            guided_pose_project_board_uv(
-                board,
-                rotation,
-                translation,
-                left,
-                bottom,
-                initial_intrinsics,
-                image_size,
-            )?,
-        ],
-        grid_lines,
-    })
-}
-
-fn guided_pose_translation_for_center(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    center_xyz: [f64; 3],
-) -> [f64; 3] {
-    let rotated_center = rotate_guided_pose_point(rotation, guided_pose_inner_center_point(board));
-    [
-        center_xyz[0] - rotated_center[0],
-        center_xyz[1] - rotated_center[1],
-        center_xyz[2] - rotated_center[2],
-    ]
-}
-
-fn guided_pose_target_translation(
-    board: BoardSpec,
-    center_uv: [f64; 2],
-    target_scale: f64,
-    rotation: [[f64; 3]; 3],
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<[f64; 3]> {
-    let target_pixel = [
-        center_uv[0] * f64::from(image_size.width),
-        center_uv[1] * f64::from(image_size.height),
-    ];
-    let center_ray = undistort_image_pixel_to_normalized(target_pixel, initial_intrinsics)?;
-    let inner_center = guided_pose_inner_center_point(board);
-    let rotated_center = rotate_guided_pose_point(rotation, inner_center);
-    let minimum_depth = guided_pose_minimum_center_depth(board, rotation, inner_center);
-    let mut center_depth =
-        guided_pose_initial_center_depth(board, target_scale, initial_intrinsics, image_size)?
-            .max(minimum_depth);
-    let mut last_translation = None;
-    for _ in 0..GUIDED_POSE_OVERLAY_DEPTH_SOLVE_ITERS {
-        let translation = guided_pose_translation_at_depth(
-            board,
-            rotation,
-            rotated_center,
-            center_ray,
-            target_pixel,
-            center_depth,
-            initial_intrinsics,
-        )?;
-        let current_scale = guided_pose_projected_inner_scale(
-            board,
-            rotation,
-            translation,
-            initial_intrinsics,
-            image_size,
-        )?;
-        last_translation = Some(translation);
-        let scale_ratio = current_scale / target_scale;
-        if !scale_ratio.is_finite() || scale_ratio <= 0.0 {
-            return last_translation;
-        }
-        if (current_scale - target_scale).abs() <= target_scale * 1.0e-4 {
-            return last_translation;
-        }
-        let next_depth = (center_depth * scale_ratio).max(minimum_depth);
-        if (next_depth - center_depth).abs() <= center_depth * 1.0e-5 {
-            return last_translation;
-        }
-        center_depth = next_depth;
-    }
-    last_translation
-}
-
-fn guided_pose_initial_center_depth(
-    board: BoardSpec,
-    target_scale: f64,
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<f64> {
-    if !target_scale.is_finite() || target_scale <= 0.0 {
-        return None;
-    }
-    let short_side = f64::from(image_size.width.min(image_size.height));
-    let inner_width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
-    let inner_height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
-    let matrix = initial_intrinsics.camera_matrix;
-    let depth =
-        (inner_width * matrix[0]).max(inner_height * matrix[4]) / (target_scale * short_side);
-    depth
-        .is_finite()
-        .then_some(depth.max(board.square_size.max(1.0)))
-}
-
-fn guided_pose_translation_at_depth(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    rotated_center: [f64; 3],
-    center_ray: [f64; 2],
-    target_pixel: [f64; 2],
-    center_depth: f64,
-    initial_intrinsics: &InitialIntrinsics,
-) -> Option<[f64; 3]> {
-    if !center_depth.is_finite() || center_depth <= 0.0 {
-        return None;
-    }
-    let matrix = initial_intrinsics.camera_matrix;
-    let mut translation = [
-        center_ray[0] * center_depth - rotated_center[0],
-        center_ray[1] * center_depth - rotated_center[1],
-        center_depth - rotated_center[2],
-    ];
-    for _ in 0..8 {
-        let (minimum, maximum) = guided_pose_projected_inner_pixel_bounds(
-            board,
-            rotation,
-            translation,
-            initial_intrinsics,
-        )?;
-        let current_center = [
-            (minimum[0] + maximum[0]) * 0.5,
-            (minimum[1] + maximum[1]) * 0.5,
-        ];
-        let error = [
-            target_pixel[0] - current_center[0],
-            target_pixel[1] - current_center[1],
-        ];
-        if error[0].abs().max(error[1].abs()) <= 1.0e-3 {
-            break;
-        }
-        translation[0] += error[0] / matrix[0] * center_depth;
-        translation[1] += error[1] / matrix[4] * center_depth;
-        if translation.iter().any(|value| !value.is_finite()) {
-            return None;
-        }
-    }
-    Some(translation)
-}
-
-fn guided_pose_projected_inner_scale(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    translation: [f64; 3],
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<f64> {
-    let (minimum, maximum) =
-        guided_pose_projected_inner_pixel_bounds(board, rotation, translation, initial_intrinsics)?;
-    let short_side = f64::from(image_size.width.min(image_size.height));
-    let scale = (maximum[0] - minimum[0]).max(maximum[1] - minimum[1]) / short_side;
-    scale.is_finite().then_some(scale)
-}
-
-fn guided_pose_projected_inner_pixel_bounds(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    translation: [f64; 3],
-    initial_intrinsics: &InitialIntrinsics,
-) -> Option<([f64; 2], [f64; 2])> {
-    let right = f64::from(board.inner_cols.saturating_sub(1));
-    let bottom = f64::from(board.inner_rows.saturating_sub(1));
-    let corners = [[0.0, 0.0], [right, 0.0], [right, bottom], [0.0, bottom]];
-    let mut minimum = [f64::INFINITY, f64::INFINITY];
-    let mut maximum = [f64::NEG_INFINITY, f64::NEG_INFINITY];
-    for [x, y] in corners {
-        let point = project_board_point_image(
-            rotation,
-            translation,
-            guided_pose_board_point(board, x, y),
-            initial_intrinsics,
-        )?;
-        let image = [f64::from(point.x), f64::from(point.y)];
-        minimum[0] = minimum[0].min(image[0]);
-        minimum[1] = minimum[1].min(image[1]);
-        maximum[0] = maximum[0].max(image[0]);
-        maximum[1] = maximum[1].max(image[1]);
-    }
-    Some((minimum, maximum))
-}
-
-fn guided_pose_minimum_center_depth(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    inner_center: [f64; 3],
-) -> f64 {
-    let center_z = rotate_guided_pose_point(rotation, inner_center)[2];
-    let right = f64::from(board.inner_cols);
-    let bottom = f64::from(board.inner_rows);
-    let outline = [[-1.0, -1.0], [right, -1.0], [right, bottom], [-1.0, bottom]];
-    let min_delta = outline.iter().fold(f64::INFINITY, |minimum, [x, y]| {
-        let z = rotate_guided_pose_point(rotation, guided_pose_board_point(board, *x, *y))[2];
-        minimum.min(z - center_z)
-    });
-    let margin = board.square_size.max(1.0) * 0.05;
-    if min_delta < 0.0 {
-        -min_delta + margin
+/// 将累计密度映射为 UI 进度；异常值一律不参与完成判断。
+fn density_progress(density: f32) -> f32 {
+    if density.is_finite() {
+        (density / DENSITY_SUFFICIENT).clamp(0.0, 1.0)
     } else {
-        margin
+        0.0
+    }
+}
+
+impl CornerDensityMap {
+    fn new() -> Self {
+        debug_assert!(DENSITY_COLS >= 8 && DENSITY_ROWS >= 8);
+        Self {
+            field: vec![0.0; DENSITY_COLS * DENSITY_ROWS],
+            center_density: 0.0,
+            edge_density: [0.0; SPATIAL_EDGE_COUNT],
+            corner_density: [0.0; SPATIAL_CORNER_COUNT],
+            depth: [false; DEPTH_COVERAGE_BINS],
+            skew: [false; SKEW_COVERAGE_BINS],
+            views: Vec::with_capacity(MAX_VIEW_SUMMARIES),
+            accepted_frames: 0,
+        }
+    }
+
+    /// 只有至少一个位于图像内的有限角点，才允许进行 TCP 原图抓取。
+    fn has_usable_corners(&self, detection: &ChessboardDetection) -> bool {
+        detection
+            .corners
+            .iter()
+            .any(|corner| normalized_corner(corner, detection.image_size).is_some())
+    }
+
+    /// 去重只检查紧凑的位姿摘要；此函数没有副作用，故可在 TCP 抓图前调用。
+    fn is_near_duplicate(&self, measurement: &GuidedPoseMeasurement) -> bool {
+        self.views.iter().any(|previous| {
+            guided_pose_jitter_score(
+                previous.xyz,
+                previous.rpy_degrees,
+                measurement.pose.xyz,
+                measurement.pose.rpy_degrees,
+            ) < DUPLICATE_VIEW_JITTER_LIMIT
+        })
+    }
+
+    /// 成功抓取原图后一次性写入角点密度、空间区域和保留的距离/倾斜覆盖。
+    /// 返回 `false` 表示没有任何有效内角点，因此不会改变累加器。
+    fn add_frame(
+        &mut self,
+        detection: &ChessboardDetection,
+        measurement: &GuidedPoseMeasurement,
+    ) -> bool {
+        if !self.has_usable_corners(detection) {
+            return false;
+        }
+        let image_size = detection.image_size;
+        let width = f64::from(image_size.width);
+        let height = f64::from(image_size.height);
+        let (mut min_x, mut min_y, mut max_x, mut max_y) = (
+            f64::INFINITY,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NEG_INFINITY,
+        );
+        for corner in &detection.corners {
+            let Some([u, v]) = normalized_corner(corner, image_size) else {
+                continue;
+            };
+            let x = f64::from(corner.x);
+            let y = f64::from(corner.y);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(x);
+            max_y = max_y.max(y);
+            self.splat_density(u, v);
+            let radius = normalized_image_radius(u, v, width, height);
+            if radius <= CENTER_RADIUS {
+                add_density(&mut self.center_density, 1.0);
+            }
+            if radius > OUTER_RADIUS_THRESHOLD {
+                self.add_outer_region_density(u, v);
+            }
+        }
+        let scale = ((max_x - min_x) / width).min((max_y - min_y) / height);
+        self.depth[depth_coverage_bin(scale)] = true;
+        // 板 Z 轴（法线）的 z 分量 = R[2][2]；保留原有倾角分档边界。
+        let normal_angle = measurement.pose.rotation[2][2]
+            .clamp(-1.0, 1.0)
+            .abs()
+            .acos()
+            .to_degrees();
+        let skew_index = if normal_angle.is_finite() {
+            skew_coverage_bin(normal_angle)
+        } else {
+            SKEW_COVERAGE_BINS - 1
+        };
+        self.skew[skew_index] = true;
+        self.remember_view(measurement.pose);
+        self.accepted_frames = self.accepted_frames.saturating_add(1);
+        true
+    }
+
+    fn splat_density(&mut self, u: f64, v: f64) {
+        let radius_x = (DENSITY_KERNEL_SIGMA * DENSITY_COLS as f64 * 3.0).ceil() as isize;
+        let radius_y = (DENSITY_KERNEL_SIGMA * DENSITY_ROWS as f64 * 3.0).ceil() as isize;
+        let center_x = (u * DENSITY_COLS as f64 - 0.5).round() as isize;
+        let center_y = (v * DENSITY_ROWS as f64 - 0.5).round() as isize;
+        let min_x = (center_x - radius_x).max(0);
+        let max_x = (center_x + radius_x).min(DENSITY_COLS as isize - 1);
+        let min_y = (center_y - radius_y).max(0);
+        let max_y = (center_y + radius_y).min(DENSITY_ROWS as isize - 1);
+        for row in min_y..=max_y {
+            let sample_v = (row as f64 + 0.5) / DENSITY_ROWS as f64;
+            for col in min_x..=max_x {
+                let sample_u = (col as f64 + 0.5) / DENSITY_COLS as f64;
+                let squared_distance = (sample_u - u).powi(2) + (sample_v - v).powi(2);
+                let weight =
+                    (-squared_distance / (2.0 * DENSITY_KERNEL_SIGMA.powi(2))).exp() as f32;
+                if weight.is_finite() {
+                    let index = row as usize * DENSITY_COLS + col as usize;
+                    add_density(&mut self.field[index], weight);
+                }
+            }
+        }
+    }
+
+    fn add_outer_region_density(&mut self, u: f64, v: f64) {
+        if u <= OUTER_REGION_BAND {
+            add_density(&mut self.edge_density[0], 1.0);
+        }
+        if u >= 1.0 - OUTER_REGION_BAND {
+            add_density(&mut self.edge_density[1], 1.0);
+        }
+        if v <= OUTER_REGION_BAND {
+            add_density(&mut self.edge_density[2], 1.0);
+        }
+        if v >= 1.0 - OUTER_REGION_BAND {
+            add_density(&mut self.edge_density[3], 1.0);
+        }
+        let corner = match (
+            u <= OUTER_REGION_BAND,
+            u >= 1.0 - OUTER_REGION_BAND,
+            v <= OUTER_REGION_BAND,
+            v >= 1.0 - OUTER_REGION_BAND,
+        ) {
+            (true, _, true, _) => Some(0),
+            (_, true, true, _) => Some(1),
+            (_, true, _, true) => Some(2),
+            (true, _, _, true) => Some(3),
+            _ => None,
+        };
+        if let Some(index) = corner {
+            add_density(&mut self.corner_density[index], 1.0);
+        }
+    }
+
+    fn remember_view(&mut self, pose: GuidedPose6Dof) {
+        let summary = AcceptedViewSummary {
+            xyz: pose.xyz,
+            rpy_degrees: pose.rpy_degrees,
+        };
+        if self.views.len() < MAX_VIEW_SUMMARIES {
+            self.views.push(summary);
+        } else {
+            let index = self.accepted_frames % MAX_VIEW_SUMMARIES;
+            self.views[index] = summary;
+        }
+    }
+
+    fn snapshot(&self) -> DatasetQuality {
+        DatasetQuality {
+            accepted_frames: self.accepted_frames,
+            heatmap: DensityHeatmap {
+                cols: DENSITY_COLS,
+                rows: DENSITY_ROWS,
+                samples: self.field.clone().into(),
+            },
+            center_density: self.center_density,
+            edge_density: self.edge_density,
+            corner_density: self.corner_density,
+            depth: self.depth,
+            skew: self.skew,
+        }
+    }
+}
+
+/// 归一化且位于图像内的角点；无效值绝不进入密度场。
+fn normalized_corner(
+    corner: &CalibrationPoint,
+    image_size: CalibrationImageSize,
+) -> Option<[f64; 2]> {
+    let width = f64::from(image_size.width);
+    let height = f64::from(image_size.height);
+    let x = f64::from(corner.x);
+    let y = f64::from(corner.y);
+    if !width.is_finite()
+        || !height.is_finite()
+        || width <= 0.0
+        || height <= 0.0
+        || !x.is_finite()
+        || !y.is_finite()
+    {
+        return None;
+    }
+    let u = x / width;
+    let v = y / height;
+    (u.is_finite() && v.is_finite() && (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v))
+        .then_some([u, v])
+}
+
+/// 角点到图像中心的连续物理半径，按图像半对角线归一化。
+fn normalized_image_radius(u: f64, v: f64, width: f64, height: f64) -> f64 {
+    ((u - 0.5) * width).hypot((v - 0.5) * height) / (width * 0.5).hypot(height * 0.5)
+}
+
+fn add_density(slot: &mut f32, contribution: f32) {
+    *slot = (*slot + contribution).min(f32::MAX);
+}
+
+/// 保留的投影尺度分档（远 / 中远 / 中近 / 近）。
+fn depth_coverage_bin(scale: f64) -> usize {
+    if scale < 0.18 {
+        0
+    } else if scale < 0.28 {
+        1
+    } else if scale < 0.42 {
+        2
+    } else {
+        3
+    }
+}
+
+/// 保留的板法线与光轴夹角分档（正视 / 浅倾 / 中倾 / 大倾）。
+fn skew_coverage_bin(normal_angle_degrees: f64) -> usize {
+    if normal_angle_degrees < 10.0 {
+        0
+    } else if normal_angle_degrees < 22.0 {
+        1
+    } else if normal_angle_degrees < 35.0 {
+        2
+    } else {
+        3
+    }
+}
+
+fn quality_missing_hint(quality: &DatasetQuality) -> &'static str {
+    if !quality.center_complete() {
+        "请让棋盘内角点覆盖画面中心"
+    } else if !quality.edges_complete() {
+        "请将棋盘移到四个画面边缘"
+    } else if !quality.corners_complete() {
+        "请将棋盘移动到四个画面角落"
+    } else if quality.depth.iter().any(|covered| !covered) {
+        "请调整棋盘距离，覆盖远中近尺度"
+    } else {
+        "请改变棋盘倾斜角度"
     }
 }
 
@@ -1333,27 +1098,6 @@ fn guided_pose_inner_center_point(board: BoardSpec) -> [f64; 3] {
 
 fn guided_pose_board_point(board: BoardSpec, x: f64, y: f64) -> [f64; 3] {
     [x * board.square_size, y * board.square_size, 0.0]
-}
-
-fn guided_pose_project_board_uv(
-    board: BoardSpec,
-    rotation: [[f64; 3]; 3],
-    translation: [f64; 3],
-    x: f64,
-    y: f64,
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Option<[f32; 2]> {
-    let point = project_board_point_image(
-        rotation,
-        translation,
-        guided_pose_board_point(board, x, y),
-        initial_intrinsics,
-    )?;
-    Some([
-        point.x / image_size.width as f32,
-        point.y / image_size.height as f32,
-    ])
 }
 
 fn guided_pose_6dof_from_rotation_translation(
@@ -1423,18 +1167,6 @@ fn guided_pose_rotation_to_rpy_degrees(rotation: [[f64; 3]; 3]) -> Option<[f64; 
     rpy.iter().all(|value| value.is_finite()).then_some(rpy)
 }
 
-fn mat3_mul(left: [[f64; 3]; 3], right: [[f64; 3]; 3]) -> [[f64; 3]; 3] {
-    let mut output = [[0.0; 3]; 3];
-    for row in 0..3 {
-        for column in 0..3 {
-            output[row][column] = left[row][0] * right[0][column]
-                + left[row][1] * right[1][column]
-                + left[row][2] * right[2][column];
-        }
-    }
-    output
-}
-
 fn signed_angle_distance_degrees(left: f64, right: f64) -> f64 {
     let delta = (left - right).rem_euclid(360.0);
     if delta > 180.0 { delta - 360.0 } else { delta }
@@ -1457,69 +1189,6 @@ fn guided_pose_signed_rotation_error_components(
         signed_angle_distance_degrees(target_rpy_degrees[2], measurement_rpy_degrees[2]),
     ])
 }
-
-fn guided_pose_rotation_error_score(components: [f64; 3], tolerance: GuidedPoseTolerance) -> f64 {
-    (components[0].abs() / tolerance.roll_degrees)
-        .max(components[1].abs() / tolerance.pitch_degrees)
-        .max(components[2].abs() / tolerance.yaw_degrees)
-}
-
-fn guided_pose_rotation_error_degrees(
-    measurement: &GuidedPose6Dof,
-    target: &GuidedPose6Dof,
-    tolerance: GuidedPoseTolerance,
-) -> Option<[f64; 3]> {
-    let direct =
-        guided_pose_signed_rotation_error_components(measurement.rpy_degrees, target.rpy_degrees)?;
-    let board_half_turn = [[-1.0, 0.0, 0.0], [0.0, -1.0, 0.0], [0.0, 0.0, 1.0]];
-    let symmetric_measurement = mat3_mul(measurement.rotation, board_half_turn);
-    let symmetric_rpy = guided_pose_rotation_to_rpy_degrees(symmetric_measurement)?;
-    let symmetric =
-        guided_pose_signed_rotation_error_components(symmetric_rpy, target.rpy_degrees)?;
-    let direct_score = guided_pose_rotation_error_score(direct, tolerance);
-    let symmetric_score = guided_pose_rotation_error_score(symmetric, tolerance);
-    Some(if symmetric_score < direct_score {
-        symmetric
-    } else {
-        direct
-    })
-}
-
-fn undistort_image_pixel_to_normalized(
-    pixel: [f64; 2],
-    initial_intrinsics: &InitialIntrinsics,
-) -> Option<[f64; 2]> {
-    let matrix = initial_intrinsics.camera_matrix;
-    if matrix[0] <= 0.0 || matrix[4] <= 0.0 || pixel.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    let distorted = [
-        (pixel[0] - matrix[2]) / matrix[0],
-        (pixel[1] - matrix[5]) / matrix[4],
-    ];
-    if distorted.iter().any(|value| !value.is_finite()) {
-        return None;
-    }
-    let mut undistorted = distorted;
-    for _ in 0..12 {
-        let projected = distort_normalized_point(
-            undistorted[0],
-            undistorted[1],
-            &initial_intrinsics.distortion_coefficients,
-        )?;
-        let error = [projected[0] - distorted[0], projected[1] - distorted[1]];
-        undistorted[0] -= error[0];
-        undistorted[1] -= error[1];
-        if error[0].abs().max(error[1].abs()) <= 1.0e-12 {
-            break;
-        }
-    }
-    undistorted
-        .iter()
-        .all(|value| value.is_finite())
-        .then_some(undistorted)
-}
-
 fn distort_normalized_point(x: f64, y: f64, distortion: &[f64]) -> Option<[f64; 2]> {
     let coefficient = |index: usize| distortion.get(index).copied().unwrap_or(0.0);
     let r2 = x * x + y * y;
@@ -1548,68 +1217,49 @@ fn distort_normalized_point(x: f64, y: f64, distortion: &[f64]) -> Option<[f64; 
         .all(|value| value.is_finite())
         .then_some(distorted)
 }
-
-fn guided_pose_rotation(tilt_degrees: f64, azimuth_degrees: f64) -> [[f64; 3]; 3] {
-    let tilt = tilt_degrees.to_radians();
-    if tilt.abs() <= f64::EPSILON {
-        return [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    }
-    let azimuth = azimuth_degrees.to_radians();
-    let axis = [-azimuth.sin(), azimuth.cos(), 0.0];
-    let (sin_theta, cos_theta) = tilt.sin_cos();
-    let one_minus_cos = 1.0 - cos_theta;
-    let [x, y, z] = axis;
-    [
-        [
-            cos_theta + x * x * one_minus_cos,
-            x * y * one_minus_cos - z * sin_theta,
-            x * z * one_minus_cos + y * sin_theta,
-        ],
-        [
-            y * x * one_minus_cos + z * sin_theta,
-            cos_theta + y * y * one_minus_cos,
-            y * z * one_minus_cos - x * sin_theta,
-        ],
-        [
-            z * x * one_minus_cos - y * sin_theta,
-            z * y * one_minus_cos + x * sin_theta,
-            cos_theta + z * z * one_minus_cos,
-        ],
-    ]
-}
-
 fn guided_hold_jitter_score(
     previous: &GuidedPoseMeasurement,
     current: &GuidedPoseMeasurement,
 ) -> f64 {
-    let depth_scale = previous.pose.xyz[2]
-        .abs()
-        .max(current.pose.xyz[2].abs())
-        .max(1.0);
-    let xyz_score = ((previous.pose.xyz[0] - current.pose.xyz[0]).abs()
-        / depth_scale
-        / GUIDED_HOLD_JITTER_XYZ_LIMIT)
-        .max(
-            (previous.pose.xyz[1] - current.pose.xyz[1]).abs()
-                / depth_scale
-                / GUIDED_HOLD_JITTER_XYZ_LIMIT,
-        )
-        .max(
-            (previous.pose.xyz[2] - current.pose.xyz[2]).abs()
-                / depth_scale
-                / GUIDED_HOLD_JITTER_Z_LIMIT,
-        );
-    let rpy_score = guided_pose_signed_rotation_error_components(
+    guided_pose_jitter_score(
+        previous.pose.xyz,
         previous.pose.rpy_degrees,
+        current.pose.xyz,
         current.pose.rpy_degrees,
     )
-    .map(|components| {
-        components
-            .into_iter()
-            .map(|component| component.abs() / GUIDED_HOLD_JITTER_RPY_DEGREES)
-            .fold(0.0_f64, f64::max)
-    })
-    .unwrap_or(f64::INFINITY);
+}
+
+/// 稳定 hold 与已采视角去重共用同一姿态距离，避免两个阈值模型漂移。
+fn guided_pose_jitter_score(
+    previous_xyz: [f64; 3],
+    previous_rpy_degrees: [f64; 3],
+    current_xyz: [f64; 3],
+    current_rpy_degrees: [f64; 3],
+) -> f64 {
+    if previous_xyz
+        .iter()
+        .chain(previous_rpy_degrees.iter())
+        .chain(current_xyz.iter())
+        .chain(current_rpy_degrees.iter())
+        .any(|value| !value.is_finite())
+    {
+        return f64::INFINITY;
+    }
+    let depth_scale = previous_xyz[2].abs().max(current_xyz[2].abs()).max(1.0);
+    let xyz_score = ((previous_xyz[0] - current_xyz[0]).abs()
+        / depth_scale
+        / GUIDED_HOLD_JITTER_XYZ_LIMIT)
+        .max((previous_xyz[1] - current_xyz[1]).abs() / depth_scale / GUIDED_HOLD_JITTER_XYZ_LIMIT)
+        .max((previous_xyz[2] - current_xyz[2]).abs() / depth_scale / GUIDED_HOLD_JITTER_Z_LIMIT);
+    let rpy_score =
+        guided_pose_signed_rotation_error_components(previous_rpy_degrees, current_rpy_degrees)
+            .map(|components| {
+                components
+                    .into_iter()
+                    .map(|component| component.abs() / GUIDED_HOLD_JITTER_RPY_DEGREES)
+                    .fold(0.0_f64, f64::max)
+            })
+            .unwrap_or(f64::INFINITY);
     xyz_score.max(rpy_score)
 }
 
@@ -1647,130 +1297,6 @@ fn guided_pose_measurement(
         image_size,
     })
 }
-
-fn assess_guided_pose(
-    step_index: usize,
-    target: &GuidedPoseTarget,
-    detection: &ChessboardDetection,
-    view: &ViewCalibrationResult,
-    board: BoardSpec,
-    initial_intrinsics: &InitialIntrinsics,
-    image_size: CalibrationImageSize,
-) -> Result<GuidedPoseAssessment, String> {
-    if detection.corners.is_empty() {
-        return Err("guided pose requires detected board corners".to_owned());
-    }
-    if detection.image_size != image_size {
-        return Err("guided pose detection image size does not match target binding".to_owned());
-    }
-    let measurement = guided_pose_measurement(view, board, initial_intrinsics, image_size)?;
-    let depth_scale = target.pose.xyz[2]
-        .abs()
-        .max(measurement.pose.xyz[2].abs())
-        .max(board.square_size.max(1.0));
-    let signed_rotation_error_degrees =
-        guided_pose_rotation_error_degrees(&measurement.pose, &target.pose, target.tolerance)
-            .ok_or_else(|| "guided pose rotation error is not finite".to_owned())?;
-    let [
-        signed_roll_degrees,
-        signed_pitch_degrees,
-        signed_yaw_degrees,
-    ] = signed_rotation_error_degrees;
-    let error = GuidedPoseError {
-        x: (measurement.pose.xyz[0] - target.pose.xyz[0]).abs() / depth_scale,
-        y: (measurement.pose.xyz[1] - target.pose.xyz[1]).abs() / depth_scale,
-        z: (measurement.pose.xyz[2] - target.pose.xyz[2]).abs() / depth_scale,
-        roll_degrees: signed_roll_degrees.abs(),
-        pitch_degrees: signed_pitch_degrees.abs(),
-        yaw_degrees: signed_yaw_degrees.abs(),
-    };
-    let pose_error_score = (error.x / target.tolerance.x)
-        .max(error.y / target.tolerance.y)
-        .max(error.z / target.tolerance.z)
-        .max(error.roll_degrees / target.tolerance.roll_degrees)
-        .max(error.pitch_degrees / target.tolerance.pitch_degrees)
-        .max(error.yaw_degrees / target.tolerance.yaw_degrees);
-    if !pose_error_score.is_finite() {
-        return Err("guided pose score is not finite".to_owned());
-    }
-    let matched = pose_error_score <= GUIDED_POSE_MATCH_SCORE_LIMIT;
-    let reason = (!matched).then(|| guided_pose_error_reason(&error, target));
-    Ok(GuidedPoseAssessment {
-        step_index,
-        target_label: target.label,
-        measurement,
-        error,
-        signed_rotation_error_degrees,
-        pose_error_score,
-        matched,
-        reason,
-    })
-}
-
-fn guided_pose_error_reason(error: &GuidedPoseError, target: &GuidedPoseTarget) -> String {
-    let values = [
-        (
-            "横向",
-            error.x / target.tolerance.x,
-            error.x,
-            target.tolerance.x,
-        ),
-        (
-            "纵向",
-            error.y / target.tolerance.y,
-            error.y,
-            target.tolerance.y,
-        ),
-        (
-            "距离",
-            error.z / target.tolerance.z,
-            error.z,
-            target.tolerance.z,
-        ),
-        (
-            "roll",
-            error.roll_degrees / target.tolerance.roll_degrees,
-            error.roll_degrees,
-            target.tolerance.roll_degrees,
-        ),
-        (
-            "pitch",
-            error.pitch_degrees / target.tolerance.pitch_degrees,
-            error.pitch_degrees,
-            target.tolerance.pitch_degrees,
-        ),
-        (
-            "yaw",
-            error.yaw_degrees / target.tolerance.yaw_degrees,
-            error.yaw_degrees,
-            target.tolerance.yaw_degrees,
-        ),
-    ];
-    let (label, _, value, limit) = values
-        .into_iter()
-        .max_by(|a, b| a.1.total_cmp(&b.1))
-        .unwrap();
-    format!("对齐黄框：{label} 误差 {value:.2}/{limit:.2}")
-}
-
-fn guided_pose_status_overlay(assessment: &GuidedPoseAssessment, hold_frames: u8) -> OverlayStatus {
-    OverlayStatus {
-        hold_frames: hold_frames.min(HOLD_TARGET),
-        hold_target: HOLD_TARGET,
-        detail_label: "pose error".to_owned(),
-        detail_value: assessment.pose_error_score,
-        detail_limit: GUIDED_POSE_MATCH_SCORE_LIMIT,
-        matched: assessment.matched,
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-enum GuidedPoseRotationRingPlane {
-    RollXy,
-    PitchYzNegativeZ,
-    YawXzNegativeZ,
-}
-
 fn detected_outline_pixels(measurement: &GuidedPoseMeasurement) -> [[f32; 2]; 4] {
     let board = measurement.board;
     let left = -1.0;
@@ -1797,193 +1323,6 @@ fn detected_outline_pixels(measurement: &GuidedPoseMeasurement) -> [[f32; 2]; 4]
         ])
     })
 }
-
-fn guided_pose_rotation_ring_visual_sweep_degrees(error_degrees: f64) -> Option<f32> {
-    if !error_degrees.is_finite()
-        || error_degrees < f64::from(f32::MIN)
-        || error_degrees > f64::from(f32::MAX)
-    {
-        return None;
-    }
-    let signed_error = error_degrees as f32;
-    let error_abs = signed_error.abs();
-    if error_abs <= f32::EPSILON {
-        return Some(0.0);
-    }
-    let emphasis = GUIDED_POSE_RING_SMALL_ERROR_GAIN
-        * (-error_abs / GUIDED_POSE_RING_SMALL_ERROR_DECAY_DEGREES).exp();
-    Some(signed_error.signum() * error_abs.min(180.0) * (1.0 + emphasis))
-}
-
-fn guided_pose_rotation_ring_radius(board: BoardSpec) -> f64 {
-    let width = f64::from(board.inner_cols.saturating_sub(1)) * board.square_size;
-    let height = f64::from(board.inner_rows.saturating_sub(1)) * board.square_size;
-    width.min(height).max(board.square_size) * 0.34
-}
-
-fn guided_pose_rotation_ring_local_point(
-    center: [f64; 3],
-    radius: f64,
-    plane: GuidedPoseRotationRingPlane,
-    angle: f32,
-) -> [f64; 3] {
-    let cos = f64::from(angle.cos());
-    let sin = f64::from(angle.sin());
-    match plane {
-        GuidedPoseRotationRingPlane::RollXy => [
-            center[0] + radius * cos,
-            center[1] + radius * sin,
-            center[2],
-        ],
-        GuidedPoseRotationRingPlane::PitchYzNegativeZ => [
-            center[0],
-            center[1] + radius * cos,
-            center[2] - radius * sin,
-        ],
-        GuidedPoseRotationRingPlane::YawXzNegativeZ => [
-            center[0] + radius * cos,
-            center[1],
-            center[2] - radius * sin,
-        ],
-    }
-}
-
-fn guided_pose_project_local_uv(
-    measurement: &GuidedPoseMeasurement,
-    point: [f64; 3],
-) -> Option<[f32; 2]> {
-    let image = project_board_point_image(
-        measurement.pose.rotation,
-        measurement.pose.translation,
-        point,
-        &measurement.initial_intrinsics,
-    )?;
-    Some([
-        image.x / measurement.image_size.width as f32,
-        image.y / measurement.image_size.height as f32,
-    ])
-}
-
-fn guided_pose_project_rotation_ring_points(
-    measurement: &GuidedPoseMeasurement,
-    plane: GuidedPoseRotationRingPlane,
-    start_angle: f32,
-    sweep: f32,
-    segments: usize,
-) -> Vec<[f32; 2]> {
-    let center = guided_pose_inner_center_point(measurement.board);
-    let radius = guided_pose_rotation_ring_radius(measurement.board);
-    let steps = segments.max(1);
-    let mut points = Vec::with_capacity(steps + 1);
-    for index in 0..=steps {
-        let t = index as f32 / steps as f32;
-        let point =
-            guided_pose_rotation_ring_local_point(center, radius, plane, start_angle + sweep * t);
-        if let Some(uv) = guided_pose_project_local_uv(measurement, point) {
-            points.push(uv);
-        }
-    }
-    points
-}
-
-fn guided_pose_project_rotation_ring_point(
-    measurement: &GuidedPoseMeasurement,
-    plane: GuidedPoseRotationRingPlane,
-    angle: f32,
-) -> [f32; 2] {
-    let center = guided_pose_inner_center_point(measurement.board);
-    let radius = guided_pose_rotation_ring_radius(measurement.board);
-    guided_pose_project_local_uv(
-        measurement,
-        guided_pose_rotation_ring_local_point(center, radius, plane, angle),
-    )
-    .unwrap_or(measurement.pose.center_uv)
-}
-
-fn guided_pose_rotation_arc_overlay(
-    measurement: &GuidedPoseMeasurement,
-    error_degrees: f64,
-    plane: GuidedPoseRotationRingPlane,
-    base_start_angle: f32,
-    base_sweep: f32,
-    arc_start_angle: f32,
-    arc_sweep_limit: f32,
-) -> OverlayRotationArc {
-    let base_segments = if base_sweep.abs() >= std::f32::consts::TAU - 1.0e-6 {
-        GUIDED_POSE_RING_SEGMENTS
-    } else {
-        GUIDED_POSE_HALF_RING_SEGMENTS
-    };
-    let visual_sweep = guided_pose_rotation_ring_visual_sweep_degrees(error_degrees)
-        .unwrap_or(0.0)
-        .to_radians()
-        .clamp(-arc_sweep_limit.abs(), arc_sweep_limit.abs());
-    let arc_uv = if visual_sweep.abs() > 0.1_f32.to_radians() {
-        guided_pose_project_rotation_ring_points(
-            measurement,
-            plane,
-            arc_start_angle,
-            visual_sweep,
-            GUIDED_POSE_HALF_RING_SEGMENTS,
-        )
-    } else {
-        Vec::new()
-    };
-    OverlayRotationArc {
-        base_uv: guided_pose_project_rotation_ring_points(
-            measurement,
-            plane,
-            base_start_angle,
-            base_sweep,
-            base_segments,
-        ),
-        arc_uv,
-        tick_uv: guided_pose_project_rotation_ring_point(measurement, plane, arc_start_angle),
-        error_degrees: error_degrees
-            .is_finite()
-            .then_some(error_degrees as f32)
-            .unwrap_or(0.0),
-    }
-}
-
-fn guided_pose_rotation_rings_overlay(
-    assessment: &GuidedPoseAssessment,
-    _target: &GuidedPoseTarget,
-) -> OverlayRotationRings {
-    let [roll, pitch, yaw] = assessment.signed_rotation_error_degrees;
-    let measurement = &assessment.measurement;
-    OverlayRotationRings {
-        center_uv: measurement.pose.center_uv,
-        roll: guided_pose_rotation_arc_overlay(
-            measurement,
-            roll,
-            GuidedPoseRotationRingPlane::RollXy,
-            0.0,
-            std::f32::consts::TAU,
-            -90.0_f32.to_radians(),
-            std::f32::consts::PI,
-        ),
-        pitch: guided_pose_rotation_arc_overlay(
-            measurement,
-            pitch,
-            GuidedPoseRotationRingPlane::PitchYzNegativeZ,
-            0.0,
-            std::f32::consts::PI,
-            90.0_f32.to_radians(),
-            90.0_f32.to_radians(),
-        ),
-        yaw: guided_pose_rotation_arc_overlay(
-            measurement,
-            yaw,
-            GuidedPoseRotationRingPlane::YawXzNegativeZ,
-            0.0,
-            std::f32::consts::PI,
-            90.0_f32.to_radians(),
-            90.0_f32.to_radians(),
-        ),
-    }
-}
-
 fn project_board_point_image(
     rotation: [[f64; 3]; 3],
     translation: [f64; 3],
@@ -2172,13 +1511,19 @@ fn dataset_frame_from_decoded_rgba(
     })
 }
 
-fn set_guide(guide: &Arc<Mutex<GuideState>>, text: &str, count: usize, hold: u8) {
+fn set_guide_quality(
+    guide: &Arc<Mutex<GuideState>>,
+    text: &str,
+    hold: u8,
+    quality: &DatasetQuality,
+) {
     let mut state = guide
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     state.text = text.to_owned();
-    state.captured_count = count;
+    state.captured_count = quality.accepted_frames;
     state.hold = hold;
+    state.quality = quality.clone();
 }
 
 /// 默认初始内参（fx=fy=900，主点按帧尺寸居中）。
@@ -2276,206 +1621,281 @@ impl StreamState {
 mod tests {
     use super::*;
 
-    fn reference_plan() -> Vec<GuidedPoseTarget> {
-        let board = BoardSpec::new(11, 8, 40.0).unwrap();
-        let image_size = CalibrationImageSize::new(1920, 1080).unwrap();
-        let intrinsics = InitialIntrinsics {
+    fn board() -> BoardSpec {
+        BoardSpec::new(11, 8, 40.0).unwrap()
+    }
+
+    fn image_size() -> CalibrationImageSize {
+        CalibrationImageSize::new(1920, 1080).unwrap()
+    }
+
+    fn intrinsics() -> InitialIntrinsics {
+        InitialIntrinsics {
             camera_matrix: [900.0, 0.0, 980.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
             distortion_coefficients: vec![0.0; 12],
-        };
-        standard_guided_pose_plan(board, &intrinsics, image_size).unwrap()
+        }
     }
 
-    fn assert_close(actual: f64, expected: f64, tolerance: f64) {
-        assert!(
-            (actual - expected).abs() <= tolerance,
-            "actual {actual:.9} expected {expected:.9} tolerance {tolerance:.9}"
-        );
+    fn identity() -> [[f64; 3]; 3] {
+        [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
     }
 
-    fn assert_uv_close(actual: [f32; 2], expected: [f64; 2], tolerance: f64) {
-        assert_close(f64::from(actual[0]), expected[0], tolerance);
-        assert_close(f64::from(actual[1]), expected[1], tolerance);
+    fn view(rotation_vector: [f64; 3], translation_vector: [f64; 3]) -> ViewCalibrationResult {
+        ViewCalibrationResult {
+            rotation_vector,
+            translation_vector,
+            projected_points: Vec::new(),
+            reprojection_rmse: 0.0,
+            max_reprojection_error: 0.0,
+        }
     }
 
-    fn projected_inner_corner_uvs(
-        board: BoardSpec,
-        intrinsics: &InitialIntrinsics,
-        image_size: CalibrationImageSize,
-        target: &GuidedPoseTarget,
-    ) -> Vec<[f64; 2]> {
-        let mut points =
-            Vec::with_capacity(usize::from(board.inner_cols) * usize::from(board.inner_rows));
-        for row in 0..board.inner_rows {
-            for column in 0..board.inner_cols {
-                let point = project_board_point_image(
-                    target.pose.rotation,
-                    target.pose.translation,
-                    guided_pose_board_point(board, f64::from(column), f64::from(row)),
-                    intrinsics,
-                )
-                .expect("inner corner should project inside camera space");
-                points.push([
-                    f64::from(point.x) / f64::from(image_size.width),
-                    f64::from(point.y) / f64::from(image_size.height),
-                ]);
+    /// 生成一个中心在 (center_x, center_y)、尺寸 (box_w × box_h) 像素的角点云。
+    fn corner_cloud(center_x: f64, center_y: f64, box_w: f64, box_h: f64) -> Vec<CalibrationPoint> {
+        let mut corners = Vec::new();
+        for row in 0..8 {
+            for column in 0..11 {
+                let x = (center_x + (column as f64 - 5.0) * box_w / 10.0) as f32;
+                let y = (center_y + (row as f64 - 3.5) * box_h / 7.0) as f32;
+                corners.push(CalibrationPoint { x, y });
             }
         }
-        points
+        corners
     }
 
-    #[test]
-    fn guided_plan_has_structured_27_pose_phases() {
-        let plan = reference_plan();
-        assert_eq!(plan.len(), CAPTURE_TARGET);
-        assert_eq!(CAPTURE_TARGET, 27);
-        assert!(
-            plan[..15]
-                .iter()
-                .all(|target| target.label.starts_with('F'))
-        );
-        assert!(
-            plan[15..23]
-                .iter()
-                .all(|target| target.label.starts_with('T'))
-        );
-        assert!(
-            plan[23..]
-                .iter()
-                .all(|target| target.label.starts_with('C'))
-        );
-        assert_eq!(plan[0].label, "F01 Fronto upper left");
-        assert_eq!(plan[14].label, "F15 Fronto lower right");
-        assert_eq!(plan[22].label, "T08 Tilt bottom");
-        assert_eq!(plan[26].label, "C04 Far oblique lower left");
-    }
-
-    #[test]
-    fn guided_plan_uses_physical_depth_ring_and_tilt_parameters() {
-        let plan = reference_plan();
-
-        for target in &plan[..15] {
-            assert_close(target.pose.xyz[2], 600.0, 1.0e-6);
-            assert!(
-                target
-                    .pose
-                    .rpy_degrees
-                    .iter()
-                    .all(|angle| angle.abs() <= 1.0e-6)
-            );
-        }
-
-        for target in &plan[15..23] {
-            assert_close(target.pose.xyz[2], 700.0, 1.0e-6);
-            assert_close(target.pose.xyz[0].hypot(target.pose.xyz[1]), 80.0, 1.0e-6);
-            let tilt_degrees = target.pose.rotation[2][2]
-                .clamp(-1.0, 1.0)
-                .acos()
-                .to_degrees();
-            assert_close(tilt_degrees, 22.0, 1.0e-6);
-        }
-
-        for target in &plan[23..] {
-            assert_close(target.pose.xyz[0], 0.0, 1.0e-6);
-            assert_close(target.pose.xyz[1], 0.0, 1.0e-6);
-            assert_close(target.pose.xyz[2], 800.0, 1.0e-6);
-            let tilt_degrees = target.pose.rotation[2][2]
-                .clamp(-1.0, 1.0)
-                .acos()
-                .to_degrees();
-            assert_close(tilt_degrees, 45.0, 1.0e-6);
-        }
-        let max_z = plan
-            .iter()
-            .map(|target| target.pose.xyz[2])
-            .fold(0.0_f64, f64::max);
-        assert_close(max_z, 800.0, 1.0e-6);
-    }
-
-    #[test]
-    fn guided_plan_fronto_grid_edges_and_overlap_follow_outer_board_ratio() {
-        let plan = reference_plan();
-        assert_uv_close(plan[0].outline_uv[0], [0.0, 0.0], 1.0e-5);
-        assert_uv_close(plan[4].outline_uv[1], [1.0, 0.0], 1.0e-5);
-        assert_uv_close(plan[10].outline_uv[3], [0.0, 1.0], 1.0e-5);
-        assert_uv_close(plan[14].outline_uv[2], [1.0, 1.0], 1.0e-5);
-
-        let first_width = f64::from(plan[0].outline_uv[1][0] - plan[0].outline_uv[0][0]);
-        let first_height = f64::from(plan[0].outline_uv[3][1] - plan[0].outline_uv[0][1]);
-        assert_close(first_width, 0.375, 1.0e-5);
-        assert_close(first_height, 0.5, 1.0e-5);
-        let horizontal_step = f64::from(plan[1].pose.center_uv[0] - plan[0].pose.center_uv[0]);
-        let vertical_step = f64::from(plan[5].pose.center_uv[1] - plan[0].pose.center_uv[1]);
-        assert_close(
-            (first_width - horizontal_step) / first_width,
-            7.0 / 12.0,
-            1.0e-4,
-        );
-        assert_close((first_height - vertical_step) / first_height, 0.5, 1.0e-5);
-    }
-
-    #[test]
-    fn guided_plan_fronto_inner_corners_cover_full_statistical_grid() {
-        let board = BoardSpec::new(11, 8, 40.0).unwrap();
-        let image_size = CalibrationImageSize::new(1920, 1080).unwrap();
-        let intrinsics = InitialIntrinsics {
-            camera_matrix: [900.0, 0.0, 980.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
-            distortion_coefficients: vec![0.0; 12],
-        };
-        let plan = standard_guided_pose_plan(board, &intrinsics, image_size).unwrap();
-        let mut occupied = [[false; 12]; 8];
-        for target in &plan[..15] {
-            for [u, v] in projected_inner_corner_uvs(board, &intrinsics, image_size, target) {
-                let x = ((u * 12.0).floor() as usize).min(11);
-                let y = ((v * 8.0).floor() as usize).min(7);
-                occupied[y][x] = true;
-            }
-        }
-        let count = occupied.iter().flatten().filter(|cell| **cell).count();
-        assert_eq!(
-            count, 96,
-            "fronto inner corner occupancy should cover every 12x8 cell"
-        );
-    }
-
-    #[test]
-    fn guided_plan_far_corners_are_centered_oblique_targets() {
-        let plan = reference_plan();
-        let expected_center = [980.0 / 1920.0, 540.0 / 1080.0];
-        for target in &plan[23..] {
-            assert!(target.label.contains("Far oblique"));
-            assert_close(target.pose.xyz[0], 0.0, 1.0e-6);
-            assert_close(target.pose.xyz[1], 0.0, 1.0e-6);
-            assert_close(target.pose.xyz[2], 800.0, 1.0e-6);
-            assert_uv_close(target.pose.center_uv, expected_center, 1.0e-6);
+    fn detection_with(corners: Vec<CalibrationPoint>) -> ChessboardDetection {
+        ChessboardDetection {
+            image_size: image_size(),
+            corners,
         }
     }
 
-    #[test]
-    fn detected_outline_uses_same_outer_board_frame_as_target_overlay() {
-        let board = BoardSpec::new(11, 8, 40.0).unwrap();
-        let image_size = CalibrationImageSize::new(1920, 1080).unwrap();
-        let intrinsics = InitialIntrinsics {
-            camera_matrix: [900.0, 0.0, 980.0, 0.0, 900.0, 540.0, 0.0, 0.0, 1.0],
-            distortion_coefficients: vec![0.0; 12],
-        };
-        let target = standard_guided_pose_plan(board, &intrinsics, image_size)
-            .unwrap()
-            .remove(0);
-        let measurement = GuidedPoseMeasurement {
-            pose: target.pose,
+    fn measurement(
+        rotation_vector: [f64; 3],
+        translation_vector: [f64; 3],
+    ) -> GuidedPoseMeasurement {
+        let board = board();
+        let initial = intrinsics();
+        let size = image_size();
+        guided_pose_measurement(
+            &view(rotation_vector, translation_vector),
             board,
-            initial_intrinsics: intrinsics,
-            image_size,
+            &initial,
+            size,
+        )
+        .expect("synthetic pose should be valid")
+    }
+
+    fn point(u: f64, v: f64) -> CalibrationPoint {
+        CalibrationPoint {
+            x: (u * f64::from(image_size().width)) as f32,
+            y: (v * f64::from(image_size().height)) as f32,
+        }
+    }
+
+    fn complete_quality() -> DatasetQuality {
+        DatasetQuality {
+            accepted_frames: 0,
+            heatmap: DensityHeatmap::zeroed(DENSITY_COLS, DENSITY_ROWS),
+            center_density: DENSITY_SUFFICIENT,
+            edge_density: [DENSITY_SUFFICIENT; SPATIAL_EDGE_COUNT],
+            corner_density: [DENSITY_SUFFICIENT; SPATIAL_CORNER_COUNT],
+            depth: [true; DEPTH_COVERAGE_BINS],
+            skew: [true; SKEW_COVERAGE_BINS],
+        }
+    }
+
+    #[test]
+    fn density_snapshot_is_zero_until_a_corner_reaches_sufficient_density() {
+        let empty = DatasetQuality::default();
+        assert!(empty.heatmap.is_valid());
+        assert!(empty.heatmap.samples.iter().all(|density| *density == 0.0));
+
+        let col = DENSITY_COLS / 2;
+        let row = DENSITY_ROWS / 2;
+        let corner = CalibrationPoint {
+            x: ((col as f64 + 0.5) * f64::from(image_size().width) / DENSITY_COLS as f64) as f32,
+            y: ((row as f64 + 0.5) * f64::from(image_size().height) / DENSITY_ROWS as f64) as f32,
+        };
+        let mut density = CornerDensityMap::new();
+        assert!(density.add_frame(
+            &detection_with(vec![corner]),
+            &measurement([0.0; 3], [0.0, 0.0, 600.0]),
+        ));
+        let snapshot = density.snapshot();
+        let center_index = row * DENSITY_COLS + col;
+        assert!(snapshot.heatmap.samples[center_index] >= DENSITY_SUFFICIENT);
+        assert_eq!(snapshot.heatmap.samples[0], 0.0);
+    }
+
+    #[test]
+    fn invalid_corners_are_a_noop() {
+        let mut density = CornerDensityMap::new();
+        let invalid = detection_with(vec![CalibrationPoint {
+            x: f32::NAN,
+            y: 0.0,
+        }]);
+        assert!(!density.add_frame(&invalid, &measurement([0.0; 3], [0.0, 0.0, 600.0]),));
+        let snapshot = density.snapshot();
+        assert_eq!(snapshot.accepted_frames, 0);
+        assert!(
+            snapshot
+                .heatmap
+                .samples
+                .iter()
+                .all(|density| *density == 0.0)
+        );
+    }
+
+    #[test]
+    fn near_duplicate_view_is_rejected_before_capture_mutates_density() {
+        let first_measurement = measurement([0.0; 3], [0.0, 0.0, 600.0]);
+        let detection = detection_with(vec![point(0.5, 0.5)]);
+        let mut density = CornerDensityMap::new();
+        assert!(density.add_frame(&detection, &first_measurement));
+        let before = density.snapshot();
+
+        assert!(density.is_near_duplicate(&first_measurement));
+        if !density.is_near_duplicate(&first_measurement) {
+            assert!(density.add_frame(&detection, &first_measurement));
+        }
+        let after = density.snapshot();
+        assert_eq!(after.accepted_frames, 1);
+        assert_eq!(after.heatmap.samples, before.heatmap.samples);
+
+        let novel = measurement([0.0; 3], [30.0, 0.0, 600.0]);
+        assert!(!density.is_near_duplicate(&novel));
+    }
+
+    #[test]
+    fn central_only_or_one_sided_observations_do_not_complete_spatial_quality() {
+        let pose = measurement([0.0; 3], [0.0, 0.0, 600.0]);
+        let mut center_density = CornerDensityMap::new();
+        assert!(center_density.add_frame(&detection_with(vec![point(0.5, 0.5)]), &pose));
+        let mut center_quality = center_density.snapshot();
+        center_quality.depth = [true; DEPTH_COVERAGE_BINS];
+        center_quality.skew = [true; SKEW_COVERAGE_BINS];
+        assert!(center_quality.center_complete());
+        assert!(!center_quality.edges_complete());
+        assert!(!center_quality.is_complete());
+
+        let mut left_density = CornerDensityMap::new();
+        assert!(left_density.add_frame(&detection_with(vec![point(0.02, 0.5)]), &pose));
+        let left_quality = left_density.snapshot();
+        assert_eq!(left_quality.covered_edges(), 1);
+        assert_eq!(left_quality.covered_corners(), 0);
+    }
+
+    #[test]
+    fn all_outer_edges_and_corners_require_continuous_outer_density() {
+        let pose = measurement([0.0; 3], [0.0, 0.0, 600.0]);
+        let corners = vec![
+            point(0.02, 0.02),
+            point(0.98, 0.02),
+            point(0.98, 0.98),
+            point(0.02, 0.98),
+        ];
+        let mut density = CornerDensityMap::new();
+        assert!(density.add_frame(&detection_with(corners), &pose));
+        let quality = density.snapshot();
+        assert!(quality.edges_complete());
+        assert!(quality.corners_complete());
+        assert_eq!(quality.covered_edges(), SPATIAL_EDGE_COUNT);
+        assert_eq!(quality.covered_corners(), SPATIAL_CORNER_COUNT);
+    }
+
+    #[test]
+    fn retained_depth_and_skew_bins_keep_their_existing_boundaries() {
+        let depths = [
+            (300.0, 168.0),
+            (400.0, 216.0),
+            (600.0, 324.0),
+            (1000.0, 540.0),
+        ];
+        let tilts = [0.0_f64, 15.0, 30.0, 45.0];
+        let mut density = CornerDensityMap::new();
+        for ((width, height), tilt) in depths.into_iter().zip(tilts) {
+            assert!(density.add_frame(
+                &detection_with(corner_cloud(960.0, 540.0, width, height)),
+                &measurement([tilt.to_radians(), 0.0, 0.0], [0.0, 0.0, 1000.0]),
+            ));
+        }
+        let quality = density.snapshot();
+        assert_eq!(quality.depth, [true; DEPTH_COVERAGE_BINS]);
+        assert_eq!(quality.skew, [true; SKEW_COVERAGE_BINS]);
+    }
+
+    #[test]
+    fn completion_has_no_frame_count_gate_but_requires_each_quality_dimension() {
+        let quality = complete_quality();
+        assert_eq!(quality.accepted_frames, 0);
+        assert!(quality.is_complete());
+
+        let mut missing_center = quality.clone();
+        missing_center.center_density = f32::from_bits(DENSITY_SUFFICIENT.to_bits() - 1);
+        assert!(!missing_center.is_complete());
+
+        let mut missing_edge = quality.clone();
+        missing_edge.edge_density[2] = f32::from_bits(DENSITY_SUFFICIENT.to_bits() - 1);
+        assert!(!missing_edge.is_complete());
+
+        let mut missing_corner = quality.clone();
+        missing_corner.corner_density[3] = f32::from_bits(DENSITY_SUFFICIENT.to_bits() - 1);
+        assert!(!missing_corner.is_complete());
+
+        let mut missing_depth = quality.clone();
+        missing_depth.depth[1] = false;
+        assert!(!missing_depth.is_complete());
+
+        let mut missing_skew = quality;
+        missing_skew.skew[3] = false;
+        assert!(!missing_skew.is_complete());
+    }
+
+    #[test]
+    #[should_panic(expected = "密度场分辨率至少为 8×8")]
+    fn heatmap_rejects_subminimum_resolution() {
+        let _ = DensityHeatmap::zeroed(7, 8);
+    }
+
+    #[test]
+    fn detected_outline_pixels_use_outer_board_frame() {
+        let measurement = GuidedPoseMeasurement {
+            pose: guided_pose_6dof_from_rotation_translation(
+                board(),
+                identity(),
+                [0.0, 0.0, 600.0],
+                &intrinsics(),
+                image_size(),
+            )
+            .expect("fronto pose should be valid"),
+            board: board(),
+            initial_intrinsics: intrinsics(),
+            image_size: image_size(),
         };
         let detected = detected_outline_pixels(&measurement);
-        for (actual, expected_uv) in detected.iter().zip(target.outline_uv) {
-            let expected = [
-                expected_uv[0] * image_size.width as f32,
-                expected_uv[1] * image_size.height as f32,
-            ];
-            assert!((actual[0] - expected[0]).abs() <= 1.0e-3);
-            assert!((actual[1] - expected[1]).abs() <= 1.0e-3);
+        // 11×8 内角点、40mm：外框 12×9 格 → 480×360mm；fx=fy=900，z=600mm。
+        let expected = [
+            [
+                (-1.0 * 40.0 * 900.0 / 600.0) + 980.0,
+                (-1.0 * 40.0 * 900.0 / 600.0) + 540.0,
+            ],
+            [
+                (11.0 * 40.0 * 900.0 / 600.0) + 980.0,
+                (-1.0 * 40.0 * 900.0 / 600.0) + 540.0,
+            ],
+            [
+                (11.0 * 40.0 * 900.0 / 600.0) + 980.0,
+                (8.0 * 40.0 * 900.0 / 600.0) + 540.0,
+            ],
+            [
+                (-1.0 * 40.0 * 900.0 / 600.0) + 980.0,
+                (8.0 * 40.0 * 900.0 / 600.0) + 540.0,
+            ],
+        ];
+        for (actual, expected) in detected.iter().zip(expected) {
+            assert!((f64::from(actual[0]) - expected[0]).abs() <= 1.0e-3);
+            assert!((f64::from(actual[1]) - expected[1]).abs() <= 1.0e-3);
         }
     }
 }
