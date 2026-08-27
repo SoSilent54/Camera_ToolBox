@@ -135,10 +135,7 @@ fn transfer(
 ///
 /// fail-stop：任何一页失败立即停止，后续页永不执行；不自动回滚。所有写路径结果都以
 /// `I2cExecutionReport` 形式返回（即使 `final_verified=false`），只有读前 I/O 失败走结构化 Failure。
-fn guarded_write(
-    request: I2cGuardedWriteRequest,
-    backend: &mut dyn I2cBackend,
-) -> I2cHelperOutput {
+fn guarded_write(request: I2cGuardedWriteRequest, backend: &mut dyn I2cBackend) -> I2cHelperOutput {
     let before = match read_ranges(&request.target, &request.read_ranges, backend) {
         Ok(image) => image,
         Err(error) => return failure(error),
@@ -262,12 +259,14 @@ fn read_ranges(
             ],
             settle_ms: None,
         };
-        let result = backend.transfer(&transaction).map_err(|error| EngineError {
-            code: "guarded_write_read_failed",
-            message: error.message,
-            transaction_index: None,
-            message_index: error.message_index,
-        })?;
+        let result = backend
+            .transfer(&transaction)
+            .map_err(|error| EngineError {
+                code: "guarded_write_read_failed",
+                message: error.message,
+                transaction_index: None,
+                message_index: error.message_index,
+            })?;
         image.extend_from_slice(&read_bytes(&result));
     }
     Ok(image)
@@ -918,11 +917,16 @@ mod tests {
         };
         assert!(!report.final_verified);
         assert!(report.pages.is_empty());
-        assert!(report
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("digest mismatch")));
-        assert_eq!(backend.writes, 0, "no page may run after stale before image");
+        assert!(
+            report
+                .error
+                .as_deref()
+                .is_some_and(|message| message.contains("digest mismatch"))
+        );
+        assert_eq!(
+            backend.writes, 0,
+            "no page may run after stale before image"
+        );
     }
 
     #[test]

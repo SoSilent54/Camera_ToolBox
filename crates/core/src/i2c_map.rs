@@ -575,26 +575,47 @@ pub struct ChecksumContract {
 }
 
 impl ChecksumContract {
-    pub fn source_ranges(&self, map: &I2cMapDefinition) -> Result<Vec<(u16, u16)>, I2cMapDefinitionError> {
-        match (self.source_offset, self.source_byte_len, self.source_fields.is_empty()) {
+    pub fn source_ranges(
+        &self,
+        map: &I2cMapDefinition,
+    ) -> Result<Vec<(u16, u16)>, I2cMapDefinitionError> {
+        match (
+            self.source_offset,
+            self.source_byte_len,
+            self.source_fields.is_empty(),
+        ) {
             (Some(offset), Some(byte_len), true) => Ok(vec![(offset, byte_len)]),
             (None, None, false) => {
                 let mut names = BTreeSet::new();
-                self.source_fields.iter().map(|name| {
-                    if !names.insert(name.as_str()) {
-                        return Err(I2cMapDefinitionError::Definition(format!("checksum source field `{name}` is duplicated")));
-                    }
-                    let slot = map.inputs.iter().find(|slot| slot.name == *name).ok_or_else(|| {
-                        I2cMapDefinitionError::Definition(format!("checksum source field `{name}` is not declared"))
-                    })?;
-                    let target = slot.target.as_ref().ok_or_else(|| {
-                        I2cMapDefinitionError::Definition(format!("checksum source field `{name}` has no encoded storage span"))
-                    })?;
-                    Ok((target.offset, target.byte_len))
-                }).collect()
+                self.source_fields
+                    .iter()
+                    .map(|name| {
+                        if !names.insert(name.as_str()) {
+                            return Err(I2cMapDefinitionError::Definition(format!(
+                                "checksum source field `{name}` is duplicated"
+                            )));
+                        }
+                        let slot = map
+                            .inputs
+                            .iter()
+                            .find(|slot| slot.name == *name)
+                            .ok_or_else(|| {
+                                I2cMapDefinitionError::Definition(format!(
+                                    "checksum source field `{name}` is not declared"
+                                ))
+                            })?;
+                        let target = slot.target.as_ref().ok_or_else(|| {
+                            I2cMapDefinitionError::Definition(format!(
+                                "checksum source field `{name}` has no encoded storage span"
+                            ))
+                        })?;
+                        Ok((target.offset, target.byte_len))
+                    })
+                    .collect()
             }
             _ => Err(I2cMapDefinitionError::Definition(
-                "checksum requires either sourceOffset/sourceByteLen or non-empty sourceFields".to_owned(),
+                "checksum requires either sourceOffset/sourceByteLen or non-empty sourceFields"
+                    .to_owned(),
             )),
         }
     }
@@ -615,18 +636,30 @@ impl ChecksumContract {
 
     fn write(&self, map: &I2cMapDefinition, image: &mut [u8]) -> Result<(), I2cMapDefinitionError> {
         let ranges = self.source_ranges(map)?;
-        let sum = ranges.into_iter().try_fold(0_u32, |sum, (offset, byte_len)| {
-            let source = image.get(usize::from(offset)..usize::from(offset + byte_len)).ok_or_else(|| {
-                I2cMapDefinitionError::Definition("checksum source range is invalid".to_owned())
+        let sum = ranges
+            .into_iter()
+            .try_fold(0_u32, |sum, (offset, byte_len)| {
+                let source = image
+                    .get(usize::from(offset)..usize::from(offset + byte_len))
+                    .ok_or_else(|| {
+                        I2cMapDefinitionError::Definition(
+                            "checksum source range is invalid".to_owned(),
+                        )
+                    })?;
+                Ok::<_, I2cMapDefinitionError>(
+                    source
+                        .iter()
+                        .fold(sum, |total, byte| total + u32::from(*byte)),
+                )
             })?;
-            Ok::<_, I2cMapDefinitionError>(source.iter().fold(sum, |total, byte| total + u32::from(*byte)))
-        })?;
         let value = match self.algorithm {
             ChecksumAlgorithm::SerialSumMod255PlusOne => ((sum % 0xff) + 1) as u8,
         };
-        *image.get_mut(usize::from(self.target_offset)).ok_or_else(|| {
-            I2cMapDefinitionError::Definition("checksum target range is invalid".to_owned())
-        })? = value;
+        *image
+            .get_mut(usize::from(self.target_offset))
+            .ok_or_else(|| {
+                I2cMapDefinitionError::Definition("checksum target range is invalid".to_owned())
+            })? = value;
         Ok(())
     }
 }

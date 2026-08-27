@@ -1,4 +1,3 @@
-
 use camera_toolbox_core::{ChecksumAlgorithm, I2cMapDefinition};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -463,16 +462,23 @@ pub fn validate_map_image(
         }
     }
     for checksum in &validation.checksums {
-        let sum = checksum.source_ranges.iter().try_fold(0_u32, |sum, range| {
-            let start = usize::from(range.offset);
-            let end = start
-                .checked_add(usize::from(range.byte_len))
-                .ok_or_else(|| "checksum source range overflow".to_owned())?;
-            let source = image
-                .get(start..end)
-                .ok_or_else(|| "checksum source range is outside image".to_owned())?;
-            Ok::<_, String>(source.iter().fold(sum, |total, byte| total + u32::from(*byte)))
-        })?;
+        let sum = checksum
+            .source_ranges
+            .iter()
+            .try_fold(0_u32, |sum, range| {
+                let start = usize::from(range.offset);
+                let end = start
+                    .checked_add(usize::from(range.byte_len))
+                    .ok_or_else(|| "checksum source range overflow".to_owned())?;
+                let source = image
+                    .get(start..end)
+                    .ok_or_else(|| "checksum source range is outside image".to_owned())?;
+                Ok::<_, String>(
+                    source
+                        .iter()
+                        .fold(sum, |total, byte| total + u32::from(*byte)),
+                )
+            })?;
         let expected = match checksum.algorithm {
             ChecksumAlgorithm::SerialSumMod255PlusOne => ((sum % 0xff) + 1) as u8,
         };
@@ -661,7 +667,8 @@ impl I2cWriteRequest {
 
     #[must_use]
     pub fn is_compiled(&self) -> bool {
-        self.plan_digest == write_request_digest(&self.map_digest, &self.pages, &self.expected_final_image)
+        self.plan_digest
+            == write_request_digest(&self.map_digest, &self.pages, &self.expected_final_image)
             && self.seal
                 == write_request_seal(
                     &self.map_id,
@@ -677,7 +684,10 @@ impl I2cWriteRequest {
     }
 
     #[must_use]
-    pub fn guarded_request(&self, expected_before_sha256: Option<String>) -> Option<I2cGuardedWriteRequest> {
+    pub fn guarded_request(
+        &self,
+        expected_before_sha256: Option<String>,
+    ) -> Option<I2cGuardedWriteRequest> {
         self.is_compiled().then(|| I2cGuardedWriteRequest {
             target: self.target.clone(),
             read_ranges: self.read_ranges.clone(),
@@ -730,7 +740,11 @@ fn write_request_seal(
     digest.finish()
 }
 
-fn write_request_digest(map_digest: &str, pages: &[I2cPageWrite], expected_final_image: &[u8]) -> String {
+fn write_request_digest(
+    map_digest: &str,
+    pages: &[I2cPageWrite],
+    expected_final_image: &[u8],
+) -> String {
     let mut digest = I2cPlanDigest::new("write-pages");
     digest.text(map_digest);
     digest.pages(pages);
@@ -859,9 +873,14 @@ pub trait I2cTaskExecutor: Send + Sync {
     ) -> Result<I2cExecutionReport, String>;
 }
 
-fn validate_guarded_write_request(request: &I2cGuardedWriteRequest) -> Result<(), I2cHelperRequestValidationError> {
+fn validate_guarded_write_request(
+    request: &I2cGuardedWriteRequest,
+) -> Result<(), I2cHelperRequestValidationError> {
     validate_i2c_target(&request.target)?;
-    validate_read_ranges(&request.read_ranges, Some(request.expected_final_image.len()))?;
+    validate_read_ranges(
+        &request.read_ranges,
+        Some(request.expected_final_image.len()),
+    )?;
     if request.pages.is_empty() {
         return Err(I2cHelperRequestValidationError::request(
             "invalid_request",
@@ -873,11 +892,18 @@ fn validate_guarded_write_request(request: &I2cGuardedWriteRequest) -> Result<()
         .len()
         .checked_mul(2)
         .and_then(|value| value.checked_add(request.pages.len().saturating_mul(2)))
-        .ok_or_else(|| I2cHelperRequestValidationError::request("invalid_request", "guarded_write transaction budget overflowed"))?;
+        .ok_or_else(|| {
+            I2cHelperRequestValidationError::request(
+                "invalid_request",
+                "guarded_write transaction budget overflowed",
+            )
+        })?;
     if transaction_budget > I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST {
         return Err(I2cHelperRequestValidationError::request(
             "invalid_request",
-            format!("guarded_write uses {transaction_budget} logical transactions; max is {I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST}"),
+            format!(
+                "guarded_write uses {transaction_budget} logical transactions; max is {I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST}"
+            ),
         ));
     }
     for (index, page) in request.pages.iter().enumerate() {
@@ -885,12 +911,21 @@ fn validate_guarded_write_request(request: &I2cGuardedWriteRequest) -> Result<()
             return Err(I2cHelperRequestValidationError::transaction(
                 "invalid_transaction",
                 index,
-                format!("page byte length must be 1..={} bytes", request.target.page_size_bytes),
+                format!(
+                    "page byte length must be 1..={} bytes",
+                    request.target.page_size_bytes
+                ),
             ));
         }
         let payload_len = usize::from(request.target.address_width_bytes)
             .checked_add(page.bytes.len())
-            .ok_or_else(|| I2cHelperRequestValidationError::transaction("invalid_transaction", index, "page payload length overflowed"))?;
+            .ok_or_else(|| {
+                I2cHelperRequestValidationError::transaction(
+                    "invalid_transaction",
+                    index,
+                    "page payload length overflowed",
+                )
+            })?;
         validate_i2c_message_len(index, 0, payload_len, "guarded_write page payload")?;
     }
     Ok(())
@@ -906,7 +941,10 @@ fn validate_i2c_target(target: &I2cTaskTarget) -> Result<(), I2cHelperRequestVal
     if target.address < 0x03 || target.address > 0x7f {
         return Err(I2cHelperRequestValidationError::request(
             "invalid_request",
-            format!("target I2C address 0x{:x} is outside accepted 7-bit range", target.address),
+            format!(
+                "target I2C address 0x{:x} is outside accepted 7-bit range",
+                target.address
+            ),
         ));
     }
     if target.page_size_bytes == 0 {
@@ -918,7 +956,10 @@ fn validate_i2c_target(target: &I2cTaskTarget) -> Result<(), I2cHelperRequestVal
     Ok(())
 }
 
-fn validate_read_ranges(ranges: &[I2cReadRange], expected_len: Option<usize>) -> Result<(), I2cHelperRequestValidationError> {
+fn validate_read_ranges(
+    ranges: &[I2cReadRange],
+    expected_len: Option<usize>,
+) -> Result<(), I2cHelperRequestValidationError> {
     if ranges.is_empty() {
         return Err(I2cHelperRequestValidationError::request(
             "invalid_request",
@@ -936,7 +977,12 @@ fn validate_read_ranges(ranges: &[I2cReadRange], expected_len: Option<usize>) ->
         }
         total = total
             .checked_add(usize::from(range.byte_len))
-            .ok_or_else(|| I2cHelperRequestValidationError::request("invalid_request", "read range total length overflowed"))?;
+            .ok_or_else(|| {
+                I2cHelperRequestValidationError::request(
+                    "invalid_request",
+                    "read range total length overflowed",
+                )
+            })?;
     }
     if total > I2C_HELPER_MAX_TOTAL_READ_BYTES {
         return Err(I2cHelperRequestValidationError::request(
@@ -944,7 +990,9 @@ fn validate_read_ranges(ranges: &[I2cReadRange], expected_len: Option<usize>) ->
             format!("read ranges total {total} exceeds {I2C_HELPER_MAX_TOTAL_READ_BYTES}"),
         ));
     }
-    if let Some(expected) = expected_len && total != expected {
+    if let Some(expected) = expected_len
+        && total != expected
+    {
         return Err(I2cHelperRequestValidationError::request(
             "invalid_request",
             format!("expected final image is {expected} bytes, but read ranges cover {total}"),
