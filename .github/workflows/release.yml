@@ -189,6 +189,7 @@ jobs:
             git \
             pkg-config \
             python3 \
+            fonts-wqy-microhei \
             libegl1-mesa-dev \
             libgl1-mesa-dev \
             libx11-dev \
@@ -241,6 +242,9 @@ jobs:
           cp target/release/pongbot-calib-tool "dist/$bundle/"
           cp helper-sidecar/camera-i2c-helper "dist/$bundle/"
           cp README.md "dist/$bundle/"
+          # CJK 字体（文泉驿微米黑，OFL 可再分发）：保证无系统字体时中文正常显示。
+          mkdir -p "dist/$bundle/fonts"
+          cp /usr/share/fonts/truetype/wqy/wqy-microhei.ttc "dist/$bundle/fonts/"
           python3 scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           python3 scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
           version_out="$(dist/$bundle/pongbot-calib-tool --version)"

@@ -111,16 +111,29 @@ fn provision_with_mode(
         .map_err(|error| format!("写入 EEPROM 失败：{error}"))
 }
 
-/// 探测 helper sidecar 路径：`PONGBOT_HELPER` 或本地 release 编译产物。
+/// 探测 helper sidecar 路径：`PONGBOT_HELPER` → 可执行文件同目录（打包发布，
+/// 各平台 bundle 根均为 `camera-i2c-helper`）→ CWD 相对编译产物（开发）。
 pub fn locate_helper() -> Option<Vec<u8>> {
     if let Ok(path) = std::env::var("PONGBOT_HELPER") {
         if let Ok(bytes) = std::fs::read(&path) {
             return Some(bytes);
         }
     }
-    let local = std::path::Path::new("target/release/camera-i2c-helper");
-    if local.exists() {
-        return std::fs::read(local).ok();
+    // 打包发布：helper 与可执行文件同目录（Windows/Linux/macOS bundle 根统一命名）。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            if let Ok(bytes) = std::fs::read(dir.join("camera-i2c-helper")) {
+                return Some(bytes);
+            }
+        }
+    }
+    let release = std::path::Path::new("target/release/camera-i2c-helper");
+    if release.exists() {
+        return std::fs::read(release).ok();
+    }
+    let debug = std::path::Path::new("target/debug/camera-i2c-helper");
+    if debug.exists() {
+        return std::fs::read(debug).ok();
     }
     None
 }
