@@ -2,6 +2,8 @@ name: Debug release 403
 
 on:
   workflow_dispatch:
+  push:
+    tags: ["debug-*"]
 
 permissions:
   contents: write
