@@ -350,6 +350,9 @@ jobs:
       contents: write
 
     steps:
+      - name: Check out source
+        # gh release create/edit 需要 git 仓库上下文解析 tag/生成 notes
+        uses: actions/checkout@v4
       - name: Download release archives
         uses: actions/download-artifact@v4
         with:
