@@ -116,6 +116,23 @@ fn run() -> Result<(), String> {
                 winit_platform.handle_event(imgui_context.io_mut(), &window, &event);
             }
             Event::WindowEvent {
+                event: WindowEvent::Ime(ime),
+                ..
+            } => {
+                // imgui-winit-support 0.13 不处理 winit 的 Ime 事件；Windows 上
+                // 输入法组合结束后只通过 Ime::Commit 提交文本，不处理会导致
+                // 中文/全角字符完全无法输入，且组合期间 KeyboardInput 的
+                // logical_key 为 NamedKey::Process（无字符），不会重复入队。
+                if let winit::event::Ime::Commit(text) = ime {
+                    let io = imgui_context.io_mut();
+                    for ch in text.chars() {
+                        if ch != '\u{7f}' {
+                            io.add_input_character(ch);
+                        }
+                    }
+                }
+            }
+            Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => window_target.exit(),
@@ -1153,7 +1170,10 @@ impl App {
         changed |= ui.combo_simple_string("光轴等级", &mut axis, &SnidDraft::AXES);
         // 序列号步进按钮：十进制 -1 / +1，有效范围 1..=3844（两位 base62 上限）。
         ui.set_next_item_width(120.0);
-        changed |= ui.input_text("序列号", &mut sequence).build();
+        changed |= ui
+            .input_text("序列号", &mut sequence)
+            .chars_decimal(true)
+            .build();
         ui.same_line();
         if ui.small_button(format!("-1##seq_{index}")) {
             if let Ok(value) = sequence.trim().parse::<u16>() {
