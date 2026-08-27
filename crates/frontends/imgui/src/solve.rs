@@ -16,17 +16,33 @@ use std::sync::Arc;
 pub(crate) const MIN_USABLE_CALIBRATION_VIEWS: usize = 5;
 const CALIBRATION_DETECT_MAX_PNG_BYTES: usize = 256 * 1024 * 1024;
 
+/// 单张图像重投影 RMSE 的剔除阈值（像素）；超过该值的视图从标定集剔除后重新求解。
+pub(crate) const MAX_VIEW_REPROJECTION_RMSE: f64 = 0.15;
+
 /// 单路求解结果（主线程展示 + EEPROM 写入用）。
 pub struct SolveResult {
     pub channel: u16,
-    /// 完整标定解（EEPROM 写入使用）。
+    /// 完整标定解（EEPROM 写入使用；已剔除超阈值视图后的最终解）。
     pub solution: CalibrationSolution,
+    /// 按单图重投影 RMSE 超阈值自动剔除的帧索引（相对入参 frames，升序去重）。
+    pub rejected_view_indices: Vec<usize>,
+    /// 求解轮数：首轮为 1，每剔除一批超阈值视图后 +1。
+    pub iterations: u32,
 }
 
 impl SolveResult {
     /// 结果摘要文本（中文，就地展示）。
     pub fn summary(&self) -> String {
-        solution_detail_summary(&format!("CH{}", self.channel), &self.solution)
+        let mut text =
+            solution_detail_summary(&format!("CH{}", self.channel), &self.solution);
+        if !self.rejected_view_indices.is_empty() {
+            text.push_str(&format!(
+                "\n已自动剔除 {} 张单图重投影误差超阈值（>{MAX_VIEW_REPROJECTION_RMSE}px）的图像并重新标定（共 {} 轮）",
+                self.rejected_view_indices.len(),
+                self.iterations
+            ));
+        }
+        text
     }
 }
 
@@ -175,10 +191,8 @@ pub(crate) fn detect_dataset_frame(
         .map_err(|error| format!("dataset 棋盘检测失败：{error}"))
 }
 
-/// 对单路 dataset 求解（后台线程调用）。
-///
-/// dataset 已在采集时转换成 luma：真实设备来自 TCP NV12 的 Y plane；检测走原版
-/// `detect_png()` 路径，内部使用自适应 `cornerSubPix` 与稳定性筛选。
+/// 求解后自动剔除单图重投影 RMSE 超过 [`MAX_VIEW_REPROJECTION_RMSE`] 的视图并
+/// 重新标定，直到没有超阈值视图或剩余视图跌破 [`MIN_USABLE_CALIBRATION_VIEWS`]。
 pub fn solve_channel(
     channel: u16,
     frames: &[Arc<CapturedDatasetFrame>],
@@ -189,13 +203,14 @@ pub fn solve_channel(
     }
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
-    let mut image_points: Vec<Vec<CalibrationPoint>> = Vec::new();
+    // 检测成功帧保留入参索引，供剔除后回写被移除的具体帧号。
+    let mut detected: Vec<(usize, Vec<CalibrationPoint>)> = Vec::new();
     let mut image_size = None;
-    for frame in frames {
+    for (frame_index, frame) in frames.iter().enumerate() {
         match detect_dataset_frame(&backend, frame, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 image_size = Some(detection.image_size);
-                image_points.push(detection.corners);
+                detected.push((frame_index, detection.corners));
             }
             Ok(ChessboardDetectionOutcome::NotFound { .. }) => {}
             Err(error) => {
@@ -204,10 +219,10 @@ pub fn solve_channel(
             }
         }
     }
-    if image_points.len() < MIN_USABLE_CALIBRATION_VIEWS {
+    if detected.len() < MIN_USABLE_CALIBRATION_VIEWS {
         return Err(format!(
             "有效检测帧不足（{}/{MIN_USABLE_CALIBRATION_VIEWS}）：请重采或调整棋盘参数",
-            image_points.len()
+            detected.len()
         ));
     }
     let image_size = image_size.expect("有检测必有尺寸");
@@ -225,16 +240,75 @@ pub fn solve_channel(
         ],
         distortion_coefficients: vec![0.0, 0.0, 0.0, 0.0, 0.0],
     };
-    let request = CalibrationRequest {
-        image_size,
-        board,
-        image_points,
-        initial_intrinsics: initial,
+
+    let mut rejected: Vec<usize> = Vec::new();
+    let mut iterations = 1_u32;
+    let solution = loop {
+        let image_points: Vec<Vec<CalibrationPoint>> = detected
+            .iter()
+            .map(|(_, corners)| corners.clone())
+            .collect();
+        let request = CalibrationRequest {
+            image_size,
+            board,
+            image_points,
+            initial_intrinsics: initial.clone(),
+        };
+        let solution: CalibrationSolution = backend
+            .calibrate(&request, &cancellation)
+            .map_err(|error| format!("标定失败：{error}"))?;
+
+        let over: Vec<usize> = views_above_threshold(
+            &solution
+                .views
+                .iter()
+                .map(|view| view.reprojection_rmse)
+                .collect::<Vec<_>>(),
+            MAX_VIEW_REPROJECTION_RMSE,
+        );
+        if over.is_empty() {
+            break solution;
+        }
+        let remaining = detected.len().saturating_sub(over.len());
+        if remaining < MIN_USABLE_CALIBRATION_VIEWS {
+            // 剔除会跌破最小视图数：保留本次结果（不记录剔除，避免误导），
+            // 标定集整体质量仍可从 summary 的单图误差看出。
+            tracing::warn!(
+                "CH{channel} 有 {} 张视图重投影误差超阈值（>{MAX_VIEW_REPROJECTION_RMSE}px），但剔除后不足 {MIN_USABLE_CALIBRATION_VIEWS} 张，保留全部",
+                over.len()
+            );
+            break solution;
+        }
+        iterations += 1;
+        let mut kept = Vec::with_capacity(remaining);
+        for (index, (frame_index, corners)) in detected.into_iter().enumerate() {
+            if over.contains(&index) {
+                rejected.push(frame_index);
+            } else {
+                kept.push((frame_index, corners));
+            }
+        }
+        detected = kept;
     };
-    let solution: CalibrationSolution = backend
-        .calibrate(&request, &cancellation)
-        .map_err(|error| format!("标定失败：{error}"))?;
-    Ok(SolveResult { channel, solution })
+
+    rejected.sort_unstable();
+    rejected.dedup();
+    Ok(SolveResult {
+        channel,
+        solution,
+        rejected_view_indices: rejected,
+        iterations,
+    })
+}
+
+/// 找出重投影 RMSE 严格超过阈值的视图索引（升序；阈值本身不剔除）。
+fn views_above_threshold(rmse_values: &[f64], threshold: f64) -> Vec<usize> {
+    rmse_values
+        .iter()
+        .enumerate()
+        .filter(|(_, rmse)| **rmse > threshold)
+        .map(|(index, _)| index)
+        .collect()
 }
 
 /// Gray8 luma 帧编码为 PNG 字节；真实设备输入来自 TCP NV12 的 Y plane。
@@ -294,7 +368,25 @@ mod tests {
     }
 
     #[test]
-    fn view_rmse_values_keep_dataset_order() {
-        assert_eq!(view_rmse_values(&solution()), vec![0.30, 0.70]);
+    fn views_above_threshold_uses_strict_gt() {
+        // 阈值本身（0.15）不剔除；严格大于才剔除，索引保持升序。
+        assert_eq!(
+            views_above_threshold(&[0.10, 0.15, 0.16, 0.30, 0.05], 0.15),
+            vec![2, 3]
+        );
+        assert!(views_above_threshold(&[0.15, 0.14], 0.15).is_empty());
+    }
+
+    #[test]
+    fn solve_result_summary_reports_rejected_views() {
+        let result = SolveResult {
+            channel: 0,
+            solution: solution(),
+            rejected_view_indices: vec![3, 7, 11],
+            iterations: 2,
+        };
+        let text = result.summary();
+        assert!(text.contains("已自动剔除 3 张单图重投影误差超阈值（>0.15px）的图像并重新标定（共 2 轮）"));
+        assert!(text.contains("CH0 求解完成"));
     }
 }
