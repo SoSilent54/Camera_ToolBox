@@ -2,8 +2,8 @@ name: Release
 
 # pongbot-calib-tool 独立发布流水线（原生 ImGui + winit 前端）。
 # 仅存在于 calib_tool_godot 分支；tag v* 推送或手动触发。
-# 模式对齐 Camera_ToolBox 的 release.yml：i2c-helper 静态 sidecar +
-# Windows x86_64 构建 + OpenCV/FFmpeg 依赖 bundle + GitHub Release 发布。
+# 平台矩阵：Windows x86_64、Linux x86_64（Ubuntu 20.04 / 22.04）、macOS arm64；
+# i2c-helper 静态 sidecar 随各平台发布包附带。
 
 "on":
   push:
@@ -25,7 +25,7 @@ env:
 jobs:
   validate-release:
     name: Validate release version
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       release_version: ${{ steps.version.outputs.release_version }}
     steps:
@@ -147,10 +147,7 @@ jobs:
           & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
           # 冒烟：--version 不初始化窗口/GL，直接验证二进制可执行且依赖 bundle 齐全。
           $versionOut = & "dist/$bundle/pongbot-calib-tool.exe" --version
-          if ($LASTEXITCODE -ne 0) {
-            Get-Content "$bundle-smoke.log" -ErrorAction SilentlyContinue
-            throw "pongbot-calib-tool.exe --version failed with exit $LASTEXITCODE"
-          }
+          if ($LASTEXITCODE -ne 0) { throw "pongbot-calib-tool.exe --version failed with exit $LASTEXITCODE" }
           if ("$versionOut" -notmatch 'pongbot-calib-tool') { throw "unexpected --version output: $versionOut" }
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$archive.zip" -Force
       - name: Upload release archive
@@ -160,12 +157,172 @@ jobs:
           path: dist/pongbot-calib-tool-${{ env.RELEASE_VERSION }}-windows-x86_64.zip
           if-no-files-found: error
 
+  build-linux:
+    name: Build linux-x86_64 (Ubuntu ${{ matrix.ubuntu }})
+    needs:
+      - validate-release
+      - build-i2c-helper-linux-aarch64
+    strategy:
+      fail-fast: false
+      matrix:
+        ubuntu: ["20.04", "22.04"]
+    runs-on: ubuntu-24.04
+    container:
+      image: ubuntu:${{ matrix.ubuntu }}
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+      UBUNTU_TAG: ${{ matrix.ubuntu }}
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            clang \
+            curl \
+            file \
+            git \
+            pkg-config \
+            python3 \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-xkb-dev \
+            libxcb-icccm4-dev \
+            libxcb-keysyms1-dev \
+            libxcb-randr0-dev \
+            libxcb-composite0-dev \
+            libxcb-xinerama0-dev \
+            libxcb-xinput-dev
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Download Linux AArch64 I2C helper
+        uses: actions/download-artifact@v4
+        with:
+          name: i2c-helper-linux-aarch64
+          path: helper-sidecar
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Prepare pinned OpenCV 5 dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/opencv5_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ffmpeg_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
+      - name: Build native ImGui frontend
+        run: |
+          cargo build --release --locked -p pongbot-calib-tool
+          test -f target/release/pongbot-calib-tool
+      - name: Package Linux release
+        run: |
+          set -euo pipefail
+          bundle="pongbot-calib-tool-linux-x86_64-ubuntu${UBUNTU_TAG}"
+          archive="pongbot-calib-tool-${RELEASE_VERSION}-linux-x86_64-ubuntu${UBUNTU_TAG}"
+          mkdir -p "dist/$bundle"
+          cp target/release/pongbot-calib-tool "dist/$bundle/"
+          cp helper-sidecar/camera-i2c-helper "dist/$bundle/"
+          cp README.md "dist/$bundle/"
+          python3 scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
+          python3 scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
+          version_out="$(dist/$bundle/pongbot-calib-tool --version)"
+          echo "$version_out"
+          case "$version_out" in *pongbot-calib-tool*) ;; *) echo "unexpected --version output" >&2; exit 1 ;; esac
+          tar -czf "dist/$archive.tar.gz" -C dist "$bundle"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64-ubuntu-${{ matrix.ubuntu }}
+          path: dist/pongbot-calib-tool-${{ env.RELEASE_VERSION }}-linux-x86_64-ubuntu${{ matrix.ubuntu }}.tar.gz
+          if-no-files-found: error
+
+  build-macos:
+    name: Build macos-aarch64
+    needs:
+      - validate-release
+      - build-i2c-helper-linux-aarch64
+    runs-on: macos-14
+    env:
+      RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Download Linux AArch64 I2C helper
+        uses: actions/download-artifact@v4
+        with:
+          name: i2c-helper-linux-aarch64
+          path: helper-sidecar
+      - name: Install Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Prepare pinned OpenCV 5 dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/opencv5_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
+      - name: Prepare pinned FFmpeg dependency
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 scripts/ffmpeg_dependency.py prepare \
+            --github-env "$GITHUB_ENV" \
+            --github-path "$GITHUB_PATH"
+      - name: Install stable Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build native ImGui frontend
+        run: |
+          cargo build --release --locked -p pongbot-calib-tool
+          test -f target/release/pongbot-calib-tool
+      - name: Package macOS release
+        run: |
+          set -euo pipefail
+          bundle="pongbot-calib-tool-macos-aarch64"
+          archive="pongbot-calib-tool-${RELEASE_VERSION}-macos-aarch64"
+          mkdir -p "dist/$bundle"
+          cp target/release/pongbot-calib-tool "dist/$bundle/"
+          cp helper-sidecar/camera-i2c-helper "dist/$bundle/"
+          cp README.md "dist/$bundle/"
+          python3 scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
+          python3 scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
+          # Apple Silicon 强制要求签名：对 bundle 内全部 Mach-O 做 ad-hoc 签名。
+          codesign --force --deep -s - "dist/$bundle"
+          version_out="$(dist/$bundle/pongbot-calib-tool --version)"
+          echo "$version_out"
+          case "$version_out" in *pongbot-calib-tool*) ;; *) echo "unexpected --version output" >&2; exit 1 ;; esac
+          ditto -c -k --sequesterRsrc --keepParent "dist/$bundle" "dist/$archive.zip"
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-aarch64
+          path: dist/pongbot-calib-tool-${{ env.RELEASE_VERSION }}-macos-aarch64.zip
+          if-no-files-found: error
+
   publish:
     name: Publish GitHub Release
     needs:
       - validate-release
       - build-windows
-    runs-on: ubuntu-22.04
+      - build-linux
+      - build-macos
+    runs-on: ubuntu-24.04
     env:
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
     permissions:
@@ -181,6 +338,9 @@ jobs:
       - name: Verify release archives
         run: |
           test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-windows-x86_64.zip"
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-x86_64-ubuntu20.04.tar.gz"
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-linux-x86_64-ubuntu22.04.tar.gz"
+          test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-macos-aarch64.zip"
       - name: Create or update GitHub Release
         uses: softprops/action-gh-release@v3
         with:
@@ -189,4 +349,4 @@ jobs:
           generate_release_notes: true
           fail_on_unmatched_files: true
           files: |
-            dist/pongbot-calib-tool-*.zip
+            dist/pongbot-calib-tool-*
