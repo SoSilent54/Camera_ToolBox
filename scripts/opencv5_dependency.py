@@ -515,7 +515,16 @@ def find_libclang_dir() -> Path:
         candidates.extend(Path("/usr/lib").glob("llvm-*/lib"))
     elif system == "Darwin":
         candidates.extend(
-            [Path("/opt/homebrew/opt/llvm/lib"), Path("/usr/local/opt/llvm/lib")]
+            [
+                Path("/opt/homebrew/opt/llvm/lib"),
+                Path("/usr/local/opt/llvm/lib"),
+                # GitHub Actions macOS runner（无 Homebrew LLVM）自带 CLT/Xcode 的 libclang。
+                Path("/Library/Developer/CommandLineTools/usr/lib"),
+                Path(
+                    "/Applications/Xcode.app/Contents/Developer/Toolchains/"
+                    "XcodeDefault.xctoolchain/usr/lib"
+                ),
+            ]
         )
     elif system == "Windows":
         candidates.append(Path("C:/Program Files/LLVM/bin"))

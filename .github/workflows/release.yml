@@ -172,6 +172,9 @@ jobs:
     env:
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
       UBUNTU_TAG: ${{ matrix.ubuntu }}
+      # bundle 的 OpenCV/FFmpeg .so 与 exe 同目录：DT_RPATH=$ORIGIN（--disable-new-dtags，
+      # RPATH 递归解析传递依赖；RUNPATH 不递归会导致 libavcodec→libswresample 查找失败）。
+      RUSTFLAGS: '-C link-arg=-Wl,-rpath,$ORIGIN -C link-arg=-Wl,--disable-new-dtags'
 
     steps:
       - name: Install build dependencies
@@ -302,6 +305,16 @@ jobs:
           cp README.md "dist/$bundle/"
           python3 scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           python3 scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
+          # 资产 dylib 的 install_name 指向构建机绝对路径：统一改写为 @loader_path，
+          # 让 exe 与 dylib 按 bundle 同目录解析（解压即用）。
+          for f in "dist/$bundle/pongbot-calib-tool" "dist/$bundle"/*.dylib; do
+            [ -f "$f" ] || continue
+            install_name_tool -id "@loader_path/$(basename "$f")" "$f" 2>/dev/null || true
+            otool -L "$f" | tail -n +2 | awk '{print $1}' \
+              | grep -E '^/' | grep -vE '^(/usr/lib|/System|/Library)' | while read -r dep; do
+                install_name_tool -change "$dep" "@loader_path/$(basename "$dep")" "$f" || true
+              done
+          done
           # Apple Silicon 强制要求签名：对 bundle 内全部 Mach-O 做 ad-hoc 签名。
           codesign --force --deep -s - "dist/$bundle"
           version_out="$(dist/$bundle/pongbot-calib-tool --version)"
