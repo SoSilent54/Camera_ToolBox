@@ -367,16 +367,36 @@ jobs:
           test -f "dist/pongbot-calib-tool-${RELEASE_VERSION}-macos-aarch64.zip"
       - name: Create or update GitHub Release
         # softprops v3.0.2 在 Node 24 强制环境（2026-08 起）下用 GITHUB_TOKEN 创建/更新
-        # release 一律 403（softprops#836）；GITHUB_TOKEN 本身权限正常（curl 直调 201）。
-        # 改用官方 gh CLI（Go 实现，无 Node 运行时依赖）。
+        # release 一律 403（softprops#836）；gh CLI 在同环境下对已存在 release 的
+        # edit/upload 也 403。curl 直调已实证：POST 201 / PATCH 200 / UPLOAD 201。
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
-            gh release edit "${RELEASE_TAG}" --title "${RELEASE_TAG}" --target "${GITHUB_SHA}"
-            gh release upload "${RELEASE_TAG}" dist/pongbot-calib-tool-* --clobber
+          api="https://api.github.com/repos/${GITHUB_REPOSITORY}/releases"
+          uploads="https://uploads.github.com/repos/${GITHUB_REPOSITORY}/releases"
+          auth=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          # 已存在 → 更新元数据；否则创建（自动 release notes）
+          release_json="$(curl -fsS "${auth[@]}" "${api}/tags/${RELEASE_TAG}" 2>/dev/null || true)"
+          if [ -n "${release_json}" ]; then
+            release_id="$(jq -r '.id' <<<"${release_json}")"
+            curl -fsS -X PATCH "${auth[@]}" "${api}/${release_id}" \
+              -d "$(jq -nc --arg t "${RELEASE_TAG}" --arg s "${GITHUB_SHA}" '{name:$t,target_commitish:$s}')" >/dev/null
           else
-            gh release create "${RELEASE_TAG}" dist/pongbot-calib-tool-* \
-              --title "${RELEASE_TAG}" --target "${GITHUB_SHA}" --generate-notes
+            notes="$(curl -fsS -X POST "${auth[@]}" "${api}/generate-notes" \
+              -d "$(jq -nc --arg t "${RELEASE_TAG}" '{tag_name:$t}')" | jq -r '.body')"
+            release_json="$(curl -fsS -X POST "${auth[@]}" "${api}" \
+              -d "$(jq -nc --arg t "${RELEASE_TAG}" --arg s "${GITHUB_SHA}" --arg b "${notes}" '{tag_name:$t,target_commitish:$s,name:$t,body:$b}')")"
+            release_id="$(jq -r '.id' <<<"${release_json}")"
           fi
+          # 上传全部产物：同名 asset 先删（重跑语义 = clobber）再传
+          for f in dist/pongbot-calib-tool-*; do
+            name="$(basename "${f}")"
+            existing="$(curl -fsS "${auth[@]}" "${api}/${release_id}/assets" | jq -r --arg n "${name}" '.[] | select(.name==$n) | .id')" || true
+            if [ -n "${existing}" ]; then
+              curl -fsS -X DELETE "${auth[@]}" "${api}/assets/${existing}" >/dev/null
+            fi
+            curl -fsS -X POST "${auth[@]}" -H "Content-Type: application/octet-stream" \
+              "${uploads}/${release_id}/assets?name=${name}" --data-binary "@${f}" >/dev/null
+            echo "uploaded ${name}"
+          done
