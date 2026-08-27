@@ -1172,14 +1172,15 @@ fn rasterize_density_heatmap(
         let v = (y as f32 + 0.5) / height_f;
         for x in 0..output_width {
             let u = (x as f32 + 0.5) / width_f;
-            let density = heatmap.sample_bilinear(u, v);
+            // 按充分阈值归一化：零密度红、达到充分阈值纯绿（单帧峰值 1/2 → 黄）。
+            let fraction = heatmap.sufficient_fraction(u, v);
             let red_to_green = [
-                theme::ERR[0] + (theme::OK[0] - theme::ERR[0]) * density,
-                theme::ERR[1] + (theme::OK[1] - theme::ERR[1]) * density,
-                theme::ERR[2] + (theme::OK[2] - theme::ERR[2]) * density,
+                theme::ERR[0] + (theme::OK[0] - theme::ERR[0]) * fraction,
+                theme::ERR[1] + (theme::OK[1] - theme::ERR[1]) * fraction,
+                theme::ERR[2] + (theme::OK[2] - theme::ERR[2]) * fraction,
             ];
             let alpha =
-                HEATMAP_ZERO_ALPHA + (HEATMAP_SUFFICIENT_ALPHA - HEATMAP_ZERO_ALPHA) * density;
+                HEATMAP_ZERO_ALPHA + (HEATMAP_SUFFICIENT_ALPHA - HEATMAP_ZERO_ALPHA) * fraction;
             let index = (y * output_width + x) * 4;
             output[index] = rgba_channel(red_to_green[0]);
             output[index + 1] = rgba_channel(red_to_green[1]);
@@ -1289,7 +1290,8 @@ mod tests {
         let sufficient = DensityHeatmap {
             cols: 8,
             rows: 8,
-            samples: vec![1.0; 64].into(),
+            samples: vec![6.0; 64].into(),
+            sufficient_level: 6.0,
         };
         assert!(rasterize_density_heatmap(&sufficient, 2, 2, &mut rgba));
         assert_eq!(
@@ -1299,6 +1301,24 @@ mod tests {
                 rgba_channel(theme::OK[1]),
                 rgba_channel(theme::OK[2]),
                 rgba_channel(HEATMAP_SUFFICIENT_ALPHA),
+            ]
+        );
+
+        // 半密度（1 帧等效观测 / 2 帧阈值）应为中间色与中等透明度，而不是纯绿。
+        let half = DensityHeatmap {
+            cols: 8,
+            rows: 8,
+            samples: vec![1.0; 64].into(),
+            sufficient_level: 2.0,
+        };
+        assert!(rasterize_density_heatmap(&half, 2, 2, &mut rgba));
+        assert_eq!(
+            &rgba[..4],
+            &[
+                rgba_channel((theme::ERR[0] + theme::OK[0]) * 0.5),
+                rgba_channel((theme::ERR[1] + theme::OK[1]) * 0.5),
+                rgba_channel((theme::ERR[2] + theme::OK[2]) * 0.5),
+                rgba_channel((HEATMAP_ZERO_ALPHA + HEATMAP_SUFFICIENT_ALPHA) * 0.5),
             ]
         );
     }
@@ -1311,6 +1331,7 @@ mod tests {
             cols: 8,
             rows: 8,
             samples: samples.into(),
+            sufficient_level: 1.0,
         };
         let at_peak = heatmap.sample_bilinear(3.5 / 8.0, 3.5 / 8.0);
         let between_cells = heatmap.sample_bilinear(4.0 / 8.0, 3.5 / 8.0);

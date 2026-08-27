@@ -12,6 +12,10 @@ use camera_toolbox_core::{
 };
 use std::sync::Arc;
 
+/// OpenCV 标定器的技术最小可用视图数；采集端仅作不可见的求解前置条件。
+pub(crate) const MIN_USABLE_CALIBRATION_VIEWS: usize = 5;
+const CALIBRATION_DETECT_MAX_PNG_BYTES: usize = 256 * 1024 * 1024;
+
 /// 单路求解结果（主线程展示 + EEPROM 写入用）。
 pub struct SolveResult {
     pub channel: u16,
@@ -146,6 +150,31 @@ pub fn distortion_summary(values: &[f64]) -> String {
         .join(" ")
 }
 
+/// 用与最终求解完全相同的 PNG/luma 与棋盘检测路径验证一张 dataset 帧。
+///
+/// 采集端必须在入库前调用本函数；这样质量证据与 `solve_channel` 的实际输入没有分叉。
+pub(crate) fn detect_dataset_frame(
+    backend: &OpenCvCalibrationBackend,
+    frame: &CapturedDatasetFrame,
+    board: BoardSpec,
+    cancellation: &CalibrationCancellation,
+) -> Result<ChessboardDetectionOutcome, String> {
+    let png = encode_luma_png(&frame.luma, frame.width, frame.height)?;
+    let expected = CalibrationImageSize {
+        width: frame.width,
+        height: frame.height,
+    };
+    backend
+        .detect_png(
+            &png,
+            expected,
+            CALIBRATION_DETECT_MAX_PNG_BYTES,
+            board,
+            cancellation,
+        )
+        .map_err(|error| format!("dataset 棋盘检测失败：{error}"))
+}
+
 /// 对单路 dataset 求解（后台线程调用）。
 ///
 /// dataset 已在采集时转换成 luma：真实设备来自 TCP NV12 的 Y plane；检测走原版
@@ -163,12 +192,7 @@ pub fn solve_channel(
     let mut image_points: Vec<Vec<CalibrationPoint>> = Vec::new();
     let mut image_size = None;
     for frame in frames {
-        let png = encode_luma_png(&frame.luma, frame.width, frame.height)?;
-        let expected = CalibrationImageSize {
-            width: frame.width,
-            height: frame.height,
-        };
-        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
+        match detect_dataset_frame(&backend, frame, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
                 image_size = Some(detection.image_size);
                 image_points.push(detection.corners);
@@ -180,9 +204,9 @@ pub fn solve_channel(
             }
         }
     }
-    if image_points.len() < 5 {
+    if image_points.len() < MIN_USABLE_CALIBRATION_VIEWS {
         return Err(format!(
-            "有效检测帧不足（{}/5）：请重采或调整棋盘参数",
+            "有效检测帧不足（{}/{MIN_USABLE_CALIBRATION_VIEWS}）：请重采或调整棋盘参数",
             image_points.len()
         ));
     }

@@ -21,6 +21,7 @@ use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, ChessboardDetection,
     ChessboardDetectionOutcome, InitialIntrinsics, ViewCalibrationResult,
 };
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -31,21 +32,41 @@ const SKEW_COVERAGE_BINS: usize = 4;
 const SPATIAL_EDGE_COUNT: usize = 4;
 const SPATIAL_CORNER_COUNT: usize = 4;
 /// 连续密度场的固定分辨率；只保存累计场，不保存角点历史。
-const DENSITY_COLS: usize = 64;
-const DENSITY_ROWS: usize = 36;
-const DENSITY_KERNEL_SIGMA: f64 = 0.035;
-/// 单个角点高斯核的峰值，也是空间区域的充分密度阈值。
-const DENSITY_SUFFICIENT: f32 = 1.0;
+///
+/// 128×72 使两个方向的格间距均小于核 σ（h_v/σ≈0.93），保证各向同性采样；
+/// 64×36 下 v 方向格间距约 1.85σ，修复后核在 v 方向欠采样。
+const DENSITY_COLS: usize = 128;
+const DENSITY_ROWS: usize = 72;
+/// 高斯核宽度（归一化图像坐标）。3σ≈0.09，略小于满幅棋盘角点间距（约 0.10），
+/// 相邻角点核基本不融合：单帧角点处密度约 1.0、间隙约 0.5，保留局部分布细节，
+/// 不会像 0.06 那样把密度扩散到无角点区域。
+const DENSITY_KERNEL_SIGMA: f64 = 0.03;
+/// 达到充分（绿）所需的等效角点观测数：单帧角点峰值计 1，
+/// 因此至少六帧覆盖同一区域才变绿，红→黄→绿共六档渐进过渡，
+/// 避免"一下全绿"。
+const DENSITY_SUFFICIENT: f32 = 6.0;
 /// 中心区域半径占图像半对角线的比例。
 const CENTER_RADIUS: f64 = 0.30;
 /// 边缘和四角区域只接受接近画面外围的角点。
 const OUTER_RADIUS_THRESHOLD: f64 = 0.80;
 /// 归一化图像坐标中的边缘/角落带宽。
 const OUTER_REGION_BAND: f64 = 0.20;
-/// 仅保留有限个已采视角摘要，保证去重累加器内存有上界。
-const MAX_VIEW_SUMMARIES: usize = 64;
-/// 小于该既有姿态 jitter 分数时，视为近重复视角。
+/// 每个空间区域中显示密度达到 `DENSITY_SUFFICIENT` 的最小面积比例。
+const REGION_SUPPORT_AREA_TARGET: f32 = 0.20;
+/// 对同一双线性密度场做固定过采样，避免 acceptance 随视频源分辨率变化。
+const SUPPORT_SAMPLE_COLS: usize = DENSITY_COLS * 4;
+const SUPPORT_SAMPLE_ROWS: usize = DENSITY_ROWS * 4;
+/// 永不驱逐的紧凑位姿占用网格。一个单元等于既有 near-duplicate 完整容差，
+/// 因此相邻单元查询覆盖恰好跨越量化边界的旧容差内姿态。
 const DUPLICATE_VIEW_JITTER_LIMIT: f64 = 0.40;
+const POSE_OCCUPANCY_DEPTH_FRACTION: f64 = GUIDED_HOLD_JITTER_Z_LIMIT * DUPLICATE_VIEW_JITTER_LIMIT;
+const POSE_OCCUPANCY_LATERAL_STEP: f64 = GUIDED_HOLD_JITTER_XYZ_LIMIT * DUPLICATE_VIEW_JITTER_LIMIT;
+/// `ln(z)` 的步长略大于 1.6% 相对深度容差的最大对数距离，保证 ±1 格足够。
+const POSE_OCCUPANCY_LOG_DEPTH_STEP: f64 = 0.0162;
+const POSE_OCCUPANCY_ANGLE_STEP_DEGREES: f64 =
+    GUIDED_HOLD_JITTER_RPY_DEGREES * DUPLICATE_VIEW_JITTER_LIMIT;
+const POSE_OCCUPANCY_ANGLE_BINS: i32 = 450;
+const POSE_OCCUPANCY_NEIGHBOR_RADIUS: i32 = 1;
 /// 稳定检测的 hold 连续帧数（满则触发采集）。
 pub const HOLD_TARGET: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
@@ -61,18 +82,18 @@ const X5_TCP_CONTROL_PORT: u16 = 9073;
 
 /// 数据集质量的 UI 快照。
 ///
-/// 空间证据来自全部已接受内角点的连续密度累加；距离和倾斜则保留原有四档
-/// 覆盖语义。没有帧数、尺度比或姿态族的额外完成门限。
+/// 空间证据来自全部已接受内角点的连续密度累加；距离和倾斜保留原有四档覆盖语义。
+/// 除 solver 所需的不可见可用视图技术下限外，不引入帧数、尺度比或姿态族的用户可见完成配额。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DatasetQuality {
-    /// 已接受且已写入 dataset 的帧数，仅用于引导文本与诊断，不是完成门限。
+    /// 已接受、已 raw 重检且已写入 dataset 的帧数；同时代表 solver 可用视图数。
     pub accepted_frames: usize,
     pub heatmap: DensityHeatmap,
-    /// 指定中心半径内的累计密度。
+    /// 中心区域中显示密度达到充分阈值的面积比例。
     pub center_density: f32,
-    /// 左、右、上、下四个外缘区域的累计密度。
+    /// 左、右、上、下外缘区域的 density-support 面积比例。
     pub edge_density: [f32; SPATIAL_EDGE_COUNT],
-    /// 左上、右上、右下、左下四个外围角落的累计密度。
+    /// 左上、右上、右下、左下外围角落的 density-support 面积比例。
     pub corner_density: [f32; SPATIAL_CORNER_COUNT],
     /// 保留的投影尺寸（远→近）四档覆盖。
     pub depth: [bool; DEPTH_COVERAGE_BINS],
@@ -95,7 +116,7 @@ impl Default for DatasetQuality {
 }
 
 impl DatasetQuality {
-    /// 连续空间、保留距离和保留倾斜证据全部充分时结束采集。
+    /// 连续空间、保留距离/倾斜和 solver 的不可见技术前置条件全部满足时结束采集。
     #[must_use]
     pub fn is_complete(&self) -> bool {
         self.center_complete()
@@ -103,37 +124,43 @@ impl DatasetQuality {
             && self.corners_complete()
             && self.depth.iter().all(|covered| *covered)
             && self.skew.iter().all(|covered| *covered)
+            && self.solver_input_ready()
+    }
+
+    #[must_use]
+    pub fn solver_input_ready(&self) -> bool {
+        self.accepted_frames >= crate::solve::MIN_USABLE_CALIBRATION_VIEWS
     }
 
     #[must_use]
     pub fn center_complete(&self) -> bool {
-        self.center_density >= DENSITY_SUFFICIENT
+        self.center_density >= REGION_SUPPORT_AREA_TARGET
     }
 
     #[must_use]
     pub fn edges_complete(&self) -> bool {
         self.edge_density
             .iter()
-            .all(|density| *density >= DENSITY_SUFFICIENT)
+            .all(|support_area| *support_area >= REGION_SUPPORT_AREA_TARGET)
     }
 
     #[must_use]
     pub fn corners_complete(&self) -> bool {
         self.corner_density
             .iter()
-            .all(|density| *density >= DENSITY_SUFFICIENT)
+            .all(|support_area| *support_area >= REGION_SUPPORT_AREA_TARGET)
     }
 
     #[must_use]
     pub fn center_progress(&self) -> f32 {
-        density_progress(self.center_density)
+        support_area_progress(self.center_density)
     }
 
     #[must_use]
     pub fn edge_progress(&self) -> f32 {
         self.edge_density
             .iter()
-            .map(|density| density_progress(*density))
+            .map(|support_area| support_area_progress(*support_area))
             .sum::<f32>()
             / SPATIAL_EDGE_COUNT as f32
     }
@@ -142,7 +169,7 @@ impl DatasetQuality {
     pub fn corner_progress(&self) -> f32 {
         self.corner_density
             .iter()
-            .map(|density| density_progress(*density))
+            .map(|support_area| support_area_progress(*support_area))
             .sum::<f32>()
             / SPATIAL_CORNER_COUNT as f32
     }
@@ -151,7 +178,7 @@ impl DatasetQuality {
     pub fn covered_edges(&self) -> usize {
         self.edge_density
             .iter()
-            .filter(|density| **density >= DENSITY_SUFFICIENT)
+            .filter(|support_area| **support_area >= REGION_SUPPORT_AREA_TARGET)
             .count()
     }
 
@@ -159,26 +186,24 @@ impl DatasetQuality {
     pub fn covered_corners(&self) -> usize {
         self.corner_density
             .iter()
-            .filter(|density| **density >= DENSITY_SUFFICIENT)
+            .filter(|support_area| **support_area >= REGION_SUPPORT_AREA_TARGET)
             .count()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-struct AcceptedViewSummary {
-    xyz: [f64; 3],
-    rpy_degrees: [f64; 3],
-}
+/// 紧凑的量化姿态占用 key；只保存一个 6D 单元，不保留原始姿态或逐帧历史。
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct QuantizedViewCell([i32; 6]);
 
 /// 单路常量内存的角点质量累加器。
 struct CornerDensityMap {
     field: Vec<f32>,
-    center_density: f32,
-    edge_density: [f32; SPATIAL_EDGE_COUNT],
-    corner_density: [f32; SPATIAL_CORNER_COUNT],
+    /// 首张 solver-valid raw 帧的宽高比，定义中心半径/外围区域的物理形状。
+    analysis_aspect: Option<f64>,
     depth: [bool; DEPTH_COVERAGE_BINS],
     skew: [bool; SKEW_COVERAGE_BINS],
-    views: Vec<AcceptedViewSummary>,
+    /// 所有接受视角的持久量化占用；绝不按数量淘汰旧单元。
+    occupied_views: HashSet<QuantizedViewCell>,
     accepted_frames: usize,
 }
 
@@ -293,23 +318,23 @@ impl RtspStream {
             loop {
                 let mut rgba = Vec::with_capacity((width * height * 4) as usize);
                 if board_mode {
-                    // 合成棋盘（12x9 格 = 11x8 内角点）：四阶段自动动作模拟标定覆盖，
-                    // X 平移 → Y 平移 → 尺寸缩放 → 倾斜；每阶段 60 步（400ms/步 ≈ 24s），
-                    // 四阶段约 96s 扫完 18 bin 全覆盖（无板验证全流程）。
+                    // 合成棋盘（12×9 格 = 11×8 内角点）：中心尺度扫描、四个外围角落
+                    // 和倾斜扫描分别供连续空间、距离与倾斜质量路径做 UI 烟测。
                     let cols = 12i32;
                     let rows = 9i32;
                     let slow = tick / 4;
                     let stage_len = 60u32;
-                    let phase = (slow / stage_len) % 4;
+                    let phase = (slow / stage_len) % 6;
                     let t = (slow % stage_len) as f32 / (stage_len - 1) as f32;
                     let (center_x, center_y, cell, shear) = match phase {
-                        // X 扫描：小棋盘（宽 192px）横向扫过 10%..90% → X 5 bin 全覆盖。
-                        0 => (0.1 + 0.8 * t, 0.5, 16.0, 0.0),
-                        // Y 扫描：棋盘高 144px，纵向扫过 15%..85% → Y 5 bin 全覆盖。
-                        1 => (0.5, 0.15 + 0.7 * t, 16.0, 0.0),
-                        // 尺寸：cell 13→54（棋盘占画面 0.16..0.68）→ Size 4 bin。
-                        2 => (0.5, 0.5, 13.0 + 41.0 * t, 0.0),
-                        // 倾斜：shear 0→0.75（板法线与光轴夹角 0..37°）→ Skew 4 bin。
+                        // 中心的远→近扫描保留四档距离覆盖，并激励中心半径。
+                        0 => (0.5, 0.5, 13.0 + 41.0 * t, 0.0),
+                        // 四个外围角落分别激励相邻边缘和对应角落的连续密度。
+                        1 => (0.18, 0.18, 16.0, 0.0),
+                        2 => (0.82, 0.18, 16.0, 0.0),
+                        3 => (0.82, 0.82, 16.0, 0.0),
+                        4 => (0.18, 0.82, 16.0, 0.0),
+                        // 斜切会使已有姿态估计跨过保留的倾斜档位。
                         _ => (0.5, 0.5, 32.0, 0.75 * t),
                     };
                     let cell = cell as i32;
@@ -693,7 +718,7 @@ fn capture_loop(
                     continue;
                 }
 
-                // 去重通过后才允许抓 TCP 原图，避免重复数据进入 solver dataset。
+                // 初筛通过后抓取 TCP 原图，但只有 solver 同规则的 raw 重检成功才能入库。
                 let dataset_frame = match capture_dataset_frame(&capture_source, &frame) {
                     Ok(frame) => frame,
                     Err(error) => {
@@ -709,28 +734,67 @@ fn capture_loop(
                         continue;
                     }
                 };
-                {
+                let validated =
+                    match validate_dataset_frame(&backend, dataset_frame, board, &cancellation) {
+                        Ok(validated) => validated,
+                        Err(error) => {
+                            hold_frames = 0;
+                            last_measurement = None;
+                            set_guide_quality(
+                                &guide,
+                                &format!("TCP 原图棋盘重检未通过，未入库：{error}"),
+                                0,
+                                &quality,
+                            );
+                            std::thread::sleep(DETECT_INTERVAL);
+                            continue;
+                        }
+                    };
+                let raw_detection = {
                     let mut captured = captured
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    captured.push(Arc::new(dataset_frame));
-                }
-                {
                     let mut poses = poses
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    poses.push(view.rotation_vector);
-                }
-                let added = density.add_frame(&detection, &measurement);
-                debug_assert!(added);
+                    match commit_solver_validated_capture(
+                        &mut density,
+                        &mut captured,
+                        &mut poses,
+                        validated,
+                    ) {
+                        Ok(Some(detection)) => detection,
+                        Ok(None) => {
+                            hold_frames = 0;
+                            last_measurement = None;
+                            set_guide_quality(
+                                &guide,
+                                "TCP 原图近重复视角已拒绝，请移动或转动棋盘后再保持稳定",
+                                0,
+                                &quality,
+                            );
+                            std::thread::sleep(DETECT_INTERVAL);
+                            continue;
+                        }
+                        Err(error) => {
+                            hold_frames = 0;
+                            last_measurement = None;
+                            set_guide_quality(
+                                &guide,
+                                &format!("TCP 原图校验失败，未入库：{error}"),
+                                0,
+                                &quality,
+                            );
+                            std::thread::sleep(DETECT_INTERVAL);
+                            continue;
+                        }
+                    }
+                };
                 quality = density.snapshot();
 
-                // 记录本次拍摄的角点（image 像素坐标）并立即发布 overlay 确认。
-                let corners_px: Vec<[f32; 2]> = detection
-                    .corners
-                    .iter()
-                    .map(|corner| [corner.x, corner.y])
-                    .collect();
+                // 记录 solver-valid raw 角点；按 RTSP 显示尺寸映射，确认入库证据而非引导帧。
+                let corners_px =
+                    captured_corners_for_overlay(&raw_detection, frame.width, frame.height);
                 last_capture = Some((std::time::Instant::now(), corners_px));
                 publish_overlay(
                     &overlay,
@@ -830,13 +894,165 @@ fn publish_overlay(
     }
 }
 
-/// 将累计密度映射为 UI 进度；异常值一律不参与完成判断。
-fn density_progress(density: f32) -> f32 {
-    if density.is_finite() {
-        (density / DENSITY_SUFFICIENT).clamp(0.0, 1.0)
+/// 将 density-support 面积映射为 UI 进度；异常值一律不参与完成判断。
+fn support_area_progress(support_area: f32) -> f32 {
+    if support_area.is_finite() {
+        (support_area / REGION_SUPPORT_AREA_TARGET).clamp(0.0, 1.0)
     } else {
         0.0
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SpatialRegionMembership {
+    center: bool,
+    edges: [bool; SPATIAL_EDGE_COUNT],
+    corners: [bool; SPATIAL_CORNER_COUNT],
+}
+
+/// 根据归一化图像坐标划分中心、四边和四角；外围区域只计入高半径范围。
+fn spatial_region_membership(u: f64, v: f64, image_aspect: f64) -> SpatialRegionMembership {
+    let radius = normalized_image_radius_for_aspect(u, v, image_aspect);
+    let center = radius <= CENTER_RADIUS;
+    if radius <= OUTER_RADIUS_THRESHOLD {
+        return SpatialRegionMembership {
+            center,
+            ..SpatialRegionMembership::default()
+        };
+    }
+    let left = u <= OUTER_REGION_BAND;
+    let right = u >= 1.0 - OUTER_REGION_BAND;
+    let top = v <= OUTER_REGION_BAND;
+    let bottom = v >= 1.0 - OUTER_REGION_BAND;
+    SpatialRegionMembership {
+        center,
+        edges: [left, right, top, bottom],
+        corners: [left && top, right && top, right && bottom, left && bottom],
+    }
+}
+
+/// 从 Viewer 渲染的同一双线性场统计每个区域中绿色充分密度的面积比例。
+fn spatial_support_from_density_field(
+    heatmap: &DensityHeatmap,
+    image_aspect: f64,
+) -> (f32, [f32; SPATIAL_EDGE_COUNT], [f32; SPATIAL_CORNER_COUNT]) {
+    if !heatmap.is_valid() || !image_aspect.is_finite() || image_aspect <= 0.0 {
+        return (0.0, [0.0; SPATIAL_EDGE_COUNT], [0.0; SPATIAL_CORNER_COUNT]);
+    }
+    let mut center_total = 0usize;
+    let mut center_sufficient = 0usize;
+    let mut edge_total = [0usize; SPATIAL_EDGE_COUNT];
+    let mut edge_sufficient = [0usize; SPATIAL_EDGE_COUNT];
+    let mut corner_total = [0usize; SPATIAL_CORNER_COUNT];
+    let mut corner_sufficient = [0usize; SPATIAL_CORNER_COUNT];
+    for row in 0..SUPPORT_SAMPLE_ROWS {
+        let v = (row as f64 + 0.5) / SUPPORT_SAMPLE_ROWS as f64;
+        for col in 0..SUPPORT_SAMPLE_COLS {
+            let u = (col as f64 + 0.5) / SUPPORT_SAMPLE_COLS as f64;
+            let regions = spatial_region_membership(u, v, image_aspect);
+            let sufficient =
+                heatmap.sample_bilinear(u as f32, v as f32) >= heatmap.sufficient_level;
+            if regions.center {
+                center_total += 1;
+                if sufficient {
+                    center_sufficient += 1;
+                }
+            }
+            for index in 0..SPATIAL_EDGE_COUNT {
+                if regions.edges[index] {
+                    edge_total[index] += 1;
+                    if sufficient {
+                        edge_sufficient[index] += 1;
+                    }
+                }
+            }
+            for index in 0..SPATIAL_CORNER_COUNT {
+                if regions.corners[index] {
+                    corner_total[index] += 1;
+                    if sufficient {
+                        corner_sufficient[index] += 1;
+                    }
+                }
+            }
+        }
+    }
+    let support_fraction = |sufficient: usize, total: usize| -> f32 {
+        if total == 0 {
+            0.0
+        } else {
+            (sufficient as f64 / total as f64) as f32
+        }
+    };
+    (
+        support_fraction(center_sufficient, center_total),
+        std::array::from_fn(|index| support_fraction(edge_sufficient[index], edge_total[index])),
+        std::array::from_fn(|index| {
+            support_fraction(corner_sufficient[index], corner_total[index])
+        }),
+    )
+}
+
+fn normalized_image_radius_for_aspect(u: f64, v: f64, image_aspect: f64) -> f64 {
+    if !u.is_finite() || !v.is_finite() || !image_aspect.is_finite() || image_aspect <= 0.0 {
+        return f64::INFINITY;
+    }
+    let half_width = image_aspect * 0.5;
+    let half_height = 0.5;
+    ((u - 0.5) * image_aspect).hypot(v - 0.5) / half_width.hypot(half_height)
+}
+
+fn quantize_linear(value: f64, step: f64) -> Option<i32> {
+    if !value.is_finite() || !step.is_finite() || step <= 0.0 {
+        return None;
+    }
+    let cell = (value / step).floor();
+    (cell.is_finite() && cell >= f64::from(i32::MIN) && cell <= f64::from(i32::MAX))
+        .then_some(cell as i32)
+}
+
+fn quantize_angle_degrees(angle: f64) -> Option<i32> {
+    if !angle.is_finite() {
+        return None;
+    }
+    let cell = (angle.rem_euclid(360.0) / POSE_OCCUPANCY_ANGLE_STEP_DEGREES).floor();
+    (cell.is_finite() && cell >= 0.0 && cell < f64::from(POSE_OCCUPANCY_ANGLE_BINS))
+        .then_some(cell as i32)
+}
+
+fn wrap_occupancy_angle_bin(value: i32) -> i32 {
+    value.rem_euclid(POSE_OCCUPANCY_ANGLE_BINS)
+}
+
+/// 将旧 `Δx/max(z, 1)` 容差保守地投影到量化横向轴，覆盖相邻深度格引起的漂移。
+fn occupancy_lateral_neighbor_radius(lateral: f64) -> Option<i32> {
+    if !lateral.is_finite() {
+        return None;
+    }
+    let min_depth_ratio = 1.0 - POSE_OCCUPANCY_DEPTH_FRACTION;
+    if !min_depth_ratio.is_finite() || min_depth_ratio <= 0.0 {
+        return None;
+    }
+    let depth_ratio_inverse = 1.0 / min_depth_ratio;
+    let maximum_lateral_delta = POSE_OCCUPANCY_LATERAL_STEP * depth_ratio_inverse
+        + lateral.abs() * (depth_ratio_inverse - 1.0);
+    let radius = (maximum_lateral_delta / POSE_OCCUPANCY_LATERAL_STEP).ceil() + 1.0;
+    (radius.is_finite() && radius >= 0.0 && radius <= f64::from(i32::MAX)).then_some(radius as i32)
+}
+
+fn quantized_view_cell(pose: &GuidedPose6Dof) -> Option<QuantizedViewCell> {
+    let depth = pose.xyz[2];
+    if !depth.is_finite() || depth <= 0.0 {
+        return None;
+    }
+    let depth_scale = depth.max(1.0);
+    Some(QuantizedViewCell([
+        quantize_linear(pose.xyz[0] / depth_scale, POSE_OCCUPANCY_LATERAL_STEP)?,
+        quantize_linear(pose.xyz[1] / depth_scale, POSE_OCCUPANCY_LATERAL_STEP)?,
+        quantize_linear(depth_scale.ln(), POSE_OCCUPANCY_LOG_DEPTH_STEP)?,
+        quantize_angle_degrees(pose.rpy_degrees[0])?,
+        quantize_angle_degrees(pose.rpy_degrees[1])?,
+        quantize_angle_degrees(pose.rpy_degrees[2])?,
+    ]))
 }
 
 impl CornerDensityMap {
@@ -844,12 +1060,10 @@ impl CornerDensityMap {
         debug_assert!(DENSITY_COLS >= 8 && DENSITY_ROWS >= 8);
         Self {
             field: vec![0.0; DENSITY_COLS * DENSITY_ROWS],
-            center_density: 0.0,
-            edge_density: [0.0; SPATIAL_EDGE_COUNT],
-            corner_density: [0.0; SPATIAL_CORNER_COUNT],
+            analysis_aspect: None,
             depth: [false; DEPTH_COVERAGE_BINS],
             skew: [false; SKEW_COVERAGE_BINS],
-            views: Vec::with_capacity(MAX_VIEW_SUMMARIES),
+            occupied_views: HashSet::new(),
             accepted_frames: 0,
         }
     }
@@ -862,20 +1076,60 @@ impl CornerDensityMap {
             .any(|corner| normalized_corner(corner, detection.image_size).is_some())
     }
 
-    /// 去重只检查紧凑的位姿摘要；此函数没有副作用，故可在 TCP 抓图前调用。
+    /// 持久量化占用查询保持旧 jitter 同义：深度变化会按 `Δx/max(z, 1)` 放宽横向邻域。
     fn is_near_duplicate(&self, measurement: &GuidedPoseMeasurement) -> bool {
-        self.views.iter().any(|previous| {
-            guided_pose_jitter_score(
-                previous.xyz,
-                previous.rpy_degrees,
-                measurement.pose.xyz,
-                measurement.pose.rpy_degrees,
-            ) < DUPLICATE_VIEW_JITTER_LIMIT
-        })
+        quantized_view_cell(&measurement.pose)
+            .is_none_or(|cell| self.occupancy_neighborhood_contains(cell, &measurement.pose))
     }
 
-    /// 成功抓取原图后一次性写入角点密度、空间区域和保留的距离/倾斜覆盖。
-    /// 返回 `false` 表示没有任何有效内角点，因此不会改变累加器。
+    fn occupancy_neighborhood_contains(
+        &self,
+        cell: QuantizedViewCell,
+        pose: &GuidedPose6Dof,
+    ) -> bool {
+        let pose_depth_scale = pose.xyz[2].max(1.0);
+        let (Some(lateral_x_radius), Some(lateral_y_radius)) = (
+            occupancy_lateral_neighbor_radius(pose.xyz[0] / pose_depth_scale),
+            occupancy_lateral_neighbor_radius(pose.xyz[1] / pose_depth_scale),
+        ) else {
+            return true;
+        };
+        let [x, y, depth_cell, roll, pitch, yaw] = cell.0;
+        for delta_x in -lateral_x_radius..=lateral_x_radius {
+            for delta_y in -lateral_y_radius..=lateral_y_radius {
+                for delta_depth in -POSE_OCCUPANCY_NEIGHBOR_RADIUS..=POSE_OCCUPANCY_NEIGHBOR_RADIUS
+                {
+                    for delta_roll in
+                        -POSE_OCCUPANCY_NEIGHBOR_RADIUS..=POSE_OCCUPANCY_NEIGHBOR_RADIUS
+                    {
+                        for delta_pitch in
+                            -POSE_OCCUPANCY_NEIGHBOR_RADIUS..=POSE_OCCUPANCY_NEIGHBOR_RADIUS
+                        {
+                            for delta_yaw in
+                                -POSE_OCCUPANCY_NEIGHBOR_RADIUS..=POSE_OCCUPANCY_NEIGHBOR_RADIUS
+                            {
+                                let candidate = QuantizedViewCell([
+                                    x.saturating_add(delta_x),
+                                    y.saturating_add(delta_y),
+                                    depth_cell.saturating_add(delta_depth),
+                                    wrap_occupancy_angle_bin(roll.saturating_add(delta_roll)),
+                                    wrap_occupancy_angle_bin(pitch.saturating_add(delta_pitch)),
+                                    wrap_occupancy_angle_bin(yaw.saturating_add(delta_yaw)),
+                                ]);
+                                if self.occupied_views.contains(&candidate) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// solver-valid raw 帧一次性写入 density、距离/倾斜与持久位姿占用。
+    /// 返回 `false` 表示无效或重复输入，累加器不发生改变。
     fn add_frame(
         &mut self,
         detection: &ChessboardDetection,
@@ -884,9 +1138,19 @@ impl CornerDensityMap {
         if !self.has_usable_corners(detection) {
             return false;
         }
+        let Some(occupancy) = quantized_view_cell(&measurement.pose) else {
+            return false;
+        };
+        if self.occupancy_neighborhood_contains(occupancy, &measurement.pose) {
+            return false;
+        }
         let image_size = detection.image_size;
         let width = f64::from(image_size.width);
         let height = f64::from(image_size.height);
+        let image_aspect = width / height;
+        if !image_aspect.is_finite() || image_aspect <= 0.0 {
+            return false;
+        }
         let (mut min_x, mut min_y, mut max_x, mut max_y) = (
             f64::INFINITY,
             f64::INFINITY,
@@ -904,13 +1168,6 @@ impl CornerDensityMap {
             max_x = max_x.max(x);
             max_y = max_y.max(y);
             self.splat_density(u, v);
-            let radius = normalized_image_radius(u, v, width, height);
-            if radius <= CENTER_RADIUS {
-                add_density(&mut self.center_density, 1.0);
-            }
-            if radius > OUTER_RADIUS_THRESHOLD {
-                self.add_outer_region_density(u, v);
-            }
         }
         let scale = ((max_x - min_x) / width).min((max_y - min_y) / height);
         self.depth[depth_coverage_bin(scale)] = true;
@@ -926,7 +1183,8 @@ impl CornerDensityMap {
             SKEW_COVERAGE_BINS - 1
         };
         self.skew[skew_index] = true;
-        self.remember_view(measurement.pose);
+        self.analysis_aspect.get_or_insert(image_aspect);
+        self.occupied_views.insert(occupancy);
         self.accepted_frames = self.accepted_frames.saturating_add(1);
         true
     }
@@ -955,60 +1213,23 @@ impl CornerDensityMap {
         }
     }
 
-    fn add_outer_region_density(&mut self, u: f64, v: f64) {
-        if u <= OUTER_REGION_BAND {
-            add_density(&mut self.edge_density[0], 1.0);
-        }
-        if u >= 1.0 - OUTER_REGION_BAND {
-            add_density(&mut self.edge_density[1], 1.0);
-        }
-        if v <= OUTER_REGION_BAND {
-            add_density(&mut self.edge_density[2], 1.0);
-        }
-        if v >= 1.0 - OUTER_REGION_BAND {
-            add_density(&mut self.edge_density[3], 1.0);
-        }
-        let corner = match (
-            u <= OUTER_REGION_BAND,
-            u >= 1.0 - OUTER_REGION_BAND,
-            v <= OUTER_REGION_BAND,
-            v >= 1.0 - OUTER_REGION_BAND,
-        ) {
-            (true, _, true, _) => Some(0),
-            (_, true, true, _) => Some(1),
-            (_, true, _, true) => Some(2),
-            (true, _, _, true) => Some(3),
-            _ => None,
-        };
-        if let Some(index) = corner {
-            add_density(&mut self.corner_density[index], 1.0);
-        }
-    }
-
-    fn remember_view(&mut self, pose: GuidedPose6Dof) {
-        let summary = AcceptedViewSummary {
-            xyz: pose.xyz,
-            rpy_degrees: pose.rpy_degrees,
-        };
-        if self.views.len() < MAX_VIEW_SUMMARIES {
-            self.views.push(summary);
-        } else {
-            let index = self.accepted_frames % MAX_VIEW_SUMMARIES;
-            self.views[index] = summary;
-        }
-    }
-
     fn snapshot(&self) -> DatasetQuality {
+        let heatmap = DensityHeatmap {
+            cols: DENSITY_COLS,
+            rows: DENSITY_ROWS,
+            samples: self.field.clone().into(),
+            sufficient_level: DENSITY_SUFFICIENT,
+        };
+        let (center_density, edge_density, corner_density) = self.analysis_aspect.map_or(
+            (0.0, [0.0; SPATIAL_EDGE_COUNT], [0.0; SPATIAL_CORNER_COUNT]),
+            |image_aspect| spatial_support_from_density_field(&heatmap, image_aspect),
+        );
         DatasetQuality {
             accepted_frames: self.accepted_frames,
-            heatmap: DensityHeatmap {
-                cols: DENSITY_COLS,
-                rows: DENSITY_ROWS,
-                samples: self.field.clone().into(),
-            },
-            center_density: self.center_density,
-            edge_density: self.edge_density,
-            corner_density: self.corner_density,
+            heatmap,
+            center_density,
+            edge_density,
+            corner_density,
             depth: self.depth,
             skew: self.skew,
         }
@@ -1037,11 +1258,6 @@ fn normalized_corner(
     let v = y / height;
     (u.is_finite() && v.is_finite() && (0.0..=1.0).contains(&u) && (0.0..=1.0).contains(&v))
         .then_some([u, v])
-}
-
-/// 角点到图像中心的连续物理半径，按图像半对角线归一化。
-fn normalized_image_radius(u: f64, v: f64, width: f64, height: f64) -> f64 {
-    ((u - 0.5) * width).hypot((v - 0.5) * height) / (width * 0.5).hypot(height * 0.5)
 }
 
 fn add_density(slot: &mut f32, contribution: f32) {
@@ -1083,8 +1299,10 @@ fn quality_missing_hint(quality: &DatasetQuality) -> &'static str {
         "请将棋盘移动到四个画面角落"
     } else if quality.depth.iter().any(|covered| !covered) {
         "请调整棋盘距离，覆盖远中近尺度"
-    } else {
+    } else if quality.skew.iter().any(|covered| !covered) {
         "请改变棋盘倾斜角度"
+    } else {
+        "请继续移动或转动棋盘，采集不同有效视角"
     }
 }
 
@@ -1436,6 +1654,86 @@ fn capture_dataset_frame(
     }
 }
 
+/// 经 solver 同规则 raw 棋盘检测与位姿估计验证、但尚未提交的 dataset 帧。
+struct SolverValidatedCapture {
+    dataset_frame: CapturedDatasetFrame,
+    detection: ChessboardDetection,
+    measurement: GuidedPoseMeasurement,
+    rotation_vector: [f64; 3],
+}
+
+/// 将 TCP raw dataset 帧用 `solve_channel` 复用的检测路径重新验证，并从该结果导出质量位姿。
+fn validate_dataset_frame(
+    backend: &OpenCvCalibrationBackend,
+    dataset_frame: CapturedDatasetFrame,
+    board: BoardSpec,
+    cancellation: &CalibrationCancellation,
+) -> Result<SolverValidatedCapture, String> {
+    let detection =
+        match crate::solve::detect_dataset_frame(backend, &dataset_frame, board, cancellation)? {
+            ChessboardDetectionOutcome::Found(detection) => detection,
+            ChessboardDetectionOutcome::NotFound { .. } => {
+                return Err("未找到完整棋盘".to_owned());
+            }
+        };
+    let initial = default_initial_intrinsics(dataset_frame.width, dataset_frame.height);
+    let view = backend
+        .estimate_pose(&detection, &initial, board, cancellation)
+        .map_err(|error| format!("raw 棋盘位姿估计失败：{error}"))?;
+    let measurement = guided_pose_measurement(&view, board, &initial, detection.image_size)
+        .map_err(|error| format!("raw 棋盘位姿无效：{error}"))?;
+    Ok(SolverValidatedCapture {
+        dataset_frame,
+        detection,
+        measurement,
+        rotation_vector: view.rotation_vector,
+    })
+}
+
+/// 提交已验证 raw 帧；质量、dataset、pose 占用只在同一个成功分支中一起改变。
+///
+/// 返回 `Ok(None)` 表示 raw 位姿与已有持久占用重复，所有状态保持不变。
+fn commit_solver_validated_capture(
+    density: &mut CornerDensityMap,
+    captured: &mut Vec<Arc<CapturedDatasetFrame>>,
+    poses: &mut Vec<[f64; 3]>,
+    validated: SolverValidatedCapture,
+) -> Result<Option<ChessboardDetection>, String> {
+    let SolverValidatedCapture {
+        dataset_frame,
+        detection,
+        measurement,
+        rotation_vector,
+    } = validated;
+    if density.is_near_duplicate(&measurement) {
+        return Ok(None);
+    }
+    if !density.add_frame(&detection, &measurement) {
+        return Err("raw 重检结果没有可提交的有限角点或位姿".to_owned());
+    }
+    captured.push(Arc::new(dataset_frame));
+    poses.push(rotation_vector);
+    Ok(Some(detection))
+}
+
+/// 将 raw 检测角点映射到当前 RTSP 视频尺寸，保证入库确认 overlay 与视频对齐。
+fn captured_corners_for_overlay(
+    detection: &ChessboardDetection,
+    display_width: u32,
+    display_height: u32,
+) -> Vec<[f32; 2]> {
+    let source_width = detection.image_size.width.max(1) as f32;
+    let source_height = detection.image_size.height.max(1) as f32;
+    let scale_x = display_width as f32 / source_width;
+    let scale_y = display_height as f32 / source_height;
+    detection
+        .corners
+        .iter()
+        .filter(|corner| corner.x.is_finite() && corner.y.is_finite())
+        .map(|corner| [corner.x * scale_x, corner.y * scale_y])
+        .collect()
+}
+
 fn dataset_frame_from_yuv_snapshot(
     snapshot: X5YuvSnapshot,
 ) -> Result<CapturedDatasetFrame, String> {
@@ -1693,20 +1991,28 @@ mod tests {
         }
     }
 
+    fn displayed_full_density() -> CornerDensityMap {
+        let mut density = CornerDensityMap::new();
+        density.analysis_aspect =
+            Some(f64::from(image_size().width) / f64::from(image_size().height));
+        density.field.fill(DENSITY_SUFFICIENT);
+        density
+    }
+
     fn complete_quality() -> DatasetQuality {
         DatasetQuality {
-            accepted_frames: 0,
+            accepted_frames: crate::solve::MIN_USABLE_CALIBRATION_VIEWS,
             heatmap: DensityHeatmap::zeroed(DENSITY_COLS, DENSITY_ROWS),
-            center_density: DENSITY_SUFFICIENT,
-            edge_density: [DENSITY_SUFFICIENT; SPATIAL_EDGE_COUNT],
-            corner_density: [DENSITY_SUFFICIENT; SPATIAL_CORNER_COUNT],
+            center_density: REGION_SUPPORT_AREA_TARGET,
+            edge_density: [REGION_SUPPORT_AREA_TARGET; SPATIAL_EDGE_COUNT],
+            corner_density: [REGION_SUPPORT_AREA_TARGET; SPATIAL_CORNER_COUNT],
             depth: [true; DEPTH_COVERAGE_BINS],
             skew: [true; SKEW_COVERAGE_BINS],
         }
     }
 
     #[test]
-    fn density_snapshot_is_zero_until_a_corner_reaches_sufficient_density() {
+    fn single_capture_is_below_sufficient_and_six_overlapping_captures_qualify() {
         let empty = DatasetQuality::default();
         assert!(empty.heatmap.is_valid());
         assert!(empty.heatmap.samples.iter().all(|density| *density == 0.0));
@@ -1724,8 +2030,62 @@ mod tests {
         ));
         let snapshot = density.snapshot();
         let center_index = row * DENSITY_COLS + col;
-        assert!(snapshot.heatmap.samples[center_index] >= DENSITY_SUFFICIENT);
+        // 单帧单角点 = 1 个等效观测，低于 6 帧充分阈值：不绿。
+        let single = snapshot.heatmap.samples[center_index];
+        assert!(single >= 0.8 && single < DENSITY_SUFFICIENT);
+        assert!(snapshot.heatmap.sufficient_fraction(0.5, 0.5) < 1.0);
         assert_eq!(snapshot.heatmap.samples[0], 0.0);
+
+        // 同一角点位置再观测五帧：等效观测达到 6 帧充分阈值。
+        let corner_u = (col as f64 + 0.5) / DENSITY_COLS as f64;
+        let corner_v = (row as f64 + 0.5) / DENSITY_ROWS as f64;
+        density.splat_density(corner_u, corner_v);
+        density.splat_density(corner_u, corner_v);
+        density.splat_density(corner_u, corner_v);
+        density.splat_density(corner_u, corner_v);
+        density.splat_density(corner_u, corner_v);
+        let doubled = density.snapshot().heatmap.samples[center_index];
+        assert!(doubled >= DENSITY_SUFFICIENT - 1e-4);
+        assert!(doubled > single);
+    }
+
+    #[test]
+    fn full_frame_board_single_capture_never_completes() {
+        // 10×7 内角点铺满 0.05..0.95：模拟一张占满画幅的棋盘。
+        let mut corners = Vec::new();
+        for row in 0..7 {
+            for col in 0..10 {
+                corners.push(point(
+                    0.05 + 0.1 * col as f64,
+                    0.05 + (0.9 / 6.0) * row as f64,
+                ));
+            }
+        }
+        assert_eq!(corners.len(), 70);
+        let mut density = CornerDensityMap::new();
+        assert!(density.add_frame(
+            &detection_with(corners),
+            &measurement([0.0; 3], [0.0, 0.0, 600.0]),
+        ));
+        let quality = density.snapshot();
+        assert_eq!(quality.accepted_frames, 1);
+        // 单帧所有角点峰值仅 1 个等效观测：任何区域都达不到充分密度。
+        assert!(quality.center_density < REGION_SUPPORT_AREA_TARGET);
+        assert!(
+            quality
+                .edge_density
+                .iter()
+                .all(|support| *support < REGION_SUPPORT_AREA_TARGET)
+        );
+        assert!(
+            quality
+                .corner_density
+                .iter()
+                .all(|support| *support < REGION_SUPPORT_AREA_TARGET)
+        );
+        assert!(!quality.is_complete());
+        // 渲染侧峰值归一化不到 1：单帧占满画幅不是纯绿。
+        assert!(quality.heatmap.sufficient_fraction(0.5, 0.5) < 1.0);
     }
 
     #[test]
@@ -1768,40 +2128,156 @@ mod tests {
     }
 
     #[test]
-    fn central_only_or_one_sided_observations_do_not_complete_spatial_quality() {
-        let pose = measurement([0.0; 3], [0.0, 0.0, 600.0]);
-        let mut center_density = CornerDensityMap::new();
-        assert!(center_density.add_frame(&detection_with(vec![point(0.5, 0.5)]), &pose));
-        let mut center_quality = center_density.snapshot();
-        center_quality.depth = [true; DEPTH_COVERAGE_BINS];
-        center_quality.skew = [true; SKEW_COVERAGE_BINS];
-        assert!(center_quality.center_complete());
-        assert!(!center_quality.edges_complete());
-        assert!(!center_quality.is_complete());
+    fn persistent_occupancy_rejects_depth_coupled_legacy_repeat_after_more_than_64_novel_views() {
+        let detection = detection_with(vec![point(0.5, 0.5)]);
+        let mut first = measurement([0.0; 3], [0.0, 0.0, 600.0]);
+        first.pose.xyz = [612.06, 0.0, 600.0];
+        let mut repeated = first.clone();
+        repeated.pose.xyz[2] = 609.0;
+        let first_cell = quantized_view_cell(&first.pose).expect("finite pose should quantize");
+        let repeated_cell =
+            quantized_view_cell(&repeated.pose).expect("finite pose should quantize");
+        assert_eq!(first_cell.0[0], 102);
+        assert_eq!(repeated_cell.0[0], 100);
+        assert_eq!((first_cell.0[0] - repeated_cell.0[0]).abs(), 2);
+        assert!(
+            guided_pose_jitter_score(
+                first.pose.xyz,
+                first.pose.rpy_degrees,
+                repeated.pose.xyz,
+                repeated.pose.rpy_degrees,
+            ) < DUPLICATE_VIEW_JITTER_LIMIT
+        );
 
-        let mut left_density = CornerDensityMap::new();
-        assert!(left_density.add_frame(&detection_with(vec![point(0.02, 0.5)]), &pose));
-        let left_quality = left_density.snapshot();
-        assert_eq!(left_quality.covered_edges(), 1);
-        assert_eq!(left_quality.covered_corners(), 0);
+        let mut density = CornerDensityMap::new();
+        assert!(density.add_frame(&detection, &first));
+        for index in 1..=64 {
+            let mut novel = first.clone();
+            novel.pose.rpy_degrees[0] += f64::from(index) * 5.0;
+            assert!(
+                !density.is_near_duplicate(&novel),
+                "view {index} should be novel"
+            );
+            assert!(density.add_frame(&detection, &novel));
+        }
+        assert_eq!(density.snapshot().accepted_frames, 65);
+        assert!(density.is_near_duplicate(&repeated));
+        assert!(!density.add_frame(&detection, &repeated));
+        assert_eq!(density.snapshot().accepted_frames, 65);
     }
 
     #[test]
-    fn all_outer_edges_and_corners_require_continuous_outer_density() {
+    fn occupancy_rejects_a_legacy_tolerance_pose_across_an_adjacent_quantization_boundary() {
+        let detection = detection_with(vec![point(0.5, 0.5)]);
+        let mut first = measurement([0.0; 3], [0.0, 0.0, 600.0]);
+        let depth = first.pose.xyz[2];
+        let raw_lateral = first.pose.xyz[0] / depth;
+        let next_boundary =
+            f64::from(quantize_linear(raw_lateral, POSE_OCCUPANCY_LATERAL_STEP).unwrap() + 1)
+                * POSE_OCCUPANCY_LATERAL_STEP;
+        first.pose.xyz[0] = (next_boundary - POSE_OCCUPANCY_LATERAL_STEP * 0.1) * depth;
+        let first_cell = quantized_view_cell(&first.pose).expect("finite pose should quantize");
+        let mut adjacent = first.clone();
+        adjacent.pose.xyz[0] = (next_boundary + POSE_OCCUPANCY_LATERAL_STEP * 0.1) * depth;
+        let adjacent_cell =
+            quantized_view_cell(&adjacent.pose).expect("adjacent pose should quantize");
+        assert_eq!(adjacent_cell.0[0], first_cell.0[0] + 1);
+        assert!(
+            guided_pose_jitter_score(
+                first.pose.xyz,
+                first.pose.rpy_degrees,
+                adjacent.pose.xyz,
+                adjacent.pose.rpy_degrees,
+            ) < DUPLICATE_VIEW_JITTER_LIMIT
+        );
+
+        let mut density = CornerDensityMap::new();
+        assert!(density.add_frame(&detection, &first));
+        assert!(density.is_near_duplicate(&adjacent));
+    }
+
+    #[test]
+    fn raw_redetection_failure_never_commits_dataset_quality_or_occupancy() {
+        let frame = CapturedDatasetFrame {
+            channel: 0,
+            width: 64,
+            height: 64,
+            luma: vec![0; 64 * 64].into(),
+            source: CapturedDatasetSource::X5TcpYuv {
+                frame_id: 1,
+                timestamp_ns: 1,
+            },
+        };
+        let backend = OpenCvCalibrationBackend;
+        let cancellation = CalibrationCancellation::default();
+        let mut density = CornerDensityMap::new();
+        let mut captured: Vec<Arc<CapturedDatasetFrame>> = Vec::new();
+        let mut poses = Vec::new();
+        let admission =
+            validate_dataset_frame(&backend, frame, board(), &cancellation).and_then(|validated| {
+                commit_solver_validated_capture(&mut density, &mut captured, &mut poses, validated)
+            });
+
+        assert!(admission.is_err());
+        assert!(captured.is_empty());
+        assert!(poses.is_empty());
+        assert_eq!(density.snapshot().accepted_frames, 0);
+        assert!(!density.is_near_duplicate(&measurement([0.0; 3], [0.0, 0.0, 600.0])));
+    }
+
+    #[test]
+    fn isolated_splats_cannot_complete_any_spatial_region() {
         let pose = measurement([0.0; 3], [0.0, 0.0, 600.0]);
-        let corners = vec![
+        let mut center_density = CornerDensityMap::new();
+        assert!(center_density.add_frame(&detection_with(vec![point(0.5, 0.5)]), &pose));
+        let center_quality = center_density.snapshot();
+        assert!(center_quality.center_density < REGION_SUPPORT_AREA_TARGET);
+        assert!(!center_quality.center_complete());
+
+        let outer_corners = vec![
             point(0.02, 0.02),
             point(0.98, 0.02),
             point(0.98, 0.98),
             point(0.02, 0.98),
         ];
-        let mut density = CornerDensityMap::new();
-        assert!(density.add_frame(&detection_with(corners), &pose));
+        let mut outer_density = CornerDensityMap::new();
+        assert!(outer_density.add_frame(&detection_with(outer_corners), &pose));
+        let outer_quality = outer_density.snapshot();
+        assert!(
+            outer_quality
+                .edge_density
+                .iter()
+                .all(|support| *support < REGION_SUPPORT_AREA_TARGET)
+        );
+        assert!(
+            outer_quality
+                .corner_density
+                .iter()
+                .all(|support| *support < REGION_SUPPORT_AREA_TARGET)
+        );
+        assert_eq!(outer_quality.covered_edges(), 0);
+        assert_eq!(outer_quality.covered_corners(), 0);
+    }
+
+    #[test]
+    fn spatial_completion_uses_the_displayed_bilinear_density_field_support_area() {
+        let mut density = displayed_full_density();
+        density.accepted_frames = crate::solve::MIN_USABLE_CALIBRATION_VIEWS;
+        density.depth = [true; DEPTH_COVERAGE_BINS];
+        density.skew = [true; SKEW_COVERAGE_BINS];
         let quality = density.snapshot();
+
+        assert_eq!(
+            quality.heatmap.sample_bilinear(0.37, 0.63),
+            DENSITY_SUFFICIENT
+        );
+        assert_eq!(quality.center_density, 1.0);
+        assert_eq!(quality.edge_density, [1.0; SPATIAL_EDGE_COUNT]);
+        assert_eq!(quality.corner_density, [1.0; SPATIAL_CORNER_COUNT]);
+        assert!(quality.center_complete());
         assert!(quality.edges_complete());
         assert!(quality.corners_complete());
-        assert_eq!(quality.covered_edges(), SPATIAL_EDGE_COUNT);
-        assert_eq!(quality.covered_corners(), SPATIAL_CORNER_COUNT);
+        assert!(quality.is_complete());
     }
 
     #[test]
@@ -1826,21 +2302,30 @@ mod tests {
     }
 
     #[test]
-    fn completion_has_no_frame_count_gate_but_requires_each_quality_dimension() {
+    fn completion_requires_the_invisible_solver_view_minimum_and_each_quality_dimension() {
         let quality = complete_quality();
-        assert_eq!(quality.accepted_frames, 0);
+        assert_eq!(
+            quality.accepted_frames,
+            crate::solve::MIN_USABLE_CALIBRATION_VIEWS
+        );
+        assert!(quality.solver_input_ready());
         assert!(quality.is_complete());
 
+        let mut insufficient_views = quality.clone();
+        insufficient_views.accepted_frames = crate::solve::MIN_USABLE_CALIBRATION_VIEWS - 1;
+        assert!(!insufficient_views.solver_input_ready());
+        assert!(!insufficient_views.is_complete());
+
         let mut missing_center = quality.clone();
-        missing_center.center_density = f32::from_bits(DENSITY_SUFFICIENT.to_bits() - 1);
+        missing_center.center_density = f32::from_bits(REGION_SUPPORT_AREA_TARGET.to_bits() - 1);
         assert!(!missing_center.is_complete());
 
         let mut missing_edge = quality.clone();
-        missing_edge.edge_density[2] = f32::from_bits(DENSITY_SUFFICIENT.to_bits() - 1);
+        missing_edge.edge_density[2] = f32::from_bits(REGION_SUPPORT_AREA_TARGET.to_bits() - 1);
         assert!(!missing_edge.is_complete());
 
         let mut missing_corner = quality.clone();
-        missing_corner.corner_density[3] = f32::from_bits(DENSITY_SUFFICIENT.to_bits() - 1);
+        missing_corner.corner_density[3] = f32::from_bits(REGION_SUPPORT_AREA_TARGET.to_bits() - 1);
         assert!(!missing_corner.is_complete());
 
         let mut missing_depth = quality.clone();

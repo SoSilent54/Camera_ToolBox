@@ -3,13 +3,16 @@ use std::sync::Arc;
 
 /// 连续角点密度场的 UI 无关快照。
 ///
-/// `samples` 以行优先顺序保存归一化图像坐标中的密度：`0` 表示零密度，`1` 及以上
-/// 表示足够密度。渲染器可按自身纹理策略平滑采样，数据层不依赖任何 UI 或 GPU 类型。
+/// `samples` 以行优先顺序保存归一化图像坐标中的密度，单位为等效角点观测数：
+/// 单个角点高斯核峰值计为 1；`sufficient_level` 表示达到"充分"所需的等效观测数。
+/// 渲染器按 `density / sufficient_level` 归一化着色，数据层不依赖任何 UI 或 GPU 类型。
 #[derive(Clone, Debug, PartialEq)]
 pub struct DensityHeatmap {
     pub cols: usize,
     pub rows: usize,
     pub samples: Arc<[f32]>,
+    /// 达到充分（绿色）所需的等效角点观测数。
+    pub sufficient_level: f32,
 }
 
 impl DensityHeatmap {
@@ -22,6 +25,7 @@ impl DensityHeatmap {
             cols,
             rows,
             samples: vec![0.0; len].into(),
+            sufficient_level: 1.0,
         }
     }
 
@@ -37,7 +41,8 @@ impl DensityHeatmap {
     }
     /// 以密度网格单元中心为采样点，在边界钳制后对渲染/质量分析共用的连续场双线性采样。
     ///
-    /// 非法快照或坐标没有密度证据，返回零，避免错误数据伪造绿色覆盖。
+    /// 返回原始等效角点观测数（不按充分阈值归一化）；非法快照或坐标返回零，
+    /// 避免错误数据伪造绿色覆盖。渲染层用 [`Self::sufficient_fraction`] 归一化。
     #[must_use]
     pub fn sample_bilinear(&self, u: f32, v: f32) -> f32 {
         if !self.is_valid() || !u.is_finite() || !v.is_finite() {
@@ -58,10 +63,22 @@ impl DensityHeatmap {
         let lower = at(left, bottom) + (at(right, bottom) - at(left, bottom)) * tx;
         let density = upper + (lower - upper) * ty;
         if density.is_finite() {
-            density.clamp(0.0, 1.0)
+            density.max(0.0)
         } else {
             0.0
         }
+    }
+
+    /// 将双线性采样密度归一化到 `0..=1` 渲染区间：`0` 表示零密度（红），
+    /// `1` 表示达到充分阈值（绿）。与质量分析共用同一连续场。
+    #[must_use]
+    pub fn sufficient_fraction(&self, u: f32, v: f32) -> f32 {
+        let level = if self.sufficient_level.is_finite() && self.sufficient_level > 0.0 {
+            self.sufficient_level
+        } else {
+            1.0
+        };
+        (self.sample_bilinear(u, v) / level).clamp(0.0, 1.0)
     }
 }
 
@@ -71,6 +88,7 @@ impl Default for DensityHeatmap {
             cols: 0,
             rows: 0,
             samples: Arc::<[f32]>::from(Vec::new()),
+            sufficient_level: 1.0,
         }
     }
 }
