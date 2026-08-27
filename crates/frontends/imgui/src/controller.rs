@@ -550,10 +550,18 @@ impl CalibController {
         };
         if !self.state.eeprom.write_armed {
             self.state.eeprom.write_armed = true;
-            self.set_eeprom_status(
-                &format!("请确认 SNID：CH0={serial0}，CH3={serial3}；再次点击开始写入。"),
-                true,
-            );
+            let mut note =
+                format!("请确认 SNID：CH0={serial0}，CH3={serial3}；再次点击开始写入。");
+            if let Some((inspect0, inspect3)) = &self.eeprom_inspect {
+                let dev0 = serial_state_label(&inspect0.state.serial);
+                let dev3 = serial_state_label(&inspect3.state.serial);
+                if dev0 != serial0 || dev3 != serial3 {
+                    note.push_str(&format!(
+                        "\n设备当前 SN：CH0={dev0}，CH3={dev3}；写入将覆盖为输入值。"
+                    ));
+                }
+            }
+            self.set_eeprom_status(&note, true);
             return;
         }
         self.state.eeprom.write_armed = false;

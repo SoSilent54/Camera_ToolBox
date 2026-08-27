@@ -24,7 +24,7 @@ pub fn persist_write_history(
     let operation_id = operation_id();
     let request = FullEepromImage::from_solution(solution, serial_number)
         .map_err(|error| format!("构造 EEPROM history 请求镜像失败：{error}"))?
-        .full_provision_request(false);
+        .full_provision_request(true);
     let document = json!({
         "schema_version": "camera-toolbox.eeprom-write-history.v1",
         "tool": "pongbot-calib-tool",

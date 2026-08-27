@@ -51,8 +51,8 @@ pub fn inspect(
         )
         .map_err(|error| format!("读取 EEPROM 失败：{error}"))
 }
-
-/// 完整烧录：写入 FLAG + 内参 + SN。若设备已有不同 SN，helper 会拒绝（不默认覆盖）。
+/// 完整烧录：写入 FLAG + 内参 + SN。设备已有不同 SN 时允许覆盖（工具
+/// 写入前置 inspect 展示现有 SN、UI 二次点击确认，覆盖属预期操作）。
 #[allow(clippy::too_many_arguments)]
 pub fn provision_full_calibration(
     host: &str,
@@ -92,7 +92,7 @@ fn provision_with_mode(
     let image = FullEepromImage::from_solution(solution, serial)
         .map_err(|error| format!("构造 EEPROM 镜像失败：{error}"))?;
     let request = if full {
-        image.full_provision_request(false)
+        image.full_provision_request(true)
     } else {
         image.update_calibration_request()
     };
