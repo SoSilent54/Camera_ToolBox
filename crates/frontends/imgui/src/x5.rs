@@ -13,8 +13,10 @@ use secrecy::SecretString;
 use std::time::{Duration, Instant};
 
 /// 板端启动 DEMO233 的命令（与 pangbot-calib-tool 一致）：
-/// 固定 LD_LIBRARY_PATH / SC233_CALIBRATION_MODE=1 / TCP 控制 9073；幂等（已运行则跳过）。
-const X5_233_DRIVER_BOOTSTRAP_COMMAND: &str = "cd /opt || exit 1\nif [ ! -x ./DEMO233 ]; then echo 'missing executable /opt/DEMO233' >&2; exit 2; fi\nif pgrep -x DEMO233 >/dev/null 2>&1; then echo 'DEMO233 already running'; else nohup env LD_LIBRARY_PATH=/usr/hobot/lib:/usr/hobot/lib/sensor:/usr/lib:/lib:/lib64:${LD_LIBRARY_PATH:-} SC233_CALIBRATION_MODE=1 X5_TCP_CONTROL_ENABLE=1 X5_TCP_CONTROL_PORT=9073 ./DEMO233 >/tmp/pangbot-calib-tool-DEMO233.log 2>&1 </dev/null & echo 'DEMO233 start queued'; fi";
+/// 固定 LD_LIBRARY_PATH / SC233_CALIBRATION_MODE=1 / TCP 控制 9073；
+/// X5_TCP_RING_DEPTH=96 扩大抓帧 ring（默认 32 → 60fps 缓存 ~1.6s，降低
+/// RTSP 延迟下 SNAPSHOT timestamp 超窗导致的取图失败）；幂等（已运行则跳过）。
+const X5_233_DRIVER_BOOTSTRAP_COMMAND: &str = "cd /opt || exit 1\nif [ ! -x ./DEMO233 ]; then echo 'missing executable /opt/DEMO233' >&2; exit 2; fi\nif pgrep -x DEMO233 >/dev/null 2>&1; then echo 'DEMO233 already running'; else nohup env LD_LIBRARY_PATH=/usr/hobot/lib:/usr/hobot/lib/sensor:/usr/lib:/lib:/lib64:${LD_LIBRARY_PATH:-} SC233_CALIBRATION_MODE=1 X5_TCP_CONTROL_ENABLE=1 X5_TCP_CONTROL_PORT=9073 X5_TCP_RING_DEPTH=96 ./DEMO233 >/tmp/pangbot-calib-tool-DEMO233.log 2>&1 </dev/null & echo 'DEMO233 start queued'; fi";
 
 /// TCP 探测 X5 驱动（同步、带协议握手）。
 pub fn probe(host: &str, port: u16) -> Result<X5ProbeSummary, String> {
