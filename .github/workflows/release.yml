@@ -343,7 +343,7 @@ jobs:
       - build-windows
       - build-linux
       - build-macos
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     env:
       RELEASE_VERSION: ${{ needs.validate-release.outputs.release_version }}
     permissions:
