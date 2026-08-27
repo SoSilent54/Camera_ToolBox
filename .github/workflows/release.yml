@@ -232,6 +232,7 @@ jobs:
           cargo build --release --locked -p pongbot-calib-tool
           test -f target/release/pongbot-calib-tool
       - name: Package Linux release
+        shell: bash
         run: |
           set -euo pipefail
           bundle="pongbot-calib-tool-linux-x86_64-ubuntu${UBUNTU_TAG}"
@@ -313,7 +314,7 @@ jobs:
             otool -L "$f" | tail -n +2 | awk '{print $1}' \
               | grep -E '^/' | grep -vE '^(/usr/lib|/System|/Library)' | while read -r dep; do
                 install_name_tool -change "$dep" "@loader_path/$(basename "$dep")" "$f" || true
-              done
+              done || true
           done
           # Apple Silicon 强制要求签名：对 bundle 内全部 Mach-O 做 ad-hoc 签名。
           codesign --force --deep -s - "dist/$bundle"
