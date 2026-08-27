@@ -26,9 +26,26 @@ const X5_233_DRIVER_REMOTE_PATH: &str = "/opt/DEMO233_Calib";
 ///   避免端口冲突导致标定驱动起不来。
 const X5_233_DRIVER_BOOTSTRAP_COMMAND: &str = "cd /opt || exit 1\nif [ ! -x ./DEMO233_Calib ]; then echo 'missing executable /opt/DEMO233_Calib' >&2; exit 2; fi\nif pgrep -x DEMO233_Calib >/dev/null 2>&1; then echo 'DEMO233_Calib already running'; else pkill -x DEMO233 2>/dev/null; sleep 1; nohup env LD_LIBRARY_PATH=/usr/hobot/lib:/usr/hobot/lib/sensor:/usr/lib:/lib:/lib64:${LD_LIBRARY_PATH:-} SC233_CALIBRATION_MODE=1 X5_TCP_CONTROL_ENABLE=1 X5_TCP_CONTROL_PORT=9073 X5_TCP_RING_DEPTH=96 ./DEMO233_Calib >/tmp/pangbot-calib-tool-DEMO233.log 2>&1 </dev/null & echo 'DEMO233_Calib start queued'; fi";
 
-/// 本地驱动二进制路径：由 `PONGBOT_DRIVER_BINARY` 指定；未设置时跳过版本检查与上传。
+/// 本地驱动二进制路径：`PONGBOT_DRIVER_BINARY` 优先，其次发布包可执行文件
+/// 同目录 `DEMO233_Calib`，最后开发仓库 `driver-sidecar/DEMO233_Calib`。
 fn local_driver_binary_path() -> Option<PathBuf> {
-    std::env::var_os("PONGBOT_DRIVER_BINARY").map(PathBuf::from)
+    if let Ok(path) = std::env::var("PONGBOT_DRIVER_BINARY") {
+        let candidate = PathBuf::from(&path);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        tracing::warn!("PONGBOT_DRIVER_BINARY 指向的文件不存在：{path}");
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            let bundled = dir.join("DEMO233_Calib");
+            if bundled.exists() {
+                return Some(bundled);
+            }
+        }
+    }
+    let dev = PathBuf::from("driver-sidecar/DEMO233_Calib");
+    dev.exists().then_some(dev)
 }
 
 /// 二进制内容的十六进制 SHA-256（无外部 hex 依赖）。
