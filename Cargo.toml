@@ -52,8 +52,8 @@ imgui-winit-support = "0.13"
 imgui-glow-renderer = "0.13"
 glow = "0.14"
 winit = { version = "0.30", default-features = false, features = ["x11", "rwh_06"] }
-glutin = { version = "0.32", default-features = false, features = ["egl", "glx", "x11"] }
-glutin-winit = { version = "0.5", default-features = false, features = ["egl", "glx", "x11"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "glx", "x11", "wgl"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["egl", "glx", "x11", "wgl"] }
 raw-window-handle = "0.6"
 
 camera-toolbox-core = { path = "crates/core" }
