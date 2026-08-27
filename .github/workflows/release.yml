@@ -316,8 +316,11 @@ jobs:
                 install_name_tool -change "$dep" "@loader_path/$(basename "$dep")" "$f" || true
               done || true
           done
-          # Apple Silicon 强制要求签名：对 bundle 内全部 Mach-O 做 ad-hoc 签名。
-          codesign --force --deep -s - "dist/$bundle"
+          # Apple Silicon 强制要求签名：codesign 不接受非 .app 目录（bundle format
+          # unrecognized），对 exe 与全部 dylib 逐个做 ad-hoc 签名。
+          for f in "dist/$bundle/pongbot-calib-tool" "dist/$bundle"/*.dylib; do
+            [ -f "$f" ] && codesign --force -s - "$f"
+          done
           version_out="$(dist/$bundle/pongbot-calib-tool --version)"
           echo "$version_out"
           case "$version_out" in *pongbot-calib-tool*) ;; *) echo "unexpected --version output" >&2; exit 1 ;; esac
