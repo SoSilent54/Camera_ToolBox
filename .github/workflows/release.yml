@@ -142,6 +142,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/pongbot-calib-tool.exe" "dist/$bundle/"
           Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper"
+          Copy-Item "driver-sidecar/DEMO233_Calib" "dist/$bundle/DEMO233_Calib"
           Copy-Item README.md "dist/$bundle/"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
@@ -241,6 +242,7 @@ jobs:
           mkdir -p "dist/$bundle"
           cp target/release/pongbot-calib-tool "dist/$bundle/"
           cp helper-sidecar/camera-i2c-helper "dist/$bundle/"
+          cp driver-sidecar/DEMO233_Calib "dist/$bundle/"
           cp README.md "dist/$bundle/"
           # CJK 字体（文泉驿微米黑，OFL 可再分发）：保证无系统字体时中文正常显示。
           mkdir -p "dist/$bundle/fonts"
@@ -307,6 +309,7 @@ jobs:
           mkdir -p "dist/$bundle"
           cp target/release/pongbot-calib-tool "dist/$bundle/"
           cp helper-sidecar/camera-i2c-helper "dist/$bundle/"
+          cp driver-sidecar/DEMO233_Calib "dist/$bundle/"
           cp README.md "dist/$bundle/"
           python3 scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           python3 scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"
