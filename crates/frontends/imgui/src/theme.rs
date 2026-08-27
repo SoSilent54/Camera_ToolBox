@@ -1,7 +1,7 @@
 //! ImGui 字体加载与状态/overlay 颜色。
 
 use imgui::{FontConfig, FontGlyphRanges, FontSource};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 pub const ACCENT: [f32; 4] = [0.32, 0.70, 1.0, 1.0];
 pub const MUTED: [f32; 4] = [0.66, 0.70, 0.78, 1.0];

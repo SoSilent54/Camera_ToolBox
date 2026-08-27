@@ -323,6 +323,7 @@ enum WorkerResult {
         ok: bool,
         write_results: Option<(EepromWriteDetail, EepromWriteDetail)>,
         history_paths: Option<(String, String)>,
+        inspect: Option<(EepromInspectDetail, EepromInspectDetail)>,
     },
 }
 
@@ -618,6 +619,21 @@ impl CalibController {
                                 write_detail("CH3/i2c-6", &b),
                             )),
                             history_paths: Some((path0, path3)),
+                            // 用写入内容构造结构化状态：与“读取 EEPROM 状态”同款表格。
+                            inspect: Some((
+                                inspect_detail_from_write(
+                                    "CH0/i2c-4",
+                                    &serial0,
+                                    &a.after.image_sha256,
+                                    &solution0,
+                                ),
+                                inspect_detail_from_write(
+                                    "CH3/i2c-6",
+                                    &serial3,
+                                    &b.after.image_sha256,
+                                    &solution3,
+                                ),
+                            )),
                         },
                         (a_history, b_history) => WorkerResult::Write {
                             text: format!(
@@ -631,6 +647,7 @@ impl CalibController {
                                 write_detail("CH3/i2c-6", &b),
                             )),
                             history_paths: None,
+                            inspect: None,
                         },
                     }
                 }
@@ -643,6 +660,7 @@ impl CalibController {
                     ok: false,
                     write_results: None,
                     history_paths: None,
+                    inspect: None,
                 },
             }
         });
@@ -833,11 +851,16 @@ impl CalibController {
                 ok,
                 write_results,
                 history_paths,
+                inspect,
             } => {
                 tracing::info!("{text}");
                 if write_results.is_some() {
                     self.state.eeprom.last_write = write_results;
                     self.state.eeprom.write_history_paths = history_paths;
+                }
+                // 写入成功后用写入内容刷新结构化状态（与读取 EEPROM 同款表格）。
+                if let Some(pair) = inspect {
+                    self.state.eeprom.inspect = Some(pair);
                 }
                 self.set_eeprom_status(&text, ok);
                 if ok {
@@ -1053,6 +1076,36 @@ fn inspect_detail(label: &str, inspect: &EepromInspectResult) -> EepromInspectDe
         calibration_error: calibration
             .err()
             .map(|error| format!("EEPROM 标定解析失败：{error}")),
+    }
+}
+
+/// 写入成功后用写入内容构造 EEPROM 状态：与“读取 EEPROM 状态”同款结构化表格。
+fn inspect_detail_from_write(
+    label: &str,
+    serial: &str,
+    after_sha8: &str,
+    solution: &CalibrationSolution,
+) -> EepromInspectDetail {
+    let detail = crate::solve::SolutionDetail::from_solution(label, solution);
+    EepromInspectDetail {
+        label: label.to_owned(),
+        sha8: short_sha8(after_sha8),
+        flag_valid: true,
+        serial: serial.to_owned(),
+        calibration: Some(BackupCalibrationDetail {
+            width: solution.image_size.width,
+            height: solution.image_size.height,
+            fx: detail.fx,
+            fy: detail.fy,
+            cx: detail.cx,
+            cy: detail.cy,
+            hfov_degrees: detail.hfov_degrees,
+            vfov_degrees: detail.vfov_degrees,
+            optical_x_degrees: detail.optical_x_degrees,
+            optical_y_degrees: detail.optical_y_degrees,
+            distortion: detail.distortion.clone(),
+        }),
+        calibration_error: None,
     }
 }
 
