@@ -165,6 +165,22 @@ fn sync_driver_binary(
             })
         })
         .map_err(|error| format!("上传板端标定驱动失败：{error}"))?;
+    // write_file_new 默认权限无执行位，补 chmod +x。
+    let chmod_argv = vec![
+        "sh".to_owned(),
+        "-lc".to_owned(),
+        format!("chmod +x {X5_233_DRIVER_REMOTE_PATH}"),
+    ];
+    let chmod_output = session
+        .execute_argv(&chmod_argv, 4096, control)
+        .map_err(|error| format!("设置板端驱动执行权限失败：{error}"))?;
+    if chmod_output.exit_status.is_some_and(|status| status != 0) {
+        return Err(format!(
+            "设置板端驱动执行权限失败：stdout={} stderr={}",
+            String::from_utf8_lossy(&chmod_output.stdout).trim(),
+            String::from_utf8_lossy(&chmod_output.stderr).trim()
+        ));
+    }
     tracing::info!("板端标定驱动已更新");
     Ok(())
 }
