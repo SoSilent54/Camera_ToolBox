@@ -31,6 +31,14 @@ const DEPTH_COVERAGE_BINS: usize = 4;
 const SKEW_COVERAGE_BINS: usize = 4;
 const SPATIAL_EDGE_COUNT: usize = 4;
 const SPATIAL_CORNER_COUNT: usize = 4;
+/// 距离档边界（棋盘投影尺度 scale，见 `depth_coverage_bin`）：[远, 中远, 中近, 近]。
+pub const DEPTH_COVERAGE_BOUNDS: [f64; 3] = [0.18, 0.28, 0.42];
+/// 距离条每格的具体数值标注（与 `DEPTH_COVERAGE_BOUNDS` 同源）。
+pub const DEPTH_COVERAGE_LABELS: [&str; DEPTH_COVERAGE_BINS] = ["<18%", "18–28%", "28–42%", "≥42%"];
+/// 倾斜档边界（板法线与光轴夹角，度）：[正视, 浅倾, 中倾, 大倾]。
+pub const SKEW_COVERAGE_BOUNDS: [f64; 3] = [10.0, 22.0, 35.0];
+/// 倾斜条每格的具体数值标注（与 `SKEW_COVERAGE_BOUNDS` 同源）。
+pub const SKEW_COVERAGE_LABELS: [&str; SKEW_COVERAGE_BINS] = ["<10°", "10–22°", "22–35°", "≥35°"];
 /// 连续密度场的固定分辨率；只保存累计场，不保存角点历史。
 ///
 /// 128×72 使两个方向的格间距均小于核 σ（h_v/σ≈0.93），保证各向同性采样；
@@ -172,6 +180,17 @@ impl DatasetQuality {
             .map(|support_area| support_area_progress(*support_area))
             .sum::<f32>()
             / SPATIAL_CORNER_COUNT as f32
+    }
+    /// 四条边（左、右、上、下）各自的 density-support 进度（0..=1）。
+    #[must_use]
+    pub fn edge_progresses(&self) -> [f32; SPATIAL_EDGE_COUNT] {
+        self.edge_density.map(support_area_progress)
+    }
+
+    /// 四个角（左上、右上、右下、左下）各自的 density-support 进度（0..=1）。
+    #[must_use]
+    pub fn corner_progresses(&self) -> [f32; SPATIAL_CORNER_COUNT] {
+        self.corner_density.map(support_area_progress)
     }
 
     #[must_use]
@@ -1266,28 +1285,24 @@ fn add_density(slot: &mut f32, contribution: f32) {
 
 /// 保留的投影尺度分档（远 / 中远 / 中近 / 近）。
 fn depth_coverage_bin(scale: f64) -> usize {
-    if scale < 0.18 {
-        0
-    } else if scale < 0.28 {
-        1
-    } else if scale < 0.42 {
-        2
-    } else {
-        3
-    }
+    coverage_bin(scale, &DEPTH_COVERAGE_BOUNDS, DEPTH_COVERAGE_BINS)
 }
 
 /// 保留的板法线与光轴夹角分档（正视 / 浅倾 / 中倾 / 大倾）。
 fn skew_coverage_bin(normal_angle_degrees: f64) -> usize {
-    if normal_angle_degrees < 10.0 {
-        0
-    } else if normal_angle_degrees < 22.0 {
-        1
-    } else if normal_angle_degrees < 35.0 {
-        2
-    } else {
-        3
+    coverage_bin(normal_angle_degrees, &SKEW_COVERAGE_BOUNDS, SKEW_COVERAGE_BINS)
+}
+
+/// 落在分档边界下的索引；非有限值归入最后一档（与旧 if-else 语义一致）。
+fn coverage_bin(value: f64, bounds: &[f64], bins: usize) -> usize {
+    if !value.is_finite() {
+        return bins - 1;
     }
+    bounds
+        .iter()
+        .filter(|bound| value >= **bound)
+        .count()
+        .min(bins - 1)
 }
 
 fn quality_missing_hint(quality: &DatasetQuality) -> &'static str {

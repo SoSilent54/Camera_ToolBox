@@ -18,6 +18,7 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
 use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
+use pongbot_calib_tool::preview::{DEPTH_COVERAGE_LABELS, SKEW_COVERAGE_LABELS};
 use pongbot_calib_tool::theme;
 use raw_window_handle::HasWindowHandle;
 use std::num::NonZeroU32;
@@ -616,22 +617,60 @@ impl App {
                 "待覆盖"
             },
         );
-        self.quality_progress_bar(
+        let edge = quality.edge_progresses();
+        let edge_segments = [
+            ("左", edge[0]),
+            ("右", edge[1]),
+            ("上", edge[2]),
+            ("下", edge[3]),
+        ];
+        self.coverage_bar(
             ui,
             "边缘",
-            quality.edge_progress(),
+            &edge_segments,
             width,
             &format!("{}/4", quality.covered_edges()),
         );
-        self.quality_progress_bar(
+        let corner = quality.corner_progresses();
+        let corner_segments = [
+            ("左上", corner[0]),
+            ("右上", corner[1]),
+            ("右下", corner[2]),
+            ("左下", corner[3]),
+        ];
+        self.coverage_bar(
             ui,
             "四角",
-            quality.corner_progress(),
+            &corner_segments,
             width,
             &format!("{}/4", quality.covered_corners()),
         );
-        self.retained_coverage_bar(ui, "距离", &quality.depth, width);
-        self.retained_coverage_bar(ui, "倾斜", &quality.skew, width);
+        let depth_segments = [
+            (DEPTH_COVERAGE_LABELS[0], quality.depth[0] as u8 as f32),
+            (DEPTH_COVERAGE_LABELS[1], quality.depth[1] as u8 as f32),
+            (DEPTH_COVERAGE_LABELS[2], quality.depth[2] as u8 as f32),
+            (DEPTH_COVERAGE_LABELS[3], quality.depth[3] as u8 as f32),
+        ];
+        self.coverage_bar(
+            ui,
+            "距离",
+            &depth_segments,
+            width,
+            &format!("{}/4", quality.depth.iter().filter(|covered| **covered).count()),
+        );
+        let skew_segments = [
+            (SKEW_COVERAGE_LABELS[0], quality.skew[0] as u8 as f32),
+            (SKEW_COVERAGE_LABELS[1], quality.skew[1] as u8 as f32),
+            (SKEW_COVERAGE_LABELS[2], quality.skew[2] as u8 as f32),
+            (SKEW_COVERAGE_LABELS[3], quality.skew[3] as u8 as f32),
+        ];
+        self.coverage_bar(
+            ui,
+            "倾斜",
+            &skew_segments,
+            width,
+            &format!("{}/4", quality.skew.iter().filter(|covered| **covered).count()),
+        );
         if quality.is_complete() {
             ui.text_colored(theme::OK, "质量完成，即将自动进入求解");
         }
@@ -686,8 +725,16 @@ impl App {
         ui.text_disabled(status);
     }
 
-    /// 保留的距离/倾斜四档条；X/Y 位置条已被连续空间分析取代。
-    fn retained_coverage_bar(&self, ui: &imgui::Ui, label: &str, bins: &[bool], width: f32) {
+    /// 分段覆盖条：每格标注指标名，格内按 0..=1 进度部分填充。
+    /// 边缘/四角每格对应一条边/一个角，距离/倾斜每格对应一个数值区间档。
+    fn coverage_bar(
+        &self,
+        ui: &imgui::Ui,
+        label: &str,
+        segments: &[(&str, f32)],
+        width: f32,
+        status: &str,
+    ) {
         ui.text(label);
         const LABEL_COLUMN: f32 = 76.0;
         ui.same_line();
@@ -698,7 +745,7 @@ impl App {
         let draw = ui.get_window_draw_list();
         let origin = ui.cursor_screen_pos();
         let height = 14.0;
-        let n = bins.len().max(1) as f32;
+        let n = segments.len().max(1) as f32;
         let segment = width / n;
         draw.add_rect(
             [origin[0], origin[1]],
@@ -707,12 +754,16 @@ impl App {
         )
         .filled(true)
         .build();
-        for (index, filled) in bins.iter().enumerate() {
+        for (index, &(name, progress)) in segments.iter().enumerate() {
             let x0 = origin[0] + index as f32 * segment;
-            if *filled {
+            let progress = progress
+                .is_finite()
+                .then_some(progress.clamp(0.0, 1.0))
+                .unwrap_or(0.0);
+            if progress > 0.0 {
                 draw.add_rect(
                     [x0, origin[1]],
-                    [x0 + segment, origin[1] + height],
+                    [x0 + segment * progress, origin[1] + height],
                     theme::OK,
                 )
                 .filled(true)
@@ -724,6 +775,20 @@ impl App {
                 [0.5, 0.55, 0.65, 0.5],
             )
             .build();
+            // 格内标注当前格对应的指标；填充过半时用深色保证对比。
+            let text = ui.calc_text_size(name);
+            draw.add_text(
+                [
+                    x0 + (segment - text[0]) * 0.5,
+                    origin[1] + (height - text[1]) * 0.5,
+                ],
+                if progress >= 0.5 {
+                    [0.05, 0.12, 0.08, 0.95]
+                } else {
+                    [0.72, 0.78, 0.88, 0.95]
+                },
+                name,
+            );
         }
         draw.add_rect(
             [origin[0], origin[1]],
@@ -731,9 +796,8 @@ impl App {
             [0.85, 0.88, 0.95, 0.8],
         )
         .build();
-        let filled = bins.iter().filter(|filled| **filled).count();
         ui.same_line();
-        ui.text_disabled(format!("{filled}/{}", bins.len()));
+        ui.text_disabled(status);
     }
 
     fn show_preview_card(&mut self, ui: &imgui::Ui, slot_index: usize, channel: u16, label: &str) {
