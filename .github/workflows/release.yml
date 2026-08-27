@@ -141,7 +141,7 @@ jobs:
           $archive = "pongbot-calib-tool-$env:RELEASE_VERSION-windows-x86_64"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/pongbot-calib-tool.exe" "dist/$bundle/"
-          Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper-linux-aarch64"
+          Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper"
           Copy-Item README.md "dist/$bundle/"
           & $env:PYTHON scripts/opencv5_dependency.py bundle --destination "dist/$bundle"
           & $env:PYTHON scripts/ffmpeg_dependency.py bundle --destination "dist/$bundle"

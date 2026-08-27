@@ -125,6 +125,10 @@ pub fn locate_helper() -> Option<Vec<u8>> {
             if let Ok(bytes) = std::fs::read(dir.join("camera-i2c-helper")) {
                 return Some(bytes);
             }
+            // 兼容 v0.1.1/v0.1.2-calib Windows 包（曾以 linux-aarch64 后缀命名）。
+            if let Ok(bytes) = std::fs::read(dir.join("camera-i2c-helper-linux-aarch64")) {
+                return Some(bytes);
+            }
         }
     }
     let release = std::path::Path::new("target/release/camera-i2c-helper");
