@@ -271,7 +271,15 @@ fn eeprom_history_dir() -> PathBuf {
             let path = PathBuf::from(value);
             (!path.as_os_str().is_empty()).then_some(path)
         })
-        .unwrap_or_else(|| PathBuf::from("write_history"))
+        // 默认写到程序（可执行文件）所在目录的 ./write_history：
+        // 打包后从任意 CWD 启动，历史文件都落在安装目录下。
+        .unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                .map(|dir| dir.join("write_history"))
+                .unwrap_or_else(|| PathBuf::from("write_history"))
+        })
 }
 
 fn safe_eeprom_history_stem(serial_number: &str) -> Result<String, String> {

@@ -272,7 +272,8 @@ impl VideoTexture {
                 self.id = Some(id);
             }
             gl.bind_texture(glow::TEXTURE_2D, self.gl_texture);
-            if self.width != width || self.height != height {
+            let dimensions_changed = self.width != width || self.height != height;
+            if dimensions_changed {
                 gl.tex_image_2d(
                     glow::TEXTURE_2D,
                     0,
@@ -284,8 +285,6 @@ impl VideoTexture {
                     glow::UNSIGNED_BYTE,
                     Some(rgba),
                 );
-                self.width = width;
-                self.height = height;
             } else {
                 gl.tex_sub_image_2d(
                     glow::TEXTURE_2D,
@@ -302,6 +301,10 @@ impl VideoTexture {
             let error = gl.get_error();
             if error != glow::NO_ERROR {
                 return Err(format!("GL 错误 {error:#x}"));
+            }
+            if dimensions_changed {
+                self.width = width;
+                self.height = height;
             }
         }
         Ok(())
@@ -505,6 +508,12 @@ impl App {
                     }
                     ui.separator();
                 }
+                // Reset 全局可用：任意 Step 均可重新开始整个流程。
+                let busy = self.controller.is_busy();
+                if ui.small_button("Reset 流程") && !busy {
+                    self.controller.reset_flow();
+                }
+                ui.same_line();
                 ui.text_colored(theme::MUTED, &self.controller.state.status_bar);
                 // 活跃步骤变化后滚动到对应区域（连接成功 → 自动进入第二步）。
                 if let Some(index) = self.pending_scroll.take() {
@@ -933,10 +942,6 @@ impl App {
         if ui.button("写入 EEPROM") && !busy {
             self.controller.write_eeprom();
         }
-        ui.same_line();
-        if ui.button("Reset 流程") {
-            self.controller.reset_flow();
-        }
         if self.controller.state.eeprom.write_armed {
             ui.text_colored(theme::WARN, "⚠ 已预检 SNID，再次点击“写入 EEPROM”执行烧录");
         }
@@ -1167,7 +1172,7 @@ fn rasterize_density_heatmap(
         let v = (y as f32 + 0.5) / height_f;
         for x in 0..output_width {
             let u = (x as f32 + 0.5) / width_f;
-            let density = sample_density_bilinear(heatmap, u, v);
+            let density = heatmap.sample_bilinear(u, v);
             let red_to_green = [
                 theme::ERR[0] + (theme::OK[0] - theme::ERR[0]) * density,
                 theme::ERR[1] + (theme::OK[1] - theme::ERR[1]) * density,
@@ -1183,29 +1188,6 @@ fn rasterize_density_heatmap(
         }
     }
     true
-}
-
-/// 以密度网格单元中心为采样点，在边界钳制后进行双线性插值。
-fn sample_density_bilinear(heatmap: &DensityHeatmap, u: f32, v: f32) -> f32 {
-    let max_col = heatmap.cols.saturating_sub(1);
-    let max_row = heatmap.rows.saturating_sub(1);
-    let source_x = (u * heatmap.cols as f32 - 0.5).clamp(0.0, max_col as f32);
-    let source_y = (v * heatmap.rows as f32 - 0.5).clamp(0.0, max_row as f32);
-    let left = source_x.floor() as usize;
-    let top = source_y.floor() as usize;
-    let right = (left + 1).min(max_col);
-    let bottom = (top + 1).min(max_row);
-    let tx = source_x - left as f32;
-    let ty = source_y - top as f32;
-    let at = |col: usize, row: usize| heatmap.samples[row * heatmap.cols + col];
-    let upper = at(left, top) + (at(right, top) - at(left, top)) * tx;
-    let lower = at(left, bottom) + (at(right, bottom) - at(left, bottom)) * tx;
-    let density = upper + (lower - upper) * ty;
-    if density.is_finite() {
-        density.clamp(0.0, 1.0)
-    } else {
-        0.0
-    }
 }
 
 fn rgba_channel(value: f32) -> u8 {
@@ -1282,5 +1264,57 @@ fn draw_overlay(draw: &imgui::DrawListMut, overlay: &OverlayData, min: [f32; 2],
                     .build();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rasterized_heatmap_maps_zero_and_sufficient_density_to_color_and_alpha() {
+        let mut rgba = Vec::new();
+        let zero = DensityHeatmap::zeroed(8, 8);
+        assert!(rasterize_density_heatmap(&zero, 2, 2, &mut rgba));
+        assert_eq!(
+            &rgba[..4],
+            &[
+                rgba_channel(theme::ERR[0]),
+                rgba_channel(theme::ERR[1]),
+                rgba_channel(theme::ERR[2]),
+                rgba_channel(HEATMAP_ZERO_ALPHA),
+            ]
+        );
+
+        let sufficient = DensityHeatmap {
+            cols: 8,
+            rows: 8,
+            samples: vec![1.0; 64].into(),
+        };
+        assert!(rasterize_density_heatmap(&sufficient, 2, 2, &mut rgba));
+        assert_eq!(
+            &rgba[..4],
+            &[
+                rgba_channel(theme::OK[0]),
+                rgba_channel(theme::OK[1]),
+                rgba_channel(theme::OK[2]),
+                rgba_channel(HEATMAP_SUFFICIENT_ALPHA),
+            ]
+        );
+    }
+
+    #[test]
+    fn density_sampling_interpolates_between_neighboring_cells() {
+        let mut samples = vec![0.0; 64];
+        samples[3 * 8 + 3] = 1.0;
+        let heatmap = DensityHeatmap {
+            cols: 8,
+            rows: 8,
+            samples: samples.into(),
+        };
+        let at_peak = heatmap.sample_bilinear(3.5 / 8.0, 3.5 / 8.0);
+        let between_cells = heatmap.sample_bilinear(4.0 / 8.0, 3.5 / 8.0);
+        assert!((at_peak - 1.0).abs() <= f32::EPSILON);
+        assert!((between_cells - 0.5).abs() <= f32::EPSILON);
     }
 }
