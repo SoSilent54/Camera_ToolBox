@@ -9,6 +9,39 @@ pub const OK: [f32; 4] = [0.30, 0.88, 0.54, 1.0];
 pub const WARN: [f32; 4] = [1.0, 0.76, 0.38, 1.0];
 pub const ERR: [f32; 4] = [1.0, 0.48, 0.48, 1.0];
 
+const MATH_GLYPH_RANGES: &[u32] = &[
+    0x00b1, 0x00b1, // ±
+    0x00d7, 0x00d7, // ×
+    0x00f7, 0x00f7, // ÷
+    0x0391, 0x03c9, // Greek capitals/lowercase: Δ, Σ, σ ...
+    0x2070, 0x209f, // superscripts/subscripts: ᵀ ...
+    0x2190, 0x22ff, // arrows + mathematical operators: ≤, ≥, ≈, ∞ ...
+    0x25a0, 0x25ff, // geometric blocks used by compact charts.
+    0x2700, 0x27bf, // dingbats: ✓ ...
+    0,
+];
+
+fn math_font_candidates() -> [PathBuf; 8] {
+    [
+        PathBuf::from("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/ttf-dejavu/DejaVuSans.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/freefont/FreeSans.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+        PathBuf::from("/usr/share/fonts/opentype/noto/NotoSansMath-Regular.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+        PathBuf::from("/usr/share/fonts/truetype/ancient-scripts/Symbola.ttf"),
+    ]
+}
+
+fn read_first_font(candidates: impl IntoIterator<Item = PathBuf>) -> Option<(PathBuf, Vec<u8>)> {
+    candidates.into_iter().find_map(|path| {
+        path.is_file()
+            .then(|| std::fs::read(&path).ok().map(|bytes| (path, bytes)))
+            .flatten()
+    })
+}
+
 /// 加载中文字体；找不到 CJK 字体时保留默认字体并记录风险。
 ///
 /// 搜索顺序：bundle 内 `fonts/`（随发布包分发）→ 各平台系统字体
@@ -45,18 +78,47 @@ pub fn install_fonts(ctx: &mut imgui::Context) {
         PathBuf::from("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc"),
         PathBuf::from("/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf"),
     ]);
-    let cjk_font = candidates.into_iter().find(|path| path.is_file());
 
-    match cjk_font.and_then(|path| std::fs::read(&path).ok()) {
-        Some(bytes) => {
-            ctx.fonts().add_font(&[FontSource::TtfData {
-                data: Box::leak(bytes.into_boxed_slice()),
-                size_pixels: 18.0,
-                config: Some(FontConfig {
-                    glyph_ranges: FontGlyphRanges::chinese_full(),
-                    ..FontConfig::default()
-                }),
-            }]);
+    match read_first_font(candidates) {
+        Some((cjk_path, cjk_bytes)) => {
+            if let Some((math_path, math_bytes)) = read_first_font(math_font_candidates()) {
+                ctx.fonts().add_font(&[
+                    FontSource::TtfData {
+                        data: &cjk_bytes,
+                        size_pixels: 18.0,
+                        config: Some(FontConfig {
+                            glyph_ranges: FontGlyphRanges::chinese_full(),
+                            ..FontConfig::default()
+                        }),
+                    },
+                    FontSource::TtfData {
+                        data: &math_bytes,
+                        size_pixels: 18.0,
+                        config: Some(FontConfig {
+                            glyph_ranges: FontGlyphRanges::from_slice(MATH_GLYPH_RANGES),
+                            ..FontConfig::default()
+                        }),
+                    },
+                ]);
+                tracing::info!(
+                    cjk = %cjk_path.display(),
+                    math = %math_path.display(),
+                    "已加载 CJK 字体并合并数学符号字形"
+                );
+            } else {
+                ctx.fonts().add_font(&[FontSource::TtfData {
+                    data: &cjk_bytes,
+                    size_pixels: 18.0,
+                    config: Some(FontConfig {
+                        glyph_ranges: FontGlyphRanges::chinese_full(),
+                        ..FontConfig::default()
+                    }),
+                }]);
+                tracing::warn!(
+                    cjk = %cjk_path.display(),
+                    "未找到数学符号字体，σ/Δ/≤ 等符号可能显示为方块"
+                );
+            }
         }
         None => {
             tracing::warn!("未找到 CJK 字体，中文可能显示为方块");

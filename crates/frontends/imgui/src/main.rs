@@ -18,7 +18,10 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
 use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
-use pongbot_calib_tool::observability::MAX_GOAL_RMS_PX;
+use pongbot_calib_tool::observability::{
+    DISTORTION_EDGE_STDDEV_TARGET_PX, FOCAL_REL_STDDEV_TARGET, MAX_GOAL_RMS_PX,
+    MAX_NORMALIZED_CONDITION, PRINCIPAL_STDDEV_TARGET_PX,
+};
 use pongbot_calib_tool::solve::MIN_USABLE_CALIBRATION_VIEWS;
 use pongbot_calib_tool::theme;
 use raw_window_handle::HasWindowHandle;
@@ -686,6 +689,7 @@ impl App {
                 "视图 {} · 角点 {} · 单图最大 {:.3}px · Δlogdet {}",
                 report.view_count, report.point_count, report.max_view_rmse, gain
             ));
+            self.show_observability_details(ui, index, report);
             if report.goal_met() {
                 ui.text_colored(theme::OK, "数值可观测性达标，即将自动进入求解");
             } else {
@@ -753,6 +757,87 @@ impl App {
         ui.text_disabled(status);
     }
 
+    fn show_observability_details(
+        &self,
+        ui: &imgui::Ui,
+        id: usize,
+        report: &pongbot_calib_tool::observability::ObservabilityReport,
+    ) {
+        let title = format!("参数明细##observability_detail_{id}");
+        ui.tree_node_config(&title).default_open(false).build(|| {
+            let mut rows = Vec::with_capacity(6 + report.distortion_edge_stddev_px.len());
+            rows.push((
+                "RMS".to_owned(),
+                metric_value(report.rms_error, "px", MAX_GOAL_RMS_PX),
+            ));
+            rows.push((
+                "cond(H)".to_owned(),
+                metric_value(report.condition_number, "", MAX_NORMALIZED_CONDITION),
+            ));
+            rows.push((
+                "fx std".to_owned(),
+                metric_value(
+                    report.focal_relative_stddev[0] * 100.0,
+                    "%",
+                    FOCAL_REL_STDDEV_TARGET * 100.0,
+                ),
+            ));
+            rows.push((
+                "fy std".to_owned(),
+                metric_value(
+                    report.focal_relative_stddev[1] * 100.0,
+                    "%",
+                    FOCAL_REL_STDDEV_TARGET * 100.0,
+                ),
+            ));
+            rows.push((
+                "cx std".to_owned(),
+                metric_value(
+                    report.principal_point_stddev_px[0],
+                    "px",
+                    PRINCIPAL_STDDEV_TARGET_PX,
+                ),
+            ));
+            rows.push((
+                "cy std".to_owned(),
+                metric_value(
+                    report.principal_point_stddev_px[1],
+                    "px",
+                    PRINCIPAL_STDDEV_TARGET_PX,
+                ),
+            ));
+            for (name, value) in report
+                .distortion_names
+                .iter()
+                .zip(report.distortion_edge_stddev_px.iter())
+            {
+                rows.push((
+                    format!("{name} edge std"),
+                    metric_value(*value, "px", DISTORTION_EDGE_STDDEV_TARGET_PX),
+                ));
+            }
+            ui.columns(3, "##observability_param_columns", false);
+            ui.text_disabled("参数");
+            ui.next_column();
+            ui.text_disabled("当前 / 阈值");
+            ui.next_column();
+            ui.text_disabled("状态");
+            ui.next_column();
+            ui.separator();
+            for (name, status) in rows {
+                ui.text(name);
+                ui.next_column();
+                ui.text(status.value);
+                ui.next_column();
+                ui.text_colored(
+                    if status.ok { theme::OK } else { theme::WARN },
+                    status.label,
+                );
+                ui.next_column();
+            }
+            ui.columns(1, "##observability_param_columns_end", false);
+        });
+    }
     fn show_preview_card(&mut self, ui: &imgui::Ui, slot_index: usize, channel: u16, label: &str) {
         ui.text_colored(theme::ACCENT, label);
         let channel_state = match channel {
@@ -952,6 +1037,7 @@ impl App {
                     ),
                 ],
             );
+            self.show_observability_details(ui, 10 + index, &report);
         }
         if !rmse.is_empty() {
             ui.separator();
@@ -1333,6 +1419,27 @@ fn draw_overlay(draw: &imgui::DrawListMut, overlay: &OverlayData, min: [f32; 2],
                     .build();
             }
         }
+    }
+}
+struct MetricDisplay {
+    value: String,
+    label: &'static str,
+    ok: bool,
+}
+
+fn metric_value(value: f64, unit: &str, threshold: f64) -> MetricDisplay {
+    let ok = value.is_finite() && threshold.is_finite() && value <= threshold;
+    let value_text = if unit.is_empty() {
+        format!("{value:.3e} / {threshold:.3e}")
+    } else if value.abs() >= 1000.0 || threshold.abs() >= 1000.0 {
+        format!("{value:.3e}{unit} / {threshold:.3e}{unit}")
+    } else {
+        format!("{value:.3}{unit} / {threshold:.3}{unit}")
+    };
+    MetricDisplay {
+        value: value_text,
+        label: if ok { "OK" } else { "继续采集" },
+        ok,
     }
 }
 

@@ -25,7 +25,7 @@ use camera_toolbox_core::{
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 /// 连续密度场的固定分辨率；只保存累计场，不保存角点历史。
@@ -372,11 +372,35 @@ impl RtspStream {
             return;
         }
         self.detect_started = true;
+        let (analysis_tx, analysis_rx) = mpsc::channel();
+        let analysis_pending = Arc::new(AtomicBool::new(false));
+        let captured_overlay: CapturedCornerOverlaySlot = Arc::new(Mutex::new(None));
+
+        let analysis_capturing = Arc::clone(&self.capturing);
+        let analysis_pending_for_worker = Arc::clone(&analysis_pending);
+        let analysis_captured = Arc::clone(&self.captured);
+        let analysis_poses = Arc::clone(&self.poses);
+        let analysis_detections = Arc::clone(&self.detections);
+        let analysis_overlay = Arc::clone(&self.overlay);
+        let analysis_guide = Arc::clone(&self.guide_state);
+        let analysis_captured_overlay = Arc::clone(&captured_overlay);
+        std::thread::spawn(move || {
+            dataset_analysis_loop(
+                analysis_capturing,
+                analysis_pending_for_worker,
+                analysis_rx,
+                analysis_captured,
+                analysis_poses,
+                analysis_detections,
+                analysis_guide,
+                analysis_overlay,
+                analysis_captured_overlay,
+                board,
+            );
+        });
+
         let capturing = Arc::clone(&self.capturing);
         let slot = Arc::clone(&self.slot);
-        let captured = Arc::clone(&self.captured);
-        let poses = Arc::clone(&self.poses);
-        let detections = Arc::clone(&self.detections);
         let overlay = Arc::clone(&self.overlay);
         let guide = Arc::clone(&self.guide_state);
         let rtsp_error = Arc::clone(&self.rtsp_error);
@@ -385,11 +409,11 @@ impl RtspStream {
             capture_loop(
                 capturing,
                 slot,
-                captured,
-                poses,
-                detections,
+                analysis_tx,
+                analysis_pending,
                 guide,
                 overlay,
+                captured_overlay,
                 rtsp_error,
                 capture_source,
                 board,
@@ -456,16 +480,51 @@ struct GuidedPoseMeasurement {
     image_size: CalibrationImageSize,
 }
 
-/// 稳定检测采集循环：hold 满后抓取 raw/subpixel dataset 帧，并实时求解可观测性。
+struct PendingDatasetAnalysis {
+    dataset_frame: CapturedDatasetFrame,
+    display_width: u32,
+    display_height: u32,
+}
+
+type CapturedCornerOverlaySlot = Arc<Mutex<Option<(std::time::Instant, Vec<[f32; 2]>)>>>;
+
+fn current_guide_quality(guide: &Arc<Mutex<GuideState>>) -> DatasetQuality {
+    guide
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .quality
+        .clone()
+}
+
+fn captured_corners_snapshot(
+    captured_overlay: &CapturedCornerOverlaySlot,
+    board: BoardSpec,
+) -> Option<(usize, usize, Vec<[f32; 2]>)> {
+    captured_overlay
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .as_ref()
+        .filter(|(time, _)| time.elapsed() < CAPTURE_CORNERS_DISPLAY)
+        .map(|(_, corners)| {
+            (
+                usize::from(board.inner_cols),
+                usize::from(board.inner_rows),
+                corners.clone(),
+            )
+        })
+}
+
+/// 稳定检测采集循环：只负责 RTSP 检测、hold 判定和及时触发 TCP raw 抓帧。
+/// raw 重检、亚像素角点、入库去重和实时求解由 `dataset_analysis_loop` 独立处理。
 #[allow(clippy::too_many_arguments)]
 fn capture_loop(
     capturing: Arc<AtomicBool>,
     slot: Arc<LatestDecodedFrameSlot>,
-    captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
-    poses: Arc<Mutex<Vec<[f64; 3]>>>,
-    detections: Arc<Mutex<Vec<DetectedDatasetFrame>>>,
+    analysis_tx: mpsc::Sender<PendingDatasetAnalysis>,
+    analysis_pending: Arc<AtomicBool>,
     guide: Arc<Mutex<GuideState>>,
     overlay: Arc<Mutex<Option<OverlayData>>>,
+    captured_overlay: CapturedCornerOverlaySlot,
     rtsp_error: Arc<Mutex<Option<String>>>,
     capture_source: DatasetCaptureSource,
     board: BoardSpec,
@@ -474,16 +533,13 @@ fn capture_loop(
     let cancellation = CalibrationCancellation::default();
     let mut hold_frames: u8 = 0;
     let mut last_measurement: Option<GuidedPoseMeasurement> = None;
-    let mut density = CornerDensityMap::new();
-    let mut quality = DatasetQuality::default();
-    let mut last_observability: Option<ObservabilityReport> = None;
-    let mut last_capture: Option<(std::time::Instant, Vec<[f32; 2]>)> = None;
     tracing::info!(
-        "稳定检测采集 worker 已启动（hold {HOLD_TARGET} 帧，raw/subpixel + 实时可观测性）"
+        "稳定检测采集 worker 已启动（hold {HOLD_TARGET} 帧；raw/subpixel 与实时求解在独立线程）"
     );
     // 上一轮已处理帧：非消费等待下一新帧，避免重复处理同一帧。
     let mut last_processed: Option<Arc<DecodedVideoFrame>> = None;
     loop {
+        let quality = current_guide_quality(&guide);
         if quality.is_complete() {
             set_guide_quality(
                 &guide,
@@ -497,12 +553,11 @@ fn capture_loop(
             break;
         }
         // 事件驱动取最新帧：非消费等待「新帧到达或首帧」，不抢走显示路径的帧。
-        // 每次检测完成后立即接续当时的 RTSP 最新帧，不引入固定节拍 sleep。
         let frame = match slot.wait_until_changed_timeout(last_processed.as_ref(), DETECT_INTERVAL)
         {
             Some(frame) => frame,
             None => {
-                // 超时且无新帧：回报 RTSP 状态后继续等待。
+                let quality = current_guide_quality(&guide);
                 let error = rtsp_error
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -527,21 +582,11 @@ fn capture_loop(
             height: frame.height,
         };
         let initial = default_initial_intrinsics(frame.width, frame.height);
-        // 拍摄角点 overlay：拍摄后短暂保留显示，供确认触发瞬间的棋盘姿态。
-        let captured_corners = last_capture
-            .as_ref()
-            .filter(|(time, _)| time.elapsed() < CAPTURE_CORNERS_DISPLAY)
-            .map(|(_, corners)| {
-                (
-                    usize::from(board.inner_cols),
-                    usize::from(board.inner_rows),
-                    corners.clone(),
-                )
-            });
-
+        let captured_corners = captured_corners_snapshot(&captured_overlay, board);
         let png = match encode_png(&frame.rgba, frame.width, frame.height) {
             Ok(png) => png,
             Err(error) => {
+                let quality = current_guide_quality(&guide);
                 set_guide_quality(&guide, &format!("PNG 编码失败：{error}"), 0, &quality);
                 continue;
             }
@@ -553,6 +598,7 @@ fn capture_loop(
                     Err(error) => {
                         hold_frames = 0;
                         last_measurement = None;
+                        let quality = current_guide_quality(&guide);
                         set_guide_quality(
                             &guide,
                             &format!("检测到棋盘，姿态估计失败：{error}"),
@@ -568,6 +614,7 @@ fn capture_loop(
                     Err(error) => {
                         hold_frames = 0;
                         last_measurement = None;
+                        let quality = current_guide_quality(&guide);
                         set_guide_quality(&guide, &format!("棋盘位姿无效：{error}"), 0, &quality);
                         continue;
                     }
@@ -581,6 +628,7 @@ fn capture_loop(
                     captured_corners.clone(),
                 );
 
+                let quality = current_guide_quality(&guide);
                 if !capturing.load(Ordering::Acquire) {
                     set_guide_quality(&guide, "等待自动采集启动…", 0, &quality);
                     continue;
@@ -611,28 +659,31 @@ fn capture_loop(
                     );
                     continue;
                 }
-                if !density.has_usable_corners(&detection) {
+                if !has_usable_corners(&detection) {
                     hold_frames = 0;
                     last_measurement = None;
                     set_guide_quality(&guide, "检测角点无效，未抓取原图", 0, &quality);
                     continue;
                 }
-                if density.is_near_duplicate(&measurement) {
+                if analysis_pending
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+                {
                     hold_frames = 0;
                     last_measurement = None;
                     set_guide_quality(
                         &guide,
-                        "近重复视角已拒绝，请移动或转动棋盘后再保持稳定",
+                        "上一张 raw/subpixel 与可观测性分析仍在后台进行，请稍候",
                         0,
                         &quality,
                     );
                     continue;
                 }
 
-                // 初筛通过后抓取 TCP 原图，但只有 solver 同规则的 raw 重检成功才能入库。
                 let dataset_frame = match capture_dataset_frame(&capture_source, &frame) {
                     Ok(frame) => frame,
                     Err(error) => {
+                        analysis_pending.store(false, Ordering::Release);
                         hold_frames = 0;
                         last_measurement = None;
                         set_guide_quality(
@@ -644,129 +695,20 @@ fn capture_loop(
                         continue;
                     }
                 };
-                let validated =
-                    match validate_dataset_frame(&backend, dataset_frame, board, &cancellation) {
-                        Ok(validated) => validated,
-                        Err(error) => {
-                            hold_frames = 0;
-                            last_measurement = None;
-                            set_guide_quality(
-                                &guide,
-                                &format!("TCP 原图棋盘重检未通过，未入库：{error}"),
-                                0,
-                                &quality,
-                            );
-                            continue;
-                        }
-                    };
-                let raw_detection = {
-                    let mut captured = captured
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let mut poses = poses
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let mut detections = detections
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    match commit_solver_validated_capture(
-                        &mut density,
-                        &mut captured,
-                        &mut poses,
-                        &mut detections,
-                        validated,
-                    ) {
-                        Ok(Some(detection)) => detection,
-                        Ok(None) => {
-                            hold_frames = 0;
-                            last_measurement = None;
-                            set_guide_quality(
-                                &guide,
-                                "TCP 原图近重复视角已拒绝，请移动或转动棋盘后再保持稳定",
-                                0,
-                                &quality,
-                            );
-                            continue;
-                        }
-                        Err(error) => {
-                            hold_frames = 0;
-                            last_measurement = None;
-                            set_guide_quality(
-                                &guide,
-                                &format!("TCP 原图校验失败，未入库：{error}"),
-                                0,
-                                &quality,
-                            );
-                            continue;
-                        }
-                    }
+                let pending = PendingDatasetAnalysis {
+                    dataset_frame,
+                    display_width: frame.width,
+                    display_height: frame.height,
                 };
-                quality = density.snapshot();
-                let cached_detections = detections
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone();
-                if cached_detections.len() >= crate::solve::MIN_USABLE_CALIBRATION_VIEWS {
-                    let channel = cached_detections
-                        .last()
-                        .map(|frame| frame.frame.channel)
-                        .unwrap_or(0);
-                    match solve_channel_from_detections(
-                        channel,
-                        &cached_detections,
-                        board,
-                        last_observability.as_ref(),
-                    ) {
-                        Ok(result) => {
-                            quality.observability = result.observability.clone();
-                            last_observability = result.observability;
-                        }
-                        Err(error) => {
-                            quality.observability = last_observability.clone();
-                            tracing::warn!(channel, "实时标定/可观测性求解失败：{error}");
-                        }
-                    }
-                }
-
-                // 记录 solver-valid raw 角点；按 RTSP 显示尺寸映射，确认入库证据而非引导帧。
-                let corners_px =
-                    captured_corners_for_overlay(&raw_detection, frame.width, frame.height);
-                last_capture = Some((std::time::Instant::now(), corners_px));
-                publish_overlay(
-                    &overlay,
-                    frame.width,
-                    frame.height,
-                    Some(&measurement),
-                    Some(HOLD_TARGET),
-                    last_capture.as_ref().map(|(_, corners)| {
-                        (
-                            usize::from(board.inner_cols),
-                            usize::from(board.inner_rows),
-                            corners.clone(),
-                        )
-                    }),
-                );
-                hold_frames = 0;
-                last_measurement = None;
-                if quality.is_complete() {
-                    set_guide_quality(
-                        &guide,
-                        &format!(
-                            "数值可观测性达标（已采 {} 张），采集结束",
-                            quality.accepted_frames
-                        ),
-                        0,
-                        &quality,
-                    );
+                if analysis_tx.send(pending).is_err() {
+                    analysis_pending.store(false, Ordering::Release);
                     break;
                 }
+                hold_frames = 0;
+                last_measurement = None;
                 set_guide_quality(
                     &guide,
-                    &format!(
-                        "已采集 {} 张 · {}",
-                        quality.accepted_frames,
-                        quality_missing_hint(&quality)
-                    ),
+                    "已抓取 raw 原图，后台进行亚像素检测和可观测性分析…",
                     0,
                     &quality,
                 );
@@ -774,6 +716,7 @@ fn capture_loop(
             Ok(ChessboardDetectionOutcome::NotFound { .. }) => {
                 hold_frames = 0;
                 last_measurement = None;
+                let quality = current_guide_quality(&guide);
                 publish_overlay(
                     &overlay,
                     frame.width,
@@ -792,6 +735,7 @@ fn capture_loop(
             Err(error) => {
                 hold_frames = 0;
                 last_measurement = None;
+                let quality = current_guide_quality(&guide);
                 publish_overlay(
                     &overlay,
                     frame.width,
@@ -804,6 +748,164 @@ fn capture_loop(
             }
         }
     }
+}
+
+/// dataset 分析线程：串行处理每路 raw 帧的亚像素重检、去重、实时求解和可观测性。
+#[allow(clippy::too_many_arguments)]
+fn dataset_analysis_loop(
+    capturing: Arc<AtomicBool>,
+    analysis_pending: Arc<AtomicBool>,
+    analysis_rx: mpsc::Receiver<PendingDatasetAnalysis>,
+    captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
+    poses: Arc<Mutex<Vec<[f64; 3]>>>,
+    detections: Arc<Mutex<Vec<DetectedDatasetFrame>>>,
+    guide: Arc<Mutex<GuideState>>,
+    overlay: Arc<Mutex<Option<OverlayData>>>,
+    captured_overlay: CapturedCornerOverlaySlot,
+    board: BoardSpec,
+) {
+    let backend = OpenCvCalibrationBackend;
+    let cancellation = CalibrationCancellation::default();
+    let mut density = CornerDensityMap::new();
+    let mut quality = DatasetQuality::default();
+    let mut last_observability: Option<ObservabilityReport> = None;
+    tracing::info!("dataset analysis worker 已启动（raw/subpixel + realtime solve）");
+
+    while let Ok(pending) = analysis_rx.recv() {
+        let channel = pending.dataset_frame.channel;
+        let validated =
+            match validate_dataset_frame(&backend, pending.dataset_frame, board, &cancellation) {
+                Ok(validated) => validated,
+                Err(error) => {
+                    set_guide_quality(
+                        &guide,
+                        &format!("TCP 原图棋盘重检未通过，未入库：{error}"),
+                        0,
+                        &quality,
+                    );
+                    analysis_pending.store(false, Ordering::Release);
+                    continue;
+                }
+            };
+        let measurement = validated.measurement.clone();
+        let raw_detection = {
+            let mut captured = captured
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut poses = poses
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut detections = detections
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match commit_solver_validated_capture(
+                &mut density,
+                &mut captured,
+                &mut poses,
+                &mut detections,
+                validated,
+            ) {
+                Ok(Some(detection)) => detection,
+                Ok(None) => {
+                    set_guide_quality(
+                        &guide,
+                        "TCP 原图近重复视角已拒绝，请移动或转动棋盘后再保持稳定",
+                        0,
+                        &quality,
+                    );
+                    analysis_pending.store(false, Ordering::Release);
+                    continue;
+                }
+                Err(error) => {
+                    set_guide_quality(
+                        &guide,
+                        &format!("TCP 原图校验失败，未入库：{error}"),
+                        0,
+                        &quality,
+                    );
+                    analysis_pending.store(false, Ordering::Release);
+                    continue;
+                }
+            }
+        };
+        quality = density.snapshot();
+        let cached_detections = detections
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if cached_detections.len() >= crate::solve::MIN_USABLE_CALIBRATION_VIEWS {
+            match solve_channel_from_detections(
+                channel,
+                &cached_detections,
+                board,
+                last_observability.as_ref(),
+            ) {
+                Ok(result) => {
+                    quality.observability = result.observability.clone();
+                    last_observability = result.observability;
+                }
+                Err(error) => {
+                    quality.observability = last_observability.clone();
+                    tracing::warn!(channel, "实时标定/可观测性求解失败：{error}");
+                }
+            }
+        }
+
+        let corners_px = captured_corners_for_overlay(
+            &raw_detection,
+            pending.display_width,
+            pending.display_height,
+        );
+        {
+            let mut slot = captured_overlay
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            *slot = Some((std::time::Instant::now(), corners_px.clone()));
+        }
+        publish_overlay(
+            &overlay,
+            pending.display_width,
+            pending.display_height,
+            Some(&measurement),
+            Some(HOLD_TARGET),
+            Some((
+                usize::from(board.inner_cols),
+                usize::from(board.inner_rows),
+                corners_px,
+            )),
+        );
+        if quality.is_complete() {
+            set_guide_quality(
+                &guide,
+                &format!(
+                    "数值可观测性达标（已采 {} 张），采集结束",
+                    quality.accepted_frames
+                ),
+                0,
+                &quality,
+            );
+            capturing.store(false, Ordering::Release);
+        } else {
+            set_guide_quality(
+                &guide,
+                &format!(
+                    "已采集 {} 张 · {}",
+                    quality.accepted_frames,
+                    quality_missing_hint(&quality)
+                ),
+                0,
+                &quality,
+            );
+        }
+        analysis_pending.store(false, Ordering::Release);
+    }
+}
+
+fn has_usable_corners(detection: &ChessboardDetection) -> bool {
+    detection
+        .corners
+        .iter()
+        .any(|corner| normalized_corner(corner, detection.image_size).is_some())
 }
 
 /// 发布当前帧的 overlay 绘制数据（检测外框 + hold 状态 + 拍摄角点）。
@@ -895,10 +997,7 @@ impl CornerDensityMap {
 
     /// 只有至少一个位于图像内的有限角点，才允许进行 TCP 原图抓取。
     fn has_usable_corners(&self, detection: &ChessboardDetection) -> bool {
-        detection
-            .corners
-            .iter()
-            .any(|corner| normalized_corner(corner, detection.image_size).is_some())
+        has_usable_corners(detection)
     }
 
     /// 持久量化占用查询保持旧 jitter 同义：深度变化会按 `Δx/max(z, 1)` 放宽横向邻域。
