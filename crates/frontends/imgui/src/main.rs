@@ -19,7 +19,6 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
 use pongbot_calib_tool::observability::MAX_GOAL_RMS_PX;
-use pongbot_calib_tool::preview::DEPTH_COVERAGE_LABELS;
 use pongbot_calib_tool::solve::MIN_USABLE_CALIBRATION_VIEWS;
 use pongbot_calib_tool::theme;
 use raw_window_handle::HasWindowHandle;
@@ -604,19 +603,19 @@ impl App {
             .size([card_width, card_height])
             .build(|| self.show_preview_card(ui, 1, 3, "CH3 · RTSP 557 · i2c-6"));
         ui.separator();
-        // 显示数值可观测性 goal；空间/bin 仅保留为辅助提示。
-        let panel_height = 300.0;
-        ui.child_window("##ch0_coverage")
+        // 显示数值可观测性 goal；旧版覆盖/bin 进度条不再显示。
+        let panel_height = 210.0;
+        ui.child_window("##ch0_observability")
             .size([card_width, panel_height])
-            .build(|| self.show_coverage_panel(ui, 0));
+            .build(|| self.show_observability_panel(ui, 0));
         ui.same_line();
-        ui.child_window("##ch3_coverage")
+        ui.child_window("##ch3_observability")
             .size([card_width, panel_height])
-            .build(|| self.show_coverage_panel(ui, 1));
+            .build(|| self.show_observability_panel(ui, 1));
     }
 
-    /// 数值可观测性面板：goal 由最新标定解的参数不确定性决定，空间/bin 只作辅助提示。
-    fn show_coverage_panel(&mut self, ui: &imgui::Ui, index: usize) {
+    /// 数值可观测性面板：goal 由最新标定解的参数不确定性决定。
+    fn show_observability_panel(&mut self, ui: &imgui::Ui, index: usize) {
         let quality = if index == 0 {
             self.controller.state.preview.ch0.quality.clone()
         } else {
@@ -703,53 +702,6 @@ impl App {
                 ),
             );
         }
-
-        ui.separator();
-        ui.text_disabled("辅助覆盖（不再作为完成条件）");
-        let edge = quality.edge_progresses();
-        let edge_segments = [
-            ("左", edge[0]),
-            ("右", edge[1]),
-            ("上", edge[2]),
-            ("下", edge[3]),
-        ];
-        self.coverage_bar(
-            ui,
-            "边缘",
-            &edge_segments,
-            width,
-            &format!("{}/4", quality.covered_edges()),
-        );
-        let corner = quality.corner_progresses();
-        let corner_segments = [
-            ("左上", corner[0]),
-            ("右上", corner[1]),
-            ("右下", corner[2]),
-            ("左下", corner[3]),
-        ];
-        self.coverage_bar(
-            ui,
-            "四角",
-            &corner_segments,
-            width,
-            &format!("{}/4", quality.covered_corners()),
-        );
-        let depth_segments = [
-            (DEPTH_COVERAGE_LABELS[0], quality.depth[0] as u8 as f32),
-            (DEPTH_COVERAGE_LABELS[1], quality.depth[1] as u8 as f32),
-            (DEPTH_COVERAGE_LABELS[2], quality.depth[2] as u8 as f32),
-            (DEPTH_COVERAGE_LABELS[3], quality.depth[3] as u8 as f32),
-        ];
-        self.coverage_bar(
-            ui,
-            "距离",
-            &depth_segments,
-            width,
-            &format!(
-                "{}/4",
-                quality.depth.iter().filter(|covered| **covered).count()
-            ),
-        );
     }
 
     /// 连续质量的单条紧凑进度条。
@@ -790,81 +742,6 @@ impl App {
             )
             .filled(true)
             .build();
-        }
-        draw.add_rect(
-            [origin[0], origin[1]],
-            [origin[0] + width, origin[1] + height],
-            [0.85, 0.88, 0.95, 0.8],
-        )
-        .build();
-        ui.same_line();
-        ui.text_disabled(status);
-    }
-
-    /// 分段覆盖条：每格标注指标名，格内按 0..=1 进度部分填充。
-    /// 边缘/四角每格对应一条边/一个角，距离/倾斜每格对应一个数值区间档。
-    fn coverage_bar(
-        &self,
-        ui: &imgui::Ui,
-        label: &str,
-        segments: &[(&str, f32)],
-        width: f32,
-        status: &str,
-    ) {
-        ui.text(label);
-        const LABEL_COLUMN: f32 = 76.0;
-        ui.same_line();
-        let cursor = ui.cursor_pos();
-        if cursor[0] < LABEL_COLUMN {
-            ui.set_cursor_pos([LABEL_COLUMN, cursor[1]]);
-        }
-        let draw = ui.get_window_draw_list();
-        let origin = ui.cursor_screen_pos();
-        let height = 14.0;
-        let n = segments.len().max(1) as f32;
-        let segment = width / n;
-        draw.add_rect(
-            [origin[0], origin[1]],
-            [origin[0] + width, origin[1] + height],
-            [0.16, 0.17, 0.22, 1.0],
-        )
-        .filled(true)
-        .build();
-        for (index, &(name, progress)) in segments.iter().enumerate() {
-            let x0 = origin[0] + index as f32 * segment;
-            let progress = progress
-                .is_finite()
-                .then_some(progress.clamp(0.0, 1.0))
-                .unwrap_or(0.0);
-            if progress > 0.0 {
-                draw.add_rect(
-                    [x0, origin[1]],
-                    [x0 + segment * progress, origin[1] + height],
-                    theme::OK,
-                )
-                .filled(true)
-                .build();
-            }
-            draw.add_line(
-                [x0, origin[1]],
-                [x0, origin[1] + height],
-                [0.5, 0.55, 0.65, 0.5],
-            )
-            .build();
-            // 格内标注当前格对应的指标；填充过半时用深色保证对比。
-            let text = ui.calc_text_size(name);
-            draw.add_text(
-                [
-                    x0 + (segment - text[0]) * 0.5,
-                    origin[1] + (height - text[1]) * 0.5,
-                ],
-                if progress >= 0.5 {
-                    [0.05, 0.12, 0.08, 0.95]
-                } else {
-                    [0.72, 0.78, 0.88, 0.95]
-                },
-                name,
-            );
         }
         draw.add_rect(
             [origin[0], origin[1]],
