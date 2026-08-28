@@ -302,8 +302,8 @@ fn decode_rtsp(
     let mut decoded = ffmpeg::util::frame::video::Video::empty();
     let mut rgba = ffmpeg::util::frame::video::Video::empty();
     let mut frame_sequence = 0_u64;
-    // 当前 X5 H.264 编码器没有 B 帧：每个送入 decoder 的 access unit 至多产生一个
-    // 对应解码帧，因此按提交顺序保存包侧 SEI 时间戳即可，不得从 PTS 推断。
+    // 首帧或解码恢复后等待 IDR，避免展示参考帧缺失时 FFmpeg 的错误隐藏输出。
+    let mut waiting_for_keyframe = true;
     let mut pending_device_timestamps = VecDeque::new();
 
     loop {
@@ -333,11 +333,28 @@ fn decode_rtsp(
         stats.record_codec_stage(codec_start.elapsed());
         loop {
             let codec_start = Instant::now();
-            if decoder.receive_frame(&mut decoded).is_err() {
-                stats.record_codec_stage(codec_start.elapsed());
+            let receive_result = decoder.receive_frame(&mut decoded);
+            stats.record_codec_stage(codec_start.elapsed());
+            if let Err(error) = receive_result {
+                if matches!(error, ffmpeg::Error::InvalidData | ffmpeg::Error::Eof) {
+                    waiting_for_keyframe = true;
+                    tracing::warn!(channel, ?error, "FFmpeg 丢弃无效 RTSP 解码输出");
+                }
                 break;
             }
-            stats.record_codec_stage(codec_start.elapsed());
+            if decoded.is_corrupt() {
+                waiting_for_keyframe = true;
+                let _ = pending_device_timestamps.pop_front();
+                tracing::warn!(channel, "FFmpeg 输出帧标记为损坏，跳过预览上传");
+                continue;
+            }
+            if waiting_for_keyframe {
+                if !decoded.is_key() {
+                    let _ = pending_device_timestamps.pop_front();
+                    continue;
+                }
+                waiting_for_keyframe = false;
+            }
             if state.shutdown_requested.load(Ordering::Acquire) {
                 return Ok(());
             }
@@ -699,12 +716,12 @@ mod tests {
     #[test]
     fn stable_rtsp_options_omit_low_latency_reorder_bypass() {
         let options = rtsp_input_options(
-            FfmpegRtspTransport::Udp,
+            FfmpegRtspTransport::Tcp,
             RtspLatencyMode::Stable,
             Duration::from_secs(2),
         );
 
-        assert_eq!(options.get("rtsp_transport"), Some("udp"));
+        assert_eq!(options.get("rtsp_transport"), Some("tcp"));
         assert_eq!(options.get("fflags"), None);
         assert_eq!(options.get("max_delay"), None);
         assert_eq!(options.get("stimeout"), Some("2000000"));
