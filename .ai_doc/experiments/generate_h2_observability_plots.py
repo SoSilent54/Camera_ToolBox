@@ -36,7 +36,20 @@ SCENARIO_LABELS = {
     "same_depth_pose_diverse": "Same depth, pose diverse",
     "progressive_full_coverage_true_D12": "Progressive coverage, true D12",
     "progressive_full_coverage_true_D5": "Progressive coverage, true D5",
+    "expected_progression_true_D5": "Expected progression, true D5",
     "aggressive_edge_coverage_true_D5": "Aggressive edge coverage, true D5",
+}
+STAGE_LABELS = {
+    "fronto-fill": "fronto-fill",
+    "multi-pose": "multi-pose",
+    "depth": "depth",
+    "edge-corner": "edge-corner",
+}
+STAGE_LABELS_ZH = {
+    "fronto-fill": "正视平铺满",
+    "multi-pose": "多姿态",
+    "depth": "补深度",
+    "edge-corner": "补边角",
 }
 
 
@@ -79,6 +92,48 @@ def b(row: Dict[str, str], key: str) -> bool:
 
 def scenario_title(name: str) -> str:
     return SCENARIO_LABELS.get(name, name)
+
+def pose_stage(row: Dict[str, str]) -> str:
+    label = row.get("added_pose") or row.get("label") or ""
+    return label.split(":", 1)[0] if ":" in label else ""
+
+
+def stage_ranges(rows: Sequence[Dict[str, str]]) -> List[Tuple[str, int, int]]:
+    ranges: List[Tuple[str, int, int]] = []
+    current_stage = ""
+    start_view = 0
+    end_view = 0
+    for row in rows:
+        stage = pose_stage(row)
+        if not stage:
+            continue
+        view = int(row["views"] if "views" in row else row["view"])
+        if stage != current_stage:
+            if current_stage:
+                ranges.append((current_stage, start_view, end_view))
+            current_stage = stage
+            start_view = view
+        end_view = view
+    if current_stage:
+        ranges.append((current_stage, start_view, end_view))
+    return ranges
+
+
+def shade_stage_regions(ax, rows: Sequence[Dict[str, str]]) -> None:
+    colors = ["#d6eaf8", "#d5f5e3", "#fcf3cf", "#fadbd8"]
+    for index, (stage, start, end) in enumerate(stage_ranges(rows)):
+        color = colors[index % len(colors)]
+        ax.axvspan(start - 0.5, end + 0.5, color=color, alpha=0.25, zorder=0)
+        ax.text(
+            (start + end) / 2,
+            0.98,
+            STAGE_LABELS.get(stage, stage),
+            ha="center",
+            va="top",
+            fontsize=7,
+            color="#333333",
+            transform=ax.get_xaxis_transform(),
+        )
 
 
 def group_by(rows: Iterable[Dict[str, str]], key: str) -> Dict[str, List[Dict[str, str]]]:
@@ -158,6 +213,7 @@ def plot_metric_dashboard(scenario: str, rows: Sequence[Dict[str, str]], output_
         ("d5_edge_std_px", "D5 edge std [px]", True),
     ]
     for ax, (key, label, threshold) in zip(axes.flat, specs):
+        shade_stage_regions(ax, rows)
         xs, ys = finite_xy(rows, key)
         ax.plot(xs, ys, marker="o", ms=3, lw=1.3, color="#1f77b4")
         if key in {"cond_h", "d5_edge_std_px"}:
@@ -300,6 +356,37 @@ def write_milestones(grouped: Dict[str, List[Dict[str, str]]], output_dir: Path)
     return path
 
 
+def write_stage_summary(grouped: Dict[str, List[Dict[str, str]]], output_dir: Path) -> Optional[Path]:
+    rows = grouped.get("expected_progression_true_D5")
+    if not rows:
+        return None
+    lines = [
+        "| 阶段 | 阶段结束 view | RMS(px) | fx/fy 误差(%) | cx/cy 误差(px) | cond(H) | 焦距 σ(%) | 主点 σ(px) | D5 edge σ(px) | H2 提示 |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    for stage, _, end in stage_ranges(rows):
+        row = next((candidate for candidate in rows if int(candidate["views"]) == end), None)
+        if row is None:
+            continue
+        lines.append(
+            "| {stage} | {view} | {rms} | {ferr} | {cerr} | {cond} | {fstd} | {pstd} | {d5} | {hint} |".format(
+                stage=STAGE_LABELS_ZH.get(stage, stage),
+                view=end,
+                rms=row_value(row, "rms_px"),
+                ferr=f"{row_value(row, 'fx_error_pct')}/{row_value(row, 'fy_error_pct')}",
+                cerr=f"{row_value(row, 'cx_error_px')}/{row_value(row, 'cy_error_px')}",
+                cond=row_value(row, "cond_h"),
+                fstd=row_value(row, "focal_std_max_pct"),
+                pstd=row_value(row, "principal_std_max_px"),
+                d5=row_value(row, "d5_edge_std_px"),
+                hint=row.get("hint", ""),
+            )
+        )
+    path = output_dir / "expected_progression_stage_summary.md"
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
 def main() -> None:
     args = parse_args()
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -315,6 +402,9 @@ def main() -> None:
     generated.append(plot_distortion_error_compare(grouped_metrics, args.output_dir))
     generated.append(write_milestones(grouped_metrics, args.output_dir))
 
+    stage_summary = write_stage_summary(grouped_metrics, args.output_dir)
+    if stage_summary is not None:
+        generated.append(stage_summary)
     for path in generated:
         print(path)
 

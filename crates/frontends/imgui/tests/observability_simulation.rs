@@ -36,7 +36,6 @@ struct ScenarioDefinition {
 }
 
 struct ScenarioData {
-    scenario: ScenarioDefinition,
     rows: Vec<MetricRow>,
     corners: Vec<CornerRow>,
 }
@@ -103,6 +102,11 @@ fn print_h2_observability_simulation_tables() {
             name: "progressive_full_coverage_true_D5",
             true_distortion_count: 5,
             poses: progressive_full_coverage(),
+        },
+        ScenarioDefinition {
+            name: "expected_progression_true_D5",
+            true_distortion_count: 5,
+            poses: expected_progression(),
         },
         ScenarioDefinition {
             name: "aggressive_edge_coverage_true_D5",
@@ -205,11 +209,7 @@ fn run_scenario(board: BoardSpec, scenario: ScenarioDefinition) -> ScenarioData 
         }
     }
 
-    ScenarioData {
-        scenario,
-        rows,
-        corners,
-    }
+    ScenarioData { rows, corners }
 }
 
 fn calibrate_from_detections(
@@ -450,6 +450,171 @@ fn progressive_full_coverage() -> Vec<SyntheticPose> {
     .collect()
 }
 
+fn expected_progression() -> Vec<SyntheticPose> {
+    let mut poses = [
+        ("fronto-fill:center", [0.0, 0.0, 0.0], [0.0, 0.0, 930.0]),
+        ("fronto-fill:left", [0.0, 0.0, 0.0], [-210.0, 0.0, 930.0]),
+        ("fronto-fill:right", [0.0, 0.0, 0.0], [210.0, 0.0, 930.0]),
+        ("fronto-fill:top", [0.0, 0.0, 0.0], [0.0, -140.0, 930.0]),
+        ("fronto-fill:bottom", [0.0, 0.0, 0.0], [0.0, 140.0, 930.0]),
+        (
+            "fronto-fill:upper-left",
+            [0.0, 0.0, 0.0],
+            [-210.0, -135.0, 930.0],
+        ),
+        (
+            "fronto-fill:upper-right",
+            [0.0, 0.0, 0.0],
+            [210.0, -135.0, 930.0],
+        ),
+        (
+            "fronto-fill:lower-left",
+            [0.0, 0.0, 0.0],
+            [-210.0, 135.0, 930.0],
+        ),
+        (
+            "fronto-fill:lower-right",
+            [0.0, 0.0, 0.0],
+            [210.0, 135.0, 930.0],
+        ),
+        (
+            "multi-pose:yaw-left",
+            [0.0, 0.32, 0.0],
+            [-130.0, 0.0, 930.0],
+        ),
+        (
+            "multi-pose:yaw-right",
+            [0.0, -0.32, 0.0],
+            [130.0, 0.0, 930.0],
+        ),
+        ("multi-pose:pitch-up", [0.32, 0.0, 0.0], [0.0, -95.0, 930.0]),
+        (
+            "multi-pose:pitch-down",
+            [-0.32, 0.0, 0.0],
+            [0.0, 95.0, 930.0],
+        ),
+        (
+            "multi-pose:roll-left",
+            [0.0, 0.0, 0.50],
+            [-130.0, -85.0, 930.0],
+        ),
+        (
+            "multi-pose:roll-right",
+            [0.0, 0.0, -0.50],
+            [130.0, 85.0, 930.0],
+        ),
+        (
+            "multi-pose:diag-a",
+            [0.24, 0.24, 0.28],
+            [-155.0, 85.0, 930.0],
+        ),
+        (
+            "multi-pose:diag-b",
+            [-0.24, -0.24, -0.28],
+            [155.0, -85.0, 930.0],
+        ),
+        (
+            "multi-pose:mixed-a",
+            [0.26, -0.18, 0.38],
+            [200.0, -125.0, 930.0],
+        ),
+        (
+            "multi-pose:mixed-b",
+            [-0.26, 0.18, -0.38],
+            [-200.0, 125.0, 930.0],
+        ),
+        (
+            "multi-pose:mixed-c",
+            [0.18, -0.28, -0.22],
+            [0.0, 145.0, 930.0],
+        ),
+        (
+            "multi-pose:mixed-d",
+            [-0.18, 0.28, 0.22],
+            [0.0, -145.0, 930.0],
+        ),
+        ("depth:near-x", [0.36, 0.0, 0.12], [-95.0, -65.0, 680.0]),
+        ("depth:near-y", [0.0, -0.36, -0.12], [95.0, 65.0, 700.0]),
+        (
+            "depth:near-roll",
+            [0.22, 0.28, -0.28],
+            [-155.0, -110.0, 720.0],
+        ),
+        (
+            "depth:near-mixed",
+            [-0.24, -0.30, 0.25],
+            [155.0, 110.0, 740.0],
+        ),
+        ("depth:far-x", [-0.36, 0.0, -0.12], [120.0, -85.0, 1280.0]),
+        ("depth:far-y", [0.0, 0.36, 0.12], [-120.0, 85.0, 1280.0]),
+        (
+            "depth:far-roll",
+            [-0.22, -0.28, 0.28],
+            [150.0, 105.0, 1350.0],
+        ),
+        (
+            "depth:far-mixed",
+            [0.24, 0.30, -0.25],
+            [-150.0, -105.0, 1320.0],
+        ),
+        (
+            "depth:mid-steep-x",
+            [0.46, 0.10, 0.18],
+            [0.0, -135.0, 820.0],
+        ),
+        (
+            "depth:mid-steep-y",
+            [-0.10, -0.46, -0.18],
+            [215.0, 0.0, 880.0],
+        ),
+        (
+            "depth:mid-roll-cw",
+            [0.12, 0.20, 0.55],
+            [175.0, -125.0, 860.0],
+        ),
+        (
+            "depth:mid-roll-ccw",
+            [-0.12, -0.20, -0.55],
+            [-175.0, 125.0, 860.0],
+        ),
+    ]
+    .into_iter()
+    .map(|(label, rvec, center_camera)| SyntheticPose {
+        label,
+        rvec,
+        center_camera,
+    })
+    .collect::<Vec<_>>();
+
+    let centers = [
+        [-260.0, -150.0, 640.0],
+        [260.0, -150.0, 640.0],
+        [-260.0, 150.0, 640.0],
+        [260.0, 150.0, 640.0],
+        [-330.0, 0.0, 820.0],
+        [330.0, 0.0, 820.0],
+        [0.0, -210.0, 820.0],
+        [0.0, 210.0, 820.0],
+    ];
+    let rotations = [
+        [0.42, 0.24, 0.0],
+        [-0.42, -0.24, 0.0],
+        [0.24, -0.42, 0.35],
+        [-0.24, 0.42, -0.35],
+        [0.50, -0.15, 0.55],
+        [-0.50, 0.15, -0.55],
+    ];
+    for center_camera in centers {
+        for rvec in rotations {
+            poses.push(SyntheticPose {
+                label: "edge-corner:extra",
+                rvec,
+                center_camera,
+            });
+        }
+    }
+    poses
+}
 fn aggressive_edge_coverage() -> Vec<SyntheticPose> {
     let mut poses = progressive_full_coverage();
     let centers = [
