@@ -30,7 +30,7 @@ usage() {
     cat <<'EOF'
 Usage: ./build.sh [profile]
 
-Builds the `camera-toolbox`, `pangbot-calib-tool`, and `camera-toolbox-web`
+Builds the `camera-toolbox` and `pangbot-calib-tool`
 executables for the current native host with Local, CV610, SSH-managed
 providers, pinned FFmpeg 8.1.2, and pinned OpenCV 5 calibration enabled
 together. It also places the deployable Linux AArch64 I²C helper beside the
@@ -108,8 +108,6 @@ frontend_args=(
     --bin camera-toolbox
     --package pangbot-calib-tool
     --bin pangbot-calib-tool
-    --package camera-toolbox-web
-    --bin camera-toolbox-web
     --no-default-features
     --features "$features"
     --locked
@@ -130,16 +128,6 @@ if (( calibration_enabled )); then
     "$python_command" "$opencv_dependency_tool" prepare
 fi
 
-printf 'Building web assets: profile=%s\n' "$profile"
-(
-    cd "${project_root}/crates/frontends/camera-toolbox-web/web"
-    if [[ -f package-lock.json ]]; then
-        npm ci
-    else
-        npm install
-    fi
-    npm run build
-)
 
 cargo "${frontend_args[@]}"
 

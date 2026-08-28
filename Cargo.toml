@@ -7,7 +7,6 @@ members = [
     "crates/frontends/cli",
     "crates/frontends/camera-toolbox",
     "crates/frontends/pangbot-calib-tool",
-    "crates/frontends/camera-toolbox-web",
     "crates/i2c-helper",
     "crates/ffmpeg-bridge",
 ]
@@ -22,8 +21,6 @@ publish = false
 
 [workspace.dependencies]
 anyhow = "1.0"
-async-stream = "0.3"
-bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 eframe = { version = "0.35", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
 egui_plot = "0.36"
@@ -36,7 +33,6 @@ thiserror = "2.0"
 tracing = "0.1"
 directories = "6.0"
 serde_json = "1.0"
-axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio", "ws"] }
 serde_yaml = "0.9"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
@@ -60,7 +56,6 @@ secrecy = "0.10"
 tokio = { version = "1.52", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-tower-http = { version = "0.6", features = ["fs"] }
 
 camera-toolbox-core = { path = "crates/core" }
 camera-toolbox-app = { path = "crates/app" }
