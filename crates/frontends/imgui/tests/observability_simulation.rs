@@ -1,18 +1,26 @@
+use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
+use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{
-    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationSolution, ChessboardDetection,
-    PANGBOT_CALIBRATION_FLAGS, ViewCalibrationResult,
+    BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
+    ChessboardDetection, InitialIntrinsics,
 };
-use pongbot_calib_tool::observability::analyze_solution;
+use pongbot_calib_tool::observability::{ObservabilityReport, analyze_solution};
 use pongbot_calib_tool::preview::{CapturedDatasetFrame, CapturedDatasetSource};
 use pongbot_calib_tool::solve::DetectedDatasetFrame;
-use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const IMAGE_SIZE: CalibrationImageSize = CalibrationImageSize {
     width: 1920,
     height: 1080,
 };
-const RMS_ERROR_PX: f64 = 0.08;
+const BOARD_COLS: u16 = 11;
+const BOARD_ROWS: u16 = 8;
+const BOARD_SQUARE_MM: f64 = 40.0;
+const TRUE_FX: f64 = 1200.0;
+const TRUE_FY: f64 = 1180.0;
+const TRUE_CX: f64 = 960.0;
+const TRUE_CY: f64 = 540.0;
 
 #[derive(Clone, Copy)]
 struct SyntheticPose {
@@ -21,177 +29,341 @@ struct SyntheticPose {
     center_camera: [f64; 3],
 }
 
-struct ScenarioResult {
-    name: String,
-    rows: Vec<ScenarioRow>,
+struct ScenarioDefinition {
+    name: &'static str,
+    true_distortion_count: usize,
+    poses: Vec<SyntheticPose>,
 }
 
-struct ScenarioRow {
+struct ScenarioData {
+    scenario: ScenarioDefinition,
+    rows: Vec<MetricRow>,
+    corners: Vec<CornerRow>,
+}
+
+struct MetricRow {
+    scenario: &'static str,
+    true_distortion_count: usize,
     views: usize,
-    label: &'static str,
-    goal: &'static str,
-    rms: String,
-    cond: String,
-    focal: String,
-    principal: String,
-    distortion: String,
-    gain: String,
+    added_pose: &'static str,
+    solve_ok: bool,
+    h2_ok: bool,
+    goal_met: bool,
+    rms_px: Option<f64>,
+    fx: Option<f64>,
+    fy: Option<f64>,
+    cx: Option<f64>,
+    cy: Option<f64>,
+    fx_error_pct: Option<f64>,
+    fy_error_pct: Option<f64>,
+    cx_error_px: Option<f64>,
+    cy_error_px: Option<f64>,
+    k: [Option<f64>; 5],
+    k_error: [Option<f64>; 5],
+    cond_h: Option<f64>,
+    focal_std_max_pct: Option<f64>,
+    principal_std_max_px: Option<f64>,
+    d5_edge_std_px: Option<f64>,
+    d12_edge_std_px: Option<f64>,
+    logdet_gain: Option<f64>,
     hint: String,
 }
 
-#[test]
-#[ignore = "generates H2 observability simulation tables for documentation"]
-fn print_h2_observability_simulation_tables() {
-    let board = BoardSpec::new(11, 8, 40.0).expect("valid board");
-    let scenarios = [
-        run_scenario("fronto_parallel_only", 12, board, &fronto_parallel_only()),
-        run_scenario(
-            "same_depth_pose_diverse",
-            12,
-            board,
-            &same_depth_pose_diverse(),
-        ),
-        run_scenario(
-            "progressive_full_coverage_D12",
-            12,
-            board,
-            &progressive_full_coverage(),
-        ),
-        run_scenario(
-            "progressive_full_coverage_D5",
-            5,
-            board,
-            &progressive_full_coverage(),
-        ),
-        run_scenario(
-            "aggressive_edge_coverage_D5",
-            5,
-            board,
-            &aggressive_edge_coverage(),
-        ),
-    ];
-    let mut markdown = String::new();
-    for scenario in &scenarios {
-        print_scenario(scenario);
-        append_markdown_table(&mut markdown, scenario);
-    }
-    if let Ok(path) = std::env::var("PONGBOT_OBSERVABILITY_SIM_MD") {
-        std::fs::write(path, markdown).expect("write markdown artifact");
-    }
+struct CornerRow {
+    scenario: &'static str,
+    true_distortion_count: usize,
+    view: usize,
+    label: &'static str,
+    corner: usize,
+    x: f32,
+    y: f32,
 }
 
-fn run_scenario(
-    name: &'static str,
-    distortion_count: usize,
-    board: BoardSpec,
-    poses: &[SyntheticPose],
-) -> ScenarioResult {
-    let mut rows = Vec::new();
+#[test]
+#[ignore = "generates H2 observability simulation CSV data for matplotlib reports"]
+fn print_h2_observability_simulation_tables() {
+    let board = BoardSpec::new(BOARD_COLS, BOARD_ROWS, BOARD_SQUARE_MM).expect("valid board");
+    let scenarios = [
+        ScenarioDefinition {
+            name: "fronto_parallel_only",
+            true_distortion_count: 12,
+            poses: fronto_parallel_only(),
+        },
+        ScenarioDefinition {
+            name: "same_depth_pose_diverse",
+            true_distortion_count: 12,
+            poses: same_depth_pose_diverse(),
+        },
+        ScenarioDefinition {
+            name: "progressive_full_coverage_true_D12",
+            true_distortion_count: 12,
+            poses: progressive_full_coverage(),
+        },
+        ScenarioDefinition {
+            name: "progressive_full_coverage_true_D5",
+            true_distortion_count: 5,
+            poses: progressive_full_coverage(),
+        },
+        ScenarioDefinition {
+            name: "aggressive_edge_coverage_true_D5",
+            true_distortion_count: 5,
+            poses: aggressive_edge_coverage(),
+        },
+    ];
+
+    let data = scenarios
+        .into_iter()
+        .map(|scenario| run_scenario(board, scenario))
+        .collect::<Vec<_>>();
+
+    let output_dir = std::env::var("PONGBOT_OBSERVABILITY_SIM_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("h2_observability_sim"));
+    std::fs::create_dir_all(&output_dir).expect("create output dir");
+    write_metrics_csv(&output_dir.join("metrics.csv"), &data).expect("write metrics csv");
+    write_corners_csv(&output_dir.join("corners.csv"), &data).expect("write corners csv");
+    println!("H2 observability simulation data: {}", output_dir.display());
+}
+
+fn run_scenario(board: BoardSpec, scenario: ScenarioDefinition) -> ScenarioData {
+    let backend = OpenCvCalibrationBackend;
+    let cancellation = CalibrationCancellation::default();
+    let mut rows = Vec::with_capacity(scenario.poses.len());
     let mut previous = None;
-    for views in 1..=poses.len() {
-        let (solution, detections) = synthetic_dataset(board, &poses[..views], distortion_count);
-        let label = poses[views - 1].label;
-        match analyze_solution(&solution, board, &detections, previous.as_ref()) {
-            Ok(report) => {
-                let goal = if report.goal_met() { "OK" } else { "NO" };
-                let hint = report.missing_hint().to_owned();
-                let row = ScenarioRow {
+    for views in 1..=scenario.poses.len() {
+        let detections = synthetic_detections(
+            board,
+            &scenario.poses[..views],
+            scenario.true_distortion_count,
+        );
+        let added_pose = scenario.poses[views - 1].label;
+        let row = match calibrate_from_detections(&backend, board, &detections, &cancellation) {
+            Ok(solution) => {
+                let analysis = analyze_solution(&solution, board, &detections, previous.as_ref());
+                let h2_error = analysis.as_ref().err().cloned();
+                let report = analysis.as_ref().ok();
+                if let Some(report) = report {
+                    previous = Some(report.clone());
+                }
+                metric_row_from_solution(
+                    scenario.name,
+                    scenario.true_distortion_count,
                     views,
-                    label,
-                    goal,
-                    rms: format!("{:.3}", report.rms_error),
-                    cond: format!("{:.2e}", report.condition_number),
-                    focal: format!(
-                        "{:.3}/{:.3}%",
-                        report.focal_relative_stddev[0] * 100.0,
-                        report.focal_relative_stddev[1] * 100.0
-                    ),
-                    principal: format!(
-                        "{:.2}/{:.2}px",
-                        report.principal_point_stddev_px[0], report.principal_point_stddev_px[1]
-                    ),
-                    distortion: format!(
-                        "D5 {:.2}px / D12 {:.2}px",
-                        max_finite(report.primary_distortion_edge_stddev_px()),
-                        max_finite(&report.distortion_edge_stddev_px)
-                    ),
-                    gain: report
-                        .last_info_gain
-                        .map_or_else(|| "--".to_owned(), |value| format!("{value:+.2}")),
-                    hint,
-                };
-                previous = Some(report);
-                rows.push(row);
+                    added_pose,
+                    &solution,
+                    report,
+                    h2_error,
+                )
             }
-            Err(error) => rows.push(ScenarioRow {
+            Err(error) => MetricRow {
+                scenario: scenario.name,
+                true_distortion_count: scenario.true_distortion_count,
                 views,
+                added_pose,
+                solve_ok: false,
+                h2_ok: false,
+                goal_met: false,
+                rms_px: None,
+                fx: None,
+                fy: None,
+                cx: None,
+                cy: None,
+                fx_error_pct: None,
+                fy_error_pct: None,
+                cx_error_px: None,
+                cy_error_px: None,
+                k: [None; 5],
+                k_error: [None; 5],
+                cond_h: None,
+                focal_std_max_pct: None,
+                principal_std_max_px: None,
+                d5_edge_std_px: None,
+                d12_edge_std_px: None,
+                logdet_gain: None,
+                hint: format!("calibrate: {error}"),
+            },
+        };
+        print_metric_row(&row);
+        rows.push(row);
+    }
+
+    let final_detections =
+        synthetic_detections(board, &scenario.poses, scenario.true_distortion_count);
+    let mut corners = Vec::new();
+    for (view_index, detection) in final_detections.iter().enumerate() {
+        let label = scenario.poses[view_index].label;
+        for (corner_index, point) in detection.detection.corners.iter().enumerate() {
+            corners.push(CornerRow {
+                scenario: scenario.name,
+                true_distortion_count: scenario.true_distortion_count,
+                view: view_index + 1,
                 label,
-                goal: "ERR",
-                rms: "--".to_owned(),
-                cond: "--".to_owned(),
-                focal: "--".to_owned(),
-                principal: "--".to_owned(),
-                distortion: "--".to_owned(),
-                gain: "--".to_owned(),
-                hint: error,
-            }),
+                corner: corner_index,
+                x: point.x,
+                y: point.y,
+            });
         }
     }
-    ScenarioResult {
-        name: format!("{name} ({distortion_count} active distortion params)"),
+
+    ScenarioData {
+        scenario,
         rows,
+        corners,
     }
 }
 
-fn synthetic_dataset(
+fn calibrate_from_detections(
+    backend: &OpenCvCalibrationBackend,
+    board: BoardSpec,
+    detections: &[DetectedDatasetFrame],
+    cancellation: &CalibrationCancellation,
+) -> Result<CalibrationSolution, String> {
+    let image_points = detections
+        .iter()
+        .map(|frame| frame.detection.corners.clone())
+        .collect::<Vec<_>>();
+    let request = CalibrationRequest {
+        image_size: IMAGE_SIZE,
+        board,
+        image_points,
+        initial_intrinsics: InitialIntrinsics {
+            camera_matrix: [900.0, 0.0, TRUE_CX, 0.0, 900.0, TRUE_CY, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 5],
+        },
+    };
+    backend
+        .calibrate(&request, cancellation)
+        .map_err(|error| error.to_string())
+}
+
+fn metric_row_from_solution(
+    scenario: &'static str,
+    true_distortion_count: usize,
+    views: usize,
+    added_pose: &'static str,
+    solution: &CalibrationSolution,
+    report: Option<&ObservabilityReport>,
+    h2_error: Option<String>,
+) -> MetricRow {
+    let d_true = true_distortion_coefficients(true_distortion_count);
+    let d = &solution.distortion_coefficients;
+    let k = [
+        d.first().copied(),
+        d.get(1).copied(),
+        d.get(2).copied(),
+        d.get(3).copied(),
+        d.get(4).copied(),
+    ];
+    let k_error = [
+        k[0].map(|value| value - d_true[0]),
+        k[1].map(|value| value - d_true[1]),
+        k[2].map(|value| value - d_true[2]),
+        k[3].map(|value| value - d_true[3]),
+        k[4].map(|value| value - d_true[4]),
+    ];
+    let fx = solution.camera_matrix[0];
+    let fy = solution.camera_matrix[4];
+    let cx = solution.camera_matrix[2];
+    let cy = solution.camera_matrix[5];
+    let (
+        h2_ok,
+        goal_met,
+        cond_h,
+        focal_std_max_pct,
+        principal_std_max_px,
+        d5_edge_std_px,
+        d12_edge_std_px,
+        logdet_gain,
+        hint,
+    ) = if let Some(report) = report {
+        (
+            true,
+            report.goal_met(),
+            Some(report.condition_number),
+            Some(max_finite(&report.focal_relative_stddev) * 100.0),
+            Some(max_finite(&report.principal_point_stddev_px)),
+            Some(max_finite(report.primary_distortion_edge_stddev_px())),
+            Some(max_finite(&report.distortion_edge_stddev_px)),
+            report.last_info_gain,
+            if report.goal_met() {
+                "达标".to_owned()
+            } else {
+                report.missing_hint().to_owned()
+            },
+        )
+    } else {
+        (
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            h2_error.unwrap_or_else(|| "observability unavailable".to_owned()),
+        )
+    };
+
+    MetricRow {
+        scenario,
+        true_distortion_count,
+        views,
+        added_pose,
+        solve_ok: true,
+        h2_ok,
+        goal_met,
+        rms_px: Some(solution.rms_error),
+        fx: Some(fx),
+        fy: Some(fy),
+        cx: Some(cx),
+        cy: Some(cy),
+        fx_error_pct: Some((fx - TRUE_FX) / TRUE_FX * 100.0),
+        fy_error_pct: Some((fy - TRUE_FY) / TRUE_FY * 100.0),
+        cx_error_px: Some(cx - TRUE_CX),
+        cy_error_px: Some(cy - TRUE_CY),
+        k,
+        k_error,
+        cond_h,
+        focal_std_max_pct,
+        principal_std_max_px,
+        d5_edge_std_px,
+        d12_edge_std_px,
+        logdet_gain,
+        hint,
+    }
+}
+
+fn synthetic_detections(
     board: BoardSpec,
     poses: &[SyntheticPose],
-    distortion_count: usize,
-) -> (CalibrationSolution, Vec<DetectedDatasetFrame>) {
+    true_distortion_count: usize,
+) -> Vec<DetectedDatasetFrame> {
     let intrinsics = camera_matrix();
-    let distortion = distortion_coefficients()
-        .into_iter()
-        .take(distortion_count)
-        .collect::<Vec<_>>();
-    let mut views = Vec::with_capacity(poses.len());
-    let mut detections = Vec::with_capacity(poses.len());
-    for (index, pose) in poses.iter().enumerate() {
-        let translation = translation_for_board_center(board, pose.rvec, pose.center_camera);
-        let corners = project_board(board, pose.rvec, translation, intrinsics, &distortion);
-        views.push(ViewCalibrationResult {
-            rotation_vector: pose.rvec,
-            translation_vector: translation,
-            projected_points: corners.clone(),
-            reprojection_rmse: RMS_ERROR_PX,
-            max_reprojection_error: RMS_ERROR_PX * 2.0,
-        });
-        detections.push(DetectedDatasetFrame {
-            frame: Arc::new(CapturedDatasetFrame {
-                channel: 0,
-                width: IMAGE_SIZE.width,
-                height: IMAGE_SIZE.height,
-                luma: Arc::<[u8]>::from(vec![0_u8; 1].into_boxed_slice()),
-                source: CapturedDatasetSource::SyntheticRgba {
-                    frame_sequence: index as u64,
+    let distortion = true_distortion_coefficients(true_distortion_count);
+    poses
+        .iter()
+        .enumerate()
+        .map(|(index, pose)| {
+            let translation = translation_for_board_center(board, pose.rvec, pose.center_camera);
+            let corners = project_board(board, pose.rvec, translation, intrinsics, &distortion);
+            DetectedDatasetFrame {
+                frame: Arc::new(CapturedDatasetFrame {
+                    channel: 0,
+                    width: IMAGE_SIZE.width,
+                    height: IMAGE_SIZE.height,
+                    luma: Arc::<[u8]>::from(vec![0_u8; 1].into_boxed_slice()),
+                    source: CapturedDatasetSource::SyntheticRgba {
+                        frame_sequence: index as u64,
+                    },
+                }),
+                detection: ChessboardDetection {
+                    image_size: IMAGE_SIZE,
+                    corners,
                 },
-            }),
-            detection: ChessboardDetection {
-                image_size: IMAGE_SIZE,
-                corners,
-            },
-        });
-    }
-    (
-        CalibrationSolution {
-            image_size: IMAGE_SIZE,
-            camera_matrix: intrinsics,
-            distortion_coefficients: distortion,
-            rms_error: RMS_ERROR_PX,
-            calibration_flags: PANGBOT_CALIBRATION_FLAGS,
-            views,
-        },
-        detections,
-    )
+            }
+        })
+        .collect()
 }
 
 fn fronto_parallel_only() -> Vec<SyntheticPose> {
@@ -361,13 +533,16 @@ fn project_board(
 }
 
 fn camera_matrix() -> [f64; 9] {
-    [1200.0, 0.0, 960.0, 0.0, 1180.0, 540.0, 0.0, 0.0, 1.0]
+    [TRUE_FX, 0.0, TRUE_CX, 0.0, TRUE_FY, TRUE_CY, 0.0, 0.0, 1.0]
 }
 
-fn distortion_coefficients() -> Vec<f64> {
+fn true_distortion_coefficients(count: usize) -> Vec<f64> {
     vec![
         0.08, -0.025, 0.001, -0.0008, 0.004, 0.0, 0.0, 0.0, 0.0002, -0.0001, 0.00015, -0.00012,
     ]
+    .into_iter()
+    .take(count)
+    .collect()
 }
 
 fn distort(x: f64, y: f64, d: &[f64]) -> [f64; 2] {
@@ -432,52 +607,111 @@ fn max_finite(values: &[f64]) -> f64 {
         .fold(0.0_f64, f64::max)
 }
 
-fn print_scenario(scenario: &ScenarioResult) {
-    println!("\n## {}", scenario.name);
-    println!("views,label,goal,rms_px,cond,focal_std,principal_std,dist_edge_std_max,gain,hint");
-    for row in &scenario.rows {
-        println!(
-            "{},{},{},{},{},{},{},{},{},{}",
-            row.views,
-            row.label,
-            row.goal,
-            row.rms,
-            row.cond,
-            row.focal,
-            row.principal,
-            row.distortion,
-            row.gain,
-            row.hint
-        );
+fn write_metrics_csv(path: &Path, data: &[ScenarioData]) -> std::io::Result<()> {
+    let mut output = String::new();
+    output.push_str("scenario,true_distortion_count,views,added_pose,solve_ok,h2_ok,goal_met,rms_px,fx,fy,cx,cy,fx_error_pct,fy_error_pct,cx_error_px,cy_error_px,k1,k2,p1,p2,k3,k1_error,k2_error,p1_error,p2_error,k3_error,cond_h,focal_std_max_pct,principal_std_max_px,d5_edge_std_px,d12_edge_std_px,logdet_gain,hint\n");
+    for scenario in data {
+        for row in &scenario.rows {
+            output.push_str(&csv_row(&[
+                row.scenario.to_owned(),
+                row.true_distortion_count.to_string(),
+                row.views.to_string(),
+                row.added_pose.to_owned(),
+                row.solve_ok.to_string(),
+                row.h2_ok.to_string(),
+                row.goal_met.to_string(),
+                optional_value(row.rms_px),
+                optional_value(row.fx),
+                optional_value(row.fy),
+                optional_value(row.cx),
+                optional_value(row.cy),
+                optional_value(row.fx_error_pct),
+                optional_value(row.fy_error_pct),
+                optional_value(row.cx_error_px),
+                optional_value(row.cy_error_px),
+                optional_value(row.k[0]),
+                optional_value(row.k[1]),
+                optional_value(row.k[2]),
+                optional_value(row.k[3]),
+                optional_value(row.k[4]),
+                optional_value(row.k_error[0]),
+                optional_value(row.k_error[1]),
+                optional_value(row.k_error[2]),
+                optional_value(row.k_error[3]),
+                optional_value(row.k_error[4]),
+                optional_value(row.cond_h),
+                optional_value(row.focal_std_max_pct),
+                optional_value(row.principal_std_max_px),
+                optional_value(row.d5_edge_std_px),
+                optional_value(row.d12_edge_std_px),
+                optional_value(row.logdet_gain),
+                row.hint.clone(),
+            ]));
+        }
+    }
+    std::fs::write(path, output)
+}
+
+fn write_corners_csv(path: &Path, data: &[ScenarioData]) -> std::io::Result<()> {
+    let mut output = String::new();
+    output.push_str("scenario,true_distortion_count,view,label,corner,x,y\n");
+    for scenario in data {
+        for corner in &scenario.corners {
+            output.push_str(&csv_row(&[
+                corner.scenario.to_owned(),
+                corner.true_distortion_count.to_string(),
+                corner.view.to_string(),
+                corner.label.to_owned(),
+                corner.corner.to_string(),
+                corner.x.to_string(),
+                corner.y.to_string(),
+            ]));
+        }
+    }
+    std::fs::write(path, output)
+}
+
+fn optional_value(value: Option<f64>) -> String {
+    value
+        .filter(|value| value.is_finite())
+        .map(|value| format!("{value:.10}"))
+        .unwrap_or_default()
+}
+
+fn csv_row(cells: &[String]) -> String {
+    let mut row = cells
+        .iter()
+        .map(|cell| csv_cell(cell))
+        .collect::<Vec<_>>()
+        .join(",");
+    row.push('\n');
+    row
+}
+
+fn csv_cell(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
     }
 }
 
-fn append_markdown_table(output: &mut String, scenario: &ScenarioResult) {
-    writeln!(output, "\n### {}\n", scenario.name).unwrap();
-    writeln!(
-        output,
-        "| views | added pose | goal | RMS(px) | cond(H) | fx/fy σ | cx/cy σ | max distortion edge σ | Δlogdet / reason |"
-    )
-    .unwrap();
-    writeln!(output, "|---:|---|---|---:|---:|---:|---:|---:|---|").unwrap();
-    for row in &scenario.rows {
-        writeln!(
-            output,
-            "| {} | {} | {} | {} | {} | {} | {} | {} | {} |",
-            row.views,
-            row.label,
-            row.goal,
-            row.rms,
-            row.cond,
-            row.focal,
-            row.principal,
-            row.distortion,
-            if row.goal == "ERR" {
-                &row.hint
-            } else {
-                &row.gain
-            }
-        )
-        .unwrap();
-    }
+fn print_metric_row(row: &MetricRow) {
+    println!(
+        "{},{},{},solve={},h2={},goal={},rms={},fx_err={}%,fy_err={}%,cx_err={}px,cy_err={}px,cond={},d5_edge={},hint={}",
+        row.scenario,
+        row.true_distortion_count,
+        row.views,
+        row.solve_ok,
+        row.h2_ok,
+        row.goal_met,
+        optional_value(row.rms_px),
+        optional_value(row.fx_error_pct),
+        optional_value(row.fy_error_pct),
+        optional_value(row.cx_error_px),
+        optional_value(row.cy_error_px),
+        optional_value(row.cond_h),
+        optional_value(row.d5_edge_std_px),
+        row.hint
+    );
 }
