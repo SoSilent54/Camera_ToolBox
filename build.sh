@@ -30,7 +30,7 @@ usage() {
     cat <<'EOF'
 Usage: ./build.sh [profile]
 
-Builds the `camera-toolbox` and `pangbot-calib-tool`
+Builds the `camera-toolbox` and `pongbot-calib-tool`
 executables for the current native host with Local, CV610, SSH-managed
 providers, pinned FFmpeg 8.1.2, and pinned OpenCV 5 calibration enabled
 together. It also places the deployable Linux AArch64 I²C helper beside the
@@ -106,10 +106,17 @@ frontend_args=(
     --manifest-path "${project_root}/Cargo.toml"
     --package camera-toolbox
     --bin camera-toolbox
-    --package pangbot-calib-tool
-    --bin pangbot-calib-tool
     --no-default-features
     --features "$features"
+    --locked
+    "${profile_args[@]}"
+)
+
+imgui_args=(
+    build
+    --manifest-path "${project_root}/Cargo.toml"
+    --package pongbot-calib-tool
+    --bin pongbot-calib-tool
     --locked
     "${profile_args[@]}"
 )
@@ -130,6 +137,9 @@ fi
 
 
 cargo "${frontend_args[@]}"
+if (( calibration_enabled )); then
+    cargo "${imgui_args[@]}"
+fi
 
 # EEPROM helpers run on the remote X5, not the GUI host.  A host-native helper
 # is unusable on x86_64/Windows/macOS and previously left local release builds

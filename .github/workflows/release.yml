@@ -159,7 +159,7 @@ jobs:
           archive="camera-toolbox-${RELEASE_VERSION}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
-          install -m 755 "target/release/pangbot-calib-tool" "dist/${bundle}/"
+          install -m 755 "target/release/pongbot-calib-tool" "dist/${bundle}/"
           install -m 755 "helper-sidecar/camera-i2c-helper" \
             "dist/${bundle}/camera-i2c-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
@@ -171,7 +171,7 @@ jobs:
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
             "dist/${bundle}/camera-toolbox" --help >/dev/null
           env -u DYLD_FALLBACK_LIBRARY_PATH -u DYLD_LIBRARY_PATH \
-            "dist/${bundle}/pangbot-calib-tool" --help >/dev/null
+            "dist/${bundle}/pongbot-calib-tool" --version >/dev/null
           tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
 
       - name: Package Windows release
@@ -184,7 +184,7 @@ jobs:
           $archive = "camera-toolbox-$env:RELEASE_VERSION-$env:ENVIRONMENT"
           New-Item -ItemType Directory -Force -Path "dist/$bundle" | Out-Null
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
-          Copy-Item "target/release/pangbot-calib-tool.exe" "dist/$bundle/"
+          Copy-Item "target/release/pongbot-calib-tool.exe" "dist/$bundle/"
           Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper-linux-aarch64"
           Copy-Item README.md "dist/$bundle/"
           New-Item -ItemType Directory -Force -Path "dist/$bundle/config" | Out-Null
@@ -194,8 +194,8 @@ jobs:
           $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
           & "dist/$bundle/camera-toolbox.exe" --help | Out-Null
           if ($LASTEXITCODE -ne 0) { throw "packaged camera-toolbox smoke failed" }
-          & "dist/$bundle/pangbot-calib-tool.exe" --help | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "packaged pangbot-calib-tool smoke failed" }
+          & "dist/$bundle/pongbot-calib-tool.exe" --version | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "packaged pongbot-calib-tool smoke failed" }
           Compress-Archive -Path "dist/$bundle" -DestinationPath "dist/$archive.zip" -Force
 
       - name: Upload release archive
@@ -291,7 +291,7 @@ jobs:
           archive="camera-toolbox-${RELEASE_VERSION}-${ENVIRONMENT}"
           mkdir -p "dist/${bundle}"
           install -m 755 "target/release/camera-toolbox" "dist/${bundle}/"
-          install -m 755 "target/release/pangbot-calib-tool" "dist/${bundle}/"
+          install -m 755 "target/release/pongbot-calib-tool" "dist/${bundle}/"
           install -m 755 "helper-sidecar/camera-i2c-helper" \
             "dist/${bundle}/camera-i2c-helper-linux-aarch64"
           install -m 644 README.md "dist/${bundle}/"
@@ -301,7 +301,7 @@ jobs:
           "$PYTHON" scripts/opencv5_dependency.py bundle --destination "dist/${bundle}"
           "$PYTHON" scripts/ffmpeg_dependency.py bundle --destination "dist/${bundle}"
           env -u LD_LIBRARY_PATH "dist/${bundle}/camera-toolbox" --help >/dev/null
-          env -u LD_LIBRARY_PATH "dist/${bundle}/pangbot-calib-tool" --help >/dev/null
+          env -u LD_LIBRARY_PATH "dist/${bundle}/pongbot-calib-tool" --version >/dev/null
           tar -C dist -czf "dist/${archive}.tar.gz" "${bundle}"
       - name: Upload release archive
         uses: actions/upload-artifact@v4

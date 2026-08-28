@@ -637,6 +637,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "chlorine"
+version = "1.0.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c00d31b1d19317b4777ec879192d3745bd97d05262b4b19cb1dda284b9d22f19"
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1219,7 +1225,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_glow",
- "glow",
+ "glow 0.17.0",
  "glutin",
  "glutin-winit",
  "image",
@@ -1324,7 +1330,7 @@ checksum = "52274b9bfb8d8e252cd0f00c9f6214f360d75a0962baa77a2d62ddb002fe99d4"
 dependencies = [
  "bytemuck",
  "egui",
- "glow",
+ "glow 0.17.0",
  "log",
  "memoffset",
  "profiling",
@@ -1845,6 +1851,18 @@ dependencies = [
 
 [[package]]
 name = "glow"
+version = "0.14.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d51fa363f025f5c111e03f13eda21162faeacb6911fe8caa0c0349f9cf0c4483"
+dependencies = [
+ "js-sys",
+ "slotmap",
+ "wasm-bindgen",
+ "web-sys",
+]
+
+[[package]]
+name = "glow"
 version = "0.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "29038e1c483364cc6bb3cf78feee1816002e127c331a1eec55a4d202b9e1adb5"
@@ -2218,6 +2236,52 @@ dependencies = [
  "tiff",
  "zune-core",
  "zune-jpeg",
+]
+
+[[package]]
+name = "imgui"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8addafa5cecf0515812226e806913814e02ce38d10215778082af5174abe5669"
+dependencies = [
+ "bitflags 1.3.2",
+ "cfg-if",
+ "imgui-sys",
+ "mint",
+ "parking_lot",
+]
+
+[[package]]
+name = "imgui-glow-renderer"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1b191cbb795a471d9f9d46cc5f5d43a0afbf9ee43b3ef7b68083e98e4dbe30ad"
+dependencies = [
+ "glow 0.14.2",
+ "imgui",
+ "memoffset",
+]
+
+[[package]]
+name = "imgui-sys"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ead193f9f4b60398e8b8f4ab1483e2321640d87aeebdaa3e5f44c55633ccd804"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "chlorine",
+ "mint",
+]
+
+[[package]]
+name = "imgui-winit-support"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ff7fcccfa9efab56c94274c0fec9939bb14149342b49e6a425883a5b7dda6a3f"
+dependencies = [
+ "imgui",
+ "winit",
 ]
 
 [[package]]
@@ -2596,6 +2660,12 @@ dependencies = [
  "adler2",
  "simd-adler32",
 ]
+
+[[package]]
+name = "mint"
+version = "0.5.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e53debba6bda7a793e5f99b8dacf19e626084f525f7829104ba9898f367d85ff"
 
 [[package]]
 name = "mio"
@@ -3256,29 +3326,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pangbot-calib-tool"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "camera-toolbox-adapters",
- "camera-toolbox-app",
- "camera-toolbox-cli",
- "camera-toolbox-core",
- "camera-toolbox-logging",
- "clap",
- "eframe",
- "egui_extras",
- "egui_plot",
- "image",
- "png 0.17.16",
- "rfd",
- "secrecy",
- "serde_json",
- "serde_yaml",
- "tracing",
-]
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3564,6 +3611,32 @@ dependencies = [
  "cpubits",
  "cpufeatures 0.3.0",
  "universal-hash",
+]
+
+[[package]]
+name = "pongbot-calib-tool"
+version = "0.1.0"
+dependencies = [
+ "camera-toolbox-adapters",
+ "camera-toolbox-app",
+ "camera-toolbox-core",
+ "glow 0.14.2",
+ "glutin",
+ "glutin-winit",
+ "image",
+ "imgui",
+ "imgui-glow-renderer",
+ "imgui-winit-support",
+ "raw-window-handle",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.10.9",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+ "winit",
 ]
 
 [[package]]

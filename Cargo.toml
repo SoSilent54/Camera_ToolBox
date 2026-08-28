@@ -6,7 +6,7 @@ members = [
     "crates/logging",
     "crates/frontends/cli",
     "crates/frontends/camera-toolbox",
-    "crates/frontends/pangbot-calib-tool",
+    "crates/frontends/imgui",
     "crates/i2c-helper",
     "crates/ffmpeg-bridge",
 ]
@@ -56,6 +56,14 @@ secrecy = "0.10"
 tokio = { version = "1.52", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+imgui = "0.12"
+imgui-winit-support = "0.13"
+imgui-glow-renderer = "0.13"
+glow = "0.14"
+winit = { version = "0.30", default-features = false, features = ["x11", "rwh_06"] }
+glutin = { version = "0.32", default-features = false, features = ["egl", "glx", "x11", "wgl"] }
+glutin-winit = { version = "0.5", default-features = false, features = ["egl", "glx", "x11", "wgl"] }
+raw-window-handle = "0.6"
 
 camera-toolbox-core = { path = "crates/core" }
 camera-toolbox-app = { path = "crates/app" }

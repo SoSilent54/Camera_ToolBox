@@ -1,0 +1,39 @@
+[package]
+name = "pongbot-calib-tool"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "pongbot-calib-tool"
+path = "src/main.rs"
+
+[dependencies]
+camera-toolbox-app = { workspace = true }
+camera-toolbox-core = { workspace = true }
+camera-toolbox-adapters = { workspace = true, features = ["platform-local", "platform-ssh", "calibration-opencv"] }
+image.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+imgui.workspace = true
+imgui-winit-support.workspace = true
+imgui-glow-renderer.workspace = true
+glow.workspace = true
+winit.workspace = true
+glutin.workspace = true
+glutin-winit.workspace = true
+raw-window-handle.workspace = true
+
+[lints.rust]
+unsafe_code = "allow"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"
