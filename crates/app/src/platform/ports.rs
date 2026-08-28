@@ -805,6 +805,43 @@ impl LatestDecodedFrameSlot {
             }
         }
     }
+
+    /// 非消费式等待新帧：阻塞直到槽内出现与 `current` 不同的帧（首帧恒为新），返回克隆。
+    ///
+    /// 不 take、不抢走帧，仅等帧变化——面向与显示路径共享同一 slot 的只读消费者
+    /// （如采集/检测 worker）：每次处理完成后立即接续最新帧，而不干扰 `latest()`/
+    /// `poll_frame` 的读取；`timeout` 内无新帧返回 `None`，供调用方回报状态。
+    #[must_use]
+    pub fn wait_until_changed_timeout(
+        &self,
+        current: Option<&Arc<DecodedVideoFrame>>,
+        timeout: Duration,
+    ) -> Option<Arc<DecodedVideoFrame>> {
+        let mut guard = self
+            .frame
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        loop {
+            if let Some(frame) = guard.as_ref() {
+                let is_new = current.map_or(true, |old| !Arc::ptr_eq(old, frame));
+                if is_new {
+                    return Some(frame.clone());
+                }
+            }
+            let (next, timed_out) = self
+                .changed
+                .wait_timeout(guard, timeout)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            guard = next;
+            if timed_out.timed_out()
+                && guard.as_ref().is_none_or(|frame| {
+                    current.is_some_and(|old| Arc::ptr_eq(old, frame))
+                })
+            {
+                return None;
+            }
+        }
+    }
 }
 
 type StreamInterrupt = Arc<dyn Fn() + Send + Sync>;
@@ -1005,5 +1042,55 @@ mod stream_cancellation_tests {
         }));
 
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn wait_until_changed_timeout_is_non_consuming_and_tracks_new_frame() {
+        use std::time::Duration;
+
+        use super::{DecodedVideoFrame, LatestDecodedFrameSlot, SourcePts, StreamFrameIdentity};
+        use crate::platform::StreamSessionId;
+
+        let frame = |sequence: u64| DecodedVideoFrame {
+            width: 2,
+            height: 2,
+            rgba: vec![0, 0, 0, 255].into(),
+            identity: StreamFrameIdentity {
+                stream_id: StreamSessionId::new("wait-test").unwrap(),
+                channel: 0,
+                frame_sequence: sequence,
+                source_pts: SourcePts::Unavailable {
+                    reason: "test".to_owned(),
+                },
+                host_monotonic_time_ns: 0,
+                device_timestamp_ns: None,
+            },
+        };
+
+        let slot = LatestDecodedFrameSlot::default();
+
+        // 首帧即新：无 current 时立即返回。
+        slot.publish(frame(1));
+        let first = slot
+            .wait_until_changed_timeout(None, Duration::from_millis(50))
+            .expect("first frame is new");
+        assert_eq!(first.identity.frame_sequence, 1);
+
+        // 非消费语义：帧仍留在槽内，`latest()` 仍可读到。
+        assert!(slot.latest().is_some(), "non-consuming: frame must remain");
+
+        // 同帧超时：无新帧时返回 None。
+        assert!(
+            slot.wait_until_changed_timeout(Some(&first), Duration::from_millis(50))
+                .is_none(),
+            "same frame must time out"
+        );
+
+        // 新帧唤醒：返回最新帧。
+        slot.publish(frame(2));
+        let second = slot
+            .wait_until_changed_timeout(Some(&first), Duration::from_millis(50))
+            .expect("new frame wakes waiter");
+        assert_eq!(second.identity.frame_sequence, 2);
     }
 }

@@ -80,7 +80,7 @@ pub const HOLD_TARGET: u8 = 3;
 const GUIDED_HOLD_JITTER_XYZ_LIMIT: f64 = 0.025;
 const GUIDED_HOLD_JITTER_Z_LIMIT: f64 = 0.04;
 const GUIDED_HOLD_JITTER_RPY_DEGREES: f64 = 2.0;
-/// 采集 worker 检测节拍。
+/// 无新帧时的状态回报检查周期（事件驱动下检测本身不受此节拍限制）。
 const DETECT_INTERVAL: Duration = Duration::from_millis(150);
 /// 成功拍摄后角点 overlay 保留显示时长（确认触发瞬间采到的棋盘姿态）。
 const CAPTURE_CORNERS_DISPLAY: Duration = Duration::from_millis(1500);
@@ -572,6 +572,8 @@ fn capture_loop(
     let mut quality = DatasetQuality::default();
     let mut last_capture: Option<(std::time::Instant, Vec<[f32; 2]>)> = None;
     tracing::info!("稳定检测采集 worker 已启动（hold {HOLD_TARGET} 帧，连续空间 + 距离/倾斜质量）");
+    // 上一轮已处理帧：非消费等待下一新帧，避免重复处理同一帧。
+    let mut last_processed: Option<Arc<DecodedVideoFrame>> = None;
     loop {
         if quality.is_complete() {
             set_guide_quality(
@@ -585,24 +587,31 @@ fn capture_loop(
             );
             break;
         }
-        let Some(frame) = slot.latest() else {
-            let error = rtsp_error
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .clone();
-            if let Some(error) = error {
-                set_guide_quality(
-                    &guide,
-                    &format!("RTSP 无帧：{error}（检查板端 DEMO233）"),
-                    0,
-                    &quality,
-                );
-            } else {
-                set_guide_quality(&guide, "等待 RTSP 帧…", 0, &quality);
+        // 事件驱动取最新帧：非消费等待「新帧到达或首帧」，不抢走显示路径的帧。
+        // 每次检测完成后立即接续当时的 RTSP 最新帧，不引入固定节拍 sleep。
+        let frame = match slot.wait_until_changed_timeout(last_processed.as_ref(), DETECT_INTERVAL)
+        {
+            Some(frame) => frame,
+            None => {
+                // 超时且无新帧：回报 RTSP 状态后继续等待。
+                let error = rtsp_error
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if let Some(error) = error {
+                    set_guide_quality(
+                        &guide,
+                        &format!("RTSP 无帧：{error}（检查板端 DEMO233）"),
+                        0,
+                        &quality,
+                    );
+                } else {
+                    set_guide_quality(&guide, "等待 RTSP 帧…", 0, &quality);
+                }
+                continue;
             }
-            std::thread::sleep(DETECT_INTERVAL);
-            continue;
         };
+        last_processed = Some(frame.clone());
 
         let image_size = CalibrationImageSize {
             width: frame.width,
@@ -621,34 +630,15 @@ fn capture_loop(
                 )
             });
 
-        let (detect_rgba, detect_w, detect_h, detect_scale) =
-            resize_for_detect(&frame.rgba, frame.width, frame.height);
-        let png = match encode_png(&detect_rgba, detect_w, detect_h) {
+        let png = match encode_png(&frame.rgba, frame.width, frame.height) {
             Ok(png) => png,
             Err(error) => {
                 set_guide_quality(&guide, &format!("PNG 编码失败：{error}"), 0, &quality);
-                std::thread::sleep(DETECT_INTERVAL);
                 continue;
             }
         };
-        let expected = CalibrationImageSize {
-            width: detect_w,
-            height: detect_h,
-        };
-        match backend.detect_png(&png, expected, 256 * 1024 * 1024, board, &cancellation) {
+        match backend.detect_png(&png, image_size, 256 * 1024 * 1024, board, &cancellation) {
             Ok(ChessboardDetectionOutcome::Found(detection)) => {
-                let corners: Vec<CalibrationPoint> = detection
-                    .corners
-                    .iter()
-                    .map(|corner| CalibrationPoint {
-                        x: corner.x / detect_scale,
-                        y: corner.y / detect_scale,
-                    })
-                    .collect();
-                let detection = ChessboardDetection {
-                    image_size,
-                    corners,
-                };
                 let view = match backend.estimate_pose(&detection, &initial, board, &cancellation) {
                     Ok(view) => view,
                     Err(error) => {
@@ -660,7 +650,6 @@ fn capture_loop(
                             0,
                             &quality,
                         );
-                        std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
@@ -671,7 +660,6 @@ fn capture_loop(
                         hold_frames = 0;
                         last_measurement = None;
                         set_guide_quality(&guide, &format!("棋盘位姿无效：{error}"), 0, &quality);
-                        std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
@@ -686,7 +674,6 @@ fn capture_loop(
 
                 if !capturing.load(Ordering::Acquire) {
                     set_guide_quality(&guide, "等待自动采集启动…", 0, &quality);
-                    std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
 
@@ -702,7 +689,6 @@ fn capture_loop(
                         0,
                         &quality,
                     );
-                    std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
                 hold_frames = hold_frames.saturating_add(1).min(HOLD_TARGET);
@@ -714,14 +700,12 @@ fn capture_loop(
                         hold_frames,
                         &quality,
                     );
-                    std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
                 if !density.has_usable_corners(&detection) {
                     hold_frames = 0;
                     last_measurement = None;
                     set_guide_quality(&guide, "检测角点无效，未抓取原图", 0, &quality);
-                    std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
                 if density.is_near_duplicate(&measurement) {
@@ -733,7 +717,6 @@ fn capture_loop(
                         0,
                         &quality,
                     );
-                    std::thread::sleep(DETECT_INTERVAL);
                     continue;
                 }
 
@@ -749,7 +732,6 @@ fn capture_loop(
                             0,
                             &quality,
                         );
-                        std::thread::sleep(DETECT_INTERVAL);
                         continue;
                     }
                 };
@@ -765,7 +747,6 @@ fn capture_loop(
                                 0,
                                 &quality,
                             );
-                            std::thread::sleep(DETECT_INTERVAL);
                             continue;
                         }
                     };
@@ -792,7 +773,6 @@ fn capture_loop(
                                 0,
                                 &quality,
                             );
-                            std::thread::sleep(DETECT_INTERVAL);
                             continue;
                         }
                         Err(error) => {
@@ -804,7 +784,6 @@ fn capture_loop(
                                 0,
                                 &quality,
                             );
-                            std::thread::sleep(DETECT_INTERVAL);
                             continue;
                         }
                     }
@@ -886,7 +865,6 @@ fn capture_loop(
                 set_guide_quality(&guide, &format!("检测失败：{error}"), 0, &quality);
             }
         }
-        std::thread::sleep(DETECT_INTERVAL);
     }
 }
 
@@ -1855,27 +1833,6 @@ fn default_initial_intrinsics(width: u32, height: u32) -> InitialIntrinsics {
         ],
         distortion_coefficients: vec![0.0, 0.0, 0.0, 0.0, 0.0],
     }
-}
-
-/// 降采样到最大边 960px（超过才缩）；返回 (缩后 RGBA, w, h, 缩放比例)。
-fn resize_for_detect(rgba: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32, f32) {
-    const MAX_DETECT_WIDTH: u32 = 960;
-    if width <= MAX_DETECT_WIDTH {
-        return (rgba.to_vec(), width, height, 1.0);
-    }
-    let scale = MAX_DETECT_WIDTH as f32 / width as f32;
-    let new_height = ((height as f32) * scale).round().max(1.0) as u32;
-    let img = match image::RgbaImage::from_raw(width, height, rgba.to_vec()) {
-        Some(img) => img,
-        None => return (rgba.to_vec(), width, height, 1.0),
-    };
-    let resized = image::imageops::resize(
-        &img,
-        MAX_DETECT_WIDTH,
-        new_height,
-        image::imageops::FilterType::Triangle,
-    );
-    (resized.into_raw(), MAX_DETECT_WIDTH, new_height, scale)
 }
 
 /// RGBA 帧编码为 PNG 字节。
