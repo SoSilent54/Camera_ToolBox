@@ -7,6 +7,7 @@ pub mod controller;
 pub mod eeprom;
 pub mod eeprom_history;
 pub mod guide_overlay;
+pub mod observability;
 pub mod preview;
 pub mod solve;
 pub mod theme;

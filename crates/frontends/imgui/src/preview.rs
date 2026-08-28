@@ -5,9 +5,11 @@
 //! dataset：真实 X5 采集在 hold 通过后按 RTSP SEI `timestamp_ns` 从 TCP 9073
 //! 精确回查同源 NV12/YUV 原图；合成模式仅用于本机 UI 测试，保留 RGBA→luma fallback。
 //! 无板验证：`PONGBOT_SYNTH=1` 用非棋盘合成帧（保证检测失败，验证采集链路）。
-//! 采集质量：每张已采帧的全部内角点写入连续密度场；中心、四边和四角的
-//! 密度证据与既有距离/倾斜 4 档共同决定完成。近重复位姿在 TCP 抓原图前拒绝。
+//! 采集质量：每张已采帧的 raw 亚像素角点实时进入求解，并以数值可观测性
+//! 作为 dataset goal；连续密度、距离和倾斜只保留为辅助提示，不再决定完成。
 use crate::guide_overlay::{DensityHeatmap, OverlayData, OverlayStatus};
+use crate::observability::ObservabilityReport;
+use crate::solve::{DetectedDatasetFrame, solve_channel_from_detections};
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_adapters::media::FfmpegRtspTransport;
 use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
@@ -107,6 +109,8 @@ pub struct DatasetQuality {
     pub depth: [bool; DEPTH_COVERAGE_BINS],
     /// 保留的板法线倾角（正视→大倾）四档覆盖。
     pub skew: [bool; SKEW_COVERAGE_BINS],
+    /// 最新标定解附近的数值可观测性；唯一决定 dataset goal 是否达标。
+    pub observability: Option<ObservabilityReport>,
 }
 
 impl Default for DatasetQuality {
@@ -119,20 +123,20 @@ impl Default for DatasetQuality {
             corner_density: [0.0; SPATIAL_CORNER_COUNT],
             depth: [false; DEPTH_COVERAGE_BINS],
             skew: [false; SKEW_COVERAGE_BINS],
+            observability: None,
         }
     }
 }
 
 impl DatasetQuality {
-    /// 连续空间、保留距离/倾斜和 solver 的不可见技术前置条件全部满足时结束采集。
+    /// dataset goal 只由最新数值可观测性决定；空间/bin 仅作为辅助提示保留。
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        self.center_complete()
-            && self.edges_complete()
-            && self.corners_complete()
-            && self.depth.iter().all(|covered| *covered)
-            && self.skew.iter().all(|covered| *covered)
-            && self.solver_input_ready()
+        self.solver_input_ready()
+            && self
+                .observability
+                .as_ref()
+                .is_some_and(ObservabilityReport::goal_met)
     }
 
     #[must_use]
@@ -277,6 +281,8 @@ pub struct RtspStream {
     captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
     /// 已采姿态（rvec，与 captured 一一对应）。
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
+    /// 已 raw 重检并完成亚像素细化的检测缓存；实时求解复用，避免重复检测历史帧。
+    detections: Arc<Mutex<Vec<DetectedDatasetFrame>>>,
     /// 检测绘制数据（worker 写，GuideOverlay draw 读）。
     overlay: Arc<Mutex<Option<OverlayData>>>,
     /// 引导状态（worker 写，主线程读）。
@@ -428,6 +434,7 @@ impl RtspStream {
             capturing: Arc::new(AtomicBool::new(false)),
             captured: Arc::new(Mutex::new(Vec::new())),
             poses: Arc::new(Mutex::new(Vec::new())),
+            detections: Arc::new(Mutex::new(Vec::new())),
             overlay: overlay_slot,
             guide_state: Arc::new(Mutex::new(GuideState::default())),
             detect_started: false,
@@ -481,6 +488,7 @@ impl RtspStream {
         let slot = Arc::clone(&self.slot);
         let captured = Arc::clone(&self.captured);
         let poses = Arc::clone(&self.poses);
+        let detections = Arc::clone(&self.detections);
         let overlay = Arc::clone(&self.overlay);
         let guide = Arc::clone(&self.guide_state);
         let rtsp_error = Arc::clone(&self.rtsp_error);
@@ -491,6 +499,7 @@ impl RtspStream {
                 slot,
                 captured,
                 poses,
+                detections,
                 guide,
                 overlay,
                 rtsp_error,
@@ -514,7 +523,7 @@ impl RtspStream {
         )
     }
 
-    /// 是否满足连续空间与保留距离/倾斜覆盖质量。
+    /// 是否满足数值可观测性 dataset goal。
     pub fn complete(&self) -> bool {
         let state = self
             .guide_state
@@ -523,9 +532,17 @@ impl RtspStream {
         state.quality.is_complete()
     }
 
-    /// 取已采 dataset 帧（solve 用；真实设备为 TCP NV12/Y plane）。
+    /// 取已采 dataset 帧（兼容旧求解入口；真实设备为 TCP NV12/Y plane）。
     pub fn captured_frames(&self) -> Vec<Arc<CapturedDatasetFrame>> {
         self.captured
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// 取已 raw 重检的 dataset 角点缓存；最终求解与实时可观测性共用。
+    pub fn captured_detections(&self) -> Vec<DetectedDatasetFrame> {
+        self.detections
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -558,6 +575,7 @@ fn capture_loop(
     slot: Arc<LatestDecodedFrameSlot>,
     captured: Arc<Mutex<Vec<Arc<CapturedDatasetFrame>>>>,
     poses: Arc<Mutex<Vec<[f64; 3]>>>,
+    detections: Arc<Mutex<Vec<DetectedDatasetFrame>>>,
     guide: Arc<Mutex<GuideState>>,
     overlay: Arc<Mutex<Option<OverlayData>>>,
     rtsp_error: Arc<Mutex<Option<String>>>,
@@ -570,6 +588,7 @@ fn capture_loop(
     let mut last_measurement: Option<GuidedPoseMeasurement> = None;
     let mut density = CornerDensityMap::new();
     let mut quality = DatasetQuality::default();
+    let mut last_observability: Option<ObservabilityReport> = None;
     let mut last_capture: Option<(std::time::Instant, Vec<[f32; 2]>)> = None;
     tracing::info!("稳定检测采集 worker 已启动（hold {HOLD_TARGET} 帧，连续空间 + 距离/倾斜质量）");
     // 上一轮已处理帧：非消费等待下一新帧，避免重复处理同一帧。
@@ -757,10 +776,14 @@ fn capture_loop(
                     let mut poses = poses
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let mut detections = detections
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     match commit_solver_validated_capture(
                         &mut density,
                         &mut captured,
                         &mut poses,
+                        &mut detections,
                         validated,
                     ) {
                         Ok(Some(detection)) => detection,
@@ -789,6 +812,31 @@ fn capture_loop(
                     }
                 };
                 quality = density.snapshot();
+                let cached_detections = detections
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
+                if cached_detections.len() >= crate::solve::MIN_USABLE_CALIBRATION_VIEWS {
+                    let channel = cached_detections
+                        .last()
+                        .map(|frame| frame.frame.channel)
+                        .unwrap_or(0);
+                    match solve_channel_from_detections(
+                        channel,
+                        &cached_detections,
+                        board,
+                        last_observability.as_ref(),
+                    ) {
+                        Ok(result) => {
+                            quality.observability = result.observability.clone();
+                            last_observability = result.observability;
+                        }
+                        Err(error) => {
+                            quality.observability = last_observability.clone();
+                            tracing::warn!(channel, "实时标定/可观测性求解失败：{error}");
+                        }
+                    }
+                }
 
                 // 记录 solver-valid raw 角点；按 RTSP 显示尺寸映射，确认入库证据而非引导帧。
                 let corners_px =
@@ -814,7 +862,7 @@ fn capture_loop(
                     set_guide_quality(
                         &guide,
                         &format!(
-                            "采集质量完成（已采 {} 张），采集结束",
+                            "数值可观测性达标（已采 {} 张），采集结束",
                             quality.accepted_frames
                         ),
                         0,
@@ -1229,6 +1277,7 @@ impl CornerDensityMap {
             corner_density,
             depth: self.depth,
             skew: self.skew,
+            observability: None,
         }
     }
 }
@@ -1268,7 +1317,11 @@ fn depth_coverage_bin(scale: f64) -> usize {
 
 /// 保留的板法线与光轴夹角分档（正视 / 浅倾 / 中倾 / 大倾）。
 fn skew_coverage_bin(normal_angle_degrees: f64) -> usize {
-    coverage_bin(normal_angle_degrees, &SKEW_COVERAGE_BOUNDS, SKEW_COVERAGE_BINS)
+    coverage_bin(
+        normal_angle_degrees,
+        &SKEW_COVERAGE_BOUNDS,
+        SKEW_COVERAGE_BINS,
+    )
 }
 
 /// 落在分档边界下的索引；非有限值归入最后一档（与旧 if-else 语义一致）。
@@ -1284,18 +1337,12 @@ fn coverage_bin(value: f64, bounds: &[f64], bins: usize) -> usize {
 }
 
 fn quality_missing_hint(quality: &DatasetQuality) -> &'static str {
-    if !quality.center_complete() {
-        "请让棋盘内角点覆盖画面中心"
-    } else if !quality.edges_complete() {
-        "请将棋盘移到四个画面边缘"
-    } else if !quality.corners_complete() {
-        "请将棋盘移动到四个画面角落"
-    } else if quality.depth.iter().any(|covered| !covered) {
-        "请调整棋盘距离，覆盖远中近尺度"
-    } else if quality.skew.iter().any(|covered| !covered) {
-        "请改变棋盘倾斜角度"
+    if !quality.solver_input_ready() {
+        "请继续采集，达到实时求解的最小有效视图数"
+    } else if let Some(report) = &quality.observability {
+        report.missing_hint()
     } else {
-        "请继续移动或转动棋盘，采集不同有效视角"
+        "等待最新 dataset 标定与可观测性分析"
     }
 }
 
@@ -1690,6 +1737,7 @@ fn commit_solver_validated_capture(
     density: &mut CornerDensityMap,
     captured: &mut Vec<Arc<CapturedDatasetFrame>>,
     poses: &mut Vec<[f64; 3]>,
+    detections: &mut Vec<DetectedDatasetFrame>,
     validated: SolverValidatedCapture,
 ) -> Result<Option<ChessboardDetection>, String> {
     let SolverValidatedCapture {
@@ -1704,8 +1752,13 @@ fn commit_solver_validated_capture(
     if !density.add_frame(&detection, &measurement) {
         return Err("raw 重检结果没有可提交的有限角点或位姿".to_owned());
     }
-    captured.push(Arc::new(dataset_frame));
+    let frame = Arc::new(dataset_frame);
+    captured.push(Arc::clone(&frame));
     poses.push(rotation_vector);
+    detections.push(DetectedDatasetFrame {
+        frame,
+        detection: detection.clone(),
+    });
     Ok(Some(detection))
 }
 
@@ -1980,6 +2033,21 @@ mod tests {
             corner_density: [REGION_SUPPORT_AREA_TARGET; SPATIAL_CORNER_COUNT],
             depth: [true; DEPTH_COVERAGE_BINS],
             skew: [true; SKEW_COVERAGE_BINS],
+            observability: Some(ObservabilityReport {
+                view_count: crate::solve::MIN_USABLE_CALIBRATION_VIEWS,
+                point_count: 100,
+                rms_error: 0.1,
+                max_view_rmse: 0.1,
+                condition_number: 1.0e3,
+                log_det_information: 0.0,
+                last_info_gain: Some(1.0),
+                focal_relative_stddev: [0.001, 0.001],
+                principal_point_stddev_px: [0.5, 0.5],
+                distortion_edge_stddev_px: vec![0.5; 12],
+                distortion_names: vec![
+                    "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
+                ],
+            }),
         }
     }
 
@@ -2185,14 +2253,22 @@ mod tests {
         let mut density = CornerDensityMap::new();
         let mut captured: Vec<Arc<CapturedDatasetFrame>> = Vec::new();
         let mut poses = Vec::new();
+        let mut detections = Vec::new();
         let admission =
             validate_dataset_frame(&backend, frame, board(), &cancellation).and_then(|validated| {
-                commit_solver_validated_capture(&mut density, &mut captured, &mut poses, validated)
+                commit_solver_validated_capture(
+                    &mut density,
+                    &mut captured,
+                    &mut poses,
+                    &mut detections,
+                    validated,
+                )
             });
 
         assert!(admission.is_err());
         assert!(captured.is_empty());
         assert!(poses.is_empty());
+        assert!(detections.is_empty());
         assert_eq!(density.snapshot().accepted_frames, 0);
         assert!(!density.is_near_duplicate(&measurement([0.0; 3], [0.0, 0.0, 600.0])));
     }
@@ -2232,7 +2308,7 @@ mod tests {
     }
 
     #[test]
-    fn spatial_completion_uses_the_displayed_bilinear_density_field_support_area() {
+    fn spatial_support_uses_the_displayed_bilinear_density_field_but_is_not_the_goal() {
         let mut density = displayed_full_density();
         density.accepted_frames = crate::solve::MIN_USABLE_CALIBRATION_VIEWS;
         density.depth = [true; DEPTH_COVERAGE_BINS];
@@ -2249,7 +2325,7 @@ mod tests {
         assert!(quality.center_complete());
         assert!(quality.edges_complete());
         assert!(quality.corners_complete());
-        assert!(quality.is_complete());
+        assert!(!quality.is_complete());
     }
 
     #[test]
@@ -2274,7 +2350,7 @@ mod tests {
     }
 
     #[test]
-    fn completion_requires_the_invisible_solver_view_minimum_and_each_quality_dimension() {
+    fn completion_requires_solver_minimum_and_observability_goal_only() {
         let quality = complete_quality();
         assert_eq!(
             quality.accepted_frames,
@@ -2288,25 +2364,25 @@ mod tests {
         assert!(!insufficient_views.solver_input_ready());
         assert!(!insufficient_views.is_complete());
 
-        let mut missing_center = quality.clone();
-        missing_center.center_density = f32::from_bits(REGION_SUPPORT_AREA_TARGET.to_bits() - 1);
-        assert!(!missing_center.is_complete());
+        let mut missing_spatial_bins = quality.clone();
+        missing_spatial_bins.center_density = 0.0;
+        missing_spatial_bins.edge_density[2] = 0.0;
+        missing_spatial_bins.corner_density[3] = 0.0;
+        missing_spatial_bins.depth[1] = false;
+        missing_spatial_bins.skew[3] = false;
+        assert!(missing_spatial_bins.is_complete());
 
-        let mut missing_edge = quality.clone();
-        missing_edge.edge_density[2] = f32::from_bits(REGION_SUPPORT_AREA_TARGET.to_bits() - 1);
-        assert!(!missing_edge.is_complete());
+        let mut missing_observability = quality.clone();
+        missing_observability.observability = None;
+        assert!(!missing_observability.is_complete());
 
-        let mut missing_corner = quality.clone();
-        missing_corner.corner_density[3] = f32::from_bits(REGION_SUPPORT_AREA_TARGET.to_bits() - 1);
-        assert!(!missing_corner.is_complete());
-
-        let mut missing_depth = quality.clone();
-        missing_depth.depth[1] = false;
-        assert!(!missing_depth.is_complete());
-
-        let mut missing_skew = quality;
-        missing_skew.skew[3] = false;
-        assert!(!missing_skew.is_complete());
+        let mut poor_focal = quality;
+        poor_focal
+            .observability
+            .as_mut()
+            .expect("test report")
+            .focal_relative_stddev[0] = crate::observability::FOCAL_REL_STDDEV_TARGET * 2.0;
+        assert!(!poor_focal.is_complete());
     }
 
     #[test]

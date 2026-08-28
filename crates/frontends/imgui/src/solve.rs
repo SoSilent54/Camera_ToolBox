@@ -3,21 +3,31 @@
 //! 复用 adapters 的 `OpenCvCalibrationBackend`（feature calibration-opencv）；
 //! 后台线程执行，结果回主线程展示；完整 `CalibrationSolution` 供 EEPROM 写入。
 
+use crate::observability::{ObservabilityReport, analyze_solution};
 use crate::preview::CapturedDatasetFrame;
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
 use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
-    ChessboardDetectionOutcome, InitialIntrinsics,
+    ChessboardDetection, ChessboardDetectionOutcome, InitialIntrinsics,
 };
 use std::sync::Arc;
 
 /// OpenCV 标定器的技术最小可用视图数；采集端仅作不可见的求解前置条件。
-pub(crate) const MIN_USABLE_CALIBRATION_VIEWS: usize = 5;
+pub const MIN_USABLE_CALIBRATION_VIEWS: usize = 5;
 const CALIBRATION_DETECT_MAX_PNG_BYTES: usize = 256 * 1024 * 1024;
 
 /// 单张图像重投影 RMSE 的剔除阈值（像素）；超过该值的视图从标定集剔除后重新求解。
 pub(crate) const MAX_VIEW_REPROJECTION_RMSE: f64 = 0.15;
+
+/// 已完成 raw dataset 亚像素棋盘检测的缓存视图。
+///
+/// 实时可观测性流程复用采集瞬间的 raw 重检角点，避免每采一张后重复检测全部 dataset。
+#[derive(Clone, Debug)]
+pub struct DetectedDatasetFrame {
+    pub frame: Arc<CapturedDatasetFrame>,
+    pub detection: ChessboardDetection,
+}
 
 /// 单路求解结果（主线程展示 + EEPROM 写入用）。
 pub struct SolveResult {
@@ -28,18 +38,34 @@ pub struct SolveResult {
     pub rejected_view_indices: Vec<usize>,
     /// 求解轮数：首轮为 1，每剔除一批超阈值视图后 +1。
     pub iterations: u32,
+    /// 最新 dataset 在最终解附近的数值可观测性；视图不足或矩阵退化时为空。
+    pub observability: Option<ObservabilityReport>,
 }
 
 impl SolveResult {
     /// 结果摘要文本（中文，就地展示）。
     pub fn summary(&self) -> String {
-        let mut text =
-            solution_detail_summary(&format!("CH{}", self.channel), &self.solution);
+        let mut text = solution_detail_summary(&format!("CH{}", self.channel), &self.solution);
         if !self.rejected_view_indices.is_empty() {
             text.push_str(&format!(
                 "\n已自动剔除 {} 张单图重投影误差超阈值（>{MAX_VIEW_REPROJECTION_RMSE}px）的图像并重新标定（共 {} 轮）",
                 self.rejected_view_indices.len(),
                 self.iterations
+            ));
+        }
+        if let Some(report) = &self.observability {
+            text.push_str(&format!(
+                "\n可观测性：{} · cond {:.2e} · fx/fy σ {:.3}%/{:.3}% · cx/cy σ {:.2}/{:.2}px",
+                if report.goal_met() {
+                    "达标"
+                } else {
+                    report.missing_hint()
+                },
+                report.condition_number,
+                report.focal_relative_stddev[0] * 100.0,
+                report.focal_relative_stddev[1] * 100.0,
+                report.principal_point_stddev_px[0],
+                report.principal_point_stddev_px[1]
             ));
         }
         text
@@ -191,62 +217,34 @@ pub(crate) fn detect_dataset_frame(
         .map_err(|error| format!("dataset 棋盘检测失败：{error}"))
 }
 
-/// 求解后自动剔除单图重投影 RMSE 超过 [`MAX_VIEW_REPROJECTION_RMSE`] 的视图并
-/// 重新标定，直到没有超阈值视图或剩余视图跌破 [`MIN_USABLE_CALIBRATION_VIEWS`]。
-pub fn solve_channel(
+/// 对已缓存的 raw/subpixel 检测结果求解，避免实时质量评估重复检测历史帧。
+pub(crate) fn solve_channel_from_detections(
     channel: u16,
-    frames: &[Arc<CapturedDatasetFrame>],
+    detections: &[DetectedDatasetFrame],
     board: BoardSpec,
+    previous_observability: Option<&ObservabilityReport>,
 ) -> Result<SolveResult, String> {
-    if frames.is_empty() {
+    if detections.is_empty() {
         return Err(format!("CH{channel} dataset 为空"));
+    }
+    if detections.len() < MIN_USABLE_CALIBRATION_VIEWS {
+        return Err(format!(
+            "有效检测帧不足（{}/{MIN_USABLE_CALIBRATION_VIEWS}）：请继续采集",
+            detections.len()
+        ));
     }
     let backend = OpenCvCalibrationBackend;
     let cancellation = CalibrationCancellation::default();
-    // 检测成功帧保留入参索引，供剔除后回写被移除的具体帧号。
-    let mut detected: Vec<(usize, Vec<CalibrationPoint>)> = Vec::new();
-    let mut image_size = None;
-    for (frame_index, frame) in frames.iter().enumerate() {
-        match detect_dataset_frame(&backend, frame, board, &cancellation) {
-            Ok(ChessboardDetectionOutcome::Found(detection)) => {
-                image_size = Some(detection.image_size);
-                detected.push((frame_index, detection.corners));
-            }
-            Ok(ChessboardDetectionOutcome::NotFound { .. }) => {}
-            Err(error) => {
-                // 单帧检测失败不中断整体求解（如运动模糊帧）。
-                tracing::warn!("CH{channel} 检测失败（跳过）：{error}");
-            }
-        }
-    }
-    if detected.len() < MIN_USABLE_CALIBRATION_VIEWS {
-        return Err(format!(
-            "有效检测帧不足（{}/{MIN_USABLE_CALIBRATION_VIEWS}）：请重采或调整棋盘参数",
-            detected.len()
-        ));
-    }
-    let image_size = image_size.expect("有检测必有尺寸");
-    let initial = InitialIntrinsics {
-        camera_matrix: [
-            900.0,
-            0.0,
-            f64::from(image_size.width) / 2.0,
-            0.0,
-            900.0,
-            f64::from(image_size.height) / 2.0,
-            0.0,
-            0.0,
-            1.0,
-        ],
-        distortion_coefficients: vec![0.0, 0.0, 0.0, 0.0, 0.0],
-    };
-
+    let image_size = detections_image_size(detections)?;
+    let initial = initial_intrinsics_for_size(image_size);
+    let mut detected: Vec<(usize, DetectedDatasetFrame)> =
+        detections.iter().cloned().enumerate().collect();
     let mut rejected: Vec<usize> = Vec::new();
     let mut iterations = 1_u32;
     let solution = loop {
         let image_points: Vec<Vec<CalibrationPoint>> = detected
             .iter()
-            .map(|(_, corners)| corners.clone())
+            .map(|(_, frame)| frame.detection.corners.clone())
             .collect();
         let request = CalibrationRequest {
             image_size,
@@ -271,8 +269,6 @@ pub fn solve_channel(
         }
         let remaining = detected.len().saturating_sub(over.len());
         if remaining < MIN_USABLE_CALIBRATION_VIEWS {
-            // 剔除会跌破最小视图数：保留本次结果（不记录剔除，避免误导），
-            // 标定集整体质量仍可从 summary 的单图误差看出。
             tracing::warn!(
                 "CH{channel} 有 {} 张视图重投影误差超阈值（>{MAX_VIEW_REPROJECTION_RMSE}px），但剔除后不足 {MIN_USABLE_CALIBRATION_VIEWS} 张，保留全部",
                 over.len()
@@ -281,11 +277,11 @@ pub fn solve_channel(
         }
         iterations += 1;
         let mut kept = Vec::with_capacity(remaining);
-        for (index, (frame_index, corners)) in detected.into_iter().enumerate() {
+        for (index, (frame_index, frame)) in detected.into_iter().enumerate() {
             if over.contains(&index) {
                 rejected.push(frame_index);
             } else {
-                kept.push((frame_index, corners));
+                kept.push((frame_index, frame));
             }
         }
         detected = kept;
@@ -293,12 +289,90 @@ pub fn solve_channel(
 
     rejected.sort_unstable();
     rejected.dedup();
+    let kept_detections = detected
+        .iter()
+        .map(|(_, detection)| detection.clone())
+        .collect::<Vec<_>>();
+    let observability =
+        analyze_solution(&solution, board, &kept_detections, previous_observability)
+            .map_err(|error| {
+                tracing::warn!("CH{channel} 可观测性分析失败：{error}");
+                error
+            })
+            .ok();
     Ok(SolveResult {
         channel,
         solution,
         rejected_view_indices: rejected,
         iterations,
+        observability,
     })
+}
+
+/// 求解后自动剔除单图重投影 RMSE 超过 [`MAX_VIEW_REPROJECTION_RMSE`] 的视图并
+/// 重新标定，直到没有超阈值视图或剩余视图跌破 [`MIN_USABLE_CALIBRATION_VIEWS`]。
+pub fn solve_channel(
+    channel: u16,
+    frames: &[Arc<CapturedDatasetFrame>],
+    board: BoardSpec,
+) -> Result<SolveResult, String> {
+    let backend = OpenCvCalibrationBackend;
+    let cancellation = CalibrationCancellation::default();
+    let mut detected = Vec::new();
+    for frame in frames {
+        match detect_dataset_frame(&backend, frame, board, &cancellation) {
+            Ok(ChessboardDetectionOutcome::Found(detection)) => {
+                detected.push(DetectedDatasetFrame {
+                    frame: Arc::clone(frame),
+                    detection,
+                });
+            }
+            Ok(ChessboardDetectionOutcome::NotFound { .. }) => {}
+            Err(error) => {
+                // 单帧检测失败不中断整体求解（如运动模糊帧）。
+                tracing::warn!("CH{channel} 检测失败（跳过）：{error}");
+            }
+        }
+    }
+    solve_channel_from_detections(channel, &detected, board, None)
+}
+
+fn initial_intrinsics_for_size(image_size: CalibrationImageSize) -> InitialIntrinsics {
+    InitialIntrinsics {
+        camera_matrix: [
+            900.0,
+            0.0,
+            f64::from(image_size.width) / 2.0,
+            0.0,
+            900.0,
+            f64::from(image_size.height) / 2.0,
+            0.0,
+            0.0,
+            1.0,
+        ],
+        distortion_coefficients: vec![0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+}
+
+fn detections_image_size(
+    detections: &[DetectedDatasetFrame],
+) -> Result<CalibrationImageSize, String> {
+    let Some(first) = detections.first() else {
+        return Err("dataset 为空".to_owned());
+    };
+    let image_size = first.detection.image_size;
+    for (index, detection) in detections.iter().enumerate() {
+        if detection.detection.image_size != image_size {
+            return Err(format!(
+                "第 {index} 张检测尺寸不一致：expected {}x{}, got {}x{}",
+                image_size.width,
+                image_size.height,
+                detection.detection.image_size.width,
+                detection.detection.image_size.height
+            ));
+        }
+    }
+    Ok(image_size)
 }
 
 /// 找出重投影 RMSE 严格超过阈值的视图索引（升序；阈值本身不剔除）。
@@ -384,9 +458,14 @@ mod tests {
             solution: solution(),
             rejected_view_indices: vec![3, 7, 11],
             iterations: 2,
+            observability: None,
         };
         let text = result.summary();
-        assert!(text.contains("已自动剔除 3 张单图重投影误差超阈值（>0.15px）的图像并重新标定（共 2 轮）"));
+        assert!(
+            text.contains(
+                "已自动剔除 3 张单图重投影误差超阈值（>0.15px）的图像并重新标定（共 2 轮）"
+            )
+        );
         assert!(text.contains("CH0 求解完成"));
     }
 }

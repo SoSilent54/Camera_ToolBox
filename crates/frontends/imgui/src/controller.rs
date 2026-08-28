@@ -1,10 +1,11 @@
 //! UI 无关的标定流程控制器。
 
 use crate::guide_overlay::OverlayData;
+use crate::observability::ObservabilityReport;
 use crate::preview::{self, StreamState};
 use crate::solve::{
-    distortion_summary, format_intrinsics_geometry, solution_detail_summary, solve_channel,
-    view_rmse_values,
+    distortion_summary, format_intrinsics_geometry, solution_detail_summary,
+    solve_channel_from_detections, view_rmse_values,
 };
 use crate::{eeprom, eeprom_history, theme, x5};
 use camera_toolbox_app::platform::{
@@ -140,6 +141,8 @@ pub struct SolveState {
     pub ch3_limit: f64,
     pub ch0_detail: Option<crate::solve::SolutionDetail>,
     pub ch3_detail: Option<crate::solve::SolutionDetail>,
+    pub ch0_observability: Option<ObservabilityReport>,
+    pub ch3_observability: Option<ObservabilityReport>,
 }
 
 impl Default for SolveState {
@@ -156,6 +159,8 @@ impl Default for SolveState {
             ch3_limit: 0.5,
             ch0_detail: None,
             ch3_detail: None,
+            ch0_observability: None,
+            ch3_observability: None,
         }
     }
 }
@@ -313,6 +318,7 @@ enum WorkerResult {
     Solve {
         text: String,
         solutions: Option<(CalibrationSolution, CalibrationSolution)>,
+        observability: Option<(Option<ObservabilityReport>, Option<ObservabilityReport>)>,
     },
     Inspect {
         text: String,
@@ -470,17 +476,23 @@ impl CalibController {
             self.set_connect_status("棋盘参数非法", theme::ERR);
             return;
         }
-        let ch0_frames = streams.ch0.captured_frames();
-        let ch3_frames = streams.ch3.captured_frames();
+        let ch0_detections = streams.ch0.captured_detections();
+        let ch3_detections = streams.ch3.captured_detections();
         self.state.solve.ch0_result = "CH0：求解中…".to_owned();
         self.state.solve.ch3_result = "CH3：求解中…".to_owned();
         self.state.solve.ch0_rmse.clear();
         self.state.solve.ch3_rmse.clear();
+        self.state.solve.ch0_observability = None;
+        self.state.solve.ch3_observability = None;
         self.spawn_task(move || {
-            let r0 = solve_channel(0, &ch0_frames, board);
-            let r1 = solve_channel(3, &ch3_frames, board);
+            let r0 = solve_channel_from_detections(0, &ch0_detections, board, None);
+            let r1 = solve_channel_from_detections(3, &ch3_detections, board, None);
             let solutions = match (&r0, &r1) {
                 (Ok(a), Ok(b)) => Some((a.solution.clone(), b.solution.clone())),
+                _ => None,
+            };
+            let observability = match (&r0, &r1) {
+                (Ok(a), Ok(b)) => Some((a.observability.clone(), b.observability.clone())),
                 _ => None,
             };
             let text = match (r0, r1) {
@@ -489,7 +501,11 @@ impl CalibController {
                 (Err(e), Ok(b)) => format!("CH0 失败：{e}\n{}", b.summary()),
                 (Err(e0), Err(e1)) => format!("CH0 失败：{e0}\nCH3 失败：{e1}"),
             };
-            WorkerResult::Solve { text, solutions }
+            WorkerResult::Solve {
+                text,
+                solutions,
+                observability,
+            }
         });
     }
 
@@ -550,8 +566,7 @@ impl CalibController {
         };
         if !self.state.eeprom.write_armed {
             self.state.eeprom.write_armed = true;
-            let mut note =
-                format!("请确认 SNID：CH0={serial0}，CH3={serial3}；再次点击开始写入。");
+            let mut note = format!("请确认 SNID：CH0={serial0}，CH3={serial3}；再次点击开始写入。");
             if let Some((inspect0, inspect3)) = &self.eeprom_inspect {
                 let dev0 = serial_state_label(&inspect0.state.serial);
                 let dev3 = serial_state_label(&inspect3.state.serial);
@@ -798,7 +813,11 @@ impl CalibController {
                     self.start_previews(&host);
                 }
             }
-            WorkerResult::Solve { text, solutions } => {
+            WorkerResult::Solve {
+                text,
+                solutions,
+                observability,
+            } => {
                 tracing::info!("求解结果：{text}");
                 match solutions {
                     Some((solution0, solution3)) => {
@@ -822,6 +841,10 @@ impl CalibController {
                         self.state.solve.ch3_rmse = view_rmse_values(&solution3);
                         self.state.solve.ch0_limit = solution0.rms_error.max(0.5);
                         self.state.solve.ch3_limit = solution3.rms_error.max(0.5);
+                        if let Some((obs0, obs3)) = observability {
+                            self.state.solve.ch0_observability = obs0;
+                            self.state.solve.ch3_observability = obs3;
+                        }
                         self.solutions = Some((solution0, solution3));
                         self.complete_step(
                             StepId::Solve,
@@ -838,6 +861,8 @@ impl CalibController {
                         self.state.solve.ch3_detail = None;
                         self.state.solve.ch0_rmse.clear();
                         self.state.solve.ch3_rmse.clear();
+                        self.state.solve.ch0_observability = None;
+                        self.state.solve.ch3_observability = None;
                     }
                 }
             }

@@ -18,7 +18,9 @@ use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
 use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
-use pongbot_calib_tool::preview::{DEPTH_COVERAGE_LABELS, SKEW_COVERAGE_LABELS};
+use pongbot_calib_tool::observability::MAX_GOAL_RMS_PX;
+use pongbot_calib_tool::preview::DEPTH_COVERAGE_LABELS;
+use pongbot_calib_tool::solve::MIN_USABLE_CALIBRATION_VIEWS;
 use pongbot_calib_tool::theme;
 use raw_window_handle::HasWindowHandle;
 use std::num::NonZeroU32;
@@ -602,8 +604,8 @@ impl App {
             .size([card_width, card_height])
             .build(|| self.show_preview_card(ui, 1, 3, "CH3 · RTSP 557 · i2c-6"));
         ui.separator();
-        // 仅显示连续空间状态与用户要求保留的距离/倾斜条。
-        let panel_height = 178.0;
+        // 显示数值可观测性 goal；空间/bin 仅保留为辅助提示。
+        let panel_height = 300.0;
         ui.child_window("##ch0_coverage")
             .size([card_width, panel_height])
             .build(|| self.show_coverage_panel(ui, 0));
@@ -613,7 +615,7 @@ impl App {
             .build(|| self.show_coverage_panel(ui, 1));
     }
 
-    /// 紧凑质量面板：中心、四边、四角，以及保留的距离和倾斜覆盖。
+    /// 数值可观测性面板：goal 由最新标定解的参数不确定性决定，空间/bin 只作辅助提示。
     fn show_coverage_panel(&mut self, ui: &imgui::Ui, index: usize) {
         let quality = if index == 0 {
             self.controller.state.preview.ch0.quality.clone()
@@ -621,19 +623,89 @@ impl App {
             self.controller.state.preview.ch3.quality.clone()
         };
         let label = if index == 0 { "CH0" } else { "CH3" };
-        ui.text_colored(theme::ACCENT, format!("{label} 采集质量"));
+        ui.text_colored(theme::ACCENT, format!("{label} 数值可观测性"));
         let width = (ui.content_region_avail()[0] - 110.0).max(120.0);
-        self.quality_progress_bar(
-            ui,
-            "中心",
-            quality.center_progress(),
-            width,
-            if quality.center_complete() {
-                "已覆盖"
+        ui.text_disabled(format!(
+            "已入库 {} 张 raw/subpixel 检测帧",
+            quality.accepted_frames
+        ));
+        if let Some(report) = &quality.observability {
+            self.quality_progress_bar(
+                ui,
+                "RMS",
+                report.residual_progress(),
+                width,
+                &format!("{:.3}px / {:.3}px", report.rms_error, MAX_GOAL_RMS_PX),
+            );
+            self.quality_progress_bar(
+                ui,
+                "焦距",
+                report.focal_progress(),
+                width,
+                &format!(
+                    "fx/fy σ {:.3}%/{:.3}%",
+                    report.focal_relative_stddev[0] * 100.0,
+                    report.focal_relative_stddev[1] * 100.0
+                ),
+            );
+            self.quality_progress_bar(
+                ui,
+                "主点",
+                report.principal_progress(),
+                width,
+                &format!(
+                    "cx/cy σ {:.2}/{:.2}px",
+                    report.principal_point_stddev_px[0], report.principal_point_stddev_px[1]
+                ),
+            );
+            self.quality_progress_bar(
+                ui,
+                "畸变",
+                report.distortion_progress(),
+                width,
+                &format!(
+                    "edge σ max {:.2}px",
+                    report
+                        .distortion_edge_stddev_px
+                        .iter()
+                        .copied()
+                        .filter(|value| value.is_finite())
+                        .fold(0.0_f64, f64::max)
+                ),
+            );
+            self.quality_progress_bar(
+                ui,
+                "条件数",
+                report.conditioning_progress(),
+                width,
+                &format!("cond {:.2e}", report.condition_number),
+            );
+            let gain = report
+                .last_info_gain
+                .map_or("--".to_owned(), |value| format!("{value:+.2}"));
+            ui.text_disabled(format!(
+                "视图 {} · 角点 {} · 单图最大 {:.3}px · Δlogdet {}",
+                report.view_count, report.point_count, report.max_view_rmse, gain
+            ));
+            if report.goal_met() {
+                ui.text_colored(theme::OK, "数值可观测性达标，即将自动进入求解");
             } else {
-                "待覆盖"
-            },
-        );
+                ui.text_colored(theme::WARN, report.missing_hint());
+            }
+        } else if quality.solver_input_ready() {
+            ui.text_colored(theme::WARN, "等待最新 dataset 标定与可观测性分析…");
+        } else {
+            ui.text_colored(
+                theme::WARN,
+                format!(
+                    "继续采集：{}/{} 张后开始实时标定",
+                    quality.accepted_frames, MIN_USABLE_CALIBRATION_VIEWS
+                ),
+            );
+        }
+
+        ui.separator();
+        ui.text_disabled("辅助覆盖（不再作为完成条件）");
         let edge = quality.edge_progresses();
         let edge_segments = [
             ("左", edge[0]),
@@ -673,24 +745,11 @@ impl App {
             "距离",
             &depth_segments,
             width,
-            &format!("{}/4", quality.depth.iter().filter(|covered| **covered).count()),
+            &format!(
+                "{}/4",
+                quality.depth.iter().filter(|covered| **covered).count()
+            ),
         );
-        let skew_segments = [
-            (SKEW_COVERAGE_LABELS[0], quality.skew[0] as u8 as f32),
-            (SKEW_COVERAGE_LABELS[1], quality.skew[1] as u8 as f32),
-            (SKEW_COVERAGE_LABELS[2], quality.skew[2] as u8 as f32),
-            (SKEW_COVERAGE_LABELS[3], quality.skew[3] as u8 as f32),
-        ];
-        self.coverage_bar(
-            ui,
-            "倾斜",
-            &skew_segments,
-            width,
-            &format!("{}/4", quality.skew.iter().filter(|covered| **covered).count()),
-        );
-        if quality.is_complete() {
-            ui.text_colored(theme::OK, "质量完成，即将自动进入求解");
-        }
     }
 
     /// 连续质量的单条紧凑进度条。
@@ -969,6 +1028,54 @@ impl App {
                 .map(|(k, v)| (k.as_str(), v.clone()))
                 .collect::<Vec<_>>(),
         );
+        let observability = if index == 0 {
+            self.controller.state.solve.ch0_observability.clone()
+        } else {
+            self.controller.state.solve.ch3_observability.clone()
+        };
+        if let Some(report) = observability {
+            ui.separator();
+            ui.text_colored(
+                if report.goal_met() {
+                    theme::OK
+                } else {
+                    theme::WARN
+                },
+                if report.goal_met() {
+                    "可观测性达标"
+                } else {
+                    report.missing_hint()
+                },
+            );
+            self.key_value_list(
+                ui,
+                &[
+                    ("cond(H)", format!("{:.2e}", report.condition_number)),
+                    (
+                        "fx/fy σ",
+                        format!(
+                            "{:.3}% / {:.3}%",
+                            report.focal_relative_stddev[0] * 100.0,
+                            report.focal_relative_stddev[1] * 100.0
+                        ),
+                    ),
+                    (
+                        "cx/cy σ",
+                        format!(
+                            "{:.2} / {:.2}px",
+                            report.principal_point_stddev_px[0],
+                            report.principal_point_stddev_px[1]
+                        ),
+                    ),
+                    (
+                        "Δlogdet",
+                        report
+                            .last_info_gain
+                            .map_or("--".to_owned(), |value| format!("{value:+.2}")),
+                    ),
+                ],
+            );
+        }
         if !rmse.is_empty() {
             ui.separator();
             ui.text(&format!(
