@@ -4,7 +4,7 @@ use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
     ChessboardDetection, InitialIntrinsics,
 };
-use pongbot_calib_tool::observability::{ObservabilityReport, analyze_solution};
+use pongbot_calib_tool::observability::{analyze_solution, ObservabilityReport};
 use pongbot_calib_tool::preview::{CapturedDatasetFrame, CapturedDatasetSource};
 use pongbot_calib_tool::solve::DetectedDatasetFrame;
 use std::path::{Path, PathBuf};
@@ -538,7 +538,7 @@ fn expected_progression() -> Vec<SyntheticPose> {
         (
             "depth:near-roll",
             [0.22, 0.28, -0.28],
-            [-155.0, -110.0, 720.0],
+            [-155.0, -95.0, 720.0],
         ),
         (
             "depth:near-mixed",
@@ -586,65 +586,49 @@ fn expected_progression() -> Vec<SyntheticPose> {
     })
     .collect::<Vec<_>>();
 
-    let centers = [
-        [-260.0, -150.0, 640.0],
-        [260.0, -150.0, 640.0],
-        [-260.0, 150.0, 640.0],
-        [260.0, 150.0, 640.0],
-        [-330.0, 0.0, 820.0],
-        [330.0, 0.0, 820.0],
-        [0.0, -210.0, 820.0],
-        [0.0, 210.0, 820.0],
-    ];
-    let rotations = [
-        [0.42, 0.24, 0.0],
-        [-0.42, -0.24, 0.0],
-        [0.24, -0.42, 0.35],
-        [-0.24, 0.42, -0.35],
-        [0.50, -0.15, 0.55],
-        [-0.50, 0.15, -0.55],
-    ];
-    for center_camera in centers {
-        for rvec in rotations {
-            poses.push(SyntheticPose {
-                label: "edge-corner:extra",
-                rvec,
-                center_camera,
-            });
-        }
-    }
+    append_visible_edge_corner_poses(&mut poses, "edge-corner:visible-extra");
     poses
 }
 fn aggressive_edge_coverage() -> Vec<SyntheticPose> {
     let mut poses = progressive_full_coverage();
-    let centers = [
-        [-260.0, -150.0, 640.0],
-        [260.0, -150.0, 640.0],
-        [-260.0, 150.0, 640.0],
-        [260.0, 150.0, 640.0],
-        [-330.0, 0.0, 820.0],
-        [330.0, 0.0, 820.0],
-        [0.0, -210.0, 820.0],
-        [0.0, 210.0, 820.0],
-    ];
-    let rotations = [
-        [0.42, 0.24, 0.0],
-        [-0.42, -0.24, 0.0],
-        [0.24, -0.42, 0.35],
-        [-0.24, 0.42, -0.35],
-        [0.50, -0.15, 0.55],
-        [-0.50, 0.15, -0.55],
-    ];
-    for center_camera in centers {
-        for rvec in rotations {
-            poses.push(SyntheticPose {
-                label: "edge-extra",
-                rvec,
-                center_camera,
-            });
-        }
-    }
+    append_visible_edge_corner_poses(&mut poses, "edge-visible-extra");
     poses
+}
+
+fn append_visible_edge_corner_poses(poses: &mut Vec<SyntheticPose>, label: &'static str) {
+    let pose_specs = [
+        ([-0.26, 0.40, 0.32], [-480.0, -259.3, 900.0]),
+        ([-0.26, 0.40, 0.32], [-522.7, -282.4, 980.0]),
+        ([-0.26, 0.40, 0.32], [-586.7, -316.9, 1100.0]),
+        ([-0.26, -0.40, -0.32], [480.0, -259.3, 900.0]),
+        ([-0.26, -0.40, -0.32], [522.7, -282.4, 980.0]),
+        ([-0.26, -0.40, -0.32], [586.7, -316.9, 1100.0]),
+        ([0.36, -0.24, 0.28], [-586.7, 316.9, 1100.0]),
+        ([0.36, 0.24, -0.28], [-522.7, 282.4, 980.0]),
+        ([0.26, 0.40, -0.32], [-522.7, 282.4, 980.0]),
+        ([0.36, 0.24, -0.28], [586.7, 316.9, 1100.0]),
+        ([0.26, -0.40, 0.32], [480.0, 259.3, 900.0]),
+        ([0.36, -0.24, 0.28], [522.7, 282.4, 980.0]),
+        ([0.18, 0.42, 0.62], [-471.5, 0.0, 820.0]),
+        ([0.42, 0.12, 0.62], [-632.5, 0.0, 1100.0]),
+        ([-0.26, 0.40, 0.32], [-563.5, 0.0, 980.0]),
+        ([-0.26, -0.40, -0.32], [563.5, 0.0, 980.0]),
+        ([-0.18, -0.42, -0.62], [517.5, 0.0, 900.0]),
+        ([-0.26, -0.40, -0.32], [632.5, 0.0, 1100.0]),
+        ([-0.36, 0.24, 0.28], [0.0, -307.3, 980.0]),
+        ([-0.36, -0.24, -0.28], [0.0, -307.3, 980.0]),
+        ([-0.26, 0.40, 0.32], [0.0, -344.9, 1100.0]),
+        ([0.26, 0.40, -0.32], [0.0, 344.9, 1100.0]),
+        ([0.26, -0.40, 0.32], [0.0, 344.9, 1100.0]),
+        ([0.26, -0.40, 0.32], [0.0, 307.3, 980.0]),
+    ];
+    for (rvec, center_camera) in pose_specs {
+        poses.push(SyntheticPose {
+            label,
+            rvec,
+            center_camera,
+        });
+    }
 }
 
 fn translation_for_board_center(
@@ -688,9 +672,16 @@ fn project_board(
             let x = camera[0] / camera[2];
             let y = camera[1] / camera[2];
             let [xd, yd] = distort(x, y, distortion);
+            let u = intrinsics[0] * xd + intrinsics[2];
+            let v = intrinsics[4] * yd + intrinsics[5];
+            assert!(
+                (0.0..=f64::from(IMAGE_SIZE.width)).contains(&u)
+                    && (0.0..=f64::from(IMAGE_SIZE.height)).contains(&v),
+                "synthetic full-board view projects outside image: ({u:.1}, {v:.1})"
+            );
             points.push(CalibrationPoint {
-                x: (intrinsics[0] * xd + intrinsics[2]) as f32,
-                y: (intrinsics[4] * yd + intrinsics[5]) as f32,
+                x: u as f32,
+                y: v as f32,
             });
         }
     }
