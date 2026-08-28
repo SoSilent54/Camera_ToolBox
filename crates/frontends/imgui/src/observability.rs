@@ -17,6 +17,10 @@ pub const FOCAL_REL_STDDEV_TARGET: f64 = 0.005;
 pub const PRINCIPAL_STDDEV_TARGET_PX: f64 = 2.0;
 /// 畸变标准差折算到归一化半径 1.0 处的像素影响目标。
 pub const DISTORTION_EDGE_STDDEV_TARGET_PX: f64 = 2.0;
+/// 采集完成只要求前 5 个主畸变项（k1,k2,p1,p2,k3）达标。
+/// k4..k6 与薄棱镜 s1..s4 仍参与求解和明细展示，但不阻塞自动采集完成；
+/// 这些高阶项在普通棋盘视场内与低阶径向/切向项高度相关，强制全 D12 达标会导致过度采集。
+pub const PRIMARY_DISTORTION_OBSERVABILITY_COUNT: usize = 5;
 /// 归一化信息矩阵条件数上限；超过该值说明某些参数方向仍接近退化。
 pub const MAX_NORMALIZED_CONDITION: f64 = 1.0e8;
 /// 最终重投影 RMS 目标；保持亚像素并给少量实际噪声余量。
@@ -56,9 +60,9 @@ impl ObservabilityReport {
 
     #[must_use]
     pub fn distortion_ok(&self) -> bool {
-        !self.distortion_edge_stddev_px.is_empty()
-            && self
-                .distortion_edge_stddev_px
+        let primary = self.primary_distortion_edge_stddev_px();
+        !primary.is_empty()
+            && primary
                 .iter()
                 .all(|value| finite_le(*value, DISTORTION_EDGE_STDDEV_TARGET_PX))
     }
@@ -118,7 +122,7 @@ impl ObservabilityReport {
     #[must_use]
     pub fn distortion_progress(&self) -> f32 {
         inverse_threshold_progress(
-            max_finite(&self.distortion_edge_stddev_px),
+            max_finite(self.primary_distortion_edge_stddev_px()),
             DISTORTION_EDGE_STDDEV_TARGET_PX,
         )
     }
@@ -131,6 +135,15 @@ impl ObservabilityReport {
     #[must_use]
     pub fn residual_progress(&self) -> f32 {
         inverse_threshold_progress(self.rms_error, MAX_GOAL_RMS_PX)
+    }
+
+    #[must_use]
+    pub fn primary_distortion_edge_stddev_px(&self) -> &[f64] {
+        let count = self
+            .distortion_edge_stddev_px
+            .len()
+            .min(PRIMARY_DISTORTION_OBSERVABILITY_COUNT);
+        &self.distortion_edge_stddev_px[..count]
     }
 }
 
@@ -677,5 +690,15 @@ mod tests {
             report.missing_hint(),
             "焦距仍未充分约束：请增加远近变化和横竖倾斜"
         );
+        report.focal_relative_stddev[0] = 0.001;
+        report.distortion_edge_stddev_px[PRIMARY_DISTORTION_OBSERVABILITY_COUNT] =
+            DISTORTION_EDGE_STDDEV_TARGET_PX * 100.0;
+        assert!(
+            report.goal_met(),
+            "高阶 D12 诊断项不应阻塞 D5 主畸变采集 goal"
+        );
+        report.distortion_edge_stddev_px[PRIMARY_DISTORTION_OBSERVABILITY_COUNT - 1] =
+            DISTORTION_EDGE_STDDEV_TARGET_PX * 2.0;
+        assert!(!report.goal_met());
     }
 }

@@ -20,7 +20,7 @@ use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, St
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
 use pongbot_calib_tool::observability::{
     DISTORTION_EDGE_STDDEV_TARGET_PX, FOCAL_REL_STDDEV_TARGET, MAX_GOAL_RMS_PX,
-    MAX_NORMALIZED_CONDITION, PRINCIPAL_STDDEV_TARGET_PX,
+    MAX_NORMALIZED_CONDITION, PRIMARY_DISTORTION_OBSERVABILITY_COUNT, PRINCIPAL_STDDEV_TARGET_PX,
 };
 use pongbot_calib_tool::solve::MIN_USABLE_CALIBRATION_VIEWS;
 use pongbot_calib_tool::theme;
@@ -666,9 +666,9 @@ impl App {
                 report.distortion_progress(),
                 width,
                 &format!(
-                    "edge σ max {:.2}px",
+                    "D5 edge σ max {:.2}px",
                     report
-                        .distortion_edge_stddev_px
+                        .primary_distortion_edge_stddev_px()
                         .iter()
                         .copied()
                         .filter(|value| value.is_finite())
@@ -806,15 +806,19 @@ impl App {
                     PRINCIPAL_STDDEV_TARGET_PX,
                 ),
             ));
-            for (name, value) in report
+            for (distortion_index, (name, value)) in report
                 .distortion_names
                 .iter()
                 .zip(report.distortion_edge_stddev_px.iter())
+                .enumerate()
             {
-                rows.push((
-                    format!("{name} edge std"),
-                    metric_value(*value, "px", DISTORTION_EDGE_STDDEV_TARGET_PX),
-                ));
+                let metric = metric_value(*value, "px", DISTORTION_EDGE_STDDEV_TARGET_PX);
+                let status = if distortion_index < PRIMARY_DISTORTION_OBSERVABILITY_COUNT {
+                    metric
+                } else {
+                    metric.as_diagnostic()
+                };
+                rows.push((format!("{name} edge std"), status));
             }
             ui.columns(3, "##observability_param_columns", false);
             ui.text_disabled("参数");
@@ -1440,6 +1444,16 @@ fn metric_value(value: f64, unit: &str, threshold: f64) -> MetricDisplay {
         value: value_text,
         label: if ok { "OK" } else { "继续采集" },
         ok,
+    }
+}
+
+impl MetricDisplay {
+    fn as_diagnostic(self) -> Self {
+        Self {
+            value: self.value,
+            label: if self.ok { "OK" } else { "诊断" },
+            ok: true,
+        }
     }
 }
 
