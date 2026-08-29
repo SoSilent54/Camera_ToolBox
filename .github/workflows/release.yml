@@ -12,7 +12,7 @@ name: Release
         type: string
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
