@@ -338,6 +338,7 @@ pub struct CalibController {
     pending_task: Option<Arc<Mutex<Option<WorkerResult>>>>,
     streams: Option<StreamState>,
     preview_finished: bool,
+    solve_after_preview_ready: bool,
     solutions: Option<(CalibrationSolution, CalibrationSolution)>,
     eeprom_inspect: Option<(EepromInspectResult, EepromInspectResult)>,
     pending_connection_probe: Option<Arc<Mutex<Option<String>>>>,
@@ -354,6 +355,7 @@ impl CalibController {
             pending_task: None,
             streams: None,
             preview_finished: false,
+            solve_after_preview_ready: false,
             solutions: None,
             eeprom_inspect: None,
             pending_connection_probe: None,
@@ -385,8 +387,9 @@ impl CalibController {
         {
             self.preview_finished = true;
             self.complete_step(StepId::Preview, "双路采集完成 · 可进入求解");
-            self.solve();
+            self.solve_after_preview_ready = true;
         }
+        self.try_auto_solve_after_preview();
     }
 
     pub fn poll_frame(&mut self, channel: u16) -> Option<Arc<DecodedVideoFrame>> {
@@ -466,16 +469,17 @@ impl CalibController {
         });
     }
 
-    pub fn solve(&mut self) {
+    pub fn solve(&mut self) -> bool {
         let Some(streams) = self.streams.as_ref() else {
             self.set_connect_status("请先完成双路采集", theme::WARN);
-            return;
+            return false;
         };
         let board = self.current_board();
         if board.validate().is_err() {
             self.set_connect_status("棋盘参数非法", theme::ERR);
-            return;
+            return false;
         }
+        self.solve_after_preview_ready = false;
         let ch0_detections = streams.ch0.captured_detections();
         let ch3_detections = streams.ch3.captured_detections();
         self.state.solve.ch0_result = "CH0：求解中…".to_owned();
@@ -507,6 +511,34 @@ impl CalibController {
                 observability,
             }
         });
+        true
+    }
+    pub fn skip_preview(&mut self) {
+        self.preview_finished = true;
+        self.complete_step(StepId::Preview, "Step 2 已跳过 · 直接进入 Step 3");
+        self.solve_after_preview_ready = true;
+        self.try_auto_solve_after_preview();
+    }
+
+    fn try_auto_solve_after_preview(&mut self) {
+        if !self.solve_after_preview_ready || self.is_busy() {
+            return;
+        }
+        if !self
+            .streams
+            .as_ref()
+            .is_some_and(StreamState::both_complete)
+        {
+            return;
+        }
+        if self.current_board().validate().is_err() {
+            return;
+        }
+        let started = self.solve();
+        debug_assert!(
+            started,
+            "auto solve preconditions should guarantee solve start"
+        );
     }
 
     pub fn inspect_eeprom(&mut self) {
@@ -695,6 +727,7 @@ impl CalibController {
         self.solutions = None;
         self.eeprom_inspect = None;
         self.preview_finished = false;
+        self.solve_after_preview_ready = false;
         self.state.completed = [false; 3];
         self.state.active = StepId::Connect;
         self.state.summaries = [
@@ -1237,5 +1270,27 @@ fn overlay_color(quality: &preview::DatasetQuality, hold: u8) -> [f32; 4] {
         theme::WARN
     } else {
         theme::ACCENT
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skip_preview_advances_to_solve() {
+        let mut controller = CalibController::new();
+        assert_eq!(controller.state.active, StepId::Connect);
+        assert!(!controller.state.completed[StepId::Preview.index()]);
+
+        controller.skip_preview();
+
+        assert!(controller.state.completed[StepId::Preview.index()]);
+        assert_eq!(controller.state.active, StepId::Solve);
+        assert!(controller.solve_after_preview_ready);
+        assert_eq!(
+            controller.state.summaries[StepId::Preview.index()],
+            "Step 2 已跳过 · 直接进入 Step 3"
+        );
     }
 }

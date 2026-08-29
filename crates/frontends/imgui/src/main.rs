@@ -514,6 +514,9 @@ impl App {
                 }
                 let mut anchors = [0.0_f32; 3];
                 for index in 0..3 {
+                    if active == StepId::Preview && index == StepId::Solve.index() {
+                        continue;
+                    }
                     anchors[index] = ui.cursor_pos()[1];
                     let open = active.index() == index;
                     self.show_step_header(ui, index, open);
@@ -596,7 +599,8 @@ impl App {
     fn show_preview_step(&mut self, ui: &imgui::Ui) {
         let avail = ui.content_region_avail();
         let card_width = (avail[0] - 12.0) * 0.5;
-        let card_height = (card_width * 9.0 / 16.0 + 46.0).max(160.0);
+        let base_card_height = (card_width * 9.0 / 16.0 + 46.0).max(160.0);
+        let card_height = base_card_height.max((avail[1] * 0.48).max(220.0));
 
         ui.child_window("##ch0_card")
             .size([card_width, card_height])
@@ -606,8 +610,8 @@ impl App {
             .size([card_width, card_height])
             .build(|| self.show_preview_card(ui, 1, 3, "CH3 · RTSP 557 · i2c-6"));
         ui.separator();
-        // 显示数值可观测性 goal；旧版覆盖/bin 进度条不再显示。
-        let panel_height = 210.0;
+        // Step2 的可观测性区域尽量吃满剩余高度，不给 Step3 预留空白。
+        let panel_height = (ui.content_region_avail()[1] - 44.0).max(160.0);
         ui.child_window("##ch0_observability")
             .size([card_width, panel_height])
             .build(|| self.show_observability_panel(ui, 0));
@@ -615,9 +619,15 @@ impl App {
         ui.child_window("##ch3_observability")
             .size([card_width, panel_height])
             .build(|| self.show_observability_panel(ui, 1));
+        ui.separator();
+        if ui.button("Skip 到 Step 3") {
+            self.controller.skip_preview();
+        }
+        ui.same_line();
+        ui.text_disabled("允许未达标直接进入求解检查与 EEPROM 写入");
     }
 
-    /// 数值可观测性面板：goal 由最新标定解的参数不确定性决定。
+    /// 数值可观测性面板：goal 只看 RMS、焦距和主点；主畸变(D5)、D12 与 cond(H) 仅作诊断。
     fn show_observability_panel(&mut self, ui: &imgui::Ui, index: usize) {
         let quality = if index == 0 {
             self.controller.state.preview.ch0.quality.clone()
@@ -631,29 +641,21 @@ impl App {
             quality.accepted_frames
         ));
         if let Some(report) = &quality.observability {
-            let width = ui.content_region_avail()[0].max(120.0);
             self.quality_metric_block(
                 ui,
                 "总体 RMS",
                 report.residual_progress(),
-                width,
                 &format!("{:.3}px / {:.3}px", report.rms_error, MAX_GOAL_RMS_PX),
                 if report.residual_ok() {
                     "RMS 已收敛"
                 } else {
                     "RMS 仍偏高"
                 },
-                if report.residual_ok() {
-                    theme::OK
-                } else {
-                    theme::WARN
-                },
             );
             self.quality_metric_block(
                 ui,
                 "焦距",
                 report.focal_progress(),
-                width,
                 &format!(
                     "fx/fy σ {:.3}% / {:.3}%",
                     report.focal_relative_stddev[0] * 100.0,
@@ -664,17 +666,11 @@ impl App {
                 } else {
                     "焦距仍未稳定"
                 },
-                if report.focal_ok() {
-                    theme::OK
-                } else {
-                    theme::WARN
-                },
             );
             self.quality_metric_block(
                 ui,
                 "主点",
                 report.principal_progress(),
-                width,
                 &format!(
                     "cx/cy σ {:.2}px / {:.2}px",
                     report.principal_point_stddev_px[0], report.principal_point_stddev_px[1]
@@ -684,54 +680,8 @@ impl App {
                 } else {
                     "主点仍未稳定"
                 },
-                if report.principal_ok() {
-                    theme::OK
-                } else {
-                    theme::WARN
-                },
             );
-            self.quality_metric_block(
-                ui,
-                "主畸变(D5)",
-                report.distortion_progress(),
-                width,
-                &format!(
-                    "D5 edge σ max {:.2}px",
-                    report
-                        .primary_distortion_edge_stddev_px()
-                        .iter()
-                        .copied()
-                        .filter(|value| value.is_finite())
-                        .fold(0.0_f64, f64::max)
-                ),
-                if report.distortion_ok() {
-                    "主畸变已收敛"
-                } else {
-                    "主畸变仍未稳定"
-                },
-                if report.distortion_ok() {
-                    theme::OK
-                } else {
-                    theme::WARN
-                },
-            );
-            self.quality_metric_block(
-                ui,
-                "条件数",
-                report.conditioning_progress(),
-                width,
-                &format!("cond(H) {:.2e}", report.condition_number),
-                if report.conditioning_ok() {
-                    "信息矩阵条件数达标"
-                } else {
-                    "信息矩阵仍病态"
-                },
-                if report.conditioning_ok() {
-                    theme::OK
-                } else {
-                    theme::WARN
-                },
-            );
+            ui.text_disabled("主畸变(D5)仅作诊断，不作为达成指标");
             let gain = report
                 .last_info_gain
                 .map_or("--".to_owned(), |value| format!("{value:+.2}"));
@@ -759,26 +709,47 @@ impl App {
         }
     }
 
-    /// 连续质量的单条紧凑块：把数值、进度和状态拆开显示。
+    /// 连续质量的单条紧凑行：把标题、数值、进度条和状态拆成固定列。
     fn quality_metric_block(
         &self,
         ui: &imgui::Ui,
         label: &str,
         progress: f32,
-        width: f32,
         value: &str,
         status: &str,
-        status_color: [f32; 4],
     ) {
-        ui.text_colored(theme::ACCENT, label);
-        ui.text_disabled(value);
+        let available = ui.content_region_avail()[0].max(320.0);
+        let label_width = 88.0;
+        let value_width = 170.0;
+        let status_width = 108.0;
+        let bar_width = (available - label_width - value_width - status_width - 24.0).max(120.0);
         let progress = progress
             .is_finite()
             .then_some(progress.clamp(0.0, 1.0))
             .unwrap_or(0.0);
-        ProgressBar::new(progress).size([width, 14.0]).build(ui);
-        ui.text_colored(status_color, status);
-        ui.spacing();
+
+        ui.columns(4, "##observability_metric_columns", false);
+        ui.set_column_width(0, label_width);
+        ui.set_column_width(1, value_width);
+        ui.set_column_width(2, bar_width);
+        ui.set_column_width(3, status_width);
+
+        ui.text_colored(theme::ACCENT, label);
+        ui.next_column();
+        ui.text_disabled(value);
+        ui.next_column();
+        ProgressBar::new(progress).size([bar_width, 10.0]).build(ui);
+        ui.next_column();
+        ui.text_colored(
+            if progress >= 1.0 {
+                theme::OK
+            } else {
+                theme::WARN
+            },
+            status,
+        );
+        ui.next_column();
+        ui.columns(1, "##observability_metric_columns_end", false);
     }
 
     fn show_observability_details(
@@ -789,7 +760,7 @@ impl App {
     ) {
         let title = format!("参数明细##observability_detail_{id}");
         ui.tree_node_config(&title).default_open(false).build(|| {
-            ui.text_disabled("展示模型：D12 原始值；自动完成仍按主畸变组门禁。");
+            ui.text_disabled("展示模型：D12 原始值；自动完成只看 RMS / 焦距 / 主点，D5、D12 与 cond(H) 仅作诊断。");
             ui.separator();
 
             ui.tree_node_config("原始内参矩阵 K")
@@ -914,6 +885,7 @@ impl App {
                 });
         });
     }
+
     fn show_preview_card(&mut self, ui: &imgui::Ui, slot_index: usize, channel: u16, label: &str) {
         ui.text_colored(theme::ACCENT, label);
         let channel_state = match channel {
@@ -977,7 +949,7 @@ impl App {
 
         ui.same_line();
         if ui.button("开始求解") && !busy {
-            self.controller.solve();
+            let _ = self.controller.solve();
         }
 
         ui.separator();

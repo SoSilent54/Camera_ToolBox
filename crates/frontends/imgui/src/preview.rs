@@ -1837,8 +1837,8 @@ mod tests {
                 last_info_gain: Some(1.0),
                 camera_matrix: [1200.0, 0.0, 970.0, 0.0, 1180.0, 535.0, 0.0, 0.0, 1.0],
                 distortion_coefficients: vec![0.5; 12],
-                focal_relative_stddev: [0.001, 0.001],
-                principal_point_stddev_px: [0.5, 0.5],
+                focal_relative_stddev: [0.0001, 0.0001],
+                principal_point_stddev_px: [0.05, 0.05],
                 distortion_edge_stddev_px: vec![0.5; 12],
                 distortion_names: vec![
                     "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
@@ -2062,6 +2062,18 @@ mod tests {
         );
         assert!(quality.solver_input_ready());
         assert!(quality.is_complete());
+
+        let mut diagnostic_outliers = quality.clone();
+        let report = diagnostic_outliers
+            .observability
+            .as_mut()
+            .expect("test report");
+        report.condition_number = 1.0e12;
+        report.distortion_edge_stddev_px[0] =
+            crate::observability::DISTORTION_EDGE_STDDEV_TARGET_PX * 2.0;
+        report.distortion_edge_stddev_px[5] = 9.0;
+        report.distortion_edge_stddev_px[11] = 9.0;
+        assert!(diagnostic_outliers.is_complete());
 
         let mut insufficient_views = quality.clone();
         insufficient_views.accepted_frames = crate::solve::MIN_USABLE_CALIBRATION_VIEWS - 1;

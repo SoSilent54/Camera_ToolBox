@@ -11,10 +11,10 @@ const DISTORTION_NAMES: [&str; 12] = [
     "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
 ];
 
-/// 焦距相对标准差目标；0.5% 是在线采集可解释、不会过早停采的保守门槛。
-pub const FOCAL_REL_STDDEV_TARGET: f64 = 0.005;
-/// 主点标准差目标；主点漂移超过 2px 时会直接影响去畸变中心与下游几何。
-pub const PRINCIPAL_STDDEV_TARGET_PX: f64 = 2.0;
+/// 焦距相对标准差目标；0.02% 是在线采集里更严格但仍可解释的保守门槛。
+pub const FOCAL_REL_STDDEV_TARGET: f64 = 0.0002;
+/// 主点标准差目标；主点漂移超过 0.3px 时会直接影响去畸变中心与下游几何。
+pub const PRINCIPAL_STDDEV_TARGET_PX: f64 = 0.3;
 /// 畸变标准差折算到归一化半径 1.0 处的像素影响目标。
 pub const DISTORTION_EDGE_STDDEV_TARGET_PX: f64 = 2.0;
 /// 采集完成只要求前 5 个主畸变项（k1,k2,p1,p2,k3）达标。
@@ -81,11 +81,7 @@ impl ObservabilityReport {
 
     #[must_use]
     pub fn goal_met(&self) -> bool {
-        self.focal_ok()
-            && self.principal_ok()
-            && self.distortion_ok()
-            && self.conditioning_ok()
-            && self.residual_ok()
+        self.focal_ok() && self.principal_ok() && self.residual_ok()
     }
 
     #[must_use]
@@ -96,10 +92,6 @@ impl ObservabilityReport {
             "焦距仍未充分约束：请增加远近变化和横竖倾斜"
         } else if !self.principal_ok() {
             "主点仍未充分约束：请把棋盘移到画面边缘/四角并加入 roll"
-        } else if !self.distortion_ok() {
-            "畸变仍未充分约束：请让角点覆盖画面大半径和四角"
-        } else if !self.conditioning_ok() {
-            "信息矩阵条件数过高：请采集与已有姿态差异更大的视图"
         } else {
             "数值可观测性已达标"
         }
@@ -147,9 +139,31 @@ impl ObservabilityReport {
             .min(PRIMARY_DISTORTION_OBSERVABILITY_COUNT);
         &self.distortion_edge_stddev_px[..count]
     }
+
+    #[must_use]
+    pub fn max_distortion_edge_stddev_px(&self) -> Option<f64> {
+        self.distortion_edge_stddev_px
+            .iter()
+            .copied()
+            .filter(|value| value.is_finite())
+            .reduce(f64::max)
+    }
+
+    #[must_use]
+    pub fn distortion_progress_d12(&self) -> f32 {
+        inverse_threshold_progress(
+            max_finite(&self.distortion_edge_stddev_px),
+            DISTORTION_EDGE_STDDEV_TARGET_PX,
+        )
+    }
+
+    #[must_use]
+    pub fn distortion_ok_d12(&self) -> bool {
+        self.max_distortion_edge_stddev_px()
+            .is_some_and(|value| finite_le(value, DISTORTION_EDGE_STDDEV_TARGET_PX))
+    }
 }
 
-/// 对最新标定解做局部可观测性分析。`detections` 必须是被最终解保留的视图，顺序与
 /// `solution.views` 一致；调用方需先移除 `SolveResult::rejected_view_indices`。
 pub fn analyze_solution(
     solution: &CalibrationSolution,
@@ -684,8 +698,8 @@ mod tests {
             last_info_gain: Some(1.0),
             camera_matrix: [1200.0, 0.0, 970.0, 0.0, 1180.0, 535.0, 0.0, 0.0, 1.0],
             distortion_coefficients: vec![0.5; 12],
-            focal_relative_stddev: [0.001, 0.001],
-            principal_point_stddev_px: [0.5, 0.5],
+            focal_relative_stddev: [0.0001, 0.0001],
+            principal_point_stddev_px: [0.05, 0.05],
             distortion_edge_stddev_px: vec![0.5; 12],
             distortion_names: DISTORTION_NAMES.to_vec(),
         };
@@ -706,5 +720,31 @@ mod tests {
         report.distortion_edge_stddev_px[PRIMARY_DISTORTION_OBSERVABILITY_COUNT - 1] =
             DISTORTION_EDGE_STDDEV_TARGET_PX * 2.0;
         assert!(!report.goal_met());
+    }
+
+    #[test]
+    fn d12_distortion_helper_checks_full_vector() {
+        let mut report = ObservabilityReport {
+            view_count: 5,
+            point_count: 100,
+            rms_error: 0.1,
+            max_view_rmse: 0.1,
+            condition_number: 1.0e3,
+            log_det_information: 0.0,
+            last_info_gain: Some(1.0),
+            camera_matrix: [1200.0, 0.0, 970.0, 0.0, 1180.0, 535.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.5; 12],
+            focal_relative_stddev: [0.0001, 0.0001],
+            principal_point_stddev_px: [0.05, 0.05],
+            distortion_edge_stddev_px: vec![0.5; 12],
+            distortion_names: DISTORTION_NAMES.to_vec(),
+        };
+        assert!(report.distortion_ok_d12());
+        report.distortion_edge_stddev_px[11] = DISTORTION_EDGE_STDDEV_TARGET_PX * 2.0;
+        assert!(!report.distortion_ok_d12());
+        assert!(
+            report.goal_met(),
+            "D12-only failure should not block D5 goal"
+        );
     }
 }
