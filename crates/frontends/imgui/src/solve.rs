@@ -3,7 +3,7 @@
 //! 复用 adapters 的 `OpenCvCalibrationBackend`（feature calibration-opencv）；
 //! 后台线程执行，结果回主线程展示；完整 `CalibrationSolution` 供 EEPROM 写入。
 
-use crate::observability::{ObservabilityReport, analyze_solution};
+use crate::observability::{analyze_solution, ObservabilityReport};
 use crate::preview::CapturedDatasetFrame;
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
 use camera_toolbox_app::ports::calibration::{CalibrationBackend, CalibrationCancellation};
@@ -126,7 +126,7 @@ impl SolutionDetail {
     #[must_use]
     pub fn summary_text(&self) -> String {
         format!(
-            "{} 求解完成：{} 帧有效 · RMS {:.3} px · 单图最大 {:.3} px\nK: fx={:.2} fy={:.2} cx={:.2} cy={:.2} · FOV H/V={:.2}°/{:.2}° · 光心偏移 x/y={:+.3}°/{:+.3}°\n畸变：{}",
+            "{} 求解完成：{} 帧有效 · RMS {:.3} px · 单图最大 {:.3} px\nK: fx={:.2} fy={:.2} cx={:.2} cy={:.2}\nFOV H/V={:.2}°/{:.2}° · 光心偏移 x/y={:+.3}°/{:+.3}°\n畸变(D12)：{}",
             self.label,
             self.view_count,
             self.rms,
@@ -398,7 +398,7 @@ fn encode_luma_png(luma: &[u8], width: u32, height: u32) -> Result<Vec<u8>, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
-    use camera_toolbox_core::{PANGBOT_CALIBRATION_FLAGS, ViewCalibrationResult};
+    use camera_toolbox_core::{ViewCalibrationResult, PANGBOT_CALIBRATION_FLAGS};
 
     fn solution() -> CalibrationSolution {
         CalibrationSolution {
@@ -461,11 +461,8 @@ mod tests {
             observability: None,
         };
         let text = result.summary();
-        assert!(
-            text.contains(
-                "已自动剔除 3 张单图重投影误差超阈值（>0.15px）的图像并重新标定（共 2 轮）"
-            )
-        );
+        assert!(text
+            .contains("已自动剔除 3 张单图重投影误差超阈值（>0.15px）的图像并重新标定（共 2 轮）"));
         assert!(text.contains("CH0 求解完成"));
     }
 }

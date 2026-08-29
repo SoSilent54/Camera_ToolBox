@@ -12,11 +12,11 @@ use glutin::{
     display::{GetGlDisplay, GlDisplay},
     surface::{GlSurface, Surface, SurfaceAttributesBuilder, SwapInterval, WindowSurface},
 };
-use imgui::{Condition, TextureId};
+use imgui::{Condition, ProgressBar, TextureId};
 use imgui_glow_renderer::Renderer as ImGuiGlowRenderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
-use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
+use pongbot_calib_tool::controller::{CalibController, SnidDraft, StepId, STEP_TITLES};
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
 use pongbot_calib_tool::observability::{
     DISTORTION_EDGE_STDDEV_TARGET_PX, FOCAL_REL_STDDEV_TARGET, MAX_GOAL_RMS_PX,
@@ -626,43 +626,73 @@ impl App {
         };
         let label = if index == 0 { "CH0" } else { "CH3" };
         ui.text_colored(theme::ACCENT, format!("{label} 数值可观测性"));
-        let width = (ui.content_region_avail()[0] - 110.0).max(120.0);
         ui.text_disabled(format!(
             "已入库 {} 张 raw/subpixel 检测帧",
             quality.accepted_frames
         ));
         if let Some(report) = &quality.observability {
-            self.quality_progress_bar(
+            let width = ui.content_region_avail()[0].max(120.0);
+            self.quality_metric_block(
                 ui,
-                "RMS",
+                "总体 RMS",
                 report.residual_progress(),
                 width,
                 &format!("{:.3}px / {:.3}px", report.rms_error, MAX_GOAL_RMS_PX),
+                if report.residual_ok() {
+                    "RMS 已收敛"
+                } else {
+                    "RMS 仍偏高"
+                },
+                if report.residual_ok() {
+                    theme::OK
+                } else {
+                    theme::WARN
+                },
             );
-            self.quality_progress_bar(
+            self.quality_metric_block(
                 ui,
                 "焦距",
                 report.focal_progress(),
                 width,
                 &format!(
-                    "fx/fy σ {:.3}%/{:.3}%",
+                    "fx/fy σ {:.3}% / {:.3}%",
                     report.focal_relative_stddev[0] * 100.0,
                     report.focal_relative_stddev[1] * 100.0
                 ),
+                if report.focal_ok() {
+                    "焦距已收敛"
+                } else {
+                    "焦距仍未稳定"
+                },
+                if report.focal_ok() {
+                    theme::OK
+                } else {
+                    theme::WARN
+                },
             );
-            self.quality_progress_bar(
+            self.quality_metric_block(
                 ui,
                 "主点",
                 report.principal_progress(),
                 width,
                 &format!(
-                    "cx/cy σ {:.2}/{:.2}px",
+                    "cx/cy σ {:.2}px / {:.2}px",
                     report.principal_point_stddev_px[0], report.principal_point_stddev_px[1]
                 ),
+                if report.principal_ok() {
+                    "主点已收敛"
+                } else {
+                    "主点仍未稳定"
+                },
+                if report.principal_ok() {
+                    theme::OK
+                } else {
+                    theme::WARN
+                },
             );
-            self.quality_progress_bar(
+            self.quality_metric_block(
                 ui,
-                "畸变",
+                "主畸变(D5)",
                 report.distortion_progress(),
                 width,
                 &format!(
@@ -674,17 +704,38 @@ impl App {
                         .filter(|value| value.is_finite())
                         .fold(0.0_f64, f64::max)
                 ),
+                if report.distortion_ok() {
+                    "主畸变已收敛"
+                } else {
+                    "主畸变仍未稳定"
+                },
+                if report.distortion_ok() {
+                    theme::OK
+                } else {
+                    theme::WARN
+                },
             );
-            self.quality_progress_bar(
+            self.quality_metric_block(
                 ui,
                 "条件数",
                 report.conditioning_progress(),
                 width,
-                &format!("cond {:.2e}", report.condition_number),
+                &format!("cond(H) {:.2e}", report.condition_number),
+                if report.conditioning_ok() {
+                    "信息矩阵条件数达标"
+                } else {
+                    "信息矩阵仍病态"
+                },
+                if report.conditioning_ok() {
+                    theme::OK
+                } else {
+                    theme::WARN
+                },
             );
             let gain = report
                 .last_info_gain
                 .map_or("--".to_owned(), |value| format!("{value:+.2}"));
+            ui.separator();
             ui.text_disabled(format!(
                 "视图 {} · 角点 {} · 单图最大 {:.3}px · Δlogdet {}",
                 report.view_count, report.point_count, report.max_view_rmse, gain
@@ -708,53 +759,26 @@ impl App {
         }
     }
 
-    /// 连续质量的单条紧凑进度条。
-    fn quality_progress_bar(
+    /// 连续质量的单条紧凑块：把数值、进度和状态拆开显示。
+    fn quality_metric_block(
         &self,
         ui: &imgui::Ui,
         label: &str,
         progress: f32,
         width: f32,
+        value: &str,
         status: &str,
+        status_color: [f32; 4],
     ) {
-        ui.text(label);
-        const LABEL_COLUMN: f32 = 76.0;
-        ui.same_line();
-        let cursor = ui.cursor_pos();
-        if cursor[0] < LABEL_COLUMN {
-            ui.set_cursor_pos([LABEL_COLUMN, cursor[1]]);
-        }
-        let draw = ui.get_window_draw_list();
-        let origin = ui.cursor_screen_pos();
-        let height = 14.0;
+        ui.text_colored(theme::ACCENT, label);
+        ui.text_disabled(value);
         let progress = progress
             .is_finite()
             .then_some(progress.clamp(0.0, 1.0))
             .unwrap_or(0.0);
-        draw.add_rect(
-            [origin[0], origin[1]],
-            [origin[0] + width, origin[1] + height],
-            [0.16, 0.17, 0.22, 1.0],
-        )
-        .filled(true)
-        .build();
-        if progress > 0.0 {
-            draw.add_rect(
-                [origin[0], origin[1]],
-                [origin[0] + width * progress, origin[1] + height],
-                theme::OK,
-            )
-            .filled(true)
-            .build();
-        }
-        draw.add_rect(
-            [origin[0], origin[1]],
-            [origin[0] + width, origin[1] + height],
-            [0.85, 0.88, 0.95, 0.8],
-        )
-        .build();
-        ui.same_line();
-        ui.text_disabled(status);
+        ProgressBar::new(progress).size([width, 14.0]).build(ui);
+        ui.text_colored(status_color, status);
+        ui.spacing();
     }
 
     fn show_observability_details(
@@ -765,81 +789,129 @@ impl App {
     ) {
         let title = format!("参数明细##observability_detail_{id}");
         ui.tree_node_config(&title).default_open(false).build(|| {
-            let mut rows = Vec::with_capacity(6 + report.distortion_edge_stddev_px.len());
-            rows.push((
-                "RMS".to_owned(),
-                metric_value(report.rms_error, "px", MAX_GOAL_RMS_PX),
-            ));
-            rows.push((
-                "cond(H)".to_owned(),
-                metric_value(report.condition_number, "", MAX_NORMALIZED_CONDITION),
-            ));
-            rows.push((
-                "fx std".to_owned(),
-                metric_value(
-                    report.focal_relative_stddev[0] * 100.0,
-                    "%",
-                    FOCAL_REL_STDDEV_TARGET * 100.0,
-                ),
-            ));
-            rows.push((
-                "fy std".to_owned(),
-                metric_value(
-                    report.focal_relative_stddev[1] * 100.0,
-                    "%",
-                    FOCAL_REL_STDDEV_TARGET * 100.0,
-                ),
-            ));
-            rows.push((
-                "cx std".to_owned(),
-                metric_value(
-                    report.principal_point_stddev_px[0],
-                    "px",
-                    PRINCIPAL_STDDEV_TARGET_PX,
-                ),
-            ));
-            rows.push((
-                "cy std".to_owned(),
-                metric_value(
-                    report.principal_point_stddev_px[1],
-                    "px",
-                    PRINCIPAL_STDDEV_TARGET_PX,
-                ),
-            ));
-            for (distortion_index, (name, value)) in report
-                .distortion_names
-                .iter()
-                .zip(report.distortion_edge_stddev_px.iter())
-                .enumerate()
-            {
-                let metric = metric_value(*value, "px", DISTORTION_EDGE_STDDEV_TARGET_PX);
-                let status = if distortion_index < PRIMARY_DISTORTION_OBSERVABILITY_COUNT {
-                    metric
-                } else {
-                    metric.as_diagnostic()
-                };
-                rows.push((format!("{name} edge std"), status));
-            }
-            ui.columns(3, "##observability_param_columns", false);
-            ui.text_disabled("参数");
-            ui.next_column();
-            ui.text_disabled("当前 / 阈值");
-            ui.next_column();
-            ui.text_disabled("状态");
-            ui.next_column();
+            ui.text_disabled("展示模型：D12 原始值；自动完成仍按主畸变组门禁。");
             ui.separator();
-            for (name, status) in rows {
-                ui.text(name);
-                ui.next_column();
-                ui.text(status.value);
-                ui.next_column();
-                ui.text_colored(
-                    if status.ok { theme::OK } else { theme::WARN },
-                    status.label,
-                );
-                ui.next_column();
-            }
-            ui.columns(1, "##observability_param_columns_end", false);
+
+            ui.tree_node_config("原始内参矩阵 K")
+                .default_open(true)
+                .build(|| {
+                    let k = report.camera_matrix;
+                    ui.text(format!("[{:.2} {:>10.2} {:>10.2}]", k[0], k[1], k[2]));
+                    ui.text(format!("[{:.2} {:>10.2} {:>10.2}]", k[3], k[4], k[5]));
+                    ui.text(format!("[{:.2} {:>10.2} {:>10.2}]", k[6], k[7], k[8]));
+                    self.key_value_list(
+                        ui,
+                        &[
+                            ("fx", format!("{:.6}", k[0])),
+                            ("fy", format!("{:.6}", k[4])),
+                            ("cx", format!("{:.6}", k[2])),
+                            ("cy", format!("{:.6}", k[5])),
+                        ],
+                    );
+                });
+
+            ui.separator();
+            ui.tree_node_config("原始 D12 畸变向量")
+                .default_open(true)
+                .build(|| {
+                    let raw_rows: Vec<(String, String)> = report
+                        .distortion_names
+                        .iter()
+                        .zip(report.distortion_coefficients.iter().copied())
+                        .map(|(name, value)| (name.to_string(), format!("{value:+.6e}")))
+                        .collect();
+                    let raw_rows_ref: Vec<(&str, String)> = raw_rows
+                        .iter()
+                        .map(|(name, value)| (name.as_str(), value.clone()))
+                        .collect();
+                    self.key_value_list(ui, &raw_rows_ref);
+                });
+
+            ui.separator();
+            ui.tree_node_config("D12 可观测性明细")
+                .default_open(true)
+                .build(|| {
+                    let stats = [
+                        (
+                            "RMS",
+                            metric_value(report.rms_error, "px", MAX_GOAL_RMS_PX).value,
+                        ),
+                        (
+                            "cond(H)",
+                            metric_value(report.condition_number, "", MAX_NORMALIZED_CONDITION)
+                                .value,
+                        ),
+                        (
+                            "fx σ",
+                            metric_value(
+                                report.focal_relative_stddev[0] * 100.0,
+                                "%",
+                                FOCAL_REL_STDDEV_TARGET * 100.0,
+                            )
+                            .value,
+                        ),
+                        (
+                            "fy σ",
+                            metric_value(
+                                report.focal_relative_stddev[1] * 100.0,
+                                "%",
+                                FOCAL_REL_STDDEV_TARGET * 100.0,
+                            )
+                            .value,
+                        ),
+                        (
+                            "cx σ",
+                            metric_value(
+                                report.principal_point_stddev_px[0],
+                                "px",
+                                PRINCIPAL_STDDEV_TARGET_PX,
+                            )
+                            .value,
+                        ),
+                        (
+                            "cy σ",
+                            metric_value(
+                                report.principal_point_stddev_px[1],
+                                "px",
+                                PRINCIPAL_STDDEV_TARGET_PX,
+                            )
+                            .value,
+                        ),
+                    ];
+                    self.key_value_list(ui, &stats);
+                    ui.separator();
+                    ui.columns(3, "##observability_param_columns", false);
+                    ui.text_disabled("参数");
+                    ui.next_column();
+                    ui.text_disabled("当前 / 阈值");
+                    ui.next_column();
+                    ui.text_disabled("状态");
+                    ui.next_column();
+                    ui.separator();
+                    for (distortion_index, (name, value)) in report
+                        .distortion_names
+                        .iter()
+                        .zip(report.distortion_edge_stddev_px.iter())
+                        .enumerate()
+                    {
+                        let metric = metric_value(*value, "px", DISTORTION_EDGE_STDDEV_TARGET_PX);
+                        let status = if distortion_index < PRIMARY_DISTORTION_OBSERVABILITY_COUNT {
+                            metric
+                        } else {
+                            metric.as_diagnostic()
+                        };
+                        ui.text(*name);
+                        ui.next_column();
+                        ui.text(status.value);
+                        ui.next_column();
+                        ui.text_colored(
+                            if status.ok { theme::OK } else { theme::WARN },
+                            status.label,
+                        );
+                        ui.next_column();
+                    }
+                    ui.columns(1, "##observability_param_columns_end", false);
+                });
         });
     }
     fn show_preview_card(&mut self, ui: &imgui::Ui, slot_index: usize, channel: u16, label: &str) {
@@ -978,22 +1050,27 @@ impl App {
             ],
         );
         ui.separator();
-        let names = [
-            "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
-        ];
-        let mut rows: Vec<(String, String)> = Vec::new();
-        for (name, value) in names.iter().zip(detail.distortion.iter().copied()) {
-            if rows.len() < 6 {
-                rows.push(((*name).to_owned(), format!("{value:.4}")));
-            }
-        }
-        self.key_value_list(
-            ui,
-            &rows
-                .iter()
-                .map(|(k, v)| (k.as_str(), v.clone()))
-                .collect::<Vec<_>>(),
-        );
+        ui.text_disabled("D12 原始值");
+        let distortion_rows: Vec<(String, String)> = detail
+            .distortion
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(index, value)| {
+                (
+                    [
+                        "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
+                    ][index]
+                        .to_owned(),
+                    format!("{value:+.6e}"),
+                )
+            })
+            .collect();
+        let distortion_rows_ref: Vec<(&str, String)> = distortion_rows
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.clone()))
+            .collect();
+        self.key_value_list(ui, &distortion_rows_ref);
         let observability = if index == 0 {
             self.controller.state.solve.ch0_observability.clone()
         } else {
