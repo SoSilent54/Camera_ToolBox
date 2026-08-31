@@ -65,14 +65,14 @@ use crate::{
     yuv_inspector::render_yuv_inspector,
 };
 use camera_toolbox_adapters::ImageRasterCodec;
-#[cfg(feature = "platform-ssh")]
-use camera_toolbox_adapters::platforms::ssh_managed::{
-    CredentialResolver, HostKeyAssessment, HostKeyManager, HostKeyTarget,
-    RusshServerHostKeyProbe, RusshTransportFactory, ServerHostKey, ServerHostKeyProbe,
-    SshConnectionTarget, SshI2cHelperService, SshTransportFactory,
-};
 #[cfg(all(feature = "calibration-opencv", feature = "platform-ssh"))]
 use camera_toolbox_adapters::platforms::ssh_managed::SshEepromProvisionService;
+#[cfg(feature = "platform-ssh")]
+use camera_toolbox_adapters::platforms::ssh_managed::{
+    CredentialResolver, HostKeyAssessment, HostKeyManager, HostKeyTarget, RusshServerHostKeyProbe,
+    RusshTransportFactory, ServerHostKey, ServerHostKeyProbe, SshConnectionTarget,
+    SshI2cHelperService, SshTransportFactory,
+};
 use camera_toolbox_adapters::x5_tcp_client::{self, X5RtspEncoderConfig};
 use camera_toolbox_app::{
     AutoOpenActivation, CapabilityResolutionKey, DecodedVideoFrame, EntryName, ExportDestination,
@@ -434,7 +434,6 @@ fn run_eeprom_operation(
     } else {
         None
     };
-
 
     let helper_result = match target.service.execute(operation, control) {
         Ok(result) => result,
@@ -2269,7 +2268,8 @@ impl eframe::App for CameraToolboxApp {
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
                                 ui.separator();
-                                let live_open_request = self.render_x5_233_driver_workspace(&context, ui);
+                                let live_open_request =
+                                    self.render_x5_233_driver_workspace(&context, ui);
                                 ui.separator();
                                 let stream_action = self.render_workspace_stream_section(ui);
                                 self.render_stream_metrics(ui);
@@ -3259,17 +3259,15 @@ impl CameraToolboxApp {
         }
         let host = self.x5_233_driver.device_ip.trim().to_owned();
         if host.is_empty() {
-            self.x5_233_driver.last_error = Some(
-                "Enter X5_233 device IP before scanning the SSH host key.".to_owned(),
-            );
+            self.x5_233_driver.last_error =
+                Some("Enter X5_233 device IP before scanning the SSH host key.".to_owned());
             return;
         }
         let target = match HostKeyTarget::new(host, X5_233_SSH_PORT) {
             Ok(target) => target,
             Err(error) => {
-                self.x5_233_driver.last_error = Some(format!(
-                    "X5_233 SSH host key target is invalid: {error}"
-                ));
+                self.x5_233_driver.last_error =
+                    Some(format!("X5_233 SSH host key target is invalid: {error}"));
                 return;
             }
         };
@@ -3316,9 +3314,8 @@ impl CameraToolboxApp {
             });
         if let Err(error) = spawn_result {
             self.x5_233_host_key_scan = None;
-            self.x5_233_driver.last_error = Some(format!(
-                "Failed to start X5_233 SSH host key scan: {error}"
-            ));
+            self.x5_233_driver.last_error =
+                Some(format!("Failed to start X5_233 SSH host key scan: {error}"));
         }
     }
 
@@ -3331,9 +3328,8 @@ impl CameraToolboxApp {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Empty) => return,
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.x5_233_driver.last_error = Some(
-                    "X5_233 SSH host key scan worker stopped unexpectedly.".to_owned(),
-                );
+                self.x5_233_driver.last_error =
+                    Some("X5_233 SSH host key scan worker stopped unexpectedly.".to_owned());
                 self.x5_233_host_key_scan = None;
                 return;
             }
@@ -5469,7 +5465,7 @@ impl CameraToolboxApp {
         if matches!(&intent, CalibrationProvisionIntent::DiscoverBuses) {
             let source = match self.remote_control_connection(
                 &context,
-            "Connect Explorer SFTP or enter an X5 board IP before discovering I²C buses.",
+                "Connect Explorer SFTP or enter an X5 board IP before discovering I²C buses.",
             ) {
                 Ok(source) => source,
                 Err(error) => {
