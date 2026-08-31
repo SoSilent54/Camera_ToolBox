@@ -145,10 +145,20 @@ fi
 # is unusable on x86_64/Windows/macOS and previously left local release builds
 # without the filename the Egui client loads.  Prefer the CI-provided artifact;
 # an AArch64 Linux workstation can build the static sidecar itself.
-helper_sidecar="${project_root}/helper-sidecar/camera-i2c-helper"
-helper_output="${target_dir}/${profile}/camera-i2c-helper-linux-aarch64"
-if [[ -f $helper_sidecar ]]; then
-    install -m 755 "$helper_sidecar" "$helper_output"
+helper_candidates=(
+    "${project_root}/helper-sidecar/camera-i2c-helper"
+    "${project_root}/helper-sidecar/target/aarch64-unknown-linux-gnu/release/camera-i2c-helper"
+    "${project_root}/helper-sidecar/target/release/camera-i2c-helper"
+)
+helper_source=""
+for candidate in "${helper_candidates[@]}"; do
+    if [[ -f $candidate ]]; then
+        helper_source=$candidate
+        break
+    fi
+done
+if [[ -n $helper_source ]]; then
+    install -m 755 "$helper_source" "$helper_output"
 elif [[ "$(uname -s)" == "Linux" && "$(uname -m)" == "aarch64" ]]; then
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-feature=+crt-static" \
         cargo "${helper_args[@]}" --target aarch64-unknown-linux-gnu
