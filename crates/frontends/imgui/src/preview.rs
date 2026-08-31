@@ -9,10 +9,10 @@
 //! 作为 dataset goal；密度热力图只保留为画面 overlay，不再生成旧版覆盖/bin 指标。
 use crate::guide_overlay::{DensityHeatmap, OverlayData, OverlayStatus};
 use crate::observability::ObservabilityReport;
-use crate::solve::{solve_channel_from_detections, DetectedDatasetFrame};
+use crate::solve::{DetectedDatasetFrame, solve_channel_from_detections};
 use camera_toolbox_adapters::calibration::OpenCvCalibrationBackend;
-use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
 use camera_toolbox_adapters::media::FfmpegRtspTransport;
+use camera_toolbox_adapters::media::ffmpeg_rtsp::FfmpegRtspDecoder;
 use camera_toolbox_adapters::x5_tcp_client::{self, X5YuvSnapshot};
 use camera_toolbox_app::platform::{
     DecodedVideoFrame, LatestDecodedFrameSlot, RtspLatencyMode, SourcePts, StreamCancellation,
@@ -25,7 +25,7 @@ use camera_toolbox_core::{
 };
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
 /// 连续密度场的固定分辨率；只保存累计场，不保存角点历史。
@@ -1243,11 +1243,7 @@ fn guided_pose_rotation_to_rpy_degrees(rotation: [[f64; 3]; 3]) -> Option<[f64; 
 
 fn signed_angle_distance_degrees(left: f64, right: f64) -> f64 {
     let delta = (left - right).rem_euclid(360.0);
-    if delta > 180.0 {
-        delta - 360.0
-    } else {
-        delta
-    }
+    if delta > 180.0 { delta - 360.0 } else { delta }
 }
 
 fn guided_pose_signed_rotation_error_components(
@@ -1843,6 +1839,7 @@ mod tests {
                 distortion_names: vec![
                     "k1", "k2", "p1", "p2", "k3", "k4", "k5", "k6", "s1", "s2", "s3", "s4",
                 ],
+                parameter_covariance: vec![vec![0.0; 16]; 16],
             }),
         }
     }
@@ -1920,11 +1917,13 @@ mod tests {
         assert!(!density.add_frame(&invalid, &measurement([0.0; 3], [0.0, 0.0, 600.0]),));
         let snapshot = density.snapshot();
         assert_eq!(snapshot.accepted_frames, 0);
-        assert!(snapshot
-            .heatmap
-            .samples
-            .iter()
-            .all(|density| *density == 0.0));
+        assert!(
+            snapshot
+                .heatmap
+                .samples
+                .iter()
+                .all(|density| *density == 0.0)
+        );
     }
 
     #[test]

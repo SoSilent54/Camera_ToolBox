@@ -11,7 +11,7 @@ use camera_toolbox_app::platform::DumpCancellation;
 use camera_toolbox_app::platform::{RemoteOperationControl, RemoteTimeouts};
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// 板端标定驱动路径：新版本一律部署为 DEMO233_Calib，保留原厂 /opt/DEMO233 不动，
@@ -64,10 +64,6 @@ pub fn probe(host: &str, port: u16) -> Result<X5ProbeSummary, String> {
     x5_tcp_client::probe(host, port)
 }
 
-/// SSH 启动板端驱动并等待 TCP 控制口就绪（最多 20s）。
-///
-/// 现场工具语义：接受板端任意主机密钥（后续如需 pin 可加字段）；
-/// 凭据仅存在于本次调用，不持久化。
 #[allow(clippy::too_many_arguments)]
 pub fn bootstrap_driver(
     host: &str,
@@ -76,27 +72,19 @@ pub fn bootstrap_driver(
     ssh_password: &str,
     tcp_port: u16,
 ) -> Result<X5ProbeSummary, String> {
-    let transport = RusshTransportFactory;
-    let target = SshConnectionTarget {
-        host: host.to_owned(),
-        port: ssh_port,
-        username: ssh_user.to_owned(),
-        expected_host_key: None,
-        command_subsystem: None,
-        remote_event_subsystem: None,
-    };
-    let credential = SshCredential::Password(SecretString::from(ssh_password.to_owned()));
-    let timeouts = RemoteTimeouts {
-        connect: Duration::from_secs(10),
-        idle: Duration::from_secs(10),
-        overall: Duration::from_secs(20),
-    };
-    let control = RemoteOperationControl::new(timeouts, DumpCancellation::default())
-        .map_err(|error| format!("操作控制初始化失败：{error}"))?;
-    let mut session = transport
-        .connect(&target, credential, &control)
-        .map_err(|error| format!("SSH 连接 {host} 失败：{error}"))?;
-    sync_driver_binary(&mut session, &control)?;
+    let local_path = local_driver_binary_path();
+    if let Ok(summary) = x5_tcp_client::probe(host, tcp_port) {
+        if local_path.is_some() {
+            let mut session = connect_password_session(host, ssh_port, ssh_user, ssh_password)?;
+            let control = control()?;
+            sync_driver_binary(&mut session, &control, local_path.as_deref())?;
+        }
+        return Ok(summary);
+    }
+
+    let mut session = connect_password_session(host, ssh_port, ssh_user, ssh_password)?;
+    let control = control()?;
+    sync_driver_binary(&mut session, &control, local_path.as_deref())?;
     let argv = vec![
         "sh".to_owned(),
         "-lc".to_owned(),
@@ -129,31 +117,73 @@ pub fn bootstrap_driver(
     ))
 }
 
+fn control() -> Result<RemoteOperationControl, String> {
+    RemoteOperationControl::new(
+        RemoteTimeouts {
+            connect: Duration::from_secs(10),
+            idle: Duration::from_secs(10),
+            overall: Duration::from_secs(20),
+        },
+        DumpCancellation::default(),
+    )
+    .map_err(|error| format!("操作控制初始化失败：{error}"))
+}
+
+fn connect_password_session(
+    host: &str,
+    ssh_port: u16,
+    ssh_user: &str,
+    ssh_password: &str,
+) -> Result<
+    Box<dyn camera_toolbox_adapters::platforms::ssh_managed::connection::SshTransportSession>,
+    String,
+> {
+    let transport = RusshTransportFactory;
+    let target = SshConnectionTarget {
+        host: host.to_owned(),
+        port: ssh_port,
+        username: ssh_user.to_owned(),
+        expected_host_key: None,
+        command_subsystem: None,
+        remote_event_subsystem: None,
+    };
+    let credential = SshCredential::Password(SecretString::from(ssh_password.to_owned()));
+    let control = control()?;
+    transport
+        .connect(&target, credential, &control)
+        .map_err(|error| format!("SSH 连接 {host} 失败：{error}"))
+}
+
 /// 版本检查并同步板端标定驱动（`PONGBOT_DRIVER_BINARY` 指向本地编译产物）。
 ///
 /// 本地 SHA-256 与板端 `DEMO233_Calib` 不一致时，删除旧文件后经 SFTP 上传替换；
 /// 未设置环境变量时跳过（直接启动板端已有版本）。
 fn sync_driver_binary(
-    session: &mut Box<dyn camera_toolbox_adapters::platforms::ssh_managed::connection::SshTransportSession>,
+    session: &mut Box<
+        dyn camera_toolbox_adapters::platforms::ssh_managed::connection::SshTransportSession,
+    >,
     control: &RemoteOperationControl,
+    local_path: Option<&Path>,
 ) -> Result<(), String> {
-    let Some(local_path) = local_driver_binary_path() else {
+    let Some(local_path) = local_path else {
         tracing::warn!("PONGBOT_DRIVER_BINARY 未设置，跳过标定驱动版本检查与上传");
         return Ok(());
     };
-    let local_bytes = std::fs::read(&local_path).map_err(|error| {
+    let local_bytes = std::fs::read(local_path).map_err(|error| {
         format!(
             "读取本地标定驱动 {} 失败：{error}（PONGBOT_DRIVER_BINARY）",
             local_path.display()
         )
     })?;
     let local_sha = sha256_hex(&local_bytes);
-
     let argv = vec![
         "sh".to_owned(),
         "-lc".to_owned(),
-        format!("sha256sum {X5_233_DRIVER_REMOTE_PATH} 2>/dev/null | cut -d' ' -f1"),
+        format!(
+            "if [ -x {X5_233_DRIVER_REMOTE_PATH} ]; then sha256sum {X5_233_DRIVER_REMOTE_PATH} 2>/dev/null | cut -d' ' -f1; else echo __missing__; fi"
+        ),
     ];
+
     let output = session
         .execute_argv(&argv, 4096, control)
         .map_err(|error| format!("查询板端驱动版本失败：{error}"))?;
@@ -200,4 +230,128 @@ fn sync_driver_binary(
     }
     tracing::info!("板端标定驱动已更新");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use camera_toolbox_adapters::platforms::ssh_managed::connection::{
+        SshConnectionTarget, SshTransportFactory, SshTransportSession, TransportCommandOutput,
+    };
+    use camera_toolbox_adapters::platforms::ssh_managed::memory_transport::{
+        MemoryRemoteFile, MemorySshTransport,
+    };
+    use camera_toolbox_app::platform::{DumpCancellation, RemoteOperationControl, RemoteTimeouts};
+    use secrecy::SecretString;
+    use sha2::{Digest, Sha256};
+    use std::collections::VecDeque;
+    use std::path::PathBuf;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    fn control() -> RemoteOperationControl {
+        RemoteOperationControl::new(
+            RemoteTimeouts {
+                connect: Duration::from_secs(1),
+                idle: Duration::from_secs(1),
+                overall: Duration::from_secs(1),
+            },
+            DumpCancellation::default(),
+        )
+        .expect("control")
+    }
+
+    fn connect_session(memory: &MemorySshTransport) -> Box<dyn SshTransportSession> {
+        memory.allow_credential("session:test");
+        let target = SshConnectionTarget {
+            host: "board".to_owned(),
+            port: 22,
+            username: "root".to_owned(),
+            expected_host_key: None,
+            command_subsystem: None,
+            remote_event_subsystem: None,
+        };
+        let credential = SshCredential::Password(SecretString::from("pw".to_owned()));
+        memory
+            .connect(&target, credential, &control())
+            .expect("connect session")
+    }
+
+    fn temp_binary(name: &str, bytes: &[u8]) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("pongbot-{name}-{stamp}.bin"));
+        std::fs::write(&path, bytes).expect("write local");
+        path
+    }
+
+    fn sha(bytes: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[test]
+    fn sync_driver_binary_skips_upload_when_remote_matches() {
+        let memory = MemorySshTransport::new("host-key");
+        let local_bytes = b"demo233-calib".to_vec();
+        let local = temp_binary("same", &local_bytes);
+        memory.insert_file(
+            X5_233_DRIVER_REMOTE_PATH,
+            MemoryRemoteFile {
+                bytes: local_bytes.clone(),
+                stats: VecDeque::new(),
+            },
+        );
+        memory.set_command_output(TransportCommandOutput {
+            stdout: format!("{}\n", sha(&local_bytes)).into_bytes(),
+            stderr: Vec::new(),
+            exit_status: Some(0),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+        let mut session = connect_session(&memory);
+
+        sync_driver_binary(&mut session, &control(), Some(local.as_path())).expect("sync");
+
+        assert_eq!(
+            memory.file_bytes(X5_233_DRIVER_REMOTE_PATH),
+            Some(local_bytes)
+        );
+        let argv = memory.captured_argv();
+        assert_eq!(argv.len(), 1);
+        assert!(argv[0][2].contains("sha256sum"));
+        let _ = std::fs::remove_file(local);
+    }
+
+    #[test]
+    fn sync_driver_binary_replaces_mismatched_remote_file() {
+        let memory = MemorySshTransport::new("host-key");
+        let local = temp_binary("mismatch", b"local-demo233");
+        memory.insert_file(
+            X5_233_DRIVER_REMOTE_PATH,
+            MemoryRemoteFile {
+                bytes: b"old-demo233".to_vec(),
+                stats: VecDeque::new(),
+            },
+        );
+        memory.set_command_output(TransportCommandOutput {
+            stdout: b"\n".to_vec(),
+            stderr: Vec::new(),
+            exit_status: Some(0),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        });
+        let mut session = connect_session(&memory);
+
+        sync_driver_binary(&mut session, &control(), Some(local.as_path())).expect("sync");
+
+        assert_eq!(
+            memory.file_bytes(X5_233_DRIVER_REMOTE_PATH),
+            Some(b"local-demo233".to_vec())
+        );
+        let argv = memory.captured_argv();
+        assert!(argv.iter().any(|cmd| cmd[2].contains("sha256sum")));
+        assert!(argv.iter().any(|cmd| cmd[2].contains("chmod +x")));
+        let _ = std::fs::remove_file(local);
+    }
 }

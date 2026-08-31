@@ -4,7 +4,7 @@ use camera_toolbox_core::{
     BoardSpec, CalibrationImageSize, CalibrationPoint, CalibrationRequest, CalibrationSolution,
     ChessboardDetection, InitialIntrinsics,
 };
-use pongbot_calib_tool::observability::{analyze_solution, ObservabilityReport};
+use pongbot_calib_tool::observability::{ObservabilityReport, analyze_solution};
 use pongbot_calib_tool::preview::{CapturedDatasetFrame, CapturedDatasetSource};
 use pongbot_calib_tool::solve::DetectedDatasetFrame;
 use std::path::{Path, PathBuf};

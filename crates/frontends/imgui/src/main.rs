@@ -16,7 +16,7 @@ use imgui::{Condition, ProgressBar, TextureId};
 use imgui_glow_renderer::Renderer as ImGuiGlowRenderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 
-use pongbot_calib_tool::controller::{CalibController, SnidDraft, StepId, STEP_TITLES};
+use pongbot_calib_tool::controller::{CalibController, STEP_TITLES, SnidDraft, StepId};
 use pongbot_calib_tool::guide_overlay::{DensityHeatmap, OverlayData};
 use pongbot_calib_tool::observability::{
     DISTORTION_EDGE_STDDEV_TARGET_PX, FOCAL_REL_STDDEV_TARGET, MAX_GOAL_RMS_PX,
@@ -587,7 +587,7 @@ impl App {
             self.controller.probe();
         }
         ui.same_line();
-        if ui.button("SSH 启动驱动") && !busy {
+        if ui.button("检测驱动并启动") && !busy {
             self.controller.bootstrap();
         }
         ui.text_colored(
@@ -850,6 +850,46 @@ impl App {
                         ),
                     ];
                     self.key_value_list(ui, &stats);
+                    let parameter_names = report.parameter_names();
+                    let correlation = report.parameter_correlation_matrix();
+                    ui.separator();
+                    ui.tree_node_config("内参相关矩阵（fx/fy/cx/cy）")
+                        .default_open(true)
+                        .build(|| {
+                            ui.text_disabled("Pearson corr；|ρ| 越接近 1，参数越难解耦");
+                            ui.text(format!(
+                                "      {:>8} {:>8} {:>8} {:>8}",
+                                parameter_names[0],
+                                parameter_names[1],
+                                parameter_names[2],
+                                parameter_names[3],
+                            ));
+                            for row in 0..4 {
+                                ui.text(format!(
+                                    "{:>4} {:>8.2} {:>8.2} {:>8.2} {:>8.2}",
+                                    parameter_names[row],
+                                    correlation[row][0],
+                                    correlation[row][1],
+                                    correlation[row][2],
+                                    correlation[row][3],
+                                ));
+                            }
+                        });
+                    ui.tree_node_config("高相关稀疏项（|ρ| ≥ 0.70）")
+                        .default_open(false)
+                        .build(|| {
+                            let sparse = report.sparse_parameter_correlations(0.70);
+                            if sparse.is_empty() {
+                                ui.text_disabled("无超过阈值的强相关项");
+                            } else {
+                                for entry in sparse.iter().take(24) {
+                                    ui.text(format!(
+                                        "{} ↔ {}  {:+.2}",
+                                        entry.left, entry.right, entry.value
+                                    ));
+                                }
+                            }
+                        });
                     ui.separator();
                     ui.columns(3, "##observability_param_columns", false);
                     ui.text_disabled("参数");

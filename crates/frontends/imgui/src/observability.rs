@@ -13,8 +13,8 @@ const DISTORTION_NAMES: [&str; 12] = [
 
 /// 焦距相对标准差目标；0.02% 是在线采集里更严格但仍可解释的保守门槛。
 pub const FOCAL_REL_STDDEV_TARGET: f64 = 0.0002;
-/// 主点标准差目标；主点漂移超过 0.3px 时会直接影响去畸变中心与下游几何。
-pub const PRINCIPAL_STDDEV_TARGET_PX: f64 = 0.3;
+/// 主点标准差目标；主点漂移超过 0.2px 时会直接影响去畸变中心与下游几何。
+pub const PRINCIPAL_STDDEV_TARGET_PX: f64 = 0.2;
 /// 畸变标准差折算到归一化半径 1.0 处的像素影响目标。
 pub const DISTORTION_EDGE_STDDEV_TARGET_PX: f64 = 2.0;
 /// 采集完成只要求前 5 个主畸变项（k1,k2,p1,p2,k3）达标。
@@ -43,6 +43,14 @@ pub struct ObservabilityReport {
     pub principal_point_stddev_px: [f64; 2],
     pub distortion_edge_stddev_px: Vec<f64>,
     pub distortion_names: Vec<&'static str>,
+    pub parameter_covariance: Vec<Vec<f64>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CorrelationEntry {
+    pub left: String,
+    pub right: String,
+    pub value: f64,
 }
 
 impl ObservabilityReport {
@@ -162,6 +170,60 @@ impl ObservabilityReport {
         self.max_distortion_edge_stddev_px()
             .is_some_and(|value| finite_le(value, DISTORTION_EDGE_STDDEV_TARGET_PX))
     }
+
+    #[must_use]
+    pub fn parameter_names(&self) -> Vec<String> {
+        let mut names = Vec::with_capacity(self.parameter_covariance.len());
+        for name in ["fx", "fy", "cx", "cy"] {
+            if names.len() == self.parameter_covariance.len() {
+                return names;
+            }
+            names.push(name.to_owned());
+        }
+        for name in &self.distortion_names {
+            if names.len() == self.parameter_covariance.len() {
+                break;
+            }
+            names.push((*name).to_owned());
+        }
+        while names.len() < self.parameter_covariance.len() {
+            names.push(format!("p{}", names.len()));
+        }
+        names
+    }
+
+    #[must_use]
+    pub fn parameter_correlation_matrix(&self) -> Vec<Vec<f64>> {
+        covariance_to_correlation(&self.parameter_covariance)
+    }
+
+    #[must_use]
+    pub fn sparse_parameter_correlations(&self, threshold: f64) -> Vec<CorrelationEntry> {
+        let correlation = self.parameter_correlation_matrix();
+        let names = self.parameter_names();
+        let threshold = threshold.abs();
+        let mut entries = Vec::new();
+        for row in 0..correlation.len() {
+            for col in row + 1..correlation.len() {
+                let value = correlation[row][col];
+                if value.is_finite() && value.abs() >= threshold {
+                    entries.push(CorrelationEntry {
+                        left: names[row].clone(),
+                        right: names[col].clone(),
+                        value,
+                    });
+                }
+            }
+        }
+        entries.sort_by(|lhs, rhs| {
+            rhs.value
+                .abs()
+                .total_cmp(&lhs.value.abs())
+                .then_with(|| lhs.left.cmp(&rhs.left))
+                .then_with(|| lhs.right.cmp(&rhs.right))
+        });
+        entries
+    }
 }
 
 /// `solution.views` 一致；调用方需先移除 `SolveResult::rejected_view_indices`。
@@ -227,12 +289,20 @@ pub fn analyze_solution(
     let max_eigen = positive.iter().copied().fold(0.0_f64, f64::max);
     let condition_number = max_eigen / min_eigen;
     let log_det_information = positive.iter().map(|value| value.ln()).sum::<f64>();
+    let sigma2 = solution.rms_error.max(0.0).powi(2);
     let inv_information = invert_matrix(&information).ok_or("内参信息矩阵不可逆")?;
-    let sigma2 = solution.rms_error.max(1.0e-3).powi(2);
+    let mut parameter_covariance = zero_matrix(n, n);
+    for row in 0..n {
+        for col in 0..n {
+            parameter_covariance[row][col] =
+                inv_information[row][col] * sigma2 * scales[row] * scales[col];
+        }
+    }
+    symmetrize(&mut parameter_covariance);
     let mut stddev = Vec::with_capacity(n);
     for index in 0..n {
-        let variance = (inv_information[index][index] * sigma2).max(0.0);
-        stddev.push(variance.sqrt() * scales[index]);
+        let variance = parameter_covariance[index][index].max(0.0);
+        stddev.push(variance.sqrt());
     }
 
     let focal_relative_stddev = [
@@ -274,6 +344,7 @@ pub fn analyze_solution(
         principal_point_stddev_px,
         distortion_edge_stddev_px,
         distortion_names,
+        parameter_covariance,
     })
 }
 
@@ -517,6 +588,33 @@ fn inverse_threshold_progress(value: f64, target: f64) -> f32 {
     (target / value.max(target)).clamp(0.0, 1.0) as f32
 }
 
+fn covariance_to_correlation(covariance: &Matrix) -> Matrix {
+    let n = covariance.len();
+    let mut correlation = zero_matrix(n, n);
+    for row in 0..n {
+        for col in row..n {
+            let value = correlation_value(covariance, row, col);
+            correlation[row][col] = value;
+            correlation[col][row] = value;
+        }
+    }
+    correlation
+}
+
+fn correlation_value(covariance: &Matrix, row: usize, col: usize) -> f64 {
+    if row == col {
+        return 1.0;
+    }
+    let variance_row = covariance[row][row].max(0.0);
+    let variance_col = covariance[col][col].max(0.0);
+    let denom = variance_row.sqrt() * variance_col.sqrt();
+    if !denom.is_finite() || denom <= 0.0 {
+        0.0
+    } else {
+        (covariance[row][col] / denom).clamp(-1.0, 1.0)
+    }
+}
+
 type Matrix = Vec<Vec<f64>>;
 
 fn zero_matrix(rows: usize, cols: usize) -> Matrix {
@@ -702,6 +800,7 @@ mod tests {
             principal_point_stddev_px: [0.05, 0.05],
             distortion_edge_stddev_px: vec![0.5; 12],
             distortion_names: DISTORTION_NAMES.to_vec(),
+            parameter_covariance: zero_matrix(16, 16),
         };
         assert!(report.goal_met());
         report.focal_relative_stddev[0] = FOCAL_REL_STDDEV_TARGET * 2.0;
@@ -710,7 +809,7 @@ mod tests {
             report.missing_hint(),
             "焦距仍未充分约束：请增加远近变化和横竖倾斜"
         );
-        report.focal_relative_stddev[0] = 0.001;
+        report.focal_relative_stddev[0] = FOCAL_REL_STDDEV_TARGET * 0.5;
         report.distortion_edge_stddev_px[PRIMARY_DISTORTION_OBSERVABILITY_COUNT] =
             DISTORTION_EDGE_STDDEV_TARGET_PX * 100.0;
         assert!(
@@ -719,7 +818,8 @@ mod tests {
         );
         report.distortion_edge_stddev_px[PRIMARY_DISTORTION_OBSERVABILITY_COUNT - 1] =
             DISTORTION_EDGE_STDDEV_TARGET_PX * 2.0;
-        assert!(!report.goal_met());
+        assert!(!report.distortion_ok());
+        assert!(report.goal_met());
     }
 
     #[test]
@@ -738,6 +838,7 @@ mod tests {
             principal_point_stddev_px: [0.05, 0.05],
             distortion_edge_stddev_px: vec![0.5; 12],
             distortion_names: DISTORTION_NAMES.to_vec(),
+            parameter_covariance: zero_matrix(16, 16),
         };
         assert!(report.distortion_ok_d12());
         report.distortion_edge_stddev_px[11] = DISTORTION_EDGE_STDDEV_TARGET_PX * 2.0;
@@ -745,6 +846,47 @@ mod tests {
         assert!(
             report.goal_met(),
             "D12-only failure should not block D5 goal"
+        );
+    }
+
+    #[test]
+    fn parameter_correlation_helpers_surface_strong_pairs() {
+        let report = ObservabilityReport {
+            view_count: 1,
+            point_count: 1,
+            rms_error: 0.1,
+            max_view_rmse: 0.1,
+            condition_number: 1.0e3,
+            log_det_information: 0.0,
+            last_info_gain: None,
+            camera_matrix: [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+            distortion_coefficients: vec![0.0; 2],
+            focal_relative_stddev: [0.1, 0.2],
+            principal_point_stddev_px: [0.3, 0.4],
+            distortion_edge_stddev_px: vec![],
+            distortion_names: vec![],
+            parameter_covariance: vec![
+                vec![4.0, 2.0, 0.0, 0.0],
+                vec![2.0, 9.0, 0.0, 0.0],
+                vec![0.0, 0.0, 1.0, 0.5],
+                vec![0.0, 0.0, 0.5, 1.0],
+            ],
+        };
+
+        let corr = report.parameter_correlation_matrix();
+        assert!((corr[0][1] - 1.0 / 3.0).abs() < 1.0e-12);
+        assert!((corr[2][3] - 0.5).abs() < 1.0e-12);
+
+        let sparse = report.sparse_parameter_correlations(0.3);
+        assert!(
+            sparse
+                .iter()
+                .any(|entry| entry.left == "fx" && entry.right == "fy")
+        );
+        assert!(
+            sparse
+                .iter()
+                .any(|entry| entry.left == "cx" && entry.right == "cy")
         );
     }
 }

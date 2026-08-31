@@ -422,7 +422,7 @@ impl CalibController {
             self.set_connect_status("请输入设备 IP", theme::WARN);
             return;
         }
-        self.set_connect_status(&format!("正在探测 {host}:9073 …"), theme::MUTED);
+        self.set_connect_status("正在检测驱动…", theme::MUTED);
         self.spawn_task(move || {
             let result = x5::probe(&host, 9073);
             match result {
@@ -432,7 +432,7 @@ impl CalibController {
                     host,
                 },
                 Err(error) => WorkerResult::Probe {
-                    text: format!("探测失败：{error}"),
+                    text: format!("未检测到驱动：{error}"),
                     ok: false,
                     host,
                 },
@@ -448,10 +448,7 @@ impl CalibController {
             self.set_connect_status("请输入设备 IP", theme::WARN);
             return;
         }
-        self.set_connect_status(
-            &format!("正在通过 SSH 启动 {host} 上的 DEMO233 …"),
-            theme::MUTED,
-        );
+        self.set_connect_status("正在检测驱动…", theme::MUTED);
         self.spawn_task(move || {
             let result = x5::bootstrap_driver(&host, 22, &user, &password, 9073);
             match result {
@@ -989,13 +986,14 @@ impl CalibController {
         if host.is_empty() {
             return;
         }
+        self.set_connect_status("正在检测驱动…", theme::MUTED);
         self.last_connection_probe = Some(Instant::now());
         let slot = Arc::new(Mutex::new(None));
         self.pending_connection_probe = Some(Arc::clone(&slot));
         std::thread::spawn(move || {
             let text = match x5::probe(&host, 9073) {
                 Ok(summary) => format!("连接正常：TCP 9073 可用 · {summary:?}"),
-                Err(error) => format!("持续检查：设备/驱动未就绪（{error}）"),
+                Err(error) => format!("未检测到驱动：{error}"),
             };
             if let Ok(mut value) = slot.lock() {
                 *value = Some(text);
@@ -1292,5 +1290,23 @@ mod tests {
             controller.state.summaries[StepId::Preview.index()],
             "Step 2 已跳过 · 直接进入 Step 3"
         );
+    }
+
+    #[test]
+    fn probe_status_uses_detecting_state_before_result() {
+        let mut controller = CalibController::new();
+        controller.state.connect.device_ip = "10.21.12.108".to_owned();
+        controller.set_connect_status("正在检测驱动…", theme::MUTED);
+
+        assert_eq!(controller.state.connect.status, "正在检测驱动…");
+        assert_eq!(controller.state.connect.status_color, theme::MUTED);
+        assert_eq!(controller.state.status_bar, "正在检测驱动…");
+
+        controller.set_connect_status("未检测到驱动：TCP 9073 不可用", theme::WARN);
+        assert_eq!(
+            controller.state.connect.status,
+            "未检测到驱动：TCP 9073 不可用"
+        );
+        assert_eq!(controller.state.connect.status_color, theme::WARN);
     }
 }
