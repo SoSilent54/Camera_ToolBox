@@ -455,7 +455,7 @@ dependencies = [
 
 [[package]]
 name = "camera-i2c-helper"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "camera-toolbox-app",
  "camera-toolbox-core",
@@ -467,7 +467,7 @@ dependencies = [
 
 [[package]]
 name = "camera-toolbox"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "anyhow",
  "camera-toolbox-adapters",
@@ -490,7 +490,7 @@ dependencies = [
 
 [[package]]
 name = "camera-toolbox-adapters"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "camera-toolbox-app",
  "camera-toolbox-core",
@@ -519,7 +519,7 @@ dependencies = [
 
 [[package]]
 name = "camera-toolbox-app"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "camera-toolbox-core",
  "directories",
@@ -532,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "camera-toolbox-cli"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "anyhow",
  "camera-toolbox-adapters",
@@ -545,7 +545,7 @@ dependencies = [
 
 [[package]]
 name = "camera-toolbox-core"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "serde",
  "serde_json",
@@ -556,14 +556,14 @@ dependencies = [
 
 [[package]]
 name = "camera-toolbox-ffmpeg-bridge"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "ffmpeg-next",
 ]
 
 [[package]]
 name = "camera-toolbox-logging"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "directories",
  "serde_json",
@@ -3615,7 +3615,7 @@ dependencies = [
 
 [[package]]
 name = "pongbot-calib-tool"
-version = "0.1.6-calib"
+version = "0.1.7-calib"
 dependencies = [
  "camera-toolbox-adapters",
  "camera-toolbox-app",

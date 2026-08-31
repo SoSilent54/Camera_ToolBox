@@ -162,6 +162,8 @@ jobs:
           install -m 755 "target/release/pongbot-calib-tool" "dist/${bundle}/"
           install -m 755 "helper-sidecar/camera-i2c-helper" \
             "dist/${bundle}/camera-i2c-helper-linux-aarch64"
+          install -m 755 "driver-sidecar/DEMO233_Calib" \
+            "dist/${bundle}/DEMO233_Calib"
           install -m 644 README.md "dist/${bundle}/"
           install -d "dist/${bundle}/config"
           install -m 644 "crates/frontends/camera-toolbox/assets/config/dataset_acceptance_default.yaml" \
@@ -186,6 +188,7 @@ jobs:
           Copy-Item "target/release/camera-toolbox.exe" "dist/$bundle/"
           Copy-Item "target/release/pongbot-calib-tool.exe" "dist/$bundle/"
           Copy-Item "helper-sidecar/camera-i2c-helper" "dist/$bundle/camera-i2c-helper-linux-aarch64"
+          Copy-Item "driver-sidecar/DEMO233_Calib" "dist/$bundle/DEMO233_Calib"
           Copy-Item README.md "dist/$bundle/"
           New-Item -ItemType Directory -Force -Path "dist/$bundle/config" | Out-Null
           Copy-Item "crates/frontends/camera-toolbox/assets/config/dataset_acceptance_default.yaml" "dist/$bundle/config/dataset-acceptance.yaml"
@@ -294,6 +297,8 @@ jobs:
           install -m 755 "target/release/pongbot-calib-tool" "dist/${bundle}/"
           install -m 755 "helper-sidecar/camera-i2c-helper" \
             "dist/${bundle}/camera-i2c-helper-linux-aarch64"
+          install -m 755 "driver-sidecar/DEMO233_Calib" \
+            "dist/${bundle}/DEMO233_Calib"
           install -m 644 README.md "dist/${bundle}/"
           install -d "dist/${bundle}/config"
           install -m 644 "crates/frontends/camera-toolbox/assets/config/dataset_acceptance_default.yaml" \
