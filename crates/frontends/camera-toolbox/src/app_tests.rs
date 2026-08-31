@@ -1,7 +1,7 @@
 #[cfg(feature = "platform-ssh")]
 use camera_toolbox_adapters::platforms::ssh_managed::ServerHostKey;
-use std::{path::PathBuf, sync::Arc, time::Duration};
 use camera_toolbox_adapters::{ImageRasterCodec, filesystem::LocalFileSystem};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use camera_toolbox_app::{
     DirectoryRef, ExportDestination, FileRef, FileSourceId, FsCancellation, ImageOpenMode,

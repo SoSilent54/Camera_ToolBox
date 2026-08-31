@@ -85,10 +85,12 @@ impl StructuredFieldExtractorNode {
                     output.id, output.pointer
                 ))
             })?;
-            datum.validate().map_err(|error| NodeError::Precondition(format!(
-                "structured field output `{}` pointer `{}` selected an invalid datum: {error}",
-                output.id, output.pointer
-            )))?;
+            datum.validate().map_err(|error| {
+                NodeError::Precondition(format!(
+                    "structured field output `{}` pointer `{}` selected an invalid datum: {error}",
+                    output.id, output.pointer
+                ))
+            })?;
             rt.emit(
                 &output.id,
                 DataPacket::TypedField {
@@ -136,9 +138,11 @@ impl NodeInstance for StructuredFieldExtractorNode {
                     ))
                 })?)
             }
-            _ => return Err(NodeError::Precondition(
-                "structuredFieldExtractor.packet requires data.packet.v1".to_owned(),
-            )),
+            _ => {
+                return Err(NodeError::Precondition(
+                    "structuredFieldExtractor.packet requires data.packet.v1".to_owned(),
+                ));
+            }
         };
         self.extract(&packet, rt)
     }
@@ -307,10 +311,9 @@ fn validate_json_pointer(pointer: &str) -> Result<(), NodeError> {
     Ok(())
 }
 
-
 #[cfg(test)]
 mod tests {
-    use std::sync::{atomic::AtomicBool, mpsc, Arc};
+    use std::sync::{Arc, atomic::AtomicBool, mpsc};
 
     use camera_toolbox_core::{PacketProvenance, TypedValue};
     use parking_lot::Mutex;
@@ -321,11 +324,24 @@ mod tests {
     };
 
     fn port(id: &str, kind: &str) -> PortSpec {
-        PortSpec { id: id.to_owned(), label: id.to_owned(), kind: kind.to_owned(), cardinality: PortCardinality::One, required: true }
+        PortSpec {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            kind: kind.to_owned(),
+            cardinality: PortCardinality::One,
+            required: true,
+        }
     }
 
     fn spec(config: Value, outputs: Vec<PortSpec>) -> NodeSpec {
-        NodeSpec { id: "extractor".to_owned(), kind: "structuredFieldExtractor".to_owned(), title: String::new(), inputs: vec![port(INPUT_PORT, PACKET_PORT_KIND)], outputs, config }
+        NodeSpec {
+            id: "extractor".to_owned(),
+            kind: "structuredFieldExtractor".to_owned(),
+            title: String::new(),
+            inputs: vec![port(INPUT_PORT, PACKET_PORT_KIND)],
+            outputs,
+            config,
+        }
     }
 
     fn runtime(recorded: Arc<Mutex<Vec<DataPacket>>>) -> NodeRuntime {
@@ -333,27 +349,69 @@ mod tests {
         let (event_tx, _) = mpsc::channel();
         let mut outputs = OutputRegistry::default();
         outputs.set_record(Arc::new(move |packet| recorded.lock().push(packet)));
-        NodeRuntime::new(SpawnContext { outputs, reporter: NodeReporter::new("extractor".to_owned(), state_tx, event_tx), services: Arc::new(EngineServices::default()), cancel: Arc::new(AtomicBool::new(false)), viewer_slot: None })
+        NodeRuntime::new(SpawnContext {
+            outputs,
+            reporter: NodeReporter::new("extractor".to_owned(), state_tx, event_tx),
+            services: Arc::new(EngineServices::default()),
+            cancel: Arc::new(AtomicBool::new(false)),
+            viewer_slot: None,
+        })
     }
 
     fn packet() -> StructuredPacket {
-        StructuredPacket::new("example.packet.v1", PacketProvenance::default(), vec![Datum::new("camera.intrinsics.fx", TypedValue::F64(912.43))]).expect("valid packet")
+        StructuredPacket::new(
+            "example.packet.v1",
+            PacketProvenance::default(),
+            vec![Datum::new("camera.intrinsics.fx", TypedValue::F64(912.43))],
+        )
+        .expect("valid packet")
     }
 
     #[test]
     fn emits_complete_datum_on_generic_field_port() {
-        let mut node = StructuredFieldExtractorNode::new(spec(serde_json::json!({"outputs":[{"id":"fx","pointer":"/fields/0"}]}), vec![port("fx", "data.field.v1")])).expect("valid config");
+        let mut node = StructuredFieldExtractorNode::new(spec(
+            serde_json::json!({"outputs":[{"id":"fx","pointer":"/fields/0"}]}),
+            vec![port("fx", "data.field.v1")],
+        ))
+        .expect("valid config");
         let recorded = Arc::new(Mutex::new(Vec::new()));
-        node.on_input(INPUT_PORT, DataPacket::StructuredPacket(Arc::new(packet())), &mut runtime(Arc::clone(&recorded))).expect("extract");
+        node.on_input(
+            INPUT_PORT,
+            DataPacket::StructuredPacket(Arc::new(packet())),
+            &mut runtime(Arc::clone(&recorded)),
+        )
+        .expect("extract");
         let output = recorded.lock();
-        let [DataPacket::TypedField { datum, .. }] = output.as_slice() else { panic!("expected field") };
+        let [DataPacket::TypedField { datum, .. }] = output.as_slice() else {
+            panic!("expected field")
+        };
         assert_eq!(datum.name, "camera.intrinsics.fx");
-        assert_eq!(DataPacket::TypedField { datum: Arc::clone(datum), generation: 1, source: typed_field_source(&packet()) }.port_kind(), "data.field.v1");
+        assert_eq!(
+            DataPacket::TypedField {
+                datum: Arc::clone(datum),
+                generation: 1,
+                source: typed_field_source(&packet())
+            }
+            .port_kind(),
+            "data.field.v1"
+        );
     }
 
     #[test]
     fn rejects_primitive_typed_port_or_config() {
-        assert!(StructuredFieldExtractorNode::new(spec(serde_json::json!({"outputs":[{"id":"fx","pointer":"/fields/0","type":"f64"}]}), vec![port("fx", "data.field.v1")])).is_err());
-        assert!(StructuredFieldExtractorNode::new(spec(serde_json::json!({"outputs":[{"id":"fx","pointer":"/fields/0"}]}), vec![port("fx", "data.field.f64.v1")])).is_err());
+        assert!(
+            StructuredFieldExtractorNode::new(spec(
+                serde_json::json!({"outputs":[{"id":"fx","pointer":"/fields/0","type":"f64"}]}),
+                vec![port("fx", "data.field.v1")]
+            ))
+            .is_err()
+        );
+        assert!(
+            StructuredFieldExtractorNode::new(spec(
+                serde_json::json!({"outputs":[{"id":"fx","pointer":"/fields/0"}]}),
+                vec![port("fx", "data.field.f64.v1")]
+            ))
+            .is_err()
+        );
     }
 }

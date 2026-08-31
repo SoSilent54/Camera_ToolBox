@@ -162,7 +162,9 @@ impl RemoteConnector {
                 self.error = None;
             }
         });
-        ui.small("The OpenSSH server public key is required and verified for every SFTP connection.");
+        ui.small(
+            "The OpenSSH server public key is required and verified for every SFTP connection.",
+        );
         if let Some(status) = &self.status {
             ui.horizontal(|ui| {
                 if connecting {
@@ -557,7 +559,8 @@ mod tests {
             password: SecretString::from("memory-test-secret".to_owned()),
         };
 
-        let error = match run_remote_connect(request, memory.as_ref(), DumpCancellation::default()) {
+        let error = match run_remote_connect(request, memory.as_ref(), DumpCancellation::default())
+        {
             Ok(_) => panic!("a changed server host key must be rejected"),
             Err(error) => error,
         };

@@ -40,19 +40,19 @@ pub use events::{
     DumpJobEvent, DumpJobState, RemoteJobEvent, RemoteJobFailure, RemoteJobState,
     StreamSessionEvent,
 };
-    pub use i2c::{
-        I2C_HELPER_MAX_MESSAGE_BYTES, I2C_HELPER_MAX_MESSAGES_PER_TRANSACTION,
-        I2C_HELPER_MAX_REQUEST_BYTES, I2C_HELPER_MAX_TOTAL_READ_BYTES,
-        I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST, I2C_HELPER_SCHEMA_VERSION, I2cBusInfo,
-        I2cExecutionReport, I2cGuardedWriteRequest, I2cHelperAction, I2cHelperFailure,
-        I2cHelperOperation, I2cHelperOutput, I2cHelperRequest, I2cHelperRequestValidationError,
-        I2cHelperResult, I2cHelperService, I2cHelperServiceError, I2cChecksumValidation,
-        I2cMapValidationContract, I2cMessageData, I2cMessageDirection, I2cMessageFlag,
-        I2cMessageResult, I2cMessageSpec,
-        I2cPageExecutionReport, I2cPageWrite, I2cReadRange, I2cReadReport, I2cReadRequest,
-        I2cTaskExecutor, I2cTaskTarget, I2cTransactionResult, I2cTransactionSpec, I2cWriteRequest,
-        validate_i2c_helper_action, validate_i2c_transfer_transactions, validate_map_image,
-    };
+pub use i2c::{
+    I2C_HELPER_MAX_MESSAGE_BYTES, I2C_HELPER_MAX_MESSAGES_PER_TRANSACTION,
+    I2C_HELPER_MAX_REQUEST_BYTES, I2C_HELPER_MAX_TOTAL_READ_BYTES,
+    I2C_HELPER_MAX_TRANSACTIONS_PER_REQUEST, I2C_HELPER_SCHEMA_VERSION, I2cBusInfo,
+    I2cChecksumValidation, I2cExecutionReport, I2cGuardedWriteRequest, I2cHelperAction,
+    I2cHelperFailure, I2cHelperOperation, I2cHelperOutput, I2cHelperRequest,
+    I2cHelperRequestValidationError, I2cHelperResult, I2cHelperService, I2cHelperServiceError,
+    I2cMapValidationContract, I2cMessageData, I2cMessageDirection, I2cMessageFlag,
+    I2cMessageResult, I2cMessageSpec, I2cPageExecutionReport, I2cPageWrite, I2cReadRange,
+    I2cReadReport, I2cReadRequest, I2cTaskExecutor, I2cTaskTarget, I2cTransactionResult,
+    I2cTransactionSpec, I2cWriteRequest, validate_i2c_helper_action,
+    validate_i2c_transfer_transactions, validate_map_image,
+};
 pub use ports::{
     DecodedVideoFrame, DumpCancellation, DumpEnvelope, DumpOperationControl, DumpOperationResult,
     DumpService, DumpServiceError, DumpSourceDescriptor, DumpStage, DumpTimeouts,

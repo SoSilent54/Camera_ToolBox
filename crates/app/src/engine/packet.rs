@@ -5,8 +5,7 @@
 use std::sync::Arc;
 
 use camera_toolbox_core::{
-    CalibrationImageSize, ChessboardDetection, Datum, PacketProvenance,
-    StructuredPacket,
+    CalibrationImageSize, ChessboardDetection, Datum, PacketProvenance, StructuredPacket,
 };
 use serde::{Deserialize, Serialize};
 
@@ -1241,14 +1240,28 @@ mod tests {
     #[test]
     fn typed_field_packets_use_generic_field_port_kind() {
         for value in [
-            TypedValue::Bool(true), TypedValue::U8(1), TypedValue::I8(-1), TypedValue::U16(1),
-            TypedValue::I16(-1), TypedValue::U32(1), TypedValue::I32(-1), TypedValue::U64(1),
-            TypedValue::I64(-1), TypedValue::F32(1.0), TypedValue::F64(1.0),
-            TypedValue::Str("value".to_owned()), TypedValue::Bytes(vec![0x12]),
+            TypedValue::Bool(true),
+            TypedValue::U8(1),
+            TypedValue::I8(-1),
+            TypedValue::U16(1),
+            TypedValue::I16(-1),
+            TypedValue::U32(1),
+            TypedValue::I32(-1),
+            TypedValue::U64(1),
+            TypedValue::I64(-1),
+            TypedValue::F32(1.0),
+            TypedValue::F64(1.0),
+            TypedValue::Str("value".to_owned()),
+            TypedValue::Bytes(vec![0x12]),
         ] {
             let field = DataPacket::TypedField {
-                datum: Arc::new(Datum::new("example.field", value)), generation: 1,
-                source: Arc::new(TypedFieldSource::new("example.packet.v1", PacketProvenance::default(), Some("example.model.v1".to_owned()))),
+                datum: Arc::new(Datum::new("example.field", value)),
+                generation: 1,
+                source: Arc::new(TypedFieldSource::new(
+                    "example.packet.v1",
+                    PacketProvenance::default(),
+                    Some("example.model.v1".to_owned()),
+                )),
             };
             assert_eq!(field.port_kind(), "data.field.v1");
             assert_eq!(field.flow_sequence(), None);

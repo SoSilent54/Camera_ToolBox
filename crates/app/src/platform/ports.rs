@@ -834,9 +834,9 @@ impl LatestDecodedFrameSlot {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             guard = next;
             if timed_out.timed_out()
-                && guard.as_ref().is_none_or(|frame| {
-                    current.is_some_and(|old| Arc::ptr_eq(old, frame))
-                })
+                && guard
+                    .as_ref()
+                    .is_none_or(|frame| current.is_some_and(|old| Arc::ptr_eq(old, frame)))
             {
                 return None;
             }
