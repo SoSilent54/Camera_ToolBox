@@ -41,22 +41,63 @@ fn main() {
         println!("pongbot-calib-tool {}", env!("CARGO_PKG_VERSION"));
         return;
     }
-    init_tracing();
+
+    let _logging = camera_toolbox_logging::init();
+    log_startup_context();
     if let Err(error) = run() {
+        tracing::error!(
+            operation = "startup",
+            error = %error,
+            "pongbot-calib-tool 启动失败"
+        );
         eprintln!("pongbot-calib-tool 启动失败：{error}");
         std::process::exit(1);
     }
 }
 
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+fn log_startup_context() {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    let current_exe = std::env::current_exe().ok();
+    let current_dir = std::env::current_dir().ok();
+    tracing::info!(
+        operation = "startup",
+        version = env!("CARGO_PKG_VERSION"),
+        argc = args.len(),
+        args = ?args,
+        current_exe = ?current_exe.as_deref(),
+        current_dir = ?current_dir.as_deref(),
+        "pongbot-calib-tool starting"
+    );
 }
 
 fn run() -> Result<(), String> {
+    tracing::info!(
+        operation = "startup_stage",
+        stage = "create_window",
+        "creating OpenGL window"
+    );
     let (event_loop, window, surface, context) = create_window()?;
+    let window_size = window.inner_size();
+    tracing::info!(
+        operation = "startup_stage",
+        stage = "create_window",
+        width = window_size.width,
+        height = window_size.height,
+        "OpenGL window ready"
+    );
+
+    tracing::info!(
+        operation = "startup_stage",
+        stage = "imgui_init",
+        "initializing ImGui context"
+    );
     let (mut winit_platform, mut imgui_context) = imgui_init(&window)?;
+
+    tracing::info!(
+        operation = "startup_stage",
+        stage = "renderer_init",
+        "initializing renderer"
+    );
     let gl = glow_context(&context);
     let clear_color = imgui_context.style()[imgui::StyleColor::WindowBg];
 
@@ -64,8 +105,19 @@ fn run() -> Result<(), String> {
     let mut renderer = ImGuiGlowRenderer::new(&gl, &mut imgui_context, &mut textures, true)
         .map_err(|error| format!("ImGui renderer 初始化失败：{error}"))?;
 
+    tracing::info!(
+        operation = "startup_stage",
+        stage = "app_init",
+        "initializing application state"
+    );
     let mut app = App::new();
     let mut last_frame = Instant::now();
+
+    tracing::info!(
+        operation = "startup_stage",
+        stage = "event_loop",
+        "entering event loop"
+    );
 
     #[allow(deprecated)]
     event_loop
@@ -102,7 +154,7 @@ fn run() -> Result<(), String> {
                 winit_platform.prepare_render(ui, &window);
                 let draw_data = imgui_context.render();
                 if let Err(error) = renderer.render(&gl, &textures, draw_data) {
-                    tracing::error!("ImGui 渲染失败：{error}");
+                    tracing::error!(operation = "render", error = %error, "ImGui 渲染失败");
                 }
                 surface.swap_buffers(&context).expect("swap_buffers 失败");
             }

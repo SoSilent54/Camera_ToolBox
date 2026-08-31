@@ -13,6 +13,7 @@ path = "src/main.rs"
 camera-toolbox-app = { workspace = true }
 camera-toolbox-core = { workspace = true }
 camera-toolbox-adapters = { workspace = true, features = ["platform-local", "platform-ssh", "calibration-opencv"] }
+camera-toolbox-logging.workspace = true
 image.workspace = true
 secrecy.workspace = true
 serde.workspace = true
