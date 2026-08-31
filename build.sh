@@ -145,6 +145,7 @@ fi
 # is unusable on x86_64/Windows/macOS and previously left local release builds
 # without the filename the Egui client loads.  Prefer the CI-provided artifact;
 # an AArch64 Linux workstation can build the static sidecar itself.
+helper_output="${target_dir}/${profile}/camera-i2c-helper-linux-aarch64"
 helper_candidates=(
     "${project_root}/helper-sidecar/camera-i2c-helper"
     "${project_root}/helper-sidecar/target/aarch64-unknown-linux-gnu/release/camera-i2c-helper"
